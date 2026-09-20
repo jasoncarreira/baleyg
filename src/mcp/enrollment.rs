@@ -185,6 +185,11 @@ pub struct Enrollment {
     interrupt: Arc<rusqlite::InterruptHandle>,
     gate: Gate,
     latched: AtomicBool,
+    /// Held across final admission and across invalidation, so a response cannot be produced from
+    /// a snapshot that another request has already observed to be gone. Lock order is always this
+    /// mutex before `conn`; `read` never takes it, so a reader that latches cannot deadlock a
+    /// waiting admission.
+    admission: Mutex<()>,
 }
 
 fn open_no_follow(path: &Path, directory: bool) -> Result<File> {
@@ -285,6 +290,7 @@ impl Enrollment {
             conn: Mutex::new(conn),
             gate: Gate::new(),
             latched: AtomicBool::new(false),
+            admission: Mutex::new(()),
         };
         // Check identities after connection setup as well as before, so a swap racing the open is
         // caught rather than adopted.
@@ -314,6 +320,13 @@ impl Enrollment {
     /// There is no in-process recovery: a later republication, a restored file or a browser read
     /// that recreates the cache must not clear the latch.
     pub fn invalidate(&self) {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        self.latch();
+    }
+
+    /// Latch without taking the admission lock. Used on paths that already hold it, and by `read`,
+    /// which must never acquire it while owning the connection.
+    fn latch(&self) {
         if !self.latched.swap(true, Ordering::SeqCst) {
             let mut generation = self.generation.lock().unwrap_or_else(|e| e.into_inner());
             *generation = uuid::Uuid::new_v4().to_string();
@@ -336,23 +349,84 @@ impl Enrollment {
         Ok(())
     }
 
+    /// Path anchors plus the opened connection's moved status, and the revision pinned in the same
+    /// lock hold. Pure: the caller decides whether to latch.
+    fn identity_and_revision(&self) -> Result<u64, McpError> {
+        self.path_identity()?;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if has_moved(&conn)? {
+            return Err(McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE));
+        }
+        current_revision(&conn).map_err(|_| McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE))
+    }
+
     /// Full identity check. Any failure latches the binding before returning.
     fn check_identity(&self) -> Result<(), McpError> {
         if !self.is_available() {
             return Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED));
         }
-        let verdict = (|| {
-            self.path_identity()?;
-            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-            if has_moved(&conn)? {
-                return Err(McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE));
-            }
-            Ok(())
-        })();
+        let verdict = self.identity_and_revision().map(|_| ());
         if verdict.is_err() {
-            self.invalidate();
+            // Not `invalidate`: this runs on the read path, which must not take the admission lock.
+            self.latch();
         }
         verdict
+    }
+
+    /// Final admission.
+    ///
+    /// Re-verifies availability, identity and the current revision, then produces the caller's
+    /// value without releasing the admission lock. Invalidation takes the same lock, so a response
+    /// or a credential can never be produced after another request has observed the store to be
+    /// gone, and a publication that raced the read is a conflict rather than a relabelled snapshot.
+    /// Bytes already sent cannot be recalled; this bounds what is allowed to start being sent.
+    pub fn admit<T>(
+        &self,
+        basis_revision: u64,
+        produce: impl FnOnce() -> T,
+    ) -> Result<T, McpError> {
+        self.admit_current(|current| {
+            if current != basis_revision {
+                return Err(McpError::new(ErrorCode::RevisionConflict, CONFLICT));
+            }
+            Ok(produce())
+        })?
+    }
+
+    /// Cheap final gate, safe to call synchronously at the moment of emission.
+    ///
+    /// Takes the admission lock and checks only the latch: no connection, no filesystem, no I/O.
+    /// The deep checks belong in `admit`, but those must run on a blocking thread, and awaiting
+    /// them reopens a window in which another request can observe invalidation before the response
+    /// is actually returned. This closes that window because nothing suspends between it and the
+    /// return. It cannot recall bytes already written; it bounds what is allowed to start.
+    pub fn still_admitted(&self) -> Result<(), McpError> {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_available() {
+            Ok(())
+        } else {
+            Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED))
+        }
+    }
+
+    /// Admission for a response that carries no evidence.
+    ///
+    /// Re-verifies availability and identity under the admission lock and hands the closure the
+    /// revision observed in that same hold. A response that describes current state has nothing to
+    /// conflict with, so a publication racing it is reported rather than refused.
+    pub fn admit_current<T>(&self, produce: impl FnOnce(u64) -> T) -> Result<T, McpError> {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.is_available() {
+            return Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED));
+        }
+        let current = match self.identity_and_revision() {
+            Ok(current) => current,
+            Err(e) => {
+                self.latch();
+                return Err(e);
+            }
+        };
+        Ok(produce(current))
     }
 
     /// Run one guarded read.

@@ -339,3 +339,108 @@ fn a_storage_failure_is_unavailable_rather_than_an_unindexed_store() {
     let err = e.current_revision(soon()).unwrap_err();
     assert_eq!(err.code, ErrorCode::StoreUnavailable);
 }
+
+#[test]
+fn admission_refuses_after_another_request_observes_invalidation() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Enrollment::enroll(state.path()).unwrap();
+    let (revision, ()) = e.read(None, soon(), |_| Ok(())).unwrap();
+
+    // Another request observes the cache is gone and latches the binding while this response is
+    // still pending.
+    fs::remove_file(state.path().join("cache.db")).unwrap();
+    assert_eq!(
+        e.read(None, soon(), |_| Ok(())).unwrap_err().code,
+        ErrorCode::StoreUnavailable
+    );
+
+    let produced = Arc::new(AtomicBool::new(false));
+    let flag = produced.clone();
+    let err = e
+        .admit(revision, move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::StoreUnavailable);
+    assert!(
+        !produced.load(std::sync::atomic::Ordering::SeqCst),
+        "nothing may be produced after observed invalidation"
+    );
+}
+
+#[test]
+fn admission_refuses_a_snapshot_a_later_publication_replaced() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Enrollment::enroll(state.path()).unwrap();
+    let (revision, ()) = e.read(None, soon(), |_| Ok(())).unwrap();
+    assert_eq!(revision, 1);
+
+    // The owner republishes between the read and the response.
+    publish(&store, Some(1));
+
+    let err = e.admit(revision, || ()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::RevisionConflict);
+    // A conflict is not identity loss: the binding stays usable at the new revision.
+    assert!(e.is_available());
+    assert!(e.admit(2, || ()).is_ok());
+}
+
+#[test]
+fn admission_serializes_against_concurrent_invalidation() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Arc::new(Enrollment::enroll(state.path()).unwrap());
+
+    // Invalidation cannot interleave between the admission checks and the value being produced.
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let admitter = {
+        let e = e.clone();
+        thread::spawn(move || {
+            e.admit(1, move || {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                "emitted"
+            })
+        })
+    };
+    inside.recv().unwrap();
+
+    let invalidator = {
+        let e = e.clone();
+        thread::spawn(move || e.invalidate())
+    };
+    thread::sleep(Duration::from_millis(50));
+    release.send(()).unwrap();
+
+    assert_eq!(admitter.join().unwrap().unwrap(), "emitted");
+    invalidator.join().unwrap();
+    assert!(!e.is_available());
+    assert_eq!(
+        e.admit(1, || ()).unwrap_err().code,
+        ErrorCode::StoreUnavailable
+    );
+}
+
+#[test]
+fn the_final_gate_refuses_after_invalidation_without_touching_the_store() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Enrollment::enroll(state.path()).unwrap();
+    assert!(e.still_admitted().is_ok());
+
+    e.invalidate();
+
+    assert_eq!(
+        e.still_admitted().unwrap_err().code,
+        ErrorCode::StoreUnavailable
+    );
+    // Still answers with the databases gone: the gate performs no I/O.
+    fs::remove_file(state.path().join("cache.db")).unwrap();
+    assert_eq!(
+        e.still_admitted().unwrap_err().code,
+        ErrorCode::StoreUnavailable
+    );
+}
