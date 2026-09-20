@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     sync::Arc,
@@ -61,7 +61,7 @@ async fn blocking_within<T: Send + 'static>(
 
 /// Contract error envelope. Distinct from the daemon's existing shape, and never carries SQL,
 /// token fragments, absolute state paths or source.
-fn fail(e: McpError) -> Response {
+pub(crate) fn fail(e: McpError) -> Response {
     let status = StatusCode::from_u16(e.code.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = (
         status,
@@ -76,6 +76,33 @@ fn fail(e: McpError) -> Response {
         .headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
+}
+
+/// Tool routes are the only ones a limited grant may reach, and the only ones the owner bearer
+/// may not. The two principals are disjoint by route, enforced here rather than by a tool
+/// allowlist in the adapter.
+pub(crate) fn is_tool_route(path: &str) -> bool {
+    // The bare prefix counts too: otherwise a request to it is classified as an owner route and
+    // answered by the guard before the tool handler can identify and charge it.
+    path == "/api/mcp-pilot/tools" || path.starts_with("/api/mcp-pilot/tools/")
+}
+
+/// Any `/api/mcp-pilot/...` path answers in the contract envelope, including guard rejections.
+pub(crate) fn is_pilot_route(path: &str) -> bool {
+    path == "/api/mcp-pilot" || path.starts_with("/api/mcp-pilot/")
+}
+
+/// A well-formed grant credential. Shape only: the guard never consults the grant table, so a
+/// rejection on an owner route cannot reveal whether a grant exists.
+pub(crate) fn looks_like_grant(token: &str) -> bool {
+    token
+        .strip_prefix(super::grants::TOKEN_PREFIX)
+        .is_some_and(|rest| {
+            rest.len() == 64
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
 }
 
 fn unavailable() -> McpError {
@@ -347,6 +374,96 @@ async fn revoke(State(s): State<Arc<DaemonState>>, Path(grant_id): Path<String>)
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Unknown tool names under the tool prefix are denied in the contract envelope rather than
+/// falling through to the daemon's generic handler. The principal is always a grant here: the
+/// guard rejects the owner bearer on this prefix before dispatch.
+/// Catch-all for the tool prefix: any method, any tail, including none.
+///
+/// Router-level rejections would answer before the request was identified, so an unusable
+/// credential would learn which tools exist and a live grant could send unlimited misses for
+/// free. Everything under the prefix is admitted first and answered afterwards.
+async fn unknown_tool(
+    State(s): State<Arc<DaemonState>>,
+    axum::Extension(principal): axum::Extension<crate::http::Principal>,
+    request: axum::extract::Request,
+) -> Response {
+    let Some(token) = principal.grant_token() else {
+        return fail(McpError::new(
+            ErrorCode::Forbidden,
+            "This credential may not be used on this route",
+        ));
+    };
+    // The enrollment itself, not a sampled generation string: a sample can be stale by the time it
+    // is compared, which would let a grant outlive the binding it was issued against.
+    let admission = match s
+        .grants
+        .admit(token, s.enrollment.as_deref(), Instant::now())
+    {
+        Ok(admission) => admission,
+        Err(e) => return fail(e),
+    };
+    // Read only now, with the budget already reserved, and only to the documented ceiling. Doing
+    // the work first and accounting for it afterwards would let a stalled or oversized stream
+    // consume the server without ever being charged to the grant that caused it.
+    let outcome = if read_body(request).await.is_err() {
+        McpError::new(
+            ErrorCode::BodyTooLarge,
+            "The tool request exceeds the permitted size",
+        )
+    } else {
+        McpError::new(
+            ErrorCode::NotFound,
+            "No such tool is available on this binding",
+        )
+    };
+    // Settled with the size actually emitted: dropping the admission would charge the whole
+    // reservation for a short error. Emission is also capped by what remains, so an ordinary error
+    // never exceeds the allowance and is replaced by the smaller budget denial when it would.
+    let mut status = outcome.code.status();
+    let mut rendered = envelope_for(&outcome);
+    if rendered.to_string().len() as u64 > admission.max_response_bytes {
+        let denial = McpError::new(
+            ErrorCode::BudgetExhausted,
+            "The grant response budget is exhausted",
+        );
+        status = denial.code.status();
+        rendered = envelope_for(&denial);
+    }
+    admission.settle(rendered.to_string().len() as u64);
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response = (status, Json(rendered)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+}
+
+fn envelope_for(e: &McpError) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "error": {
+            "code": e.code.as_str(),
+            "message": e.message,
+            "retryable": e.code.retryable(),
+        },
+        "requestId": uuid::Uuid::new_v4().to_string(),
+    })
+}
+
+/// Read a tool request body, bounded by the documented ceiling.
+///
+/// Called after admission has reserved, so bytes a caller makes the server hold are charged to a
+/// grant. `Err` means the body exceeded the ceiling.
+async fn read_body(request: axum::extract::Request) -> Result<axum::body::Bytes, ()> {
+    match axum::body::to_bytes(request.into_body(), MAX_TOOL_REQUEST_BYTES + 1).await {
+        Ok(bytes) if bytes.len() <= MAX_TOOL_REQUEST_BYTES => Ok(bytes),
+        _ => Err(()),
+    }
+}
+
+/// Backend ceiling on a tool request body.
+pub(crate) const MAX_TOOL_REQUEST_BYTES: usize = 16 * 1024;
+
 pub fn routes() -> Router<Arc<DaemonState>> {
     Router::new()
         .route("/api/mcp-pilot/binding", get(binding))
@@ -354,5 +471,13 @@ pub fn routes() -> Router<Arc<DaemonState>> {
         .route(
             "/api/mcp-pilot/grants/{grant_id}",
             axum::routing::delete(revoke),
+        )
+        // Every method and every tail under the tool prefix, so a router-level 404 or 405 can
+        // never answer an authenticated request before it has been identified and charged.
+        .route("/api/mcp-pilot/tools", axum::routing::any(unknown_tool))
+        .route("/api/mcp-pilot/tools/", axum::routing::any(unknown_tool))
+        .route(
+            "/api/mcp-pilot/tools/{*tool}",
+            axum::routing::any(unknown_tool),
         )
 }

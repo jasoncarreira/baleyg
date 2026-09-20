@@ -443,6 +443,100 @@ async fn db<T: Send + 'static>(
         })?
         .map_err(Into::into)
 }
+/// Which credential a request presented.
+///
+/// Owner and limited-grant principals are disjoint by route: a grant reaches only the pilot's tool
+/// routes, and the owner bearer reaches everything except them. Dispatch is default-deny, so a new
+/// route is closed to grants until it is deliberately added under the tool prefix.
+#[derive(Debug, Clone)]
+pub(crate) enum Principal {
+    Owner,
+    Grant(String),
+}
+
+impl Principal {
+    /// The presented grant secret, for the tool routes to admit against the grant table. `None`
+    /// for the owner, which is never admitted on a tool route.
+    pub(crate) fn grant_token(&self) -> Option<&str> {
+        match self {
+            Self::Grant(token) => Some(token),
+            Self::Owner => None,
+        }
+    }
+}
+
+/// Authenticate and authorize the principal for this route. Returns a denial response, or `None`
+/// when the request may proceed with its principal recorded in the request extensions.
+fn authenticate(s: &Arc<DaemonState>, req: &mut Request) -> Option<Response> {
+    let path = req.uri().path().to_string();
+    if path != "/api" && !path.starts_with("/api/") {
+        return None;
+    }
+    let pilot = crate::mcp::http::is_pilot_route(&path);
+    let unauthorized = || {
+        Some(if pilot {
+            crate::mcp::http::fail(crate::mcp::McpError::new(
+                crate::mcp::ErrorCode::Unauthorized,
+                "The grant is not usable",
+            ))
+        } else {
+            error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Bearer authentication required",
+            )
+        })
+    };
+    let forbidden = || {
+        Some(if pilot {
+            crate::mcp::http::fail(crate::mcp::McpError::new(
+                crate::mcp::ErrorCode::Forbidden,
+                "This credential may not be used on this route",
+            ))
+        } else {
+            error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "This credential may not be used on this route",
+            )
+        })
+    };
+
+    let headers = req.headers();
+    if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
+        return unauthorized();
+    }
+    let Some(presented) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+    else {
+        return unauthorized();
+    };
+    // Compared in constant time before any shape test, so recognizing the owner token never
+    // depends on how far it matches.
+    let owner = bool::from(presented.as_bytes().ct_eq(s.token.as_bytes()));
+    let principal = if owner {
+        Principal::Owner
+    } else if crate::mcp::http::looks_like_grant(presented) {
+        Principal::Grant(presented.to_string())
+    } else {
+        return unauthorized();
+    };
+
+    let allowed = match (&principal, crate::mcp::http::is_tool_route(&path)) {
+        (Principal::Owner, false) => true,
+        (Principal::Grant(_), true) => true,
+        // The owner bearer on a tool route, or a grant anywhere else.
+        _ => false,
+    };
+    if !allowed {
+        return forbidden();
+    }
+    req.extensions_mut().insert(principal);
+    None
+}
+
 async fn guard(State(s): State<Arc<DaemonState>>, mut req: Request, next: Next) -> Response {
     let headers = req.headers();
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
@@ -463,19 +557,13 @@ async fn guard(State(s): State<Arc<DaemonState>>, mut req: Request, next: Next) 
             "invalid_origin",
             "Origin is not allowed",
         )
-    } else if (req.uri().path() == "/api" || req.uri().path().starts_with("/api/"))
-        && (headers.get_all(header::AUTHORIZATION).iter().count() != 1
-            || !headers
-                .get(header::AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|h| h.strip_prefix("Bearer "))
-                .is_some_and(|t| bool::from(t.as_bytes().ct_eq(s.token.as_bytes()))))
-    {
-        error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Bearer authentication required",
-        )
+    } else if let Some(denial) = authenticate(&s, &mut req) {
+        denial
+    } else if crate::mcp::http::is_tool_route(req.uri().path()) {
+        // Tool routes read their own body, after their grant has been identified and its budget
+        // reserved. Buffering here would do the work first and account for it afterwards, so a
+        // stalled or oversized stream could consume the server without ever being charged.
+        next.run(req).await
     } else {
         let body = std::mem::replace(req.body_mut(), Body::empty());
         match to_bytes(body, 1024 * 1024).await {
