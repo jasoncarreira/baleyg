@@ -164,6 +164,90 @@ fn enrollment_rejects_a_boundary_for_another_state_directory() {
 }
 
 #[test]
+fn a_separately_opened_store_refuses_a_second_live_enrollment() {
+    let (state, work, store) = fixture();
+    let _first = Enrollment::enroll(state.path(), store.publication_lock()).unwrap();
+    let second_store = Store::open(state.path(), work.path()).unwrap();
+    assert!(
+        Enrollment::enroll(state.path(), second_store.publication_lock()).is_err(),
+        "a separate Store bypassed the enrollment lease"
+    );
+}
+
+#[test]
+fn dropping_enrollment_releases_the_kernel_lease_for_a_fresh_store() {
+    let (state, work, store) = fixture();
+    let first = Enrollment::enroll(state.path(), store.publication_lock()).unwrap();
+    drop(first);
+
+    let restarted_store = Store::open(state.path(), work.path()).unwrap();
+    let restarted = Enrollment::enroll(state.path(), restarted_store.publication_lock()).unwrap();
+    assert!(restarted.is_available());
+}
+
+#[test]
+fn pending_work_retains_the_enrollment_lease_after_the_facade_drops() {
+    let (state, work, store) = fixture();
+    publish(&store, Some(0));
+    let enrollment = Enrollment::enroll(state.path(), store.publication_lock()).unwrap();
+    let pending = enrollment.admit_current(soon(), |_| "pending").unwrap();
+    drop(enrollment);
+
+    let blocked_store = Store::open(state.path(), work.path()).unwrap();
+    assert!(
+        Enrollment::enroll(state.path(), blocked_store.publication_lock()).is_err(),
+        "pending work did not retain its enrollment lease"
+    );
+    drop(pending);
+
+    let restarted_store = Store::open(state.path(), work.path()).unwrap();
+    assert!(Enrollment::enroll(state.path(), restarted_store.publication_lock()).is_ok());
+}
+
+#[test]
+fn partial_initialization_cannot_replace_a_live_enrollment_inode() {
+    let (state, work, store) = fixture();
+    publish(&store, Some(0));
+    let enrollment = Enrollment::enroll(state.path(), store.publication_lock()).unwrap();
+    let pending = enrollment.admit_current(soon(), |_| "pending").unwrap();
+    drop(enrollment);
+
+    // The surviving publication lock proves prior initialization. Removing databases must not make
+    // a missing enrollment-lock peer eligible for silent recreation on a different inode.
+    for name in [
+        "cache.db",
+        "cache.db-wal",
+        "cache.db-shm",
+        "workspace.db",
+        "workspace.db-wal",
+        "workspace.db-shm",
+        "mcp-enrollment.lock",
+    ] {
+        let path = state.path().join(name);
+        if path.exists() {
+            fs::rename(&path, state.path().join(format!("old-{name}"))).unwrap();
+        }
+    }
+
+    assert!(
+        Store::open(state.path(), work.path()).is_err(),
+        "partial initialization recreated a missing coordination inode"
+    );
+    drop(pending);
+}
+
+#[test]
+fn enrollment_does_not_block_publication_from_a_separate_store() {
+    let (state, work, store) = fixture();
+    publish(&store, Some(0));
+    let enrollment = Enrollment::enroll(state.path(), store.publication_lock()).unwrap();
+    let publisher = Store::open(state.path(), work.path()).unwrap();
+
+    assert_eq!(publish(&publisher, Some(1)), 2);
+    assert_eq!(enrollment.current_revision(soon()).unwrap(), 2);
+}
+
+#[test]
 fn reads_the_published_revision_in_one_transaction() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
@@ -1257,6 +1341,76 @@ fn lock_path_mutations_fail_closed() {
 }
 
 #[test]
+fn enrollment_lock_path_mutations_fail_closed_and_latch() {
+    #[derive(Clone, Copy)]
+    enum Mutation {
+        Missing,
+        Replacement,
+        Symlink,
+        Hardlink,
+        Mode,
+    }
+    for mutation in [
+        Mutation::Missing,
+        Mutation::Replacement,
+        Mutation::Symlink,
+        Mutation::Hardlink,
+        Mutation::Mode,
+    ] {
+        let (state, _work, store) = fixture();
+        publish(&store, Some(0));
+        let enrollment = Enrollment::enroll(state.path(), store.publication_lock()).unwrap();
+        let lock = state.path().join("mcp-enrollment.lock");
+        match mutation {
+            Mutation::Missing => fs::remove_file(&lock).unwrap(),
+            Mutation::Replacement => {
+                fs::remove_file(&lock).unwrap();
+                fs::write(&lock, b"replacement").unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+            Mutation::Symlink => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::symlink;
+                    let target = state.path().join("enrollment-target.lock");
+                    fs::write(&target, b"").unwrap();
+                    fs::remove_file(&lock).unwrap();
+                    symlink(&target, &lock).unwrap();
+                }
+            }
+            Mutation::Hardlink => {
+                fs::hard_link(&lock, state.path().join("enrollment-second-link")).unwrap();
+            }
+            Mutation::Mode => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o640)).unwrap();
+                }
+            }
+        }
+
+        let error = enrollment.current_revision(soon()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::StoreUnavailable);
+        assert!(!enrollment.is_available());
+        assert!(
+            store
+                .publish(
+                    &graph(),
+                    Some(1),
+                    &(Arc::new(AtomicBool::new(false)) as CancelFlag),
+                )
+                .is_err(),
+            "Store publication accepted a mutated enrollment lock path"
+        );
+    }
+}
+
+#[test]
 fn validator_delay_past_the_original_deadline_refuses_handoff() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
@@ -1426,6 +1580,52 @@ fn known_precommit_error_reopens_publication() {
             .is_err()
     );
     assert_eq!(publish(&store, Some(1)), 2);
+}
+
+#[test]
+fn flock_enrollment_child_helper() {
+    let Ok(state) = std::env::var("BALEYG_ENROLLMENT_CHILD_STATE") else {
+        return;
+    };
+    let work = std::env::var("BALEYG_ENROLLMENT_CHILD_WORK").unwrap();
+    let completed = std::env::var("BALEYG_ENROLLMENT_CHILD_COMPLETED").unwrap();
+    let store = Store::open(std::path::Path::new(&state), std::path::Path::new(&work)).unwrap();
+    assert!(
+        Enrollment::enroll(std::path::Path::new(&state), store.publication_lock()).is_err(),
+        "child process bypassed the live enrollment lease"
+    );
+    fs::write(completed, b"excluded").unwrap();
+}
+
+#[test]
+fn a_real_child_process_cannot_repeat_live_enrollment() {
+    let (state, work, store) = fixture();
+    let _enrollment = Enrollment::enroll(state.path(), store.publication_lock()).unwrap();
+    let completed = state.path().join("enrollment-child-completed");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("mcp::enrollment_tests::flock_enrollment_child_helper")
+        .arg("--nocapture")
+        .env("BALEYG_ENROLLMENT_CHILD_STATE", state.path())
+        .env("BALEYG_ENROLLMENT_CHILD_WORK", work.path())
+        .env("BALEYG_ENROLLMENT_CHILD_COMPLETED", &completed)
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child enrollment probe did not complete");
+        }
+        thread::yield_now();
+    };
+    assert!(status.success());
+    assert!(completed.exists());
 }
 
 #[test]

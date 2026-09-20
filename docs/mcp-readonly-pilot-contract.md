@@ -105,7 +105,7 @@ call. That would turn identity loss into revision 0 and hide the failure. Those 
 a safe implementation of this MCP binding, including owner binding discovery and grant issuance. Add a dedicated read-only connection service; this is required new code, not a claim
 about today's daemon.
 
-Enroll once at daemon startup after ordinary store initialization and before granting tool access. The Store publication boundary permanently accepts only one enrollment/lifecycle; repeat construction is rejected even after invalidation or drop. Boundary, raw connection, generic snapshot/admission/preparation, lifecycle callback, and finalization APIs are crate-private. PR2 exposes only bounded typed operations and its outer Tower handoff:
+Enroll once at daemon startup after ordinary store initialization and before granting tool access. The Store publication boundary permanently accepts only one enrollment/lifecycle. A separate owner-only stable enrollment-lock inode carries an exclusive nonblocking kernel lease for the enrolled core lifetime, so separately opened Stores and processes also reject concurrent enrollment. A fresh Store may acquire that lease only after the prior enrolled core is fully dropped, as daemon-restart semantics. Boundary, raw connection, generic snapshot/admission/preparation, lifecycle callback, and finalization APIs are crate-private. PR2 exposes only bounded typed operations and its outer Tower handoff:
 
 1. Retain a no-follow directory FD for the canonical state directory and no-follow regular-file FDs
    for `cache.db` and `workspace.db`. Record their Unix device/inode identities and validate file

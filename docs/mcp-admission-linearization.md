@@ -49,13 +49,13 @@ lifecycle sequencer -> private grant mutex (try_lock) -> infallible finalizer
 
 No compliant revoke or grant mutation can land between response validation and response finalization. If revoke or an identity latch owns lifecycle first, the response fails. If response finalization owns it first, that response commits first and the observer waits. A synchronous identity observer publishes the fast negative signal immediately but cannot return until guarded latch state is reconciled and the generation has rotated exactly once. Thus there is no best-effort-check race after a finalizer. Destructive store work must latch/teardown, release lifecycle, and only then wait for exclusive publication; it must never wait for publication while holding lifecycle.
 
-## Stable publication authority
+## Stable publication and enrollment authority
 
-One Store publication boundary accepts exactly one enrollment/lifecycle for the process lifetime. A second enrollment is permanently rejected, including after invalidation or after the first enrollment is dropped. Boundary construction and access are crate-private.
+One Store publication boundary accepts exactly one enrollment/lifecycle. Its in-process one-shot claim remains permanent, including after invalidation or after the enrollment facade is dropped. A separate exclusive, nonblocking kernel lease on `mcp-enrollment.lock` prevents a separately opened Store or process from enrolling the same state concurrently. The lease remains in the enrolled core while any work from that binding exists. After that core is dropped, a fresh Store may acquire the lease as daemon-restart semantics. Boundary construction and access are crate-private.
 
-`publication.lock` is created with mode `0600` only for new state or the bounded v1/v2 migration. Current state with a missing lock fails closed. Open uses `O_NOFOLLOW`, never repairs or replaces the inode, and checks owner, mode, link count, device, and inode. State-directory, cache, and workspace identities are anchored likewise.
+`publication.lock` and `mcp-enrollment.lock` are initialized together with mode `0600` only for new state or the bounded v1/v2 migration. Current state with either lock missing fails closed. Opens use `O_NOFOLLOW`, never repair or replace an inode, and check owner, mode, link count, device, and inode. Every boundary identity sample checks both stable lock paths. State-directory, cache, and workspace identities are anchored likewise.
 
-`Store::publish` holds exclusive in-process and cross-process publication authority around its SQLite transaction. A known pre-commit failure reopens it. A successful commit reopens it only after the final identity check. An ambiguous SQLite commit quarantines the canonical path and intentionally retains the exclusive flock until process exit.
+`Store::publish` uses only `publication.lock`; the enrollment lease does not block normal publication. Publication holds exclusive in-process and cross-process authority around its SQLite transaction. A known pre-commit failure reopens it. A successful commit reopens it only after the final identity check. An ambiguous SQLite commit quarantines the canonical path and intentionally retains the publication flock until process exit.
 
 The supported model requires cooperating writers to use `Store::publish` on a local Unix filesystem. Direct SQLite writes, inode-preserving overwrite, actors that ignore `flock`, and mutation after the last metadata sample are outside the claim. The child-process test qualifies real `flock` exclusion.
 

@@ -84,8 +84,11 @@ pub(crate) struct Boundary {
     dir_id: FileId,
     lock_path: PathBuf,
     lock_id: FileId,
+    enrollment_lock_path: PathBuf,
+    enrollment_lock_id: FileId,
     _dir_anchor: File,
     _lock_anchor: File,
+    _enrollment_lock_anchor: File,
 }
 
 #[derive(Debug, Default)]
@@ -275,21 +278,21 @@ fn validate_lock_metadata(meta: &Metadata, expected: Option<FileId>) -> std::io:
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "publication lock must be an owner-only regular file with one link",
+                "coordination lock must be an owner-only regular file with one link",
             ));
         }
     }
     if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "publication lock is not a regular file",
+            "coordination lock is not a regular file",
         ));
     }
     let id = file_id(meta);
     if expected.is_some_and(|expected| expected != id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "publication lock identity changed",
+            "coordination lock identity changed",
         ));
     }
     Ok(id)
@@ -306,6 +309,26 @@ fn open_existing_lock(path: &Path, expected: Option<FileId>) -> std::io::Result<
     let file = options.open(path)?;
     let id = validate_lock_metadata(&file.metadata()?, expected)?;
     Ok((file, id))
+}
+
+fn initialize_lock(path: &Path) -> std::io::Result<()> {
+    let mut options = File::options();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            validate_lock_metadata(&file.metadata()?, None)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn legacy_state_needs_boundary(state_dir: &Path) -> bool {
@@ -354,35 +377,31 @@ impl Boundary {
         let dir_meta = dir_anchor.metadata()?;
         ensure!(dir_meta.is_dir(), "state directory must be a directory");
         let lock_path = state_dir.join("publication.lock");
+        let enrollment_lock_path = state_dir.join("mcp-enrollment.lock");
 
-        if !lock_path.exists() {
-            // A missing lock is initialized only for a genuinely new state. Existing database
-            // state without its original coordination inode fails closed.
+        let publication_exists = lock_path.exists();
+        let enrollment_exists = enrollment_lock_path.exists();
+        ensure!(
+            publication_exists == enrollment_exists,
+            "state has a partial coordination-lock initialization"
+        );
+        if !publication_exists {
+            // Both coordination inodes are initialized together only when neither path survives
+            // and the state is genuinely new or on the bounded v1/v2 migration path. A surviving
+            // peer proves prior initialization and is never used to repair a missing inode.
             let databases_absent =
                 !state_dir.join("cache.db").exists() && !state_dir.join("workspace.db").exists();
             ensure!(
                 databases_absent || legacy_state_needs_boundary(&state_dir),
-                "existing state is missing publication.lock"
+                "existing state is missing its coordination locks"
             );
-            let mut options = File::options();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-            }
-            match options.open(&lock_path) {
-                Ok(file) => {
-                    validate_lock_metadata(&file.metadata()?, None)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
+            initialize_lock(&lock_path)?;
+            initialize_lock(&enrollment_lock_path)?;
         }
 
         let (lock_anchor, lock_id) = open_existing_lock(&lock_path, None)?;
+        let (enrollment_lock_anchor, enrollment_lock_id) =
+            open_existing_lock(&enrollment_lock_path, None)?;
         let boundary = Self {
             state: Mutex::new(BoundaryState::default()),
             ready: Condvar::new(),
@@ -392,8 +411,11 @@ impl Boundary {
             dir_id: file_id(&dir_meta),
             lock_path,
             lock_id,
+            enrollment_lock_path,
+            enrollment_lock_id,
             _dir_anchor: dir_anchor,
             _lock_anchor: lock_anchor,
+            _enrollment_lock_anchor: enrollment_lock_anchor,
         };
         boundary.verify_identity()?;
         Ok(boundary)
@@ -439,20 +461,34 @@ impl Boundary {
                 "state directory identity changed",
             ));
         }
-        let lock = std::fs::symlink_metadata(&self.lock_path)?;
-        if lock.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "publication lock became a symlink",
-            ));
+        for (path, expected) in [
+            (&self.lock_path, self.lock_id),
+            (&self.enrollment_lock_path, self.enrollment_lock_id),
+        ] {
+            let lock = std::fs::symlink_metadata(path)?;
+            if lock.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "coordination lock became a symlink",
+                ));
+            }
+            validate_lock_metadata(&lock, Some(expected))?;
         }
-        validate_lock_metadata(&lock, Some(self.lock_id))?;
         Ok(())
     }
 
     fn open_lock(&self) -> std::io::Result<File> {
         self.verify_identity()?;
         let (file, _) = open_existing_lock(&self.lock_path, Some(self.lock_id))?;
+        Ok(file)
+    }
+
+    fn acquire_enrollment_lease(&self) -> std::io::Result<File> {
+        self.verify_identity()?;
+        let (file, _) =
+            open_existing_lock(&self.enrollment_lock_path, Some(self.enrollment_lock_id))?;
+        let file = lock_file(file, true, false)?;
+        self.verify_identity()?;
         Ok(file)
     }
 
@@ -901,6 +937,8 @@ struct EnrolledCore {
     _dir: File,
     _cache: File,
     _workspace: File,
+    // Keep the kernel enrollment lease while any work from this binding can still exist.
+    _enrollment_lease: File,
     conn: Mutex<Connection>,
     interrupt: Arc<rusqlite::InterruptHandle>,
     gate: Gate,
@@ -1466,10 +1504,13 @@ impl Enrollment {
         );
         publication
             .verify_identity()
-            .context("verify publication lock identity")?;
+            .context("verify coordination lock identity")?;
         // The claim is permanent for this Boundary, including after the Enrollment is dropped.
         // A daemon/store boundary has exactly one lifecycle and can never mint a bypass authority.
         publication.claim_enrollment()?;
+        let enrollment_lease = publication
+            .acquire_enrollment_lease()
+            .context("take the enrollment lease")?;
 
         let conn = Connection::open_with_flags(&cache_path, READ_ONLY_FLAGS)
             .context("open the bound cache read-only")?;
@@ -1498,6 +1539,7 @@ impl Enrollment {
             _dir: dir,
             _cache: cache,
             _workspace: workspace,
+            _enrollment_lease: enrollment_lease,
             interrupt: Arc::new(conn.get_interrupt_handle()),
             conn: Mutex::new(conn),
             gate: Gate::new(),
