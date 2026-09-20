@@ -324,3 +324,57 @@ async fn a_latched_binding_ends_the_session() {
         "expected a terminal failure, got {code}"
     );
 }
+
+#[tokio::test]
+async fn authenticated_error_responses_are_charged_to_the_lifetime_budget() {
+    let (_d, store, app) = setup();
+    publish(&store, Some(0));
+    let limits =
+        json!({"maxRequests": 50, "maxTotalResponseBytes": 1000, "maxResponseBytes": 65536});
+    let (token, _id, binding) = grant(&app, 1, limits).await;
+
+    // Malformed but authenticated: each error envelope must be charged, or lifetime ceilings can
+    // be bypassed indefinitely by sending traffic that fails before admission.
+    let mut malformed = json!({"schemaVersion": 1, "binding": binding.clone()});
+    malformed["surprise"] = json!(true);
+    let mut exhausted = false;
+    for _ in 0..12 {
+        let (code, _) = call(&app, "POST", DESCRIBE, &token, malformed.clone()).await;
+        if code == StatusCode::TOO_MANY_REQUESTS {
+            exhausted = true;
+            break;
+        }
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+    assert!(
+        exhausted,
+        "error responses were not charged to the byte budget"
+    );
+
+    // A valid request cannot proceed once the budget is spent.
+    let (code, body) = call(
+        &app,
+        "POST",
+        DESCRIBE,
+        &token,
+        json!({"schemaVersion": 1, "binding": binding}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "budget_exhausted");
+}
+
+#[tokio::test]
+async fn an_oversized_body_is_too_large_even_when_it_is_also_malformed() {
+    let (_d, store, app) = setup();
+    publish(&store, Some(0));
+    let (token, _id, binding) = grant(&app, 1, default_limits()).await;
+
+    // Size is checked before deserialization, so this is 413 rather than 400.
+    let mut malformed =
+        json!({"schemaVersion": 1, "binding": binding, "surprise": "x".repeat(40 * 1024)});
+    malformed["alsoUnknown"] = json!(true);
+    let (code, body) = call(&app, "POST", DESCRIBE, &token, malformed).await;
+    assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["error"]["code"], "body_too_large");
+}

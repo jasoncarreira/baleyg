@@ -59,23 +59,38 @@ async fn blocking_within<T: Send + 'static>(
     }
 }
 
-/// Contract error envelope. Distinct from the daemon's existing shape, and never carries SQL,
-/// token fragments, absolute state paths or source.
-pub(crate) fn fail(e: McpError) -> Response {
-    let status = StatusCode::from_u16(e.code.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut response = (
-        status,
-        Json(json!({
-            "schemaVersion": 1,
-            "error": {"code": e.code.as_str(), "message": e.message, "retryable": e.code.retryable()},
-            "requestId": uuid::Uuid::new_v4().to_string(),
-        })),
-    )
-        .into_response();
+/// Contract error envelope as a value, so its size can be charged before it is sent.
+fn error_body(e: &McpError) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "error": {"code": e.code.as_str(), "message": e.message, "retryable": e.code.retryable()},
+        "requestId": uuid::Uuid::new_v4().to_string(),
+    })
+}
+
+fn respond(status: u16, body: Value) -> Response {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response = (status, Json(body)).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
+}
+
+/// Failure on a request that could not be charged to a grant. Never carries SQL, token fragments,
+/// absolute state paths or source.
+pub(crate) fn fail(e: McpError) -> Response {
+    respond(e.code.status(), error_body(&e))
+}
+
+/// Failure on an identified request. Ordinary authenticated errors are charged to the grant that
+/// sent them: otherwise malformed traffic bypasses both lifetime ceilings entirely. Only the
+/// unidentifiable case above goes uncharged, which is the contract's fixed error allowance.
+fn charged(admission: crate::mcp::grants::Admission<'_>, e: McpError) -> Response {
+    let status = e.code.status();
+    let body = error_body(&e);
+    admission.settle(body.to_string().len() as u64);
+    respond(status, body)
 }
 
 /// Tool routes are the only ones a limited grant may reach, and the only ones the owner bearer
@@ -382,17 +397,12 @@ struct DescribeBody {
 }
 
 /// Success envelope shared by every tool.
-///
-/// Serializes, enforces this admission's response ceiling, rechecks that the grant is still live,
-/// and only then settles the actual byte cost. A response that races revocation is discarded
-/// rather than emitted.
-fn emit(
-    grants: &crate::mcp::grants::Grants,
-    admission: crate::mcp::grants::Admission<'_>,
-    basis: crate::mcp::EvidenceBasis,
-    data: serde_json::Value,
-) -> Response {
-    let body = json!({
+fn envelope(
+    basis: &crate::mcp::EvidenceBasis,
+    data: Value,
+    truncation: Option<&'static str>,
+) -> Value {
+    json!({
         "schemaVersion": 1,
         "requestId": uuid::Uuid::new_v4().to_string(),
         "evidenceBasis": {
@@ -402,49 +412,20 @@ fn emit(
         },
         "data": data,
         "warnings": [],
-        "truncated": false,
-        "truncationReason": Value::Null,
-    });
-    let encoded = body.to_string();
-    let size = encoded.len() as u64;
-    if size > admission.max_response_bytes {
-        return fail(McpError::new(
-            ErrorCode::BudgetExhausted,
-            "The response exceeds the remaining response budget",
-        ));
-    }
-    if let Err(e) = grants.still_valid(&admission.grant_id, Instant::now()) {
-        return fail(e);
-    }
-    admission.settle(size);
-    let mut response = (StatusCode::OK, Json(body)).into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    response
+        "truncated": truncation.is_some(),
+        "truncationReason": truncation.map(Value::from).unwrap_or(Value::Null),
+    })
 }
 
-/// Shared preamble for every tool route: request size, schema, principal and admission.
-fn admit<'a>(
+/// Identify the grant and reserve its budget.
+///
+/// Runs before the body is parsed, so size, schema, binding and semantic failures are all charged.
+/// The binding is checked separately once the body is available.
+fn identify<'a>(
     s: &'a Arc<DaemonState>,
     principal: &crate::http::Principal,
-    body: &str,
-    binding: &BindingBody,
-    schema_version: u32,
     capability: Capability,
 ) -> Result<crate::mcp::grants::Admission<'a>, McpError> {
-    if body.len() > MAX_TOOL_REQUEST_BYTES {
-        return Err(McpError::new(
-            ErrorCode::BodyTooLarge,
-            "The tool request exceeds the permitted size",
-        ));
-    }
-    if schema_version != 1 {
-        return Err(McpError::new(
-            ErrorCode::InvalidRequest,
-            "Unsupported schema version",
-        ));
-    }
     // The guard admits only grants on this prefix; treat anything else as a programming error
     // rather than silently accepting it.
     let Some(token) = principal.grant_token() else {
@@ -453,12 +434,44 @@ fn admit<'a>(
             "This credential may not be used on this route",
         ));
     };
-    let presented = crate::mcp::grants::Binding {
+    s.grants.admit(token, capability, Instant::now())
+}
+
+/// Shared request preamble after identification: size, schema and binding, each charged.
+fn accept<T: serde::de::DeserializeOwned>(
+    admission: &crate::mcp::grants::Admission<'_>,
+    body: &str,
+    schema_version: impl FnOnce(&T) -> u32,
+    binding: impl FnOnce(&T) -> crate::mcp::grants::Binding,
+) -> Result<T, McpError> {
+    // Checked before deserialization so an oversized body is too large rather than malformed.
+    if body.len() > MAX_TOOL_REQUEST_BYTES {
+        return Err(McpError::new(
+            ErrorCode::BodyTooLarge,
+            "The tool request exceeds the permitted size",
+        ));
+    }
+    let parsed: T = serde_json::from_str(body).map_err(|_| {
+        McpError::new(
+            ErrorCode::InvalidRequest,
+            "The request is malformed or carries unknown fields",
+        )
+    })?;
+    if schema_version(&parsed) != 1 {
+        return Err(McpError::new(
+            ErrorCode::InvalidRequest,
+            "Unsupported schema version",
+        ));
+    }
+    admission.check_binding(&binding(&parsed))?;
+    Ok(parsed)
+}
+
+fn to_binding(binding: &BindingBody) -> crate::mcp::grants::Binding {
+    crate::mcp::grants::Binding {
         daemon_instance_id: binding.daemon_instance_id.clone(),
         store_generation: binding.store_generation.clone(),
-    };
-    s.grants
-        .admit(token, &presented, capability, Instant::now())
+    }
 }
 
 /// Bootstraps a session: reports the admitted binding, the current and admitted revisions, and
@@ -469,76 +482,94 @@ async fn describe(
     axum::Extension(principal): axum::Extension<crate::http::Principal>,
     body: String,
 ) -> Response {
-    let parsed: DescribeBody = match serde_json::from_str(&body) {
-        Ok(parsed) => parsed,
-        Err(_) => {
-            return fail(McpError::new(
-                ErrorCode::InvalidRequest,
-                "The request is malformed or carries unknown fields",
-            ));
-        }
-    };
-    let admission = match admit(
-        &s,
-        &principal,
-        &body,
-        &parsed.binding,
-        parsed.schema_version,
-        Capability::WorkspaceDescribe,
-    ) {
+    let at = deadline();
+    let admission = match identify(&s, &principal, Capability::WorkspaceDescribe) {
         Ok(admission) => admission,
         Err(e) => return fail(e),
     };
-
+    if let Err(e) = accept::<DescribeBody>(
+        &admission,
+        &body,
+        |b| b.schema_version,
+        |b| to_binding(&b.binding),
+    ) {
+        return charged(admission, e);
+    }
     let Some(enrollment) = s.enrollment.clone() else {
-        return fail(unavailable());
+        return charged(admission, unavailable());
     };
-    let revision = match tokio::task::spawn_blocking(move || {
-        enrollment
-            .current_revision(deadline())
-            .map(|revision| (enrollment.basis(revision), revision))
-    })
-    .await
-    {
-        Ok(Ok(value)) => value,
-        Ok(Err(e)) => return fail(e),
-        Err(_) => return fail(unavailable()),
-    };
-    let (basis, current) = revision;
 
-    let Some(summary) = s.grants.summary(&admission.grant_id) else {
-        return fail(McpError::new(
-            ErrorCode::Unauthorized,
-            "The grant is not usable",
-        ));
-    };
-    // A stale admitted revision is reported honestly rather than failing: describe still bootstraps
-    // a session, it just cannot back an evidence read until the owner reissues.
-    let readable = current > 0 && current == summary.admitted_revision;
+    let grant_id = admission.grant_id.clone();
+    let max_bytes = admission.max_response_bytes;
     let label = std::path::Path::new(s.store_workspace_root())
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let data = json!({
-        "workspaceLabel": label,
-        "binding": {
-            "daemonInstanceId": basis.daemon_instance_id.clone(),
-            "storeGeneration": basis.store_generation.clone(),
-        },
-        "indexRevision": current,
-        "admittedRevision": summary.admitted_revision,
-        "evidenceReadable": readable,
-        "toolSchemaVersion": 1,
-        "serverVersion": env!("CARGO_PKG_VERSION"),
-        "capabilities": summary.capabilities.iter().map(|c| c.wire()).collect::<Vec<_>>(),
-        "effectiveLimits": LimitsBody {
-            max_requests: summary.limits.max_requests,
-            max_total_response_bytes: summary.limits.max_total_response_bytes,
-            max_response_bytes: summary.limits.max_response_bytes,
-        },
-        "expiresAt": summary.expires_at_unix,
-    });
-    emit(&s.grants, admission, basis, data)
+    let state = s.clone();
+    // The whole response is built inside the admission the store identity is checked in, so a
+    // describe pending when another request observes invalidation cannot still report readable
+    // evidence.
+    let outcome = blocking_within(at, move || {
+        enrollment.admit_current(|revision| {
+            state.grants.still_valid(&grant_id, Instant::now())?;
+            let Some(summary) = state.grants.summary(&grant_id) else {
+                return Err(McpError::new(
+                    ErrorCode::Unauthorized,
+                    "The grant is not usable",
+                ));
+            };
+            // A stale admitted revision is reported honestly rather than failing: describe still
+            // bootstraps a session, it just cannot back an evidence read until the owner reissues.
+            let readable = revision > 0 && revision == summary.admitted_revision;
+            let basis = enrollment.basis(revision);
+            let data = json!({
+                "workspaceLabel": label,
+                "binding": {
+                    "daemonInstanceId": basis.daemon_instance_id.clone(),
+                    "storeGeneration": basis.store_generation.clone(),
+                },
+                "indexRevision": revision,
+                "admittedRevision": summary.admitted_revision,
+                "evidenceReadable": readable,
+                "toolSchemaVersion": 1,
+                "serverVersion": env!("CARGO_PKG_VERSION"),
+                "capabilities": summary.capabilities.iter().map(|c| c.wire()).collect::<Vec<_>>(),
+                "effectiveLimits": LimitsBody {
+                    max_requests: summary.limits.max_requests,
+                    max_total_response_bytes: summary.limits.max_total_response_bytes,
+                    max_response_bytes: summary.limits.max_response_bytes,
+                },
+                "expiresAt": summary.expires_at_unix,
+            });
+            let encoded = envelope(&basis, data, None).to_string();
+            let size = encoded.len() as u64;
+            if size > max_bytes {
+                return Err(McpError::new(
+                    ErrorCode::BudgetExhausted,
+                    "The response exceeds the remaining response budget",
+                ));
+            }
+            Ok((encoded, size))
+        })?
+    })
+    .await;
+
+    match outcome {
+        Ok((encoded, size)) => {
+            admission.settle(size);
+            let mut response = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                encoded,
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+            response
+        }
+        Err(e) => charged(admission, e),
+    }
 }
 
 /// Unknown tool names under the tool prefix are denied in the contract envelope rather than
