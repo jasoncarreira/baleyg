@@ -100,6 +100,7 @@ excluded; local archives and runtime state must not be committed.
 - [Architecture and accepted direction](SPEC.md)
 - [MCP-first direct/ACP agent integration plan](docs/agent-integration-plan.md)
 - [Single-workspace read-only MCP pilot and scoped grants](docs/mcp-readonly-pilot-contract.md)
+- [Pilot implementation slices and authorization boundary](docs/mcp-pilot-implementation-plan.md)
 - [Unified terminal and ACP workbench design](docs/terminal-workbench-contract.md)
 - [Multi-language SCIP semantic import roadmap](docs/scip-multilanguage-plan.md)
 - [Optional LSP bridge: Java-first assessment](docs/lsp-integration-plan.md)
