@@ -1,0 +1,83 @@
+{
+  "status": "smoke-complete; full benchmark pending human rubric/input-coverage review",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "questionId": "q01-smoke",
+  "candidateCount": 35,
+  "versions": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@agentclientprotocol/claude-agent-acp": "0.79.0",
+    "@modelcontextprotocol/sdk": "1.30.0"
+  },
+  "baseline": {
+    "labels": {
+      "essential": 2,
+      "supporting": 4,
+      "incidental": 29
+    }
+  },
+  "jev": {
+    "model": "jev-1.13.0",
+    "latencyMs": 879.969291,
+    "usage": {
+      "input_tokens": 32626,
+      "output_tokens": 1854
+    },
+    "estimatedUsd": 0.0013702920000000002,
+    "labels": {
+      "essential": 2,
+      "incidental": 33
+    }
+  },
+  "claudeAcp": {
+    "requestedModel": "opus[1m]",
+    "negotiatedModel": "opus[1m]",
+    "latencyMs": 28950,
+    "usage": {
+      "inputTokens": 8,
+      "outputTokens": 2173,
+      "cachedReadTokens": 257280,
+      "cachedWriteTokens": 134791,
+      "totalTokens": 394252
+    },
+    "reportedTokenEquivalentUsd": 1.532102,
+    "labels": {
+      "essential": 2,
+      "supporting": 4,
+      "incidental": 29
+    },
+    "stopReason": "end_turn",
+    "permissionsDenied": 0
+  },
+  "failedAttempt": {
+    "artifact": "outputs/q01-smoke.claude.json",
+    "reportedTokenEquivalentUsd": 0.523703,
+    "validView": false,
+    "reservationStillHeldUsd": 2
+  },
+  "allApproachesShowSameTwoNodes": true,
+  "baselineAndOpusLabelsIdentical": true,
+  "cost": {
+    "totalObservedEstimatesIncludingFailedAttemptUsd": 2.057175292,
+    "ledgerHeldUsd": 3.632102,
+    "authorizedExperimentCapUsd": 10,
+    "invoiceVerified": false,
+    "note": "Jev rate-card estimate plus Claude token-equivalent estimates; subscription cash charges are unknown."
+  },
+  "validation": {
+    "offlineTestsPassed": 20,
+    "browserDesktopWidth": 1440,
+    "browserMobileWidth": 390,
+    "mobileHorizontalOverflow": false,
+    "providerMetadataInBlindHtml": false,
+    "serverBlindKeyRoute": 404,
+    "serverEnvRoute": 404,
+    "generatedFilesContainKnownJevKey": false
+  },
+  "limitations": [
+    "Only one easy question, no winner or calibration claim",
+    "Fixed candidate packet, not unrestricted agent exploration",
+    "Long source excerpts and 48-candidate cap affect harder questions; fix input coverage before full benchmark",
+    "ACP usage reports 394252 aggregate cache-inclusive tokens and a final context near135k; investigate overhead before scaling",
+    "Reported latency includes startup/protocol/multiple-turn overhead; not isolated model compute"
+  ]
+}

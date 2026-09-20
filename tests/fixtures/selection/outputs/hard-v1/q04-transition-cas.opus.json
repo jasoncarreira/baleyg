@@ -1,0 +1,317 @@
+{
+  "schemaVersion": 1,
+  "provider": "claude-acp",
+  "reservationId": "36ae280d-8f74-4d1d-92ca-bc8da5b45b38",
+  "packetHash": "ab97746f75547d63c2e1ca0642cb64a4c88c70ddf54c427aea509883baabc81e",
+  "providerPacketHash": "75cae5238c322ea99bfeadf91d57f24979ffb4d62f79c2fd436af7753d8bc64d",
+  "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "questionId": "q04-transition-cas",
+  "requestedModel": "opus[1m]",
+  "packetBytes": 178621,
+  "providerPacketBytes": 90896,
+  "limits": {
+    "reserveUsd": 2.95,
+    "maxBudgetUsd": 2.5,
+    "maxTurns": 4,
+    "maxOutputTokens": 4096,
+    "timeoutMs": 120000
+  },
+  "costNote": "Provider-reported token-equivalent USD estimate, not actual subscription cash charge; unknown/failed cost retains the full reservation. Not an invoice guarantee.",
+  "negotiated": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "@agentclientprotocol/claude-agent-acp",
+      "title": "Claude Agent",
+      "version": "0.79.0"
+    },
+    "agentCapabilities": {
+      "_meta": {
+        "claudeCode": {
+          "promptQueueing": true
+        },
+        "authStatus": {}
+      },
+      "promptCapabilities": {
+        "image": true,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "auth": {
+        "logout": {}
+      },
+      "providers": {},
+      "loadSession": true,
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "list": {},
+        "resume": {},
+        "subagents": {}
+      }
+    }
+  },
+  "models": null,
+  "configOptions": [
+    {
+      "id": "mode",
+      "name": "Mode",
+      "description": "Session permission mode",
+      "category": "mode",
+      "type": "select",
+      "currentValue": "default",
+      "options": [
+        {
+          "value": "default",
+          "name": "Manual",
+          "description": "Always ask before making changes",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "acceptEdits",
+          "name": "Accept edits",
+          "description": "Automatically accept all file edits",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "plan",
+          "name": "Plan",
+          "description": "Create a plan before making changes",
+          "_meta": {
+            "kind": "plan"
+          }
+        },
+        {
+          "value": "auto",
+          "name": "Auto",
+          "description": "Claude handles permission decisions",
+          "_meta": {
+            "kind": "auto_review"
+          }
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "name": "Model",
+      "description": "AI model to use",
+      "category": "model",
+      "type": "select",
+      "currentValue": "opus[1m]",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default (recommended)",
+          "description": "Opus (1M context)"
+        },
+        {
+          "value": "opus[1m]",
+          "name": "Opus 5",
+          "description": "Opus 5 with 1M context · Best for everyday, complex tasks"
+        },
+        {
+          "value": "claude-fable-5-1[1m]",
+          "name": "Fable 5.1",
+          "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks"
+        },
+        {
+          "value": "sonnet",
+          "name": "Sonnet 5",
+          "description": "Sonnet 5 · Efficient for routine tasks"
+        },
+        {
+          "value": "haiku",
+          "name": "Haiku 4.5",
+          "description": "Haiku 4.5 · Fastest for quick answers"
+        }
+      ]
+    },
+    {
+      "id": "effort",
+      "name": "Effort",
+      "description": "Available effort levels for this model",
+      "category": "thought_level",
+      "type": "select",
+      "currentValue": "low",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default"
+        },
+        {
+          "value": "low",
+          "name": "Low"
+        },
+        {
+          "value": "medium",
+          "name": "Medium"
+        },
+        {
+          "value": "high",
+          "name": "High"
+        },
+        {
+          "value": "xhigh",
+          "name": "Xhigh"
+        },
+        {
+          "value": "max",
+          "name": "Max"
+        }
+      ]
+    },
+    {
+      "id": "fast",
+      "name": "Fast mode",
+      "description": "Faster responses on supported models",
+      "category": "model_config",
+      "type": "select",
+      "currentValue": "off",
+      "options": [
+        {
+          "value": "on",
+          "name": "On"
+        },
+        {
+          "value": "off",
+          "name": "Off"
+        }
+      ]
+    }
+  ],
+  "currentModelId": "opus[1m]",
+  "status": "failed",
+  "errorEvidence": {
+    "category": "prompt_failed",
+    "code": -32603,
+    "stage": "prompt"
+  },
+  "error": "ACP smoke failed during prompt; see redacted local diagnostics. No retry was attempted.",
+  "phaseTimingsMs": {
+    "launch": 6,
+    "initialize": 291,
+    "session": 335,
+    "model_selection": 6,
+    "prompt": 38111,
+    "cleanup": 307
+  },
+  "toolCallAudit": {
+    "count": 41,
+    "names": [
+      "mcp__selection__get_candidates",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate",
+      "mcp__selection__get_candidate"
+    ]
+  },
+  "latencyMs": 39057,
+  "permissionsDenied": 0,
+  "permissionAudit": [],
+  "auth": {
+    "kind": "account",
+    "plan": "team"
+  },
+  "usageUpdates": [
+    {
+      "used": 5123,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 5130,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 119247,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 120620,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 126778,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 127526,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 127526,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 130336,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 131322,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 131322,
+      "size": 1000000,
+      "cost": {
+        "amount": 1.5089519999999998,
+        "currency": "USD"
+      }
+    }
+  ],
+  "reportedEstimatedUsd": 1.5089519999999998,
+  "settledUsd": null
+}

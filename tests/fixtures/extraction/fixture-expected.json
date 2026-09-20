@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "file_base": "fixture",
+  "count_semantics": "Static syntactic callsites, not runtime invocations. Counts aggregate by file, enclosing named caller, and textual callee.",
+  "assertions": [
+    {
+      "file": "flow.js",
+      "caller": "direct",
+      "callee": "transform",
+      "expected_count": 1,
+      "kind": "call",
+      "resolved_target": "helpers.js#transform"
+    },
+    {
+      "file": "flow.js",
+      "caller": "callbackReference",
+      "callee": "register",
+      "expected_count": 1,
+      "kind": "call",
+      "resolved_target": "helpers.js#register"
+    },
+    {
+      "file": "flow.js",
+      "caller": "callbackReference",
+      "callee": "transform",
+      "expected_count": 0,
+      "kind": "non_call_reference",
+      "expected_reference_count": 1,
+      "resolved_target": "helpers.js#transform"
+    },
+    {
+      "file": "flow.js",
+      "caller": "repeated",
+      "callee": "transform",
+      "expected_count": 2,
+      "kind": "call",
+      "resolved_target": "helpers.js#transform"
+    },
+    {
+      "file": "flow.js",
+      "caller": "branchLoop",
+      "callee": "transform",
+      "expected_count": 3,
+      "kind": "call",
+      "resolved_target": "helpers.js#transform"
+    },
+    {
+      "file": "flow.js",
+      "caller": "branchLoop",
+      "callee": "recover",
+      "expected_count": 1,
+      "kind": "call",
+      "resolved_target": "helpers.js#recover"
+    },
+    {
+      "file": "flow.js",
+      "caller": "guarded",
+      "callee": "transform",
+      "expected_count": 1,
+      "kind": "call",
+      "resolved_target": "helpers.js#transform"
+    },
+    {
+      "file": "flow.js",
+      "caller": "guarded",
+      "callee": "recover",
+      "expected_count": 1,
+      "kind": "call",
+      "resolved_target": "helpers.js#recover"
+    },
+    {
+      "file": "dynamic.js",
+      "caller": "recursive",
+      "callee": "recursive",
+      "expected_count": 1,
+      "kind": "call",
+      "resolved_target": "dynamic.js#recursive"
+    },
+    {
+      "file": "dynamic.js",
+      "caller": "injected",
+      "callee": "callback",
+      "expected_count": 1,
+      "kind": "call",
+      "resolved_target": null,
+      "resolution_note": "Parameter symbol may resolve; runtime callable target is unknown."
+    }
+  ],
+  "expected_total_callsites": 12,
+  "expected_callsites_by_caller": {
+    "helpers.js#transform": 0,
+    "helpers.js#register": 0,
+    "helpers.js#recover": 0,
+    "flow.js#direct": 1,
+    "flow.js#callbackReference": 1,
+    "flow.js#repeated": 2,
+    "flow.js#branchLoop": 4,
+    "flow.js#guarded": 2,
+    "dynamic.js#recursive": 1,
+    "dynamic.js#injected": 1
+  }
+}

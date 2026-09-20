@@ -1,0 +1,29 @@
+{
+  "status": "sanitized historical summary; not a new validation run",
+  "evidenceNote": "Private-workspace trial, browser, preservation and deployment details are omitted. Historical Baleyg development checks below are copied from the original report, not rerun or independently reverified during publication cleanup. No synthetic example is presented as an observed run.",
+  "scope": "frontend presentation only; no reindex or native changes",
+  "historicalDevelopmentChecks": {
+    "rust": {
+      "passed": 334,
+      "ignored": 1,
+      "failed": 0,
+      "note": "Native code unchanged. Final frontend fixes validated by Node tests, rebuild and live asset/browser checks."
+    },
+    "ui": {
+      "passed": 216,
+      "failed": 0
+    },
+    "clippy": "passed -D warnings",
+    "fmt": "passed",
+    "build": "passed",
+    "remoteCI": "not run",
+    "review": "independent review passed; pagination, focus and directional routing regressions covered"
+  },
+  "limitations": [
+    "Java/Python class links remain syntax candidates, not resolved types.",
+    "Related chooser operates on the bounded returned neighborhood.",
+    "API keeps existing 24-node,64-edge,12-expansion and byte bounds.",
+    "Compact sequence guards remain conditional; unknown behavior is not silently removed.",
+    "ACP exploration and multi-project support are not enabled by this UI update."
+  ]
+}

@@ -1,0 +1,823 @@
+[
+  {
+    "id": "q01-smoke",
+    "question": "Which function does writeProtectedJsonAtomic directly delegate to, and how does it prepare the data?",
+    "seed": {
+      "path": "core/atomic-write.js",
+      "name": "writeProtectedJsonAtomic"
+    },
+    "candidate_paths": [
+      "core/atomic-write.js",
+      "core/write-core.js",
+      "core/run-lock.js"
+    ],
+    "must_show": [
+      {
+        "fact": "Direct lexical call: writeProtectedJsonAtomic returns writeProtectedFileAtomic with rootDir, relativePath, JSON.stringify(value, null, 2) plus a newline, and options.",
+        "evidence": [
+          {
+            "path": "core/atomic-write.js",
+            "startLine": 18,
+            "endLine": 20
+          }
+        ],
+        "symbol_names": [
+          "writeProtectedJsonAtomic",
+          "writeProtectedFileAtomic"
+        ]
+      }
+    ],
+    "distractors": [
+      "coordinateRunJsonTransition: higher-level state coordination, not the wrapper callee.",
+      "withRunJsonLock: lock acquisition is not performed by this wrapper."
+    ],
+    "limitations": [
+      "Showing the direct edge is necessary; serialization details need a source-backed label or excerpt.",
+      "This wrapper does not prove publication success or runtime execution."
+    ]
+  },
+  {
+    "id": "q02-atomic-branches",
+    "question": "How does protected file publication differ between create-only and replacement writes, including the beforeCommit hook?",
+    "seed": {
+      "path": "core/atomic-write.js",
+      "name": "writeProtectedFileAtomic"
+    },
+    "candidate_paths": [
+      "core/atomic-write.js",
+      "core/write-core.js",
+      "core/run-lock.js"
+    ],
+    "must_show": [
+      {
+        "fact": "writeProtectedFileAtomic resolves the path and checks the target before opening an exclusive temporary file, writing it, and syncing it.",
+        "evidence": [
+          {
+            "path": "core/atomic-write.js",
+            "startLine": 22,
+            "endLine": 43
+          }
+        ],
+        "symbol_names": [
+          "writeProtectedFileAtomic",
+          "resolveProtectedPath",
+          "assertSafeTarget"
+        ]
+      },
+      {
+        "fact": "Branch/source evidence: create-only rechecks absence, invokes an optional beforeCommit callback, then publishes by link; replacement invokes that callback, rechecks target safety, then calls rename.",
+        "evidence": [
+          {
+            "path": "core/atomic-write.js",
+            "startLine": 45,
+            "endLine": 66
+          }
+        ],
+        "symbol_names": [
+          "writeProtectedFileAtomic",
+          "assertSafeTarget"
+        ]
+      },
+      {
+        "fact": "Target safety rejects an existing create-only target or a non-file replacement target; ENOENT is permitted.",
+        "evidence": [
+          {
+            "path": "core/atomic-write.js",
+            "startLine": 106,
+            "endLine": 117
+          }
+        ],
+        "symbol_names": [
+          "assertSafeTarget"
+        ]
+      },
+      {
+        "fact": "After publication, the function calls syncDirectory; selected directory-sync errors are tolerated.",
+        "evidence": [
+          {
+            "path": "core/atomic-write.js",
+            "startLine": 85,
+            "endLine": 86
+          }
+        ],
+        "symbol_names": [
+          "writeProtectedFileAtomic",
+          "syncDirectory"
+        ]
+      },
+      {
+        "fact": "syncDirectory tolerates EINVAL, EPERM, EISDIR, EACCES and ENOTSUP, rather than promising universal directory fsync.",
+        "evidence": [
+          {
+            "path": "core/atomic-write.js",
+            "startLine": 119,
+            "endLine": 129
+          }
+        ],
+        "symbol_names": [
+          "syncDirectory"
+        ]
+      }
+    ],
+    "distractors": [
+      "releaseOwnedRunJsonLock: lock cleanup is not temporary publication cleanup."
+    ],
+    "limitations": [
+      "link and rename can be injected via options.fsOps; do not always label them native filesystem calls.",
+      "beforeCommit is an optional awaited callback, not a resolved direct edge to a named project function.",
+      "A call graph alone cannot prove race freedom or power-loss durability."
+    ]
+  },
+  {
+    "id": "q03-lock-reclaim",
+    "question": "Which checks allow withRunJsonLock to attempt reclaiming an existing lock, and where is the protected callback invoked?",
+    "seed": {
+      "path": "core/run-lock.js",
+      "name": "withRunJsonLock"
+    },
+    "candidate_paths": [
+      "core/run-lock.js",
+      "core/write-core.js",
+      "state/session-lock.js"
+    ],
+    "must_show": [
+      {
+        "fact": "When mkdir reports EEXIST, the acquisition loop reads directory identity and owner evidence; it attempts stealByRename for a stealable owner or a reclaimable ownerless lock.",
+        "evidence": [
+          {
+            "path": "core/run-lock.js",
+            "startLine": 36,
+            "endLine": 56
+          }
+        ],
+        "symbol_names": [
+          "withRunJsonLock",
+          "lockDirectoryIdentity",
+          "readLockOwnerEvidence",
+          "canStealRunJsonLock",
+          "ownerlessLockIsReclaimable",
+          "stealByRename"
+        ]
+      },
+      {
+        "fact": "canStealRunJsonLock requires a durable owner whose inspected liveness is dead.",
+        "evidence": [
+          {
+            "path": "core/run-lock.js",
+            "startLine": 79,
+            "endLine": 81
+          }
+        ],
+        "symbol_names": [
+          "canStealRunJsonLock",
+          "isDurableLockOwner",
+          "inspectLockOwnerLiveness"
+        ]
+      },
+      {
+        "fact": "Liveness is a same-host acquired_at TTL comparison, not an OS process-liveness probe; foreign hosts and invalid owners are indeterminate.",
+        "evidence": [
+          {
+            "path": "core/run-lock.js",
+            "startLine": 174,
+            "endLine": 185
+          }
+        ],
+        "symbol_names": [
+          "inspectLockOwnerLiveness"
+        ]
+      },
+      {
+        "fact": "Ownerless reclaim requires no owner entry and a directory age exceeding the grace period.",
+        "evidence": [
+          {
+            "path": "core/run-lock.js",
+            "startLine": 251,
+            "endLine": 260
+          }
+        ],
+        "symbol_names": [
+          "ownerlessLockIsReclaimable",
+          "lockOwnerEntryExists"
+        ]
+      },
+      {
+        "fact": "The owner is published and checked before awaiting fn; the finally block releases a published owner or conditionally cleans up an unpublished lock.",
+        "evidence": [
+          {
+            "path": "core/run-lock.js",
+            "startLine": 61,
+            "endLine": 76
+          }
+        ],
+        "symbol_names": [
+          "withRunJsonLock",
+          "releaseOwnedRunJsonLock",
+          "quarantineAndRemoveOwnedLock"
+        ]
+      }
+    ],
+    "distractors": [
+      "state/session-lock.js: a separate lock domain; do not substitute its policy for run-json.lock."
+    ],
+    "limitations": [
+      "fn is an injected async-capable callback; lexical graph edges do not resolve its runtime identity.",
+      "TTL policy is source guard evidence, not proof that a process is actually dead."
+    ]
+  },
+  {
+    "id": "q04-transition-cas",
+    "question": "How does transition reach the protected write, and where are the two unchanged-state checks relative to reobservation and final rename?",
+    "seed": {
+      "path": "state/transition.js",
+      "name": "transition"
+    },
+    "candidate_paths": [
+      "state/transition.js",
+      "core/write-core.js",
+      "core/atomic-write.js",
+      "core/run-lock.js",
+      "core/contracts.js"
+    ],
+    "must_show": [
+      {
+        "fact": "transition builds a frozen descriptor and directly calls coordinateRunJsonTransition with contracts, validateRun, reobservers, hooks and finalGuard.",
+        "evidence": [
+          {
+            "path": "state/transition.js",
+            "startLine": 13,
+            "endLine": 25
+          }
+        ],
+        "symbol_names": [
+          "transition",
+          "coordinateRunJsonTransition"
+        ]
+      },
+      {
+        "fact": "The coordinator calls withRunJsonLock with an async callback. Reading, applying, validating and writeProtectedJsonAtomic occur inside that callback, not as direct lexical coordinator calls.",
+        "evidence": [
+          {
+            "path": "core/write-core.js",
+            "startLine": 23,
+            "endLine": 47
+          }
+        ],
+        "symbol_names": [
+          "coordinateRunJsonTransition",
+          "withRunJsonLock",
+          "<callback@23:34>",
+          "readRunState",
+          "writeProtectedJsonAtomic"
+        ]
+      },
+      {
+        "fact": "The injected fsOps.rename async function reads and checks unchanged state before contract.reobserve, then reads and checks again after reobservation.",
+        "evidence": [
+          {
+            "path": "core/write-core.js",
+            "startLine": 47,
+            "endLine": 72
+          }
+        ],
+        "symbol_names": [
+          "rename",
+          "readRunState",
+          "assertUnchanged",
+          "projectAll"
+        ]
+      },
+      {
+        "fact": "The optional finalGuard runs after the second comparison, rejects a thenable return, and is followed by the imported filesystem rename call.",
+        "evidence": [
+          {
+            "path": "core/write-core.js",
+            "startLine": 71,
+            "endLine": 77
+          }
+        ],
+        "symbol_names": [
+          "rename"
+        ]
+      },
+      {
+        "fact": "assertUnchanged rejects states that are not deeply strictly equal.",
+        "evidence": [
+          {
+            "path": "core/write-core.js",
+            "startLine": 85,
+            "endLine": 89
+          }
+        ],
+        "symbol_names": [
+          "assertUnchanged"
+        ]
+      },
+      {
+        "fact": "writeProtectedFileAtomic takes options.fsOps.rename and invokes that chosen function in the replacement branch.",
+        "evidence": [
+          {
+            "path": "core/atomic-write.js",
+            "startLine": 25,
+            "endLine": 28
+          }
+        ],
+        "symbol_names": [
+          "writeProtectedFileAtomic"
+        ]
+      },
+      {
+        "fact": "Replacement publication calls the selected rename after the optional hook and target check.",
+        "evidence": [
+          {
+            "path": "core/atomic-write.js",
+            "startLine": 61,
+            "endLine": 65
+          }
+        ],
+        "symbol_names": [
+          "writeProtectedFileAtomic",
+          "assertSafeTarget"
+        ]
+      }
+    ],
+    "distractors": [
+      "configure in core/effective-push.js: Git configuration is unrelated to run.json CAS."
+    ],
+    "limitations": [
+      "The graph has no points-to analysis: injected rename and contract methods may remain unresolved. Show callback ownership instead of inventing direct coordinator edges.",
+      "Source order in the rename callback is not global execution-order proof or a formal atomic CAS guarantee."
+    ]
+  },
+  {
+    "id": "q05-push-target",
+    "question": "How do bootstrap and check differ when enforcing the effective push target, and why are targets compared as bytes?",
+    "seed": {
+      "path": "core/effective-push.js",
+      "name": "enforceEffectivePushTarget"
+    },
+    "candidate_paths": [
+      "core/effective-push.js",
+      "bin/factory.js",
+      "core/executable.js"
+    ],
+    "must_show": [
+      {
+        "fact": "Both operations capture the operator target. Only bootstrap checks argvSafe, configures the sandbox, and recaptures the operator target; both capture the sandbox and require byte equality.",
+        "evidence": [
+          {
+            "path": "core/effective-push.js",
+            "startLine": 59,
+            "endLine": 87
+          }
+        ],
+        "symbol_names": [
+          "enforceEffectivePushTarget",
+          "capture",
+          "argvSafe",
+          "configure"
+        ]
+      },
+      {
+        "fact": "capture uses remote get-url --push origin, rejects failed results, and removes exactly one required LF before returning nonempty bytes.",
+        "evidence": [
+          {
+            "path": "core/effective-push.js",
+            "startLine": 23,
+            "endLine": 41
+          }
+        ],
+        "symbol_names": [
+          "capture",
+          "execute"
+        ]
+      },
+      {
+        "fact": "argvSafe checks a UTF-8 round trip, while configure calls execute with config --replace-all remote.origin.pushurl.",
+        "evidence": [
+          {
+            "path": "core/effective-push.js",
+            "startLine": 47,
+            "endLine": 56
+          }
+        ],
+        "symbol_names": [
+          "argvSafe",
+          "configure",
+          "execute"
+        ]
+      },
+      {
+        "fact": "execute invokes the injected run function with git, shell:false, C locale and piped output; no encoding is supplied.",
+        "evidence": [
+          {
+            "path": "core/effective-push.js",
+            "startLine": 11,
+            "endLine": 20
+          }
+        ],
+        "symbol_names": [
+          "execute"
+        ]
+      }
+    ],
+    "distractors": [
+      "resolveSpawnExecutable: executable lookup is not effective remote comparison."
+    ],
+    "limitations": [
+      "run defaults to spawnSync but is injectable; do not treat every indirect run call as a resolved edge.",
+      "No git push is executed here; equality checking is not evidence that a push occurred."
+    ]
+  },
+  {
+    "id": "q06-review-binding",
+    "question": "How do assertReviewBinding and readValidatorReview differ in checking verdicts while binding reviews to an observed commit?",
+    "seed": {
+      "path": "observe/review.js",
+      "name": "assertReviewBinding"
+    },
+    "candidate_paths": [
+      "observe/review.js",
+      "state/schema.js",
+      "observe/index.js"
+    ],
+    "must_show": [
+      {
+        "fact": "assertReviewBinding optionally checks subject and attempt, calls isApproving, requires a SHA-shaped observed head and equality with reviewed_commit.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 68,
+            "endLine": 87
+          }
+        ],
+        "symbol_names": [
+          "assertReviewBinding",
+          "isApproving"
+        ]
+      },
+      {
+        "fact": "isApproving checks the uppercased string against APPROVING_VERDICTS.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 61,
+            "endLine": 63
+          }
+        ],
+        "symbol_names": [
+          "isApproving"
+        ]
+      },
+      {
+        "fact": "readValidatorReview calls reviewRef and readReview, checks the implementation-validator subject and VALIDATOR_VERDICTS membership, then observed head shape and equality. It does not call assertReviewBinding.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 100,
+            "endLine": 115
+          }
+        ],
+        "symbol_names": [
+          "readValidatorReview",
+          "reviewRef",
+          "readReview"
+        ]
+      }
+    ],
+    "distractors": [
+      "observeMergeProof: merge-content verification is separate from review-record binding."
+    ],
+    "limitations": [
+      "Accepted verdict constants are data references, not function-call edges.",
+      "These guards do not independently observe Git HEAD; they check the supplied observedHead."
+    ]
+  },
+  {
+    "id": "q07-merge-proof",
+    "question": "Which observations and comparisons does observeMergeProof use to accept a two-parent merge without requiring whole-tree equality?",
+    "seed": {
+      "path": "observe/review.js",
+      "name": "observeMergeProof"
+    },
+    "candidate_paths": [
+      "observe/review.js",
+      "observe/index.js",
+      "state/transition.js"
+    ],
+    "must_show": [
+      {
+        "fact": "observeMergeProof calls observeAncestry and revList, rejecting non-ancestor observations, unavailable parents, or a parent count other than two.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 143,
+            "endLine": 161
+          }
+        ],
+        "symbol_names": [
+          "observeMergeProof",
+          "observeAncestry",
+          "revList"
+        ]
+      },
+      {
+        "fact": "It calls pathsChanged for base-to-reviewed and first-parent-to-merge and rejects unavailable, extra or missing changed paths.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 163,
+            "endLine": 176
+          }
+        ],
+        "symbol_names": [
+          "observeMergeProof",
+          "pathsChanged"
+        ]
+      },
+      {
+        "fact": "It compares reviewed-to-merge drift and rejects drift only where it intersects reviewedPaths before returning proven:true.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 206,
+            "endLine": 213
+          }
+        ],
+        "symbol_names": [
+          "observeMergeProof",
+          "pathsChanged"
+        ]
+      },
+      {
+        "fact": "revList and pathsChanged call git; pathsChanged uses --literal-pathspecs diff --name-only -z and splits NUL-delimited output without trimming filenames.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 216,
+            "endLine": 230
+          }
+        ],
+        "symbol_names": [
+          "revList",
+          "pathsChanged",
+          "git"
+        ]
+      }
+    ],
+    "distractors": [
+      "assertReviewBinding: it validates a record binding, not merge path/content comparisons."
+    ],
+    "limitations": [
+      "A generic pathsChanged edge cannot alone explain its three distinct argument pairs; show callsites or source labels.",
+      "This is not proof that every change anywhere on the integration branch was reviewed."
+    ]
+  },
+  {
+    "id": "q08-publication",
+    "question": "What evidence dependencies and conditional alternatives must a view show for assertPublicationReady, including the repair-tested-head shortcut?",
+    "seed": {
+      "path": "observe/review.js",
+      "name": "assertPublicationReady"
+    },
+    "candidate_paths": [
+      "observe/review.js",
+      "observe/repair-record.js",
+      "observe/index.js",
+      "state/schema.js"
+    ],
+    "must_show": [
+      {
+        "fact": "Source guards reject parked or terminal state, unapproved gates, an empty slice plan and unmerged slices.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 245,
+            "endLine": 267
+          }
+        ],
+        "symbol_names": [
+          "assertPublicationReady"
+        ]
+      },
+      {
+        "fact": "The supplied observeHead callback is invoked; a multi-slice run requires a validator and any recorded validator must approve and bind to that head.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 271,
+            "endLine": 283
+          }
+        ],
+        "symbol_names": [
+          "assertPublicationReady",
+          "isApproving"
+        ]
+      },
+      {
+        "fact": "Without a validator, a recorded pre_pr reviewed_head must match; an existing test-verifier step must be accepted.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 288,
+            "endLine": 300
+          }
+        ],
+        "symbol_names": [
+          "assertPublicationReady"
+        ]
+      },
+      {
+        "fact": "The direct call to assertRepairPublicationReady can satisfy tested-head evidence and return early when repair.tested equals head.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 302,
+            "endLine": 308
+          }
+        ],
+        "symbol_names": [
+          "assertPublicationReady",
+          "assertRepairPublicationReady"
+        ]
+      },
+      {
+        "fact": "Otherwise evidenceRef and readEvidence obtain test-verifier evidence; guards require matching subject, observed tests, zero exit, review_ready and commit equal to head.",
+        "evidence": [
+          {
+            "path": "observe/review.js",
+            "startLine": 318,
+            "endLine": 334
+          }
+        ],
+        "symbol_names": [
+          "assertPublicationReady",
+          "evidenceRef",
+          "readEvidence"
+        ]
+      }
+    ],
+    "distractors": [
+      "readValidatorReview: not called by assertPublicationReady; this function checks the already-recorded state.validator.",
+      "observeMergeProof: not a direct publication-readiness callsite here."
+    ],
+    "limitations": [
+      "Guard conditions require branch/source annotations; listing callees alone is insufficient.",
+      "This question concerns the readiness function, not whether every CLI publication path invokes it.",
+      "observeHead is injected; do not label it a direct Git observation without caller evidence."
+    ]
+  },
+  {
+    "id": "q09-repair-lifecycle",
+    "question": "Where does reverifyRepair hold the run lock, and how are detached execution and evidence publication separated?",
+    "seed": {
+      "path": "observe/repair-reverification.js",
+      "name": "reverifyRepair"
+    },
+    "candidate_paths": [
+      "observe/repair-reverification.js",
+      "observe/repair-record.js",
+      "core/run-lock.js",
+      "core/atomic-write.js",
+      "observe/index.js"
+    ],
+    "must_show": [
+      {
+        "fact": "reverifyRepair reads repair state, checks eligibility, creates a detached worktree and asserts its detached state, with cleanup on failed assertion.",
+        "evidence": [
+          {
+            "path": "observe/repair-reverification.js",
+            "startLine": 69,
+            "endLine": 82
+          }
+        ],
+        "symbol_names": [
+          "reverifyRepair",
+          "readRepairState",
+          "assertEnvelope",
+          "createDetached",
+          "assertDetached",
+          "removeDetached"
+        ]
+      },
+      {
+        "fact": "The first withRunJsonLock receives an async callback that rereads state and publishes a create-only marker through writeProtectedJsonAtomic, then verifies read-back.",
+        "evidence": [
+          {
+            "path": "observe/repair-reverification.js",
+            "startLine": 84,
+            "endLine": 111
+          }
+        ],
+        "symbol_names": [
+          "reverifyRepair",
+          "withRunJsonLock",
+          "<callback@86:49>",
+          "readRepairState",
+          "writeProtectedJsonAtomic"
+        ]
+      },
+      {
+        "fact": "After the first lock call resolves, spawnSync runs the configured trigger in the temporary worktree; Git HEAD and cleanliness are observed and the worktree is removed before the second lock call.",
+        "evidence": [
+          {
+            "path": "observe/repair-reverification.js",
+            "startLine": 117,
+            "endLine": 133
+          }
+        ],
+        "symbol_names": [
+          "reverifyRepair",
+          "observeCleanliness",
+          "removeDetached",
+          "withRunJsonLock"
+        ]
+      },
+      {
+        "fact": "The second lock callback checks unchanged run/journal bytes and reservation, publishes create-only result evidence, rereads it and returns whether that attempt effectively passed.",
+        "evidence": [
+          {
+            "path": "observe/repair-reverification.js",
+            "startLine": 133,
+            "endLine": 162
+          }
+        ],
+        "symbol_names": [
+          "<callback@133:51>",
+          "readRepairState",
+          "writeProtectedJsonAtomic"
+        ]
+      },
+      {
+        "fact": "After the second callback result, ineffective completion throws; success reports physical_status needs-human and effective_status verified.",
+        "evidence": [
+          {
+            "path": "observe/repair-reverification.js",
+            "startLine": 163,
+            "endLine": 168
+          }
+        ],
+        "symbol_names": [
+          "reverifyRepair"
+        ]
+      }
+    ],
+    "distractors": [
+      "coordinateRunJsonTransition: this function publishes evidence through the atomic writer, not through a transition call."
+    ],
+    "limitations": [
+      "Marker and result writer calls belong to different async callbacks, not direct reverifyRepair call edges.",
+      "Lexical source supports lock-scope placement, not an observed execution trace or actual passing test result.",
+      "Returned effective_status does not establish that run.json was transitioned to verified."
+    ]
+  },
+  {
+    "id": "q10-executable-search",
+    "question": "How does resolveSpawnExecutable choose direct-path versus PATH candidates, and what checks can return success?",
+    "seed": {
+      "path": "core/executable.js",
+      "name": "resolveSpawnExecutable"
+    },
+    "candidate_paths": [
+      "core/executable.js",
+      "observe/index.js",
+      "core/effective-push.js"
+    ],
+    "must_show": [
+      {
+        "fact": "The function refuses win32, accepts injectable stat/access functions and uses a direct-path branch when argv0 contains a slash; otherwise it searches PATH or a POSIX default path.",
+        "evidence": [
+          {
+            "path": "core/executable.js",
+            "startLine": 10,
+            "endLine": 20
+          }
+        ],
+        "symbol_names": [
+          "resolveSpawnExecutable"
+        ]
+      },
+      {
+        "fact": "Candidate checks require stat(candidate).isFile() and access(candidate, X_OK); the first passing candidate returns ok:true and exhausted candidates return not-executable.",
+        "evidence": [
+          {
+            "path": "core/executable.js",
+            "startLine": 21,
+            "endLine": 28
+          }
+        ],
+        "symbol_names": [
+          "resolveSpawnExecutable"
+        ]
+      }
+    ],
+    "distractors": [
+      "execute in core/effective-push.js: it runs Git commands rather than resolving an executable candidate."
+    ],
+    "limitations": [
+      "The map callback constructing PATH candidates is separate lexical ownership, not an external executable call.",
+      "Injected stat/access are not necessarily resolved native calls. No process is spawned by this function.",
+      "A passing check is not proof the executable remains available when another function later spawns it."
+    ]
+  }
+]

@@ -1,0 +1,73 @@
+{
+  "date": "2026-09-18",
+  "scope": "First Rust JavaScript/SCIP/SQLite daemon; not production sequence rendering",
+  "checks": {
+    "rustIntegrationTests": 37,
+    "selectionOfflineTests": 39,
+    "clippyWarningsDenied": true,
+    "rustfmt": true,
+    "javascriptSyntaxCheck": true,
+    "remoteCiExecuted": false
+  },
+  "realSnapshot": {
+    "stats": {
+      "files": 18,
+      "symbols": 377,
+      "calls": 2203,
+      "regions": 1728,
+      "internal": 814,
+      "external": 816,
+      "unresolved": 260,
+      "ambiguous": 313,
+      "parseErrorFiles": 0,
+      "semanticState": "fresh",
+      "changedFiles": []
+    },
+    "sitesMatchedToSpikeAfterCoordinateNormalization": 2203,
+    "newInternalClassConstructorSites": 9,
+    "sourceHashDrift": []
+  },
+  "queryLatency": {
+    "profile": "debug",
+    "iterations": 30,
+    "query": "transition immediate",
+    "minMs": 1.5971669927239418,
+    "medianMs": 1.8228335538879037,
+    "maxMs": 3.623667173087597,
+    "responseNodes": 2,
+    "responseCalls": 5
+  },
+  "liveHttpSecurityStatusCodes": {
+    "noBearer": 401,
+    "evilOrigin": 403,
+    "evilHost": 403,
+    "traversal": 400,
+    "envNotIndexed": 404,
+    "tokenNotServed": 404
+  },
+  "browser": {
+    "desktop": [
+      1440,
+      1000
+    ],
+    "mobile": [
+      390,
+      844
+    ],
+    "horizontalOverflow": false,
+    "savedViewsAndNotesSurvivedRefreshAndRestart": true,
+    "sourceHighlightVerified": true,
+    "staleSourceStatus": 409,
+    "browserStorageCredentialEntries": 0,
+    "finalConsoleErrors": 0,
+    "screenshot": "images/daemon-desktop.png"
+  },
+  "constraints": [
+    "No inference/provider calls",
+    "No source repository edits",
+    "Only explicit full refresh; no watcher",
+    "Unix-only daemon authentication",
+    "No true sequence renderer",
+    "Local changes only: directory is not a Git repository"
+  ]
+}

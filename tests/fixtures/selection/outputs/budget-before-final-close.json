@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "capUsd": 10,
+  "entries": [
+    {
+      "id": "jev-7c7da771-74a6-4589-90b3-c8d27805a6a7",
+      "provider": "jev",
+      "maxUsd": 0.1,
+      "state": "settled",
+      "createdAt": "2026-09-18T02:38:44.018Z",
+      "actualUsd": null,
+      "note": "Completed. Usage-derived estimated USD 0.0013702920000000002; retaining $0.10 reservation."
+    },
+    {
+      "id": "c27be415-83fb-4596-8fdb-1d4b7870beac",
+      "provider": "claude-acp",
+      "maxUsd": 2,
+      "state": "settled",
+      "createdAt": "2026-09-18T02:40:55.562Z",
+      "actualUsd": 0.523703,
+      "note": "No verified completed-turn USD report; retain full reservation Reconciled to final SDK token-equivalent report; original reservation/evidence retained.",
+      "reconciliation": {
+        "at": "2026-09-18T03:11:46.071070+00:00",
+        "artifact": "outputs/q01-smoke.claude.json",
+        "basis": "Final SDK cumulative token-equivalent USD report on a failed terminal turn; not an invoice",
+        "previousActualUsd": null,
+        "reportedEstimateUsd": 0.523703
+      }
+    },
+    {
+      "id": "ff8b93a2-9381-4c56-ac97-52a43be4bec7",
+      "provider": "claude-acp",
+      "maxUsd": 5,
+      "state": "settled",
+      "createdAt": "2026-09-18T02:45:17.327Z",
+      "actualUsd": 1.532102,
+      "note": "Completed ACP turn reported cumulative USD estimate (not invoiced cost)"
+    },
+    {
+      "id": "jev-3d214f58-6cf9-479f-8f09-ea8eec0b519c",
+      "provider": "jev",
+      "maxUsd": 0.1,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:09:03.508Z",
+      "actualUsd": null,
+      "note": "Failed or timed out; no retries; full reservation retained."
+    },
+    {
+      "id": "8e9e7b15-7c3d-4301-8db7-32a3bea914b8",
+      "provider": "claude-acp",
+      "maxUsd": 2,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:09:18.805Z",
+      "actualUsd": 1.4453295,
+      "note": "No verified completed-turn USD report; retain full reservation Reconciled to final SDK token-equivalent report; original reservation/evidence retained.",
+      "reconciliation": {
+        "at": "2026-09-18T03:11:46.071459+00:00",
+        "artifact": "outputs/hard-v1/q02-atomic-branches.opus.json",
+        "basis": "Final SDK cumulative token-equivalent USD report on a failed terminal turn; not an invoice",
+        "previousActualUsd": null,
+        "reportedEstimateUsd": 1.4453295
+      }
+    },
+    {
+      "id": "jev-b4029a50-a253-4b1e-b88f-02582b715a01",
+      "provider": "jev",
+      "maxUsd": 0.1,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:09:49.155Z",
+      "actualUsd": null,
+      "note": "Completed. Usage-derived estimated USD 0.00099981; retaining $0.10 reservation."
+    },
+    {
+      "id": "jev-98aeab3c-4b4e-4113-95b4-2cbcc3d3c87e",
+      "provider": "jev",
+      "maxUsd": 0.1,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:11:46.276Z",
+      "actualUsd": null,
+      "note": "Completed. Usage-derived estimated USD 0.001026102; retaining $0.10 reservation."
+    },
+    {
+      "id": "jev-b3233d0b-57ae-4d7e-a86c-e0cc787c9818",
+      "provider": "jev",
+      "maxUsd": 0.1,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:11:47.309Z",
+      "actualUsd": null,
+      "note": "Completed. Usage-derived estimated USD 0.0018919740000000003; retaining $0.10 reservation."
+    },
+    {
+      "id": "10e678ab-c6bc-48d7-827d-fe53bbfdbb27",
+      "provider": "claude-acp",
+      "maxUsd": 2.95,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:12:08.876Z",
+      "actualUsd": 1.465585,
+      "note": "Completed ACP turn reported cumulative USD estimate (not invoiced cost)"
+    },
+    {
+      "id": "36ae280d-8f74-4d1d-92ca-bc8da5b45b38",
+      "provider": "claude-acp",
+      "maxUsd": 2.95,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:12:23.851Z",
+      "actualUsd": 1.5089519999999998,
+      "note": "No verified completed-turn USD report; retain full reservation Reconciled to final SDK reported estimate; original reservation retained.",
+      "reconciliation": {
+        "at": "2026-09-18T03:16:01.591952+00:00",
+        "artifact": "outputs/hard-v1/q04-transition-cas.opus.json",
+        "basis": "Final SDK cumulative token-equivalent USD report, not an invoice",
+        "previousActualUsd": null,
+        "reportedEstimateUsd": 1.5089519999999998
+      }
+    },
+    {
+      "id": "85d33bff-dcfc-444c-88e7-66e67adefb31",
+      "provider": "claude-acp",
+      "maxUsd": 2.95,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:17:48.287Z",
+      "actualUsd": 1.3164935,
+      "note": "Completed ACP turn reported cumulative USD estimate (not invoiced cost)"
+    },
+    {
+      "id": "8411d5cb-478a-45ca-a7fc-cb69441a2f5a",
+      "provider": "claude-acp",
+      "maxUsd": 1.6,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:21:28.048Z",
+      "actualUsd": null,
+      "note": "No verified completed-turn USD report; retain full reservation"
+    }
+  ]
+}

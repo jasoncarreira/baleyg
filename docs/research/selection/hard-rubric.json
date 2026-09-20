@@ -1,0 +1,606 @@
+{
+  "schemaVersion": 1,
+  "status": "provisional-human-grounded",
+  "purpose": "Question-scoped human assessment, not objective correctness truth or an automatic symbol-recall oracle.",
+  "user_preference": "None of the extra stuff is useful unless I ask about it specifically.",
+  "assessment_rules": [
+    "Judge only the unchanged question. Extra true facts are not required and do not compensate for a missing requested fact.",
+    "Optional context is not required in the default answer or expanded view. Collapsed helpers may supply concise source-backed annotations without becoming required visible nodes.",
+    "required_candidates identifies essential explanation anchors, not every transitive helper. A compact grouping may preserve an anchor without a separate card. Candidate presence alone cannot satisfy guards, branch conditions or source ordering.",
+    "Use source control flow and callback ownership, not execution-trace claims. Dynamic calls remain unresolved in the graph even when option wiring is visible in source.",
+    "Source completeness was assessed from extraction snapshot files and inputs/hard-v1 packets only, before any model-output review. No inference was run and no outputs were read."
+  ],
+  "source_snapshot": {
+    "path": "../extraction/feature-factory.graph.json",
+    "scope": "Static lexical call sites, NOT execution order. Callback bodies are separate functions. No points-to analysis.",
+    "files": [
+      {
+        "path": "core/atomic-write.js",
+        "hash": "b9447c6d3d8933e4d2d24ee376ee1c6b25ce680e60cf32c2b7da598e557053aa"
+      },
+      {
+        "path": "core/run-lock.js",
+        "hash": "84d96bff0d101a6459f40196f71c770e3e14128605026d8979d17ab440d974c6"
+      },
+      {
+        "path": "core/write-core.js",
+        "hash": "09b7519b9afb7137a2fb45965400d539c1302eef79946727a8e802048ef7afee"
+      },
+      {
+        "path": "state/transition.js",
+        "hash": "08f0f29d87376dfc1e23a9a95645326e9ec878b4de7138c6168f24d063686459"
+      }
+    ]
+  },
+  "questions": [
+    {
+      "id": "q02-atomic-branches",
+      "question": "How does protected file publication differ between create-only and replacement writes, including the beforeCommit hook?",
+      "minimal_necessary_facts": [
+        {
+          "fact": "createOnly is enabled only by options.createOnly === true. Create-only rechecks target absence, awaits beforeCommit if it is a function, then publishes the temporary file with the selected link operation; EEXIST is rejected rather than replacing a target. The temporary link is then removed.",
+          "evidence": [
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 25,
+              "endLine": 28
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 45,
+              "endLine": 59
+            }
+          ]
+        },
+        {
+          "fact": "Replacement awaits beforeCommit if it is a function, then rechecks target safety, then calls the selected rename operation. Safety permits an absent target, but an existing target must be a regular file; create-only rejects any existing target.",
+          "evidence": [
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 61,
+              "endLine": 66
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 106,
+              "endLine": 117
+            }
+          ]
+        },
+        {
+          "fact": "beforeCommit is an optional dynamic callback. link and rename come from options.fsOps when provided, otherwise the imported filesystem operations; the graph does not resolve these selected calls to fixed callees.",
+          "evidence": [
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 7,
+              "endLine": 7
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 26,
+              "endLine": 28
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 45,
+              "endLine": 64
+            }
+          ]
+        }
+      ],
+      "required_candidates": [
+        {
+          "path": "core/atomic-write.js",
+          "name": "writeProtectedFileAtomic",
+          "reason": "Owns the requested branch and hook ordering."
+        }
+      ],
+      "optional_context": [
+        {
+          "fact": "Both branches stage and sync an exclusive temporary file before publication.",
+          "evidence": [
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 31,
+              "endLine": 43
+            }
+          ]
+        },
+        {
+          "fact": "Directory sync and cleanup error handling are shared or failure-path details, not needed to explain the requested publication contrast.",
+          "evidence": [
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 53,
+              "endLine": 59
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 67,
+              "endLine": 85
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 119,
+              "endLine": 134
+            }
+          ]
+        }
+      ],
+      "acceptable_collapsed": [
+        {
+          "path": "core/atomic-write.js",
+          "name": "assertSafeTarget",
+          "reason": "Keep absence-versus-regular-file semantics in a branch annotation; a separate helper node is unnecessary."
+        },
+        {
+          "path": "core/atomic-write.js",
+          "name": "resolveProtectedPath",
+          "reason": "Path validation internals are outside the requested contrast."
+        },
+        {
+          "path": "core/atomic-write.js",
+          "name": "syncDirectory",
+          "reason": "Directory-sync implementation and tolerated error codes are optional, not required."
+        },
+        {
+          "path": "core/atomic-write.js",
+          "name": "constructor",
+          "reason": "Error class implementation is not needed."
+        }
+      ],
+      "irrelevant_examples": [
+        "Run-lock acquisition, stale-lock reclaim and release helpers.",
+        "Transition contracts, projections and CAS comparisons."
+      ],
+      "representation_limits": [
+        "Selecting the writer or its safety helper alone cannot express the opposite hook/check ordering in the two branches. Show a source-backed branch annotation.",
+        "Do not claim observed publication, race freedom, or guaranteed power-loss durability."
+      ],
+      "source_evidence_completeness": {
+        "snapshot": "complete for the minimal facts",
+        "input_packet": "complete for the minimal facts",
+        "input_path": "inputs/hard-v1/q02-atomic-branches.json",
+        "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+        "included_candidates": 35,
+        "omitted_candidates": 0,
+        "truncated_sources": 0,
+        "gaps": [],
+        "audit": "All referenced full-file texts match the extraction snapshot. All required candidate anchors are present. sourceFiles supplies full source once in the shared provider payload; completeness does not depend on a model answer.",
+        "symbol_selection_alone_sufficient": false
+      }
+    },
+    {
+      "id": "q03-lock-reclaim",
+      "question": "Which checks allow withRunJsonLock to attempt reclaiming an existing lock, and where is the protected callback invoked?",
+      "minimal_necessary_facts": [
+        {
+          "fact": "After mkdir reports EEXIST, reclaim eligibility is considered only while stealAttempted is false. The loop reads directory identity and owner evidence; a qualifying owned or ownerless case sets stealAttempted, and a non-null observed directory identity is required to call stealByRename. This is an attempt, not successful acquisition.",
+          "evidence": [
+            {
+              "path": "core/run-lock.js",
+              "startLine": 36,
+              "endLine": 56
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 218,
+              "endLine": 226
+            }
+          ]
+        },
+        {
+          "fact": "The owned-lock case requires a durable owner and liveness classified as dead: valid owner record, same host, finite acquired_at age strictly greater than the stale TTL. This is a timestamp policy, not an OS process-death probe; foreign-host or invalid owners are indeterminate.",
+          "evidence": [
+            {
+              "path": "core/run-lock.js",
+              "startLine": 79,
+              "endLine": 94
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 174,
+              "endLine": 185
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 197,
+              "endLine": 205
+            }
+          ]
+        },
+        {
+          "fact": "The ownerless case requires no usable owner evidence AND no owner entry, plus finite directory mtime age strictly greater than the grace period. An invalid but existing owner entry is not reclaimable through this branch; inspection errors fail closed.",
+          "evidence": [
+            {
+              "path": "core/run-lock.js",
+              "startLine": 49,
+              "endLine": 51
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 83,
+              "endLine": 94
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 187,
+              "endLine": 195
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 251,
+              "endLine": 260
+            }
+          ]
+        },
+        {
+          "fact": "After acquiring the directory, withRunJsonLock verifies its identity, exclusively publishes owner.json and verifies the owner. It then invokes and awaits the supplied fn({ lock_dir: lockDir, owner }) at line 69, inside try before finally cleanup. fn is dynamic, not a statically resolved project function.",
+          "evidence": [
+            {
+              "path": "core/run-lock.js",
+              "startLine": 59,
+              "endLine": 76
+            }
+          ]
+        }
+      ],
+      "required_candidates": [
+        {
+          "path": "core/run-lock.js",
+          "name": "withRunJsonLock",
+          "reason": "Owns EEXIST gating, the two eligibility branches, and callback placement."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "canStealRunJsonLock",
+          "reason": "Defines the owned-lock eligibility predicate."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "inspectLockOwnerLiveness",
+          "reason": "Defines the same-host TTL policy needed to explain dead."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "ownerlessLockIsReclaimable",
+          "reason": "Defines the distinct ownerless grace policy."
+        }
+      ],
+      "optional_context": [
+        {
+          "fact": "After an attempt is requested, stealByRename optionally awaits onBeforeSteal, rechecks owned evidence, and uses identity-checked quarantine rename. These are attempt-execution safeguards, not additional eligibility branches in withRunJsonLock.",
+          "evidence": [
+            {
+              "path": "core/run-lock.js",
+              "startLine": 111,
+              "endLine": 135
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 157,
+              "endLine": 168
+            }
+          ]
+        },
+        {
+          "fact": "Exact owner validation fields are positive integer pid, nonblank hostname, parseable acquired_at and UUID-shaped nonce; numeric TTL/grace defaults and timeout/retry policy are implementation context.",
+          "evidence": [
+            {
+              "path": "core/run-lock.js",
+              "startLine": 11,
+              "endLine": 14
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 54,
+              "endLine": 55
+            },
+            {
+              "path": "core/run-lock.js",
+              "startLine": 197,
+              "endLine": 205
+            }
+          ]
+        }
+      ],
+      "acceptable_collapsed": [
+        {
+          "path": "core/run-lock.js",
+          "name": "readLockOwnerEvidence",
+          "reason": "Summarize usable owner evidence versus an existing invalid entry."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "isDurableLockOwner",
+          "reason": "Label valid durable owner; do not expand every field unless asked."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "lockOwnerEntryExists",
+          "reason": "Label no owner entry and fail-closed inspection."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "lockDirectoryIdentity",
+          "reason": "Label non-null directory identity without expanding lstat mechanics."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "stealByRename",
+          "reason": "Show the attempted operation by name; its quarantine implementation is optional."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "sameLockOwner",
+          "reason": "Summarize publication verification at callback placement."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "sameLockDirectoryIdentity",
+          "reason": "Summarize identity verification at callback placement."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "releaseOwnedRunJsonLock",
+          "reason": "Finally cleanup can stay collapsed."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "quarantineAndRemoveOwnedLock",
+          "reason": "Unpublished-owner cleanup is not requested."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "renameOwnedLockToQuarantine",
+          "reason": "Quarantine mechanics are not needed to identify eligibility."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "normalizePositiveInteger",
+          "reason": "Timing validation internals are not required."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "delay",
+          "reason": "Retry scheduling internals are not required."
+        }
+      ],
+      "irrelevant_examples": [
+        "state/session-lock.js: separate lock domain and policy.",
+        "coordinateRunJsonTransition, projections and protected-write CAS logic."
+      ],
+      "representation_limits": [
+        "A list of reclaim helper symbols cannot express EEXIST, the attempt gate, the AND/OR conditions, strict age comparisons, or callback placement. Keep source-backed guard labels.",
+        "Do not equate TTL dead with a proven dead process or a reclaim attempt with successful lock ownership."
+      ],
+      "source_evidence_completeness": {
+        "snapshot": "complete for the minimal facts",
+        "input_packet": "complete for the minimal facts",
+        "input_path": "inputs/hard-v1/q03-lock-reclaim.json",
+        "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+        "included_candidates": 40,
+        "omitted_candidates": 0,
+        "truncated_sources": 0,
+        "gaps": [],
+        "audit": "All referenced full-file texts match the extraction snapshot. All required candidate anchors are present. sourceFiles supplies full source once in the shared provider payload; completeness does not depend on a model answer.",
+        "symbol_selection_alone_sufficient": false
+      }
+    },
+    {
+      "id": "q04-transition-cas",
+      "question": "How does transition reach the protected write, and where are the two unchanged-state checks relative to reobservation and final rename?",
+      "minimal_necessary_facts": [
+        {
+          "fact": "transition delegates to coordinateRunJsonTransition. The coordinator passes an async callback to withRunJsonLock; that callback reads initial state, applies/validates the candidate and calls writeProtectedJsonAtomic. The JSON wrapper delegates to writeProtectedFileAtomic with options preserved. The write call belongs to the lock callback, not directly to the coordinator.",
+          "evidence": [
+            {
+              "path": "state/transition.js",
+              "startLine": 13,
+              "endLine": 25
+            },
+            {
+              "path": "core/write-core.js",
+              "startLine": 23,
+              "endLine": 47
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 18,
+              "endLine": 20
+            }
+          ]
+        },
+        {
+          "fact": "The lock callback supplies fsOps.rename as a nested async function. The atomic writer selects options.fsOps.rename when present; this call uses replacement mode, whose optional beforeCommit hook and safety check precede the selected rename call. This source wiring identifies the intended callback without turning the unresolved graph call into a resolved edge.",
+          "evidence": [
+            {
+              "path": "core/write-core.js",
+              "startLine": 44,
+              "endLine": 80
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 25,
+              "endLine": 28
+            },
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 61,
+              "endLine": 65
+            }
+          ]
+        },
+        {
+          "fact": "Inside the injected rename callback, reread state and compare it with initial before projecting and awaiting contract.reobserve. After reobservation, reread again and compare with the same initial state. assertUnchanged rejects anything not deeply strictly equal.",
+          "evidence": [
+            {
+              "path": "core/write-core.js",
+              "startLine": 47,
+              "endLine": 64
+            },
+            {
+              "path": "core/write-core.js",
+              "startLine": 71,
+              "endLine": 72
+            },
+            {
+              "path": "core/write-core.js",
+              "startLine": 85,
+              "endLine": 94
+            }
+          ]
+        },
+        {
+          "fact": "After the second unchanged-state check, an optional synchronous finalGuard runs (thenable results are rejected); then the callback calls the imported filesystem rename. Distinguish this final filesystem call from the atomic writer invoking the injected rename callback.",
+          "evidence": [
+            {
+              "path": "core/write-core.js",
+              "startLine": 1,
+              "endLine": 2
+            },
+            {
+              "path": "core/write-core.js",
+              "startLine": 71,
+              "endLine": 77
+            }
+          ]
+        }
+      ],
+      "required_candidates": [
+        {
+          "path": "state/transition.js",
+          "name": "transition",
+          "reason": "Entry point and delegation."
+        },
+        {
+          "path": "core/write-core.js",
+          "name": "coordinateRunJsonTransition",
+          "reason": "Owns the lock call and callback registration."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "withRunJsonLock",
+          "reason": "Names the lock boundary on the requested write path; its internals may stay collapsed."
+        },
+        {
+          "path": "core/write-core.js",
+          "name": "<callback@23:34>",
+          "reason": "Owns candidate preparation, protected JSON write and injected rename registration."
+        },
+        {
+          "path": "core/atomic-write.js",
+          "name": "writeProtectedJsonAtomic",
+          "reason": "Connects the protected JSON write to the file writer."
+        },
+        {
+          "path": "core/atomic-write.js",
+          "name": "writeProtectedFileAtomic",
+          "reason": "Selects and invokes the injected rename in replacement mode."
+        },
+        {
+          "path": "core/write-core.js",
+          "name": "rename",
+          "reason": "Nested callback at lines 47-78, not the imported filesystem function; owns both comparisons and reobservation."
+        },
+        {
+          "path": "core/write-core.js",
+          "name": "assertUnchanged",
+          "reason": "Defines what the requested unchanged-state comparisons mean."
+        }
+      ],
+      "optional_context": [
+        {
+          "fact": "Descriptor freezing, contract registries, projection validation and recursive freezing support transition validation but their implementations are not needed for this path/order question.",
+          "evidence": [
+            {
+              "path": "state/transition.js",
+              "startLine": 14,
+              "endLine": 17
+            },
+            {
+              "path": "core/write-core.js",
+              "startLine": 18,
+              "endLine": 42
+            },
+            {
+              "path": "core/write-core.js",
+              "startLine": 96,
+              "endLine": 146
+            }
+          ]
+        },
+        {
+          "fact": "JSON pretty-printing and trailing newline are wrapper details, not required to follow delegation.",
+          "evidence": [
+            {
+              "path": "core/atomic-write.js",
+              "startLine": 18,
+              "endLine": 20
+            }
+          ]
+        }
+      ],
+      "acceptable_collapsed": [
+        {
+          "path": "core/write-core.js",
+          "name": "readRunState",
+          "reason": "Label each reread in the rename callback; parsing/validation helper internals can stay collapsed."
+        },
+        {
+          "path": "core/write-core.js",
+          "name": "projectAll",
+          "reason": "Label projection before reobservation without expanding projection validation."
+        },
+        {
+          "path": "core/write-core.js",
+          "name": "deepFreeze",
+          "reason": "Recursive freezing is not needed to show either comparison."
+        },
+        {
+          "path": "core/write-core.js",
+          "name": "contractRegistry",
+          "reason": "Registry validation is not the requested path or check placement."
+        },
+        {
+          "path": "core/write-core.js",
+          "name": "participantRegistry",
+          "reason": "Participant validation is not the requested path or check placement."
+        },
+        {
+          "path": "core/atomic-write.js",
+          "name": "assertSafeTarget",
+          "reason": "Label the safety check before injected rename; no separate expansion required."
+        },
+        {
+          "path": "core/run-lock.js",
+          "name": "withRunJsonLock internals",
+          "reason": "Keep the required lock boundary but collapse reclaim/release internals."
+        }
+      ],
+      "irrelevant_examples": [
+        "core/contracts.js individual family contract implementations; no need to resolve dynamic contract.reobserve methods.",
+        "Stale-lock liveness, ownerless grace and quarantine cleanup.",
+        "Create-only publication and directory-fsync error lists.",
+        "Git push configuration and executable lookup."
+      ],
+      "representation_limits": [
+        "Selection alone cannot encode callback ownership, two separate read/check callsites, or reobservation between them. Supply source-backed ownership and order annotations.",
+        "contract.reobserve, finalGuard and the selected options.fsOps.rename remain dynamic/unresolved graph calls. Do not invent direct coordinator-to-writer or atomic-writer-to-injected-callback edges as resolved lexical edges.",
+        "Source order is not an observed execution trace, global execution order, or a formal atomic CAS guarantee."
+      ],
+      "source_evidence_completeness": {
+        "snapshot": "complete for the minimal facts",
+        "input_packet": "complete for the minimal facts",
+        "input_path": "inputs/hard-v1/q04-transition-cas.json",
+        "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+        "included_candidates": 73,
+        "omitted_candidates": 0,
+        "truncated_sources": 0,
+        "gaps": [],
+        "audit": "All referenced full-file texts match the extraction snapshot. All required candidate anchors are present. sourceFiles supplies full source once in the shared provider payload; completeness does not depend on a model answer.",
+        "symbol_selection_alone_sufficient": false
+      }
+    }
+  ]
+}

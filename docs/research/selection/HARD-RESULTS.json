@@ -1,0 +1,264 @@
+{
+  "status": "three hard questions compared; no further paid calls",
+  "questions": [
+    {
+      "id": "q02-atomic-branches",
+      "question": "How does protected file publication differ between create-only and replacement writes, including the beforeCommit hook?",
+      "candidates": 35,
+      "completeSourceFiles": 3,
+      "providers": {
+        "baseline": {
+          "artifact": "outputs/hard-v1/q02-atomic-branches.baseline.json",
+          "status": "ok",
+          "labels": {
+            "essential": 5,
+            "uncertain": 1,
+            "incidental": 29
+          },
+          "visibleNodes": 5,
+          "collapsedNodes": 1,
+          "seedForced": false,
+          "essentialNames": [
+            "writeProtectedFileAtomic",
+            "constructor",
+            "resolveProtectedPath",
+            "assertSafeTarget",
+            "syncDirectory"
+          ],
+          "latencyMs": null,
+          "estimatedUsd": null,
+          "providerPacketHash": null,
+          "instructionsHash": null
+        },
+        "jev": {
+          "artifact": "outputs/hard-v1/q02-atomic-branches.jev-attempt2.json",
+          "status": "ok",
+          "labels": {
+            "essential": 2,
+            "incidental": 29,
+            "supporting": 4
+          },
+          "visibleNodes": 2,
+          "collapsedNodes": 4,
+          "seedForced": false,
+          "essentialNames": [
+            "writeProtectedFileAtomic",
+            "assertSafeTarget"
+          ],
+          "latencyMs": 779.584959,
+          "estimatedUsd": 0.00099981,
+          "providerPacketHash": "3da07a7f572af9c2822329749856d8a1183784786181384032d8a79fb7a2bb00",
+          "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8"
+        },
+        "opus": {
+          "artifact": "outputs/hard-v1/q02-atomic-branches.opus-emitted.json",
+          "status": "validated-emission-terminal-error",
+          "labels": {
+            "essential": 2,
+            "supporting": 4,
+            "incidental": 29
+          },
+          "visibleNodes": 2,
+          "collapsedNodes": 4,
+          "seedForced": false,
+          "essentialNames": [
+            "writeProtectedFileAtomic",
+            "assertSafeTarget"
+          ],
+          "latencyMs": 21983,
+          "estimatedUsd": 1.4453295,
+          "providerPacketHash": "3da07a7f572af9c2822329749856d8a1183784786181384032d8a79fb7a2bb00",
+          "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8"
+        }
+      },
+      "identicalSuppliedPackets": true,
+      "identicalInstructions": true,
+      "essentialSelectionsEqual": true
+    },
+    {
+      "id": "q03-lock-reclaim",
+      "question": "Which checks allow withRunJsonLock to attempt reclaiming an existing lock, and where is the protected callback invoked?",
+      "candidates": 40,
+      "completeSourceFiles": 3,
+      "providers": {
+        "baseline": {
+          "artifact": "outputs/hard-v1/q03-lock-reclaim.baseline.json",
+          "status": "ok",
+          "labels": {
+            "essential": 13,
+            "supporting": 5,
+            "incidental": 11,
+            "uncertain": 11
+          },
+          "visibleNodes": 13,
+          "collapsedNodes": 16,
+          "seedForced": false,
+          "essentialNames": [
+            "withRunJsonLock",
+            "canStealRunJsonLock",
+            "readLockOwnerEvidence",
+            "stealByRename",
+            "releaseOwnedRunJsonLock",
+            "quarantineAndRemoveOwnedLock",
+            "lockOwnerEntryExists",
+            "sameLockOwner",
+            "lockDirectoryIdentity",
+            "sameLockDirectoryIdentity",
+            "normalizePositiveInteger",
+            "delay",
+            "ownerlessLockIsReclaimable"
+          ],
+          "latencyMs": null,
+          "estimatedUsd": null,
+          "providerPacketHash": null,
+          "instructionsHash": null
+        },
+        "jev": {
+          "artifact": "outputs/hard-v1/q03-lock-reclaim.jev.json",
+          "status": "ok",
+          "labels": {
+            "essential": 4,
+            "supporting": 15,
+            "incidental": 21
+          },
+          "visibleNodes": 4,
+          "collapsedNodes": 15,
+          "seedForced": false,
+          "essentialNames": [
+            "withRunJsonLock",
+            "canStealRunJsonLock",
+            "ownerlessLockIsReclaimable",
+            "inspectLockOwnerLiveness"
+          ],
+          "latencyMs": 809.715167,
+          "estimatedUsd": 0.001026102,
+          "providerPacketHash": "63c0c895fb667b7543b13732f049ede59ace473c9e6623651585780ad83b48c8",
+          "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8"
+        },
+        "opus": {
+          "artifact": "outputs/hard-v1/q03-lock-reclaim.opus.json",
+          "status": "ok",
+          "labels": {
+            "essential": 4,
+            "supporting": 7,
+            "incidental": 29
+          },
+          "visibleNodes": 4,
+          "collapsedNodes": 7,
+          "seedForced": false,
+          "essentialNames": [
+            "withRunJsonLock",
+            "canStealRunJsonLock",
+            "ownerlessLockIsReclaimable",
+            "inspectLockOwnerLiveness"
+          ],
+          "latencyMs": 12452,
+          "estimatedUsd": 1.465585,
+          "providerPacketHash": "63c0c895fb667b7543b13732f049ede59ace473c9e6623651585780ad83b48c8",
+          "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8"
+        }
+      },
+      "identicalSuppliedPackets": true,
+      "identicalInstructions": true,
+      "essentialSelectionsEqual": true
+    },
+    {
+      "id": "q04-transition-cas",
+      "question": "How does transition reach the protected write, and where are the two unchanged-state checks relative to reobservation and final rename?",
+      "candidates": 73,
+      "completeSourceFiles": 5,
+      "providers": {
+        "baseline": {
+          "artifact": "outputs/hard-v1/q04-transition-cas.baseline.json",
+          "status": "ok",
+          "labels": {
+            "essential": 3,
+            "supporting": 4,
+            "uncertain": 13,
+            "incidental": 53
+          },
+          "visibleNodes": 3,
+          "collapsedNodes": 17,
+          "seedForced": false,
+          "essentialNames": [
+            "transition",
+            "coordinateRunJsonTransition",
+            "<callback@15:58>"
+          ],
+          "latencyMs": null,
+          "estimatedUsd": null,
+          "providerPacketHash": null,
+          "instructionsHash": null
+        },
+        "jev": {
+          "artifact": "outputs/hard-v1/q04-transition-cas.jev.json",
+          "status": "ok",
+          "labels": {
+            "supporting": 6,
+            "essential": 4,
+            "incidental": 63
+          },
+          "visibleNodes": 5,
+          "collapsedNodes": 5,
+          "seedForced": true,
+          "essentialNames": [
+            "coordinateRunJsonTransition",
+            "<callback@23:34>",
+            "rename",
+            "assertUnchanged"
+          ],
+          "latencyMs": 1103.231708,
+          "estimatedUsd": 0.0018919740000000003,
+          "providerPacketHash": "75cae5238c322ea99bfeadf91d57f24979ffb4d62f79c2fd436af7753d8bc64d",
+          "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8"
+        },
+        "opus": {
+          "artifact": "outputs/hard-v1/q04-transition-cas.opus-inline-emitted.json",
+          "status": "validated-emission-terminal-error",
+          "labels": {
+            "essential": 8,
+            "incidental": 61,
+            "supporting": 4
+          },
+          "visibleNodes": 8,
+          "collapsedNodes": 4,
+          "seedForced": false,
+          "essentialNames": [
+            "transition",
+            "coordinateRunJsonTransition",
+            "<callback@23:34>",
+            "writeProtectedJsonAtomic",
+            "readRunState",
+            "writeProtectedFileAtomic",
+            "rename",
+            "assertUnchanged"
+          ],
+          "latencyMs": 27327,
+          "estimatedUsd": 1.6598305,
+          "providerPacketHash": "75cae5238c322ea99bfeadf91d57f24979ffb4d62f79c2fd436af7753d8bc64d",
+          "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8"
+        }
+      },
+      "identicalSuppliedPackets": true,
+      "identicalInstructions": true,
+      "essentialSelectionsEqual": false
+    }
+  ],
+  "offlineTestsPassed": 39,
+  "inputPolicy": "full files once, all fixed-scope candidates, no rubric sent, source/code treated as data",
+  "userScopePreference": "Only detail that directly answers the question belongs in the default view. These are not sequence diagrams.",
+  "budget": {
+    "authorizedUsd": 10,
+    "accountedTokenEstimatesAndReservationsUsd": 9.9519955,
+    "inferenceClosed": true,
+    "cashChargesVerified": false
+  },
+  "caveats": [
+    "q02 and final inline q04 use schema-validated MCP emissions from terminal-error sessions; marked partial, never called normal successes",
+    "Initial q02 Jev probability validation failed; original body not retained. Recorded retry passed; root cause unknown",
+    "Initial q04 Opus had41tool calls and no emission. MCP64k retry completed but received persisted-output preview and marked66candidates uncertain; excluded from quality comparison",
+    "Final q04 delivered exact full packet inline through ACP, used MCP only for emission; packet/instruction hashes match Jev",
+    "Unexpected~113kcontext growth after tiny emit acknowledgement remains unresolved; spilling is not sufficient explanation",
+    "Single accepted output per condition after integration repairs; no p95, calibration, or general model-superiority claim"
+  ]
+}

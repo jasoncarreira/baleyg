@@ -1,0 +1,78 @@
+{
+  "workspace": "<repository>",
+  "production": "http://127.0.0.1:8877",
+  "revision": 5,
+  "workspaceStats": {
+    "files": 86,
+    "symbols": 2731,
+    "calls": 14517,
+    "regions": 2755,
+    "internal": 0,
+    "external": 0,
+    "unresolved": 14517,
+    "ambiguous": 0,
+    "parseErrorFiles": 0,
+    "semanticState": "unavailable",
+    "changedFiles": []
+  },
+  "tests": {
+    "rustPassed": 253,
+    "rustIgnoredOptInSmoke": 1,
+    "uiPassed": 141,
+    "fmt": true,
+    "clippyWarningsDenied": true,
+    "build": true,
+    "remoteCiRun": false
+  },
+  "catalog": {
+    "ecosystem": "Rust/Cargo only",
+    "packagesDiscovered": 244,
+    "packagesWithDeclarations": 80,
+    "symbols": 50000,
+    "sourceFilesInOptInSmoke": 1742,
+    "indexStates": {
+      "partial": 171,
+      "complete": 73
+    },
+    "inMemory": true,
+    "semanticResolution": false,
+    "projectConfigAttestedToCachedWorkspace": false
+  },
+  "browser": {
+    "method": "src/acp.rs::check_file_with_unlinked",
+    "candidateType": "std::fs::OpenOptions",
+    "collapsedCalls": 2,
+    "expandedCalls": 10,
+    "recollapsedCalls": 2,
+    "showAllCalls": 10,
+    "keyboardEnterSpace": true,
+    "focusPreserved": true,
+    "source": "std/src/fs.rs:1884",
+    "sourceHighlightedLines": 3,
+    "sourceWindowMaxLines": 600,
+    "primarySelectionPreserved": true,
+    "desktopWidth": 1440,
+    "mobileWidth": 390,
+    "pageHorizontalOverflow": false
+  },
+  "safety": {
+    "thirdPartyBehaviorExpanded": false,
+    "externalSymbolsAcceptedAsSequenceRoots": false,
+    "providerCalls": 0,
+    "providersDisabled": true,
+    "savedViewsUnchanged": true,
+    "notesUnchanged": true,
+    "tokenAndHistoricalLedgersUnchanged": true,
+    "indexingCommandsExecuted": false,
+    "trustedCompilerMetadataProbeAtStartup": true
+  },
+  "remaining": [
+    "No exact Rust receiver/trait/dispatch resolution",
+    "Only Rust/Cargo dependency discovery; Windows secure reader and other ecosystem adapters not implemented",
+    "Partial catalogs at explicit resource bounds; 164 discovered packages currently have no indexed declarations",
+    "No persistent catalog cache or watcher",
+    "Cargo workspace inheritance/custom sources/generated exports not resolved",
+    "Tree-sitter parse has no wall-clock deadline"
+  ],
+  "publicationNote": "Publication copy: local absolute paths are replaced with labelled placeholders. This is not a verbatim capture or a new run. Byte-exact originals are retained in an ignored private archive; measured results and source hashes are unchanged."
+}

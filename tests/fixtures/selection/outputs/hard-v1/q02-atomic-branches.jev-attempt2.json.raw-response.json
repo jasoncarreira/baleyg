@@ -1,0 +1,394 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "c001": {
+      "type": "choice",
+      "choice": "essential",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 1,
+        "incidental": 0,
+        "uncertain": 0
+      }
+    },
+    "c002": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.86,
+      "probabilities": {
+        "supporting": 0.1,
+        "essential": 0,
+        "incidental": 0.9,
+        "uncertain": 0
+      }
+    },
+    "c003": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.51,
+      "probabilities": {
+        "supporting": 0.33,
+        "essential": 0.03,
+        "incidental": 0.64,
+        "uncertain": 0
+      }
+    },
+    "c004": {
+      "type": "choice",
+      "choice": "essential",
+      "confidence": 0.65,
+      "probabilities": {
+        "supporting": 0.26,
+        "essential": 0.74,
+        "incidental": 0,
+        "uncertain": 0
+      }
+    },
+    "c005": {
+      "type": "choice",
+      "choice": "supporting",
+      "confidence": 0.35,
+      "probabilities": {
+        "supporting": 0.51,
+        "essential": 0.08,
+        "incidental": 0.41,
+        "uncertain": 0
+      }
+    },
+    "c006": {
+      "type": "choice",
+      "choice": "supporting",
+      "confidence": 0.46,
+      "probabilities": {
+        "supporting": 0.6,
+        "essential": 0.01,
+        "incidental": 0.39,
+        "uncertain": 0
+      }
+    },
+    "c007": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.86,
+      "probabilities": {
+        "supporting": 0.1,
+        "essential": 0.01,
+        "incidental": 0.89,
+        "uncertain": 0
+      }
+    },
+    "c008": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.99,
+      "probabilities": {
+        "supporting": 0.01,
+        "essential": 0,
+        "incidental": 0.99,
+        "uncertain": 0
+      }
+    },
+    "c009": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c010": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.99,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c011": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.99,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c012": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c013": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c014": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c015": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c016": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c017": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c018": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c019": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.99,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c020": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.99,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c021": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c022": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c023": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c024": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c025": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c026": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 1,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c027": {
+      "type": "choice",
+      "choice": "supporting",
+      "confidence": 0.38,
+      "probabilities": {
+        "supporting": 0.54,
+        "essential": 0.04,
+        "incidental": 0.42,
+        "uncertain": 0
+      }
+    },
+    "c028": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.33,
+      "probabilities": {
+        "supporting": 0.47,
+        "essential": 0.03,
+        "incidental": 0.5,
+        "uncertain": 0
+      }
+    },
+    "c029": {
+      "type": "choice",
+      "choice": "supporting",
+      "confidence": 0.49,
+      "probabilities": {
+        "supporting": 0.62,
+        "essential": 0.15,
+        "incidental": 0.23,
+        "uncertain": 0
+      }
+    },
+    "c030": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.55,
+      "probabilities": {
+        "supporting": 0.29,
+        "essential": 0.05,
+        "incidental": 0.66,
+        "uncertain": 0
+      }
+    },
+    "c031": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.78,
+      "probabilities": {
+        "supporting": 0.16,
+        "essential": 0.01,
+        "incidental": 0.83,
+        "uncertain": 0
+      }
+    },
+    "c032": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.98,
+      "probabilities": {
+        "supporting": 0.01,
+        "essential": 0,
+        "incidental": 0.99,
+        "uncertain": 0
+      }
+    },
+    "c033": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.99,
+      "probabilities": {
+        "supporting": 0,
+        "essential": 0,
+        "incidental": 1,
+        "uncertain": 0
+      }
+    },
+    "c034": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.98,
+      "probabilities": {
+        "supporting": 0.01,
+        "essential": 0,
+        "incidental": 0.99,
+        "uncertain": 0
+      }
+    },
+    "c035": {
+      "type": "choice",
+      "choice": "incidental",
+      "confidence": 0.97,
+      "probabilities": {
+        "supporting": 0.02,
+        "essential": 0,
+        "incidental": 0.98,
+        "uncertain": 0
+      }
+    }
+  },
+  "usage": {
+    "input_tokens": 23805,
+    "output_tokens": 1854
+  }
+}

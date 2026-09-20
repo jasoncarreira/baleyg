@@ -1,0 +1,763 @@
+{
+  "schemaVersion": 1,
+  "scope": "Static lexical call sites, NOT execution order. Callback bodies are separate functions. No points-to analysis.",
+  "indexTool": {
+    "name": "scip-typescript",
+    "version": "0.4.0",
+    "arguments": []
+  },
+  "files": [
+    {
+      "path": "cases.js",
+      "hash": "08169fd97819ce8e83ce1aaa1511e4b7c647b72ed182dba4c554d5102fcc7792",
+      "text": "function actual() { return 1; }\nfunction key() { return 'method'; }\nfunction a() { return 1; }\nfunction b() { return 2; }\nfunction sink(callback) { return callback; }\nconst obj = { get f() { return actual; }, method() { return actual(); } };\nobj.f();\nclass C { [key()]() { actual(); } }\nexport function branching(x) {\n  x ? a() : b();\n  x && a();\n  for (a(); b(); a()) actual();\n}\nexport function callbacks() {\n  sink((() => actual()));\n  sink(obj.method);\n}\n"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "local:cases.js:local 1",
+      "name": "f",
+      "kind": "method",
+      "accessor": true,
+      "path": "cases.js",
+      "line": 6,
+      "endLine": 6,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "local:cases.js:local 2",
+      "name": "method",
+      "kind": "method",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 6,
+      "endLine": 6,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "module:cases.js",
+      "name": "cases.js",
+      "kind": "module",
+      "path": "cases.js",
+      "line": 1,
+      "endLine": 18
+    },
+    {
+      "id": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "name": "a",
+      "kind": "function",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 3,
+      "endLine": 3,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "name": "actual",
+      "kind": "function",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 1,
+      "endLine": 1,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/b().",
+      "name": "b",
+      "kind": "function",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 4,
+      "endLine": 4,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().",
+      "name": "branching",
+      "kind": "function",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 9,
+      "endLine": 13,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/callbacks().",
+      "name": "callbacks",
+      "kind": "function",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 14,
+      "endLine": 17,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/key().",
+      "name": "key",
+      "kind": "function",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 2,
+      "endLine": 2,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/sink().",
+      "name": "sink",
+      "kind": "function",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 5,
+      "endLine": 5,
+      "parent": "module:cases.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "syntax:cases.js:261:method_definition",
+      "name": "[key()]",
+      "kind": "method",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 8,
+      "endLine": 8,
+      "parent": "module:cases.js",
+      "provenance": "treesitter"
+    },
+    {
+      "id": "syntax:cases.js:419:arrow_function",
+      "name": "<callback@15:9>",
+      "kind": "function",
+      "accessor": false,
+      "path": "cases.js",
+      "line": 15,
+      "endLine": 15,
+      "parent": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/callbacks().",
+      "provenance": "treesitter"
+    }
+  ],
+  "calls": [
+    {
+      "id": "call:cases.js:227",
+      "caller": "local:cases.js:local 2",
+      "calleeText": "actual",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 6,
+      "column": 61,
+      "offset": 227,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:242",
+      "caller": "module:cases.js",
+      "calleeText": "obj.f",
+      "target": null,
+      "resolution": "unresolved",
+      "candidateSymbols": [
+        "local:cases.js:local 1"
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 7,
+      "column": 1,
+      "offset": 242,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:262",
+      "caller": "module:cases.js",
+      "calleeText": "key",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/key().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/key()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 8,
+      "column": 12,
+      "offset": 262,
+      "ordinal": 2,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:273",
+      "caller": "syntax:cases.js:261:method_definition",
+      "calleeText": "actual",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 8,
+      "column": 23,
+      "offset": 273,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:324",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().",
+      "calleeText": "a",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 10,
+      "column": 7,
+      "offset": 324,
+      "ordinal": 1,
+      "regions": [
+        "region:cases.js:324:conditional-true"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:330",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().",
+      "calleeText": "b",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/b().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/b()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 10,
+      "column": 13,
+      "offset": 330,
+      "ordinal": 2,
+      "regions": [
+        "region:cases.js:330:conditional-false"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:342",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().",
+      "calleeText": "a",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 11,
+      "column": 8,
+      "offset": 342,
+      "ordinal": 3,
+      "regions": [
+        "region:cases.js:342:short-circuit"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:354",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().",
+      "calleeText": "a",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 12,
+      "column": 8,
+      "offset": 354,
+      "ordinal": 4,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:359",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().",
+      "calleeText": "b",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/b().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/b()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 12,
+      "column": 13,
+      "offset": 359,
+      "ordinal": 5,
+      "regions": [
+        "region:cases.js:349:loop"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:364",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().",
+      "calleeText": "a",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 12,
+      "column": 18,
+      "offset": 364,
+      "ordinal": 6,
+      "regions": [
+        "region:cases.js:349:loop"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:369",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().",
+      "calleeText": "actual",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 12,
+      "column": 23,
+      "offset": 369,
+      "ordinal": 7,
+      "regions": [
+        "region:cases.js:349:loop"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:413",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/callbacks().",
+      "calleeText": "sink",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/sink().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/sink()."
+      ],
+      "callbackArguments": [
+        "syntax:cases.js:419:arrow_function"
+      ],
+      "path": "cases.js",
+      "line": 15,
+      "column": 3,
+      "offset": 413,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:425",
+      "caller": "syntax:cases.js:419:arrow_function",
+      "calleeText": "actual",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual()."
+      ],
+      "callbackArguments": [],
+      "path": "cases.js",
+      "line": 15,
+      "column": 15,
+      "offset": 425,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:cases.js:439",
+      "caller": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/callbacks().",
+      "calleeText": "sink",
+      "target": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/sink().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/sink()."
+      ],
+      "callbackArguments": [
+        "local:cases.js:local 2"
+      ],
+      "path": "cases.js",
+      "line": 16,
+      "column": 3,
+      "offset": 439,
+      "ordinal": 2,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    }
+  ],
+  "regions": [
+    {
+      "id": "region:cases.js:324:conditional-true",
+      "kind": "conditional-true",
+      "label": "when x",
+      "parent": null,
+      "path": "cases.js",
+      "line": 10,
+      "endLine": 10,
+      "owner": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching()."
+    },
+    {
+      "id": "region:cases.js:330:conditional-false",
+      "kind": "conditional-false",
+      "label": "unless x",
+      "parent": null,
+      "path": "cases.js",
+      "line": 10,
+      "endLine": 10,
+      "owner": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching()."
+    },
+    {
+      "id": "region:cases.js:342:short-circuit",
+      "kind": "short-circuit",
+      "label": "&& RHS guarded by x",
+      "parent": null,
+      "path": "cases.js",
+      "line": 11,
+      "endLine": 11,
+      "owner": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching()."
+    },
+    {
+      "id": "region:cases.js:349:loop",
+      "kind": "loop",
+      "label": "for (a(); b(); a()) actual();",
+      "parent": null,
+      "path": "cases.js",
+      "line": 12,
+      "endLine": 12,
+      "owner": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching()."
+    }
+  ],
+  "references": [
+    {
+      "path": "cases.js",
+      "range": [
+        4,
+        33,
+        41
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/sink().(callback)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        5,
+        31,
+        37
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        5,
+        60,
+        66
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        6,
+        0,
+        3
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/obj.",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        6,
+        4,
+        5
+      ],
+      "symbol": "local:cases.js:local 1",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        7,
+        11,
+        14
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/key().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        7,
+        22,
+        28
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        9,
+        2,
+        3
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().(x)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        9,
+        6,
+        7
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        9,
+        12,
+        13
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/b().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        10,
+        2,
+        3
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/branching().(x)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        10,
+        7,
+        8
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        11,
+        7,
+        8
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        11,
+        12,
+        13
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/b().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        11,
+        17,
+        18
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/a().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        11,
+        22,
+        28
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        14,
+        2,
+        6
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/sink().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        14,
+        14,
+        20
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/actual().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        15,
+        2,
+        6
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/sink().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        15,
+        7,
+        10
+      ],
+      "symbol": "scip-typescript npm baleyg-edge-fixture 1.0.0 `cases.js`/obj.",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "cases.js",
+      "range": [
+        15,
+        11,
+        17
+      ],
+      "symbol": "local:cases.js:local 2",
+      "enclosingRange": [],
+      "stale": false
+    }
+  ],
+  "stats": {
+    "files": 1,
+    "nodes": 12,
+    "calls": 14,
+    "internal": 13,
+    "external": 0,
+    "unresolved": 1,
+    "ambiguous": 0,
+    "parseErrors": 0,
+    "occurrences": 35,
+    "referenceEnclosingRanges": 0,
+    "definitionEnclosingRanges": 9,
+    "semanticFresh": true,
+    "changedFiles": []
+  }
+}

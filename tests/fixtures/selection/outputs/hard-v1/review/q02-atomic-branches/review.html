@@ -1,0 +1,266 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>Blind selection review</title><style>
+  :root{color-scheme:light;--ink:oklch(.24 0 0);--bg:oklch(1 0 0);--muted:oklch(.43 0 0);--line:oklch(.78 0 0);--accent:oklch(.48 .16 20)}
+  *{box-sizing:border-box}body{margin:0;padding:2rem;font:16px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--ink)}main{max-width:1500px;margin:auto}h1{font-size:1.7rem}h2{font-size:1.3rem}h3{font-size:1rem}p{max-width:75ch}header{margin-bottom:2rem}.panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2rem}section{min-width:0;border-top:2px solid var(--ink)}svg{width:100%;max-height:720px}svg path{fill:none;stroke:var(--muted);stroke-width:1.5}polygon{fill:var(--muted)}rect{fill:var(--bg);stroke:var(--line)}text{fill:var(--ink);font:14px system-ui}details{border-top:1px solid var(--line);padding:.7rem 0}summary{cursor:pointer;overflow-wrap:anywhere}summary:hover{color:var(--accent)}summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}pre{overflow:auto;padding:.7rem;background:oklch(.96 0 0);font-size:.8rem}li,p{overflow-wrap:anywhere}ul{padding-left:1.2rem}small{color:var(--muted);overflow-wrap:anywhere}@media(max-width:1000px){.panels{grid-template-columns:1fr}body{padding:1rem}svg{max-width:560px}}
+  </style></head><body><main><header><h1>Blind selection review</h1><p><strong>How does protected file publication differ between create-only and replacement writes, including the beforeCommit hook?</strong></p><p>Call-selection sketch — not a sequence diagram or an execution trace. Judge only what helps answer this question; adjacent detail is not useful by default. Panels are shuffled. Arrows show measured direct calls only; hidden intermediates are never bridged. Callback references do not establish execution.</p><small>Graph snapshot: 9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db. Fixed candidate scope; source excerpts may be truncated.</small></header><div class="panels"><section aria-labelledby="panel-A"><h2 id="panel-A">Panel A</h2><p>2 shown · 3 measured direct calls</p><svg viewBox="0 0 460 130" role="img" aria-label="Panel A: function nodes and measured direct calls"><defs><marker id="arrow-A" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6"/></marker></defs><path data-call="call:core/atomic-write.js:1686" d="M 335 35 C 360 11, 360 124, 335 100" marker-end="url(#arrow-A)"><title>c001 → c004, line 31</title></path><path data-call="call:core/atomic-write.js:2151" d="M 335 35 C 374 11, 374 124, 335 100" marker-end="url(#arrow-A)"><title>c001 → c004, line 46</title></path><path data-call="call:core/atomic-write.js:3040" d="M 335 35 C 388 11, 388 124, 335 100" marker-end="url(#arrow-A)"><title>c001 → c004, line 63</title></path><g><title>writeProtectedFileAtomic — core/atomic-write.js:22</title><rect x="12" y="15" width="323" height="40" rx="4"/><text x="22" y="40">c001 · writeProtectedFileAtomic</text></g><g><title>assertSafeTarget — core/atomic-write.js:106</title><rect x="12" y="80" width="323" height="40" rx="4"/><text x="22" y="105">c004 · assertSafeTarget</text></g></svg><h3>Shown functions and source</h3><details><summary>c001 · writeProtectedFileAtomic — essential</summary><p>core/atomic-write.js:22–87</p><pre><code>export async function writeProtectedFileAtomic(rootDir, relativePath, data, options = {}) {
+  const targetPath = resolveProtectedPath(rootDir, relativePath);
+  const parentDir = resolve(targetPath, &quot;..&quot;);
+  const createOnly = options.createOnly === true;
+  const rename = options.fsOps?.rename ?? fsRename;
+  const link = options.fsOps?.link ?? fsLink;
+  const beforeCommit = options.hooks?.beforeCommit;
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(String(data), &quot;utf8&quot;);
+
+  await assertSafeTarget(targetPath, createOnly);
+
+  const tempPath = join(parentDir, `.${randomUUID()}.tmp`);
+  let handle = null;
+  let published = false;
+  try {
+    // &quot;wx&quot; is O_CREAT|O_EXCL|O_WRONLY: if the name exists, fail rather than adopt
+    // a file somebody else created.
+    handle = await open(tempPath, &quot;wx&quot;, 0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+
+    if (createOnly) {
+      await assertSafeTarget(targetPath, true);
+      if (typeof beforeCommit === &quot;function&quot;) await beforeCommit();
+      try { await link(tempPath, targetPath); } catch (error) {
+        if (error?.code === &quot;EEXIST&quot;) throw new ProtectedWriteError(&quot;protected create target already exists&quot;, error);
+        throw error;
+      }
+      published = true;
+      try { await unlink(tempPath); } catch (cleanupError) {
+        try { await unlink(tempPath); } catch (retryError) {
+          if (retryError?.code !== &quot;ENOENT&quot;) {
+            throw new ProtectedWriteError(&quot;protected create published target but temporary cleanup is indeterminate&quot;, retryError);
+          }
+        }
+        throw new ProtectedWriteError(&quot;protected create published target but initial temporary cleanup failed&quot;, cleanupError);
+      }
+    } else {
+      if (typeof beforeCommit === &quot;function&quot;) await beforeCommit();
+      await assertSafeTarget(targetPath, false);
+      await rename(tempPath, targetPath);
+      published = true;
+    }
+  } catch (error) {
+    if (handle) {
+      try { await handle.close(); } catch { /* the original error is the one that matters */ }
+    }
+    if (!published) {
+      try {
+        await unlink(tempPath);
+      } catch (cleanupError) {
+        if (cleanupError?.code !== &quot;ENOENT&quot;) {
+          throw new ProtectedWriteError(&quot;protected temporary file cleanup is indeterminate&quot;, cleanupError);
+        }
+      }
+    }
+    throw error instanceof ProtectedWriteError
+      ? error
+      : new ProtectedWriteError(&quot;protected file commit failed&quot;, error);
+  }
+
+  await syncDirectory(parentDir);
+  return { path: targetPath };
+}</code></pre><details><summary>Call boundaries (25)</summary><ul><li>call:core/atomic-write.js:1303, line 23: resolveProtectedPath → resolveProtectedPath (not shown) · internal</li><li>call:core/atomic-write.js:1368, line 24: resolve → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1611, line 29: Buffer.isBuffer → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1642, line 29: Buffer.from → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1654, line 29: String → unresolved / outside packet · ambiguous</li><li>call:core/atomic-write.js:1748, line 33: join → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1768, line 33: randomUUID → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1982, line 39: open → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2021, line 40: handle.writeFile → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2056, line 41: handle.sync → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2081, line 42: handle.close → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2239, line 47: beforeCommit → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:2273, line 48: link → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:2363, line 49: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:2508, line 53: unlink → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2571, line 54: unlink → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2677, line 56: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:2826, line 59: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:3012, line 62: beforeCommit → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:3089, line 64: rename → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:3205, line 69: handle.close → unresolved / outside packet · external</li><li>call:core/atomic-write.js:3336, line 73: unlink → unresolved / outside packet · external</li><li>call:core/atomic-write.js:3448, line 76: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:3633, line 82: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:3710, line 85: syncDirectory → syncDirectory (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c004 · assertSafeTarget — essential</summary><p>core/atomic-write.js:106–117</p><pre><code>async function assertSafeTarget(path, createOnly) {
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch (error) {
+    // Absent is the normal first-write case; anything else is unreadable state.
+    if (error?.code === &quot;ENOENT&quot;) return;
+    throw new ProtectedWriteError(&quot;protected file target could not be inspected&quot;, error);
+  }
+  if (createOnly) throw new ProtectedWriteError(&quot;protected create target already exists&quot;);
+  if (!stats.isFile()) throw new ProtectedWriteError(&quot;protected file target has an unsafe type&quot;);
+}</code></pre><details><summary>Call boundaries (5)</summary><ul><li>call:core/atomic-write.js:4614, line 109: lstat → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4780, line 113: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:4888, line 115: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:4962, line 116: stats.isFile → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4984, line 116: ProtectedWriteError → constructor (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>Collapsed / uncertain candidates</summary><ul><li>c005 · syncDirectory — <strong>supporting</strong> · core/atomic-write.js:119</li><li>c006 · writeProtectedJsonAtomic — <strong>supporting</strong> · core/atomic-write.js:18</li><li>c027 · coordinateRunJsonTransition — <strong>supporting</strong> · core/write-core.js:9</li><li>c029 · rename — <strong>supporting</strong> · core/write-core.js:47</li></ul></details><details><summary>Hidden candidates</summary><ul><li>c002 · constructor — <strong>incidental</strong> · core/atomic-write.js:12</li><li>c003 · resolveProtectedPath — <strong>incidental</strong> · core/atomic-write.js:89</li><li>c007 · withRunJsonLock — <strong>incidental</strong> · core/run-lock.js:18</li><li>c008 · canStealRunJsonLock — <strong>incidental</strong> · core/run-lock.js:79</li><li>c009 · readLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:83</li><li>c010 · stealByRename — <strong>incidental</strong> · core/run-lock.js:111</li><li>c011 · releaseOwnedRunJsonLock — <strong>incidental</strong> · core/run-lock.js:138</li><li>c012 · quarantineAndRemoveOwnedLock — <strong>incidental</strong> · core/run-lock.js:150</li><li>c013 · renameOwnedLockToQuarantine — <strong>incidental</strong> · core/run-lock.js:157</li><li>c014 · inspectLockOwnerLiveness — <strong>incidental</strong> · core/run-lock.js:174</li><li>c015 · lockOwnerEntryExists — <strong>incidental</strong> · core/run-lock.js:187</li><li>c016 · isDurableLockOwner — <strong>incidental</strong> · core/run-lock.js:197</li><li>c017 · sameLockOwner — <strong>incidental</strong> · core/run-lock.js:207</li><li>c018 · sameLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:211</li><li>c019 · lockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:218</li><li>c020 · sameLockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:228</li><li>c021 · normalizePositiveInteger — <strong>incidental</strong> · core/run-lock.js:232</li><li>c022 · delay — <strong>incidental</strong> · core/run-lock.js:239</li><li>c023 · &lt;callback@240:22&gt; — <strong>incidental</strong> · core/run-lock.js:240</li><li>c024 · ownerlessLockIsReclaimable — <strong>incidental</strong> · core/run-lock.js:251</li><li>c025 · isRecord — <strong>incidental</strong> · core/run-lock.js:263</li><li>c026 · stringValue — <strong>incidental</strong> · core/run-lock.js:267</li><li>c028 · &lt;callback@23:34&gt; — <strong>incidental</strong> · core/write-core.js:23</li><li>c030 · assertUnchanged — <strong>incidental</strong> · core/write-core.js:85</li><li>c031 · readRunState — <strong>incidental</strong> · core/write-core.js:91</li><li>c032 · contractRegistry — <strong>incidental</strong> · core/write-core.js:96</li><li>c033 · participantRegistry — <strong>incidental</strong> · core/write-core.js:114</li><li>c034 · projectAll — <strong>incidental</strong> · core/write-core.js:132</li><li>c035 · deepFreeze — <strong>incidental</strong> · core/write-core.js:142</li></ul></details></section><section aria-labelledby="panel-B"><h2 id="panel-B">Panel B</h2><p role="note"><strong>Run caveat:</strong> A validated selection was captured, but its session ended with an error. This panel is a partial run, not a normal completion.</p><p>2 shown · 3 measured direct calls</p><svg viewBox="0 0 460 130" role="img" aria-label="Panel B: function nodes and measured direct calls"><defs><marker id="arrow-B" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6"/></marker></defs><path data-call="call:core/atomic-write.js:1686" d="M 335 35 C 360 11, 360 124, 335 100" marker-end="url(#arrow-B)"><title>c001 → c004, line 31</title></path><path data-call="call:core/atomic-write.js:2151" d="M 335 35 C 374 11, 374 124, 335 100" marker-end="url(#arrow-B)"><title>c001 → c004, line 46</title></path><path data-call="call:core/atomic-write.js:3040" d="M 335 35 C 388 11, 388 124, 335 100" marker-end="url(#arrow-B)"><title>c001 → c004, line 63</title></path><g><title>writeProtectedFileAtomic — core/atomic-write.js:22</title><rect x="12" y="15" width="323" height="40" rx="4"/><text x="22" y="40">c001 · writeProtectedFileAtomic</text></g><g><title>assertSafeTarget — core/atomic-write.js:106</title><rect x="12" y="80" width="323" height="40" rx="4"/><text x="22" y="105">c004 · assertSafeTarget</text></g></svg><h3>Shown functions and source</h3><details><summary>c001 · writeProtectedFileAtomic — essential</summary><p>core/atomic-write.js:22–87</p><pre><code>export async function writeProtectedFileAtomic(rootDir, relativePath, data, options = {}) {
+  const targetPath = resolveProtectedPath(rootDir, relativePath);
+  const parentDir = resolve(targetPath, &quot;..&quot;);
+  const createOnly = options.createOnly === true;
+  const rename = options.fsOps?.rename ?? fsRename;
+  const link = options.fsOps?.link ?? fsLink;
+  const beforeCommit = options.hooks?.beforeCommit;
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(String(data), &quot;utf8&quot;);
+
+  await assertSafeTarget(targetPath, createOnly);
+
+  const tempPath = join(parentDir, `.${randomUUID()}.tmp`);
+  let handle = null;
+  let published = false;
+  try {
+    // &quot;wx&quot; is O_CREAT|O_EXCL|O_WRONLY: if the name exists, fail rather than adopt
+    // a file somebody else created.
+    handle = await open(tempPath, &quot;wx&quot;, 0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+
+    if (createOnly) {
+      await assertSafeTarget(targetPath, true);
+      if (typeof beforeCommit === &quot;function&quot;) await beforeCommit();
+      try { await link(tempPath, targetPath); } catch (error) {
+        if (error?.code === &quot;EEXIST&quot;) throw new ProtectedWriteError(&quot;protected create target already exists&quot;, error);
+        throw error;
+      }
+      published = true;
+      try { await unlink(tempPath); } catch (cleanupError) {
+        try { await unlink(tempPath); } catch (retryError) {
+          if (retryError?.code !== &quot;ENOENT&quot;) {
+            throw new ProtectedWriteError(&quot;protected create published target but temporary cleanup is indeterminate&quot;, retryError);
+          }
+        }
+        throw new ProtectedWriteError(&quot;protected create published target but initial temporary cleanup failed&quot;, cleanupError);
+      }
+    } else {
+      if (typeof beforeCommit === &quot;function&quot;) await beforeCommit();
+      await assertSafeTarget(targetPath, false);
+      await rename(tempPath, targetPath);
+      published = true;
+    }
+  } catch (error) {
+    if (handle) {
+      try { await handle.close(); } catch { /* the original error is the one that matters */ }
+    }
+    if (!published) {
+      try {
+        await unlink(tempPath);
+      } catch (cleanupError) {
+        if (cleanupError?.code !== &quot;ENOENT&quot;) {
+          throw new ProtectedWriteError(&quot;protected temporary file cleanup is indeterminate&quot;, cleanupError);
+        }
+      }
+    }
+    throw error instanceof ProtectedWriteError
+      ? error
+      : new ProtectedWriteError(&quot;protected file commit failed&quot;, error);
+  }
+
+  await syncDirectory(parentDir);
+  return { path: targetPath };
+}</code></pre><details><summary>Call boundaries (25)</summary><ul><li>call:core/atomic-write.js:1303, line 23: resolveProtectedPath → resolveProtectedPath (not shown) · internal</li><li>call:core/atomic-write.js:1368, line 24: resolve → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1611, line 29: Buffer.isBuffer → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1642, line 29: Buffer.from → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1654, line 29: String → unresolved / outside packet · ambiguous</li><li>call:core/atomic-write.js:1748, line 33: join → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1768, line 33: randomUUID → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1982, line 39: open → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2021, line 40: handle.writeFile → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2056, line 41: handle.sync → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2081, line 42: handle.close → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2239, line 47: beforeCommit → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:2273, line 48: link → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:2363, line 49: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:2508, line 53: unlink → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2571, line 54: unlink → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2677, line 56: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:2826, line 59: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:3012, line 62: beforeCommit → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:3089, line 64: rename → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:3205, line 69: handle.close → unresolved / outside packet · external</li><li>call:core/atomic-write.js:3336, line 73: unlink → unresolved / outside packet · external</li><li>call:core/atomic-write.js:3448, line 76: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:3633, line 82: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:3710, line 85: syncDirectory → syncDirectory (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c004 · assertSafeTarget — essential</summary><p>core/atomic-write.js:106–117</p><pre><code>async function assertSafeTarget(path, createOnly) {
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch (error) {
+    // Absent is the normal first-write case; anything else is unreadable state.
+    if (error?.code === &quot;ENOENT&quot;) return;
+    throw new ProtectedWriteError(&quot;protected file target could not be inspected&quot;, error);
+  }
+  if (createOnly) throw new ProtectedWriteError(&quot;protected create target already exists&quot;);
+  if (!stats.isFile()) throw new ProtectedWriteError(&quot;protected file target has an unsafe type&quot;);
+}</code></pre><details><summary>Call boundaries (5)</summary><ul><li>call:core/atomic-write.js:4614, line 109: lstat → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4780, line 113: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:4888, line 115: ProtectedWriteError → constructor (not shown) · internal</li><li>call:core/atomic-write.js:4962, line 116: stats.isFile → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4984, line 116: ProtectedWriteError → constructor (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>Collapsed / uncertain candidates</summary><ul><li>c002 · constructor — <strong>supporting</strong> · core/atomic-write.js:12</li><li>c005 · syncDirectory — <strong>supporting</strong> · core/atomic-write.js:119</li><li>c028 · &lt;callback@23:34&gt; — <strong>supporting</strong> · core/write-core.js:23</li><li>c029 · rename — <strong>supporting</strong> · core/write-core.js:47</li></ul></details><details><summary>Hidden candidates</summary><ul><li>c003 · resolveProtectedPath — <strong>incidental</strong> · core/atomic-write.js:89</li><li>c006 · writeProtectedJsonAtomic — <strong>incidental</strong> · core/atomic-write.js:18</li><li>c007 · withRunJsonLock — <strong>incidental</strong> · core/run-lock.js:18</li><li>c008 · canStealRunJsonLock — <strong>incidental</strong> · core/run-lock.js:79</li><li>c009 · readLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:83</li><li>c010 · stealByRename — <strong>incidental</strong> · core/run-lock.js:111</li><li>c011 · releaseOwnedRunJsonLock — <strong>incidental</strong> · core/run-lock.js:138</li><li>c012 · quarantineAndRemoveOwnedLock — <strong>incidental</strong> · core/run-lock.js:150</li><li>c013 · renameOwnedLockToQuarantine — <strong>incidental</strong> · core/run-lock.js:157</li><li>c014 · inspectLockOwnerLiveness — <strong>incidental</strong> · core/run-lock.js:174</li><li>c015 · lockOwnerEntryExists — <strong>incidental</strong> · core/run-lock.js:187</li><li>c016 · isDurableLockOwner — <strong>incidental</strong> · core/run-lock.js:197</li><li>c017 · sameLockOwner — <strong>incidental</strong> · core/run-lock.js:207</li><li>c018 · sameLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:211</li><li>c019 · lockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:218</li><li>c020 · sameLockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:228</li><li>c021 · normalizePositiveInteger — <strong>incidental</strong> · core/run-lock.js:232</li><li>c022 · delay — <strong>incidental</strong> · core/run-lock.js:239</li><li>c023 · &lt;callback@240:22&gt; — <strong>incidental</strong> · core/run-lock.js:240</li><li>c024 · ownerlessLockIsReclaimable — <strong>incidental</strong> · core/run-lock.js:251</li><li>c025 · isRecord — <strong>incidental</strong> · core/run-lock.js:263</li><li>c026 · stringValue — <strong>incidental</strong> · core/run-lock.js:267</li><li>c027 · coordinateRunJsonTransition — <strong>incidental</strong> · core/write-core.js:9</li><li>c030 · assertUnchanged — <strong>incidental</strong> · core/write-core.js:85</li><li>c031 · readRunState — <strong>incidental</strong> · core/write-core.js:91</li><li>c032 · contractRegistry — <strong>incidental</strong> · core/write-core.js:96</li><li>c033 · participantRegistry — <strong>incidental</strong> · core/write-core.js:114</li><li>c034 · projectAll — <strong>incidental</strong> · core/write-core.js:132</li><li>c035 · deepFreeze — <strong>incidental</strong> · core/write-core.js:142</li></ul></details></section><section aria-labelledby="panel-C"><h2 id="panel-C">Panel C</h2><p>5 shown · 17 measured direct calls</p><svg viewBox="0 0 460 325" role="img" aria-label="Panel C: function nodes and measured direct calls"><defs><marker id="arrow-C" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6"/></marker></defs><path data-call="call:core/atomic-write.js:1303" d="M 335 35 C 360 11, 360 189, 335 165" marker-end="url(#arrow-C)"><title>c001 → c003, line 23</title></path><path data-call="call:core/atomic-write.js:1686" d="M 335 35 C 374 11, 374 254, 335 230" marker-end="url(#arrow-C)"><title>c001 → c004, line 31</title></path><path data-call="call:core/atomic-write.js:2151" d="M 335 35 C 388 11, 388 254, 335 230" marker-end="url(#arrow-C)"><title>c001 → c004, line 46</title></path><path data-call="call:core/atomic-write.js:2363" d="M 335 35 C 402 11, 402 124, 335 100" marker-end="url(#arrow-C)"><title>c001 → c002, line 49</title></path><path data-call="call:core/atomic-write.js:2677" d="M 335 35 C 416 11, 416 124, 335 100" marker-end="url(#arrow-C)"><title>c001 → c002, line 56</title></path><path data-call="call:core/atomic-write.js:2826" d="M 335 35 C 430 11, 430 124, 335 100" marker-end="url(#arrow-C)"><title>c001 → c002, line 59</title></path><path data-call="call:core/atomic-write.js:3040" d="M 335 35 C 360 11, 360 254, 335 230" marker-end="url(#arrow-C)"><title>c001 → c004, line 63</title></path><path data-call="call:core/atomic-write.js:3448" d="M 335 35 C 374 11, 374 124, 335 100" marker-end="url(#arrow-C)"><title>c001 → c002, line 76</title></path><path data-call="call:core/atomic-write.js:3633" d="M 335 35 C 388 11, 388 124, 335 100" marker-end="url(#arrow-C)"><title>c001 → c002, line 82</title></path><path data-call="call:core/atomic-write.js:3710" d="M 335 35 C 402 11, 402 319, 335 295" marker-end="url(#arrow-C)"><title>c001 → c005, line 85</title></path><path data-call="call:core/atomic-write.js:3915" d="M 335 165 C 416 141, 416 124, 335 100" marker-end="url(#arrow-C)"><title>c003 → c002, line 91</title></path><path data-call="call:core/atomic-write.js:4082" d="M 335 165 C 430 141, 430 124, 335 100" marker-end="url(#arrow-C)"><title>c003 → c002, line 94</title></path><path data-call="call:core/atomic-write.js:4426" d="M 335 165 C 360 141, 360 124, 335 100" marker-end="url(#arrow-C)"><title>c003 → c002, line 101</title></path><path data-call="call:core/atomic-write.js:4780" d="M 335 230 C 374 206, 374 124, 335 100" marker-end="url(#arrow-C)"><title>c004 → c002, line 113</title></path><path data-call="call:core/atomic-write.js:4888" d="M 335 230 C 388 206, 388 124, 335 100" marker-end="url(#arrow-C)"><title>c004 → c002, line 115</title></path><path data-call="call:core/atomic-write.js:4984" d="M 335 230 C 402 206, 402 124, 335 100" marker-end="url(#arrow-C)"><title>c004 → c002, line 116</title></path><path data-call="call:core/atomic-write.js:5458" d="M 335 295 C 416 271, 416 124, 335 100" marker-end="url(#arrow-C)"><title>c005 → c002, line 128</title></path><g><title>writeProtectedFileAtomic — core/atomic-write.js:22</title><rect x="12" y="15" width="323" height="40" rx="4"/><text x="22" y="40">c001 · writeProtectedFileAtomic</text></g><g><title>constructor — core/atomic-write.js:12</title><rect x="12" y="80" width="323" height="40" rx="4"/><text x="22" y="105">c002 · constructor</text></g><g><title>resolveProtectedPath — core/atomic-write.js:89</title><rect x="12" y="145" width="323" height="40" rx="4"/><text x="22" y="170">c003 · resolveProtectedPath</text></g><g><title>assertSafeTarget — core/atomic-write.js:106</title><rect x="12" y="210" width="323" height="40" rx="4"/><text x="22" y="235">c004 · assertSafeTarget</text></g><g><title>syncDirectory — core/atomic-write.js:119</title><rect x="12" y="275" width="323" height="40" rx="4"/><text x="22" y="300">c005 · syncDirectory</text></g></svg><h3>Shown functions and source</h3><details><summary>c001 · writeProtectedFileAtomic — essential</summary><p>core/atomic-write.js:22–87</p><pre><code>export async function writeProtectedFileAtomic(rootDir, relativePath, data, options = {}) {
+  const targetPath = resolveProtectedPath(rootDir, relativePath);
+  const parentDir = resolve(targetPath, &quot;..&quot;);
+  const createOnly = options.createOnly === true;
+  const rename = options.fsOps?.rename ?? fsRename;
+  const link = options.fsOps?.link ?? fsLink;
+  const beforeCommit = options.hooks?.beforeCommit;
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(String(data), &quot;utf8&quot;);
+
+  await assertSafeTarget(targetPath, createOnly);
+
+  const tempPath = join(parentDir, `.${randomUUID()}.tmp`);
+  let handle = null;
+  let published = false;
+  try {
+    // &quot;wx&quot; is O_CREAT|O_EXCL|O_WRONLY: if the name exists, fail rather than adopt
+    // a file somebody else created.
+    handle = await open(tempPath, &quot;wx&quot;, 0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+
+    if (createOnly) {
+      await assertSafeTarget(targetPath, true);
+      if (typeof beforeCommit === &quot;function&quot;) await beforeCommit();
+      try { await link(tempPath, targetPath); } catch (error) {
+        if (error?.code === &quot;EEXIST&quot;) throw new ProtectedWriteError(&quot;protected create target already exists&quot;, error);
+        throw error;
+      }
+      published = true;
+      try { await unlink(tempPath); } catch (cleanupError) {
+        try { await unlink(tempPath); } catch (retryError) {
+          if (retryError?.code !== &quot;ENOENT&quot;) {
+            throw new ProtectedWriteError(&quot;protected create published target but temporary cleanup is indeterminate&quot;, retryError);
+          }
+        }
+        throw new ProtectedWriteError(&quot;protected create published target but initial temporary cleanup failed&quot;, cleanupError);
+      }
+    } else {
+      if (typeof beforeCommit === &quot;function&quot;) await beforeCommit();
+      await assertSafeTarget(targetPath, false);
+      await rename(tempPath, targetPath);
+      published = true;
+    }
+  } catch (error) {
+    if (handle) {
+      try { await handle.close(); } catch { /* the original error is the one that matters */ }
+    }
+    if (!published) {
+      try {
+        await unlink(tempPath);
+      } catch (cleanupError) {
+        if (cleanupError?.code !== &quot;ENOENT&quot;) {
+          throw new ProtectedWriteError(&quot;protected temporary file cleanup is indeterminate&quot;, cleanupError);
+        }
+      }
+    }
+    throw error instanceof ProtectedWriteError
+      ? error
+      : new ProtectedWriteError(&quot;protected file commit failed&quot;, error);
+  }
+
+  await syncDirectory(parentDir);
+  return { path: targetPath };
+}</code></pre><details><summary>Call boundaries (18)</summary><ul><li>call:core/atomic-write.js:1368, line 24: resolve → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1611, line 29: Buffer.isBuffer → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1642, line 29: Buffer.from → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1654, line 29: String → unresolved / outside packet · ambiguous</li><li>call:core/atomic-write.js:1748, line 33: join → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1768, line 33: randomUUID → unresolved / outside packet · external</li><li>call:core/atomic-write.js:1982, line 39: open → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2021, line 40: handle.writeFile → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2056, line 41: handle.sync → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2081, line 42: handle.close → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2239, line 47: beforeCommit → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:2273, line 48: link → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:2508, line 53: unlink → unresolved / outside packet · external</li><li>call:core/atomic-write.js:2571, line 54: unlink → unresolved / outside packet · external</li><li>call:core/atomic-write.js:3012, line 62: beforeCommit → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:3089, line 64: rename → unresolved / outside packet · unresolved</li><li>call:core/atomic-write.js:3205, line 69: handle.close → unresolved / outside packet · external</li><li>call:core/atomic-write.js:3336, line 73: unlink → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c002 · constructor — essential</summary><p>core/atomic-write.js:12–15</p><pre><code>  constructor(message, cause) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = &quot;ProtectedWriteError&quot;;
+  }</code></pre><details><summary>Call boundaries (1)</summary><ul><li>call:core/atomic-write.js:887, line 13: super → unresolved / outside packet · unresolved</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c003 · resolveProtectedPath — essential</summary><p>core/atomic-write.js:89–104</p><pre><code>function resolveProtectedPath(rootDir, relativePath) {
+  if (typeof rootDir !== &quot;string&quot; || !rootDir.trim() || !isAbsolute(rootDir)) {
+    throw new ProtectedWriteError(&quot;protected file root is invalid&quot;);
+  }
+  if (typeof relativePath !== &quot;string&quot; || !relativePath.trim() || isAbsolute(relativePath)) {
+    throw new ProtectedWriteError(&quot;protected relative path is invalid&quot;);
+  }
+  const root = resolve(rootDir);
+  const targetPath = resolve(root, relativePath);
+  // Containment, not string prefixing: comparing against `${root}${sep}` refuses
+  // `/a/bc` for root `/a/b`.
+  if (targetPath === root || !targetPath.startsWith(`${root}${sep}`)) {
+    throw new ProtectedWriteError(&quot;protected relative path escapes its root&quot;);
+  }
+  return targetPath;
+}</code></pre><details><summary>Call boundaries (7)</summary><ul><li>call:core/atomic-write.js:3863, line 90: rootDir.trim → unresolved / outside packet · external</li><li>call:core/atomic-write.js:3882, line 90: isAbsolute → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4021, line 93: relativePath.trim → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4044, line 93: isAbsolute → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4164, line 96: resolve → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4203, line 97: resolve → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4374, line 100: targetPath.startsWith → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c004 · assertSafeTarget — essential</summary><p>core/atomic-write.js:106–117</p><pre><code>async function assertSafeTarget(path, createOnly) {
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch (error) {
+    // Absent is the normal first-write case; anything else is unreadable state.
+    if (error?.code === &quot;ENOENT&quot;) return;
+    throw new ProtectedWriteError(&quot;protected file target could not be inspected&quot;, error);
+  }
+  if (createOnly) throw new ProtectedWriteError(&quot;protected create target already exists&quot;);
+  if (!stats.isFile()) throw new ProtectedWriteError(&quot;protected file target has an unsafe type&quot;);
+}</code></pre><details><summary>Call boundaries (2)</summary><ul><li>call:core/atomic-write.js:4614, line 109: lstat → unresolved / outside packet · external</li><li>call:core/atomic-write.js:4962, line 116: stats.isFile → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c005 · syncDirectory — essential</summary><p>core/atomic-write.js:119–135</p><pre><code>async function syncDirectory(dir) {
+  let handle = null;
+  try {
+    handle = await open(dir, &quot;r&quot;);
+    await handle.sync();
+  } catch (error) {
+    // A filesystem that refuses to fsync a directory is not a reason to fail a
+    // write that already committed: durability degrades, correctness does not.
+    if (![&quot;EINVAL&quot;, &quot;EPERM&quot;, &quot;EISDIR&quot;, &quot;EACCES&quot;, &quot;ENOTSUP&quot;].includes(error?.code)) {
+      throw new ProtectedWriteError(&quot;protected target is committed but directory sync failed&quot;, error);
+    }
+  } finally {
+    if (handle) {
+      try { await handle.close(); } catch { /* nothing actionable */ }
+    }
+  }
+}</code></pre><details><summary>Call boundaries (4)</summary><ul><li>call:core/atomic-write.js:5140, line 122: open → unresolved / outside packet · external</li><li>call:core/atomic-write.js:5166, line 123: handle.sync → unresolved / outside packet · external</li><li>call:core/atomic-write.js:5370, line 127: [&quot;EINVAL&quot;, &quot;EPERM&quot;, &quot;EISDIR&quot;, &quot;EACCES&quot;, &quot;ENOTSUP&quot;].includes → unresolved / outside packet · external</li><li>call:core/atomic-write.js:5605, line 132: handle.close → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>Collapsed / uncertain candidates</summary><ul><li>c006 · writeProtectedJsonAtomic — <strong>uncertain</strong> · core/atomic-write.js:18</li></ul></details><details><summary>Hidden candidates</summary><ul><li>c007 · withRunJsonLock — <strong>incidental</strong> · core/run-lock.js:18</li><li>c008 · canStealRunJsonLock — <strong>incidental</strong> · core/run-lock.js:79</li><li>c009 · readLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:83</li><li>c010 · stealByRename — <strong>incidental</strong> · core/run-lock.js:111</li><li>c011 · releaseOwnedRunJsonLock — <strong>incidental</strong> · core/run-lock.js:138</li><li>c012 · quarantineAndRemoveOwnedLock — <strong>incidental</strong> · core/run-lock.js:150</li><li>c013 · renameOwnedLockToQuarantine — <strong>incidental</strong> · core/run-lock.js:157</li><li>c014 · inspectLockOwnerLiveness — <strong>incidental</strong> · core/run-lock.js:174</li><li>c015 · lockOwnerEntryExists — <strong>incidental</strong> · core/run-lock.js:187</li><li>c016 · isDurableLockOwner — <strong>incidental</strong> · core/run-lock.js:197</li><li>c017 · sameLockOwner — <strong>incidental</strong> · core/run-lock.js:207</li><li>c018 · sameLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:211</li><li>c019 · lockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:218</li><li>c020 · sameLockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:228</li><li>c021 · normalizePositiveInteger — <strong>incidental</strong> · core/run-lock.js:232</li><li>c022 · delay — <strong>incidental</strong> · core/run-lock.js:239</li><li>c023 · &lt;callback@240:22&gt; — <strong>incidental</strong> · core/run-lock.js:240</li><li>c024 · ownerlessLockIsReclaimable — <strong>incidental</strong> · core/run-lock.js:251</li><li>c025 · isRecord — <strong>incidental</strong> · core/run-lock.js:263</li><li>c026 · stringValue — <strong>incidental</strong> · core/run-lock.js:267</li><li>c027 · coordinateRunJsonTransition — <strong>incidental</strong> · core/write-core.js:9</li><li>c028 · &lt;callback@23:34&gt; — <strong>incidental</strong> · core/write-core.js:23</li><li>c029 · rename — <strong>incidental</strong> · core/write-core.js:47</li><li>c030 · assertUnchanged — <strong>incidental</strong> · core/write-core.js:85</li><li>c031 · readRunState — <strong>incidental</strong> · core/write-core.js:91</li><li>c032 · contractRegistry — <strong>incidental</strong> · core/write-core.js:96</li><li>c033 · participantRegistry — <strong>incidental</strong> · core/write-core.js:114</li><li>c034 · projectAll — <strong>incidental</strong> · core/write-core.js:132</li><li>c035 · deepFreeze — <strong>incidental</strong> · core/write-core.js:142</li></ul></details></section></div></main></body></html>

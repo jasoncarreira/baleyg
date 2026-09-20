@@ -1,0 +1,22 @@
+{
+  "bin/factory.js": "018e7f7a808ad4619d6a7b2dea4fcabf0bed02fdc0c760918a3a43b97609f8b5",
+  "bin/init-publication.js": "009a516062cdba155ce504d999526160ff44e91b48e0b6ab9b7547387a1888d1",
+  "core/atomic-write.js": "b9447c6d3d8933e4d2d24ee376ee1c6b25ce680e60cf32c2b7da598e557053aa",
+  "core/contracts.js": "ddba9e2f58bb5b908dec870b9973e53bee929631698b8a7ec68c2c91c7021264",
+  "core/effective-push.js": "24f39a5eb589b04507603579fb884925f8ff8314e3fffe222a852c62f289a682",
+  "core/executable.js": "08d5c9e7567889dada44e9f08a650eb8e1cffed3d8e74e55e2e2f0fbdd5215a5",
+  "core/run-lock.js": "84d96bff0d101a6459f40196f71c770e3e14128605026d8979d17ab440d974c6",
+  "core/write-core.js": "09b7519b9afb7137a2fb45965400d539c1302eef79946727a8e802048ef7afee",
+  "observe/index.js": "c1efc2b0b4d6e23867bff0e1bd61ab105ec02e9b6f52b797e2d3d7da5b24af25",
+  "observe/repair-record.js": "3a8f9db4ab022aad1feb345ee5f05a23e92978b3018a1a10721bd9701de42cc9",
+  "observe/repair-reverification.js": "7761ec88d4bc732396f06af8300416d30adf33e62eb3c869d0fe6a5902ec55dc",
+  "observe/repository-config.js": "996bf19d4f4a765a9e187b4a3edcabf2bc9e05c07b519f18b7605258edd726e7",
+  "observe/review.js": "8ee47bb48dcbcf8d317562ed2ac858e29076d83402ffa6ed65309674b70222a1",
+  "package.json": "e4ddc95fa93d1894f0068219371c25d2842bcb3d5a7c0f35e1c21b01f3987af8",
+  "state/index.js": "87a5adc143c89e3c9b8549b1b34c4ec7d70b22ef64425a45377fd77e8dd51bea",
+  "state/review-archive.js": "36329806ba2c7655dcbfad24e8bd39cd13cf1a7d29374caa42ba43e65b6a3af7",
+  "state/schema.js": "17b756adb51b45f92ea2ded751ca6b4e3fc625b261d54d64bd60c8fc05b22dfb",
+  "state/session-lock.js": "3618cd536c6d737ddc92a4f7f9c3ce05e5937e00ed1fb89b55758b67fd6de4df",
+  "state/transition.js": "08f0f29d87376dfc1e23a9a95645326e9ec878b4de7138c6168f24d063686459",
+  "tsconfig.json": "102bfd99d6c531b38d4ec411292fa5dab09a6c1b8de86a681ee6b3cdce330947"
+}

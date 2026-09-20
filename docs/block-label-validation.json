@@ -1,0 +1,83 @@
+{
+  "feature": "clipped-corner control block labels",
+  "revision": 8,
+  "production": "http://127.0.0.1:8877",
+  "stats": {
+    "files": 88,
+    "symbols": 3016,
+    "calls": 15753,
+    "regions": 3071,
+    "internal": 0,
+    "external": 0,
+    "unresolved": 15753,
+    "ambiguous": 0,
+    "parseErrorFiles": 0,
+    "semanticState": "unavailable",
+    "changedFiles": []
+  },
+  "tests": {
+    "rustPassed": 262,
+    "rustIgnored": 1,
+    "uiPassed": 173,
+    "rendererPassed": 16,
+    "fmt": true,
+    "clippyWarningsDenied": true,
+    "build": true,
+    "remoteCI": false
+  },
+  "browser": {
+    "realMethods": [
+      "src/acp.rs::check_file_with_unlinked",
+      "src/dependency_rust.rs::hash"
+    ],
+    "operatorTabs": [
+      "alt",
+      "loop"
+    ],
+    "clickTabPathSelectsOriginalStep": true,
+    "clickOperatorSelectsOriginalStep": true,
+    "keyboardEnterSelectsOriginalStep": true,
+    "selectionDoesNotOpenSource": true,
+    "explicitSourceHighlightLines": [
+      29,
+      32
+    ],
+    "chainEntryPreviewArrows": 1,
+    "guardGapPixels": 12,
+    "desktop": [
+      1440,
+      900
+    ],
+    "mobile": [
+      390,
+      844
+    ],
+    "pageHorizontalOverflow": false,
+    "syntheticWrappedGuardDepth": 50,
+    "syntheticWrappedGuardsInsideFrame": true,
+    "syntheticWrappedHeaderChildOverlaps": 0
+  },
+  "preservation": {
+    "views": true,
+    "annotations": true,
+    "tokenAndHistoricalBudgetBytes": true,
+    "providersDisabled": true,
+    "originalDtoCallbacksAndControlTree": true
+  },
+  "notes": [
+    "UML-style presentation only, not inferred UML semantics.",
+    "Guard descriptions come from original evidence, never invented source predicates.",
+    "No activation bars or return arrows added.",
+    "try and generic block tab mappings covered by unit tests."
+  ],
+  "screenshots": [
+    "docs/images/block-labels-desktop.png",
+    "docs/images/block-labels-loop.png",
+    "docs/images/block-labels-mobile.png"
+  ],
+  "sourceHashes": {
+    "web/sequence.js": "dd2bd0f067e6f5e921d0e4b59472af8f47a600bef357f480b6b40edbb0b84cf5",
+    "web/style.css": "1891c176b0c8d603639e8177f9597d0445f2b9be865bef8e481fa3f96b46b787",
+    "tests/sequence-ui.test.cjs": "9c3e413c29d7de7d5b56225f1ca30a40d2f8faa8c634104aa852642478ffcbd1"
+  }
+}

@@ -1,0 +1,662 @@
+{
+  "schemaVersion": 1,
+  "provider": "claude-acp",
+  "contextDelivery": "inline",
+  "reservationId": "8411d5cb-478a-45ca-a7fc-cb69441a2f5a",
+  "packetHash": "ab97746f75547d63c2e1ca0642cb64a4c88c70ddf54c427aea509883baabc81e",
+  "providerPacketHash": "75cae5238c322ea99bfeadf91d57f24979ffb4d62f79c2fd436af7753d8bc64d",
+  "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "questionId": "q04-transition-cas",
+  "requestedModel": "opus[1m]",
+  "packetBytes": 178621,
+  "providerPacketBytes": 90896,
+  "limits": {
+    "reserveUsd": 1.6,
+    "maxBudgetUsd": 1.2,
+    "maxTurns": 4,
+    "maxOutputTokens": 4096,
+    "maxMcpOutputTokens": 64000,
+    "timeoutMs": 120000
+  },
+  "costNote": "Provider-reported token-equivalent USD estimate, not actual subscription cash charge; unknown/failed cost retains the full reservation. Not an invoice guarantee.",
+  "negotiated": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "@agentclientprotocol/claude-agent-acp",
+      "title": "Claude Agent",
+      "version": "0.79.0"
+    },
+    "agentCapabilities": {
+      "_meta": {
+        "claudeCode": {
+          "promptQueueing": true
+        },
+        "authStatus": {}
+      },
+      "promptCapabilities": {
+        "image": true,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "auth": {
+        "logout": {}
+      },
+      "providers": {},
+      "loadSession": true,
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "list": {},
+        "resume": {},
+        "subagents": {}
+      }
+    }
+  },
+  "models": null,
+  "configOptions": [
+    {
+      "id": "mode",
+      "name": "Mode",
+      "description": "Session permission mode",
+      "category": "mode",
+      "type": "select",
+      "currentValue": "default",
+      "options": [
+        {
+          "value": "default",
+          "name": "Manual",
+          "description": "Always ask before making changes",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "acceptEdits",
+          "name": "Accept edits",
+          "description": "Automatically accept all file edits",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "plan",
+          "name": "Plan",
+          "description": "Create a plan before making changes",
+          "_meta": {
+            "kind": "plan"
+          }
+        },
+        {
+          "value": "auto",
+          "name": "Auto",
+          "description": "Claude handles permission decisions",
+          "_meta": {
+            "kind": "auto_review"
+          }
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "name": "Model",
+      "description": "AI model to use",
+      "category": "model",
+      "type": "select",
+      "currentValue": "opus[1m]",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default (recommended)",
+          "description": "Opus (1M context)"
+        },
+        {
+          "value": "opus[1m]",
+          "name": "Opus 5",
+          "description": "Opus 5 with 1M context · Best for everyday, complex tasks"
+        },
+        {
+          "value": "claude-fable-5-1[1m]",
+          "name": "Fable 5.1",
+          "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks"
+        },
+        {
+          "value": "sonnet",
+          "name": "Sonnet 5",
+          "description": "Sonnet 5 · Efficient for routine tasks"
+        },
+        {
+          "value": "haiku",
+          "name": "Haiku 4.5",
+          "description": "Haiku 4.5 · Fastest for quick answers"
+        }
+      ]
+    },
+    {
+      "id": "effort",
+      "name": "Effort",
+      "description": "Available effort levels for this model",
+      "category": "thought_level",
+      "type": "select",
+      "currentValue": "low",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default"
+        },
+        {
+          "value": "low",
+          "name": "Low"
+        },
+        {
+          "value": "medium",
+          "name": "Medium"
+        },
+        {
+          "value": "high",
+          "name": "High"
+        },
+        {
+          "value": "xhigh",
+          "name": "Xhigh"
+        },
+        {
+          "value": "max",
+          "name": "Max"
+        }
+      ]
+    },
+    {
+      "id": "fast",
+      "name": "Fast mode",
+      "description": "Faster responses on supported models",
+      "category": "model_config",
+      "type": "select",
+      "currentValue": "off",
+      "options": [
+        {
+          "value": "on",
+          "name": "On"
+        },
+        {
+          "value": "off",
+          "name": "Off"
+        }
+      ]
+    }
+  ],
+  "currentModelId": "opus[1m]",
+  "status": "validated-emission-terminal-error",
+  "errorEvidence": {
+    "category": "prompt_failed",
+    "code": -32603,
+    "stage": "prompt",
+    "sdkCategory": "error_max_budget_usd"
+  },
+  "error": "ACP smoke failed during prompt; see redacted local diagnostics. No retry was attempted.",
+  "phaseTimingsMs": {
+    "launch": 7,
+    "initialize": 289,
+    "session": 622,
+    "model_selection": 6,
+    "prompt": 26099,
+    "cleanup": 304
+  },
+  "toolCallAudit": {
+    "count": 1,
+    "names": [
+      "mcp__selection__emit_view"
+    ]
+  },
+  "toolResponseAudit": {
+    "count": 1,
+    "dropped": 0,
+    "responses": [
+      {
+        "name": "mcp__selection__emit_view",
+        "status": "completed",
+        "serializedBytes": 34,
+        "textBytes": 28,
+        "textChars": 28,
+        "textBlocks": 1,
+        "markers": {
+          "persistedOutput": false,
+          "outputTruncated": false,
+          "savedToFile": false
+        }
+      }
+    ]
+  },
+  "latencyMs": 27327,
+  "permissionsDenied": 0,
+  "permissionAudit": [],
+  "auth": {
+    "kind": "account",
+    "plan": "team"
+  },
+  "usageUpdates": [
+    {
+      "used": 42419,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 44088,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 157726,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 158053,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 158053,
+      "size": 1000000,
+      "cost": {
+        "amount": 1.6598305,
+        "currency": "USD"
+      }
+    }
+  ],
+  "reportedEstimatedUsd": 1.6598305,
+  "settledUsd": null,
+  "terminalStatus": "failed",
+  "selectionCaveat": "A validated selection was captured, but its session ended with an error. This panel is a partial run, not a normal completion.",
+  "decisions": [
+    {
+      "candidateId": "c001",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c002",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c003",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c004",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c005",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c006",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c007",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c008",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c009",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c010",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c011",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c012",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c013",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c014",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c015",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c016",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c017",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c018",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c019",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c020",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c021",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c022",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c023",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c024",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c025",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c026",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c027",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c028",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c029",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c030",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c031",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c032",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c033",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c034",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c035",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c036",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c037",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c038",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c039",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c040",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c041",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c042",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c043",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c044",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c045",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c046",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c047",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c048",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c049",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c050",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c051",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c052",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c053",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c054",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c055",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c056",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c057",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c058",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c059",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c060",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c061",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c062",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c063",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c064",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c065",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c066",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c067",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c068",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c069",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c070",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c071",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c072",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c073",
+      "relevance": "essential"
+    }
+  ],
+  "view": {
+    "questionId": "q04-transition-cas",
+    "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+    "visible": [
+      "scip-typescript npm feature-factory 0.9.0 state/`transition.js`/transition().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/coordinateRunJsonTransition().",
+      "syntax:core/write-core.js:814:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/writeProtectedJsonAtomic().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/readRunState().",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/writeProtectedFileAtomic().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/rename0:",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/assertUnchanged()."
+    ],
+    "collapsed": [
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/withRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/projectAll().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/deepFreeze().",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/assertSafeTarget()."
+    ],
+    "hidden": [
+      "syntax:state/transition.js:834:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/contractRegistry().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/participantRegistry().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/canStealRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/readLockOwnerEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stealByRename().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/releaseOwnedRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/quarantineAndRemoveOwnedLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockOwnerEntryExists().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwner().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockDirectoryIdentity().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockDirectoryIdentity().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/normalizePositiveInteger().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/delay().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/ownerlessLockIsReclaimable().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/renameOwnedLockToQuarantine().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/inspectLockOwnerLiveness().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isDurableLockOwner().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwnerEvidence().",
+      "syntax:core/run-lock.js:11558:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/ProtectedWriteError#`<constructor>`().",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/resolveProtectedPath().",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/syncDirectory().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isRecord().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stringValue().",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/callRegisteredObserver().",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/contract().",
+      "syntax:core/contracts.js:1541:arrow_function",
+      "syntax:core/contracts.js:1705:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/project1:",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/validateTransition1:",
+      "syntax:core/contracts.js:3600:arrow_function",
+      "syntax:core/contracts.js:3844:arrow_function",
+      "syntax:core/contracts.js:4550:arrow_function",
+      "syntax:core/contracts.js:4769:arrow_function",
+      "syntax:core/contracts.js:5699:arrow_function",
+      "syntax:core/contracts.js:5977:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/checkPrePrApproval().",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/project2:",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/validateTransition2:",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/project3:",
+      "syntax:core/contracts.js:11888:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/validateTransition3:",
+      "syntax:core/contracts.js:12016:arrow_function",
+      "syntax:core/contracts.js:15082:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/reobserveSlices().",
+      "syntax:core/contracts.js:16429:arrow_function",
+      "syntax:core/contracts.js:16921:arrow_function",
+      "syntax:core/contracts.js:16982:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/project4:",
+      "syntax:core/contracts.js:18329:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/validateTransition4:",
+      "syntax:core/contracts.js:18589:arrow_function",
+      "syntax:core/contracts.js:18643:arrow_function",
+      "syntax:core/contracts.js:20392:arrow_function",
+      "syntax:core/contracts.js:22674:arrow_function",
+      "syntax:core/contracts.js:22944:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/checkPublication().",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/project5:",
+      "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/validateTransition5:",
+      "syntax:core/contracts.js:25417:arrow_function"
+    ],
+    "seedForced": false,
+    "overDisplayBudget": false,
+    "edgePolicy": "Use only measured call edges; hidden intermediates never become direct edges. Callback links remain explicitly non-call links."
+  },
+  "derivation": {
+    "terminalArtifact": "q04-transition-cas.opus-inline.json",
+    "emissionArtifact": "q04-transition-cas.opus-inline.json.decisions.json",
+    "emissionSha256": "4516abdcd7c642dd60721c4898d004795736292ccdc5164935b4e9999bd3a9f4",
+    "newInference": false
+  }
+}

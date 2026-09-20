@@ -1,0 +1,20 @@
+.playwright-mcp/
+.env
+.env.*
+!.env.example
+
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+
+/target/
+/.baleyg/
+/.pre-git-archive/
+*.db
+*.db-shm
+*.db-wal
+*.token
+
+# Private-workspace screenshot; do not publish as a documentation asset.
+/compact-directories.png

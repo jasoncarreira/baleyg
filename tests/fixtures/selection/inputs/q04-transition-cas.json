@@ -1,0 +1,3117 @@
+{
+  "schemaVersion": 1,
+  "questionId": "q04-transition-cas",
+  "question": "How does transition reach the protected write, and where are the two unchanged-state checks relative to reobservation and final rename?",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "seedId": "c001",
+  "labels": [
+    "essential",
+    "supporting",
+    "incidental",
+    "uncertain"
+  ],
+  "candidates": [
+    {
+      "id": "c001",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`transition.js`/transition().",
+      "name": "transition",
+      "kind": "function",
+      "path": "state/transition.js",
+      "startLine": 13,
+      "endLine": 26,
+      "distance": 0,
+      "source": "export async function transition(runDir, { participants, apply, reobservers, hooks, finalGuard } = {}) {\n  const descriptor = Object.freeze({\n    participants: Object.freeze((participants ?? []).map((entry) => Object.freeze({ ...entry }))),\n    apply,\n  });\n  return coordinateRunJsonTransition(runDir, {\n    contracts: FAMILY_CONTRACTS,\n    descriptor,\n    validateRun,\n    reobservers: reobservers ?? new Map(),\n    atomicWriteHooks: hooks,\n    finalGuard,\n  });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/transition.js:761",
+          "line": 14,
+          "callee": "Object.freeze",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/transition.js:795",
+          "line": 15,
+          "callee": "Object.freeze",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/transition.js:809",
+          "line": 15,
+          "callee": "(participants ?? []).map",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c003"
+          ]
+        },
+        {
+          "id": "call:state/transition.js:902",
+          "line": 18,
+          "callee": "coordinateRunJsonTransition",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/transition.js:1038",
+          "line": 22,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c002",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/coordinateRunJsonTransition().",
+      "name": "coordinateRunJsonTransition",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 9,
+      "endLine": 83,
+      "distance": 1,
+      "source": "export async function coordinateRunJsonTransition(runDir, options) {\n  const {\n    contracts,\n    descriptor,\n    validateRun,\n    reobservers = new Map(),\n    atomicWriteHooks,\n    finalGuard,\n  } = options ?? {};\n  const registry = contractRegistry(contracts);\n  const participants = participantRegistry(descriptor, registry);\n  if (typeof validateRun !== \"function\") throw new Error(\"validateRun must be a function\");\n  if (!(reobservers instanceof Map)) throw new Error(\"reobservers must be a Map\");\n\n  return withRunJsonLock(runDir, async () => {\n    const initial = deepFreeze(await readRunState(runDir, validateRun));\n    const before = projectAll(registry, initial);\n    const applied = descriptor.apply(structuredClone(initial));\n    if (!applied || typeof applied !== \"object\" || Array.isArray(applied)) {\n      throw new Error(\"transition apply must return a state object\");\n    }\n    validateRun(applied);\n    const candidate = deepFreeze(applied);\n    const after = projectAll(registry, candidate);\n\n    for (const [familyId, contract] of registry) {\n      contract.validateTransition({\n        mode: participants.get(familyId),\n        before: before.get(f\n/* ... source excerpt omitted ... */\nd this rename would silently overwrite it.\n          // Only the synchronous final guard may run between this line and the rename.\n          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));\n          assertUnchanged(finalObserved, initial);\n          if (typeof finalGuard === \"function\") {\n            const guarded = finalGuard({ state: finalObserved, candidate });\n            if (guarded && typeof guarded.then === \"function\") throw new Error(\"final commit guard must be synchronous\");\n          }\n          await rename(source, destination);\n        },\n      },\n    });\n    return candidate;\n  });\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:421",
+          "line": 14,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:510",
+          "line": 18,
+          "callee": "contractRegistry",
+          "target": "c006",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:562",
+          "line": 19,
+          "callee": "participantRegistry",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:652",
+          "line": 20,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:740",
+          "line": 21,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:790",
+          "line": 23,
+          "callee": "withRunJsonLock",
+          "target": "c004",
+          "resolution": "internal",
+          "callbackArguments": [
+            "c005"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c003",
+      "symbolId": "syntax:state/transition.js:834:arrow_function",
+      "name": "<callback@15:58>",
+      "kind": "function",
+      "path": "state/transition.js",
+      "startLine": 15,
+      "endLine": 15,
+      "distance": 1,
+      "source": "    participants: Object.freeze((participants ?? []).map((entry) => Object.freeze({ ...entry }))),",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/transition.js:845",
+          "line": 15,
+          "callee": "Object.freeze",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c004",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/withRunJsonLock().",
+      "name": "withRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 18,
+      "endLine": 77,
+      "distance": 2,
+      "source": "export async function withRunJsonLock(runDir, fn, options = {}) {\n  if (typeof fn !== \"function\") throw new Error(\"withRunJsonLock requires a callback\");\n  const { onBeforeSteal } = options;\n  if (onBeforeSteal !== undefined && typeof onBeforeSteal !== \"function\") {\n    throw new Error(\"onBeforeSteal must be a function\");\n  }\n  const timeoutMs = normalizePositiveInteger(options.timeoutMs, DEFAULT_LOCK_TIMEOUT_MS);\n  normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);\n  normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);\n  const lockDir = join(runDir, LOCK_DIR);\n  const ownerPath = join(lockDir, LOCK_OWNER_FILE);\n  const deadline = Date.now() + timeoutMs;\n  let stealAttempted = false;\n  let createdIdentity = null;\n  let owner = null;\n  let ownerPublished = false;\n  let publishedEvidence = null;\n\n  while (true) {\n    try {\n      await mkdir(lockDir);\n      createdIdentity = await lockDirectoryIdentity(lockDir);\n      break;\n    } catch (error) {\n      if (error?.code !== \"EEXIST\") throw error;\n      if (!stealAttempted) {\n        const observedIdentity = await lockDirectoryIdentity(lockDir);\n        co\n/* ... source excerpt omitted ... */\ningify(owner, null, 2)}\\n`, { encoding: \"utf8\", flag: \"wx\" });\n    publishedEvidence = await readLockOwnerEvidence(ownerPath);\n    if (!sameLockOwner(owner, publishedEvidence?.owner)) throw new Error(`run.json lock owner publication failed at ${lockDir}`);\n    ownerPublished = true;\n    return await fn({ lock_dir: lockDir, owner });\n  } finally {\n    if (ownerPublished) {\n      await releaseOwnedRunJsonLock(runDir, lockDir, createdIdentity, publishedEvidence);\n    } else if (!ownerPublished && !(await lockOwnerEntryExists(ownerPath))) {\n      await quarantineAndRemoveOwnedLock(runDir, lockDir, createdIdentity);\n    }\n  }\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:880",
+          "line": 19,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1053",
+          "line": 22,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1124",
+          "line": 24,
+          "callee": "normalizePositiveInteger",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1196",
+          "line": 25,
+          "callee": "normalizePositiveInteger",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1268",
+          "line": 26,
+          "callee": "normalizePositiveInteger",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1373",
+          "line": 27,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1417",
+          "line": 28,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1468",
+          "line": 29,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1674",
+          "line": 38,
+          "callee": "mkdir",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1720",
+          "line": 39,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1904",
+          "line": 44,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1975",
+          "line": 45,
+          "callee": "readLockOwnerEvidence",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2021",
+          "line": 46,
+          "callee": "canStealRunJsonLock",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2151",
+          "line": 48,
+          "callee": "stealByRename",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2290",
+          "line": 49,
+          "callee": "ownerlessLockIsReclaimable",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2422",
+          "line": 51,
+          "callee": "stealByRename",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2531",
+          "line": 54,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2561",
+          "line": 54,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2637",
+          "line": 55,
+          "callee": "delay",
+          "target": "c019",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2643",
+          "line": 55,
+          "callee": "Math.min",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2681",
+          "line": 55,
+          "callee": "Math.max",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2704",
+          "line": 55,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2770",
+          "line": 59,
+          "callee": "hostname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2795",
+          "line": 59,
+          "callee": "new Date().toISOString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2795",
+          "line": 59,
+          "callee": "Date",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2828",
+          "line": 59,
+          "callee": "randomUUID",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2862",
+          "line": 62,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2911",
+          "line": 62,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2958",
+          "line": 63,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3059",
+          "line": 65,
+          "callee": "writeFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3083",
+          "line": 65,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3184",
+          "line": 66,
+          "callee": "readLockOwnerEvidence",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3227",
+          "line": 67,
+          "callee": "sameLockOwner",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3281",
+          "line": 67,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3392",
+          "line": 69,
+          "callee": "fn",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3478",
+          "line": 72,
+          "callee": "releaseOwnedRunJsonLock",
+          "target": "c012",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3598",
+          "line": 73,
+          "callee": "lockOwnerEntryExists",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3646",
+          "line": 74,
+          "callee": "quarantineAndRemoveOwnedLock",
+          "target": "c013",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c005",
+      "symbolId": "syntax:core/write-core.js:814:arrow_function",
+      "name": "<callback@23:34>",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 23,
+      "endLine": 82,
+      "distance": 2,
+      "source": "  return withRunJsonLock(runDir, async () => {\n    const initial = deepFreeze(await readRunState(runDir, validateRun));\n    const before = projectAll(registry, initial);\n    const applied = descriptor.apply(structuredClone(initial));\n    if (!applied || typeof applied !== \"object\" || Array.isArray(applied)) {\n      throw new Error(\"transition apply must return a state object\");\n    }\n    validateRun(applied);\n    const candidate = deepFreeze(applied);\n    const after = projectAll(registry, candidate);\n\n    for (const [familyId, contract] of registry) {\n      contract.validateTransition({\n        mode: participants.get(familyId),\n        before: before.get(familyId),\n        after: after.get(familyId),\n        current: initial,\n        candidate,\n      });\n    }\n\n    await writeProtectedJsonAtomic(runDir, RUN_FILE, candidate, {\n      hooks: atomicWriteHooks,\n      fsOps: {\n        rename: async (source, destination) => {\n\n          // First comparison: gives the reobservers a state to reason about that is\n          // known current as of this moment.\n          const observed = deepFreeze(await readRunState(runDir, validateRun));\n          assertUnchange\n/* ... source excerpt omitted ... */\nand this rename would silently overwrite it.\n          // Only the synchronous final guard may run between this line and the rename.\n          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));\n          assertUnchanged(finalObserved, initial);\n          if (typeof finalGuard === \"function\") {\n            const guarded = finalGuard({ state: finalObserved, candidate });\n            if (guarded && typeof guarded.then === \"function\") throw new Error(\"final commit guard must be synchronous\");\n          }\n          await rename(source, destination);\n        },\n      },\n    });\n    return candidate;\n  });",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:848",
+          "line": 24,
+          "callee": "deepFreeze",
+          "target": "c023",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:865",
+          "line": 24,
+          "callee": "readRunState",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:920",
+          "line": 25,
+          "callee": "projectAll",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:971",
+          "line": 26,
+          "callee": "descriptor.apply",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:988",
+          "line": 26,
+          "callee": "structuredClone",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1066",
+          "line": 27,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1104",
+          "line": 28,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1172",
+          "line": 30,
+          "callee": "validateRun",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1216",
+          "line": 31,
+          "callee": "deepFreeze",
+          "target": "c023",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1255",
+          "line": 32,
+          "callee": "projectAll",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1346",
+          "line": 35,
+          "callee": "contract.validateTransition",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1390",
+          "line": 36,
+          "callee": "participants.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1434",
+          "line": 37,
+          "callee": "before.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1471",
+          "line": 38,
+          "callee": "after.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1564",
+          "line": 44,
+          "callee": "writeProtectedJsonAtomic",
+          "target": "c008",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c006",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/contractRegistry().",
+      "name": "contractRegistry",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 96,
+      "endLine": 112,
+      "distance": 2,
+      "source": "function contractRegistry(contracts) {\n  if (!Array.isArray(contracts) || !Object.isFrozen(contracts)) {\n    throw new Error(\"contracts must be a frozen array\");\n  }\n  const registry = new Map();\n  for (const contract of contracts) {\n    if (!contract || !Object.isFrozen(contract) || typeof contract.id !== \"string\" || !contract.id) {\n      throw new Error(\"each contract must be frozen and have an id\");\n    }\n    for (const method of [\"project\", \"validateProjection\", \"validateTransition\", \"reobserve\"]) {\n      if (typeof contract[method] !== \"function\") throw new Error(`contract '${contract.id}' is missing ${method}`);\n    }\n    if (registry.has(contract.id)) throw new Error(`duplicate contract '${contract.id}'`);\n    registry.set(contract.id, contract);\n  }\n  return registry;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:3735",
+          "line": 97,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3764",
+          "line": 97,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3804",
+          "line": 98,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3874",
+          "line": 100,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3945",
+          "line": 102,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4037",
+          "line": 103,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4254",
+          "line": 106,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4329",
+          "line": 108,
+          "callee": "registry.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4362",
+          "line": 108,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4416",
+          "line": 109,
+          "callee": "registry.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c007",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/participantRegistry().",
+      "name": "participantRegistry",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 114,
+      "endLine": 130,
+      "distance": 2,
+      "source": "function participantRegistry(descriptor, contracts) {\n  if (!descriptor || !Object.isFrozen(descriptor) || typeof descriptor.apply !== \"function\"\n    || !Array.isArray(descriptor.participants) || !Object.isFrozen(descriptor.participants)) {\n    throw new Error(\"descriptor and participants must be frozen\");\n  }\n  const participants = new Map();\n  for (const participant of descriptor.participants) {\n    if (!participant || !Object.isFrozen(participant) || typeof participant.familyId !== \"string\"\n      || !participant.familyId || typeof participant.mode !== \"string\" || !participant.mode) {\n      throw new Error(\"each participant must be frozen and declare familyId and mode\");\n    }\n    if (!contracts.has(participant.familyId)) throw new Error(`unknown contract '${participant.familyId}'`);\n    if (participants.has(participant.familyId)) throw new Error(`duplicate participant '${participant.familyId}'`);\n    participants.set(participant.familyId, participant.mode);\n  }\n  return participants;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:4555",
+          "line": 115,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4633",
+          "line": 116,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4676",
+          "line": 116,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4730",
+          "line": 117,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4814",
+          "line": 119,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4905",
+          "line": 121,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5085",
+          "line": 123,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5176",
+          "line": 125,
+          "callee": "contracts.has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5219",
+          "line": 125,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5284",
+          "line": 126,
+          "callee": "participants.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5330",
+          "line": 126,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5396",
+          "line": 127,
+          "callee": "participants.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c008",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/writeProtectedJsonAtomic().",
+      "name": "writeProtectedJsonAtomic",
+      "kind": "function",
+      "path": "core/atomic-write.js",
+      "startLine": 18,
+      "endLine": 20,
+      "distance": 3,
+      "source": "export function writeProtectedJsonAtomic(rootDir, relativePath, value, options = {}) {\n  return writeProtectedFileAtomic(rootDir, relativePath, `${JSON.stringify(value, null, 2)}\\n`, options);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/atomic-write.js:1090",
+          "line": 19,
+          "callee": "writeProtectedFileAtomic",
+          "target": "c024",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1141",
+          "line": 19,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c009",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/canStealRunJsonLock().",
+      "name": "canStealRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 79,
+      "endLine": 81,
+      "distance": 3,
+      "source": "function canStealRunJsonLock(owner, options = {}) {\n  return isDurableLockOwner(owner) && inspectLockOwnerLiveness(owner, options) === \"dead\";\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:3784",
+          "line": 80,
+          "callee": "isDurableLockOwner",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3813",
+          "line": 80,
+          "callee": "inspectLockOwnerLiveness",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c010",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/readLockOwnerEvidence().",
+      "name": "readLockOwnerEvidence",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 83,
+      "endLine": 96,
+      "distance": 3,
+      "source": "async function readLockOwnerEvidence(ownerPath) {\n  let handle;\n  try {\n    handle = await open(ownerPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));\n    const parsed = JSON.parse(await handle.readFile(\"utf8\"));\n    if (!isDurableLockOwner(parsed)) return null;\n    const value = await handle.stat();\n    return { owner: parsed, identity: { dev: value.dev, ino: value.ino } };\n  } catch {\n    return null;\n  } finally {\n    await handle?.close();\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:3960",
+          "line": 86,
+          "callee": "open",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4046",
+          "line": 87,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4063",
+          "line": 87,
+          "callee": "handle.readFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4098",
+          "line": 88,
+          "callee": "isDurableLockOwner",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4163",
+          "line": 89,
+          "callee": "handle.stat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4307",
+          "line": 94,
+          "callee": "handle?.close",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c011",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stealByRename().",
+      "name": "stealByRename",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 111,
+      "endLine": 136,
+      "distance": 3,
+      "source": "async function stealByRename(runDir, lockDir, observedIdentity, observedEvidence, onBeforeSteal) {\n  if (onBeforeSteal) await onBeforeSteal({ runDir, lockDir, owner: observedEvidence?.owner ?? null });\n  // The owner must still be the one we judged stale, and the directory's dev/ino cannot establish\n  // that: Linux reuses inode numbers, so a lock deleted and recreated here presents the identity we\n  // recorded and the post-rename check sees nothing wrong while a live lock is renamed away. The\n  // nonce is the discriminator. The note that once stood here — a pre-check is undetectable — was\n  // falsified only on APFS, which does not reuse the inode; CI failed on Linux and passed on macOS.\n  // The post-rename check stays, the two together are narrower, and the write core is still the\n  // real boundary, so the residual check-then-act window cannot produce a lost update.\n  if (observedEvidence\n    && !sameLockOwnerEvidence(observedEvidence, await readLockOwnerEvidence(join(lockDir, LOCK_OWNER_FILE)))) {\n    return false;\n  }\n  let quarantine;\n  try {\n    quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, observedIdentity);\n  } catch (error) {\n    // Losing the race is a retry, not a failure: ENOENT is the rename losing the path, ELOCKIDENTITY\n    // is noticing the winner before renaming. Only ENOENT was handled, so the second case failed the\n    // whole run — rare until the owner pre-check widened that window, and then CI hit it.\n    if (error?.code === \"ENOENT\" || error?.code === \"ELOCKIDENTITY\") return false;\n    throw error;\n  }\n  await rm(quarantine, { recursive: true, force: true });\n  return true;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:5260",
+          "line": 112,
+          "callee": "onBeforeSteal",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6050",
+          "line": 121,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6096",
+          "line": 121,
+          "callee": "readLockOwnerEvidence",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6118",
+          "line": 121,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6225",
+          "line": 126,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c025",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6716",
+          "line": 134,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c012",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/releaseOwnedRunJsonLock().",
+      "name": "releaseOwnedRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 138,
+      "endLine": 148,
+      "distance": 3,
+      "source": "async function releaseOwnedRunJsonLock(runDir, lockDir, expectedIdentity, expectedEvidence) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) return;\n  if (!sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(lockDir, LOCK_OWNER_FILE)))) return;\n  const quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity);\n  if (!sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(quarantine, LOCK_OWNER_FILE)))) {\n    throw new Error(`run.json lock cleanup identity changed at ${quarantine}`);\n  }\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))\n    || !sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(quarantine, LOCK_OWNER_FILE)))) return;\n  await rm(quarantine, { recursive: true, force: true });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:6885",
+          "line": 139,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6935",
+          "line": 139,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6983",
+          "line": 140,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7029",
+          "line": 140,
+          "callee": "readLockOwnerEvidence",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7051",
+          "line": 140,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7120",
+          "line": 141,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c025",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7191",
+          "line": 142,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7237",
+          "line": 142,
+          "callee": "readLockOwnerEvidence",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7259",
+          "line": 142,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7308",
+          "line": 143,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7389",
+          "line": 145,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7439",
+          "line": 145,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7482",
+          "line": 146,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7528",
+          "line": 146,
+          "callee": "readLockOwnerEvidence",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7550",
+          "line": 146,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7603",
+          "line": 147,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c013",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/quarantineAndRemoveOwnedLock().",
+      "name": "quarantineAndRemoveOwnedLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 150,
+      "endLine": 155,
+      "distance": 3,
+      "source": "async function quarantineAndRemoveOwnedLock(runDir, lockDir, expectedIdentity) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) return;\n  const quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity);\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))) return;\n  await rm(quarantine, { recursive: true, force: true });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:7744",
+          "line": 151,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7794",
+          "line": 151,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7862",
+          "line": 152,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c025",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7933",
+          "line": 153,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7983",
+          "line": 153,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8035",
+          "line": 154,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c014",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockOwnerEntryExists().",
+      "name": "lockOwnerEntryExists",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 187,
+      "endLine": 195,
+      "distance": 3,
+      "source": "async function lockOwnerEntryExists(ownerPath) {\n  try {\n    await lstat(ownerPath);\n    return true;\n  } catch (error) {\n    if (error?.code === \"ENOENT\") return false;\n    return true;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:9966",
+          "line": 189,
+          "callee": "lstat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c015",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwner().",
+      "name": "sameLockOwner",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 207,
+      "endLine": 209,
+      "distance": 3,
+      "source": "function sameLockOwner(left, right) {\n  return isDurableLockOwner(left) && isDurableLockOwner(right) && left.nonce === right.nonce;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10499",
+          "line": 208,
+          "callee": "isDurableLockOwner",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10527",
+          "line": 208,
+          "callee": "isDurableLockOwner",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c016",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockDirectoryIdentity().",
+      "name": "lockDirectoryIdentity",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 218,
+      "endLine": 226,
+      "distance": 3,
+      "source": "async function lockDirectoryIdentity(lockDir) {\n  try {\n    const value = await lstat(lockDir);\n    if (!value.isDirectory() || value.isSymbolicLink()) return null;\n    return { dev: value.dev, ino: value.ino, mtimeMs: value.mtimeMs };\n  } catch {\n    return null;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10891",
+          "line": 220,
+          "callee": "lstat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10916",
+          "line": 221,
+          "callee": "value.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10939",
+          "line": 221,
+          "callee": "value.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c017",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockDirectoryIdentity().",
+      "name": "sameLockDirectoryIdentity",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 228,
+      "endLine": 230,
+      "distance": 3,
+      "source": "function sameLockDirectoryIdentity(left, right) {\n  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11142",
+          "line": 229,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c018",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/normalizePositiveInteger().",
+      "name": "normalizePositiveInteger",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 232,
+      "endLine": 236,
+      "distance": 3,
+      "source": "function normalizePositiveInteger(value, fallback) {\n  if (value === undefined || value === null) return fallback;\n  if (!Number.isInteger(value) || value <= 0) throw new Error(\"lock timing options must be positive integers\");\n  return value;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11343",
+          "line": 234,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:11388",
+          "line": 234,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c019",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/delay().",
+      "name": "delay",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 239,
+      "endLine": 241,
+      "distance": 3,
+      "source": "function delay(ms) {\n  return new Promise((resolve) => setTimeout(resolve, ms));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11546",
+          "line": 240,
+          "callee": "Promise",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": [
+            "c029"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c020",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/ownerlessLockIsReclaimable().",
+      "name": "ownerlessLockIsReclaimable",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 251,
+      "endLine": 261,
+      "distance": 3,
+      "source": "async function ownerlessLockIsReclaimable(lockDir, ownerPath, options = {}) {\n  if (await lockOwnerEntryExists(ownerPath)) return false;\n  const graceMs = normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);\n  try {\n    const observed = await stat(lockDir);\n    const ageMs = Date.now() - observed.mtimeMs;\n    return Number.isFinite(ageMs) && ageMs > graceMs;\n  } catch {\n    return false;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:12205",
+          "line": 252,
+          "callee": "lockOwnerEntryExists",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12270",
+          "line": 253,
+          "callee": "normalizePositiveInteger",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12392",
+          "line": 255,
+          "callee": "stat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12425",
+          "line": 256,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12467",
+          "line": 257,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c021",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/readRunState().",
+      "name": "readRunState",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 91,
+      "endLine": 94,
+      "distance": 3,
+      "source": "async function readRunState(runDir, validateRun) {\n  const state = JSON.parse(await readFile(join(runDir, RUN_FILE), \"utf8\"));\n  return validateRun(state);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:3597",
+          "line": 92,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3614",
+          "line": 92,
+          "callee": "readFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3623",
+          "line": 92,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3666",
+          "line": 93,
+          "callee": "validateRun",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c022",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/projectAll().",
+      "name": "projectAll",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 132,
+      "endLine": 140,
+      "distance": 3,
+      "source": "function projectAll(contracts, state) {\n  const projections = new Map();\n  for (const [familyId, contract] of contracts) {\n    const projection = contract.project(state);\n    contract.validateProjection(projection);\n    projections.set(familyId, projection);\n  }\n  return projections;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:5546",
+          "line": 133,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5630",
+          "line": 135,
+          "callee": "contract.project",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5659",
+          "line": 136,
+          "callee": "contract.validateProjection",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5704",
+          "line": 137,
+          "callee": "projections.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c023",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/deepFreeze().",
+      "name": "deepFreeze",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 142,
+      "endLine": 146,
+      "distance": 3,
+      "source": "function deepFreeze(value) {\n  if (!value || typeof value !== \"object\" || Object.isFrozen(value)) return value;\n  for (const nested of Object.values(value)) deepFreeze(nested);\n  return Object.freeze(value);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:5846",
+          "line": 143,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5907",
+          "line": 144,
+          "callee": "Object.values",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5929",
+          "line": 144,
+          "callee": "deepFreeze",
+          "target": "c023",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5958",
+          "line": 145,
+          "callee": "Object.freeze",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c024",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/writeProtectedFileAtomic().",
+      "name": "writeProtectedFileAtomic",
+      "kind": "function",
+      "path": "core/atomic-write.js",
+      "startLine": 22,
+      "endLine": 87,
+      "distance": 4,
+      "source": "export async function writeProtectedFileAtomic(rootDir, relativePath, data, options = {}) {\n  const targetPath = resolveProtectedPath(rootDir, relativePath);\n  const parentDir = resolve(targetPath, \"..\");\n  const createOnly = options.createOnly === true;\n  const rename = options.fsOps?.rename ?? fsRename;\n  const link = options.fsOps?.link ?? fsLink;\n  const beforeCommit = options.hooks?.beforeCommit;\n  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(String(data), \"utf8\");\n\n  await assertSafeTarget(targetPath, createOnly);\n\n  const tempPath = join(parentDir, `.${randomUUID()}.tmp`);\n  let handle = null;\n  let published = false;\n  try {\n    // \"wx\" is O_CREAT|O_EXCL|O_WRONLY: if the name exists, fail rather than adopt\n    // a file somebody else created.\n    handle = await open(tempPath, \"wx\", 0o600);\n    await handle.writeFile(bytes);\n    await handle.sync();\n    await handle.close();\n    handle = null;\n\n    if (createOnly) {\n      await assertSafeTarget(targetPath, true);\n      if (typeof beforeCommit === \"function\") await beforeCommit();\n      try { await link(tempPath, targetPath); } catch (error) {\n        if (error?.code === \"EEXIST\") thr\n/* ... source excerpt omitted ... */\nrue;\n    }\n  } catch (error) {\n    if (handle) {\n      try { await handle.close(); } catch { /* the original error is the one that matters */ }\n    }\n    if (!published) {\n      try {\n        await unlink(tempPath);\n      } catch (cleanupError) {\n        if (cleanupError?.code !== \"ENOENT\") {\n          throw new ProtectedWriteError(\"protected temporary file cleanup is indeterminate\", cleanupError);\n        }\n      }\n    }\n    throw error instanceof ProtectedWriteError\n      ? error\n      : new ProtectedWriteError(\"protected file commit failed\", error);\n  }\n\n  await syncDirectory(parentDir);\n  return { path: targetPath };\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/atomic-write.js:1303",
+          "line": 23,
+          "callee": "resolveProtectedPath",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1368",
+          "line": 24,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1611",
+          "line": 29,
+          "callee": "Buffer.isBuffer",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1642",
+          "line": 29,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1654",
+          "line": 29,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1686",
+          "line": 31,
+          "callee": "assertSafeTarget",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1748",
+          "line": 33,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1768",
+          "line": 33,
+          "callee": "randomUUID",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1982",
+          "line": 39,
+          "callee": "open",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2021",
+          "line": 40,
+          "callee": "handle.writeFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2056",
+          "line": 41,
+          "callee": "handle.sync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2081",
+          "line": 42,
+          "callee": "handle.close",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2151",
+          "line": 46,
+          "callee": "assertSafeTarget",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2239",
+          "line": 47,
+          "callee": "beforeCommit",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2273",
+          "line": 48,
+          "callee": "link",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2363",
+          "line": 49,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2508",
+          "line": 53,
+          "callee": "unlink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2571",
+          "line": 54,
+          "callee": "unlink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2677",
+          "line": 56,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2826",
+          "line": 59,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3012",
+          "line": 62,
+          "callee": "beforeCommit",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3040",
+          "line": 63,
+          "callee": "assertSafeTarget",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3089",
+          "line": 64,
+          "callee": "rename",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3205",
+          "line": 69,
+          "callee": "handle.close",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3336",
+          "line": 73,
+          "callee": "unlink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3448",
+          "line": 76,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3633",
+          "line": 82,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3710",
+          "line": 85,
+          "callee": "syncDirectory",
+          "target": "c033",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c025",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/renameOwnedLockToQuarantine().",
+      "name": "renameOwnedLockToQuarantine",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 157,
+      "endLine": 169,
+      "distance": 4,
+      "source": "async function renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) {\n    // Coded so a *steal* can treat it as losing a race and retry. Release and cleanup check identity\n    // first, so for them it stays the error it is.\n    throw Object.assign(new Error(`run.json lock directory identity changed at ${lockDir}`), { code: \"ELOCKIDENTITY\" });\n  }\n  const quarantine = join(runDir, `.run-json.lock-quarantine-${randomUUID()}`);\n  await rename(lockDir, quarantine);\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))) {\n    throw new Error(`run.json lock quarantine identity changed at ${quarantine}`);\n  }\n  return quarantine;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:8175",
+          "line": 158,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8225",
+          "line": 158,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8424",
+          "line": 161,
+          "callee": "Object.assign",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8438",
+          "line": 161,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8560",
+          "line": 163,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8602",
+          "line": 163,
+          "callee": "randomUUID",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8627",
+          "line": 164,
+          "callee": "rename",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8663",
+          "line": 165,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8713",
+          "line": 165,
+          "callee": "lockDirectoryIdentity",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8761",
+          "line": 166,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c026",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/inspectLockOwnerLiveness().",
+      "name": "inspectLockOwnerLiveness",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 174,
+      "endLine": 185,
+      "distance": 4,
+      "source": "function inspectLockOwnerLiveness(owner, options = {}) {\n  if (!isDurableLockOwner(owner)) return \"indeterminate\";\n  // A lock taken on another host cannot be adjudicated from here at all.\n  if (owner.hostname !== hostname()) return \"indeterminate\";\n  const staleAfterMs = normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);\n  const heldForMs = Date.now() - Date.parse(owner.acquired_at);\n  if (!Number.isFinite(heldForMs)) return \"indeterminate\";\n  // A future `acquired_at` yields a negative age, which is never greater than the\n  // TTL, so clock skew already fails closed here. An explicit `heldForMs < 0`\n  // branch was removed after its falsification showed removing it changed nothing.\n  return heldForMs > staleAfterMs ? \"dead\" : \"alive\";\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:9194",
+          "line": 175,
+          "callee": "isDurableLockOwner",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9344",
+          "line": 177,
+          "callee": "hostname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9403",
+          "line": 178,
+          "callee": "normalizePositiveInteger",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9493",
+          "line": 179,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9506",
+          "line": 179,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9544",
+          "line": 180,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c027",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isDurableLockOwner().",
+      "name": "isDurableLockOwner",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 197,
+      "endLine": 205,
+      "distance": 4,
+      "source": "function isDurableLockOwner(owner) {\n  return isRecord(owner)\n    && Number.isInteger(owner.pid)\n    && owner.pid > 0\n    && stringValue(owner.hostname)\n    && Number.isFinite(Date.parse(owner.acquired_at || \"\"))\n    && typeof owner.nonce === \"string\"\n    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(owner.nonce);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10139",
+          "line": 198,
+          "callee": "isRecord",
+          "target": "c034",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10162",
+          "line": 199,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10218",
+          "line": 201,
+          "callee": "stringValue",
+          "target": "c035",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10253",
+          "line": 202,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10269",
+          "line": 202,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10352",
+          "line": 204,
+          "callee": "/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c028",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwnerEvidence().",
+      "name": "sameLockOwnerEvidence",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 211,
+      "endLine": 216,
+      "distance": 4,
+      "source": "function sameLockOwnerEvidence(left, right) {\n  return Boolean(left && right\n    && sameLockOwner(left.owner, right.owner)\n    && left.identity.dev === right.identity.dev\n    && left.identity.ino === right.identity.ino);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10642",
+          "line": 212,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10671",
+          "line": 213,
+          "callee": "sameLockOwner",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c029",
+      "symbolId": "syntax:core/run-lock.js:11558:arrow_function",
+      "name": "<callback@240:22>",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 240,
+      "endLine": 240,
+      "distance": 4,
+      "source": "  return new Promise((resolve) => setTimeout(resolve, ms));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11571",
+          "line": 240,
+          "callee": "setTimeout",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c030",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/ProtectedWriteError#`<constructor>`().",
+      "name": "constructor",
+      "kind": "method",
+      "path": "core/atomic-write.js",
+      "startLine": 12,
+      "endLine": 15,
+      "distance": 5,
+      "source": "  constructor(message, cause) {\n    super(message, cause === undefined ? undefined : { cause });\n    this.name = \"ProtectedWriteError\";\n  }",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/atomic-write.js:887",
+          "line": 13,
+          "callee": "super",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c031",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/resolveProtectedPath().",
+      "name": "resolveProtectedPath",
+      "kind": "function",
+      "path": "core/atomic-write.js",
+      "startLine": 89,
+      "endLine": 104,
+      "distance": 5,
+      "source": "function resolveProtectedPath(rootDir, relativePath) {\n  if (typeof rootDir !== \"string\" || !rootDir.trim() || !isAbsolute(rootDir)) {\n    throw new ProtectedWriteError(\"protected file root is invalid\");\n  }\n  if (typeof relativePath !== \"string\" || !relativePath.trim() || isAbsolute(relativePath)) {\n    throw new ProtectedWriteError(\"protected relative path is invalid\");\n  }\n  const root = resolve(rootDir);\n  const targetPath = resolve(root, relativePath);\n  // Containment, not string prefixing: comparing against `${root}${sep}` refuses\n  // `/a/bc` for root `/a/b`.\n  if (targetPath === root || !targetPath.startsWith(`${root}${sep}`)) {\n    throw new ProtectedWriteError(\"protected relative path escapes its root\");\n  }\n  return targetPath;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/atomic-write.js:3863",
+          "line": 90,
+          "callee": "rootDir.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3882",
+          "line": 90,
+          "callee": "isAbsolute",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3915",
+          "line": 91,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4021",
+          "line": 93,
+          "callee": "relativePath.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4044",
+          "line": 93,
+          "callee": "isAbsolute",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4082",
+          "line": 94,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4164",
+          "line": 96,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4203",
+          "line": 97,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4374",
+          "line": 100,
+          "callee": "targetPath.startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4426",
+          "line": 101,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c032",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/assertSafeTarget().",
+      "name": "assertSafeTarget",
+      "kind": "function",
+      "path": "core/atomic-write.js",
+      "startLine": 106,
+      "endLine": 117,
+      "distance": 5,
+      "source": "async function assertSafeTarget(path, createOnly) {\n  let stats;\n  try {\n    stats = await lstat(path);\n  } catch (error) {\n    // Absent is the normal first-write case; anything else is unreadable state.\n    if (error?.code === \"ENOENT\") return;\n    throw new ProtectedWriteError(\"protected file target could not be inspected\", error);\n  }\n  if (createOnly) throw new ProtectedWriteError(\"protected create target already exists\");\n  if (!stats.isFile()) throw new ProtectedWriteError(\"protected file target has an unsafe type\");\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/atomic-write.js:4614",
+          "line": 109,
+          "callee": "lstat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4780",
+          "line": 113,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4888",
+          "line": 115,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4962",
+          "line": 116,
+          "callee": "stats.isFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:4984",
+          "line": 116,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c033",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/syncDirectory().",
+      "name": "syncDirectory",
+      "kind": "function",
+      "path": "core/atomic-write.js",
+      "startLine": 119,
+      "endLine": 135,
+      "distance": 5,
+      "source": "async function syncDirectory(dir) {\n  let handle = null;\n  try {\n    handle = await open(dir, \"r\");\n    await handle.sync();\n  } catch (error) {\n    // A filesystem that refuses to fsync a directory is not a reason to fail a\n    // write that already committed: durability degrades, correctness does not.\n    if (![\"EINVAL\", \"EPERM\", \"EISDIR\", \"EACCES\", \"ENOTSUP\"].includes(error?.code)) {\n      throw new ProtectedWriteError(\"protected target is committed but directory sync failed\", error);\n    }\n  } finally {\n    if (handle) {\n      try { await handle.close(); } catch { /* nothing actionable */ }\n    }\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/atomic-write.js:5140",
+          "line": 122,
+          "callee": "open",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:5166",
+          "line": 123,
+          "callee": "handle.sync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:5370",
+          "line": 127,
+          "callee": "[\"EINVAL\", \"EPERM\", \"EISDIR\", \"EACCES\", \"ENOTSUP\"].includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:5458",
+          "line": 128,
+          "callee": "ProtectedWriteError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:5605",
+          "line": 132,
+          "callee": "handle.close",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c034",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isRecord().",
+      "name": "isRecord",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 263,
+      "endLine": 265,
+      "distance": 5,
+      "source": "function isRecord(value) {\n  return Boolean(value) && typeof value === \"object\" && !Array.isArray(value);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:12583",
+          "line": 264,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12631",
+          "line": 264,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c035",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stringValue().",
+      "name": "stringValue",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 267,
+      "endLine": 269,
+      "distance": 5,
+      "source": "function stringValue(value) {\n  return typeof value === \"string\" && value.trim().length > 0;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:12724",
+          "line": 268,
+          "callee": "value.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c036",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/callRegisteredObserver().",
+      "name": "callRegisteredObserver",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 23,
+      "endLine": 25,
+      "distance": null,
+      "source": "async function callRegisteredObserver({ observe, ...rest }) {\n  if (typeof observe === \"function\") await observe(rest);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:1385",
+          "line": 24,
+          "callee": "observe",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c037",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/contract().",
+      "name": "contract",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 27,
+      "endLine": 37,
+      "distance": null,
+      "source": "function contract({ id, project, validateTransition, reobserve }) {\n  return Object.freeze({\n    id,\n    project,\n    validateProjection: (projection) => {\n      if (projection === undefined) throw new Error(`${id} projection is undefined`);\n    },\n    validateTransition,\n    reobserve: reobserve ?? (async () => {}),\n  });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:1480",
+          "line": 28,
+          "callee": "Object.freeze",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c038",
+      "symbolId": "syntax:core/contracts.js:1541:arrow_function",
+      "name": "validateProjection",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 31,
+      "endLine": 33,
+      "distance": null,
+      "source": "    validateProjection: (projection) => {\n      if (projection === undefined) throw new Error(`${id} projection is undefined`);\n    },",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:1601",
+          "line": 32,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c039",
+      "symbolId": "syntax:core/contracts.js:1705:arrow_function",
+      "name": "<callback@35:30>",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 35,
+      "endLine": 35,
+      "distance": null,
+      "source": "    reobserve: reobserve ?? (async () => {}),",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c040",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/project1:",
+      "name": "project",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 45,
+      "endLine": 59,
+      "distance": null,
+      "source": "  project: (state) => ({\n    run_id: state.run_id,\n    status: state.status,\n    mode: state.mode,\n    branch: state.branch,\n    worktree: state.worktree,\n    pr_base: state.pr_base,\n    pr_draft: state.pr_draft,\n    created_at: state.created_at,\n    updated_at: state.updated_at,\n    terminal_result: state.terminal_result ?? null,\n    operator_decision: state.operator_decision ?? null,\n    bootstrap_command: state.bootstrap_command,\n    bootstrap_exit: state.bootstrap_exit,\n  }),",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c041",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/validateTransition1:",
+      "name": "validateTransition",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 60,
+      "endLine": 139,
+      "distance": null,
+      "source": "  validateTransition: ({ mode, before, after, current, candidate }) => {\n    if (before.status === \"needs-human\") {\n      // Recording an operator decision is the one write a parked run accepts besides amend-paths, and it\n      // touches nothing but the decision itself: the park stands, its reason stands, and resuming stays an\n      // explicit separate act. Answering the question is not the same as deciding to continue.\n      if (mode === \"decide\") {\n        if (after.status !== \"needs-human\") throw new Error(\"decide must preserve parked status\");\n        if (!isDeepStrictEqual(after.terminal_result, before.terminal_result)) {\n          throw new Error(\"decide must preserve terminal_result\");\n        }\n        if (isDeepStrictEqual(after.operator_decision, before.operator_decision)) {\n          throw new Error(\"decide must record a decision\");\n        }\n        if (Date.parse(after.updated_at) <= Date.parse(before.updated_at)) {\n          throw new Error(\"decide must move updated_at forwards\");\n        }\n        for (const key of Object.keys(before).filter((key) => ![\"updated_at\", \"operator_decision\"].includes(key))) {\n          if (!isDeepStrictEqua\n/* ... source excerpt omitted ... */\nmay change only during bootstrap resume`);\n    }\n    if (Date.parse(after.updated_at) < Date.parse(before.updated_at)) {\n      throw new Error(\"envelope.updated_at cannot move backwards\");\n    }\n    const wasTerminal = TERMINAL_STATUSES.includes(before.status);\n    const isTerminal = TERMINAL_STATUSES.includes(after.status);\n    if (wasTerminal && before.status !== after.status) {\n      throw new Error(`envelope cannot leave terminal status ${before.status}`);\n    }\n    if (isTerminal && !wasTerminal && !TERMINAL_MODES.has(mode)) {\n      throw new Error(`only a terminalize transition may enter ${after.status}`);\n    }\n  },",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:3032",
+          "line": 66,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3094",
+          "line": 67,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3178",
+          "line": 68,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3251",
+          "line": 70,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3339",
+          "line": 71,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3405",
+          "line": 73,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3437",
+          "line": 73,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3486",
+          "line": 74,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3573",
+          "line": 76,
+          "callee": "Object.keys(before).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c042"
+          ]
+        },
+        {
+          "id": "call:core/contracts.js:3573",
+          "line": 76,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3679",
+          "line": 77,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3729",
+          "line": 77,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3816",
+          "line": 79,
+          "callee": "Object.keys(current).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c043"
+          ]
+        },
+        {
+          "id": "call:core/contracts.js:3816",
+          "line": 79,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3900",
+          "line": 80,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:3955",
+          "line": 80,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4121",
+          "line": 85,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4188",
+          "line": 86,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4272",
+          "line": 87,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4350",
+          "line": 89,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4382",
+          "line": 89,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4431",
+          "line": 90,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4523",
+          "line": 92,
+          "callee": "Object.keys(before).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c044"
+          ]
+        },
+        {
+          "id": "call:core/contracts.js:4523",
+          "line": 92,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4599",
+          "line": 93,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4649",
+          "line": 93,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4741",
+          "line": 95,
+          "callee": "Object.keys(current).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c045"
+          ]
+        },
+        {
+          "id": "call:core/contracts.js:4741",
+          "line": 95,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4845",
+          "line": 96,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4900",
+          "line": 96,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:4996",
+          "line": 100,
+          "callee": "[\"resume-needs-human\", \"record-bootstrap\"].includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5061",
+          "line": 100,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5264",
+          "line": 102,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5335",
+          "line": 103,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5417",
+          "line": 104,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5498",
+          "line": 106,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5530",
+          "line": 106,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5577",
+          "line": 107,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5672",
+          "line": 109,
+          "callee": "Object.keys(before).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c046"
+          ]
+        },
+        {
+          "id": "call:core/contracts.js:5672",
+          "line": 109,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5804",
+          "line": 110,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5854",
+          "line": 110,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:5949",
+          "line": 112,
+          "callee": "Object.keys(current).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c047"
+          ]
+        },
+        {
+          "id": "call:core/contracts.js:5949",
+          "line": 112,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:6031",
+          "line": 113,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:6086",
+          "line": 113,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:6210",
+          "line": 117,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:6331",
+          "line": 118,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:6422",
+          "line": 119,
+          "callee": "[\"resume-needs-human\", \"record-bootstrap\"].includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:6487",
+          "line": 119,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:6859",
+          "line": 123,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:6984",
+          "line": 126,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7034",
+          "line": 126,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7118",
+          "line": 128,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7149",
+          "line": 128,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7194",
+          "line": 129,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7280",
+          "line": 131,
+          "callee": "TERMINAL_STATUSES.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7346",
+          "line": 132,
+          "callee": "TERMINAL_STATUSES.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7457",
+          "line": 134,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7571",
+          "line": 136,
+          "callee": "TERMINAL_MODES.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:7611",
+          "line": 137,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c042",
+      "symbolId": "syntax:core/contracts.js:3600:arrow_function",
+      "name": "<callback@76:54>",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 76,
+      "endLine": 76,
+      "distance": null,
+      "source": "        for (const key of Object.keys(before).filter((key) => ![\"updated_at\", \"operator_decision\"].includes(key))) {",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:3610",
+          "line": 76,
+          "callee": "[\"updated_at\", \"operator_decision\"].includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c043",
+      "symbolId": "syntax:core/contracts.js:3844:arrow_function",
+      "name": "<callback@79:55>",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 79,
+      "endLine": 79,
+      "distance": null,
+      "source": "        for (const key of Object.keys(current).filter((key) => !Object.hasOwn(before, key))) {",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:3854",
+          "line": 79,
+          "callee": "Object.hasOwn",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c044",
+      "symbolId": "syntax:core/contracts.js:4550:arrow_function",
+      "name": "<callback@92:54>",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 92,
+      "endLine": 92,
+      "distance": null,
+      "source": "        for (const key of Object.keys(before).filter((key) => key !== \"updated_at\")) {",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c045",
+      "symbolId": "syntax:core/contracts.js:4769:arrow_function",
+      "name": "<callback@95:55>",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 95,
+      "endLine": 95,
+      "distance": null,
+      "source": "        for (const key of Object.keys(current).filter((key) => !Object.hasOwn(before, key) && key !== \"slices\")) {",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:4779",
+          "line": 95,
+          "callee": "Object.hasOwn",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c046",
+      "symbolId": "syntax:core/contracts.js:5699:arrow_function",
+      "name": "<callback@109:52>",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 109,
+      "endLine": 109,
+      "distance": null,
+      "source": "      for (const key of Object.keys(before).filter((key) => ![\"status\", \"updated_at\", \"bootstrap_command\", \"bootstrap_exit\"].includes(key))) {",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:5709",
+          "line": 109,
+          "callee": "[\"status\", \"updated_at\", \"bootstrap_command\", \"bootstrap_exit\"].includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c047",
+      "symbolId": "syntax:core/contracts.js:5977:arrow_function",
+      "name": "<callback@112:53>",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 112,
+      "endLine": 112,
+      "distance": null,
+      "source": "      for (const key of Object.keys(current).filter((key) => !Object.hasOwn(before, key))) {",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:5987",
+          "line": 112,
+          "callee": "Object.hasOwn",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c048",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`contracts.js`/checkPrePrApproval().",
+      "name": "checkPrePrApproval",
+      "kind": "function",
+      "path": "core/contracts.js",
+      "startLine": 152,
+      "endLine": 160,
+      "distance": null,
+      "source": "async function checkPrePrApproval({ observe, current, candidate, state, nextState }) {\n  const wasApproved = current?.pre_pr?.status === \"approved\";\n  const isApproved = candidate?.pre_pr?.status === \"approved\";\n  if (!isApproved || wasApproved) return callRegisteredObserver({ observe, current, candidate, state, nextState });\n  if (typeof observe !== \"function\") {\n    throw new Error(\"approving the pre_pr gate requires a publication-readiness observer\");\n  }\n  await observe({ current, candidate, state, nextState });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/contracts.js:8726",
+          "line": 155,
+          "callee": "callRegisteredObserver",
+          "target": "c036",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:8850",
+          "line": 157,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/contracts.js:8944",
+          "line": 159,
+          "callee": "observe",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    }
+  ],
+  "scope": {
+    "eligibleCandidates": 73,
+    "includedCandidates": 48,
+    "omittedCandidates": 25,
+    "maxSourceChars": 1800,
+    "limitations": "Fixed candidate scope, truncated source excerpts, syntax-level source ordering. Callback references do not establish execution."
+  }
+}

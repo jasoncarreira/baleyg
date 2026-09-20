@@ -1,0 +1,104 @@
+{
+  "feature": "reference-inspired diagram workbench",
+  "production": "http://127.0.0.1:8877",
+  "revision": 7,
+  "stats": {
+    "files": 88,
+    "symbols": 2984,
+    "calls": 15635,
+    "regions": 3046,
+    "internal": 0,
+    "external": 0,
+    "unresolved": 15635,
+    "ambiguous": 0,
+    "parseErrorFiles": 0,
+    "semanticState": "unavailable",
+    "changedFiles": []
+  },
+  "tests": {
+    "rustPassed": 262,
+    "rustIgnored": 1,
+    "uiPassed": 170,
+    "fmt": true,
+    "clippyWarningsDenied": true,
+    "build": true,
+    "remoteCI": false
+  },
+  "browser": {
+    "desktop": [
+      1440,
+      900
+    ],
+    "tablet": [
+      768,
+      900
+    ],
+    "mobile": [
+      390,
+      844
+    ],
+    "disconnectedShortViewport": [
+      320,
+      320
+    ],
+    "pageHorizontalOverflow": false,
+    "localFontsLoaded": true,
+    "consoleErrors": 0,
+    "collapsedPreviewArrows": 1,
+    "collapsedParticipants": [
+      "check_file_with_unlinked",
+      "OpenOptions",
+      "file",
+      "check_file_metadata"
+    ],
+    "expandedCalls": 10,
+    "showAllRestoresFullGuardLabels": true,
+    "keyboardGroupToggleFocusPreserved": true,
+    "keyboardTabs": true,
+    "rowSelectionSourceRequests": 0,
+    "explicitCallSiteSourceRequests": 1,
+    "sourceHighlightLines": [
+      58,
+      65
+    ],
+    "librarySourceHighlightLines": [
+      1884,
+      1886
+    ],
+    "librarySourcePreservesMethod": true,
+    "sourceScrollRegression": "Fixed: reveal highlighted lines in the scrolling source panel, not only its full-height pre element.",
+    "mobileDrawersExclusive": true,
+    "sourceOpensWithoutObstructingDrawer": true,
+    "providerAnswerRequests": 0
+  },
+  "preservation": {
+    "views": true,
+    "annotations": true,
+    "tokenAndHistoricalBudgetBytes": true,
+    "providersDisabled": true,
+    "publicSecretMatches": 0
+  },
+  "limits": [
+    "Syntactic possible paths, not runtime traces.",
+    "Unresolved source hints and library candidates do not prove types or dispatch.",
+    "All original guards, alternatives and exits remain; compact labels only.",
+    "Third-party calls remain terminal."
+  ],
+  "screenshots": [
+    "docs/images/design-refresh-desktop.png",
+    "docs/images/design-refresh-mobile.png",
+    "docs/images/design-refresh-source-mobile.png"
+  ],
+  "sourceHashes": {
+    "web/shell.js": "68d1a7f0f485aa7f0aec8e7a2e8642a2adfb85420c94c10a535aa20a528ab61d",
+    "web/sequence.js": "9401800cbaace10fc0f36b0f7ff13ed42498baad9e6f434933fe735d90535ff7",
+    "web/index.html": "017a6713a8eb92a0afd44760509424ace37535e74e7444cd03794370e5b12d80",
+    "web/style.css": "620b3458afd06497cc174b957d23e918cfeca6fdfaefd473bf504d75c52b0622",
+    "web/app.js": "1ed934afb597d3af18254ee7c3b557772f8c8e1637314cfe4055d9707a48a740",
+    "src/http.rs": "604271350e390642c1c18aadd1d2a3e8254814d1de8a9a71dc58509ca3819009",
+    "tests/http.rs": "ea9c07b1dc95af4eba6bf4105754c95f8d164c168b42da4e130c8bc926ec8bf0",
+    "tests/shell-ui.test.cjs": "a5fe06a126ce0bc5472d33ddf4513eed7ac11891af9aabaca9ac5df4fed467d8",
+    "tests/browse-ui.test.cjs": "50607188bd9d163c2b08183a5644a96d109446c32ce1a47f797606c6574ffb36",
+    "tests/sequence-ui.test.cjs": "3f2eb8f681edd1dc59dc33832af477422c12f7bf27509f39b11b73f3dd1f79f9"
+  }
+}

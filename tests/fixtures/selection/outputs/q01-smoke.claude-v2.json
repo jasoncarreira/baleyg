@@ -1,0 +1,450 @@
+{
+  "schemaVersion": 1,
+  "provider": "claude-acp",
+  "reservationId": "ff8b93a2-9381-4c56-ac97-52a43be4bec7",
+  "packetHash": "5f8d0a4ed9b5b1278c61e8f408799488618693c5ee012158a1fd7a07cea1cb4a",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "questionId": "q01-smoke",
+  "requestedModel": "opus[1m]",
+  "limits": {
+    "maxBudgetUsd": 3,
+    "maxTurns": 4,
+    "maxOutputTokens": 4096,
+    "timeoutMs": 120000
+  },
+  "costNote": "Provider-reported token-equivalent USD estimate, not actual subscription cash charge; unknown/failed cost retains $5 reservation. Not an invoice guarantee.",
+  "negotiated": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "@agentclientprotocol/claude-agent-acp",
+      "title": "Claude Agent",
+      "version": "0.79.0"
+    },
+    "agentCapabilities": {
+      "_meta": {
+        "claudeCode": {
+          "promptQueueing": true
+        },
+        "authStatus": {}
+      },
+      "promptCapabilities": {
+        "image": true,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "auth": {
+        "logout": {}
+      },
+      "providers": {},
+      "loadSession": true,
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "list": {},
+        "resume": {},
+        "subagents": {}
+      }
+    }
+  },
+  "models": null,
+  "configOptions": [
+    {
+      "id": "mode",
+      "name": "Mode",
+      "description": "Session permission mode",
+      "category": "mode",
+      "type": "select",
+      "currentValue": "default",
+      "options": [
+        {
+          "value": "default",
+          "name": "Manual",
+          "description": "Always ask before making changes",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "acceptEdits",
+          "name": "Accept edits",
+          "description": "Automatically accept all file edits",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "plan",
+          "name": "Plan",
+          "description": "Create a plan before making changes",
+          "_meta": {
+            "kind": "plan"
+          }
+        },
+        {
+          "value": "auto",
+          "name": "Auto",
+          "description": "Claude handles permission decisions",
+          "_meta": {
+            "kind": "auto_review"
+          }
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "name": "Model",
+      "description": "AI model to use",
+      "category": "model",
+      "type": "select",
+      "currentValue": "opus[1m]",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default (recommended)",
+          "description": "Opus (1M context)"
+        },
+        {
+          "value": "opus[1m]",
+          "name": "Opus 5",
+          "description": "Opus 5 with 1M context · Best for everyday, complex tasks"
+        },
+        {
+          "value": "claude-fable-5-1[1m]",
+          "name": "Fable 5.1",
+          "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks"
+        },
+        {
+          "value": "sonnet",
+          "name": "Sonnet 5",
+          "description": "Sonnet 5 · Efficient for routine tasks"
+        },
+        {
+          "value": "haiku",
+          "name": "Haiku 4.5",
+          "description": "Haiku 4.5 · Fastest for quick answers"
+        }
+      ]
+    },
+    {
+      "id": "effort",
+      "name": "Effort",
+      "description": "Available effort levels for this model",
+      "category": "thought_level",
+      "type": "select",
+      "currentValue": "low",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default"
+        },
+        {
+          "value": "low",
+          "name": "Low"
+        },
+        {
+          "value": "medium",
+          "name": "Medium"
+        },
+        {
+          "value": "high",
+          "name": "High"
+        },
+        {
+          "value": "xhigh",
+          "name": "Xhigh"
+        },
+        {
+          "value": "max",
+          "name": "Max"
+        }
+      ]
+    },
+    {
+      "id": "fast",
+      "name": "Fast mode",
+      "description": "Faster responses on supported models",
+      "category": "model_config",
+      "type": "select",
+      "currentValue": "off",
+      "options": [
+        {
+          "value": "on",
+          "name": "On"
+        },
+        {
+          "value": "off",
+          "name": "Off"
+        }
+      ]
+    }
+  ],
+  "currentModelId": "opus[1m]",
+  "stopReason": "end_turn",
+  "usage": {
+    "inputTokens": 8,
+    "outputTokens": 2173,
+    "cachedReadTokens": 257280,
+    "cachedWriteTokens": 134791,
+    "totalTokens": 394252
+  },
+  "decisions": [
+    {
+      "candidateId": "c001",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c002",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c003",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c004",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c005",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c006",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c007",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c008",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c009",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c010",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c011",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c012",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c013",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c014",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c015",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c016",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c017",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c018",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c019",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c020",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c021",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c022",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c023",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c024",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c025",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c026",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c027",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c028",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c029",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c030",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c031",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c032",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c033",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c034",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c035",
+      "relevance": "incidental"
+    }
+  ],
+  "view": {
+    "questionId": "q01-smoke",
+    "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+    "visible": [
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/writeProtectedJsonAtomic().",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/writeProtectedFileAtomic()."
+    ],
+    "collapsed": [
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/ProtectedWriteError#`<constructor>`().",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/resolveProtectedPath().",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/assertSafeTarget().",
+      "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/syncDirectory()."
+    ],
+    "hidden": [
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/withRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/canStealRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/readLockOwnerEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stealByRename().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/releaseOwnedRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/quarantineAndRemoveOwnedLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/renameOwnedLockToQuarantine().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/inspectLockOwnerLiveness().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockOwnerEntryExists().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isDurableLockOwner().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwner().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwnerEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockDirectoryIdentity().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockDirectoryIdentity().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/normalizePositiveInteger().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/delay().",
+      "syntax:core/run-lock.js:11558:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/ownerlessLockIsReclaimable().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isRecord().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stringValue().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/coordinateRunJsonTransition().",
+      "syntax:core/write-core.js:814:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/rename0:",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/assertUnchanged().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/readRunState().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/contractRegistry().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/participantRegistry().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/projectAll().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/deepFreeze()."
+    ],
+    "seedForced": false,
+    "overDisplayBudget": false,
+    "edgePolicy": "Use only measured call edges; hidden intermediates never become direct edges. Callback links remain explicitly non-call links."
+  },
+  "status": "ok",
+  "latencyMs": 28950,
+  "permissionsDenied": 0,
+  "permissionAudit": [],
+  "auth": {
+    "kind": "account",
+    "plan": "team"
+  },
+  "usageUpdates": [
+    {
+      "used": 4734,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 4743,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 118865,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 119802,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 133718,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 134656,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 134656,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 134795,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 135051,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 135051,
+      "size": 1000000,
+      "cost": {
+        "amount": 1.532102,
+        "currency": "USD"
+      }
+    }
+  ],
+  "reportedEstimatedUsd": 1.532102,
+  "settledUsd": 1.532102
+}

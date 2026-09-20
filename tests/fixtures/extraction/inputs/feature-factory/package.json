@@ -1,0 +1,35 @@
+{
+  "name": "feature-factory",
+  "version": "0.9.0",
+  "description": "Durable, observed control plane for /feature runs. Host-agnostic: no opencode dependency.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jasoncarreira/feature-factory.git",
+    "directory": "packages/feature-factory"
+  },
+  "bin": {
+    "factory": "bin/factory.js"
+  },
+  "main": "state/index.js",
+  "exports": {
+    ".": "./state/index.js"
+  },
+  "files": [
+    "bin",
+    "core",
+    "observe",
+    "state",
+    "WORKFLOW.md",
+    "agents",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "FACTORY_PUBLISHING_IDENTITY=factory-test node --import ../../tools/resolve-guard.mjs --test test/*.test.js"
+  }
+}

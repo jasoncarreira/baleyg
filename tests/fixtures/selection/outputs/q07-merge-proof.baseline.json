@@ -1,0 +1,260 @@
+{
+  "provider": "deterministic",
+  "questionId": "q07-merge-proof",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "decisions": [
+    {
+      "candidateId": "c001",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c002",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c003",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c004",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c005",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c006",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c007",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c008",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c009",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c010",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c011",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c012",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c013",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c014",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c015",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c016",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c017",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c018",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c019",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c020",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c021",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c022",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c023",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c024",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c025",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c026",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c027",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c028",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c029",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c030",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c031",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c032",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c033",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c034",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c035",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c036",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c037",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c038",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c039",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c040",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c041",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c042",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c043",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c044",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c045",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c046",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c047",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c048",
+      "relevance": "incidental"
+    }
+  ],
+  "view": {
+    "questionId": "q07-merge-proof",
+    "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+    "visible": [
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/observeMergeProof().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeAncestry().",
+      "local:observe/review.js:local 36",
+      "syntax:observe/review.js:10043:arrow_function",
+      "syntax:observe/review.js:10246:arrow_function",
+      "syntax:observe/review.js:12618:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/revList().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/pathsChanged()."
+    ],
+    "collapsed": [
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/git().",
+      "syntax:observe/review.js:13667:arrow_function"
+    ],
+    "hidden": [
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeWorktree().",
+      "local:observe/index.js:local 16",
+      "syntax:observe/index.js:2858:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeCleanliness().",
+      "syntax:observe/index.js:4025:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/runBootstrap().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeTrackedCleanliness().",
+      "syntax:observe/index.js:5095:arrow_function",
+      "syntax:observe/index.js:5224:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/runTests().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/deriveReviewReady().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/reconcileClaim().",
+      "local:observe/index.js:local 92",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/unownedPaths().",
+      "syntax:observe/index.js:9271:arrow_function",
+      "syntax:observe/index.js:9301:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/coversPath().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/privilegedPaths().",
+      "syntax:observe/index.js:10517:arrow_function",
+      "syntax:observe/index.js:10552:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/buildEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/resolveWorktree().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/proveInitContainment().",
+      "syntax:observe/index.js:16650:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/exactDirectory().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/ensureDirectory().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/inspectComponents().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/gitPath().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/assertWorktreeRelationship().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/within().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/summarize().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/evidenceRef.",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/reviewRef.",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/readReview().",
+      "syntax:observe/review.js:1760:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/isApproving().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/assertReviewBinding().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/readValidatorReview()."
+    ],
+    "seedForced": false,
+    "overDisplayBudget": false,
+    "edgePolicy": "Use only measured call edges; hidden intermediates never become direct edges. Callback links remain explicitly non-call links."
+  }
+}

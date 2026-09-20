@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Baleyg · extraction spike</title>
+<style>
+/* A developer compares source at a well-lit desk: a plain, light reading surface. */
+:root{color-scheme:light;--bg:oklch(1 0 0);--surface:oklch(.96 0 0);--ink:oklch(.25 .015 230);--muted:oklch(.43 .015 230);--line:oklch(.8 0 0);--primary:oklch(.44 .1 230);--selected:oklch(.93 .035 230)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif}header{padding:20px 24px 16px;border-bottom:1px solid var(--line)}h1{font-size:21px;margin:0 0 8px}p{max-width:85ch;margin:6px 0}label{display:flex;gap:6px;flex-direction:column;font-weight:600}select,input,button{font:inherit;max-width:100%}select,button{padding:6px;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:3px}select{max-width:440px}button{cursor:pointer}button:hover{background:var(--selected)}:focus-visible{outline:2px solid var(--primary);outline-offset:3px}.controls{display:flex;flex-wrap:wrap;gap:16px;margin:16px 0 8px;align-items:end}.notice{font-weight:600}#status,.muted{color:var(--muted)}main{display:grid;grid-template-columns:minmax(0,3fr) minmax(300px,2fr)}section{min-width:0;padding:16px 24px}h2{font-size:16px;margin:0 0 8px}.diagram-scroll{overflow:auto;max-height:72vh;border:1px solid var(--line)}svg{display:block;font:12px system-ui,sans-serif}svg text{fill:var(--ink)}.lifeline{stroke:var(--line);stroke-dasharray:3 5}.arrow{stroke:var(--primary);fill:none;stroke-width:1.5}.uncertain{stroke-dasharray:5 4}.message{cursor:pointer}.message:hover .row-bg,.message:focus .row-bg,.message.selected .row-bg{fill:var(--selected)}.row-bg{fill:var(--bg);fill-opacity:.95}.context{font-size:11px;fill:var(--muted)}#source-title{overflow-wrap:anywhere}#source{overflow:auto;max-height:72vh;background:var(--surface);border:1px solid var(--line);margin:0;font:12px/1.65 ui-monospace,monospace;tab-size:2;padding:8px 0;white-space:pre}#source .line{display:block;padding:0 12px;min-width:max-content}#source .selected{background:var(--selected);outline:1px solid var(--primary)}.line-number{display:inline-block;min-width:5ch;color:var(--muted);user-select:none}#details{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0} @media(max-width:850px){main{grid-template-columns:1fr}section{padding:16px}.diagram-scroll,#source{max-height:55vh}header{padding:16px}}
+</style>
+</head>
+<body>
+<header>
+<h1>Baleyg · extraction spike</h1>
+<p class="notice">Static source order — not an execution trace. No return arrows are inferred.</p>
+<p>Internal calls expand to depth 3, up to 60 messages. Branches are alternatives, loops are not repeated, and callbacks are boundaries, not automatically executed.</p>
+<div class="controls">
+<label>Graph<select id="graph-choice"><option value="feature-factory.graph.json">Feature Factory</option><option value="fixture.graph.json">Validation fixture</option></select></label>
+<label>Seed function<select id="seed" disabled><option>Load a graph first</option></select></label>
+<label>Or open graph JSON<input id="file" type="file" accept=".json,application/json"></label>
+</div>
+<p id="status" role="status">Loading graph…</p>
+</header>
+<main>
+<section aria-labelledby="diagram-title"><h2 id="diagram-title">Bounded call sequence</h2><p class="muted">Solid: resolved internal call. Dashed: external, unresolved, or ambiguous. Select an arrow to read its source.</p><div class="diagram-scroll"><svg id="diagram" role="group" aria-label="Static call sequence"></svg></div><p id="bounds" class="muted"></p></section>
+<section aria-labelledby="source-title"><h2 id="source-title">Read-only source</h2><div id="details">Select a call or change the seed.</div><pre id="source" tabindex="0" aria-label="Read-only source text"></pre></section>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const NS = 'http://www.w3.org/2000/svg';
+let graph, nodes, regions, byCaller, request = 0;
+function element(tag, attrs = {}, text) {
+  const el = document.createElementNS(NS, tag);
+  for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+function install(data, name) {
+  if (data.schemaVersion !== 1 || !['nodes','calls','regions','files'].every(k => Array.isArray(data[k]))) throw new Error('Expected graph schemaVersion 1 with nodes, calls, regions and files.');
+  graph = data; nodes = new Map(data.nodes.map(n => [n.id,n])); regions = new Map(data.regions.map(r => [r.id,r])); byCaller = new Map();
+  for (const c of data.calls) { if (!byCaller.has(c.caller)) byCaller.set(c.caller, []); byCaller.get(c.caller).push(c); }
+  for (const calls of byCaller.values()) calls.sort((a,b) => a.ordinal-b.ordinal || a.line-b.line || a.column-b.column);
+  const seeds = [...data.nodes].sort((a,b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  $('seed').replaceChildren();
+  for (const n of seeds) { const option=document.createElement('option'); option.value=n.id; option.textContent=`${n.name} · ${n.path}:${n.line}`; $('seed').append(option); }
+  $('seed').disabled = !seeds.length;
+  const preferred = name.includes('fixture') ? 'flow' : 'readRun';
+  const chosen=seeds.find(n => n.name===preferred) || seeds.find(n => n.name.endsWith('.'+preferred)) || seeds.find(n => byCaller.has(n.id)) || seeds[0];
+  if (chosen) $('seed').value=chosen.id;
+  $('status').textContent=`${name} · ${data.files.length} files · ${data.nodes.length} symbols · ${data.calls.length} call sites`;
+  render();
+}
+function sequence(seed) {
+  const rows=[]; let truncated=false;
+  function visit(id, depth, stack) {
+    for (const call of byCaller.get(id) || []) {
+      if (rows.length >= 60) {truncated=true; return;}
+      const internal=call.resolution==='internal' && nodes.has(call.target);
+      const notes=[];
+      if ((call.callbackArguments || []).length) notes.push('Callback boundary: '+call.callbackArguments.map(id => nodes.get(id)?.name || id).join(', ')+' (not expanded)');
+      if (internal && stack.includes(call.target)) notes.push('Recursion boundary: not expanded');
+      else if (internal && depth >= 3) notes.push('Depth boundary: not expanded');
+      if (call.resolution==='internal' && !internal) notes.push('Missing target: not expanded');
+      rows.push({call,depth,notes,internal});
+      if (internal && depth < 3 && !stack.includes(call.target)) visit(call.target,depth+1,[...stack,call.target]);
+    }
+  }
+  visit(seed,0,[seed]); return {rows,truncated};
+}
+function context(call) {
+  const labels=[]; const seen=new Set();
+  function add(id) {if(seen.has(id)) return; seen.add(id); const r=regions.get(id); if(!r) return; if(r.parent) add(r.parent); labels.push(`${r.kind}: ${r.label || ''}`);}
+  for(const id of call.regions || []) add(id);
+  return labels.join(' / ');
+}
+function showSource(item, description) {
+  $('source-title').textContent=`${item.path}:${item.line} · read-only`;
+  $('details').textContent=description;
+  $('source').replaceChildren();
+  const file=graph.files.find(f => f.path===item.path);
+  if (!file || typeof file.text !== 'string') {$('source').textContent='Source text is not included in this graph.'; return;}
+  let selected;
+  file.text.split('\n').forEach((text,index) => {
+    const line=document.createElement('span'); line.className='line';
+    const number=document.createElement('span'); number.className='line-number'; number.textContent=String(index+1)+' ';
+    line.append(number,document.createTextNode(text || ' '));
+    if(index+1===item.line){line.classList.add('selected');selected=line;}
+    $('source').append(line);
+  });
+  if(selected) $('source').scrollTop=Math.max(0,selected.offsetTop-$('source').offsetTop-$('source').clientHeight/3);
+}
+function render() {
+  const svg=$('diagram'); svg.replaceChildren();
+  const seed=nodes.get($('seed').value); if(!seed){$('bounds').textContent='This graph has no seed symbols.';return;}
+  const {rows,truncated}=sequence(seed.id);
+  const lanes=new Map([[seed.id,seed.name]]);
+  const destination = row => row.internal ? row.call.target : 'boundary:'+row.call.calleeText;
+  for(const row of rows){lanes.set(row.call.caller,nodes.get(row.call.caller)?.name || row.call.caller);lanes.set(destination(row), row.internal ? nodes.get(row.call.target).name : row.call.calleeText);}
+  const positions=new Map([...lanes.keys()].map((id,i)=>[id,140+i*230]));
+  const width=Math.max(760,lanes.size*230+60), height=Math.max(180,90+rows.length*100);
+  svg.setAttribute('width',width); svg.setAttribute('height',height); svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
+  const defs=element('defs'), marker=element('marker',{id:'arrowhead',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto-start-reverse'});
+  marker.append(element('path',{d:'M 0 0 L 10 5 L 0 10 z',fill:'var(--primary)'}));defs.append(marker);svg.append(defs);
+  for(const [id,label] of lanes){const x=positions.get(id);svg.append(element('line',{x1:x,y1:58,x2:x,y2:height-10,class:'lifeline'}));const text=element('text',{x,y:28,'text-anchor':'middle'},label.length>28 ? label.slice(0,25)+'…' : label);text.append(element('title',{},label));svg.append(text);}
+  rows.forEach((row,i)=>{
+    const c=row.call,x1=positions.get(c.caller),x2=positions.get(destination(row)),y=90+i*100;
+    const ctx=context(c);const description=[`${c.calleeText} · ${c.resolution} · source ordinal ${c.ordinal}`,ctx,...row.notes,(c.candidateSymbols || []).length ? 'Candidates: '+c.candidateSymbols.join(', ') : ''].filter(Boolean).join('\n');
+    const group=element('g',{class:'message',tabindex:0,role:'button','aria-label':`${i+1}. ${description}. Open ${c.path}:${c.line}`});
+    group.append(element('title',{},description),element('rect',{x:8,y:y-37,width:width-16,height:90,class:'row-bg',rx:2}));
+    const short = text => text.length>125 ? text.slice(0,122)+'…' : text;
+    group.append(element('text',{x:18,y:y-21,class:'context'},short(ctx || 'Unconditional source context')));
+    const path=x1===x2 ? `M ${x1} ${y} h 50 v 16 h -50` : `M ${x1} ${y+8} H ${x2}`;
+    group.append(element('path',{d:path,class:'arrow'+(row.internal?'':' uncertain'),'marker-end':'url(#arrowhead)'}));
+    group.append(element('text',{x:Math.min(x1,x2)+8,y:y-3},`${i+1}. ${c.calleeText.length>60 ? c.calleeText.slice(0,57)+'…' : c.calleeText} [${c.resolution}]`));
+    group.append(element('text',{x:18,y:y+38,class:'context'},short(row.notes.join(' · ') || `${c.path}:${c.line} · expansion depth ${row.depth}`)));
+    const select=()=>{svg.querySelectorAll('.selected').forEach(el=>el.classList.remove('selected'));group.classList.add('selected');showSource(c,description);};
+    group.addEventListener('click',select);group.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();select();}});svg.append(group);
+  });
+  $('bounds').textContent=`${rows.length} messages shown. ${truncated ? '60-message cap reached; remaining calls omitted.' : 'End of bounded source walk.'}${rows.length ? '' : ' No calls extracted for this seed.'}`;
+  showSource(seed,`Seed: ${seed.name}. Source snapshot from the selected graph; not live file contents.`);
+}
+function fail(error) {graph=null; $('seed').disabled=true; $('diagram').replaceChildren(); $('source').replaceChildren(); $('details').textContent=''; $('bounds').textContent=''; $('status').textContent=`Could not load graph: ${error.message}. Serve this folder over HTTP, or use “open graph JSON”.`;}
+async function load() {const token=++request; $('status').textContent='Loading graph…';$('seed').disabled=true;try{const response=await fetch($('graph-choice').value);if(!response.ok)throw new Error(`HTTP ${response.status}`);const data=await response.json();if(token===request)install(data,$('graph-choice').value);}catch(error){if(token===request)fail(error);}}
+$('graph-choice').addEventListener('change',load);$('seed').addEventListener('change',render);
+$('file').addEventListener('change',async event=>{const file=event.target.files[0];if(!file)return;const token=++request;try{const data=JSON.parse(await file.text());if(token===request)install(data,file.name);}catch(error){if(token===request)fail(error);}});
+load();
+</script>
+</body>
+</html>

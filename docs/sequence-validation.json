@@ -1,0 +1,25 @@
+{
+  "rustTestsPassed": 135,
+  "uiTestsPassed": 53,
+  "acpRunnerTestsPassed": 19,
+  "remoteCiRun": false,
+  "browser": {
+    "files": 18,
+    "atomicFileMethods": 6,
+    "atomicMethodSteps": 91,
+    "atomicMethodParticipants": 6,
+    "truncated": false,
+    "sourceHighlightVerified": true,
+    "selectedMethodPreserved": true,
+    "desktopNoPageOverflow": true,
+    "mobileWidth": 390,
+    "mobileNoPageOverflow": true,
+    "diagramScrollContained": true
+  },
+  "providerCalls": 0,
+  "languageNeutralDto": true,
+  "implementedAdapters": [
+    "javascript"
+  ],
+  "filtering": "Methods retained conservatively; standalone console.log/debug wrappers hidden by explicit naming heuristic; not semantic importance classification."
+}

@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "scope": "Bounded SQLite revision-publication spike; not a production schema",
+  "command": "node --test lifecycle.test.mjs",
+  "runtime": "v24.11.1",
+  "input": "feature-factory.graph.json",
+  "canonicalInputDigest": "9eeb6d1b9004179d372f06dc9a227d3e709ea88f603effe38949a468641d329f",
+  "canonicalRowCount": 13733,
+  "expectedTests": 5,
+  "passed": 5,
+  "status": "passed",
+  "observations": [
+    {
+      "name": "WAL pinned snapshot survives whole-revision replacement",
+      "status": "passed",
+      "journalMode": "wal",
+      "independentConnections": 3,
+      "checkpoints": 3,
+      "pinnedDigest": "9eeb6d1b9004179d372f06dc9a227d3e709ea88f603effe38949a468641d329f",
+      "publishedDigest": "e9cca0af459b3a4401e08a41cd80baee089f561e01d92e8a81270b5fb25ea312",
+      "newTransactionSeesPublishedRevision": true
+    },
+    {
+      "name": "exception rolls back deleted and partially inserted rows",
+      "status": "passed",
+      "injectedAt": [
+        "after-delete",
+        "mid-insert",
+        "before-commit"
+      ],
+      "reopenedAfterEachRollback": true,
+      "recoveredWriterPublishes": true,
+      "actualWorkerCancellation": false
+    },
+    {
+      "name": "injected-cancellation rolls back deleted and partially inserted rows",
+      "status": "passed",
+      "injectedAt": [
+        "after-delete",
+        "mid-insert",
+        "before-commit"
+      ],
+      "reopenedAfterEachRollback": true,
+      "recoveredWriterPublishes": true,
+      "actualWorkerCancellation": false
+    },
+    {
+      "name": "deleted cache rebuilds identical canonical rows from the same graph",
+      "status": "passed",
+      "canonicalRowCount": 13733,
+      "beforeDigest": "9eeb6d1b9004179d372f06dc9a227d3e709ea88f603effe38949a468641d329f",
+      "rebuiltDigest": "9eeb6d1b9004179d372f06dc9a227d3e709ea88f603effe38949a468641d329f",
+      "deletedCacheFiles": true
+    },
+    {
+      "name": "workspace annotation survives cache rebuild and becomes explicit orphan after target rename",
+      "status": "passed",
+      "targetId": "local:bin/factory.js:local 1134",
+      "separateWorkspaceDatabase": true,
+      "annotationSurvivesReopen": true,
+      "survivesSameGraphRebuild": true,
+      "renamedTargetStatus": "orphan",
+      "orphanReason": "target-not-in-current-revision",
+      "automaticRetargeting": false
+    }
+  ],
+  "limitations": [
+    "Synchronous single-process experiment with separate SQLite connections; no worker or process crash was tested.",
+    "Cancellation is an injected AbortError at a transaction checkpoint, not actual worker cancellation.",
+    "cache.db and workspace.db have independent transactions; cross-database reads/writes are not atomic.",
+    "Annotation resolution uses exact extracted node IDs only; renamed/removed targets become orphans, with no automatic identity migration.",
+    "Canonical row equality is tested, not SQLite file-byte equality, scale, throughput, fsync durability under power loss, or production migrations."
+  ]
+}

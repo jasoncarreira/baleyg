@@ -1,0 +1,27 @@
+{
+  "status": "sanitized historical summary; not a new validation run",
+  "evidenceNote": "Private-workspace trial, browser, preservation and deployment details are omitted. Historical Baleyg development checks below are copied from the original report, not rerun or independently reverified during publication cleanup. No synthetic example is presented as an observed run.",
+  "feature": "Java/Python declared class diagrams with related-class context menus",
+  "historicalDevelopmentChecks": {
+    "rustPassed": 334,
+    "rustIgnored": 1,
+    "uiPassed": 197,
+    "clippy": "pass",
+    "fmt": "pass",
+    "build": "pass",
+    "remoteCi": false
+  },
+  "limits": {
+    "diagramNodes": 24,
+    "diagramEdges": 64,
+    "expandedSeeds": 12,
+    "responseBytes": 4194304,
+    "classPresentationBytes": 65536,
+    "searchContentBytes": 3145728,
+    "sourceFileBytes": 2097152,
+    "sourceTotalBytes": 268435456,
+    "classes": 20000,
+    "membersPerClass": 256,
+    "detailRecords": 250000
+  }
+}

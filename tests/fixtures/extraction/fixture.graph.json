@@ -1,0 +1,907 @@
+{
+  "schemaVersion": 1,
+  "scope": "Static lexical call sites, NOT execution order. Callback bodies are separate functions. No points-to analysis.",
+  "indexTool": {
+    "name": "scip-typescript",
+    "version": "0.4.0",
+    "arguments": []
+  },
+  "files": [
+    {
+      "path": "dynamic.js",
+      "hash": "02ea95c6c8fa23a1c829d33e2d6924212a1f4cef95ba94f9cdbc138fdcf4d0f2",
+      "text": "/** @param {number} value @returns {number} */\nexport function recursive(value) {\n  if (value <= 0) return 0;\n  return recursive(value - 1);\n}\n\n/** @param {(value: number) => number} callback @param {number} value */\nexport function injected(callback, value) {\n  return callback(value);\n}\n"
+    },
+    {
+      "path": "flow.js",
+      "hash": "df837649d93f2e6a9b938301152e90c2c9d959d8972eb89d6d00db043ac13606",
+      "text": "import { transform, register, recover } from './helpers.js';\n\n/** @param {number} value */\nexport function direct(value) {\n  /* 🧪 café */ return transform(value);\n}\n\nexport function callbackReference() {\n  return register(transform);\n}\n\n/** @param {number} value */\nexport function repeated(value) {\n  transform(value);\n  return transform(value + 1);\n}\n\n/** @param {number} value */\nexport function branchLoop(value) {\n  if (value > 0) {\n    if (value > 1) {\n      transform(value);\n    } else {\n      recover();\n    }\n  } else {\n    transform(0);\n  }\n  for (let index = 0; index < value; index += 1) {\n    transform(index);\n  }\n}\n\n/** @param {number} value */\nexport function guarded(value) {\n  try {\n    return transform(value);\n  } catch (error) {\n    return recover();\n  }\n}\n"
+    },
+    {
+      "path": "helpers.js",
+      "hash": "bcaeecd10e87b67d2a8bb49846dbe87e36854cf0a5fe5ec969f06481a573fde2",
+      "text": "/** @param {number} value */\nexport function transform(value) {\n  return value + 1;\n}\n\n/** @param {(value: number) => number} callback */\nexport function register(callback) {\n  return callback;\n}\n\nexport function recover() {\n  return -1;\n}\n"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "module:dynamic.js",
+      "name": "dynamic.js",
+      "kind": "module",
+      "path": "dynamic.js",
+      "line": 1,
+      "endLine": 11
+    },
+    {
+      "id": "module:flow.js",
+      "name": "flow.js",
+      "kind": "module",
+      "path": "flow.js",
+      "line": 1,
+      "endLine": 42
+    },
+    {
+      "id": "module:helpers.js",
+      "name": "helpers.js",
+      "kind": "module",
+      "path": "helpers.js",
+      "line": 1,
+      "endLine": 14
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/injected().",
+      "name": "injected",
+      "kind": "function",
+      "accessor": false,
+      "path": "dynamic.js",
+      "line": 8,
+      "endLine": 10,
+      "parent": "module:dynamic.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/recursive().",
+      "name": "recursive",
+      "kind": "function",
+      "accessor": false,
+      "path": "dynamic.js",
+      "line": 2,
+      "endLine": 5,
+      "parent": "module:dynamic.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().",
+      "name": "branchLoop",
+      "kind": "function",
+      "accessor": false,
+      "path": "flow.js",
+      "line": 19,
+      "endLine": 32,
+      "parent": "module:flow.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/callbackReference().",
+      "name": "callbackReference",
+      "kind": "function",
+      "accessor": false,
+      "path": "flow.js",
+      "line": 8,
+      "endLine": 10,
+      "parent": "module:flow.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/direct().",
+      "name": "direct",
+      "kind": "function",
+      "accessor": false,
+      "path": "flow.js",
+      "line": 4,
+      "endLine": 6,
+      "parent": "module:flow.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/guarded().",
+      "name": "guarded",
+      "kind": "function",
+      "accessor": false,
+      "path": "flow.js",
+      "line": 35,
+      "endLine": 41,
+      "parent": "module:flow.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/repeated().",
+      "name": "repeated",
+      "kind": "function",
+      "accessor": false,
+      "path": "flow.js",
+      "line": 13,
+      "endLine": 16,
+      "parent": "module:flow.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/recover().",
+      "name": "recover",
+      "kind": "function",
+      "accessor": false,
+      "path": "helpers.js",
+      "line": 11,
+      "endLine": 13,
+      "parent": "module:helpers.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/register().",
+      "name": "register",
+      "kind": "function",
+      "accessor": false,
+      "path": "helpers.js",
+      "line": 7,
+      "endLine": 9,
+      "parent": "module:helpers.js",
+      "provenance": "scip+treesitter"
+    },
+    {
+      "id": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "name": "transform",
+      "kind": "function",
+      "accessor": false,
+      "path": "helpers.js",
+      "line": 2,
+      "endLine": 4,
+      "parent": "module:helpers.js",
+      "provenance": "scip+treesitter"
+    }
+  ],
+  "calls": [
+    {
+      "id": "call:dynamic.js:119",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/recursive().",
+      "calleeText": "recursive",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/recursive().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/recursive()."
+      ],
+      "callbackArguments": [],
+      "path": "dynamic.js",
+      "line": 4,
+      "column": 10,
+      "offset": 119,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:dynamic.js:270",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/injected().",
+      "calleeText": "callback",
+      "target": null,
+      "resolution": "unresolved",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/injected().(callback)"
+      ],
+      "callbackArguments": [],
+      "path": "dynamic.js",
+      "line": 9,
+      "column": 10,
+      "offset": 270,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:146",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/direct().",
+      "calleeText": "transform",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 5,
+      "column": 24,
+      "offset": 146,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:214",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/callbackReference().",
+      "calleeText": "register",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/register().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/register()."
+      ],
+      "callbackArguments": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform()."
+      ],
+      "path": "flow.js",
+      "line": 9,
+      "column": 10,
+      "offset": 214,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:303",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/repeated().",
+      "calleeText": "transform",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 14,
+      "column": 3,
+      "offset": 303,
+      "ordinal": 1,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:330",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/repeated().",
+      "calleeText": "transform",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 15,
+      "column": 10,
+      "offset": 330,
+      "ordinal": 2,
+      "regions": [],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:466",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().",
+      "calleeText": "transform",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 22,
+      "column": 7,
+      "offset": 466,
+      "ordinal": 1,
+      "regions": [
+        "region:flow.js:422:if",
+        "region:flow.js:443:if"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:503",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().",
+      "calleeText": "recover",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/recover().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/recover()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 24,
+      "column": 7,
+      "offset": 503,
+      "ordinal": 2,
+      "regions": [
+        "region:flow.js:422:if",
+        "region:flow.js:490:else"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:535",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().",
+      "calleeText": "transform",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 27,
+      "column": 5,
+      "offset": 535,
+      "ordinal": 3,
+      "regions": [
+        "region:flow.js:524:else"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:608",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().",
+      "calleeText": "transform",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 30,
+      "column": 5,
+      "offset": 608,
+      "ordinal": 4,
+      "regions": [
+        "region:flow.js:555:loop"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:714",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/guarded().",
+      "calleeText": "transform",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 37,
+      "column": 12,
+      "offset": 714,
+      "ordinal": 1,
+      "regions": [
+        "region:flow.js:697:try_statement"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    },
+    {
+      "id": "call:flow.js:763",
+      "caller": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/guarded().",
+      "calleeText": "recover",
+      "target": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/recover().",
+      "resolution": "internal",
+      "candidateSymbols": [
+        "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/recover()."
+      ],
+      "callbackArguments": [],
+      "path": "flow.js",
+      "line": 39,
+      "column": 12,
+      "offset": 763,
+      "ordinal": 2,
+      "regions": [
+        "region:flow.js:697:try_statement",
+        "region:flow.js:736:catch_clause"
+      ],
+      "syntax": "call_expression",
+      "provenance": {
+        "callsite": "treesitter",
+        "resolution": "scip"
+      }
+    }
+  ],
+  "regions": [
+    {
+      "id": "region:dynamic.js:84:if",
+      "kind": "if",
+      "label": "if (value <= 0)",
+      "parent": null,
+      "path": "dynamic.js",
+      "line": 3,
+      "endLine": 3,
+      "owner": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/recursive()."
+    },
+    {
+      "id": "region:flow.js:422:if",
+      "kind": "if",
+      "label": "if (value > 0)",
+      "parent": null,
+      "path": "flow.js",
+      "line": 20,
+      "endLine": 28,
+      "owner": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop()."
+    },
+    {
+      "id": "region:flow.js:443:if",
+      "kind": "if",
+      "label": "if (value > 1)",
+      "parent": "region:flow.js:422:if",
+      "path": "flow.js",
+      "line": 21,
+      "endLine": 25,
+      "owner": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop()."
+    },
+    {
+      "id": "region:flow.js:490:else",
+      "kind": "else",
+      "label": "else of line 21",
+      "parent": "region:flow.js:422:if",
+      "path": "flow.js",
+      "line": 23,
+      "endLine": 25,
+      "owner": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop()."
+    },
+    {
+      "id": "region:flow.js:524:else",
+      "kind": "else",
+      "label": "else of line 20",
+      "parent": null,
+      "path": "flow.js",
+      "line": 26,
+      "endLine": 28,
+      "owner": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop()."
+    },
+    {
+      "id": "region:flow.js:555:loop",
+      "kind": "loop",
+      "label": "for (let index = 0; index < value; index += 1)",
+      "parent": null,
+      "path": "flow.js",
+      "line": 29,
+      "endLine": 31,
+      "owner": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop()."
+    },
+    {
+      "id": "region:flow.js:697:try_statement",
+      "kind": "try_statement",
+      "label": "try ",
+      "parent": null,
+      "path": "flow.js",
+      "line": 36,
+      "endLine": 40,
+      "owner": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/guarded()."
+    },
+    {
+      "id": "region:flow.js:736:catch_clause",
+      "kind": "catch_clause",
+      "label": "catch (error) ",
+      "parent": "region:flow.js:697:try_statement",
+      "path": "flow.js",
+      "line": 38,
+      "endLine": 40,
+      "owner": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/guarded()."
+    }
+  ],
+  "references": [
+    {
+      "path": "dynamic.js",
+      "range": [
+        2,
+        6,
+        11
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/recursive().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "dynamic.js",
+      "range": [
+        3,
+        9,
+        18
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/recursive().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "dynamic.js",
+      "range": [
+        3,
+        19,
+        24
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/recursive().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "dynamic.js",
+      "range": [
+        8,
+        9,
+        17
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/injected().(callback)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "dynamic.js",
+      "range": [
+        8,
+        18,
+        23
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `dynamic.js`/injected().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        0,
+        9,
+        18
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        0,
+        20,
+        28
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/register().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        0,
+        30,
+        37
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/recover().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        0,
+        45,
+        59
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        4,
+        23,
+        32
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        4,
+        33,
+        38
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/direct().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        8,
+        9,
+        17
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/register().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        8,
+        18,
+        27
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        13,
+        2,
+        11
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        13,
+        12,
+        17
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/repeated().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        14,
+        9,
+        18
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        14,
+        19,
+        24
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/repeated().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        19,
+        6,
+        11
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        20,
+        8,
+        13
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        21,
+        6,
+        15
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        21,
+        16,
+        21
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        23,
+        6,
+        13
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/recover().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        26,
+        4,
+        13
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        28,
+        22,
+        27
+      ],
+      "symbol": "local:flow.js:local 2",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        28,
+        30,
+        35
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/branchLoop().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        28,
+        37,
+        42
+      ],
+      "symbol": "local:flow.js:local 2",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        29,
+        4,
+        13
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        29,
+        14,
+        19
+      ],
+      "symbol": "local:flow.js:local 2",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        36,
+        11,
+        20
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        36,
+        21,
+        26
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `flow.js`/guarded().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "flow.js",
+      "range": [
+        38,
+        11,
+        18
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/recover().",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "helpers.js",
+      "range": [
+        2,
+        9,
+        14
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/transform().(value)",
+      "enclosingRange": [],
+      "stale": false
+    },
+    {
+      "path": "helpers.js",
+      "range": [
+        7,
+        9,
+        17
+      ],
+      "symbol": "scip-typescript npm baleyg-extraction-fixture HEAD `helpers.js`/register().(callback)",
+      "enclosingRange": [],
+      "stale": false
+    }
+  ],
+  "stats": {
+    "files": 3,
+    "nodes": 13,
+    "calls": 12,
+    "internal": 11,
+    "external": 0,
+    "unresolved": 1,
+    "ambiguous": 0,
+    "parseErrors": 0,
+    "occurrences": 57,
+    "referenceEnclosingRanges": 0,
+    "definitionEnclosingRanges": 13,
+    "semanticFresh": true,
+    "changedFiles": []
+  }
+}

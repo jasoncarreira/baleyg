@@ -1,0 +1,272 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>Blind selection review</title><style>
+  :root{color-scheme:light;--ink:oklch(.24 0 0);--bg:oklch(1 0 0);--muted:oklch(.43 0 0);--line:oklch(.78 0 0);--accent:oklch(.48 .16 20)}
+  *{box-sizing:border-box}body{margin:0;padding:2rem;font:16px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--ink)}main{max-width:1500px;margin:auto}h1{font-size:1.7rem}h2{font-size:1.3rem}h3{font-size:1rem}p{max-width:75ch}header{margin-bottom:2rem}.panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2rem}section{min-width:0;border-top:2px solid var(--ink)}svg{width:100%;max-height:720px}svg path{fill:none;stroke:var(--muted);stroke-width:1.5}polygon{fill:var(--muted)}rect{fill:var(--bg);stroke:var(--line)}text{fill:var(--ink);font:14px system-ui}details{border-top:1px solid var(--line);padding:.7rem 0}summary{cursor:pointer;overflow-wrap:anywhere}summary:hover{color:var(--accent)}summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}pre{overflow:auto;padding:.7rem;background:oklch(.96 0 0);font-size:.8rem}li,p{overflow-wrap:anywhere}ul{padding-left:1.2rem}small{color:var(--muted);overflow-wrap:anywhere}@media(max-width:1000px){.panels{grid-template-columns:1fr}body{padding:1rem}svg{max-width:560px}}
+  </style></head><body><main><header><h1>Blind selection review</h1><p><strong>How does transition reach the protected write, and where are the two unchanged-state checks relative to reobservation and final rename?</strong></p><p>Call-selection sketch — not a sequence diagram or an execution trace. Judge only what helps answer this question; adjacent detail is not useful by default. Panels are shuffled. Arrows show measured direct calls only; hidden intermediates are never bridged. Callback references do not establish execution.</p><small>Graph snapshot: 9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db. Fixed candidate scope; source excerpts may be truncated.</small></header><div class="panels"><section aria-labelledby="panel-A"><h2 id="panel-A">Panel A</h2><p>5 shown · 3 measured direct calls</p><svg viewBox="0 0 460 325" role="img" aria-label="Panel A: function nodes and measured direct calls"><defs><marker id="arrow-A" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6"/></marker></defs><path data-call="call:state/transition.js:902" d="M 335 35 C 360 11, 360 124, 335 100" marker-end="url(#arrow-A)"><title>c001 → c002, line 18</title></path><path data-call="call:core/write-core.js:1937" d="M 335 230 C 374 206, 374 319, 335 295" marker-end="url(#arrow-A)"><title>c072 → c073, line 52</title></path><path data-call="call:core/write-core.js:2953" d="M 335 230 C 388 206, 388 319, 335 295" marker-end="url(#arrow-A)"><title>c072 → c073, line 72</title></path><g><title>transition — state/transition.js:13</title><rect x="12" y="15" width="323" height="40" rx="4"/><text x="22" y="40">c001 · transition</text></g><g><title>coordinateRunJsonTransition — core/write-core.js:9</title><rect x="12" y="80" width="323" height="40" rx="4"/><text x="22" y="105">c002 · coordinateRunJsonTransition</text></g><g><title>&lt;callback@23:34&gt; — core/write-core.js:23</title><rect x="12" y="145" width="323" height="40" rx="4"/><text x="22" y="170">c005 · &lt;callback@23:34&gt;</text></g><g><title>rename — core/write-core.js:47</title><rect x="12" y="210" width="323" height="40" rx="4"/><text x="22" y="235">c072 · rename</text></g><g><title>assertUnchanged — core/write-core.js:85</title><rect x="12" y="275" width="323" height="40" rx="4"/><text x="22" y="300">c073 · assertUnchanged</text></g></svg><h3>Shown functions and source</h3><details><summary>c001 · transition — supporting (forced seed)</summary><p>state/transition.js:13–26</p><pre><code>export async function transition(runDir, { participants, apply, reobservers, hooks, finalGuard } = {}) {
+  const descriptor = Object.freeze({
+    participants: Object.freeze((participants ?? []).map((entry) =&gt; Object.freeze({ ...entry }))),
+    apply,
+  });
+  return coordinateRunJsonTransition(runDir, {
+    contracts: FAMILY_CONTRACTS,
+    descriptor,
+    validateRun,
+    reobservers: reobservers ?? new Map(),
+    atomicWriteHooks: hooks,
+    finalGuard,
+  });
+}</code></pre><details><summary>Call boundaries (4)</summary><ul><li>call:state/transition.js:761, line 14: Object.freeze → unresolved / outside packet · external</li><li>call:state/transition.js:795, line 15: Object.freeze → unresolved / outside packet · external</li><li>call:state/transition.js:809, line 15: (participants ?? []).map → unresolved / outside packet · unresolved</li><li>call:state/transition.js:1038, line 22: Map → unresolved / outside packet · ambiguous</li></ul></details><details><summary>Callback references — not calls (1)</summary><ul><li>call:state/transition.js:809, line 15: &lt;callback@15:58&gt;</li></ul></details></details><details><summary>c002 · coordinateRunJsonTransition — essential</summary><p>core/write-core.js:9–83</p><pre><code>export async function coordinateRunJsonTransition(runDir, options) {
+  const {
+    contracts,
+    descriptor,
+    validateRun,
+    reobservers = new Map(),
+    atomicWriteHooks,
+    finalGuard,
+  } = options ?? {};
+  const registry = contractRegistry(contracts);
+  const participants = participantRegistry(descriptor, registry);
+  if (typeof validateRun !== &quot;function&quot;) throw new Error(&quot;validateRun must be a function&quot;);
+  if (!(reobservers instanceof Map)) throw new Error(&quot;reobservers must be a Map&quot;);
+
+  return withRunJsonLock(runDir, async () =&gt; {
+    const initial = deepFreeze(await readRunState(runDir, validateRun));
+    const before = projectAll(registry, initial);
+    const applied = descriptor.apply(structuredClone(initial));
+    if (!applied || typeof applied !== &quot;object&quot; || Array.isArray(applied)) {
+      throw new Error(&quot;transition apply must return a state object&quot;);
+    }
+    validateRun(applied);
+    const candidate = deepFreeze(applied);
+    const after = projectAll(registry, candidate);
+
+    for (const [familyId, contract] of registry) {
+      contract.validateTransition({
+        mode: participants.get(familyId),
+        before: before.get(familyId),
+        after: after.get(familyId),
+        current: initial,
+        candidate,
+      });
+    }
+
+    await writeProtectedJsonAtomic(runDir, RUN_FILE, candidate, {
+      hooks: atomicWriteHooks,
+      fsOps: {
+        rename: async (source, destination) =&gt; {
+
+          // First comparison: gives the reobservers a state to reason about that is
+          // known current as of this moment.
+          const observed = deepFreeze(await readRunState(runDir, validateRun));
+          assertUnchanged(observed, initial);
+
+          const observedProjections = projectAll(registry, observed);
+          for (const [familyId, contract] of registry) {
+            await contract.reobserve({
+              mode: participants.get(familyId),
+              current: observedProjections.get(familyId),
+              candidate: after.get(familyId),
+              observe: reobservers.get(familyId),
+              state: observed,
+              nextState: candidate,
+            });
+          }
+
+          // Second comparison, immediately before the rename and after anything the
+          // reobservers did. Comparing only once left a window: a reobserver - or a
+          // concurrent writer running while one awaited - could commit a valid
+          // record after the check, and this rename would silently overwrite it.
+          // Only the synchronous final guard may run between this line and the rename.
+          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));
+          assertUnchanged(finalObserved, initial);
+          if (typeof finalGuard === &quot;function&quot;) {
+            const guarded = finalGuard({ state: finalObserved, candidate });
+            if (guarded &amp;&amp; typeof guarded.then === &quot;function&quot;) throw new Error(&quot;final commit guard must be synchronous&quot;);
+          }
+          await rename(source, destination);
+        },
+      },
+    });
+    return candidate;
+  });
+}</code></pre><details><summary>Call boundaries (6)</summary><ul><li>call:core/write-core.js:421, line 14: Map → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:510, line 18: contractRegistry → contractRegistry (not shown) · internal</li><li>call:core/write-core.js:562, line 19: participantRegistry → participantRegistry (not shown) · internal</li><li>call:core/write-core.js:652, line 20: Error → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:740, line 21: Error → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:790, line 23: withRunJsonLock → withRunJsonLock (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (1)</summary><ul><li>call:core/write-core.js:790, line 23: &lt;callback@23:34&gt;</li></ul></details></details><details><summary>c005 · &lt;callback@23:34&gt; — essential</summary><p>core/write-core.js:23–82</p><pre><code>  return withRunJsonLock(runDir, async () =&gt; {
+    const initial = deepFreeze(await readRunState(runDir, validateRun));
+    const before = projectAll(registry, initial);
+    const applied = descriptor.apply(structuredClone(initial));
+    if (!applied || typeof applied !== &quot;object&quot; || Array.isArray(applied)) {
+      throw new Error(&quot;transition apply must return a state object&quot;);
+    }
+    validateRun(applied);
+    const candidate = deepFreeze(applied);
+    const after = projectAll(registry, candidate);
+
+    for (const [familyId, contract] of registry) {
+      contract.validateTransition({
+        mode: participants.get(familyId),
+        before: before.get(familyId),
+        after: after.get(familyId),
+        current: initial,
+        candidate,
+      });
+    }
+
+    await writeProtectedJsonAtomic(runDir, RUN_FILE, candidate, {
+      hooks: atomicWriteHooks,
+      fsOps: {
+        rename: async (source, destination) =&gt; {
+
+          // First comparison: gives the reobservers a state to reason about that is
+          // known current as of this moment.
+          const observed = deepFreeze(await readRunState(runDir, validateRun));
+          assertUnchanged(observed, initial);
+
+          const observedProjections = projectAll(registry, observed);
+          for (const [familyId, contract] of registry) {
+            await contract.reobserve({
+              mode: participants.get(familyId),
+              current: observedProjections.get(familyId),
+              candidate: after.get(familyId),
+              observe: reobservers.get(familyId),
+              state: observed,
+              nextState: candidate,
+            });
+          }
+
+          // Second comparison, immediately before the rename and after anything the
+          // reobservers did. Comparing only once left a window: a reobserver - or a
+          // concurrent writer running while one awaited - could commit a valid
+          // record after the check, and this rename would silently overwrite it.
+          // Only the synchronous final guard may run between this line and the rename.
+          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));
+          assertUnchanged(finalObserved, initial);
+          if (typeof finalGuard === &quot;function&quot;) {
+            const guarded = finalGuard({ state: finalObserved, candidate });
+            if (guarded &amp;&amp; typeof guarded.then === &quot;function&quot;) throw new Error(&quot;final commit guard must be synchronous&quot;);
+          }
+          await rename(source, destination);
+        },
+      },
+    });
+    return candidate;
+  });</code></pre><details><summary>Call boundaries (15)</summary><ul><li>call:core/write-core.js:848, line 24: deepFreeze → deepFreeze (not shown) · internal</li><li>call:core/write-core.js:865, line 24: readRunState → readRunState (not shown) · internal</li><li>call:core/write-core.js:920, line 25: projectAll → projectAll (not shown) · internal</li><li>call:core/write-core.js:971, line 26: descriptor.apply → unresolved / outside packet · unresolved</li><li>call:core/write-core.js:988, line 26: structuredClone → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:1066, line 27: Array.isArray → unresolved / outside packet · external</li><li>call:core/write-core.js:1104, line 28: Error → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:1172, line 30: validateRun → unresolved / outside packet · unresolved</li><li>call:core/write-core.js:1216, line 31: deepFreeze → deepFreeze (not shown) · internal</li><li>call:core/write-core.js:1255, line 32: projectAll → projectAll (not shown) · internal</li><li>call:core/write-core.js:1346, line 35: contract.validateTransition → unresolved / outside packet · unresolved</li><li>call:core/write-core.js:1390, line 36: participants.get → unresolved / outside packet · external</li><li>call:core/write-core.js:1434, line 37: before.get → unresolved / outside packet · external</li><li>call:core/write-core.js:1471, line 38: after.get → unresolved / outside packet · external</li><li>call:core/write-core.js:1564, line 44: writeProtectedJsonAtomic → writeProtectedJsonAtomic (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c072 · rename — essential</summary><p>core/write-core.js:47–78</p><pre><code>        rename: async (source, destination) =&gt; {
+
+          // First comparison: gives the reobservers a state to reason about that is
+          // known current as of this moment.
+          const observed = deepFreeze(await readRunState(runDir, validateRun));
+          assertUnchanged(observed, initial);
+
+          const observedProjections = projectAll(registry, observed);
+          for (const [familyId, contract] of registry) {
+            await contract.reobserve({
+              mode: participants.get(familyId),
+              current: observedProjections.get(familyId),
+              candidate: after.get(familyId),
+              observe: reobservers.get(familyId),
+              state: observed,
+              nextState: candidate,
+            });
+          }
+
+          // Second comparison, immediately before the rename and after anything the
+          // reobservers did. Comparing only once left a window: a reobserver - or a
+          // concurrent writer running while one awaited - could commit a valid
+          // record after the check, and this rename would silently overwrite it.
+          // Only the synchronous final guard may run between this line and the rename.
+          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));
+          assertUnchanged(finalObserved, initial);
+          if (typeof finalGuard === &quot;function&quot;) {
+            const guarded = finalGuard({ state: finalObserved, candidate });
+            if (guarded &amp;&amp; typeof guarded.then === &quot;function&quot;) throw new Error(&quot;final commit guard must be synchronous&quot;);
+          }
+          await rename(source, destination);
+        },</code></pre><details><summary>Call boundaries (13)</summary><ul><li>call:core/write-core.js:1874, line 51: deepFreeze → deepFreeze (not shown) · internal</li><li>call:core/write-core.js:1891, line 51: readRunState → readRunState (not shown) · internal</li><li>call:core/write-core.js:2012, line 54: projectAll → projectAll (not shown) · internal</li><li>call:core/write-core.js:2119, line 56: contract.reobserve → unresolved / outside packet · unresolved</li><li>call:core/write-core.js:2160, line 57: participants.get → unresolved / outside packet · external</li><li>call:core/write-core.js:2211, line 58: observedProjections.get → unresolved / outside packet · external</li><li>call:core/write-core.js:2271, line 59: after.get → unresolved / outside packet · external</li><li>call:core/write-core.js:2315, line 60: reobservers.get → unresolved / outside packet · external</li><li>call:core/write-core.js:2890, line 71: deepFreeze → deepFreeze (not shown) · internal</li><li>call:core/write-core.js:2907, line 71: readRunState → readRunState (not shown) · internal</li><li>call:core/write-core.js:3072, line 74: finalGuard → unresolved / outside packet · unresolved</li><li>call:core/write-core.js:3190, line 75: Error → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:3271, line 77: rename → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c073 · assertUnchanged — essential</summary><p>core/write-core.js:85–89</p><pre><code>function assertUnchanged(observed, initial) {
+  if (!isDeepStrictEqual(observed, initial)) {
+    throw new Error(&quot;run state changed before protected replacement&quot;);
+  }
+}</code></pre><details><summary>Call boundaries (2)</summary><ul><li>call:core/write-core.js:3412, line 86: isDeepStrictEqual → unresolved / outside packet · external</li><li>call:core/write-core.js:3462, line 87: Error → unresolved / outside packet · ambiguous</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>Collapsed / uncertain candidates</summary><ul><li>c008 · writeProtectedJsonAtomic — <strong>supporting</strong> · core/atomic-write.js:18</li><li>c021 · readRunState — <strong>supporting</strong> · core/write-core.js:91</li><li>c022 · projectAll — <strong>supporting</strong> · core/write-core.js:132</li><li>c024 · writeProtectedFileAtomic — <strong>supporting</strong> · core/atomic-write.js:22</li><li>c056 · reobserveSlices — <strong>supporting</strong> · core/contracts.js:278</li></ul></details><details><summary>Hidden candidates</summary><ul><li>c003 · &lt;callback@15:58&gt; — <strong>incidental</strong> · state/transition.js:15</li><li>c004 · withRunJsonLock — <strong>incidental</strong> · core/run-lock.js:18</li><li>c006 · contractRegistry — <strong>incidental</strong> · core/write-core.js:96</li><li>c007 · participantRegistry — <strong>incidental</strong> · core/write-core.js:114</li><li>c009 · canStealRunJsonLock — <strong>incidental</strong> · core/run-lock.js:79</li><li>c010 · readLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:83</li><li>c011 · stealByRename — <strong>incidental</strong> · core/run-lock.js:111</li><li>c012 · releaseOwnedRunJsonLock — <strong>incidental</strong> · core/run-lock.js:138</li><li>c013 · quarantineAndRemoveOwnedLock — <strong>incidental</strong> · core/run-lock.js:150</li><li>c014 · lockOwnerEntryExists — <strong>incidental</strong> · core/run-lock.js:187</li><li>c015 · sameLockOwner — <strong>incidental</strong> · core/run-lock.js:207</li><li>c016 · lockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:218</li><li>c017 · sameLockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:228</li><li>c018 · normalizePositiveInteger — <strong>incidental</strong> · core/run-lock.js:232</li><li>c019 · delay — <strong>incidental</strong> · core/run-lock.js:239</li><li>c020 · ownerlessLockIsReclaimable — <strong>incidental</strong> · core/run-lock.js:251</li><li>c023 · deepFreeze — <strong>incidental</strong> · core/write-core.js:142</li><li>c025 · renameOwnedLockToQuarantine — <strong>incidental</strong> · core/run-lock.js:157</li><li>c026 · inspectLockOwnerLiveness — <strong>incidental</strong> · core/run-lock.js:174</li><li>c027 · isDurableLockOwner — <strong>incidental</strong> · core/run-lock.js:197</li><li>c028 · sameLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:211</li><li>c029 · &lt;callback@240:22&gt; — <strong>incidental</strong> · core/run-lock.js:240</li><li>c030 · constructor — <strong>incidental</strong> · core/atomic-write.js:12</li><li>c031 · resolveProtectedPath — <strong>incidental</strong> · core/atomic-write.js:89</li><li>c032 · assertSafeTarget — <strong>incidental</strong> · core/atomic-write.js:106</li><li>c033 · syncDirectory — <strong>incidental</strong> · core/atomic-write.js:119</li><li>c034 · isRecord — <strong>incidental</strong> · core/run-lock.js:263</li><li>c035 · stringValue — <strong>incidental</strong> · core/run-lock.js:267</li><li>c036 · callRegisteredObserver — <strong>incidental</strong> · core/contracts.js:23</li><li>c037 · contract — <strong>incidental</strong> · core/contracts.js:27</li><li>c038 · validateProjection — <strong>incidental</strong> · core/contracts.js:31</li><li>c039 · &lt;callback@35:30&gt; — <strong>incidental</strong> · core/contracts.js:35</li><li>c040 · project — <strong>incidental</strong> · core/contracts.js:45</li><li>c041 · validateTransition — <strong>incidental</strong> · core/contracts.js:60</li><li>c042 · &lt;callback@76:54&gt; — <strong>incidental</strong> · core/contracts.js:76</li><li>c043 · &lt;callback@79:55&gt; — <strong>incidental</strong> · core/contracts.js:79</li><li>c044 · &lt;callback@92:54&gt; — <strong>incidental</strong> · core/contracts.js:92</li><li>c045 · &lt;callback@95:55&gt; — <strong>incidental</strong> · core/contracts.js:95</li><li>c046 · &lt;callback@109:52&gt; — <strong>incidental</strong> · core/contracts.js:109</li><li>c047 · &lt;callback@112:53&gt; — <strong>incidental</strong> · core/contracts.js:112</li><li>c048 · checkPrePrApproval — <strong>incidental</strong> · core/contracts.js:152</li><li>c049 · project — <strong>incidental</strong> · core/contracts.js:165</li><li>c050 · validateTransition — <strong>incidental</strong> · core/contracts.js:166</li><li>c051 · project — <strong>incidental</strong> · core/contracts.js:214</li><li>c052 · &lt;callback@214:47&gt; — <strong>incidental</strong> · core/contracts.js:214</li><li>c053 · validateTransition — <strong>incidental</strong> · core/contracts.js:215</li><li>c054 · &lt;callback@216:45&gt; — <strong>incidental</strong> · core/contracts.js:216</li><li>c055 · &lt;callback@260:23&gt; — <strong>incidental</strong> · core/contracts.js:260</li><li>c057 · &lt;callback@281:36&gt; — <strong>incidental</strong> · core/contracts.js:281</li><li>c058 · &lt;callback@291:41&gt; — <strong>incidental</strong> · core/contracts.js:291</li><li>c059 · &lt;callback@292:25&gt; — <strong>incidental</strong> · core/contracts.js:292</li><li>c060 · project — <strong>incidental</strong> · core/contracts.js:320</li><li>c061 · &lt;callback@320:48&gt; — <strong>incidental</strong> · core/contracts.js:320</li><li>c062 · validateTransition — <strong>incidental</strong> · core/contracts.js:321</li><li>c063 · &lt;callback@324:33&gt; — <strong>incidental</strong> · core/contracts.js:324</li><li>c064 · &lt;callback@325:17&gt; — <strong>incidental</strong> · core/contracts.js:325</li><li>c065 · &lt;callback@353:42&gt; — <strong>incidental</strong> · core/contracts.js:353</li><li>c066 · &lt;callback@391:41&gt; — <strong>incidental</strong> · core/contracts.js:391</li><li>c067 · &lt;callback@399:23&gt; — <strong>incidental</strong> · core/contracts.js:399</li><li>c068 · checkPublication — <strong>incidental</strong> · core/contracts.js:407</li><li>c069 · project — <strong>incidental</strong> · core/contracts.js:416</li><li>c070 · validateTransition — <strong>incidental</strong> · core/contracts.js:417</li><li>c071 · &lt;callback@444:62&gt; — <strong>incidental</strong> · core/contracts.js:444</li></ul></details></section><section aria-labelledby="panel-B"><h2 id="panel-B">Panel B</h2><p>3 shown · 1 measured direct calls</p><svg viewBox="0 0 460 195" role="img" aria-label="Panel B: function nodes and measured direct calls"><defs><marker id="arrow-B" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6"/></marker></defs><path data-call="call:state/transition.js:902" d="M 335 35 C 360 11, 360 124, 335 100" marker-end="url(#arrow-B)"><title>c001 → c002, line 18</title></path><g><title>transition — state/transition.js:13</title><rect x="12" y="15" width="323" height="40" rx="4"/><text x="22" y="40">c001 · transition</text></g><g><title>coordinateRunJsonTransition — core/write-core.js:9</title><rect x="12" y="80" width="323" height="40" rx="4"/><text x="22" y="105">c002 · coordinateRunJsonTransition</text></g><g><title>&lt;callback@15:58&gt; — state/transition.js:15</title><rect x="12" y="145" width="323" height="40" rx="4"/><text x="22" y="170">c003 · &lt;callback@15:58&gt;</text></g></svg><h3>Shown functions and source</h3><details><summary>c001 · transition — essential</summary><p>state/transition.js:13–26</p><pre><code>export async function transition(runDir, { participants, apply, reobservers, hooks, finalGuard } = {}) {
+  const descriptor = Object.freeze({
+    participants: Object.freeze((participants ?? []).map((entry) =&gt; Object.freeze({ ...entry }))),
+    apply,
+  });
+  return coordinateRunJsonTransition(runDir, {
+    contracts: FAMILY_CONTRACTS,
+    descriptor,
+    validateRun,
+    reobservers: reobservers ?? new Map(),
+    atomicWriteHooks: hooks,
+    finalGuard,
+  });
+}</code></pre><details><summary>Call boundaries (4)</summary><ul><li>call:state/transition.js:761, line 14: Object.freeze → unresolved / outside packet · external</li><li>call:state/transition.js:795, line 15: Object.freeze → unresolved / outside packet · external</li><li>call:state/transition.js:809, line 15: (participants ?? []).map → unresolved / outside packet · unresolved</li><li>call:state/transition.js:1038, line 22: Map → unresolved / outside packet · ambiguous</li></ul></details><details><summary>Callback references — not calls (1)</summary><ul><li>call:state/transition.js:809, line 15: &lt;callback@15:58&gt;</li></ul></details></details><details><summary>c002 · coordinateRunJsonTransition — essential</summary><p>core/write-core.js:9–83</p><pre><code>export async function coordinateRunJsonTransition(runDir, options) {
+  const {
+    contracts,
+    descriptor,
+    validateRun,
+    reobservers = new Map(),
+    atomicWriteHooks,
+    finalGuard,
+  } = options ?? {};
+  const registry = contractRegistry(contracts);
+  const participants = participantRegistry(descriptor, registry);
+  if (typeof validateRun !== &quot;function&quot;) throw new Error(&quot;validateRun must be a function&quot;);
+  if (!(reobservers instanceof Map)) throw new Error(&quot;reobservers must be a Map&quot;);
+
+  return withRunJsonLock(runDir, async () =&gt; {
+    const initial = deepFreeze(await readRunState(runDir, validateRun));
+    const before = projectAll(registry, initial);
+    const applied = descriptor.apply(structuredClone(initial));
+    if (!applied || typeof applied !== &quot;object&quot; || Array.isArray(applied)) {
+      throw new Error(&quot;transition apply must return a state object&quot;);
+    }
+    validateRun(applied);
+    const candidate = deepFreeze(applied);
+    const after = projectAll(registry, candidate);
+
+    for (const [familyId, contract] of registry) {
+      contract.validateTransition({
+        mode: participants.get(familyId),
+        before: before.get(familyId),
+        after: after.get(familyId),
+        current: initial,
+        candidate,
+      });
+    }
+
+    await writeProtectedJsonAtomic(runDir, RUN_FILE, candidate, {
+      hooks: atomicWriteHooks,
+      fsOps: {
+        rename: async (source, destination) =&gt; {
+
+          // First comparison: gives the reobservers a state to reason about that is
+          // known current as of this moment.
+          const observed = deepFreeze(await readRunState(runDir, validateRun));
+          assertUnchanged(observed, initial);
+
+          const observedProjections = projectAll(registry, observed);
+          for (const [familyId, contract] of registry) {
+            await contract.reobserve({
+              mode: participants.get(familyId),
+              current: observedProjections.get(familyId),
+              candidate: after.get(familyId),
+              observe: reobservers.get(familyId),
+              state: observed,
+              nextState: candidate,
+            });
+          }
+
+          // Second comparison, immediately before the rename and after anything the
+          // reobservers did. Comparing only once left a window: a reobserver - or a
+          // concurrent writer running while one awaited - could commit a valid
+          // record after the check, and this rename would silently overwrite it.
+          // Only the synchronous final guard may run between this line and the rename.
+          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));
+          assertUnchanged(finalObserved, initial);
+          if (typeof finalGuard === &quot;function&quot;) {
+            const guarded = finalGuard({ state: finalObserved, candidate });
+            if (guarded &amp;&amp; typeof guarded.then === &quot;function&quot;) throw new Error(&quot;final commit guard must be synchronous&quot;);
+          }
+          await rename(source, destination);
+        },
+      },
+    });
+    return candidate;
+  });
+}</code></pre><details><summary>Call boundaries (6)</summary><ul><li>call:core/write-core.js:421, line 14: Map → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:510, line 18: contractRegistry → contractRegistry (not shown) · internal</li><li>call:core/write-core.js:562, line 19: participantRegistry → participantRegistry (not shown) · internal</li><li>call:core/write-core.js:652, line 20: Error → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:740, line 21: Error → unresolved / outside packet · ambiguous</li><li>call:core/write-core.js:790, line 23: withRunJsonLock → withRunJsonLock (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (1)</summary><ul><li>call:core/write-core.js:790, line 23: &lt;callback@23:34&gt;</li></ul></details></details><details><summary>c003 · &lt;callback@15:58&gt; — essential</summary><p>state/transition.js:15–15</p><pre><code>    participants: Object.freeze((participants ?? []).map((entry) =&gt; Object.freeze({ ...entry }))),</code></pre><details><summary>Call boundaries (1)</summary><ul><li>call:state/transition.js:845, line 15: Object.freeze → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>Collapsed / uncertain candidates</summary><ul><li>c004 · withRunJsonLock — <strong>supporting</strong> · core/run-lock.js:18</li><li>c005 · &lt;callback@23:34&gt; — <strong>supporting</strong> · core/write-core.js:23</li><li>c006 · contractRegistry — <strong>supporting</strong> · core/write-core.js:96</li><li>c007 · participantRegistry — <strong>supporting</strong> · core/write-core.js:114</li><li>c008 · writeProtectedJsonAtomic — <strong>uncertain</strong> · core/atomic-write.js:18</li><li>c011 · stealByRename — <strong>uncertain</strong> · core/run-lock.js:111</li><li>c021 · readRunState — <strong>uncertain</strong> · core/write-core.js:91</li><li>c024 · writeProtectedFileAtomic — <strong>uncertain</strong> · core/atomic-write.js:22</li><li>c025 · renameOwnedLockToQuarantine — <strong>uncertain</strong> · core/run-lock.js:157</li><li>c031 · resolveProtectedPath — <strong>uncertain</strong> · core/atomic-write.js:89</li><li>c041 · validateTransition — <strong>uncertain</strong> · core/contracts.js:60</li><li>c050 · validateTransition — <strong>uncertain</strong> · core/contracts.js:166</li><li>c053 · validateTransition — <strong>uncertain</strong> · core/contracts.js:215</li><li>c062 · validateTransition — <strong>uncertain</strong> · core/contracts.js:321</li><li>c070 · validateTransition — <strong>uncertain</strong> · core/contracts.js:417</li><li>c072 · rename — <strong>uncertain</strong> · core/write-core.js:47</li><li>c073 · assertUnchanged — <strong>uncertain</strong> · core/write-core.js:85</li></ul></details><details><summary>Hidden candidates</summary><ul><li>c009 · canStealRunJsonLock — <strong>incidental</strong> · core/run-lock.js:79</li><li>c010 · readLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:83</li><li>c012 · releaseOwnedRunJsonLock — <strong>incidental</strong> · core/run-lock.js:138</li><li>c013 · quarantineAndRemoveOwnedLock — <strong>incidental</strong> · core/run-lock.js:150</li><li>c014 · lockOwnerEntryExists — <strong>incidental</strong> · core/run-lock.js:187</li><li>c015 · sameLockOwner — <strong>incidental</strong> · core/run-lock.js:207</li><li>c016 · lockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:218</li><li>c017 · sameLockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:228</li><li>c018 · normalizePositiveInteger — <strong>incidental</strong> · core/run-lock.js:232</li><li>c019 · delay — <strong>incidental</strong> · core/run-lock.js:239</li><li>c020 · ownerlessLockIsReclaimable — <strong>incidental</strong> · core/run-lock.js:251</li><li>c022 · projectAll — <strong>incidental</strong> · core/write-core.js:132</li><li>c023 · deepFreeze — <strong>incidental</strong> · core/write-core.js:142</li><li>c026 · inspectLockOwnerLiveness — <strong>incidental</strong> · core/run-lock.js:174</li><li>c027 · isDurableLockOwner — <strong>incidental</strong> · core/run-lock.js:197</li><li>c028 · sameLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:211</li><li>c029 · &lt;callback@240:22&gt; — <strong>incidental</strong> · core/run-lock.js:240</li><li>c030 · constructor — <strong>incidental</strong> · core/atomic-write.js:12</li><li>c032 · assertSafeTarget — <strong>incidental</strong> · core/atomic-write.js:106</li><li>c033 · syncDirectory — <strong>incidental</strong> · core/atomic-write.js:119</li><li>c034 · isRecord — <strong>incidental</strong> · core/run-lock.js:263</li><li>c035 · stringValue — <strong>incidental</strong> · core/run-lock.js:267</li><li>c036 · callRegisteredObserver — <strong>incidental</strong> · core/contracts.js:23</li><li>c037 · contract — <strong>incidental</strong> · core/contracts.js:27</li><li>c038 · validateProjection — <strong>incidental</strong> · core/contracts.js:31</li><li>c039 · &lt;callback@35:30&gt; — <strong>incidental</strong> · core/contracts.js:35</li><li>c040 · project — <strong>incidental</strong> · core/contracts.js:45</li><li>c042 · &lt;callback@76:54&gt; — <strong>incidental</strong> · core/contracts.js:76</li><li>c043 · &lt;callback@79:55&gt; — <strong>incidental</strong> · core/contracts.js:79</li><li>c044 · &lt;callback@92:54&gt; — <strong>incidental</strong> · core/contracts.js:92</li><li>c045 · &lt;callback@95:55&gt; — <strong>incidental</strong> · core/contracts.js:95</li><li>c046 · &lt;callback@109:52&gt; — <strong>incidental</strong> · core/contracts.js:109</li><li>c047 · &lt;callback@112:53&gt; — <strong>incidental</strong> · core/contracts.js:112</li><li>c048 · checkPrePrApproval — <strong>incidental</strong> · core/contracts.js:152</li><li>c049 · project — <strong>incidental</strong> · core/contracts.js:165</li><li>c051 · project — <strong>incidental</strong> · core/contracts.js:214</li><li>c052 · &lt;callback@214:47&gt; — <strong>incidental</strong> · core/contracts.js:214</li><li>c054 · &lt;callback@216:45&gt; — <strong>incidental</strong> · core/contracts.js:216</li><li>c055 · &lt;callback@260:23&gt; — <strong>incidental</strong> · core/contracts.js:260</li><li>c056 · reobserveSlices — <strong>incidental</strong> · core/contracts.js:278</li><li>c057 · &lt;callback@281:36&gt; — <strong>incidental</strong> · core/contracts.js:281</li><li>c058 · &lt;callback@291:41&gt; — <strong>incidental</strong> · core/contracts.js:291</li><li>c059 · &lt;callback@292:25&gt; — <strong>incidental</strong> · core/contracts.js:292</li><li>c060 · project — <strong>incidental</strong> · core/contracts.js:320</li><li>c061 · &lt;callback@320:48&gt; — <strong>incidental</strong> · core/contracts.js:320</li><li>c063 · &lt;callback@324:33&gt; — <strong>incidental</strong> · core/contracts.js:324</li><li>c064 · &lt;callback@325:17&gt; — <strong>incidental</strong> · core/contracts.js:325</li><li>c065 · &lt;callback@353:42&gt; — <strong>incidental</strong> · core/contracts.js:353</li><li>c066 · &lt;callback@391:41&gt; — <strong>incidental</strong> · core/contracts.js:391</li><li>c067 · &lt;callback@399:23&gt; — <strong>incidental</strong> · core/contracts.js:399</li><li>c068 · checkPublication — <strong>incidental</strong> · core/contracts.js:407</li><li>c069 · project — <strong>incidental</strong> · core/contracts.js:416</li><li>c071 · &lt;callback@444:62&gt; — <strong>incidental</strong> · core/contracts.js:444</li></ul></details></section><section aria-labelledby="panel-C"><h2 id="panel-C">Panel C</h2><p><strong>No validated selection was produced.</strong></p><p>This is a run failure, not a decision to omit all functions. Do not score this panel for selection quality.</p><details><summary>Run boundary</summary><p>41 tool calls were recorded before the session ended. The failure artifact is retained in the experiment report.</p></details></section></div></main></body></html>

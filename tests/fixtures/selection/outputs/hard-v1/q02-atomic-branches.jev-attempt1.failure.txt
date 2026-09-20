@@ -1,0 +1,12 @@
+[Publication copy: local absolute paths are replaced with labelled placeholders. This is not a verbatim capture or a new run. Byte-exact originals are retained in an ignored private archive; measured results and source hashes are unchanged.]
+
+file://<historical-selection-dir>/jev.mjs:54
+    throw new Error(String(error.message).split(key).join('[REDACTED]'));
+          ^
+
+Error: Invalid distribution
+    at runJev (file://<historical-selection-dir>/jev.mjs:54:11)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async file://<historical-selection-dir>/jev.mjs:63:3
+
+Node.js v24.11.1

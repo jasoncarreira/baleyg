@@ -1,0 +1,28 @@
+{
+  "rustTestsPassed": 146,
+  "uiTestsPassed": 77,
+  "fmtPassed": true,
+  "clippyPassed": true,
+  "buildPassed": true,
+  "remoteCiRun": false,
+  "providerCallsByThisWork": 0,
+  "browseRoot": "<repository>",
+  "indexedWorkspace": "<repository>/tests/fixtures/extraction/inputs/feature-factory",
+  "revision": 3,
+  "rootEntries": 19,
+  "sourceFileBrowsedWithoutSearch": "src/main.rs",
+  "mobileTreeHeight": 338,
+  "mobileViewportWidth": 390,
+  "mobilePageWidth": 390,
+  "jsonParticipant": {
+    "label": "JSON",
+    "kind": "builtin"
+  },
+  "savedViewsNotesBudgetsPreserved": true,
+  "limitations": [
+    "Only cached indexed files have methods; cwd Rust files are visible but not indexed",
+    "External names/import bindings identified, external implementation and object identity not resolved",
+    "Unix directory metadata only; symlinks not followed; no filesystem source-content endpoint"
+  ],
+  "publicationNote": "Publication copy: local absolute paths are replaced with labelled placeholders. This is not a verbatim capture or a new run. Byte-exact originals are retained in an ignored private archive; measured results and source hashes are unchanged."
+}

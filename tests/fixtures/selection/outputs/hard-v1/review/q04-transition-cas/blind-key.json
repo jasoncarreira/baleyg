@@ -1,0 +1,9 @@
+{
+  "questionId": "q04-transition-cas",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "panels": {
+    "A": "jev",
+    "B": "deterministic",
+    "C": "claude-acp"
+  }
+}

@@ -1,0 +1,318 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>Blind selection review</title><style>
+  :root{color-scheme:light;--ink:oklch(.24 0 0);--bg:oklch(1 0 0);--muted:oklch(.43 0 0);--line:oklch(.78 0 0);--accent:oklch(.48 .16 20)}
+  *{box-sizing:border-box}body{margin:0;padding:2rem;font:16px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--ink)}main{max-width:1500px;margin:auto}h1{font-size:1.7rem}h2{font-size:1.3rem}h3{font-size:1rem}p{max-width:75ch}header{margin-bottom:2rem}.panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2rem}section{min-width:0;border-top:2px solid var(--ink)}svg{width:100%;max-height:720px}svg path{fill:none;stroke:var(--muted);stroke-width:1.5}polygon{fill:var(--muted)}rect{fill:var(--bg);stroke:var(--line)}text{fill:var(--ink);font:14px system-ui}details{border-top:1px solid var(--line);padding:.7rem 0}summary{cursor:pointer;overflow-wrap:anywhere}summary:hover{color:var(--accent)}summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}pre{overflow:auto;padding:.7rem;background:oklch(.96 0 0);font-size:.8rem}li,p{overflow-wrap:anywhere}ul{padding-left:1.2rem}small{color:var(--muted);overflow-wrap:anywhere}@media(max-width:1000px){.panels{grid-template-columns:1fr}body{padding:1rem}svg{max-width:560px}}
+  </style></head><body><main><header><h1>Blind selection review</h1><p><strong>Which checks allow withRunJsonLock to attempt reclaiming an existing lock, and where is the protected callback invoked?</strong></p><p>Call-selection sketch — not a sequence diagram or an execution trace. Judge only what helps answer this question; adjacent detail is not useful by default. Panels are shuffled. Arrows show measured direct calls only; hidden intermediates are never bridged. Callback references do not establish execution.</p><small>Graph snapshot: 9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db. Fixed candidate scope; source excerpts may be truncated.</small></header><div class="panels"><section aria-labelledby="panel-A"><h2 id="panel-A">Panel A</h2><p>13 shown · 32 measured direct calls</p><svg viewBox="0 0 460 845" role="img" aria-label="Panel A: function nodes and measured direct calls"><defs><marker id="arrow-A" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6"/></marker></defs><path data-call="call:core/run-lock.js:1124" d="M 335 35 C 360 11, 360 709, 335 685" marker-end="url(#arrow-A)"><title>c001 → c011, line 24</title></path><path data-call="call:core/run-lock.js:1196" d="M 335 35 C 374 11, 374 709, 335 685" marker-end="url(#arrow-A)"><title>c001 → c011, line 25</title></path><path data-call="call:core/run-lock.js:1268" d="M 335 35 C 388 11, 388 709, 335 685" marker-end="url(#arrow-A)"><title>c001 → c011, line 26</title></path><path data-call="call:core/run-lock.js:1720" d="M 335 35 C 402 11, 402 579, 335 555" marker-end="url(#arrow-A)"><title>c001 → c009, line 39</title></path><path data-call="call:core/run-lock.js:1904" d="M 335 35 C 416 11, 416 579, 335 555" marker-end="url(#arrow-A)"><title>c001 → c009, line 44</title></path><path data-call="call:core/run-lock.js:1975" d="M 335 35 C 430 11, 430 189, 335 165" marker-end="url(#arrow-A)"><title>c001 → c003, line 45</title></path><path data-call="call:core/run-lock.js:2021" d="M 335 35 C 360 11, 360 124, 335 100" marker-end="url(#arrow-A)"><title>c001 → c002, line 46</title></path><path data-call="call:core/run-lock.js:2151" d="M 335 35 C 374 11, 374 254, 335 230" marker-end="url(#arrow-A)"><title>c001 → c004, line 48</title></path><path data-call="call:core/run-lock.js:2290" d="M 335 35 C 388 11, 388 839, 335 815" marker-end="url(#arrow-A)"><title>c001 → c013, line 49</title></path><path data-call="call:core/run-lock.js:2422" d="M 335 35 C 402 11, 402 254, 335 230" marker-end="url(#arrow-A)"><title>c001 → c004, line 51</title></path><path data-call="call:core/run-lock.js:2637" d="M 335 35 C 416 11, 416 774, 335 750" marker-end="url(#arrow-A)"><title>c001 → c012, line 55</title></path><path data-call="call:core/run-lock.js:2862" d="M 335 35 C 430 11, 430 644, 335 620" marker-end="url(#arrow-A)"><title>c001 → c010, line 62</title></path><path data-call="call:core/run-lock.js:2911" d="M 335 35 C 360 11, 360 579, 335 555" marker-end="url(#arrow-A)"><title>c001 → c009, line 62</title></path><path data-call="call:core/run-lock.js:3184" d="M 335 35 C 374 11, 374 189, 335 165" marker-end="url(#arrow-A)"><title>c001 → c003, line 66</title></path><path data-call="call:core/run-lock.js:3227" d="M 335 35 C 388 11, 388 514, 335 490" marker-end="url(#arrow-A)"><title>c001 → c008, line 67</title></path><path data-call="call:core/run-lock.js:3478" d="M 335 35 C 402 11, 402 319, 335 295" marker-end="url(#arrow-A)"><title>c001 → c005, line 72</title></path><path data-call="call:core/run-lock.js:3598" d="M 335 35 C 416 11, 416 449, 335 425" marker-end="url(#arrow-A)"><title>c001 → c007, line 73</title></path><path data-call="call:core/run-lock.js:3646" d="M 335 35 C 430 11, 430 384, 335 360" marker-end="url(#arrow-A)"><title>c001 → c006, line 74</title></path><path data-call="call:core/run-lock.js:6096" d="M 335 230 C 360 206, 360 189, 335 165" marker-end="url(#arrow-A)"><title>c004 → c003, line 121</title></path><path data-call="call:core/run-lock.js:6885" d="M 335 295 C 374 271, 374 644, 335 620" marker-end="url(#arrow-A)"><title>c005 → c010, line 139</title></path><path data-call="call:core/run-lock.js:6935" d="M 335 295 C 388 271, 388 579, 335 555" marker-end="url(#arrow-A)"><title>c005 → c009, line 139</title></path><path data-call="call:core/run-lock.js:7029" d="M 335 295 C 402 271, 402 189, 335 165" marker-end="url(#arrow-A)"><title>c005 → c003, line 140</title></path><path data-call="call:core/run-lock.js:7237" d="M 335 295 C 416 271, 416 189, 335 165" marker-end="url(#arrow-A)"><title>c005 → c003, line 142</title></path><path data-call="call:core/run-lock.js:7389" d="M 335 295 C 430 271, 430 644, 335 620" marker-end="url(#arrow-A)"><title>c005 → c010, line 145</title></path><path data-call="call:core/run-lock.js:7439" d="M 335 295 C 360 271, 360 579, 335 555" marker-end="url(#arrow-A)"><title>c005 → c009, line 145</title></path><path data-call="call:core/run-lock.js:7528" d="M 335 295 C 374 271, 374 189, 335 165" marker-end="url(#arrow-A)"><title>c005 → c003, line 146</title></path><path data-call="call:core/run-lock.js:7744" d="M 335 360 C 388 336, 388 644, 335 620" marker-end="url(#arrow-A)"><title>c006 → c010, line 151</title></path><path data-call="call:core/run-lock.js:7794" d="M 335 360 C 402 336, 402 579, 335 555" marker-end="url(#arrow-A)"><title>c006 → c009, line 151</title></path><path data-call="call:core/run-lock.js:7933" d="M 335 360 C 416 336, 416 644, 335 620" marker-end="url(#arrow-A)"><title>c006 → c010, line 153</title></path><path data-call="call:core/run-lock.js:7983" d="M 335 360 C 430 336, 430 579, 335 555" marker-end="url(#arrow-A)"><title>c006 → c009, line 153</title></path><path data-call="call:core/run-lock.js:12205" d="M 335 815 C 360 791, 360 449, 335 425" marker-end="url(#arrow-A)"><title>c013 → c007, line 252</title></path><path data-call="call:core/run-lock.js:12270" d="M 335 815 C 374 791, 374 709, 335 685" marker-end="url(#arrow-A)"><title>c013 → c011, line 253</title></path><g><title>withRunJsonLock — core/run-lock.js:18</title><rect x="12" y="15" width="323" height="40" rx="4"/><text x="22" y="40">c001 · withRunJsonLock</text></g><g><title>canStealRunJsonLock — core/run-lock.js:79</title><rect x="12" y="80" width="323" height="40" rx="4"/><text x="22" y="105">c002 · canStealRunJsonLock</text></g><g><title>readLockOwnerEvidence — core/run-lock.js:83</title><rect x="12" y="145" width="323" height="40" rx="4"/><text x="22" y="170">c003 · readLockOwnerEvidence</text></g><g><title>stealByRename — core/run-lock.js:111</title><rect x="12" y="210" width="323" height="40" rx="4"/><text x="22" y="235">c004 · stealByRename</text></g><g><title>releaseOwnedRunJsonLock — core/run-lock.js:138</title><rect x="12" y="275" width="323" height="40" rx="4"/><text x="22" y="300">c005 · releaseOwnedRunJsonLock</text></g><g><title>quarantineAndRemoveOwnedLock — core/run-lock.js:150</title><rect x="12" y="340" width="323" height="40" rx="4"/><text x="22" y="365">c006 · quarantineAndRemoveOwnedLock</text></g><g><title>lockOwnerEntryExists — core/run-lock.js:187</title><rect x="12" y="405" width="323" height="40" rx="4"/><text x="22" y="430">c007 · lockOwnerEntryExists</text></g><g><title>sameLockOwner — core/run-lock.js:207</title><rect x="12" y="470" width="323" height="40" rx="4"/><text x="22" y="495">c008 · sameLockOwner</text></g><g><title>lockDirectoryIdentity — core/run-lock.js:218</title><rect x="12" y="535" width="323" height="40" rx="4"/><text x="22" y="560">c009 · lockDirectoryIdentity</text></g><g><title>sameLockDirectoryIdentity — core/run-lock.js:228</title><rect x="12" y="600" width="323" height="40" rx="4"/><text x="22" y="625">c010 · sameLockDirectoryIdentity</text></g><g><title>normalizePositiveInteger — core/run-lock.js:232</title><rect x="12" y="665" width="323" height="40" rx="4"/><text x="22" y="690">c011 · normalizePositiveInteger</text></g><g><title>delay — core/run-lock.js:239</title><rect x="12" y="730" width="323" height="40" rx="4"/><text x="22" y="755">c012 · delay</text></g><g><title>ownerlessLockIsReclaimable — core/run-lock.js:251</title><rect x="12" y="795" width="323" height="40" rx="4"/><text x="22" y="820">c013 · ownerlessLockIsReclaimable</text></g></svg><h3>Shown functions and source</h3><details><summary>c001 · withRunJsonLock — essential</summary><p>core/run-lock.js:18–77</p><pre><code>export async function withRunJsonLock(runDir, fn, options = {}) {
+  if (typeof fn !== &quot;function&quot;) throw new Error(&quot;withRunJsonLock requires a callback&quot;);
+  const { onBeforeSteal } = options;
+  if (onBeforeSteal !== undefined &amp;&amp; typeof onBeforeSteal !== &quot;function&quot;) {
+    throw new Error(&quot;onBeforeSteal must be a function&quot;);
+  }
+  const timeoutMs = normalizePositiveInteger(options.timeoutMs, DEFAULT_LOCK_TIMEOUT_MS);
+  normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);
+  normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);
+  const lockDir = join(runDir, LOCK_DIR);
+  const ownerPath = join(lockDir, LOCK_OWNER_FILE);
+  const deadline = Date.now() + timeoutMs;
+  let stealAttempted = false;
+  let createdIdentity = null;
+  let owner = null;
+  let ownerPublished = false;
+  let publishedEvidence = null;
+
+  while (true) {
+    try {
+      await mkdir(lockDir);
+      createdIdentity = await lockDirectoryIdentity(lockDir);
+      break;
+    } catch (error) {
+      if (error?.code !== &quot;EEXIST&quot;) throw error;
+      if (!stealAttempted) {
+        const observedIdentity = await lockDirectoryIdentity(lockDir);
+        const observedEvidence = await readLockOwnerEvidence(ownerPath);
+        if (canStealRunJsonLock(observedEvidence?.owner, options)) {
+          stealAttempted = true;
+          if (observedIdentity &amp;&amp; await stealByRename(runDir, lockDir, observedIdentity, observedEvidence, onBeforeSteal)) continue;
+        } else if (!observedEvidence &amp;&amp; await ownerlessLockIsReclaimable(lockDir, ownerPath, options)) {
+          stealAttempted = true;
+          if (observedIdentity &amp;&amp; await stealByRename(runDir, lockDir, observedIdentity, null, onBeforeSteal)) continue;
+        }
+      }
+      if (Date.now() &gt;= deadline) throw new Error(`timed out waiting for run.json lock at ${lockDir}`);
+      await delay(Math.min(DEFAULT_LOCK_RETRY_DELAY_MS, Math.max(1, deadline - Date.now())));
+    }
+  }
+
+  owner = { pid: process.pid, hostname: hostname(), acquired_at: new Date().toISOString(), nonce: randomUUID() };
+
+  try {
+    if (!sameLockDirectoryIdentity(createdIdentity, await lockDirectoryIdentity(lockDir))) {
+      throw new Error(`run.json lock ownership changed before owner publication at ${lockDir}`);
+    }
+    await writeFile(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { encoding: &quot;utf8&quot;, flag: &quot;wx&quot; });
+    publishedEvidence = await readLockOwnerEvidence(ownerPath);
+    if (!sameLockOwner(owner, publishedEvidence?.owner)) throw new Error(`run.json lock owner publication failed at ${lockDir}`);
+    ownerPublished = true;
+    return await fn({ lock_dir: lockDir, owner });
+  } finally {
+    if (ownerPublished) {
+      await releaseOwnedRunJsonLock(runDir, lockDir, createdIdentity, publishedEvidence);
+    } else if (!ownerPublished &amp;&amp; !(await lockOwnerEntryExists(ownerPath))) {
+      await quarantineAndRemoveOwnedLock(runDir, lockDir, createdIdentity);
+    }
+  }
+}</code></pre><details><summary>Call boundaries (20)</summary><ul><li>call:core/run-lock.js:880, line 19: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:1053, line 22: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:1373, line 27: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:1417, line 28: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:1468, line 29: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:1674, line 38: mkdir → unresolved / outside packet · external</li><li>call:core/run-lock.js:2531, line 54: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:2561, line 54: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:2643, line 55: Math.min → unresolved / outside packet · external</li><li>call:core/run-lock.js:2681, line 55: Math.max → unresolved / outside packet · external</li><li>call:core/run-lock.js:2704, line 55: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:2770, line 59: hostname → unresolved / outside packet · external</li><li>call:core/run-lock.js:2795, line 59: new Date().toISOString → unresolved / outside packet · external</li><li>call:core/run-lock.js:2795, line 59: Date → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:2828, line 59: randomUUID → unresolved / outside packet · external</li><li>call:core/run-lock.js:2958, line 63: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:3059, line 65: writeFile → unresolved / outside packet · external</li><li>call:core/run-lock.js:3083, line 65: JSON.stringify → unresolved / outside packet · external</li><li>call:core/run-lock.js:3281, line 67: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:3392, line 69: fn → unresolved / outside packet · unresolved</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c002 · canStealRunJsonLock — essential</summary><p>core/run-lock.js:79–81</p><pre><code>function canStealRunJsonLock(owner, options = {}) {
+  return isDurableLockOwner(owner) &amp;&amp; inspectLockOwnerLiveness(owner, options) === &quot;dead&quot;;
+}</code></pre><details><summary>Call boundaries (2)</summary><ul><li>call:core/run-lock.js:3784, line 80: isDurableLockOwner → isDurableLockOwner (not shown) · internal</li><li>call:core/run-lock.js:3813, line 80: inspectLockOwnerLiveness → inspectLockOwnerLiveness (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c003 · readLockOwnerEvidence — essential</summary><p>core/run-lock.js:83–96</p><pre><code>async function readLockOwnerEvidence(ownerPath) {
+  let handle;
+  try {
+    handle = await open(ownerPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    const parsed = JSON.parse(await handle.readFile(&quot;utf8&quot;));
+    if (!isDurableLockOwner(parsed)) return null;
+    const value = await handle.stat();
+    return { owner: parsed, identity: { dev: value.dev, ino: value.ino } };
+  } catch {
+    return null;
+  } finally {
+    await handle?.close();
+  }
+}</code></pre><details><summary>Call boundaries (6)</summary><ul><li>call:core/run-lock.js:3960, line 86: open → unresolved / outside packet · external</li><li>call:core/run-lock.js:4046, line 87: JSON.parse → unresolved / outside packet · external</li><li>call:core/run-lock.js:4063, line 87: handle.readFile → unresolved / outside packet · external</li><li>call:core/run-lock.js:4098, line 88: isDurableLockOwner → isDurableLockOwner (not shown) · internal</li><li>call:core/run-lock.js:4163, line 89: handle.stat → unresolved / outside packet · external</li><li>call:core/run-lock.js:4307, line 94: handle?.close → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c004 · stealByRename — essential</summary><p>core/run-lock.js:111–136</p><pre><code>async function stealByRename(runDir, lockDir, observedIdentity, observedEvidence, onBeforeSteal) {
+  if (onBeforeSteal) await onBeforeSteal({ runDir, lockDir, owner: observedEvidence?.owner ?? null });
+  // The owner must still be the one we judged stale, and the directory&#39;s dev/ino cannot establish
+  // that: Linux reuses inode numbers, so a lock deleted and recreated here presents the identity we
+  // recorded and the post-rename check sees nothing wrong while a live lock is renamed away. The
+  // nonce is the discriminator. The note that once stood here — a pre-check is undetectable — was
+  // falsified only on APFS, which does not reuse the inode; CI failed on Linux and passed on macOS.
+  // The post-rename check stays, the two together are narrower, and the write core is still the
+  // real boundary, so the residual check-then-act window cannot produce a lost update.
+  if (observedEvidence
+    &amp;&amp; !sameLockOwnerEvidence(observedEvidence, await readLockOwnerEvidence(join(lockDir, LOCK_OWNER_FILE)))) {
+    return false;
+  }
+  let quarantine;
+  try {
+    quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, observedIdentity);
+  } catch (error) {
+    // Losing the race is a retry, not a failure: ENOENT is the rename losing the path, ELOCKIDENTITY
+    // is noticing the winner before renaming. Only ENOENT was handled, so the second case failed the
+    // whole run — rare until the owner pre-check widened that window, and then CI hit it.
+    if (error?.code === &quot;ENOENT&quot; || error?.code === &quot;ELOCKIDENTITY&quot;) return false;
+    throw error;
+  }
+  await rm(quarantine, { recursive: true, force: true });
+  return true;
+}</code></pre><details><summary>Call boundaries (5)</summary><ul><li>call:core/run-lock.js:5260, line 112: onBeforeSteal → unresolved / outside packet · unresolved</li><li>call:core/run-lock.js:6050, line 121: sameLockOwnerEvidence → sameLockOwnerEvidence (not shown) · internal</li><li>call:core/run-lock.js:6118, line 121: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:6225, line 126: renameOwnedLockToQuarantine → renameOwnedLockToQuarantine (not shown) · internal</li><li>call:core/run-lock.js:6716, line 134: rm → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c005 · releaseOwnedRunJsonLock — essential</summary><p>core/run-lock.js:138–148</p><pre><code>async function releaseOwnedRunJsonLock(runDir, lockDir, expectedIdentity, expectedEvidence) {
+  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) return;
+  if (!sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(lockDir, LOCK_OWNER_FILE)))) return;
+  const quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity);
+  if (!sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(quarantine, LOCK_OWNER_FILE)))) {
+    throw new Error(`run.json lock cleanup identity changed at ${quarantine}`);
+  }
+  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))
+    || !sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(quarantine, LOCK_OWNER_FILE)))) return;
+  await rm(quarantine, { recursive: true, force: true });
+}</code></pre><details><summary>Call boundaries (9)</summary><ul><li>call:core/run-lock.js:6983, line 140: sameLockOwnerEvidence → sameLockOwnerEvidence (not shown) · internal</li><li>call:core/run-lock.js:7051, line 140: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:7120, line 141: renameOwnedLockToQuarantine → renameOwnedLockToQuarantine (not shown) · internal</li><li>call:core/run-lock.js:7191, line 142: sameLockOwnerEvidence → sameLockOwnerEvidence (not shown) · internal</li><li>call:core/run-lock.js:7259, line 142: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:7308, line 143: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:7482, line 146: sameLockOwnerEvidence → sameLockOwnerEvidence (not shown) · internal</li><li>call:core/run-lock.js:7550, line 146: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:7603, line 147: rm → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c006 · quarantineAndRemoveOwnedLock — essential</summary><p>core/run-lock.js:150–155</p><pre><code>async function quarantineAndRemoveOwnedLock(runDir, lockDir, expectedIdentity) {
+  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) return;
+  const quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity);
+  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))) return;
+  await rm(quarantine, { recursive: true, force: true });
+}</code></pre><details><summary>Call boundaries (2)</summary><ul><li>call:core/run-lock.js:7862, line 152: renameOwnedLockToQuarantine → renameOwnedLockToQuarantine (not shown) · internal</li><li>call:core/run-lock.js:8035, line 154: rm → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c007 · lockOwnerEntryExists — essential</summary><p>core/run-lock.js:187–195</p><pre><code>async function lockOwnerEntryExists(ownerPath) {
+  try {
+    await lstat(ownerPath);
+    return true;
+  } catch (error) {
+    if (error?.code === &quot;ENOENT&quot;) return false;
+    return true;
+  }
+}</code></pre><details><summary>Call boundaries (1)</summary><ul><li>call:core/run-lock.js:9966, line 189: lstat → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c008 · sameLockOwner — essential</summary><p>core/run-lock.js:207–209</p><pre><code>function sameLockOwner(left, right) {
+  return isDurableLockOwner(left) &amp;&amp; isDurableLockOwner(right) &amp;&amp; left.nonce === right.nonce;
+}</code></pre><details><summary>Call boundaries (2)</summary><ul><li>call:core/run-lock.js:10499, line 208: isDurableLockOwner → isDurableLockOwner (not shown) · internal</li><li>call:core/run-lock.js:10527, line 208: isDurableLockOwner → isDurableLockOwner (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c009 · lockDirectoryIdentity — essential</summary><p>core/run-lock.js:218–226</p><pre><code>async function lockDirectoryIdentity(lockDir) {
+  try {
+    const value = await lstat(lockDir);
+    if (!value.isDirectory() || value.isSymbolicLink()) return null;
+    return { dev: value.dev, ino: value.ino, mtimeMs: value.mtimeMs };
+  } catch {
+    return null;
+  }
+}</code></pre><details><summary>Call boundaries (3)</summary><ul><li>call:core/run-lock.js:10891, line 220: lstat → unresolved / outside packet · external</li><li>call:core/run-lock.js:10916, line 221: value.isDirectory → unresolved / outside packet · external</li><li>call:core/run-lock.js:10939, line 221: value.isSymbolicLink → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c010 · sameLockDirectoryIdentity — essential</summary><p>core/run-lock.js:228–230</p><pre><code>function sameLockDirectoryIdentity(left, right) {
+  return Boolean(left &amp;&amp; right &amp;&amp; left.dev === right.dev &amp;&amp; left.ino === right.ino);
+}</code></pre><details><summary>Call boundaries (1)</summary><ul><li>call:core/run-lock.js:11142, line 229: Boolean → unresolved / outside packet · ambiguous</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c011 · normalizePositiveInteger — essential</summary><p>core/run-lock.js:232–236</p><pre><code>function normalizePositiveInteger(value, fallback) {
+  if (value === undefined || value === null) return fallback;
+  if (!Number.isInteger(value) || value &lt;= 0) throw new Error(&quot;lock timing options must be positive integers&quot;);
+  return value;
+}</code></pre><details><summary>Call boundaries (2)</summary><ul><li>call:core/run-lock.js:11343, line 234: Number.isInteger → unresolved / outside packet · external</li><li>call:core/run-lock.js:11388, line 234: Error → unresolved / outside packet · ambiguous</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c012 · delay — essential</summary><p>core/run-lock.js:239–241</p><pre><code>function delay(ms) {
+  return new Promise((resolve) =&gt; setTimeout(resolve, ms));
+}</code></pre><details><summary>Call boundaries (1)</summary><ul><li>call:core/run-lock.js:11546, line 240: Promise → unresolved / outside packet · ambiguous</li></ul></details><details><summary>Callback references — not calls (1)</summary><ul><li>call:core/run-lock.js:11546, line 240: &lt;callback@240:22&gt;</li></ul></details></details><details><summary>c013 · ownerlessLockIsReclaimable — essential</summary><p>core/run-lock.js:251–261</p><pre><code>async function ownerlessLockIsReclaimable(lockDir, ownerPath, options = {}) {
+  if (await lockOwnerEntryExists(ownerPath)) return false;
+  const graceMs = normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);
+  try {
+    const observed = await stat(lockDir);
+    const ageMs = Date.now() - observed.mtimeMs;
+    return Number.isFinite(ageMs) &amp;&amp; ageMs &gt; graceMs;
+  } catch {
+    return false;
+  }
+}</code></pre><details><summary>Call boundaries (3)</summary><ul><li>call:core/run-lock.js:12392, line 255: stat → unresolved / outside packet · external</li><li>call:core/run-lock.js:12425, line 256: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:12467, line 257: Number.isFinite → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>Collapsed / uncertain candidates</summary><ul><li>c014 · renameOwnedLockToQuarantine — <strong>supporting</strong> · core/run-lock.js:157</li><li>c015 · inspectLockOwnerLiveness — <strong>supporting</strong> · core/run-lock.js:174</li><li>c016 · isDurableLockOwner — <strong>supporting</strong> · core/run-lock.js:197</li><li>c017 · sameLockOwnerEvidence — <strong>supporting</strong> · core/run-lock.js:211</li><li>c018 · &lt;callback@240:22&gt; — <strong>supporting</strong> · core/run-lock.js:240</li><li>c022 · &lt;callback@23:34&gt; — <strong>uncertain</strong> · core/write-core.js:23</li><li>c031 · readSessionLock — <strong>uncertain</strong> · state/session-lock.js:32</li><li>c032 · inspectSessionLock — <strong>uncertain</strong> · state/session-lock.js:43</li><li>c033 · claimSessionLock — <strong>uncertain</strong> · state/session-lock.js:52</li><li>c034 · &lt;callback@53:34&gt; — <strong>uncertain</strong> · state/session-lock.js:53</li><li>c035 · refreshSessionLock — <strong>uncertain</strong> · state/session-lock.js:73</li><li>c036 · &lt;callback@74:34&gt; — <strong>uncertain</strong> · state/session-lock.js:74</li><li>c037 · releaseSessionLock — <strong>uncertain</strong> · state/session-lock.js:85</li><li>c038 · &lt;callback@86:34&gt; — <strong>uncertain</strong> · state/session-lock.js:86</li><li>c039 · isValidLock — <strong>uncertain</strong> · state/session-lock.js:95</li><li>c040 · &lt;callback@99:33&gt; — <strong>uncertain</strong> · state/session-lock.js:99</li></ul></details><details><summary>Hidden candidates</summary><ul><li>c019 · isRecord — <strong>incidental</strong> · core/run-lock.js:263</li><li>c020 · stringValue — <strong>incidental</strong> · core/run-lock.js:267</li><li>c021 · coordinateRunJsonTransition — <strong>incidental</strong> · core/write-core.js:9</li><li>c023 · rename — <strong>incidental</strong> · core/write-core.js:47</li><li>c024 · assertUnchanged — <strong>incidental</strong> · core/write-core.js:85</li><li>c025 · readRunState — <strong>incidental</strong> · core/write-core.js:91</li><li>c026 · contractRegistry — <strong>incidental</strong> · core/write-core.js:96</li><li>c027 · participantRegistry — <strong>incidental</strong> · core/write-core.js:114</li><li>c028 · projectAll — <strong>incidental</strong> · core/write-core.js:132</li><li>c029 · deepFreeze — <strong>incidental</strong> · core/write-core.js:142</li><li>c030 · constructor — <strong>incidental</strong> · state/session-lock.js:25</li></ul></details></section><section aria-labelledby="panel-B"><h2 id="panel-B">Panel B</h2><p>4 shown · 3 measured direct calls</p><svg viewBox="0 0 460 260" role="img" aria-label="Panel B: function nodes and measured direct calls"><defs><marker id="arrow-B" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6"/></marker></defs><path data-call="call:core/run-lock.js:2021" d="M 335 35 C 360 11, 360 124, 335 100" marker-end="url(#arrow-B)"><title>c001 → c002, line 46</title></path><path data-call="call:core/run-lock.js:2290" d="M 335 35 C 374 11, 374 189, 335 165" marker-end="url(#arrow-B)"><title>c001 → c013, line 49</title></path><path data-call="call:core/run-lock.js:3813" d="M 335 100 C 388 76, 388 254, 335 230" marker-end="url(#arrow-B)"><title>c002 → c015, line 80</title></path><g><title>withRunJsonLock — core/run-lock.js:18</title><rect x="12" y="15" width="323" height="40" rx="4"/><text x="22" y="40">c001 · withRunJsonLock</text></g><g><title>canStealRunJsonLock — core/run-lock.js:79</title><rect x="12" y="80" width="323" height="40" rx="4"/><text x="22" y="105">c002 · canStealRunJsonLock</text></g><g><title>ownerlessLockIsReclaimable — core/run-lock.js:251</title><rect x="12" y="145" width="323" height="40" rx="4"/><text x="22" y="170">c013 · ownerlessLockIsReclaimable</text></g><g><title>inspectLockOwnerLiveness — core/run-lock.js:174</title><rect x="12" y="210" width="323" height="40" rx="4"/><text x="22" y="235">c015 · inspectLockOwnerLiveness</text></g></svg><h3>Shown functions and source</h3><details><summary>c001 · withRunJsonLock — essential</summary><p>core/run-lock.js:18–77</p><pre><code>export async function withRunJsonLock(runDir, fn, options = {}) {
+  if (typeof fn !== &quot;function&quot;) throw new Error(&quot;withRunJsonLock requires a callback&quot;);
+  const { onBeforeSteal } = options;
+  if (onBeforeSteal !== undefined &amp;&amp; typeof onBeforeSteal !== &quot;function&quot;) {
+    throw new Error(&quot;onBeforeSteal must be a function&quot;);
+  }
+  const timeoutMs = normalizePositiveInteger(options.timeoutMs, DEFAULT_LOCK_TIMEOUT_MS);
+  normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);
+  normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);
+  const lockDir = join(runDir, LOCK_DIR);
+  const ownerPath = join(lockDir, LOCK_OWNER_FILE);
+  const deadline = Date.now() + timeoutMs;
+  let stealAttempted = false;
+  let createdIdentity = null;
+  let owner = null;
+  let ownerPublished = false;
+  let publishedEvidence = null;
+
+  while (true) {
+    try {
+      await mkdir(lockDir);
+      createdIdentity = await lockDirectoryIdentity(lockDir);
+      break;
+    } catch (error) {
+      if (error?.code !== &quot;EEXIST&quot;) throw error;
+      if (!stealAttempted) {
+        const observedIdentity = await lockDirectoryIdentity(lockDir);
+        const observedEvidence = await readLockOwnerEvidence(ownerPath);
+        if (canStealRunJsonLock(observedEvidence?.owner, options)) {
+          stealAttempted = true;
+          if (observedIdentity &amp;&amp; await stealByRename(runDir, lockDir, observedIdentity, observedEvidence, onBeforeSteal)) continue;
+        } else if (!observedEvidence &amp;&amp; await ownerlessLockIsReclaimable(lockDir, ownerPath, options)) {
+          stealAttempted = true;
+          if (observedIdentity &amp;&amp; await stealByRename(runDir, lockDir, observedIdentity, null, onBeforeSteal)) continue;
+        }
+      }
+      if (Date.now() &gt;= deadline) throw new Error(`timed out waiting for run.json lock at ${lockDir}`);
+      await delay(Math.min(DEFAULT_LOCK_RETRY_DELAY_MS, Math.max(1, deadline - Date.now())));
+    }
+  }
+
+  owner = { pid: process.pid, hostname: hostname(), acquired_at: new Date().toISOString(), nonce: randomUUID() };
+
+  try {
+    if (!sameLockDirectoryIdentity(createdIdentity, await lockDirectoryIdentity(lockDir))) {
+      throw new Error(`run.json lock ownership changed before owner publication at ${lockDir}`);
+    }
+    await writeFile(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { encoding: &quot;utf8&quot;, flag: &quot;wx&quot; });
+    publishedEvidence = await readLockOwnerEvidence(ownerPath);
+    if (!sameLockOwner(owner, publishedEvidence?.owner)) throw new Error(`run.json lock owner publication failed at ${lockDir}`);
+    ownerPublished = true;
+    return await fn({ lock_dir: lockDir, owner });
+  } finally {
+    if (ownerPublished) {
+      await releaseOwnedRunJsonLock(runDir, lockDir, createdIdentity, publishedEvidence);
+    } else if (!ownerPublished &amp;&amp; !(await lockOwnerEntryExists(ownerPath))) {
+      await quarantineAndRemoveOwnedLock(runDir, lockDir, createdIdentity);
+    }
+  }
+}</code></pre><details><summary>Call boundaries (36)</summary><ul><li>call:core/run-lock.js:880, line 19: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:1053, line 22: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:1124, line 24: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:1196, line 25: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:1268, line 26: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:1373, line 27: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:1417, line 28: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:1468, line 29: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:1674, line 38: mkdir → unresolved / outside packet · external</li><li>call:core/run-lock.js:1720, line 39: lockDirectoryIdentity → lockDirectoryIdentity (not shown) · internal</li><li>call:core/run-lock.js:1904, line 44: lockDirectoryIdentity → lockDirectoryIdentity (not shown) · internal</li><li>call:core/run-lock.js:1975, line 45: readLockOwnerEvidence → readLockOwnerEvidence (not shown) · internal</li><li>call:core/run-lock.js:2151, line 48: stealByRename → stealByRename (not shown) · internal</li><li>call:core/run-lock.js:2422, line 51: stealByRename → stealByRename (not shown) · internal</li><li>call:core/run-lock.js:2531, line 54: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:2561, line 54: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:2637, line 55: delay → delay (not shown) · internal</li><li>call:core/run-lock.js:2643, line 55: Math.min → unresolved / outside packet · external</li><li>call:core/run-lock.js:2681, line 55: Math.max → unresolved / outside packet · external</li><li>call:core/run-lock.js:2704, line 55: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:2770, line 59: hostname → unresolved / outside packet · external</li><li>call:core/run-lock.js:2795, line 59: new Date().toISOString → unresolved / outside packet · external</li><li>call:core/run-lock.js:2795, line 59: Date → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:2828, line 59: randomUUID → unresolved / outside packet · external</li><li>call:core/run-lock.js:2862, line 62: sameLockDirectoryIdentity → sameLockDirectoryIdentity (not shown) · internal</li><li>call:core/run-lock.js:2911, line 62: lockDirectoryIdentity → lockDirectoryIdentity (not shown) · internal</li><li>call:core/run-lock.js:2958, line 63: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:3059, line 65: writeFile → unresolved / outside packet · external</li><li>call:core/run-lock.js:3083, line 65: JSON.stringify → unresolved / outside packet · external</li><li>call:core/run-lock.js:3184, line 66: readLockOwnerEvidence → readLockOwnerEvidence (not shown) · internal</li><li>call:core/run-lock.js:3227, line 67: sameLockOwner → sameLockOwner (not shown) · internal</li><li>call:core/run-lock.js:3281, line 67: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:3392, line 69: fn → unresolved / outside packet · unresolved</li><li>call:core/run-lock.js:3478, line 72: releaseOwnedRunJsonLock → releaseOwnedRunJsonLock (not shown) · internal</li><li>call:core/run-lock.js:3598, line 73: lockOwnerEntryExists → lockOwnerEntryExists (not shown) · internal</li><li>call:core/run-lock.js:3646, line 74: quarantineAndRemoveOwnedLock → quarantineAndRemoveOwnedLock (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c002 · canStealRunJsonLock — essential</summary><p>core/run-lock.js:79–81</p><pre><code>function canStealRunJsonLock(owner, options = {}) {
+  return isDurableLockOwner(owner) &amp;&amp; inspectLockOwnerLiveness(owner, options) === &quot;dead&quot;;
+}</code></pre><details><summary>Call boundaries (1)</summary><ul><li>call:core/run-lock.js:3784, line 80: isDurableLockOwner → isDurableLockOwner (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c013 · ownerlessLockIsReclaimable — essential</summary><p>core/run-lock.js:251–261</p><pre><code>async function ownerlessLockIsReclaimable(lockDir, ownerPath, options = {}) {
+  if (await lockOwnerEntryExists(ownerPath)) return false;
+  const graceMs = normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);
+  try {
+    const observed = await stat(lockDir);
+    const ageMs = Date.now() - observed.mtimeMs;
+    return Number.isFinite(ageMs) &amp;&amp; ageMs &gt; graceMs;
+  } catch {
+    return false;
+  }
+}</code></pre><details><summary>Call boundaries (5)</summary><ul><li>call:core/run-lock.js:12205, line 252: lockOwnerEntryExists → lockOwnerEntryExists (not shown) · internal</li><li>call:core/run-lock.js:12270, line 253: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:12392, line 255: stat → unresolved / outside packet · external</li><li>call:core/run-lock.js:12425, line 256: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:12467, line 257: Number.isFinite → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c015 · inspectLockOwnerLiveness — essential</summary><p>core/run-lock.js:174–185</p><pre><code>function inspectLockOwnerLiveness(owner, options = {}) {
+  if (!isDurableLockOwner(owner)) return &quot;indeterminate&quot;;
+  // A lock taken on another host cannot be adjudicated from here at all.
+  if (owner.hostname !== hostname()) return &quot;indeterminate&quot;;
+  const staleAfterMs = normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);
+  const heldForMs = Date.now() - Date.parse(owner.acquired_at);
+  if (!Number.isFinite(heldForMs)) return &quot;indeterminate&quot;;
+  // A future `acquired_at` yields a negative age, which is never greater than the
+  // TTL, so clock skew already fails closed here. An explicit `heldForMs &lt; 0`
+  // branch was removed after its falsification showed removing it changed nothing.
+  return heldForMs &gt; staleAfterMs ? &quot;dead&quot; : &quot;alive&quot;;
+}</code></pre><details><summary>Call boundaries (6)</summary><ul><li>call:core/run-lock.js:9194, line 175: isDurableLockOwner → isDurableLockOwner (not shown) · internal</li><li>call:core/run-lock.js:9344, line 177: hostname → unresolved / outside packet · external</li><li>call:core/run-lock.js:9403, line 178: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:9493, line 179: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:9506, line 179: Date.parse → unresolved / outside packet · external</li><li>call:core/run-lock.js:9544, line 180: Number.isFinite → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>Collapsed / uncertain candidates</summary><ul><li>c003 · readLockOwnerEvidence — <strong>supporting</strong> · core/run-lock.js:83</li><li>c004 · stealByRename — <strong>supporting</strong> · core/run-lock.js:111</li><li>c007 · lockOwnerEntryExists — <strong>supporting</strong> · core/run-lock.js:187</li><li>c016 · isDurableLockOwner — <strong>supporting</strong> · core/run-lock.js:197</li><li>c021 · coordinateRunJsonTransition — <strong>supporting</strong> · core/write-core.js:9</li><li>c022 · &lt;callback@23:34&gt; — <strong>supporting</strong> · core/write-core.js:23</li><li>c033 · claimSessionLock — <strong>supporting</strong> · state/session-lock.js:52</li></ul></details><details><summary>Hidden candidates</summary><ul><li>c005 · releaseOwnedRunJsonLock — <strong>incidental</strong> · core/run-lock.js:138</li><li>c006 · quarantineAndRemoveOwnedLock — <strong>incidental</strong> · core/run-lock.js:150</li><li>c008 · sameLockOwner — <strong>incidental</strong> · core/run-lock.js:207</li><li>c009 · lockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:218</li><li>c010 · sameLockDirectoryIdentity — <strong>incidental</strong> · core/run-lock.js:228</li><li>c011 · normalizePositiveInteger — <strong>incidental</strong> · core/run-lock.js:232</li><li>c012 · delay — <strong>incidental</strong> · core/run-lock.js:239</li><li>c014 · renameOwnedLockToQuarantine — <strong>incidental</strong> · core/run-lock.js:157</li><li>c017 · sameLockOwnerEvidence — <strong>incidental</strong> · core/run-lock.js:211</li><li>c018 · &lt;callback@240:22&gt; — <strong>incidental</strong> · core/run-lock.js:240</li><li>c019 · isRecord — <strong>incidental</strong> · core/run-lock.js:263</li><li>c020 · stringValue — <strong>incidental</strong> · core/run-lock.js:267</li><li>c023 · rename — <strong>incidental</strong> · core/write-core.js:47</li><li>c024 · assertUnchanged — <strong>incidental</strong> · core/write-core.js:85</li><li>c025 · readRunState — <strong>incidental</strong> · core/write-core.js:91</li><li>c026 · contractRegistry — <strong>incidental</strong> · core/write-core.js:96</li><li>c027 · participantRegistry — <strong>incidental</strong> · core/write-core.js:114</li><li>c028 · projectAll — <strong>incidental</strong> · core/write-core.js:132</li><li>c029 · deepFreeze — <strong>incidental</strong> · core/write-core.js:142</li><li>c030 · constructor — <strong>incidental</strong> · state/session-lock.js:25</li><li>c031 · readSessionLock — <strong>incidental</strong> · state/session-lock.js:32</li><li>c032 · inspectSessionLock — <strong>incidental</strong> · state/session-lock.js:43</li><li>c034 · &lt;callback@53:34&gt; — <strong>incidental</strong> · state/session-lock.js:53</li><li>c035 · refreshSessionLock — <strong>incidental</strong> · state/session-lock.js:73</li><li>c036 · &lt;callback@74:34&gt; — <strong>incidental</strong> · state/session-lock.js:74</li><li>c037 · releaseSessionLock — <strong>incidental</strong> · state/session-lock.js:85</li><li>c038 · &lt;callback@86:34&gt; — <strong>incidental</strong> · state/session-lock.js:86</li><li>c039 · isValidLock — <strong>incidental</strong> · state/session-lock.js:95</li><li>c040 · &lt;callback@99:33&gt; — <strong>incidental</strong> · state/session-lock.js:99</li></ul></details></section><section aria-labelledby="panel-C"><h2 id="panel-C">Panel C</h2><p>4 shown · 3 measured direct calls</p><svg viewBox="0 0 460 260" role="img" aria-label="Panel C: function nodes and measured direct calls"><defs><marker id="arrow-C" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><polygon points="0 0, 6 3, 0 6"/></marker></defs><path data-call="call:core/run-lock.js:2021" d="M 335 35 C 360 11, 360 124, 335 100" marker-end="url(#arrow-C)"><title>c001 → c002, line 46</title></path><path data-call="call:core/run-lock.js:2290" d="M 335 35 C 374 11, 374 189, 335 165" marker-end="url(#arrow-C)"><title>c001 → c013, line 49</title></path><path data-call="call:core/run-lock.js:3813" d="M 335 100 C 388 76, 388 254, 335 230" marker-end="url(#arrow-C)"><title>c002 → c015, line 80</title></path><g><title>withRunJsonLock — core/run-lock.js:18</title><rect x="12" y="15" width="323" height="40" rx="4"/><text x="22" y="40">c001 · withRunJsonLock</text></g><g><title>canStealRunJsonLock — core/run-lock.js:79</title><rect x="12" y="80" width="323" height="40" rx="4"/><text x="22" y="105">c002 · canStealRunJsonLock</text></g><g><title>ownerlessLockIsReclaimable — core/run-lock.js:251</title><rect x="12" y="145" width="323" height="40" rx="4"/><text x="22" y="170">c013 · ownerlessLockIsReclaimable</text></g><g><title>inspectLockOwnerLiveness — core/run-lock.js:174</title><rect x="12" y="210" width="323" height="40" rx="4"/><text x="22" y="235">c015 · inspectLockOwnerLiveness</text></g></svg><h3>Shown functions and source</h3><details><summary>c001 · withRunJsonLock — essential</summary><p>core/run-lock.js:18–77</p><pre><code>export async function withRunJsonLock(runDir, fn, options = {}) {
+  if (typeof fn !== &quot;function&quot;) throw new Error(&quot;withRunJsonLock requires a callback&quot;);
+  const { onBeforeSteal } = options;
+  if (onBeforeSteal !== undefined &amp;&amp; typeof onBeforeSteal !== &quot;function&quot;) {
+    throw new Error(&quot;onBeforeSteal must be a function&quot;);
+  }
+  const timeoutMs = normalizePositiveInteger(options.timeoutMs, DEFAULT_LOCK_TIMEOUT_MS);
+  normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);
+  normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);
+  const lockDir = join(runDir, LOCK_DIR);
+  const ownerPath = join(lockDir, LOCK_OWNER_FILE);
+  const deadline = Date.now() + timeoutMs;
+  let stealAttempted = false;
+  let createdIdentity = null;
+  let owner = null;
+  let ownerPublished = false;
+  let publishedEvidence = null;
+
+  while (true) {
+    try {
+      await mkdir(lockDir);
+      createdIdentity = await lockDirectoryIdentity(lockDir);
+      break;
+    } catch (error) {
+      if (error?.code !== &quot;EEXIST&quot;) throw error;
+      if (!stealAttempted) {
+        const observedIdentity = await lockDirectoryIdentity(lockDir);
+        const observedEvidence = await readLockOwnerEvidence(ownerPath);
+        if (canStealRunJsonLock(observedEvidence?.owner, options)) {
+          stealAttempted = true;
+          if (observedIdentity &amp;&amp; await stealByRename(runDir, lockDir, observedIdentity, observedEvidence, onBeforeSteal)) continue;
+        } else if (!observedEvidence &amp;&amp; await ownerlessLockIsReclaimable(lockDir, ownerPath, options)) {
+          stealAttempted = true;
+          if (observedIdentity &amp;&amp; await stealByRename(runDir, lockDir, observedIdentity, null, onBeforeSteal)) continue;
+        }
+      }
+      if (Date.now() &gt;= deadline) throw new Error(`timed out waiting for run.json lock at ${lockDir}`);
+      await delay(Math.min(DEFAULT_LOCK_RETRY_DELAY_MS, Math.max(1, deadline - Date.now())));
+    }
+  }
+
+  owner = { pid: process.pid, hostname: hostname(), acquired_at: new Date().toISOString(), nonce: randomUUID() };
+
+  try {
+    if (!sameLockDirectoryIdentity(createdIdentity, await lockDirectoryIdentity(lockDir))) {
+      throw new Error(`run.json lock ownership changed before owner publication at ${lockDir}`);
+    }
+    await writeFile(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { encoding: &quot;utf8&quot;, flag: &quot;wx&quot; });
+    publishedEvidence = await readLockOwnerEvidence(ownerPath);
+    if (!sameLockOwner(owner, publishedEvidence?.owner)) throw new Error(`run.json lock owner publication failed at ${lockDir}`);
+    ownerPublished = true;
+    return await fn({ lock_dir: lockDir, owner });
+  } finally {
+    if (ownerPublished) {
+      await releaseOwnedRunJsonLock(runDir, lockDir, createdIdentity, publishedEvidence);
+    } else if (!ownerPublished &amp;&amp; !(await lockOwnerEntryExists(ownerPath))) {
+      await quarantineAndRemoveOwnedLock(runDir, lockDir, createdIdentity);
+    }
+  }
+}</code></pre><details><summary>Call boundaries (36)</summary><ul><li>call:core/run-lock.js:880, line 19: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:1053, line 22: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:1124, line 24: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:1196, line 25: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:1268, line 26: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:1373, line 27: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:1417, line 28: join → unresolved / outside packet · external</li><li>call:core/run-lock.js:1468, line 29: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:1674, line 38: mkdir → unresolved / outside packet · external</li><li>call:core/run-lock.js:1720, line 39: lockDirectoryIdentity → lockDirectoryIdentity (not shown) · internal</li><li>call:core/run-lock.js:1904, line 44: lockDirectoryIdentity → lockDirectoryIdentity (not shown) · internal</li><li>call:core/run-lock.js:1975, line 45: readLockOwnerEvidence → readLockOwnerEvidence (not shown) · internal</li><li>call:core/run-lock.js:2151, line 48: stealByRename → stealByRename (not shown) · internal</li><li>call:core/run-lock.js:2422, line 51: stealByRename → stealByRename (not shown) · internal</li><li>call:core/run-lock.js:2531, line 54: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:2561, line 54: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:2637, line 55: delay → delay (not shown) · internal</li><li>call:core/run-lock.js:2643, line 55: Math.min → unresolved / outside packet · external</li><li>call:core/run-lock.js:2681, line 55: Math.max → unresolved / outside packet · external</li><li>call:core/run-lock.js:2704, line 55: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:2770, line 59: hostname → unresolved / outside packet · external</li><li>call:core/run-lock.js:2795, line 59: new Date().toISOString → unresolved / outside packet · external</li><li>call:core/run-lock.js:2795, line 59: Date → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:2828, line 59: randomUUID → unresolved / outside packet · external</li><li>call:core/run-lock.js:2862, line 62: sameLockDirectoryIdentity → sameLockDirectoryIdentity (not shown) · internal</li><li>call:core/run-lock.js:2911, line 62: lockDirectoryIdentity → lockDirectoryIdentity (not shown) · internal</li><li>call:core/run-lock.js:2958, line 63: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:3059, line 65: writeFile → unresolved / outside packet · external</li><li>call:core/run-lock.js:3083, line 65: JSON.stringify → unresolved / outside packet · external</li><li>call:core/run-lock.js:3184, line 66: readLockOwnerEvidence → readLockOwnerEvidence (not shown) · internal</li><li>call:core/run-lock.js:3227, line 67: sameLockOwner → sameLockOwner (not shown) · internal</li><li>call:core/run-lock.js:3281, line 67: Error → unresolved / outside packet · ambiguous</li><li>call:core/run-lock.js:3392, line 69: fn → unresolved / outside packet · unresolved</li><li>call:core/run-lock.js:3478, line 72: releaseOwnedRunJsonLock → releaseOwnedRunJsonLock (not shown) · internal</li><li>call:core/run-lock.js:3598, line 73: lockOwnerEntryExists → lockOwnerEntryExists (not shown) · internal</li><li>call:core/run-lock.js:3646, line 74: quarantineAndRemoveOwnedLock → quarantineAndRemoveOwnedLock (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c002 · canStealRunJsonLock — essential</summary><p>core/run-lock.js:79–81</p><pre><code>function canStealRunJsonLock(owner, options = {}) {
+  return isDurableLockOwner(owner) &amp;&amp; inspectLockOwnerLiveness(owner, options) === &quot;dead&quot;;
+}</code></pre><details><summary>Call boundaries (1)</summary><ul><li>call:core/run-lock.js:3784, line 80: isDurableLockOwner → isDurableLockOwner (not shown) · internal</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c013 · ownerlessLockIsReclaimable — essential</summary><p>core/run-lock.js:251–261</p><pre><code>async function ownerlessLockIsReclaimable(lockDir, ownerPath, options = {}) {
+  if (await lockOwnerEntryExists(ownerPath)) return false;
+  const graceMs = normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);
+  try {
+    const observed = await stat(lockDir);
+    const ageMs = Date.now() - observed.mtimeMs;
+    return Number.isFinite(ageMs) &amp;&amp; ageMs &gt; graceMs;
+  } catch {
+    return false;
+  }
+}</code></pre><details><summary>Call boundaries (5)</summary><ul><li>call:core/run-lock.js:12205, line 252: lockOwnerEntryExists → lockOwnerEntryExists (not shown) · internal</li><li>call:core/run-lock.js:12270, line 253: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:12392, line 255: stat → unresolved / outside packet · external</li><li>call:core/run-lock.js:12425, line 256: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:12467, line 257: Number.isFinite → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>c015 · inspectLockOwnerLiveness — essential</summary><p>core/run-lock.js:174–185</p><pre><code>function inspectLockOwnerLiveness(owner, options = {}) {
+  if (!isDurableLockOwner(owner)) return &quot;indeterminate&quot;;
+  // A lock taken on another host cannot be adjudicated from here at all.
+  if (owner.hostname !== hostname()) return &quot;indeterminate&quot;;
+  const staleAfterMs = normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);
+  const heldForMs = Date.now() - Date.parse(owner.acquired_at);
+  if (!Number.isFinite(heldForMs)) return &quot;indeterminate&quot;;
+  // A future `acquired_at` yields a negative age, which is never greater than the
+  // TTL, so clock skew already fails closed here. An explicit `heldForMs &lt; 0`
+  // branch was removed after its falsification showed removing it changed nothing.
+  return heldForMs &gt; staleAfterMs ? &quot;dead&quot; : &quot;alive&quot;;
+}</code></pre><details><summary>Call boundaries (6)</summary><ul><li>call:core/run-lock.js:9194, line 175: isDurableLockOwner → isDurableLockOwner (not shown) · internal</li><li>call:core/run-lock.js:9344, line 177: hostname → unresolved / outside packet · external</li><li>call:core/run-lock.js:9403, line 178: normalizePositiveInteger → normalizePositiveInteger (not shown) · internal</li><li>call:core/run-lock.js:9493, line 179: Date.now → unresolved / outside packet · external</li><li>call:core/run-lock.js:9506, line 179: Date.parse → unresolved / outside packet · external</li><li>call:core/run-lock.js:9544, line 180: Number.isFinite → unresolved / outside packet · external</li></ul></details><details><summary>Callback references — not calls (0)</summary><ul></ul></details></details><details><summary>Collapsed / uncertain candidates</summary><ul><li>c003 · readLockOwnerEvidence — <strong>supporting</strong> · core/run-lock.js:83</li><li>c004 · stealByRename — <strong>supporting</strong> · core/run-lock.js:111</li><li>c007 · lockOwnerEntryExists — <strong>supporting</strong> · core/run-lock.js:187</li><li>c008 · sameLockOwner — <strong>supporting</strong> · core/run-lock.js:207</li><li>c009 · lockDirectoryIdentity — <strong>supporting</strong> · core/run-lock.js:218</li><li>c010 · sameLockDirectoryIdentity — <strong>supporting</strong> · core/run-lock.js:228</li><li>c014 · renameOwnedLockToQuarantine — <strong>supporting</strong> · core/run-lock.js:157</li><li>c016 · isDurableLockOwner — <strong>supporting</strong> · core/run-lock.js:197</li><li>c017 · sameLockOwnerEvidence — <strong>supporting</strong> · core/run-lock.js:211</li><li>c019 · isRecord — <strong>supporting</strong> · core/run-lock.js:263</li><li>c021 · coordinateRunJsonTransition — <strong>supporting</strong> · core/write-core.js:9</li><li>c022 · &lt;callback@23:34&gt; — <strong>supporting</strong> · core/write-core.js:23</li><li>c034 · &lt;callback@53:34&gt; — <strong>supporting</strong> · state/session-lock.js:53</li><li>c036 · &lt;callback@74:34&gt; — <strong>supporting</strong> · state/session-lock.js:74</li><li>c038 · &lt;callback@86:34&gt; — <strong>supporting</strong> · state/session-lock.js:86</li></ul></details><details><summary>Hidden candidates</summary><ul><li>c005 · releaseOwnedRunJsonLock — <strong>incidental</strong> · core/run-lock.js:138</li><li>c006 · quarantineAndRemoveOwnedLock — <strong>incidental</strong> · core/run-lock.js:150</li><li>c011 · normalizePositiveInteger — <strong>incidental</strong> · core/run-lock.js:232</li><li>c012 · delay — <strong>incidental</strong> · core/run-lock.js:239</li><li>c018 · &lt;callback@240:22&gt; — <strong>incidental</strong> · core/run-lock.js:240</li><li>c020 · stringValue — <strong>incidental</strong> · core/run-lock.js:267</li><li>c023 · rename — <strong>incidental</strong> · core/write-core.js:47</li><li>c024 · assertUnchanged — <strong>incidental</strong> · core/write-core.js:85</li><li>c025 · readRunState — <strong>incidental</strong> · core/write-core.js:91</li><li>c026 · contractRegistry — <strong>incidental</strong> · core/write-core.js:96</li><li>c027 · participantRegistry — <strong>incidental</strong> · core/write-core.js:114</li><li>c028 · projectAll — <strong>incidental</strong> · core/write-core.js:132</li><li>c029 · deepFreeze — <strong>incidental</strong> · core/write-core.js:142</li><li>c030 · constructor — <strong>incidental</strong> · state/session-lock.js:25</li><li>c031 · readSessionLock — <strong>incidental</strong> · state/session-lock.js:32</li><li>c032 · inspectSessionLock — <strong>incidental</strong> · state/session-lock.js:43</li><li>c033 · claimSessionLock — <strong>incidental</strong> · state/session-lock.js:52</li><li>c035 · refreshSessionLock — <strong>incidental</strong> · state/session-lock.js:73</li><li>c037 · releaseSessionLock — <strong>incidental</strong> · state/session-lock.js:85</li><li>c039 · isValidLock — <strong>incidental</strong> · state/session-lock.js:95</li><li>c040 · &lt;callback@99:33&gt; — <strong>incidental</strong> · state/session-lock.js:99</li></ul></details></section></div></main></body></html>

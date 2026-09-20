@@ -1,0 +1,42 @@
+{
+  "status": "sanitized historical summary; not a new validation run",
+  "evidenceNote": "Private-workspace trial, browser, preservation and deployment details are omitted. Historical Baleyg development checks below are copied from the original report, not rerun or independently reverified during publication cleanup. No synthetic example is presented as an observed run.",
+  "scope": [
+    "Python proven name binding and deferred-definition correction",
+    "automatic indexed class ancestors/descendants; other associations opt-in"
+  ],
+  "historicalDevelopmentChecks": {
+    "rustPassed": 347,
+    "rustIgnored": 1,
+    "uiPassed": 225,
+    "failures": 0,
+    "clippy": "passed -D warnings",
+    "fmt": "passed",
+    "build": "passed",
+    "independentReview": "passed",
+    "remoteCI": "not run"
+  },
+  "limits": {
+    "nodes": 24,
+    "edges": 64,
+    "explicitRoots": 12,
+    "responseBytes": 4194304,
+    "hierarchyAdjacencyQueries": 48,
+    "additionalOptionalNeighborhoodQueries": 48,
+    "manualBridgeLookups": 12,
+    "hierarchyDepth": 24,
+    "thinHierarchyRecords": 256,
+    "representativesPerAdjacency": 64,
+    "classLoadAttempts": 24,
+    "relationLoadAttempts": 256
+  },
+  "limitations": [
+    "Annotations require a narrowly proven AST module future header for the new definition shortcut.",
+    "Defaults/decorators/generics/classes/lambdas and unsupported headers remain opaque.",
+    "Prefixed or concatenated docstrings conservatively do not establish the future-header shortcut.",
+    "Hierarchy uses cached syntax candidates, not compiler types; unknown hints remain explicitly optional.",
+    "No unrelated sibling discovery by turning from an ancestor down another branch. Focus the base to explore its subclasses.",
+    "Bounded hierarchy and chooser results may be partial.",
+    "No new ACP exploration tools or multi-project implementation."
+  ]
+}

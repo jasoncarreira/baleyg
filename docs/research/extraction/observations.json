@@ -1,0 +1,159 @@
+{
+  "scope": "Local JavaScript extraction and bounded SQLite spike; not M4 or Java validation",
+  "node": "v24.11.1",
+  "steps": [
+    {
+      "label": "feature-factory:index",
+      "elapsedMs": 2637.0782910000003,
+      "exitCode": 0
+    },
+    {
+      "label": "feature-factory:extract",
+      "elapsedMs": 3007.961792,
+      "exitCode": 0
+    },
+    {
+      "label": "fixture:index",
+      "elapsedMs": 1203.592291,
+      "exitCode": 0
+    },
+    {
+      "label": "fixture:extract",
+      "elapsedMs": 219.8351249999996,
+      "exitCode": 0
+    },
+    {
+      "label": "edge-fixture:index",
+      "elapsedMs": 770.5209170000007,
+      "exitCode": 0
+    },
+    {
+      "label": "edge-fixture:extract",
+      "elapsedMs": 212.8500840000006,
+      "exitCode": 0
+    },
+    {
+      "label": "extraction:tests",
+      "elapsedMs": 4297.156833,
+      "exitCode": 0
+    },
+    {
+      "label": "lifecycle:tests",
+      "elapsedMs": 4108.4385,
+      "exitCode": 0
+    },
+    {
+      "label": "viewer:smoke",
+      "elapsedMs": 197.03299999999945,
+      "exitCode": 0
+    }
+  ],
+  "featureFactory": {
+    "output": "feature-factory.graph.json",
+    "elapsedMs": 2682.400917,
+    "files": 18,
+    "nodes": 372,
+    "calls": 2203,
+    "internal": 805,
+    "external": 816,
+    "unresolved": 269,
+    "ambiguous": 313,
+    "parseErrors": 0,
+    "occurrences": 12025,
+    "referenceEnclosingRanges": 0,
+    "definitionEnclosingRanges": 214,
+    "semanticFresh": true,
+    "changedFiles": []
+  },
+  "fixture": {
+    "files": 3,
+    "nodes": 13,
+    "calls": 12,
+    "internal": 11,
+    "external": 0,
+    "unresolved": 1,
+    "ambiguous": 0,
+    "parseErrors": 0,
+    "occurrences": 57,
+    "referenceEnclosingRanges": 0,
+    "definitionEnclosingRanges": 13,
+    "semanticFresh": true,
+    "changedFiles": []
+  },
+  "storage": {
+    "status": "passed",
+    "passed": 5,
+    "canonicalRowCount": 13733,
+    "canonicalInputDigest": "9eeb6d1b9004179d372f06dc9a227d3e709ea88f603effe38949a468641d329f",
+    "observations": [
+      {
+        "name": "WAL pinned snapshot survives whole-revision replacement",
+        "status": "passed",
+        "journalMode": "wal",
+        "independentConnections": 3,
+        "checkpoints": 3,
+        "pinnedDigest": "9eeb6d1b9004179d372f06dc9a227d3e709ea88f603effe38949a468641d329f",
+        "publishedDigest": "e9cca0af459b3a4401e08a41cd80baee089f561e01d92e8a81270b5fb25ea312",
+        "newTransactionSeesPublishedRevision": true
+      },
+      {
+        "name": "exception rolls back deleted and partially inserted rows",
+        "status": "passed",
+        "injectedAt": [
+          "after-delete",
+          "mid-insert",
+          "before-commit"
+        ],
+        "reopenedAfterEachRollback": true,
+        "recoveredWriterPublishes": true,
+        "actualWorkerCancellation": false
+      },
+      {
+        "name": "injected-cancellation rolls back deleted and partially inserted rows",
+        "status": "passed",
+        "injectedAt": [
+          "after-delete",
+          "mid-insert",
+          "before-commit"
+        ],
+        "reopenedAfterEachRollback": true,
+        "recoveredWriterPublishes": true,
+        "actualWorkerCancellation": false
+      },
+      {
+        "name": "deleted cache rebuilds identical canonical rows from the same graph",
+        "status": "passed",
+        "canonicalRowCount": 13733,
+        "beforeDigest": "9eeb6d1b9004179d372f06dc9a227d3e709ea88f603effe38949a468641d329f",
+        "rebuiltDigest": "9eeb6d1b9004179d372f06dc9a227d3e709ea88f603effe38949a468641d329f",
+        "deletedCacheFiles": true
+      },
+      {
+        "name": "workspace annotation survives cache rebuild and becomes explicit orphan after target rename",
+        "status": "passed",
+        "targetId": "local:bin/factory.js:local 1134",
+        "separateWorkspaceDatabase": true,
+        "annotationSurvivesReopen": true,
+        "survivesSameGraphRebuild": true,
+        "renamedTargetStatus": "orphan",
+        "orphanReason": "target-not-in-current-revision",
+        "automaticRetargeting": false
+      }
+    ]
+  },
+  "sourceFilesUnchanged": true,
+  "browser": {
+    "featureFactorySeedsAtCap": [
+      "readRun",
+      "transition",
+      "coordinateRunJsonTransition"
+    ],
+    "fixtureBranchLoopMessages": 4,
+    "sourceNavigation": "state/transition.js:14 matched highlighted snapshot line",
+    "warmBoundedTraversalMeanMsRange": [
+      0.0039,
+      0.007
+    ],
+    "timingCaveat": "1000 repeated in-memory bounded traversals; excludes graph load, SQLite and rendering; not a representative product benchmark"
+  }
+}

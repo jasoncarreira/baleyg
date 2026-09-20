@@ -1,0 +1,85 @@
+[
+  {
+    "id": "q01-smoke",
+    "candidates": 35,
+    "sourceExcerptsTruncated": 4,
+    "eligibleCandidatesOmitted": 0,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q02-atomic-branches",
+    "candidates": 35,
+    "sourceExcerptsTruncated": 4,
+    "eligibleCandidatesOmitted": 0,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q03-lock-reclaim",
+    "candidates": 40,
+    "sourceExcerptsTruncated": 3,
+    "eligibleCandidatesOmitted": 0,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q04-transition-cas",
+    "candidates": 48,
+    "sourceExcerptsTruncated": 5,
+    "eligibleCandidatesOmitted": 25,
+    "rubricNamesWithoutCandidate": [
+      "assertUnchanged",
+      "rename"
+    ],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q05-push-target",
+    "candidates": 48,
+    "sourceExcerptsTruncated": 1,
+    "eligibleCandidatesOmitted": 76,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q06-review-binding",
+    "candidates": 48,
+    "sourceExcerptsTruncated": 4,
+    "eligibleCandidatesOmitted": 41,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q07-merge-proof",
+    "candidates": 48,
+    "sourceExcerptsTruncated": 4,
+    "eligibleCandidatesOmitted": 11,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q08-publication",
+    "candidates": 48,
+    "sourceExcerptsTruncated": 5,
+    "eligibleCandidatesOmitted": 70,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q09-repair-lifecycle",
+    "candidates": 48,
+    "sourceExcerptsTruncated": 7,
+    "eligibleCandidatesOmitted": 52,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  },
+  {
+    "id": "q10-executable-search",
+    "candidates": 43,
+    "sourceExcerptsTruncated": 2,
+    "eligibleCandidatesOmitted": 0,
+    "rubricNamesWithoutCandidate": [],
+    "note": "Missing names may be external calls, alias targets or source facts, not necessarily retrieval defects; human inspection required."
+  }
+]

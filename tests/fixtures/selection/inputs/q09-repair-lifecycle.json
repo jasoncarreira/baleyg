@@ -1,0 +1,3961 @@
+{
+  "schemaVersion": 1,
+  "questionId": "q09-repair-lifecycle",
+  "question": "Where does reverifyRepair hold the run lock, and how are detached execution and evidence publication separated?",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "seedId": "c001",
+  "labels": [
+    "essential",
+    "supporting",
+    "incidental",
+    "uncertain"
+  ],
+  "candidates": [
+    {
+      "id": "c001",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/reverifyRepair().",
+      "name": "reverifyRepair",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 69,
+      "endLine": 169,
+      "distance": 0,
+      "source": "export async function reverifyRepair({ repo, runDir, runId, recordId, at }) {\n  const parsedAt = typeof at === \"string\" ? Date.parse(at) : NaN;\n  if (!Number.isFinite(parsedAt) || new Date(parsedAt).toISOString() !== at) throw new Error(\"repair re-verification timestamp is not canonical\");\n  const preread = readRepairState({ repo, runDir, runId, recordId });\n  assertEnvelope(preread.run);\n  if (preread.selectedHistory.pass !== null) throw new Error(`repair record '${recordId}' is already effectively verified`);\n  if (preread.selectedHistory.tail) throw new Error(`repair record '${recordId}' has a marker-only attempt requiring manual resolution`);\n  const temporary = createDetached(repo, preread.selected.repair_commit);\n  try {\n    assertDetached(temporary.worktree, preread.selected.repair_commit);\n  } catch (error) {\n    try { removeDetached(repo, temporary); } catch (cleanup) { throw new Error(`${error.message}; ${cleanup.message}`); }\n    throw error;\n  }\n\n  let reservation;\n  try {\n    reservation = await withRunJsonLock(runDir, async () => {\n      const current = readRepairState({ repo, runDir, runId, recordId });\n      assertEnvelope(current.run);\n/* ... source excerpt omitted ... */\nngify(reread.selectedHistory.results.get(reservation.attempt)) !== JSON.stringify(result)) {\n      throw new Error(\"repair result did not read back as the unique final attempt\");\n    }\n    return { result, effective: reread.selectedHistory.pass === reservation.attempt };\n  });\n  if (!completed.effective) throw new Error(`repair re-verification attempt ${reservation.attempt} did not pass`);\n  return {\n    run_id: runId, record_id: recordId, attempt: reservation.attempt,\n    physical_status: \"needs-human\", effective_status: \"verified\", repair_commit: reservation.repairCommit,\n    evidence_ref: reservation.refs.result,\n  };\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:3121",
+          "line": 70,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3150",
+          "line": 71,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3179",
+          "line": 71,
+          "callee": "new Date(parsedAt).toISOString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3179",
+          "line": 71,
+          "callee": "Date",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3226",
+          "line": 71,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3308",
+          "line": 72,
+          "callee": "readRepairState",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3362",
+          "line": 73,
+          "callee": "assertEnvelope",
+          "target": "c006",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3442",
+          "line": 74,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3558",
+          "line": 75,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3674",
+          "line": 76,
+          "callee": "createDetached",
+          "target": "c008",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3740",
+          "line": 78,
+          "callee": "assertDetached",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3838",
+          "line": 80,
+          "callee": "removeDetached",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:3897",
+          "line": 80,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4023",
+          "line": 86,
+          "callee": "withRunJsonLock",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": [
+            "c010"
+          ]
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5899",
+          "line": 113,
+          "callee": "removeDetached",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5958",
+          "line": 113,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6078",
+          "line": 119,
+          "callee": "spawnSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6269",
+          "line": 122,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6372",
+          "line": 123,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6471",
+          "line": 124,
+          "callee": "SHA.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6480",
+          "line": 124,
+          "callee": "head.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6502",
+          "line": 124,
+          "callee": "head.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6553",
+          "line": 125,
+          "callee": "observeCleanliness",
+          "target": "c004",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6717",
+          "line": 128,
+          "callee": "removeDetached",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6776",
+          "line": 128,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6852",
+          "line": 131,
+          "callee": "removeDetached",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:6912",
+          "line": 133,
+          "callee": "withRunJsonLock",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": [
+            "c011"
+          ]
+        },
+        {
+          "id": "call:observe/repair-reverification.js:8980",
+          "line": 163,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c002",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/withRunJsonLock().",
+      "name": "withRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 18,
+      "endLine": 77,
+      "distance": 1,
+      "source": "export async function withRunJsonLock(runDir, fn, options = {}) {\n  if (typeof fn !== \"function\") throw new Error(\"withRunJsonLock requires a callback\");\n  const { onBeforeSteal } = options;\n  if (onBeforeSteal !== undefined && typeof onBeforeSteal !== \"function\") {\n    throw new Error(\"onBeforeSteal must be a function\");\n  }\n  const timeoutMs = normalizePositiveInteger(options.timeoutMs, DEFAULT_LOCK_TIMEOUT_MS);\n  normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);\n  normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);\n  const lockDir = join(runDir, LOCK_DIR);\n  const ownerPath = join(lockDir, LOCK_OWNER_FILE);\n  const deadline = Date.now() + timeoutMs;\n  let stealAttempted = false;\n  let createdIdentity = null;\n  let owner = null;\n  let ownerPublished = false;\n  let publishedEvidence = null;\n\n  while (true) {\n    try {\n      await mkdir(lockDir);\n      createdIdentity = await lockDirectoryIdentity(lockDir);\n      break;\n    } catch (error) {\n      if (error?.code !== \"EEXIST\") throw error;\n      if (!stealAttempted) {\n        const observedIdentity = await lockDirectoryIdentity(lockDir);\n        co\n/* ... source excerpt omitted ... */\ningify(owner, null, 2)}\\n`, { encoding: \"utf8\", flag: \"wx\" });\n    publishedEvidence = await readLockOwnerEvidence(ownerPath);\n    if (!sameLockOwner(owner, publishedEvidence?.owner)) throw new Error(`run.json lock owner publication failed at ${lockDir}`);\n    ownerPublished = true;\n    return await fn({ lock_dir: lockDir, owner });\n  } finally {\n    if (ownerPublished) {\n      await releaseOwnedRunJsonLock(runDir, lockDir, createdIdentity, publishedEvidence);\n    } else if (!ownerPublished && !(await lockOwnerEntryExists(ownerPath))) {\n      await quarantineAndRemoveOwnedLock(runDir, lockDir, createdIdentity);\n    }\n  }\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:880",
+          "line": 19,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1053",
+          "line": 22,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1124",
+          "line": 24,
+          "callee": "normalizePositiveInteger",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1196",
+          "line": 25,
+          "callee": "normalizePositiveInteger",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1268",
+          "line": 26,
+          "callee": "normalizePositiveInteger",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1373",
+          "line": 27,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1417",
+          "line": 28,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1468",
+          "line": 29,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1674",
+          "line": 38,
+          "callee": "mkdir",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1720",
+          "line": 39,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1904",
+          "line": 44,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1975",
+          "line": 45,
+          "callee": "readLockOwnerEvidence",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2021",
+          "line": 46,
+          "callee": "canStealRunJsonLock",
+          "target": "c013",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2151",
+          "line": 48,
+          "callee": "stealByRename",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2290",
+          "line": 49,
+          "callee": "ownerlessLockIsReclaimable",
+          "target": "c024",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2422",
+          "line": 51,
+          "callee": "stealByRename",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2531",
+          "line": 54,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2561",
+          "line": 54,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2637",
+          "line": 55,
+          "callee": "delay",
+          "target": "c023",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2643",
+          "line": 55,
+          "callee": "Math.min",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2681",
+          "line": 55,
+          "callee": "Math.max",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2704",
+          "line": 55,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2770",
+          "line": 59,
+          "callee": "hostname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2795",
+          "line": 59,
+          "callee": "new Date().toISOString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2795",
+          "line": 59,
+          "callee": "Date",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2828",
+          "line": 59,
+          "callee": "randomUUID",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2862",
+          "line": 62,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2911",
+          "line": 62,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2958",
+          "line": 63,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3059",
+          "line": 65,
+          "callee": "writeFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3083",
+          "line": 65,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3184",
+          "line": 66,
+          "callee": "readLockOwnerEvidence",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3227",
+          "line": 67,
+          "callee": "sameLockOwner",
+          "target": "c019",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3281",
+          "line": 67,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3392",
+          "line": 69,
+          "callee": "fn",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3478",
+          "line": 72,
+          "callee": "releaseOwnedRunJsonLock",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3598",
+          "line": 73,
+          "callee": "lockOwnerEntryExists",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3646",
+          "line": 74,
+          "callee": "quarantineAndRemoveOwnedLock",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c003",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/git().",
+      "name": "git",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 20,
+      "endLine": 30,
+      "distance": 1,
+      "source": "export function git(cwd, args, { runner = spawnSync } = {}) {\n  const result = runner(\"git\", args, { cwd, encoding: \"utf8\", shell: false, env: { ...process.env, LC_ALL: \"C\" } });\n  const status = Number.isInteger(result?.status) ? result.status : null;\n  return {\n    ok: status === 0,\n    status,\n    stdout: String(result?.stdout ?? \"\"),\n    stderr: String(result?.stderr ?? \"\"),\n    argv: [\"git\", ...args],\n  };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:1053",
+          "line": 21,
+          "callee": "runner",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1170",
+          "line": 22,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1284",
+          "line": 26,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1326",
+          "line": 27,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c004",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeCleanliness().",
+      "name": "observeCleanliness",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 73,
+      "endLine": 78,
+      "distance": 1,
+      "source": "export function observeCleanliness(worktree, options = {}) {\n  const probe = git(worktree, [\"status\", \"--porcelain\", \"--untracked-files=normal\"], options);\n  if (!probe.ok) return { clean: false, reason: \"worktree state could not be observed\", entries: [] };\n  const entries = probe.stdout.split(\"\\n\").map((line) => line.trim()).filter(Boolean);\n  return { clean: entries.length === 0, reason: entries.length === 0 ? null : \"worktree has uncommitted changes\", entries };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:3796",
+          "line": 74,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:3996",
+          "line": 76,
+          "callee": "probe.stdout.split(\"\\n\").map((line) => line.trim()).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:3996",
+          "line": 76,
+          "callee": "probe.stdout.split(\"\\n\").map",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c025"
+          ]
+        },
+        {
+          "id": "call:observe/index.js:3996",
+          "line": 76,
+          "callee": "probe.stdout.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c005",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/readRepairState().",
+      "name": "readRepairState",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 254,
+      "endLine": 287,
+      "distance": 1,
+      "source": "export function readRepairState({ runDir, state = null, runId, repo, recordId = null } = {}) {\n  let runBytes;\n  let rawRun;\n  try {\n    runBytes = readFileSync(join(runDir, \"run.json\"));\n    rawRun = validateRun(JSON.parse(runBytes.toString(\"utf8\")));\n  } catch (error) {\n    fail(`run.json could not be validated: ${error.message}`);\n  }\n  const run = validateRun(state ?? rawRun);\n  if (run.run_id !== runId || rawRun.run_id !== runId) fail(`run ID does not equal loaded run_id '${rawRun.run_id}'`);\n  const journalPath = join(runDir, REPAIR_JOURNAL_REF);\n  const journalFile = canonicalFile(journalPath, REPAIR_JOURNAL_REF, { optional: true });\n  if (!journalFile) {\n    const inventory = validateInventory(runDir, runId, []);\n    if (recordId !== null) fail(`repair journal is absent; record '${recordId}' does not exist`);\n    return { run, runBytes, journal: null, journalBytes: null, records: [], chains: new Map(), inventory, selected: null };\n  }\n  if (!repo) fail(\"repository is required to validate the repair journal\");\n  const { records, chains } = validateJournal(journalFile.value, run, repo);\n  const inventory = validateInventory(runDir, runId, records\n/* ... source excerpt omitted ... */\nrecord '${recordId}' does not identify exactly one journal row`);\n    selected = matches[0];\n    if (chains.get(selected.introducing_merge)?.at(-1) !== selected\n      || selected.status !== \"needs-human\" || selected.repair_commit === null) {\n      fail(`record '${recordId}' is not the latest eligible post-commit needs-human row`);\n    }\n  }\n  return { run, runBytes, journal: journalFile.value, journalBytes: journalFile.bytes,\n    records, chains, inventory, selected, selectedHistory: selected ? inventory.get(recordId) ?? { markers: new Map(), results: new Map(), names: [], attempts: 0, tail: false, pass: null } : null };\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:14382",
+          "line": 258,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14395",
+          "line": 258,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14435",
+          "line": 259,
+          "callee": "validateRun",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14447",
+          "line": 259,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14458",
+          "line": 259,
+          "callee": "runBytes.toString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14511",
+          "line": 261,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14588",
+          "line": 263,
+          "callee": "validateRun",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14673",
+          "line": 264,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14759",
+          "line": 265,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14815",
+          "line": 266,
+          "callee": "canonicalFile",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14927",
+          "line": 268,
+          "callee": "validateInventory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14992",
+          "line": 269,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15147",
+          "line": 270,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15204",
+          "line": 272,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15297",
+          "line": 273,
+          "callee": "validateJournal",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15364",
+          "line": 274,
+          "callee": "validateInventory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15477",
+          "line": 277,
+          "callee": "records.filter",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c030"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:15560",
+          "line": 278,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15667",
+          "line": 280,
+          "callee": "chains.get(selected.introducing_merge)?.at",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15667",
+          "line": 280,
+          "callee": "chains.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15814",
+          "line": 282,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16066",
+          "line": 286,
+          "callee": "inventory.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16104",
+          "line": 286,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16124",
+          "line": 286,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c006",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/assertEnvelope().",
+      "name": "assertEnvelope",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 15,
+      "endLine": 19,
+      "distance": 1,
+      "source": "function assertEnvelope(run) {\n  if (![\"running\", \"needs-human\"].includes(run.status)) {\n    throw new Error(`factory reverify-repair requires run status running or needs-human; found '${run.status}'`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:784",
+          "line": 16,
+          "callee": "[\"running\", \"needs-human\"].includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:845",
+          "line": 17,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c007",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/assertDetached().",
+      "name": "assertDetached",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 21,
+      "endLine": 28,
+      "distance": 1,
+      "source": "function assertDetached(worktree, commit) {\n  const head = git(worktree, [\"rev-parse\", \"--verify\", \"HEAD^{commit}\"]);\n  if (!head.ok || head.stdout.trim() !== commit) throw new Error(`detached repair worktree is not at immutable repair commit ${commit}`);\n  const symbolic = git(worktree, [\"symbolic-ref\", \"--quiet\", \"HEAD\"]);\n  if (symbolic.status !== 1) throw new Error(\"repair worktree is not detached\");\n  const cleanliness = observeCleanliness(worktree);\n  if (!cleanliness.clean) throw new Error(`detached repair worktree is not initially clean: ${cleanliness.reason}`);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:1015",
+          "line": 22,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1092",
+          "line": 23,
+          "callee": "head.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1129",
+          "line": 23,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1231",
+          "line": 24,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1318",
+          "line": 25,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1386",
+          "line": 26,
+          "callee": "observeCleanliness",
+          "target": "c004",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1448",
+          "line": 27,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c008",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/createDetached().",
+      "name": "createDetached",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 46,
+      "endLine": 55,
+      "distance": 1,
+      "source": "function createDetached(repo, commit) {\n  const parent = mkdtempSync(join(tmpdir(), \"factory-reverify-repair-\"));\n  const worktree = join(parent, \"worktree\");\n  const added = git(repo, [\"worktree\", \"add\", \"--detach\", worktree, commit]);\n  if (!added.ok) {\n    rmSync(parent, { recursive: true, force: true });\n    throw new Error(`could not create detached repair worktree at ${commit}`);\n  }\n  return { parent, worktree };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:2156",
+          "line": 47,
+          "callee": "mkdtempSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2168",
+          "line": 47,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2173",
+          "line": 47,
+          "callee": "tmpdir",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2232",
+          "line": 48,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2274",
+          "line": 49,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2359",
+          "line": 51,
+          "callee": "rmSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2419",
+          "line": 52,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c009",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/removeDetached().",
+      "name": "removeDetached",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 57,
+      "endLine": 67,
+      "distance": 1,
+      "source": "function removeDetached(repo, temporary) {\n  const removed = git(repo, [\"worktree\", \"remove\", \"--force\", temporary.worktree]);\n  if (!removed.ok || existsSync(temporary.worktree)) {\n    throw new Error(`repair worktree cleanup failed; retained at ${temporary.worktree}`);\n  }\n  try {\n    rmSync(temporary.parent, { recursive: true, force: false });\n  } catch (error) {\n    throw new Error(`repair worktree cleanup failed for ${temporary.parent}: ${error.message}`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:2587",
+          "line": 58,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2674",
+          "line": 59,
+          "callee": "existsSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2718",
+          "line": 60,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2814",
+          "line": 63,
+          "callee": "rmSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:2905",
+          "line": 65,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c010",
+      "symbolId": "syntax:observe/repair-reverification.js:4047:arrow_function",
+      "name": "<callback@86:49>",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 86,
+      "endLine": 111,
+      "distance": 1,
+      "source": "    reservation = await withRunJsonLock(runDir, async () => {\n      const current = readRepairState({ repo, runDir, runId, recordId });\n      assertEnvelope(current.run);\n      assertDetached(temporary.worktree, current.selected.repair_commit);\n      const history = current.selectedHistory;\n      if (history.pass !== null) throw new Error(`repair record '${recordId}' is already effectively verified`);\n      if (history.tail) throw new Error(`repair record '${recordId}' has a marker-only attempt requiring manual resolution`);\n      const attempt = history.attempts + 1;\n      const refs = evidenceNames(recordId, attempt);\n      const marker = {\n        version: 1, run_id: runId, record_id: recordId, attempt,\n        run_sha256: digest(current.run), journal_sha256: digest(current.journal), record_sha256: digest(current.selected),\n        introducing_merge: current.selected.introducing_merge, repair_commit: current.selected.repair_commit,\n        trigger: current.selected.trigger, started_at: at,\n      };\n      ensureEvidenceDirectory(runDir);\n      await writeProtectedJsonAtomic(runDir, refs.marker, marker, { createOnly: true });\n      const reread = read\n/* ... source excerpt omitted ... */\nectedHistory.tail || reread.selectedHistory.attempts !== attempt\n        || !sameNames(reread.selectedHistory.names, [...history.names, refs.marker.slice(\"evidence/\".length)])\n        || JSON.stringify(reread.selectedHistory.markers.get(attempt)) !== JSON.stringify(marker)) {\n        throw new Error(\"repair marker did not read back as the unique next attempt\");\n      }\n      return { attempt, refs, marker, runBytes: Buffer.from(current.runBytes), journalBytes: Buffer.from(current.journalBytes),\n        priorNames: [...history.names], repairCommit: current.selected.repair_commit, trigger: current.selected.trigger };\n    });",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:4083",
+          "line": 87,
+          "callee": "readRepairState",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4141",
+          "line": 88,
+          "callee": "assertEnvelope",
+          "target": "c006",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4176",
+          "line": 89,
+          "callee": "assertDetached",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4330",
+          "line": 91,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4434",
+          "line": 92,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4593",
+          "line": 94,
+          "callee": "evidenceNames",
+          "target": "c034",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4735",
+          "line": 97,
+          "callee": "digest",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4772",
+          "line": 97,
+          "callee": "digest",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:4812",
+          "line": 97,
+          "callee": "digest",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5022",
+          "line": 101,
+          "callee": "ensureEvidenceDirectory",
+          "target": "c033",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5067",
+          "line": 102,
+          "callee": "writeProtectedJsonAtomic",
+          "target": "c012",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5165",
+          "line": 103,
+          "callee": "readRepairState",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5315",
+          "line": 105,
+          "callee": "sameNames",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5374",
+          "line": 105,
+          "callee": "refs.marker.slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5425",
+          "line": 106,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5440",
+          "line": 106,
+          "callee": "reread.selectedHistory.markers.get",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5489",
+          "line": 106,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5529",
+          "line": 107,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5658",
+          "line": 109,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:5703",
+          "line": 109,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c011",
+      "symbolId": "syntax:observe/repair-reverification.js:6936:arrow_function",
+      "name": "<callback@133:51>",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 133,
+      "endLine": 162,
+      "distance": 1,
+      "source": "  const completed = await withRunJsonLock(runDir, async () => {\n    const current = readRepairState({ repo, runDir, runId, recordId });\n    assertEnvelope(current.run);\n    if (!current.runBytes.equals(reservation.runBytes) || !current.journalBytes.equals(reservation.journalBytes)) {\n      throw new Error(\"run or repair journal bytes changed during re-verification\");\n    }\n    const history = current.selectedHistory;\n    const markerName = reservation.refs.marker.slice(\"evidence/\".length);\n    if (!history.tail || history.attempts !== reservation.attempt\n      || !sameNames(history.names, [...reservation.priorNames, markerName])\n      || JSON.stringify(history.markers.get(reservation.attempt)) !== JSON.stringify(reservation.marker)\n      || current.selected.repair_commit !== reservation.repairCommit\n      || JSON.stringify(current.selected.trigger) !== JSON.stringify(reservation.trigger)) {\n      throw new Error(\"repair reservation changed before result publication\");\n    }\n    const result = {\n      version: 1, run_id: runId, record_id: recordId, attempt: reservation.attempt,\n      marker_sha256: digest(reservation.marker), run_sha256: reservation.mar\n/* ... source excerpt omitted ... */\nr, result: execution, observed_at: at, observed_by: \"factory\",\n    };\n    await writeProtectedJsonAtomic(runDir, reservation.refs.result, result, { createOnly: true });\n    const reread = readRepairState({ repo, runDir, runId, recordId });\n    if (reread.selectedHistory.tail || reread.selectedHistory.attempts !== reservation.attempt\n      || JSON.stringify(reread.selectedHistory.results.get(reservation.attempt)) !== JSON.stringify(result)) {\n      throw new Error(\"repair result did not read back as the unique final attempt\");\n    }\n    return { result, effective: reread.selectedHistory.pass === reservation.attempt };\n  });",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:6970",
+          "line": 134,
+          "callee": "readRepairState",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7026",
+          "line": 135,
+          "callee": "assertEnvelope",
+          "target": "c006",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7064",
+          "line": 136,
+          "callee": "current.runBytes.equals",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7114",
+          "line": 136,
+          "callee": "current.journalBytes.equals",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7183",
+          "line": 137,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7330",
+          "line": 140,
+          "callee": "reservation.refs.marker.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7457",
+          "line": 142,
+          "callee": "sameNames",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7532",
+          "line": 143,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7547",
+          "line": 143,
+          "callee": "history.markers.get",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7593",
+          "line": 143,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7706",
+          "line": 145,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7751",
+          "line": 145,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:7802",
+          "line": 146,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:8001",
+          "line": 150,
+          "callee": "digest",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:8395",
+          "line": 155,
+          "callee": "writeProtectedJsonAtomic",
+          "target": "c012",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:8503",
+          "line": 156,
+          "callee": "readRepairState",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:8659",
+          "line": 158,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:8674",
+          "line": 158,
+          "callee": "reread.selectedHistory.results.get",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:8735",
+          "line": 158,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:8773",
+          "line": 159,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c012",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/writeProtectedJsonAtomic().",
+      "name": "writeProtectedJsonAtomic",
+      "kind": "function",
+      "path": "core/atomic-write.js",
+      "startLine": 18,
+      "endLine": 20,
+      "distance": 2,
+      "source": "export function writeProtectedJsonAtomic(rootDir, relativePath, value, options = {}) {\n  return writeProtectedFileAtomic(rootDir, relativePath, `${JSON.stringify(value, null, 2)}\\n`, options);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/atomic-write.js:1090",
+          "line": 19,
+          "callee": "writeProtectedFileAtomic",
+          "target": "c035",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1141",
+          "line": 19,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c013",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/canStealRunJsonLock().",
+      "name": "canStealRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 79,
+      "endLine": 81,
+      "distance": 2,
+      "source": "function canStealRunJsonLock(owner, options = {}) {\n  return isDurableLockOwner(owner) && inspectLockOwnerLiveness(owner, options) === \"dead\";\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:3784",
+          "line": 80,
+          "callee": "isDurableLockOwner",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3813",
+          "line": 80,
+          "callee": "inspectLockOwnerLiveness",
+          "target": "c037",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c014",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/readLockOwnerEvidence().",
+      "name": "readLockOwnerEvidence",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 83,
+      "endLine": 96,
+      "distance": 2,
+      "source": "async function readLockOwnerEvidence(ownerPath) {\n  let handle;\n  try {\n    handle = await open(ownerPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));\n    const parsed = JSON.parse(await handle.readFile(\"utf8\"));\n    if (!isDurableLockOwner(parsed)) return null;\n    const value = await handle.stat();\n    return { owner: parsed, identity: { dev: value.dev, ino: value.ino } };\n  } catch {\n    return null;\n  } finally {\n    await handle?.close();\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:3960",
+          "line": 86,
+          "callee": "open",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4046",
+          "line": 87,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4063",
+          "line": 87,
+          "callee": "handle.readFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4098",
+          "line": 88,
+          "callee": "isDurableLockOwner",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4163",
+          "line": 89,
+          "callee": "handle.stat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4307",
+          "line": 94,
+          "callee": "handle?.close",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c015",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stealByRename().",
+      "name": "stealByRename",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 111,
+      "endLine": 136,
+      "distance": 2,
+      "source": "async function stealByRename(runDir, lockDir, observedIdentity, observedEvidence, onBeforeSteal) {\n  if (onBeforeSteal) await onBeforeSteal({ runDir, lockDir, owner: observedEvidence?.owner ?? null });\n  // The owner must still be the one we judged stale, and the directory's dev/ino cannot establish\n  // that: Linux reuses inode numbers, so a lock deleted and recreated here presents the identity we\n  // recorded and the post-rename check sees nothing wrong while a live lock is renamed away. The\n  // nonce is the discriminator. The note that once stood here — a pre-check is undetectable — was\n  // falsified only on APFS, which does not reuse the inode; CI failed on Linux and passed on macOS.\n  // The post-rename check stays, the two together are narrower, and the write core is still the\n  // real boundary, so the residual check-then-act window cannot produce a lost update.\n  if (observedEvidence\n    && !sameLockOwnerEvidence(observedEvidence, await readLockOwnerEvidence(join(lockDir, LOCK_OWNER_FILE)))) {\n    return false;\n  }\n  let quarantine;\n  try {\n    quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, observedIdentity);\n  } catch (error) {\n    // Losing the race is a retry, not a failure: ENOENT is the rename losing the path, ELOCKIDENTITY\n    // is noticing the winner before renaming. Only ENOENT was handled, so the second case failed the\n    // whole run — rare until the owner pre-check widened that window, and then CI hit it.\n    if (error?.code === \"ENOENT\" || error?.code === \"ELOCKIDENTITY\") return false;\n    throw error;\n  }\n  await rm(quarantine, { recursive: true, force: true });\n  return true;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:5260",
+          "line": 112,
+          "callee": "onBeforeSteal",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6050",
+          "line": 121,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6096",
+          "line": 121,
+          "callee": "readLockOwnerEvidence",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6118",
+          "line": 121,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6225",
+          "line": 126,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c036",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6716",
+          "line": 134,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c016",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/releaseOwnedRunJsonLock().",
+      "name": "releaseOwnedRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 138,
+      "endLine": 148,
+      "distance": 2,
+      "source": "async function releaseOwnedRunJsonLock(runDir, lockDir, expectedIdentity, expectedEvidence) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) return;\n  if (!sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(lockDir, LOCK_OWNER_FILE)))) return;\n  const quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity);\n  if (!sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(quarantine, LOCK_OWNER_FILE)))) {\n    throw new Error(`run.json lock cleanup identity changed at ${quarantine}`);\n  }\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))\n    || !sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(quarantine, LOCK_OWNER_FILE)))) return;\n  await rm(quarantine, { recursive: true, force: true });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:6885",
+          "line": 139,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6935",
+          "line": 139,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6983",
+          "line": 140,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7029",
+          "line": 140,
+          "callee": "readLockOwnerEvidence",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7051",
+          "line": 140,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7120",
+          "line": 141,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c036",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7191",
+          "line": 142,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7237",
+          "line": 142,
+          "callee": "readLockOwnerEvidence",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7259",
+          "line": 142,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7308",
+          "line": 143,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7389",
+          "line": 145,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7439",
+          "line": 145,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7482",
+          "line": 146,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7528",
+          "line": 146,
+          "callee": "readLockOwnerEvidence",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7550",
+          "line": 146,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7603",
+          "line": 147,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c017",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/quarantineAndRemoveOwnedLock().",
+      "name": "quarantineAndRemoveOwnedLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 150,
+      "endLine": 155,
+      "distance": 2,
+      "source": "async function quarantineAndRemoveOwnedLock(runDir, lockDir, expectedIdentity) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) return;\n  const quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity);\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))) return;\n  await rm(quarantine, { recursive: true, force: true });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:7744",
+          "line": 151,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7794",
+          "line": 151,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7862",
+          "line": 152,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c036",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7933",
+          "line": 153,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7983",
+          "line": 153,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8035",
+          "line": 154,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c018",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockOwnerEntryExists().",
+      "name": "lockOwnerEntryExists",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 187,
+      "endLine": 195,
+      "distance": 2,
+      "source": "async function lockOwnerEntryExists(ownerPath) {\n  try {\n    await lstat(ownerPath);\n    return true;\n  } catch (error) {\n    if (error?.code === \"ENOENT\") return false;\n    return true;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:9966",
+          "line": 189,
+          "callee": "lstat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c019",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwner().",
+      "name": "sameLockOwner",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 207,
+      "endLine": 209,
+      "distance": 2,
+      "source": "function sameLockOwner(left, right) {\n  return isDurableLockOwner(left) && isDurableLockOwner(right) && left.nonce === right.nonce;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10499",
+          "line": 208,
+          "callee": "isDurableLockOwner",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10527",
+          "line": 208,
+          "callee": "isDurableLockOwner",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c020",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockDirectoryIdentity().",
+      "name": "lockDirectoryIdentity",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 218,
+      "endLine": 226,
+      "distance": 2,
+      "source": "async function lockDirectoryIdentity(lockDir) {\n  try {\n    const value = await lstat(lockDir);\n    if (!value.isDirectory() || value.isSymbolicLink()) return null;\n    return { dev: value.dev, ino: value.ino, mtimeMs: value.mtimeMs };\n  } catch {\n    return null;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10891",
+          "line": 220,
+          "callee": "lstat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10916",
+          "line": 221,
+          "callee": "value.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10939",
+          "line": 221,
+          "callee": "value.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c021",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockDirectoryIdentity().",
+      "name": "sameLockDirectoryIdentity",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 228,
+      "endLine": 230,
+      "distance": 2,
+      "source": "function sameLockDirectoryIdentity(left, right) {\n  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11142",
+          "line": 229,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c022",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/normalizePositiveInteger().",
+      "name": "normalizePositiveInteger",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 232,
+      "endLine": 236,
+      "distance": 2,
+      "source": "function normalizePositiveInteger(value, fallback) {\n  if (value === undefined || value === null) return fallback;\n  if (!Number.isInteger(value) || value <= 0) throw new Error(\"lock timing options must be positive integers\");\n  return value;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11343",
+          "line": 234,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:11388",
+          "line": 234,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c023",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/delay().",
+      "name": "delay",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 239,
+      "endLine": 241,
+      "distance": 2,
+      "source": "function delay(ms) {\n  return new Promise((resolve) => setTimeout(resolve, ms));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11546",
+          "line": 240,
+          "callee": "Promise",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": [
+            "c040"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c024",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/ownerlessLockIsReclaimable().",
+      "name": "ownerlessLockIsReclaimable",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 251,
+      "endLine": 261,
+      "distance": 2,
+      "source": "async function ownerlessLockIsReclaimable(lockDir, ownerPath, options = {}) {\n  if (await lockOwnerEntryExists(ownerPath)) return false;\n  const graceMs = normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);\n  try {\n    const observed = await stat(lockDir);\n    const ageMs = Date.now() - observed.mtimeMs;\n    return Number.isFinite(ageMs) && ageMs > graceMs;\n  } catch {\n    return false;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:12205",
+          "line": 252,
+          "callee": "lockOwnerEntryExists",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12270",
+          "line": 253,
+          "callee": "normalizePositiveInteger",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12392",
+          "line": 255,
+          "callee": "stat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12425",
+          "line": 256,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12467",
+          "line": 257,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c025",
+      "symbolId": "syntax:observe/index.js:4025:arrow_function",
+      "name": "<callback@76:48>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 76,
+      "endLine": 76,
+      "distance": 2,
+      "source": "  const entries = probe.stdout.split(\"\\n\").map((line) => line.trim()).filter(Boolean);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:4035",
+          "line": 76,
+          "callee": "line.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c026",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/fail.",
+      "name": "fail",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 20,
+      "endLine": 20,
+      "distance": 2,
+      "source": "const fail = (message) => { throw new Error(`repair state is invalid: ${message}`); };",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:1375",
+          "line": 20,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c027",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/canonicalFile().",
+      "name": "canonicalFile",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 28,
+      "endLine": 50,
+      "distance": 2,
+      "source": "function canonicalFile(path, label, { optional = false } = {}) {\n  let stats;\n  let bytes;\n  try {\n    stats = lstatSync(path);\n    if (!stats.isFile() || stats.isSymbolicLink()) fail(`${label} is not a regular non-symlink file`);\n    bytes = readFileSync(path);\n  } catch (error) {\n    if (optional && error?.code === \"ENOENT\") return null;\n    if (String(error.message).startsWith(\"repair state is invalid:\")) throw error;\n    fail(`${label} could not be read: ${error.message}`);\n  }\n  let text;\n  let value;\n  try {\n    text = new TextDecoder(\"utf-8\", { fatal: true }).decode(bytes);\n    value = JSON.parse(text);\n  } catch {\n    fail(`${label} is not canonical UTF-8 JSON`);\n  }\n  if (!bytes.equals(Buffer.from(`${JSON.stringify(value, null, 2)}\\n`, \"utf8\"))) fail(`${label} bytes are not canonical`);\n  return { bytes, value };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:2041",
+          "line": 32,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2067",
+          "line": 33,
+          "callee": "stats.isFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2085",
+          "line": 33,
+          "callee": "stats.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2109",
+          "line": 33,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2173",
+          "line": 34,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2280",
+          "line": 37,
+          "callee": "String(error.message).startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2280",
+          "line": 37,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2359",
+          "line": 38,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2461",
+          "line": 43,
+          "callee": "new TextDecoder(\"utf-8\", { fatal: true }).decode",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2461",
+          "line": 43,
+          "callee": "TextDecoder",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2530",
+          "line": 44,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2564",
+          "line": 46,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2621",
+          "line": 48,
+          "callee": "bytes.equals",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2634",
+          "line": 48,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2649",
+          "line": 48,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2695",
+          "line": 48,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c028",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateJournal().",
+      "name": "validateJournal",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 127,
+      "endLine": 151,
+      "distance": 2,
+      "source": "function validateJournal(value, run, repo) {\n  if (!sameKeys(value, JOURNAL_KEYS) || value.version !== 1 || !Array.isArray(value.records) || value.records.length === 0) {\n    fail(\"journal has the wrong version, key order, or shape\");\n  }\n  const records = value.records.map((row, index) => validateRecord(row, index, run));\n  const ids = new Set();\n  const chains = new Map();\n  let active = 0;\n  for (const row of records) {\n    if (ids.has(row.record_id)) fail(`duplicate record '${row.record_id}'`);\n    ids.add(row.record_id);\n    if ([\"planned\", \"committed\"].includes(row.status)) active += 1;\n    const chain = chains.get(row.introducing_merge) ?? [];\n    const prior = chain.at(-1);\n    if (row.attempt !== chain.length + 1) fail(`record '${row.record_id}' is not the next contiguous attempt`);\n    if (prior && (prior.status !== \"failed\" || row.starting_head !== prior.repair_commit)) {\n      fail(`record '${row.record_id}' does not validly follow the prior repair attempt`);\n    }\n    chain.push(row);\n    chains.set(row.introducing_merge, chain);\n    validateBindings(repo, row, run);\n  }\n  if (active > 1) fail(\"more than one repair record is active\");\n  return { records, chains };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:7621",
+          "line": 128,
+          "callee": "sameKeys",
+          "target": "c041",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7678",
+          "line": 128,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7744",
+          "line": 129,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7826",
+          "line": 131,
+          "callee": "value.records.map",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c044"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:7908",
+          "line": 132,
+          "callee": "Set",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7936",
+          "line": 133,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8004",
+          "line": 136,
+          "callee": "ids.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8028",
+          "line": 136,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8077",
+          "line": 137,
+          "callee": "ids.add",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8109",
+          "line": 138,
+          "callee": "[\"planned\", \"committed\"].includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8187",
+          "line": 139,
+          "callee": "chains.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8246",
+          "line": 140,
+          "callee": "chain.at",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8302",
+          "line": 141,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8471",
+          "line": 143,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8565",
+          "line": 145,
+          "callee": "chain.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8586",
+          "line": 146,
+          "callee": "chains.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8632",
+          "line": 147,
+          "callee": "validateBindings",
+          "target": "c043",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8688",
+          "line": 149,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c029",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateInventory().",
+      "name": "validateInventory",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 205,
+      "endLine": 252,
+      "distance": 2,
+      "source": "function validateInventory(runDir, runId, records) {\n  const rows = new Map(records.map((row) => [row.record_id, row]));\n  const histories = new Map();\n  const filename = /^repair-reverification\\.(repair-[0-9a-f]{40}-[1-9][0-9]*)\\.([1-9][0-9]*)(\\.started)?\\.json$/u;\n  for (const name of evidenceEntries(runDir)) {\n    const match = filename.exec(name);\n    if (!match) fail(`evidence entry '${name}' has a malformed repair re-verification name`);\n    const row = rows.get(match[1]);\n    const attempt = Number(match[2]);\n    if (!row || !positive(attempt) || !(row.status === \"needs-human\" && row.repair_commit !== null)) {\n      fail(`evidence entry '${name}' does not identify an eligible repair record`);\n    }\n    const history = histories.get(row.record_id) ?? { markers: new Map(), results: new Map(), names: [] };\n    const kind = match[3] ? \"markers\" : \"results\";\n    const parsed = canonicalFile(join(runDir, \"evidence\", name), `evidence '${name}'`).value;\n    if (history[kind].has(attempt)) fail(`evidence entry '${name}' duplicates an attempt`);\n    history[kind].set(attempt, parsed);\n    history.names.push(name);\n    histories.set(row.record_id, history)\n/* ... source excerpt omitted ... */\nee_clean;\n        if (qualifies) {\n          if (pass !== null) fail(`evidence for '${recordId}' contains a second pass`);\n          pass = attempt;\n        }\n      } else if (attempt !== attempts.at(-1)) fail(`evidence for '${recordId}' has a non-final marker-only attempt`);\n    }\n    if (pass !== null && (pass !== attempts.at(-1) || !history.results.has(pass))) fail(`evidence for '${recordId}' continues after its first pass`);\n    history.attempts = attempts.length;\n    history.tail = attempts.length > 0 && !history.results.has(attempts.at(-1));\n    history.pass = pass;\n    history.names.sort();\n  }\n  return histories;\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:11503",
+          "line": 206,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11511",
+          "line": 206,
+          "callee": "records.map",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c048"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:11576",
+          "line": 207,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11723",
+          "line": 209,
+          "callee": "evidenceEntries",
+          "target": "c047",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11768",
+          "line": 210,
+          "callee": "filename.exec",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11805",
+          "line": 211,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11899",
+          "line": 212,
+          "callee": "rows.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11939",
+          "line": 213,
+          "callee": "Number",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11974",
+          "line": 214,
+          "callee": "positive",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12066",
+          "line": 215,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12170",
+          "line": 217,
+          "callee": "histories.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12213",
+          "line": 217,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12233",
+          "line": 217,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12327",
+          "line": 219,
+          "callee": "canonicalFile",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12341",
+          "line": 219,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12410",
+          "line": 220,
+          "callee": "history[kind].has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12438",
+          "line": 220,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12498",
+          "line": 221,
+          "callee": "history[kind].set",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12538",
+          "line": 222,
+          "callee": "history.names.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12568",
+          "line": 223,
+          "callee": "histories.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12676",
+          "line": 226,
+          "callee": "rows.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12717",
+          "line": 227,
+          "callee": "[...history.markers.keys()].sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12721",
+          "line": 227,
+          "callee": "history.markers.keys",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12776",
+          "line": 228,
+          "callee": "attempts.some",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12834",
+          "line": 228,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12895",
+          "line": 229,
+          "callee": "[...history.results.keys()].some",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12899",
+          "line": 229,
+          "callee": "history.results.keys",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12973",
+          "line": 229,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13121",
+          "line": 232,
+          "callee": "history.markers.get",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13157",
+          "line": 233,
+          "callee": "validateMarker",
+          "target": "c045",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13279",
+          "line": 234,
+          "callee": "history.results.get",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13337",
+          "line": 236,
+          "callee": "validateResult",
+          "target": "c046",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13666",
+          "line": 240,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13790",
+          "line": 243,
+          "callee": "attempts.at",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13807",
+          "line": 243,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13920",
+          "line": 245,
+          "callee": "attempts.at",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13940",
+          "line": 245,
+          "callee": "history.results.has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13968",
+          "line": 245,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14118",
+          "line": 247,
+          "callee": "history.results.has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14138",
+          "line": 247,
+          "callee": "attempts.at",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14185",
+          "line": 249,
+          "callee": "history.names.sort",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c030",
+      "symbolId": "syntax:observe/repair-record.js:15492:arrow_function",
+      "name": "<callback@277:36>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 277,
+      "endLine": 277,
+      "distance": 2,
+      "source": "    const matches = records.filter((row) => row.record_id === recordId);",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c031",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/digest.",
+      "name": "digest",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 12,
+      "endLine": 12,
+      "distance": 2,
+      "source": "const digest = (value) => `sha256:${createHash(\"sha256\").update(JSON.stringify(value), \"utf8\").digest(\"hex\")}`;",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:562",
+          "line": 12,
+          "callee": "createHash(\"sha256\").update(JSON.stringify(value), \"utf8\").digest",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:562",
+          "line": 12,
+          "callee": "createHash(\"sha256\").update",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:562",
+          "line": 12,
+          "callee": "createHash",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:590",
+          "line": 12,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c032",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/sameNames.",
+      "name": "sameNames",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 13,
+      "endLine": 13,
+      "distance": 2,
+      "source": "const sameNames = (left, right) => JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:673",
+          "line": 13,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:688",
+          "line": 13,
+          "callee": "[...left].sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:710",
+          "line": 13,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:725",
+          "line": 13,
+          "callee": "[...right].sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c033",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/ensureEvidenceDirectory().",
+      "name": "ensureEvidenceDirectory",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 30,
+      "endLine": 39,
+      "distance": 2,
+      "source": "function ensureEvidenceDirectory(runDir) {\n  const path = join(runDir, \"evidence\");\n  try {\n    const stats = lstatSync(path);\n    if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error(\"repair evidence path is not a regular directory\");\n  } catch (error) {\n    if (error?.code !== \"ENOENT\") throw error;\n    mkdirSync(path, { mode: 0o700 });\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-reverification.js:1594",
+          "line": 31,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1646",
+          "line": 33,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1672",
+          "line": 34,
+          "callee": "stats.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1695",
+          "line": 34,
+          "callee": "stats.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1725",
+          "line": 34,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-reverification.js:1858",
+          "line": 37,
+          "callee": "mkdirSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c034",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-reverification.js`/evidenceNames().",
+      "name": "evidenceNames",
+      "kind": "function",
+      "path": "observe/repair-reverification.js",
+      "startLine": 41,
+      "endLine": 44,
+      "distance": 2,
+      "source": "function evidenceNames(recordId, attempt) {\n  const stem = `${REPAIR_EVIDENCE_PREFIX}${recordId}.${attempt}`;\n  return { marker: `evidence/${stem}.started.json`, result: `evidence/${stem}.json` };\n}",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c035",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`atomic-write.js`/writeProtectedFileAtomic().",
+      "name": "writeProtectedFileAtomic",
+      "kind": "function",
+      "path": "core/atomic-write.js",
+      "startLine": 22,
+      "endLine": 87,
+      "distance": 3,
+      "source": "export async function writeProtectedFileAtomic(rootDir, relativePath, data, options = {}) {\n  const targetPath = resolveProtectedPath(rootDir, relativePath);\n  const parentDir = resolve(targetPath, \"..\");\n  const createOnly = options.createOnly === true;\n  const rename = options.fsOps?.rename ?? fsRename;\n  const link = options.fsOps?.link ?? fsLink;\n  const beforeCommit = options.hooks?.beforeCommit;\n  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(String(data), \"utf8\");\n\n  await assertSafeTarget(targetPath, createOnly);\n\n  const tempPath = join(parentDir, `.${randomUUID()}.tmp`);\n  let handle = null;\n  let published = false;\n  try {\n    // \"wx\" is O_CREAT|O_EXCL|O_WRONLY: if the name exists, fail rather than adopt\n    // a file somebody else created.\n    handle = await open(tempPath, \"wx\", 0o600);\n    await handle.writeFile(bytes);\n    await handle.sync();\n    await handle.close();\n    handle = null;\n\n    if (createOnly) {\n      await assertSafeTarget(targetPath, true);\n      if (typeof beforeCommit === \"function\") await beforeCommit();\n      try { await link(tempPath, targetPath); } catch (error) {\n        if (error?.code === \"EEXIST\") thr\n/* ... source excerpt omitted ... */\nrue;\n    }\n  } catch (error) {\n    if (handle) {\n      try { await handle.close(); } catch { /* the original error is the one that matters */ }\n    }\n    if (!published) {\n      try {\n        await unlink(tempPath);\n      } catch (cleanupError) {\n        if (cleanupError?.code !== \"ENOENT\") {\n          throw new ProtectedWriteError(\"protected temporary file cleanup is indeterminate\", cleanupError);\n        }\n      }\n    }\n    throw error instanceof ProtectedWriteError\n      ? error\n      : new ProtectedWriteError(\"protected file commit failed\", error);\n  }\n\n  await syncDirectory(parentDir);\n  return { path: targetPath };\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/atomic-write.js:1303",
+          "line": 23,
+          "callee": "resolveProtectedPath",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1368",
+          "line": 24,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1611",
+          "line": 29,
+          "callee": "Buffer.isBuffer",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1642",
+          "line": 29,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1654",
+          "line": 29,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1686",
+          "line": 31,
+          "callee": "assertSafeTarget",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1748",
+          "line": 33,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1768",
+          "line": 33,
+          "callee": "randomUUID",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:1982",
+          "line": 39,
+          "callee": "open",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2021",
+          "line": 40,
+          "callee": "handle.writeFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2056",
+          "line": 41,
+          "callee": "handle.sync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2081",
+          "line": 42,
+          "callee": "handle.close",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2151",
+          "line": 46,
+          "callee": "assertSafeTarget",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2239",
+          "line": 47,
+          "callee": "beforeCommit",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2273",
+          "line": 48,
+          "callee": "link",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2363",
+          "line": 49,
+          "callee": "ProtectedWriteError",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2508",
+          "line": 53,
+          "callee": "unlink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2571",
+          "line": 54,
+          "callee": "unlink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2677",
+          "line": 56,
+          "callee": "ProtectedWriteError",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:2826",
+          "line": 59,
+          "callee": "ProtectedWriteError",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3012",
+          "line": 62,
+          "callee": "beforeCommit",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3040",
+          "line": 63,
+          "callee": "assertSafeTarget",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3089",
+          "line": 64,
+          "callee": "rename",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3205",
+          "line": 69,
+          "callee": "handle.close",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3336",
+          "line": 73,
+          "callee": "unlink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3448",
+          "line": 76,
+          "callee": "ProtectedWriteError",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3633",
+          "line": 82,
+          "callee": "ProtectedWriteError",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/atomic-write.js:3710",
+          "line": 85,
+          "callee": "syncDirectory",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c036",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/renameOwnedLockToQuarantine().",
+      "name": "renameOwnedLockToQuarantine",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 157,
+      "endLine": 169,
+      "distance": 3,
+      "source": "async function renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) {\n    // Coded so a *steal* can treat it as losing a race and retry. Release and cleanup check identity\n    // first, so for them it stays the error it is.\n    throw Object.assign(new Error(`run.json lock directory identity changed at ${lockDir}`), { code: \"ELOCKIDENTITY\" });\n  }\n  const quarantine = join(runDir, `.run-json.lock-quarantine-${randomUUID()}`);\n  await rename(lockDir, quarantine);\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))) {\n    throw new Error(`run.json lock quarantine identity changed at ${quarantine}`);\n  }\n  return quarantine;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:8175",
+          "line": 158,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8225",
+          "line": 158,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8424",
+          "line": 161,
+          "callee": "Object.assign",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8438",
+          "line": 161,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8560",
+          "line": 163,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8602",
+          "line": 163,
+          "callee": "randomUUID",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8627",
+          "line": 164,
+          "callee": "rename",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8663",
+          "line": 165,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8713",
+          "line": 165,
+          "callee": "lockDirectoryIdentity",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8761",
+          "line": 166,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c037",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/inspectLockOwnerLiveness().",
+      "name": "inspectLockOwnerLiveness",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 174,
+      "endLine": 185,
+      "distance": 3,
+      "source": "function inspectLockOwnerLiveness(owner, options = {}) {\n  if (!isDurableLockOwner(owner)) return \"indeterminate\";\n  // A lock taken on another host cannot be adjudicated from here at all.\n  if (owner.hostname !== hostname()) return \"indeterminate\";\n  const staleAfterMs = normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);\n  const heldForMs = Date.now() - Date.parse(owner.acquired_at);\n  if (!Number.isFinite(heldForMs)) return \"indeterminate\";\n  // A future `acquired_at` yields a negative age, which is never greater than the\n  // TTL, so clock skew already fails closed here. An explicit `heldForMs < 0`\n  // branch was removed after its falsification showed removing it changed nothing.\n  return heldForMs > staleAfterMs ? \"dead\" : \"alive\";\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:9194",
+          "line": 175,
+          "callee": "isDurableLockOwner",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9344",
+          "line": 177,
+          "callee": "hostname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9403",
+          "line": 178,
+          "callee": "normalizePositiveInteger",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9493",
+          "line": 179,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9506",
+          "line": 179,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9544",
+          "line": 180,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c038",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isDurableLockOwner().",
+      "name": "isDurableLockOwner",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 197,
+      "endLine": 205,
+      "distance": 3,
+      "source": "function isDurableLockOwner(owner) {\n  return isRecord(owner)\n    && Number.isInteger(owner.pid)\n    && owner.pid > 0\n    && stringValue(owner.hostname)\n    && Number.isFinite(Date.parse(owner.acquired_at || \"\"))\n    && typeof owner.nonce === \"string\"\n    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(owner.nonce);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10139",
+          "line": 198,
+          "callee": "isRecord",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10162",
+          "line": 199,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10218",
+          "line": 201,
+          "callee": "stringValue",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10253",
+          "line": 202,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10269",
+          "line": 202,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10352",
+          "line": 204,
+          "callee": "/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c039",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwnerEvidence().",
+      "name": "sameLockOwnerEvidence",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 211,
+      "endLine": 216,
+      "distance": 3,
+      "source": "function sameLockOwnerEvidence(left, right) {\n  return Boolean(left && right\n    && sameLockOwner(left.owner, right.owner)\n    && left.identity.dev === right.identity.dev\n    && left.identity.ino === right.identity.ino);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10642",
+          "line": 212,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10671",
+          "line": 213,
+          "callee": "sameLockOwner",
+          "target": "c019",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c040",
+      "symbolId": "syntax:core/run-lock.js:11558:arrow_function",
+      "name": "<callback@240:22>",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 240,
+      "endLine": 240,
+      "distance": 3,
+      "source": "  return new Promise((resolve) => setTimeout(resolve, ms));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11571",
+          "line": 240,
+          "callee": "setTimeout",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c041",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/sameKeys.",
+      "name": "sameKeys",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 21,
+      "endLine": 22,
+      "distance": 3,
+      "source": "const sameKeys = (value, keys) => value && typeof value === \"object\" && !Array.isArray(value)\n  && JSON.stringify(Object.keys(value)) === JSON.stringify(keys);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:1501",
+          "line": 21,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1527",
+          "line": 22,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1542",
+          "line": 22,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1566",
+          "line": 22,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c042",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/positive.",
+      "name": "positive",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 24,
+      "endLine": 24,
+      "distance": 3,
+      "source": "const positive = (value) => Number.isSafeInteger(value) && value > 0;",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:1696",
+          "line": 24,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c043",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateBindings().",
+      "name": "validateBindings",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 102,
+      "endLine": 125,
+      "distance": 3,
+      "source": "function validateBindings(repo, row, run) {\n  const slices = run.slices.filter((slice) => slice.status === \"merged\" && slice.merge_commit === row.introducing_merge);\n  if (slices.length !== 1) fail(`record '${row.record_id}' introducing merge does not identify exactly one merged slice`);\n  if (!git(repo, [\"merge-base\", \"--is-ancestor\", row.introducing_merge, row.starting_head]).ok) {\n    fail(`record '${row.record_id}' starting head does not descend from its introducing merge`);\n  }\n  if (row.repair_commit === null) return;\n  if (row.repair_commit === row.introducing_merge) fail(`record '${row.record_id}' repair commit equals its introducing merge`);\n  const parents = gitValue(repo, [\"rev-list\", \"--parents\", \"-n\", \"1\", row.repair_commit], `record '${row.record_id}' repair commit`)\n    .trim().split(/\\s+/u).slice(1);\n  if (parents.length !== 1 || parents[0] !== row.starting_head) fail(`record '${row.record_id}' repair commit has the wrong parent`);\n  const paths = gitValue(repo, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"--no-renames\", \"-z\", row.starting_head, row.repair_commit], `record '${row.record_id}' repair diff`)\n    .split(\"\\0\").filter(Boolean).sort();\n  if (paths.length === 0 || !equal(paths, row.test_paths)) fail(`record '${row.record_id}' repair diff does not equal test_paths`);\n  let config;\n  try {\n    config = parseRepositoryConfig(gitValue(repo, [\"show\", `${row.repair_commit}:.factory.json`], `record '${row.record_id}' committed config`));\n  } catch (error) {\n    fail(`record '${row.record_id}' committed config is invalid: ${error.message}`);\n  }\n  if (config.command !== row.trigger.command || config.timeoutMs !== row.trigger.timeout_ms) {\n    fail(`record '${row.record_id}' trigger does not match its committed config`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:5853",
+          "line": 103,
+          "callee": "run.slices.filter",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:5985",
+          "line": 104,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6088",
+          "line": 105,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6183",
+          "line": 106,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6373",
+          "line": 109,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6469",
+          "line": 110,
+          "callee": "gitValue(repo, [\"rev-list\", \"--parents\", \"-n\", \"1\", row.repair_commit], `record '${row.record_id}' repair commit`)\n    .trim().split(/\\s+/u).slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6469",
+          "line": 110,
+          "callee": "gitValue(repo, [\"rev-list\", \"--parents\", \"-n\", \"1\", row.repair_commit], `record '${row.record_id}' repair commit`)\n    .trim().split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6469",
+          "line": 110,
+          "callee": "gitValue(repo, [\"rev-list\", \"--parents\", \"-n\", \"1\", row.repair_commit], `record '${row.record_id}' repair commit`)\n    .trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6469",
+          "line": 110,
+          "callee": "gitValue",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6684",
+          "line": 112,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6770",
+          "line": 113,
+          "callee": "gitValue(repo, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"--no-renames\", \"-z\", row.starting_head, row.repair_commit], `record '${row.record_id}' repair diff`)\n    .split(\"\\0\").filter(Boolean).sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6770",
+          "line": 113,
+          "callee": "gitValue(repo, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"--no-renames\", \"-z\", row.starting_head, row.repair_commit], `record '${row.record_id}' repair diff`)\n    .split(\"\\0\").filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6770",
+          "line": 113,
+          "callee": "gitValue(repo, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"--no-renames\", \"-z\", row.starting_head, row.repair_commit], `record '${row.record_id}' repair diff`)\n    .split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6770",
+          "line": 113,
+          "callee": "gitValue",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7004",
+          "line": 115,
+          "callee": "equal",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7034",
+          "line": 115,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7142",
+          "line": 118,
+          "callee": "parseRepositoryConfig",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7164",
+          "line": 118,
+          "callee": "gitValue",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7299",
+          "line": 120,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7483",
+          "line": 123,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c044",
+      "symbolId": "syntax:observe/repair-record.js:7844:arrow_function",
+      "name": "<callback@131:37>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 131,
+      "endLine": 131,
+      "distance": 3,
+      "source": "  const records = value.records.map((row, index) => validateRecord(row, index, run));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:7860",
+          "line": 131,
+          "callee": "validateRecord",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c045",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateMarker().",
+      "name": "validateMarker",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 158,
+      "endLine": 167,
+      "distance": 3,
+      "source": "function validateMarker(value, row, runId, attempt, label) {\n  if (!sameKeys(value, MARKER_KEYS) || value.version !== 1 || value.run_id !== runId\n    || value.record_id !== row.record_id || value.attempt !== attempt\n    || !DIGEST.test(value.run_sha256) || !DIGEST.test(value.journal_sha256)\n    || value.record_sha256 !== digest(row) || value.introducing_merge !== row.introducing_merge\n    || value.repair_commit !== row.repair_commit || !equal(value.trigger, row.trigger)\n    || !sameKeys(value.trigger, [\"command\", \"timeout_ms\"]) || !canonicalTimestamp(value.started_at)) {\n    fail(`${label} has an invalid marker binding or schema`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:9024",
+          "line": 159,
+          "callee": "sameKeys",
+          "target": "c041",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9180",
+          "line": 161,
+          "callee": "DIGEST.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9214",
+          "line": 161,
+          "callee": "DIGEST.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9279",
+          "line": 162,
+          "callee": "digest",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9397",
+          "line": 163,
+          "callee": "equal",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9439",
+          "line": 164,
+          "callee": "sameKeys",
+          "target": "c041",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9494",
+          "line": 164,
+          "callee": "canonicalTimestamp",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9538",
+          "line": 165,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c046",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateResult().",
+      "name": "validateResult",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 176,
+      "endLine": 186,
+      "distance": 3,
+      "source": "function validateResult(value, marker, row, runId, attempt, label) {\n  if (!sameKeys(value, RESULT_KEYS) || value.version !== 1 || value.run_id !== runId\n    || value.record_id !== row.record_id || value.attempt !== attempt || value.marker_sha256 !== digest(marker)\n    || value.run_sha256 !== marker.run_sha256 || value.journal_sha256 !== marker.journal_sha256\n    || value.record_sha256 !== marker.record_sha256 || value.introducing_merge !== marker.introducing_merge\n    || value.repair_commit !== marker.repair_commit || !equal(value.trigger, marker.trigger)\n    || !sameKeys(value.trigger, [\"command\", \"timeout_ms\"]) || !validateExecutionResult(value.result)\n    || !canonicalTimestamp(value.observed_at) || value.observed_at !== marker.started_at || value.observed_by !== \"factory\") {\n    fail(`${label} has an invalid result binding or schema`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:10070",
+          "line": 177,
+          "callee": "sameKeys",
+          "target": "c041",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10245",
+          "line": 178,
+          "callee": "digest",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10520",
+          "line": 181,
+          "callee": "equal",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10565",
+          "line": 182,
+          "callee": "sameKeys",
+          "target": "c041",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10620",
+          "line": 182,
+          "callee": "validateExecutionResult",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10666",
+          "line": 183,
+          "callee": "canonicalTimestamp",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10789",
+          "line": 184,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c047",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/evidenceEntries().",
+      "name": "evidenceEntries",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 188,
+      "endLine": 203,
+      "distance": 3,
+      "source": "function evidenceEntries(runDir) {\n  const dir = join(runDir, \"evidence\");\n  let stats;\n  try {\n    stats = lstatSync(dir);\n  } catch (error) {\n    if (error?.code === \"ENOENT\") return [];\n    fail(`evidence directory could not be inspected: ${error.message}`);\n  }\n  if (!stats.isDirectory() || stats.isSymbolicLink()) fail(\"evidence path is not a regular directory\");\n  try {\n    return readdirSync(dir).filter((name) => name.toLowerCase().startsWith(REPAIR_EVIDENCE_PREFIX)).sort();\n  } catch (error) {\n    fail(`evidence directory could not be read: ${error.message}`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:10903",
+          "line": 189,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10962",
+          "line": 192,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11047",
+          "line": 195,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11127",
+          "line": 197,
+          "callee": "stats.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11150",
+          "line": 197,
+          "callee": "stats.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11174",
+          "line": 197,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11243",
+          "line": 199,
+          "callee": "readdirSync(dir).filter((name) => name.toLowerCase().startsWith(REPAIR_EVIDENCE_PREFIX)).sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11243",
+          "line": 199,
+          "callee": "readdirSync(dir).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11243",
+          "line": 199,
+          "callee": "readdirSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11364",
+          "line": 201,
+          "callee": "fail",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c048",
+      "symbolId": "syntax:observe/repair-record.js:11523:arrow_function",
+      "name": "<callback@206:36>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 206,
+      "endLine": 206,
+      "distance": 3,
+      "source": "  const rows = new Map(records.map((row) => [row.record_id, row]));",
+      "sourceTruncated": false,
+      "calls": []
+    }
+  ],
+  "scope": {
+    "eligibleCandidates": 100,
+    "includedCandidates": 48,
+    "omittedCandidates": 52,
+    "maxSourceChars": 1800,
+    "limitations": "Fixed candidate scope, truncated source excerpts, syntax-level source ordering. Callback references do not establish execution."
+  }
+}

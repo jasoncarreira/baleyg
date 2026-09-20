@@ -1,0 +1,128 @@
+{
+  "node": "v24.11.1",
+  "steps": [
+    {
+      "label": "feature-factory:index",
+      "args": [
+        "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+        "index",
+        "--cwd",
+        "inputs/feature-factory",
+        "--output",
+        "<historical-extraction-dir>/feature-factory.scip",
+        "--no-progress-bar"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 2637.0782910000003,
+      "stdout": "+ inputs/feature-factory (978ms)\ndone <historical-extraction-dir>/feature-factory.scip\n",
+      "stderr": ""
+    },
+    {
+      "label": "feature-factory:extract",
+      "args": [
+        "extract.mjs",
+        "inputs/feature-factory",
+        "feature-factory.scip",
+        "feature-factory.hashes.json",
+        "feature-factory.graph.json"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 3007.961792,
+      "stdout": "{\n  \"output\": \"feature-factory.graph.json\",\n  \"elapsedMs\": 2682.400917,\n  \"files\": 18,\n  \"nodes\": 372,\n  \"calls\": 2203,\n  \"internal\": 805,\n  \"external\": 816,\n  \"unresolved\": 269,\n  \"ambiguous\": 313,\n  \"parseErrors\": 0,\n  \"occurrences\": 12025,\n  \"referenceEnclosingRanges\": 0,\n  \"definitionEnclosingRanges\": 214,\n  \"semanticFresh\": true,\n  \"changedFiles\": []\n}\n",
+      "stderr": ""
+    },
+    {
+      "label": "fixture:index",
+      "args": [
+        "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+        "index",
+        "--cwd",
+        "fixture",
+        "--output",
+        "<historical-extraction-dir>/fixture.scip",
+        "--no-progress-bar"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 1203.592291,
+      "stdout": "+ fixture (22ms)\ndone <historical-extraction-dir>/fixture.scip\n",
+      "stderr": ""
+    },
+    {
+      "label": "fixture:extract",
+      "args": [
+        "extract.mjs",
+        "fixture",
+        "fixture.scip",
+        "fixture.hashes.json",
+        "fixture.graph.json"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 219.8351249999996,
+      "stdout": "{\n  \"output\": \"fixture.graph.json\",\n  \"elapsedMs\": 16.690292,\n  \"files\": 3,\n  \"nodes\": 13,\n  \"calls\": 12,\n  \"internal\": 11,\n  \"external\": 0,\n  \"unresolved\": 1,\n  \"ambiguous\": 0,\n  \"parseErrors\": 0,\n  \"occurrences\": 57,\n  \"referenceEnclosingRanges\": 0,\n  \"definitionEnclosingRanges\": 13,\n  \"semanticFresh\": true,\n  \"changedFiles\": []\n}\n",
+      "stderr": ""
+    },
+    {
+      "label": "edge-fixture:index",
+      "args": [
+        "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+        "index",
+        "--cwd",
+        "edge-fixture",
+        "--output",
+        "<historical-extraction-dir>/edge-fixture.scip",
+        "--no-progress-bar"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 770.5209170000007,
+      "stdout": "+ edge-fixture (16ms)\ndone <historical-extraction-dir>/edge-fixture.scip\n",
+      "stderr": ""
+    },
+    {
+      "label": "edge-fixture:extract",
+      "args": [
+        "extract.mjs",
+        "edge-fixture",
+        "edge-fixture.scip",
+        "edge-fixture.hashes.json",
+        "edge-fixture.graph.json"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 212.8500840000006,
+      "stdout": "{\n  \"output\": \"edge-fixture.graph.json\",\n  \"elapsedMs\": 15.400416,\n  \"files\": 1,\n  \"nodes\": 12,\n  \"calls\": 14,\n  \"internal\": 13,\n  \"external\": 0,\n  \"unresolved\": 1,\n  \"ambiguous\": 0,\n  \"parseErrors\": 0,\n  \"occurrences\": 35,\n  \"referenceEnclosingRanges\": 0,\n  \"definitionEnclosingRanges\": 9,\n  \"semanticFresh\": true,\n  \"changedFiles\": []\n}\n",
+      "stderr": ""
+    },
+    {
+      "label": "extraction:tests",
+      "args": [
+        "--test",
+        "extract.test.mjs"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 4297.156833,
+      "stdout": "✔ hand-labelled fixture: exact call counts and semantic targets (0.626708ms)\n✔ callback reference is symbol-resolved but is not a call (0.401667ms)\n✔ repeated call sites have unique identities and distinct ordinals (0.078417ms)\n✔ nested branch, else and loop regions remain distinguishable (0.134583ms)\n✔ same inputs produce byte-identical normalized graphs (3.149625ms)\n✔ input edit invalidates all SCIP resolutions; original index stays intact (9.449ms)\n✔ reference enclosing ranges cannot supply callers for this indexer (0.104167ms)\n✔ real imported cross-file calls resolve in feature-factory (2117.392042ms)\n✔ added, deleted, and configuration-changed inputs cannot retain a fresh index (22.435583ms)\n✔ accessors, computed keys, guarded arms, loop initialization and wrapped callbacks (1.665708ms)\n✔ real reindex preserves an exported symbol across body edits but not a rename (1641.213459ms)\nℹ tests 11\nℹ suites 0\nℹ pass 11\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 4086.597834\n",
+      "stderr": ""
+    },
+    {
+      "label": "lifecycle:tests",
+      "args": [
+        "--test",
+        "lifecycle.test.mjs"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 4108.4385,
+      "stdout": "(node:1243) ExperimentalWarning: SQLite is an experimental feature and might change at any time\n(Use `node --trace-warnings ...` to show where the warning was created)\n✔ WAL pinned snapshot survives whole-revision replacement (786.751958ms)\n✔ exception rolls back deleted and partially inserted rows (934.829791ms)\n✔ injected-cancellation rolls back deleted and partially inserted rows (772.808583ms)\n✔ deleted cache rebuilds identical canonical rows from the same graph (508.002584ms)\n✔ workspace annotation survives cache rebuild and becomes explicit orphan after target rename (475.564834ms)\nℹ tests 5\nℹ suites 0\nℹ pass 5\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 3923.200541\n",
+      "stderr": ""
+    },
+    {
+      "label": "viewer:smoke",
+      "args": [
+        "viewer-smoke.mjs"
+      ],
+      "exitCode": 0,
+      "elapsedMs": 197.03299999999945,
+      "stdout": "PASS: source walk order, callbacks, recursion, depth, regions, 60-message cap, safe text rendering\n",
+      "stderr": ""
+    }
+  ],
+  "publicationNote": "Publication copy: local absolute paths are replaced with labelled placeholders. This is not a verbatim capture or a new run. Byte-exact originals are retained in an ignored private archive; measured results and source hashes are unchanged."
+}

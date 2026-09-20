@@ -1,0 +1,235 @@
+{
+  "provider": "deterministic",
+  "questionId": "q10-executable-search",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "decisions": [
+    {
+      "candidateId": "c001",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c002",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c003",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c004",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c005",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c006",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c007",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c008",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c009",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c010",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c011",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c012",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c013",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c014",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c015",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c016",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c017",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c018",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c019",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c020",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c021",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c022",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c023",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c024",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c025",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c026",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c027",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c028",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c029",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c030",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c031",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c032",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c033",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c034",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c035",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c036",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c037",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c038",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c039",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c040",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c041",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c042",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c043",
+      "relevance": "incidental"
+    }
+  ],
+  "view": {
+    "questionId": "q10-executable-search",
+    "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+    "visible": [
+      "scip-typescript npm feature-factory 0.9.0 core/`executable.js`/resolveSpawnExecutable().",
+      "syntax:core/executable.js:1555:arrow_function"
+    ],
+    "collapsed": [
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/coversPath().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/gitPath()."
+    ],
+    "hidden": [
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/failure().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/execute().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/capture().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/argvSafe().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/configure().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/enforceEffectivePushTarget().",
+      "syntax:core/effective-push.js:2860:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/git().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeWorktree().",
+      "local:observe/index.js:local 16",
+      "syntax:observe/index.js:2858:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeCleanliness().",
+      "syntax:observe/index.js:4025:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/runBootstrap().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeTrackedCleanliness().",
+      "syntax:observe/index.js:5095:arrow_function",
+      "syntax:observe/index.js:5224:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeAncestry().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/runTests().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/deriveReviewReady().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/reconcileClaim().",
+      "local:observe/index.js:local 92",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/unownedPaths().",
+      "syntax:observe/index.js:9271:arrow_function",
+      "syntax:observe/index.js:9301:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/privilegedPaths().",
+      "syntax:observe/index.js:10517:arrow_function",
+      "syntax:observe/index.js:10552:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/buildEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/resolveWorktree().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/proveInitContainment().",
+      "syntax:observe/index.js:16650:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/exactDirectory().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/ensureDirectory().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/inspectComponents().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/assertWorktreeRelationship().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/within().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/summarize().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/evidenceRef."
+    ],
+    "seedForced": false,
+    "overDisplayBudget": false,
+    "edgePolicy": "Use only measured call edges; hidden intermediates never become direct edges. Callback links remain explicitly non-call links."
+  }
+}

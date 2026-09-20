@@ -1,0 +1,260 @@
+{
+  "provider": "deterministic",
+  "questionId": "q05-push-target",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "decisions": [
+    {
+      "candidateId": "c001",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c002",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c003",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c004",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c005",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c006",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c007",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c008",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c009",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c010",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c011",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c012",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c013",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c014",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c015",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c016",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c017",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c018",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c019",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c020",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c021",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c022",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c023",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c024",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c025",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c026",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c027",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c028",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c029",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c030",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c031",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c032",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c033",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c034",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c035",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c036",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c037",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c038",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c039",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c040",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c041",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c042",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c043",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c044",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c045",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c046",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c047",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c048",
+      "relevance": "incidental"
+    }
+  ],
+  "view": {
+    "questionId": "q05-push-target",
+    "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+    "visible": [
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/enforceEffectivePushTarget().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/failure().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/capture().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/argvSafe().",
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/configure().",
+      "syntax:core/effective-push.js:2860:arrow_function"
+    ],
+    "collapsed": [
+      "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/execute().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/bootstrapOutcome().",
+      "local:bin/factory.js:local 328"
+    ],
+    "hidden": [
+      "syntax:bin/factory.js:4515:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/CliError#`<constructor>`().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/run().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/parse().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/key.",
+      "syntax:bin/factory.js:6108:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/planDigest().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/assertExecutableTestPlan().",
+      "syntax:bin/factory.js:7401:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/presentedPlanDigest().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/briefDigestFor().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/planeInventory().",
+      "local:bin/factory.js:local 76",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/observedParkSnapshot().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/runDirFor().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/assertRunNotParked().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/assertFreshSessionOwner().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/sameSessionOwner().",
+      "syntax:bin/factory.js:15364:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/validatePathAdditions().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/integrationHead().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/requireIntegrationWorktree().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/branchPoint().",
+      "syntax:bin/factory.js:19694:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/writeObservedEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/canonicalRepositoryVerifyEvidence().",
+      "syntax:bin/factory.js:21142:arrow_function",
+      "syntax:bin/factory.js:22704:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/classifyRepositoryVerifyEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/repositoryVerifyRefusal().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/mergedPayload().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/repositoryVerifyUnknownRefusal().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/repositoryVerifyRetrySafety().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/runRepositoryVerifyAttempts().",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/verifyRecordedMerge().",
+      "syntax:bin/factory.js:29111:method_definition",
+      "local:bin/factory.js:local 330",
+      "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/apply0:",
+      "local:bin/factory.js:local 358"
+    ],
+    "seedForced": false,
+    "overDisplayBudget": false,
+    "edgePolicy": "Use only measured call edges; hidden intermediates never become direct edges. Callback links remain explicitly non-call links."
+  }
+}

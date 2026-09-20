@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "capUsd": 10,
+  "entries": [
+    {
+      "id": "jev-7c7da771-74a6-4589-90b3-c8d27805a6a7",
+      "provider": "jev",
+      "maxUsd": 0.1,
+      "state": "settled",
+      "createdAt": "2026-09-18T02:38:44.018Z",
+      "actualUsd": null,
+      "note": "Completed. Usage-derived estimated USD 0.0013702920000000002; retaining $0.10 reservation."
+    },
+    {
+      "id": "c27be415-83fb-4596-8fdb-1d4b7870beac",
+      "provider": "claude-acp",
+      "maxUsd": 2,
+      "state": "settled",
+      "createdAt": "2026-09-18T02:40:55.562Z",
+      "actualUsd": null,
+      "note": "No verified completed-turn USD report; retain full reservation"
+    },
+    {
+      "id": "ff8b93a2-9381-4c56-ac97-52a43be4bec7",
+      "provider": "claude-acp",
+      "maxUsd": 5,
+      "state": "settled",
+      "createdAt": "2026-09-18T02:45:17.327Z",
+      "actualUsd": 1.532102,
+      "note": "Completed ACP turn reported cumulative USD estimate (not invoiced cost)"
+    },
+    {
+      "id": "jev-3d214f58-6cf9-479f-8f09-ea8eec0b519c",
+      "provider": "jev",
+      "maxUsd": 0.1,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:09:03.508Z",
+      "actualUsd": null,
+      "note": "Failed or timed out; no retries; full reservation retained."
+    },
+    {
+      "id": "8e9e7b15-7c3d-4301-8db7-32a3bea914b8",
+      "provider": "claude-acp",
+      "maxUsd": 2,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:09:18.805Z",
+      "actualUsd": null,
+      "note": "No verified completed-turn USD report; retain full reservation"
+    },
+    {
+      "id": "jev-b4029a50-a253-4b1e-b88f-02582b715a01",
+      "provider": "jev",
+      "maxUsd": 0.1,
+      "state": "settled",
+      "createdAt": "2026-09-18T03:09:49.155Z",
+      "actualUsd": null,
+      "note": "Completed. Usage-derived estimated USD 0.00099981; retaining $0.10 reservation."
+    }
+  ]
+}

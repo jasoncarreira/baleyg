@@ -1,0 +1,486 @@
+{
+  "schemaVersion": 1,
+  "provider": "claude-acp",
+  "reservationId": "10e678ab-c6bc-48d7-827d-fe53bbfdbb27",
+  "packetHash": "2d13a8b6cafb7f8406b7b9f3c721923972db01542fe3db9301dbec3a4aa47ca2",
+  "providerPacketHash": "63c0c895fb667b7543b13732f049ede59ace473c9e6623651585780ad83b48c8",
+  "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "questionId": "q03-lock-reclaim",
+  "requestedModel": "opus[1m]",
+  "packetBytes": 93256,
+  "providerPacketBytes": 46051,
+  "limits": {
+    "reserveUsd": 2.95,
+    "maxBudgetUsd": 2.5,
+    "maxTurns": 4,
+    "maxOutputTokens": 4096,
+    "timeoutMs": 120000
+  },
+  "costNote": "Provider-reported token-equivalent USD estimate, not actual subscription cash charge; unknown/failed cost retains the full reservation. Not an invoice guarantee.",
+  "negotiated": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "@agentclientprotocol/claude-agent-acp",
+      "title": "Claude Agent",
+      "version": "0.79.0"
+    },
+    "agentCapabilities": {
+      "_meta": {
+        "claudeCode": {
+          "promptQueueing": true
+        },
+        "authStatus": {}
+      },
+      "promptCapabilities": {
+        "image": true,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "auth": {
+        "logout": {}
+      },
+      "providers": {},
+      "loadSession": true,
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "list": {},
+        "resume": {},
+        "subagents": {}
+      }
+    }
+  },
+  "models": null,
+  "configOptions": [
+    {
+      "id": "mode",
+      "name": "Mode",
+      "description": "Session permission mode",
+      "category": "mode",
+      "type": "select",
+      "currentValue": "default",
+      "options": [
+        {
+          "value": "default",
+          "name": "Manual",
+          "description": "Always ask before making changes",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "acceptEdits",
+          "name": "Accept edits",
+          "description": "Automatically accept all file edits",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "plan",
+          "name": "Plan",
+          "description": "Create a plan before making changes",
+          "_meta": {
+            "kind": "plan"
+          }
+        },
+        {
+          "value": "auto",
+          "name": "Auto",
+          "description": "Claude handles permission decisions",
+          "_meta": {
+            "kind": "auto_review"
+          }
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "name": "Model",
+      "description": "AI model to use",
+      "category": "model",
+      "type": "select",
+      "currentValue": "opus[1m]",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default (recommended)",
+          "description": "Opus (1M context)"
+        },
+        {
+          "value": "opus[1m]",
+          "name": "Opus 5",
+          "description": "Opus 5 with 1M context · Best for everyday, complex tasks"
+        },
+        {
+          "value": "claude-fable-5-1[1m]",
+          "name": "Fable 5.1",
+          "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks"
+        },
+        {
+          "value": "sonnet",
+          "name": "Sonnet 5",
+          "description": "Sonnet 5 · Efficient for routine tasks"
+        },
+        {
+          "value": "haiku",
+          "name": "Haiku 4.5",
+          "description": "Haiku 4.5 · Fastest for quick answers"
+        }
+      ]
+    },
+    {
+      "id": "effort",
+      "name": "Effort",
+      "description": "Available effort levels for this model",
+      "category": "thought_level",
+      "type": "select",
+      "currentValue": "low",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default"
+        },
+        {
+          "value": "low",
+          "name": "Low"
+        },
+        {
+          "value": "medium",
+          "name": "Medium"
+        },
+        {
+          "value": "high",
+          "name": "High"
+        },
+        {
+          "value": "xhigh",
+          "name": "Xhigh"
+        },
+        {
+          "value": "max",
+          "name": "Max"
+        }
+      ]
+    },
+    {
+      "id": "fast",
+      "name": "Fast mode",
+      "description": "Faster responses on supported models",
+      "category": "model_config",
+      "type": "select",
+      "currentValue": "off",
+      "options": [
+        {
+          "value": "on",
+          "name": "On"
+        },
+        {
+          "value": "off",
+          "name": "Off"
+        }
+      ]
+    }
+  ],
+  "currentModelId": "opus[1m]",
+  "stopReason": "end_turn",
+  "usage": {
+    "inputTokens": 6,
+    "outputTokens": 947,
+    "cachedReadTokens": 93634,
+    "cachedWriteTokens": 139380,
+    "totalTokens": 233967
+  },
+  "decisions": [
+    {
+      "candidateId": "c001",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c002",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c003",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c004",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c005",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c006",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c007",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c008",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c009",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c010",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c011",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c012",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c013",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c014",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c015",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c016",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c017",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c018",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c019",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c020",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c021",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c022",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c023",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c024",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c025",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c026",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c027",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c028",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c029",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c030",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c031",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c032",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c033",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c034",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c035",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c036",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c037",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c038",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c039",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c040",
+      "relevance": "incidental"
+    }
+  ],
+  "view": {
+    "questionId": "q03-lock-reclaim",
+    "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+    "visible": [
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/withRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/canStealRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/ownerlessLockIsReclaimable().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/inspectLockOwnerLiveness()."
+    ],
+    "collapsed": [
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/readLockOwnerEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stealByRename().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockOwnerEntryExists().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isDurableLockOwner().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/coordinateRunJsonTransition().",
+      "syntax:core/write-core.js:814:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/claimSessionLock()."
+    ],
+    "hidden": [
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/releaseOwnedRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/quarantineAndRemoveOwnedLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwner().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockDirectoryIdentity().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockDirectoryIdentity().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/normalizePositiveInteger().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/delay().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/renameOwnedLockToQuarantine().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwnerEvidence().",
+      "syntax:core/run-lock.js:11558:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isRecord().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stringValue().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/rename0:",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/assertUnchanged().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/readRunState().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/contractRegistry().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/participantRegistry().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/projectAll().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/deepFreeze().",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/SessionLockHeldError#`<constructor>`().",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/readSessionLock().",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/inspectSessionLock().",
+      "syntax:state/session-lock.js:2481:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/refreshSessionLock().",
+      "syntax:state/session-lock.js:3415:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/releaseSessionLock().",
+      "syntax:state/session-lock.js:3987:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/isValidLock().",
+      "syntax:state/session-lock.js:4457:arrow_function"
+    ],
+    "seedForced": false,
+    "overDisplayBudget": false,
+    "edgePolicy": "Use only measured call edges; hidden intermediates never become direct edges. Callback links remain explicitly non-call links."
+  },
+  "status": "ok",
+  "phaseTimingsMs": {
+    "launch": 7,
+    "initialize": 298,
+    "session": 596,
+    "model_selection": 6,
+    "prompt": 11241,
+    "validation": 0,
+    "cleanup": 303
+  },
+  "toolCallAudit": {
+    "count": 2,
+    "names": [
+      "mcp__selection__get_candidates",
+      "mcp__selection__emit_view"
+    ]
+  },
+  "latencyMs": 12452,
+  "permissionsDenied": 0,
+  "permissionAudit": [],
+  "auth": {
+    "kind": "account",
+    "plan": "team"
+  },
+  "usageUpdates": [
+    {
+      "used": 4862,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 4873,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 88830,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 89694,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 139384,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 139400,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 139400,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 139400,
+      "size": 1000000,
+      "cost": {
+        "amount": 1.465585,
+        "currency": "USD"
+      }
+    }
+  ],
+  "reportedEstimatedUsd": 1.465585,
+  "settledUsd": 1.465585
+}

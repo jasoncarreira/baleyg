@@ -1,0 +1,263 @@
+{
+  "schemaVersion": 1,
+  "provider": "claude-acp",
+  "reservationId": "8e9e7b15-7c3d-4301-8db7-32a3bea914b8",
+  "packetHash": "9e5e391b8920925db3e9ce868e13f41ea2341fd67e6e169243f3f3b25265b95b",
+  "providerPacketHash": "3da07a7f572af9c2822329749856d8a1183784786181384032d8a79fb7a2bb00",
+  "instructionsHash": "62ed21bc46f8c7e8ed3a616314133e1e3e1a36959435a88260730f3d770ccdc8",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "questionId": "q02-atomic-branches",
+  "requestedModel": "opus[1m]",
+  "packetBytes": 93989,
+  "providerPacketBytes": 46911,
+  "limits": {
+    "reserveUsd": 2,
+    "maxBudgetUsd": 1,
+    "maxTurns": 4,
+    "maxOutputTokens": 4096,
+    "timeoutMs": 120000
+  },
+  "costNote": "Provider-reported token-equivalent USD estimate, not actual subscription cash charge; unknown/failed cost retains the full reservation. Not an invoice guarantee.",
+  "negotiated": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "@agentclientprotocol/claude-agent-acp",
+      "title": "Claude Agent",
+      "version": "0.79.0"
+    },
+    "agentCapabilities": {
+      "_meta": {
+        "claudeCode": {
+          "promptQueueing": true
+        },
+        "authStatus": {}
+      },
+      "promptCapabilities": {
+        "image": true,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "auth": {
+        "logout": {}
+      },
+      "providers": {},
+      "loadSession": true,
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "list": {},
+        "resume": {},
+        "subagents": {}
+      }
+    }
+  },
+  "models": null,
+  "configOptions": [
+    {
+      "id": "mode",
+      "name": "Mode",
+      "description": "Session permission mode",
+      "category": "mode",
+      "type": "select",
+      "currentValue": "default",
+      "options": [
+        {
+          "value": "default",
+          "name": "Manual",
+          "description": "Always ask before making changes",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "acceptEdits",
+          "name": "Accept edits",
+          "description": "Automatically accept all file edits",
+          "_meta": {
+            "kind": "standard"
+          }
+        },
+        {
+          "value": "plan",
+          "name": "Plan",
+          "description": "Create a plan before making changes",
+          "_meta": {
+            "kind": "plan"
+          }
+        },
+        {
+          "value": "auto",
+          "name": "Auto",
+          "description": "Claude handles permission decisions",
+          "_meta": {
+            "kind": "auto_review"
+          }
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "name": "Model",
+      "description": "AI model to use",
+      "category": "model",
+      "type": "select",
+      "currentValue": "opus[1m]",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default (recommended)",
+          "description": "Opus (1M context)"
+        },
+        {
+          "value": "opus[1m]",
+          "name": "Opus 5",
+          "description": "Opus 5 with 1M context · Best for everyday, complex tasks"
+        },
+        {
+          "value": "claude-fable-5-1[1m]",
+          "name": "Fable 5.1",
+          "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks"
+        },
+        {
+          "value": "sonnet",
+          "name": "Sonnet 5",
+          "description": "Sonnet 5 · Efficient for routine tasks"
+        },
+        {
+          "value": "haiku",
+          "name": "Haiku 4.5",
+          "description": "Haiku 4.5 · Fastest for quick answers"
+        }
+      ]
+    },
+    {
+      "id": "effort",
+      "name": "Effort",
+      "description": "Available effort levels for this model",
+      "category": "thought_level",
+      "type": "select",
+      "currentValue": "low",
+      "options": [
+        {
+          "value": "default",
+          "name": "Default"
+        },
+        {
+          "value": "low",
+          "name": "Low"
+        },
+        {
+          "value": "medium",
+          "name": "Medium"
+        },
+        {
+          "value": "high",
+          "name": "High"
+        },
+        {
+          "value": "xhigh",
+          "name": "Xhigh"
+        },
+        {
+          "value": "max",
+          "name": "Max"
+        }
+      ]
+    },
+    {
+      "id": "fast",
+      "name": "Fast mode",
+      "description": "Faster responses on supported models",
+      "category": "model_config",
+      "type": "select",
+      "currentValue": "off",
+      "options": [
+        {
+          "value": "on",
+          "name": "On"
+        },
+        {
+          "value": "off",
+          "name": "Off"
+        }
+      ]
+    }
+  ],
+  "currentModelId": "opus[1m]",
+  "status": "failed",
+  "errorEvidence": {
+    "category": "prompt_failed",
+    "code": -32603,
+    "stage": "prompt"
+  },
+  "error": "ACP smoke failed during prompt; see redacted local diagnostics. No retry was attempted.",
+  "phaseTimingsMs": {
+    "launch": 6,
+    "initialize": 314,
+    "session": 683,
+    "model_selection": 7,
+    "prompt": 20670,
+    "cleanup": 303
+  },
+  "toolCallAudit": {
+    "count": 2,
+    "names": [
+      "mcp__selection__get_candidates",
+      "mcp__selection__emit_view"
+    ]
+  },
+  "latencyMs": 21983,
+  "permissionsDenied": 0,
+  "permissionAudit": [],
+  "auth": {
+    "kind": "account",
+    "plan": "team"
+  },
+  "usageUpdates": [
+    {
+      "used": 4806,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 4815,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 66121,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 66885,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 139441,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 139732,
+      "size": 1000000,
+      "cost": null
+    },
+    {
+      "used": 139732,
+      "size": 1000000,
+      "cost": {
+        "amount": 1.4453295,
+        "currency": "USD"
+      }
+    }
+  ],
+  "reportedEstimatedUsd": 1.4453295,
+  "settledUsd": null
+}

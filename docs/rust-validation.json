@@ -1,0 +1,46 @@
+{
+  "rustTestsPassed": 172,
+  "uiTestsPassed": 104,
+  "rustBehaviorTests": 19,
+  "rustIndexerTests": 4,
+  "rustCachedHttpTests": 1,
+  "fmtPassed": true,
+  "clippyPassed": true,
+  "remoteCiRun": false,
+  "revision": 3,
+  "stats": {
+    "files": 74,
+    "symbols": 2158,
+    "calls": 11176,
+    "regions": 2209,
+    "internal": 0,
+    "external": 0,
+    "unresolved": 11176,
+    "ambiguous": 0,
+    "parseErrorFiles": 0,
+    "semanticState": "unavailable",
+    "changedFiles": []
+  },
+  "rustFiles": 39,
+  "javascriptFiles": 35,
+  "browser": {
+    "path": "src/auth.rs",
+    "methods": [
+      "valid_token",
+      "load_or_create_token"
+    ],
+    "sourceHighlightVerified": true,
+    "largerMethodSteps": 69,
+    "desktopWidth": 1440,
+    "mobileWidth": 390,
+    "noPageOverflow": true
+  },
+  "providerCalls": 0,
+  "savedDataPreserved": true,
+  "limitations": [
+    "Rust syntax only: no type/trait/semantic dispatch resolution",
+    "Macros and cfg not expanded/evaluated",
+    "Implicit Drop/coercion/panic paths not expanded",
+    "Complex constructs are explicit source-linked boundaries"
+  ]
+}

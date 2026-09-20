@@ -1,0 +1,556 @@
+/* Cached syntax only. No source or provider request occurs on selection. */
+(function () {
+  "use strict";
+  const MAX_NODES = 24, MAX_EDGES = 64, MAX_EXPANDED = 12;
+  const WIDTH = 300, HEIGHT = 116, OPEN_HEIGHT = 390, STEP_X = 520;
+  let api, ui, serial = 0, searchSerial = 0, seed = null, expanded = [], diagram = null;
+  let positions = new Map(), cards = new Map(), stage = null, menu = null, menuAnchor = null, warningBox = null;
+  let menuContext = null, menuExpanded = null, menuOnClose = null, menuScroll = new Map();
+  let bound = false, snapshot = null, diagramGeneration = 0, displayTicket = 0;
+  let controls, changeButton, allButton, chooser = null, showAll = false, membersOpen = new Set();
+  const currentView = () => snapshot && valid(snapshot) && displayTicket === serial;
+  function closeChooser() { if (chooser) chooser.remove(); chooser = null; }
+  const hierarchyEdge = edge => edge.kind === "extends" || edge.kind === "implements";
+  function selectedHierarchy(data) {
+    const actual = new Set(data.nodes.slice(0, MAX_NODES).filter(node => node.class).map(node => node.id));
+    const roots = [seed, ...expanded].filter(id => actual.has(id));
+    const edges = data.edges.slice(0, MAX_EDGES).filter(edge => hierarchyEdge(edge) && actual.has(edge.owner) && actual.has(edge.target));
+    // Walk ancestors and descendants separately from the explicit roots. An ancestor's
+    // other subtypes are not descendants of the focus. Hints never bridge actual classes.
+    const walk = (from, to) => {
+      const reached = new Set(roots);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const edge of edges) if (reached.has(edge[from]) && !reached.has(edge[to])) {
+          reached.add(edge[to]); changed = true;
+        }
+      }
+      return reached;
+    };
+    return new Set([...walk("owner", "target"), ...walk("target", "owner")]);
+  }
+  function visibleNodes(data) {
+    const selected = selectedHierarchy(data);
+    return data.nodes.slice(0, MAX_NODES).filter(node => showAll || selected.has(node.id) ||
+      (!node.class && ui.unmatched.checked && data.edges.slice(0, MAX_EDGES).some(edge =>
+        (edge.target === node.id && selected.has(edge.owner)) || (edge.owner === node.id && selected.has(edge.target)))));
+  }
+  function shownEdges(data, ids) {
+    const hints = new Set(data.nodes.slice(0, MAX_NODES).filter(node => !node.class).map(node => node.id));
+    return data.edges.slice(0, MAX_EDGES).filter(edge => ids.has(edge.owner) && ids.has(edge.target) &&
+      (showAll || hierarchyEdge(edge) || expanded.includes(edge.owner) || expanded.includes(edge.target) ||
+        (ui.unmatched.checked && (hints.has(edge.owner) || hints.has(edge.target)))));
+  }
+  function updateStatus() {
+    const nodes = visibleNodes(diagram), ids = new Set(nodes.map(node => node.id));
+    const count = shownEdges(diagram, ids).length;
+    const partial = diagram.truncated || diagram.nodes.length > MAX_NODES || diagram.edges.length > MAX_EDGES;
+    state(`${nodes.length} shown · ${count} relationships.${partial ? " Partial diagram; some index or diagram details are omitted. See notices." : ""}${diagram.requireIndex ? " Index workspace to populate class declarations." : ""}`, diagram.requireIndex ? "unindexed" : partial ? "partial" : "ready");
+    controls.hidden = false;
+    allButton.textContent = showAll ? "Show hierarchy and selected classes" : "Show all returned classes";
+    allButton.setAttribute("aria-pressed", String(showAll));
+  }
+  function showRelated(node) {
+    closeChooser();
+    const c = snapshot, generation = diagramGeneration;
+    const usable = () => valid(c) && generation === diagramGeneration && displayTicket === serial;
+    const automatic = selectedHierarchy(diagram);
+    const candidates = diagram.nodes.slice(0, MAX_NODES).filter(item => item.class && item.id !== node.id && !automatic.has(item.id) &&
+      diagram.edges.slice(0, MAX_EDGES).some(edge => (edge.owner === node.id && edge.target === item.id) || (edge.target === node.id && edge.owner === item.id)));
+    chooser = el("section", undefined, "classes-chooser");
+    chooser.setAttribute("aria-label", `Related classes for ${node.class.symbol.name}`);
+    chooser.append(el("h3", `Related to ${node.class.symbol.name}`));
+    chooser.append(el("p", "Indexed hierarchy is already shown. Choose other related classes to add.", "classes-choice-note"));
+    const needsAnchor = !automatic.has(node.id);
+    if (needsAnchor) {
+      candidates.unshift(node);
+      chooser.append(el("p", `Include ${node.class.symbol.name} to keep new classes connected to your selection.`));
+    }
+    const choices = [];
+    for (const candidate of candidates) {
+      const label = el("label", undefined, "classes-choice"), check = el("input"); check.type = "checkbox";
+      check.value = candidate.id;
+      if (needsAnchor && candidate.id === node.id) check.checked = true;
+      const relations = diagram.edges.slice(0, MAX_EDGES).filter(edge => candidate.id === node.id
+        ? (edge.owner === node.id && automatic.has(edge.target)) || (edge.target === node.id && automatic.has(edge.owner))
+        : (edge.owner === node.id && edge.target === candidate.id) || (edge.target === node.id && edge.owner === candidate.id));
+      const directions = [...new Set(relations.map(edge => `${edge.owner === node.id ? "outgoing" : "incoming"} ${edge.kind}`))].join(" / ");
+      const info = el("span");
+      info.append(el("strong", candidate.class.symbol.name), el("span", `${directions} · ${candidate.class.qualifiedName || candidate.label} · ${candidate.class.symbol.path}`, "classes-choice-identity"));
+      label.append(check, info); chooser.append(label); choices.push(check);
+    }
+    if (!choices.length) chooser.append(el("p", "No more related classes in this bounded result."));
+    const note = el("p", `Choose up to ${MAX_EXPANDED - expanded.length} classes. Their indexed hierarchy is shown automatically.`, "classes-choice-note");
+    const add = el("button", "Add selected classes"), cancel = el("button", "Cancel");
+    add.type = cancel.type = "button"; add.disabled = true;
+    const refresh = () => {
+      const count = choices.filter(check => check.checked).length;
+      add.disabled = !count || count + expanded.length > MAX_EXPANDED || (needsAnchor && !choices[0].checked);
+      note.textContent = count + expanded.length > MAX_EXPANDED ? `Choose at most ${MAX_EXPANDED - expanded.length} classes.` : `Choose up to ${MAX_EXPANDED - expanded.length} classes. Their indexed hierarchy is shown automatically.`;
+    };
+    for (const check of choices) check.addEventListener("change", refresh);
+    refresh();
+    add.addEventListener("click", () => {
+      if (!usable()) return;
+      const ids = choices.filter(check => check.checked).map(check => check.value);
+      if (!ids.length || ids.length + expanded.length > MAX_EXPANDED || (needsAnchor && !ids.includes(node.id))) return;
+      return loadDiagram(seed, [...expanded, ...ids], false, node.id);
+    });
+    const dismiss = () => { closeChooser(); const anchor = cards.get(node.id); if (anchor) anchor.focus({preventScroll: true}); };
+    cancel.addEventListener("click", dismiss);
+    chooser.addEventListener("keydown", event => { if (event.key === "Escape") { event.preventDefault(); dismiss(); } });
+    chooser.append(note, add, cancel); ui.diagram.before(chooser);
+    (choices[0] || cancel).focus({preventScroll: true});
+  }
+  const el = (tag, text, cls) => {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    if (cls) node.className = cls;
+    return node;
+  };
+  const svg = (tag, attrs, text) => {
+    const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const context = () => ({session: api.currentSession(), revision: api.currentRevision()});
+  const valid = c => !!api && c.session === api.currentSession() && c.revision === api.currentRevision();
+  const state = (text, kind = "ready") => { ui.state.textContent = text; ui.state.dataset.state = kind; };
+  function renderWarnings(warnings = []) {
+    if (!warningBox) {
+      warningBox = el("details", undefined, "classes-warnings");
+      ui.diagram.before(warningBox);
+    }
+    warningBox.replaceChildren(); warningBox.open = false; warningBox.hidden = !warnings.length;
+    if (!warnings.length) return;
+    warningBox.append(el("summary", `${warnings.length} indexing / diagram ${warnings.length === 1 ? "notice" : "notices"}`));
+    const list = el("ul");
+    for (const warning of warnings.slice(0, 50)) {
+      const message = String(warning);
+      list.append(el("li", message.length > 2000 ? message.slice(0, 2000) + "… (notice shortened)" : message));
+    }
+    if (warnings.length > 50) list.append(el("li", `${warnings.length - 50} more notices omitted from this summary.`));
+    warningBox.append(list);
+  }
+  function closeContextMenu(restore = true, reason = "dismiss") {
+    const closing = menu, anchor = menuAnchor, expanded = menuExpanded, onClose = menuOnClose;
+    // Clear ownership before DOM, callbacks or focus can re-enter dismissal.
+    menu = menuAnchor = menuContext = menuOnClose = null; menuExpanded = null; menuScroll.clear();
+    if (closing) closing.remove();
+    if (anchor) anchor.setAttribute("aria-expanded", expanded ?? "false");
+    if (onClose) onClose(reason);
+    if (restore && !menu && anchor && anchor.isConnected) anchor.focus({preventScroll: true});
+  }
+  async function invoke(run, c) {
+    if (!valid(c)) { closeContextMenu(false); return; }
+    try { await run(); }
+    catch (error) { if (valid(c) && error.name !== "AbortError") state(error.message || "Action unavailable.", "error"); }
+  }
+  // Public menu actions: [{label: string, run: () => void|Promise, disabled?: boolean}].
+  // The event's currentTarget is the focus-return anchor. Root must reset on session/revision changes.
+  // Optional onClose(reason): "dismiss", "replace" or "action"; called once.
+  // The returned handle can dismiss only the menu created by this call.
+  function showContextMenu(event, actions, options = {}) {
+    event.preventDefault(); event.stopPropagation();
+    closeContextMenu(false, "replace");
+    menuAnchor = event.currentTarget || event.target || document.activeElement;
+    menuExpanded = menuAnchor.getAttribute("aria-expanded");
+    // A queued scroll event from bringing the trigger into view must not close
+    // the newly opened menu. Actual subsequent scrolling still dismisses it.
+    for (let ancestor = menuAnchor, depth = 0; ancestor && depth < 64; ancestor = ancestor.parentNode, depth++) {
+      if (typeof ancestor.scrollTop === "number" && typeof ancestor.scrollLeft === "number") {
+        menuScroll.set(ancestor, [ancestor.scrollTop, ancestor.scrollLeft]);
+      }
+    }
+    menuContext = context();
+    const c = menuContext;
+    menu = el("div", undefined, "classes-context-menu");
+    const createdMenu = menu;
+    menuOnClose = typeof options.onClose === "function" ? options.onClose : null;
+    menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", "Class actions");
+    menuAnchor.setAttribute("aria-expanded", "true");
+    const buttons = [];
+    for (const action of actions) {
+      const item = el("button", action.label);
+      item.type = "button"; item.setAttribute("role", "menuitem"); item.tabIndex = -1;
+      item.disabled = !!action.disabled;
+      item.addEventListener("click", () => {
+        if (menu !== createdMenu) return;
+        closeContextMenu(true, "action"); return invoke(action.run, c);
+      });
+      menu.append(item); if (!item.disabled) buttons.push(item);
+    }
+    menu.addEventListener("keydown", event => {
+      if (menu !== createdMenu) return;
+      if (!valid(c)) { closeContextMenu(false); return; }
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeContextMenu(); return; }
+      if (event.key === "Tab") { closeContextMenu(); return; }
+      const index = buttons.indexOf(document.activeElement);
+      let next;
+      if (event.key === "ArrowDown") next = (index + 1) % buttons.length;
+      if (event.key === "ArrowUp") next = (index - 1 + buttons.length) % buttons.length;
+      if (event.key === "Home") next = 0;
+      if (event.key === "End") next = buttons.length - 1;
+      if (next !== undefined && buttons[next]) { event.preventDefault(); event.stopPropagation(); buttons[next].focus(); }
+    });
+    document.body.append(menu);
+    const rect = menuAnchor.getBoundingClientRect();
+    const keyboard = event.type === "keydown" || (!event.clientX && !event.clientY);
+    const x = keyboard ? rect.left : event.clientX, y = keyboard ? rect.bottom : event.clientY;
+    const bounds = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - bounds.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - bounds.height - 8))}px`;
+    if (buttons[0]) buttons[0].focus({preventScroll: true});
+    return {close: () => { if (menu === createdMenu) closeContextMenu(); }};
+  }
+  function listenMenu(node, actions) {
+    node.setAttribute("aria-haspopup", "menu");
+    node.addEventListener("contextmenu", event => showContextMenu(event, actions()));
+    node.addEventListener("keydown", event => {
+      if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) showContextMenu(event, actions());
+    });
+  }
+  function reset() {
+    if (api && api.onChange) api.onChange();
+    serial++; searchSerial++; diagramGeneration++; closeContextMenu(false);
+    seed = null; expanded = []; diagram = null; snapshot = null; showAll = false; membersOpen.clear(); closeChooser();
+    if (controls) controls.hidden = true;
+    if (ui) ui.results.hidden = false;
+    positions = new Map(); cards = new Map(); stage = null;
+    if (!ui) return;
+    ui.results.replaceChildren(); ui.diagram.replaceChildren(); renderWarnings();
+    ui.diagram.setAttribute("aria-busy", "false");
+    ui.query.value = ""; ui.unmatched.checked = false;
+    state("Choose a Java or Python class, or search the indexed workspace.", "empty");
+  }
+  function init(options) {
+    api = options;
+    ui = Object.fromEntries(["panel", "state", "query", "search", "results", "diagram", "unmatched"].map(key => [key, document.getElementById(`classes-${key}`)]));
+    ui.state.setAttribute("role", "status"); ui.state.setAttribute("aria-live", "polite");
+    ui.diagram.setAttribute("tabindex", "0"); ui.diagram.setAttribute("aria-label", "Class diagram. Scroll to explore. Class actions are available with Shift F10.");
+    if (!bound) {
+      bound = true;
+      controls = el("div", undefined, "classes-controls");
+      changeButton = el("button", "Change class"); allButton = el("button", "Show all returned classes");
+      changeButton.type = allButton.type = "button";
+      changeButton.setAttribute("aria-controls", "classes-results");
+      changeButton.addEventListener("click", () => {
+        ui.results.hidden = !ui.results.hidden;
+        changeButton.setAttribute("aria-expanded", String(!ui.results.hidden));
+        if (!ui.results.hidden) ui.query.focus();
+      });
+      allButton.addEventListener("click", () => {
+        if (!currentView()) return;
+        closeChooser(); showAll = !showAll; render(diagram); updateStatus();
+      });
+      controls.append(changeButton, allButton); ui.diagram.before(controls);
+      ui.search.addEventListener("click", () => lookup({q: ui.query.value.trim()}));
+      ui.query.addEventListener("keydown", event => {
+        if (event.key === "Enter") { event.preventDefault(); lookup({q: ui.query.value.trim()}); }
+      });
+      ui.unmatched.addEventListener("change", () => { if (seed) return loadDiagram(seed, expanded); });
+      document.addEventListener("pointerdown", event => { if (menu && !menu.contains(event.target)) closeContextMenu(false); }, true);
+      document.addEventListener("focusin", event => { if (menu && (!valid(menuContext) || !menu.contains(event.target))) closeContextMenu(false); });
+      document.addEventListener("scroll", event => {
+        if (!menu || menu.contains(event.target)) return;
+        const previous = menuScroll.get(event.target);
+        if (previous && previous[0] === event.target.scrollTop && previous[1] === event.target.scrollLeft) return;
+        closeContextMenu();
+      }, true);
+      window.addEventListener("resize", () => closeContextMenu());
+    }
+    reset();
+  }
+  function unsupported(path) { return path && !/\.(java|py|pyi)$/i.test(path); }
+  async function open(options = {}) {
+    if (!ui) return;
+    closeContextMenu(false);
+    if (unsupported(options.path)) {
+      reset(); state("Class diagrams currently support Java and Python declarations. Sequence browsing is unchanged.", "unsupported"); return;
+    }
+    if (options.seed) {
+      searchSerial++; ui.results.replaceChildren();
+      return loadDiagram(options.seed, [], true);
+    }
+    return lookup({path: options.path || "", q: "", autoOpen: !!options.path});
+  }
+  async function lookup({path = "", q = "", offset = 0, autoOpen = false} = {}) {
+    const c = context(), ticket = ++searchSerial;
+    if (api.onChange) api.onChange();
+    serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
+    controls.hidden = true;
+    if (!offset) {
+      showAll = false; membersOpen.clear(); expanded = [];
+      seed = null; diagram = null; diagramGeneration++; ui.diagram.replaceChildren();
+      stage = null; cards = new Map(); positions = new Map(); ui.results.replaceChildren();
+    }
+    ui.diagram.setAttribute("aria-busy", "false");
+    state("Looking for indexed classes…", "loading");
+    try {
+      const params = new URLSearchParams({q, offset: String(offset), limit: "100", revision: String(c.revision)});
+      if (path) params.set("path", path);
+      const data = await api.request(`/api/classes?${params}`);
+      if (ticket !== searchSerial || !valid(c)) return;
+      if (data.revision !== c.revision) { state("Workspace revision changed. Search again.", "stale"); return; }
+      const items = data.items || [];
+      for (const definition of items) {
+        const button = el("button", undefined, "classes-result"); button.type = "button";
+        button.append(el("span", definition.qualifiedName || definition.symbol.name), el("span", definition.symbol.path, "classes-path"));
+        button.addEventListener("click", () => { if (valid(c)) return loadDiagram(definition.symbol.id, [], true); });
+        ui.results.append(button);
+      }
+      if (data.nextOffset != null) {
+        const more = el("button", "More classes", "classes-more"); more.type = "button";
+        more.addEventListener("click", () => { if (!valid(c)) return; more.remove(); return lookup({path, q, offset: data.nextOffset}); });
+        ui.results.append(more);
+      }
+      const warnings = data.warnings || [];
+      const unindexed = data.requireIndex || warnings.some(warning => /index workspace/i.test(warning));
+      renderWarnings(warnings);
+      state(`${unindexed ? "Index workspace to populate class declarations." : items.length ? "Choose a class to show its declared relationships." : "No matching classes. Try another name or index Java / Python files."}${data.truncated ? " Results are partial." : ""}`, unindexed ? "unindexed" : data.truncated ? "partial" : items.length ? "ready" : "empty");
+      if (autoOpen && items.length) await loadDiagram(items[0].symbol.id, [], true);
+    } catch (error) {
+      if (ticket === searchSerial && valid(c) && error.name !== "AbortError") state(error.message || "Class lookup failed. Try Search again.", "error");
+    }
+  }
+  async function loadDiagram(nextSeed, nextExpanded, fresh = false, focusId = null) {
+    // A chosen diagram owns status/notices; late catalog pages must not replace them.
+    searchSerial++;
+    const c = context(), ticket = ++serial, focusBefore = document.activeElement;
+    const restoreFocus = () => {
+      if ((!fresh && !focusId) || ticket !== serial || !valid(c) || displayTicket !== ticket) return;
+      // Do not pull focus back after the user has moved to another control while loading.
+      if (document.activeElement !== document.body && document.activeElement !== focusBefore) return;
+      const anchor = cards.get(focusId || seed);
+      if (anchor && anchor.isConnected) anchor.focus({preventScroll: true});
+    };
+    if (api.onChange) api.onChange();
+    closeContextMenu(false); closeChooser(); ui.diagram.setAttribute("aria-busy", "true");
+    state("Loading declared relationships…", "loading");
+    const expansion = [...nextExpanded];
+    try {
+      const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: true, includeUnmatched: !!ui.unmatched.checked}});
+      if (ticket !== serial || !valid(c)) return;
+      if (data.revision !== c.revision) { state("Workspace revision changed. Open the class again.", "stale"); return; }
+      if (fresh) { positions = new Map(); cards = new Map(); stage = null; showAll = false; membersOpen.clear(); ui.diagram.replaceChildren(); }
+      ui.results.hidden = true; changeButton.setAttribute("aria-expanded", "false");
+      seed = data.seed; expanded = expansion; diagram = data; snapshot = c; diagramGeneration++; displayTicket = ticket;
+      render(data); renderWarnings(data.warnings || []);
+      updateStatus(); restoreFocus();
+    } catch (error) {
+      if (ticket === serial && valid(c) && error.name !== "AbortError") {
+        const recoverable = diagram && snapshot && valid(snapshot) && ![401, 403, 409].includes(error.status);
+        if (recoverable) {
+          // This request never published a new view. Restore only the still-current cached view.
+          displayTicket = ticket;
+          state(`${error.message || "Class diagram unavailable."} Previous diagram retained. Its actions are available; retry the class action.`, "error");
+          restoreFocus();
+        } else {
+          diagramGeneration++; diagram = null; snapshot = null; seed = null; expanded = [];
+          stage = null; cards = new Map(); positions = new Map(); controls.hidden = true; ui.diagram.replaceChildren();
+          state(`${error.message || "Class diagram unavailable."} ${error.status === 409 ? "Workspace revision changed. Refresh status and open the class again." : "Try opening the class again."}`, error.status === 409 ? "stale" : "error");
+        }
+      }
+    } finally { if (ticket === serial && valid(c)) ui.diagram.setAttribute("aria-busy", "false"); }
+  }
+  function classActions(node) {
+    const c = snapshot, generation = diagramGeneration;
+    const guarded = action => () => { if (valid(c) && generation === diagramGeneration && displayTicket === serial) return action(); };
+    return [
+      {label: "Show related classes", disabled: !node.expandable || expanded.length >= MAX_EXPANDED,
+        run: guarded(() => showRelated(node))},
+      {label: "Read class source", run: guarded(() => api.readSource({path: node.class.symbol.path, range: {...node.class.symbol.range}}, c.revision))},
+      {label: "Focus this class", run: guarded(() => loadDiagram(node.id, [], true))}
+    ];
+  }
+  function compartment(definition, name, members, c, generation) {
+    const section = el("section", undefined, "classes-compartment");
+    section.append(el("h4", `${name} (${members.length})`));
+    const list = el("div", undefined, "classes-members");
+    list.tabIndex = 0; list.setAttribute("aria-label", `${name} of ${definition.symbol.name}`);
+    for (const member of members.slice(0, 200)) {
+      const label = `${member.name}${name === "Methods" ? "()" : ""}${member.typeHint ? ": " + member.typeHint : ""}`;
+      const method = name === "Methods" && member.symbolId;
+      const row = el("div", undefined, "classes-member"); row.title = label;
+      const memberName = el(method ? "button" : "span", `${member.name}${name === "Methods" ? "()" : ""}`, "classes-member-name");
+      if (method) {
+        memberName.type = "button"; memberName.setAttribute("aria-label", `Show sequence for ${label}`);
+        memberName.addEventListener("click", () => {
+          if (!valid(c) || generation !== diagramGeneration || displayTicket !== serial || ui.panel.hidden) return;
+          return invoke(() => api.selectMethod({id: member.symbolId, name: member.name, kind: "method", path: member.path, range: {...member.range}, parent: definition.symbol.id, accessor: false, provenance: definition.symbol.provenance}), c);
+        });
+      }
+      row.append(memberName);
+      const canNavigate = typeof api.navigateMember === "function";
+      const navigate = event => {
+        // Stop here synchronously: a member intent must not also open its class menu.
+        event.preventDefault(); event.stopPropagation();
+        const ticket = displayTicket;
+        const isCurrent = () => snapshot === c && valid(c) && generation === diagramGeneration &&
+          ticket === displayTicket && ticket === serial && !ui.panel.hidden && row.isConnected &&
+          membersOpen.has(definition.symbol.id);
+        if (!canNavigate || !isCurrent()) return;
+        // Names and type hints are display text, never a global search selector.
+        return api.navigateMember(event, {classId: definition.symbol.id, memberName: member.name,
+          startByte: member.range.startByte, endByte: member.range.endByte}, {isCurrent});
+      };
+      row.addEventListener("contextmenu", navigate);
+      row.addEventListener("keydown", event => {
+        if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) return navigate(event);
+      });
+      if (member.typeHint) {
+        row.append(el("span", ": ", "classes-member-separator"));
+        const type = el(canNavigate ? "button" : "span", member.typeHint, "classes-member-type");
+        if (canNavigate) {
+          type.type = "button"; type.setAttribute("aria-haspopup", "menu");
+          type.setAttribute("aria-label", `Navigate declared type ${member.typeHint} for ${member.name}`);
+          type.addEventListener("click", navigate);
+        }
+        row.append(type);
+      }
+      if (canNavigate) {
+        row.tabIndex = -1; row.setAttribute("aria-haspopup", "menu");
+        const actions = el("button", "⋯", "classes-member-menu"); actions.type = "button";
+        actions.setAttribute("aria-label", `Navigate member ${label}`); actions.setAttribute("aria-haspopup", "menu");
+        actions.addEventListener("click", navigate); row.append(actions);
+      }
+      list.append(row);
+    }
+    if (!members.length) list.append(el("span", "None declared", "classes-empty-member"));
+    if (members.length > 200) list.append(el("span", "First 200 members shown. Read source for more.", "classes-empty-member"));
+    section.append(list); return section;
+  }
+  const dataIndex = id => diagram.nodes.findIndex(node => node.id === id);
+  function card(node) {
+    const article = el("article", undefined, `classes-node${node.class ? "" : " classes-hint"}${node.id === seed ? " classes-seed" : ""}`);
+    article.dataset.classId = node.id; article.tabIndex = 0;
+    article.setAttribute("aria-label", `${node.label}${node.class ? ", class actions available" : ", terminal " + node.kind + " type hint"}`);
+    const header = el("header", undefined, "classes-node-header");
+    const title = el("div", undefined, "classes-node-title");
+    const fullName = node.class ? node.class.qualifiedName || node.label : node.label;
+    title.append(el("span", node.class ? `${node.class.language} · ${node.class.declarationKind}${node.id === seed ? " · focus" : ""}` : `${node.kind} · terminal hint`, "classes-kind"), el("h3", node.class ? node.class.symbol.name : node.label));
+    if (node.class) {
+      title.title = `${fullName} · ${node.class.symbol.path}`;
+      article.setAttribute("aria-label", `${fullName}, class actions available`);
+    }
+    header.append(title); article.append(header);
+    if (node.class) {
+      const menuButton = el("button", "⋯", "classes-menu-button"); menuButton.type = "button";
+      menuButton.setAttribute("aria-label", `Actions for ${node.label}`); menuButton.setAttribute("aria-haspopup", "menu");
+      menuButton.addEventListener("click", event => showContextMenu(event, classActions(node)));
+      header.append(menuButton); listenMenu(article, () => classActions(node));
+      const fields = node.class.fields || [], methods = node.class.methods || [];
+      const reveal = el("button", `Members · ${fields.length} ${fields.length === 1 ? "field" : "fields"} · ${methods.length} ${methods.length === 1 ? "method" : "methods"}`, "classes-members-toggle");
+      reveal.type = "button"; reveal.setAttribute("aria-expanded", String(membersOpen.has(node.id)));
+      const content = el("div", undefined, "classes-member-detail");
+      content.hidden = !membersOpen.has(node.id);
+      const detailId = `classes-members-${dataIndex(node.id)}`;
+      content.id = detailId; reveal.setAttribute("aria-controls", detailId);
+      const qualified = el("span", fullName, "classes-qualified"); qualified.title = fullName;
+      const path = el("div", node.class.symbol.path, "classes-node-path"); path.title = node.class.symbol.path;
+      content.append(qualified, path, compartment(node.class, "Fields", fields, snapshot, diagramGeneration), compartment(node.class, "Methods", methods, snapshot, diagramGeneration));
+      const c = snapshot, generation = diagramGeneration;
+      reveal.addEventListener("click", () => {
+        if (!valid(c) || generation !== diagramGeneration || displayTicket !== serial) return;
+        if (membersOpen.has(node.id)) membersOpen.delete(node.id); else membersOpen.add(node.id);
+        render(diagram); cards.get(node.id).querySelector(".classes-members-toggle").focus({preventScroll: true});
+      });
+      article.append(reveal, content);
+      if (node.class.truncated) article.append(el("div", "Partial declaration · read source for details", "classes-node-notice"));
+    } else article.append(el("p", "No unique indexed class match. This hint cannot expand.", "classes-hint-note"));
+    return article;
+  }
+  function render(data) {
+    const nodes = visibleNodes(data), ids = new Set(nodes.map(node => node.id));
+    if (!stage) { stage = el("div", undefined, "classes-stage"); ui.diagram.append(stage); }
+    // Reserve stable grid slots across expansions. No force simulation or DTO mutation.
+    for (const id of positions.keys()) if (!ids.has(id)) positions.delete(id);
+    const occupied = new Set(positions.values());
+    for (const node of nodes) if (!positions.has(node.id)) {
+      let slot = 0; while (occupied.has(slot)) slot++;
+      positions.set(node.id, slot); occupied.add(slot);
+    }
+    for (const [id, item] of cards) if (!ids.has(id)) { item.remove(); cards.delete(id); }
+    const maxSlot = Math.max(0, ...nodes.map(node => positions.get(node.id)));
+    const rowTops = [24], rowHeights = [];
+    for (let row = 0; row <= Math.floor(maxSlot / 2); row++) {
+      rowHeights[row] = nodes.some(node => Math.floor(positions.get(node.id) / 2) === row && membersOpen.has(node.id)) ? OPEN_HEIGHT : HEIGHT;
+      rowTops[row + 1] = rowTops[row] + rowHeights[row] + 100;
+    }
+    const width = nodes.length > 1 ? STEP_X + WIDTH + 100 : WIDTH + 48;
+    const height = rowTops[rowTops.length - 1];
+    stage.style.width = `${width}px`; stage.style.height = `${height}px`;
+    const coords = id => { const slot = positions.get(id), row = Math.floor(slot / 2); return {x: 24 + (slot % 2) * STEP_X, y: rowTops[row], rowBottom: rowTops[row] + rowHeights[row], height: membersOpen.has(id) ? OPEN_HEIGHT : HEIGHT}; };
+    const priorEdges = stage.querySelector(".classes-edges"); if (priorEdges) priorEdges.remove();
+    const edges = svg("svg", {class: "classes-edges", width, height, "aria-hidden": "true"});
+    const defs = svg("defs"), marker = svg("marker", {id: "classes-arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 8, markerHeight: 8, orient: "auto-start-reverse"});
+    marker.append(svg("path", {d: "M 1 1 L 9 5 L 1 9", fill: "none", stroke: "currentColor", "stroke-width": 1.4})); defs.append(marker); edges.append(defs);
+    const existingLedger = ui.diagram.querySelector(".classes-relationships"); if (existingLedger) existingLedger.remove();
+    const ledger = el("details", undefined, "classes-relationships"); ledger.open = false;
+    ledger.append(el("summary", "Declared relationships · syntax evidence"));
+    const list = el("ol");
+    const labels = new Map(nodes.map(node => [node.id, node.label]));
+    const visibleEdges = shownEdges(data, ids);
+    const bundles = new Map();
+    visibleEdges.forEach(edge => {
+      const key = JSON.stringify([edge.owner, edge.target]);
+      if (!bundles.has(key)) bundles.set(key, []);
+      bundles.get(key).push(edge);
+      const certainty = edge.matchKind === "syntaxCandidate" ? "syntax candidate" : `${edge.matchKind} hint`;
+      const row = el("li", undefined, "classes-relationship"); row.dataset.edgeId = edge.id;
+      row.append(el("span", `${labels.get(edge.owner)} → ${labels.get(edge.target)}`, "classes-relation-names"), el("span", `${edge.kind} · ${certainty} · ${edge.typeName}`, "classes-relation-evidence"));
+      // The original record, including identity, candidates and source range, is never summarized away.
+      row.append(el("pre", JSON.stringify(edge, null, 2), "classes-relation-record"));
+      list.append(row);
+    });
+    let index = 0;
+    for (const bundle of bundles.values()) {
+      const edge = bundle[0], from = coords(edge.owner), to = coords(edge.target);
+      const kinds = [...new Set(bundle.map(item => item.kind))];
+      const label = kinds.join(" / ");
+      const lane = 20 + (index++ % 4) * 18;
+      const labelWidth = Math.max(48, label.length * 8 + 12);
+      let route, labelCenter, labelY;
+      if (edge.owner === edge.target) {
+        // Self relationships loop in the right gutter and return through the bottom.
+        const right = from.x + WIDTH + 20, bottom = from.y + from.height;
+        labelY = from.rowBottom + 40; labelCenter = from.x + WIDTH / 2;
+        route = `M ${from.x + WIDTH} ${from.y + 40} H ${right} V ${labelY} H ${labelCenter} V ${bottom}`;
+      } else if (from.x === to.x && from.y < to.y) {
+        // Downward same-column edges use only the right gutter.
+        const right = from.x + WIDTH + lane;
+        labelY = from.rowBottom + 30; labelCenter = right - labelWidth / 2;
+        route = `M ${from.x + WIDTH} ${from.y + from.height / 2} H ${right} V ${to.y + to.height / 2} H ${to.x + WIDTH}`;
+      } else if (from.x === to.x) {
+        // Reverse/upward edges use the left gutter, never the downward rail.
+        const left = from.x - 16;
+        labelY = to.rowBottom + 70; labelCenter = left + labelWidth / 2;
+        route = `M ${from.x} ${from.y + from.height / 2} H ${left} V ${to.y + to.height / 2} H ${to.x}`;
+      } else {
+        const sx = from.x + WIDTH, sy = from.y + from.height - 24;
+        const tx = to.x, ty = to.y + 40, right = sx + lane, left = tx - 14;
+        labelY = from.rowBottom + lane; labelCenter = (right + left) / 2;
+        route = `M ${sx} ${sy} H ${right} V ${labelY} H ${left} V ${ty} H ${tx}`;
+      }
+      const path = svg("path", {d: route, class: "classes-edge", "marker-end": "url(#classes-arrow)"});
+      path.append(svg("title", {}, `${labels.get(edge.owner)} → ${labels.get(edge.target)}: ${label}. ${bundle.length} declarations; full evidence below.`)); edges.append(path);
+      const labelX = Math.max(4, Math.min(width - labelWidth - 4, labelCenter - labelWidth / 2));
+      const group = svg("g", {class: "classes-edge-label"});
+      group.append(svg("title", {}, `${labels.get(edge.owner)} → ${labels.get(edge.target)}: ${label}`), svg("rect", {x: labelX, y: labelY - 11, width: labelWidth, height: 22, rx: 3}), svg("text", {x: labelX + 6, y: labelY + 4}, label)); edges.append(group);
+    }
+    if (!list.children.length) list.append(el("li", "No declared relationships in this view."));
+    ledger.append(list); stage.append(edges);
+    for (const node of nodes) {
+      const old = cards.get(node.id), fresh = card(node), pos = coords(node.id);
+      // Preserve the actual DOM node identity and position, replacing only its contents.
+      let item = fresh;
+      if (old) { old.className = fresh.className; old.replaceChildren(...Array.from(fresh.children)); item = old; }
+      else { cards.set(node.id, item); stage.append(item); }
+      item.style.left = `${pos.x}px`; item.style.top = `${pos.y}px`; item.style.height = `${pos.height}px`;
+    }
+    ui.diagram.append(ledger);
+  }
+  window.BaleygClasses = Object.freeze({init, open, reset, showContextMenu, closeContextMenu});
+})();

@@ -1,0 +1,2822 @@
+{
+  "schemaVersion": 1,
+  "questionId": "q06-review-binding",
+  "question": "How do assertReviewBinding and readValidatorReview differ in checking verdicts while binding reviews to an observed commit?",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "seedId": "c001",
+  "labels": [
+    "essential",
+    "supporting",
+    "incidental",
+    "uncertain"
+  ],
+  "candidates": [
+    {
+      "id": "c001",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/assertReviewBinding().",
+      "name": "assertReviewBinding",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 68,
+      "endLine": 88,
+      "distance": 0,
+      "source": "export function assertReviewBinding({ review, ref, observedHead, subject = null, attempt = null }) {\n  // Finding 2: a review was bound to a commit but not to a subject, so a valid\n  // approval for another slice at the same commit was accepted. With several slices\n  // in a wave and one --review-ref argument, passing the wrong one is an ordinary\n  // mistake. The record already names its subject, so checking costs nothing.\n  if (subject !== null && review.subject !== subject) {\n    throw new Error(`review '${ref}' approved '${review.subject}', not '${subject}'`);\n  }\n  if (attempt !== null && review.attempt !== attempt) {\n    throw new Error(`review '${ref}' is for attempt ${review.attempt}, subject is at attempt ${attempt}`);\n  }\n  if (!isApproving(review.verdict)) {\n    throw new Error(`review '${ref}' verdict is ${review.verdict}, not an approval`);\n  }\n  if (!SHA.test(String(observedHead))) {\n    throw new Error(`review '${ref}' cannot be consumed without an observed head`);\n  }\n  if (review.reviewed_commit !== observedHead) {\n    throw new Error(`review '${ref}' approved ${review.reviewed_commit.slice(0, 12)} but the head is ${String(observedHead).slice(0, 12)}`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:4624",
+          "line": 74,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:4771",
+          "line": 77,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:4879",
+          "line": 79,
+          "callee": "isApproving",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:4920",
+          "line": 80,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:5007",
+          "line": 82,
+          "callee": "SHA.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:5016",
+          "line": 82,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:5051",
+          "line": 83,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:5188",
+          "line": 86,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:5226",
+          "line": 86,
+          "callee": "review.reviewed_commit.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:5281",
+          "line": 86,
+          "callee": "String(observedHead).slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:5281",
+          "line": 86,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c002",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/isApproving().",
+      "name": "isApproving",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 61,
+      "endLine": 63,
+      "distance": 1,
+      "source": "export function isApproving(verdict) {\n  return APPROVING_VERDICTS.includes(String(verdict).toUpperCase());\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:3829",
+          "line": 62,
+          "callee": "APPROVING_VERDICTS.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3857",
+          "line": 62,
+          "callee": "String(verdict).toUpperCase",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3857",
+          "line": 62,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c003",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/git().",
+      "name": "git",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 20,
+      "endLine": 30,
+      "distance": null,
+      "source": "export function git(cwd, args, { runner = spawnSync } = {}) {\n  const result = runner(\"git\", args, { cwd, encoding: \"utf8\", shell: false, env: { ...process.env, LC_ALL: \"C\" } });\n  const status = Number.isInteger(result?.status) ? result.status : null;\n  return {\n    ok: status === 0,\n    status,\n    stdout: String(result?.stdout ?? \"\"),\n    stderr: String(result?.stderr ?? \"\"),\n    argv: [\"git\", ...args],\n  };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:1053",
+          "line": 21,
+          "callee": "runner",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1170",
+          "line": 22,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1284",
+          "line": 26,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1326",
+          "line": 27,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c004",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeWorktree().",
+      "name": "observeWorktree",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 39,
+      "endLine": 61,
+      "distance": null,
+      "source": "export function observeWorktree(worktree, baseRef, options = {}) {\n  const ref = options.ref ?? \"HEAD\";\n  const commands = [];\n  const record = (result) => {\n    commands.push({ cmd: result.argv.join(\" \"), exit: result.status, summary: summarize(result) });\n    return result;\n  };\n\n  const head = record(git(worktree, [\"rev-parse\", ref], options));\n  const names = record(git(worktree, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"-z\", `${baseRef}...${ref}`], options));\n  const stat = record(git(worktree, [\"diff\", \"--stat\", `${baseRef}...${ref}`], options));\n\n  const observed = head.ok && names.ok && stat.ok;\n  return {\n    commit: head.ok ? head.stdout.trim() : null,\n    // NUL-separated and untrimmed: ownership is decided on these paths, so a name with a\n    // trailing space must stay a distinct path rather than collapsing onto another.\n    files_changed: names.ok ? names.stdout.split(\"\\0\").filter((path) => path !== \"\") : [],\n    diff_stat: stat.ok ? stat.stdout.trim() : null,\n    diff_observed: observed,\n    commands,\n  };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:2242",
+          "line": 47,
+          "callee": "record",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2249",
+          "line": 47,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2310",
+          "line": 48,
+          "callee": "record",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2317",
+          "line": 48,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2434",
+          "line": 49,
+          "callee": "record",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2441",
+          "line": 49,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2594",
+          "line": 53,
+          "callee": "head.stdout.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2826",
+          "line": 56,
+          "callee": "names.stdout.split(\"\\0\").filter",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c006"
+          ]
+        },
+        {
+          "id": "call:observe/index.js:2826",
+          "line": 56,
+          "callee": "names.stdout.split",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2912",
+          "line": 57,
+          "callee": "stat.stdout.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c005",
+      "symbolId": "local:observe/index.js:local 16",
+      "name": "record",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 42,
+      "endLine": 45,
+      "distance": null,
+      "source": "  const record = (result) => {\n    commands.push({ cmd: result.argv.join(\" \"), exit: result.status, summary: summarize(result) });\n    return result;\n  };",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:2106",
+          "line": 43,
+          "callee": "commands.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2127",
+          "line": 43,
+          "callee": "result.argv.join",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:2180",
+          "line": 43,
+          "callee": "summarize",
+          "target": "c035",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c006",
+      "symbolId": "syntax:observe/index.js:2858:arrow_function",
+      "name": "<callback@56:63>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 56,
+      "endLine": 56,
+      "distance": null,
+      "source": "    files_changed: names.ok ? names.stdout.split(\"\\0\").filter((path) => path !== \"\") : [],",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c007",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeCleanliness().",
+      "name": "observeCleanliness",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 73,
+      "endLine": 78,
+      "distance": null,
+      "source": "export function observeCleanliness(worktree, options = {}) {\n  const probe = git(worktree, [\"status\", \"--porcelain\", \"--untracked-files=normal\"], options);\n  if (!probe.ok) return { clean: false, reason: \"worktree state could not be observed\", entries: [] };\n  const entries = probe.stdout.split(\"\\n\").map((line) => line.trim()).filter(Boolean);\n  return { clean: entries.length === 0, reason: entries.length === 0 ? null : \"worktree has uncommitted changes\", entries };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:3796",
+          "line": 74,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:3996",
+          "line": 76,
+          "callee": "probe.stdout.split(\"\\n\").map((line) => line.trim()).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:3996",
+          "line": 76,
+          "callee": "probe.stdout.split(\"\\n\").map",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c008"
+          ]
+        },
+        {
+          "id": "call:observe/index.js:3996",
+          "line": 76,
+          "callee": "probe.stdout.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c008",
+      "symbolId": "syntax:observe/index.js:4025:arrow_function",
+      "name": "<callback@76:48>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 76,
+      "endLine": 76,
+      "distance": null,
+      "source": "  const entries = probe.stdout.split(\"\\n\").map((line) => line.trim()).filter(Boolean);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:4035",
+          "line": 76,
+          "callee": "line.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c009",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/runBootstrap().",
+      "name": "runBootstrap",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 80,
+      "endLine": 87,
+      "distance": null,
+      "source": "export function runBootstrap(worktree, command, timeoutMs = DEFAULT_BOOTSTRAP_TIMEOUT_MS, { runner = spawnSync } = {}) {\n  try {\n    const result = runner(command, [], {\n      cwd: worktree, shell: true, env: process.env, timeout: timeoutMs, stdio: [\"inherit\", process.stderr, process.stderr],\n    });\n    return Number.isSafeInteger(result?.status) && result.status >= 0 ? result.status : null;\n  } catch { return null; }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:4341",
+          "line": 82,
+          "callee": "runner",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:4506",
+          "line": 85,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c010",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeTrackedCleanliness().",
+      "name": "observeTrackedCleanliness",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 89,
+      "endLine": 100,
+      "distance": null,
+      "source": "export function observeTrackedCleanliness(worktree, options = {}) {\n  try {\n    const top = git(worktree, [\"rev-parse\", \"--show-toplevel\"], options);\n    const probes = [\n      git(worktree, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"-z\"], options),\n      git(worktree, [\"--literal-pathspecs\", \"diff\", \"--cached\", \"--name-only\", \"-z\"], options),\n    ];\n    if (!top.ok || realpathSync(resolve(worktree, top.stdout.trim())) !== realpathSync(worktree)\n      || probes.some((probe) => !probe.ok)) return { observed: false, entries: [] };\n    return { observed: true, entries: [...new Set(probes.flatMap((probe) => probe.stdout.split(\"\\0\").filter(Boolean)))].sort() };\n  } catch { return { observed: false, entries: [] }; }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:4711",
+          "line": 91,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:4796",
+          "line": 93,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:4880",
+          "line": 94,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:4996",
+          "line": 96,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:5009",
+          "line": 96,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:5027",
+          "line": 96,
+          "callee": "top.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:5051",
+          "line": 96,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:5083",
+          "line": 97,
+          "callee": "probes.some",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c011"
+          ]
+        },
+        {
+          "id": "call:observe/index.js:5197",
+          "line": 98,
+          "callee": "[...new Set(probes.flatMap((probe) => probe.stdout.split(\"\\0\").filter(Boolean)))].sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:5201",
+          "line": 98,
+          "callee": "Set",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:5209",
+          "line": 98,
+          "callee": "probes.flatMap",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c012"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c011",
+      "symbolId": "syntax:observe/index.js:5095:arrow_function",
+      "name": "<callback@97:22>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 97,
+      "endLine": 97,
+      "distance": null,
+      "source": "      || probes.some((probe) => !probe.ok)) return { observed: false, entries: [] };",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c012",
+      "symbolId": "syntax:observe/index.js:5224:arrow_function",
+      "name": "<callback@98:66>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 98,
+      "endLine": 98,
+      "distance": null,
+      "source": "    return { observed: true, entries: [...new Set(probes.flatMap((probe) => probe.stdout.split(\"\\0\").filter(Boolean)))].sort() };",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:5235",
+          "line": 98,
+          "callee": "probe.stdout.split(\"\\0\").filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:5235",
+          "line": 98,
+          "callee": "probe.stdout.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c013",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/observeAncestry().",
+      "name": "observeAncestry",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 102,
+      "endLine": 107,
+      "distance": null,
+      "source": "export function observeAncestry(worktree, ancestor, descendant, options = {}) {\n  const probe = git(worktree, [\"merge-base\", \"--is-ancestor\", ancestor, descendant], options);\n  if (probe.ok) return \"ancestor\";\n  if (probe.status === 1) return \"not-ancestor\";\n  return \"indeterminate\";\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:5443",
+          "line": 103,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c014",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/runTests().",
+      "name": "runTests",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 112,
+      "endLine": 124,
+      "distance": null,
+      "source": "export function runTests(worktree, command, { runner = spawnSync, skipReason = null, shellCommand = false, timeoutMs = DEFAULT_REPOSITORY_VERIFY_TIMEOUT_MS } = {}) {\n  if (!command) {\n    // Finding 1: defaulting a skip reason let omission manufacture review readiness.\n    // Tests must be observed green or explicitly skipped with a caller-declared reason;\n    // omission alone is neither.\n    return { cmd: null, exit: null, observed: false, skipped_reason: skipReason };\n  }\n  const result = shellCommand\n    ? runner(command, [], { cwd: worktree, shell: true, stdio: \"inherit\", env: process.env, timeout: timeoutMs })\n    : runner(command[0], command.slice(1), { cwd: worktree, encoding: \"utf8\", shell: false });\n  const exit = Number.isInteger(result?.status) ? result.status : null;\n  return { cmd: shellCommand ? command : command.join(\" \"), exit, observed: exit !== null, skipped_reason: null };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:6367",
+          "line": 120,
+          "callee": "runner",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:6481",
+          "line": 121,
+          "callee": "runner",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:6500",
+          "line": 121,
+          "callee": "command.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:6585",
+          "line": 122,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:6683",
+          "line": 123,
+          "callee": "command.join",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c015",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/deriveReviewReady().",
+      "name": "deriveReviewReady",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 128,
+      "endLine": 140,
+      "distance": null,
+      "source": "export function deriveReviewReady(evidence) {\n  if (evidence.status !== \"completed\") return false;\n  // A tree with uncommitted changes cannot produce evidence about the commit it\n  // claims, whatever the tests said.\n  if (evidence.worktree_clean !== true) return false;\n  if (!Array.isArray(evidence.files_changed) || evidence.files_changed.length === 0) return false;\n  if (evidence.diff_observed !== true) return false;\n  const tests = evidence.tests ?? {};\n  if (tests.observed === true) return tests.exit === 0;\n  // A skip is only acceptable when a reason was recorded. Absent tests with no\n  // reason is the shape a fabricated pass would take.\n  return typeof tests.skipped_reason === \"string\" && tests.skipped_reason.trim().length > 0;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:7190",
+          "line": 133,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:7617",
+          "line": 139,
+          "callee": "tests.skipped_reason.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c016",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/reconcileClaim().",
+      "name": "reconcileClaim",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 144,
+      "endLine": 166,
+      "distance": null,
+      "source": "export function reconcileClaim(claim, observation) {\n  if (claim === null || claim === undefined) return { claimed: false, mismatches: [] };\n  const mismatches = [];\n  const compare = (field, claimed, observed) => {\n    if (claimed === undefined || claimed === null) return;\n    if (Array.isArray(claimed) && Array.isArray(observed)) {\n      const claimedSet = [...claimed].sort().join(\"\\n\");\n      const observedSet = [...observed].sort().join(\"\\n\");\n      if (claimedSet !== observedSet) mismatches.push({ field, claimed, observed });\n      return;\n    }\n    if (claimed !== observed) mismatches.push({ field, claimed, observed });\n  };\n  compare(\"commit\", claim.commit, observation.commit);\n  compare(\"files_changed\", claim.files_changed, observation.files_changed);\n  compare(\"status\", claim.status, observation.status);\n  // The important one: a claimed passing test against an observed failure or an\n  // unobserved run.\n  if (claim.tests?.exit !== undefined && claim.tests.exit !== null) {\n    compare(\"tests.exit\", claim.tests.exit, observation.tests?.exit ?? null);\n  }\n  return { claimed: true, mismatches };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:8451",
+          "line": 157,
+          "callee": "compare",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8506",
+          "line": 158,
+          "callee": "compare",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8582",
+          "line": 159,
+          "callee": "compare",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8811",
+          "line": 163,
+          "callee": "compare",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c017",
+      "symbolId": "local:observe/index.js:local 92",
+      "name": "compare",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 147,
+      "endLine": 156,
+      "distance": null,
+      "source": "  const compare = (field, claimed, observed) => {\n    if (claimed === undefined || claimed === null) return;\n    if (Array.isArray(claimed) && Array.isArray(observed)) {\n      const claimedSet = [...claimed].sort().join(\"\\n\");\n      const observedSet = [...observed].sort().join(\"\\n\");\n      if (claimedSet !== observedSet) mismatches.push({ field, claimed, observed });\n      return;\n    }\n    if (claimed !== observed) mismatches.push({ field, claimed, observed });\n  };",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:8093",
+          "line": 149,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8119",
+          "line": 149,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8171",
+          "line": 150,
+          "callee": "[...claimed].sort().join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8171",
+          "line": 150,
+          "callee": "[...claimed].sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8229",
+          "line": 151,
+          "callee": "[...observed].sort().join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8229",
+          "line": 151,
+          "callee": "[...observed].sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8300",
+          "line": 152,
+          "callee": "mismatches.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:8397",
+          "line": 155,
+          "callee": "mismatches.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c018",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/unownedPaths().",
+      "name": "unownedPaths",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 170,
+      "endLine": 173,
+      "distance": null,
+      "source": "export function unownedPaths(filesChanged, declaredPaths) {\n  if (!Array.isArray(declaredPaths) || declaredPaths.length === 0) return [...filesChanged];\n  return filesChanged.filter((file) => !declaredPaths.some((declared) => coversPath(declared, file)));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:9156",
+          "line": 171,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:9251",
+          "line": 172,
+          "callee": "filesChanged.filter",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c019"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c019",
+      "symbolId": "syntax:observe/index.js:9271:arrow_function",
+      "name": "<callback@172:30>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 172,
+      "endLine": 172,
+      "distance": null,
+      "source": "  return filesChanged.filter((file) => !declaredPaths.some((declared) => coversPath(declared, file)));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:9282",
+          "line": 172,
+          "callee": "declaredPaths.some",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c020"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c020",
+      "symbolId": "syntax:observe/index.js:9301:arrow_function",
+      "name": "<callback@172:60>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 172,
+      "endLine": 172,
+      "distance": null,
+      "source": "  return filesChanged.filter((file) => !declaredPaths.some((declared) => coversPath(declared, file)));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:9315",
+          "line": 172,
+          "callee": "coversPath",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c021",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/coversPath().",
+      "name": "coversPath",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 175,
+      "endLine": 181,
+      "distance": null,
+      "source": "function coversPath(declared, file) {\n  const normalizedDeclared = declared.replace(/\\/+$/u, \"\");\n  if (file === normalizedDeclared) return true;\n  // A directory declaration covers its subtree; a prefix that is not a path\n  // boundary does not, so \"src/app\" must not cover \"src/application/x\".\n  return file.startsWith(`${normalizedDeclared}/`);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:9415",
+          "line": 176,
+          "callee": "declared.replace",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:9653",
+          "line": 180,
+          "callee": "file.startsWith",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c022",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/privilegedPaths().",
+      "name": "privilegedPaths",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 193,
+      "endLine": 196,
+      "distance": null,
+      "source": "export function privilegedPaths(filesChanged) {\n  return filesChanged.filter((file) => PRIVILEGED_PREFIXES.some((prefix) => file === prefix || file.startsWith(`${prefix}/`))\n    || PRIVILEGED_EXACT.includes(file));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:10497",
+          "line": 194,
+          "callee": "filesChanged.filter",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c023"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c023",
+      "symbolId": "syntax:observe/index.js:10517:arrow_function",
+      "name": "<callback@194:30>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 194,
+      "endLine": 195,
+      "distance": null,
+      "source": "  return filesChanged.filter((file) => PRIVILEGED_PREFIXES.some((prefix) => file === prefix || file.startsWith(`${prefix}/`))\n    || PRIVILEGED_EXACT.includes(file));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:10527",
+          "line": 194,
+          "callee": "PRIVILEGED_PREFIXES.some",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c024"
+          ]
+        },
+        {
+          "id": "call:observe/index.js:10621",
+          "line": 195,
+          "callee": "PRIVILEGED_EXACT.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c024",
+      "symbolId": "syntax:observe/index.js:10552:arrow_function",
+      "name": "<callback@194:65>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 194,
+      "endLine": 194,
+      "distance": null,
+      "source": "  return filesChanged.filter((file) => PRIVILEGED_PREFIXES.some((prefix) => file === prefix || file.startsWith(`${prefix}/`))",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:10583",
+          "line": 194,
+          "callee": "file.startsWith",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c025",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/buildEvidence().",
+      "name": "buildEvidence",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 198,
+      "endLine": 259,
+      "distance": null,
+      "source": "export function buildEvidence({ subject, runId, attempt, branch, baseRef, worktree, status, blockedReason = null, claim = null, testCommand = null, skipReason = null, shellCommand = false, testTimeoutMs = DEFAULT_REPOSITORY_VERIFY_TIMEOUT_MS, options = {} }) {\n  // Cleanliness is established before anything else is observed, because every later\n  // fact - the diff, the commit, and above all the test result - is only about the\n  // recorded commit if the tree has nothing uncommitted in it.\n  const cleanliness = observeCleanliness(worktree, options);\n  const observation = observeWorktree(worktree, baseRef, options);\n  // Tests are not run at all against a dirty tree: running them would produce a\n  // result about bytes that are not going to merge.\n  const tests = cleanliness.clean\n    ? runTests(worktree, testCommand, { ...options, skipReason, shellCommand, timeoutMs: testTimeoutMs })\n    : { cmd: testCommand ? (shellCommand ? testCommand : testCommand.join(\" \")) : null, exit: null, observed: false, skipped_reason: null };\n\n  // Third round, finding 1: cleanliness was a pre-test snapshot, so a test that wrote\n  // tracked files left the tree dirty while\n/* ... source excerpt omitted ... */\nstat: observation.diff_stat,\n    diff_observed: observation.diff_observed,\n    commands: observation.commands,\n    tests,\n    commit: observation.commit,\n    observed_by: \"orchestrator\",\n    review_ready: false,\n    claim_reconciliation: { claimed: false, mismatches: [] },\n  };\n  evidence.review_ready = deriveReviewReady(evidence);\n  evidence.claim_reconciliation = reconcileClaim(claim, evidence);\n  // A claim that disagrees with what we observed cannot be review-ready: the\n  // disagreement is itself the finding.\n  if (evidence.claim_reconciliation.mismatches.length > 0) evidence.review_ready = false;\n  return evidence;\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/index.js:11175",
+          "line": 202,
+          "callee": "observeCleanliness",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:11236",
+          "line": 203,
+          "callee": "observeWorktree",
+          "target": "c004",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:11455",
+          "line": 207,
+          "callee": "runTests",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:11612",
+          "line": 208,
+          "callee": "testCommand.join",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:12637",
+          "line": 223,
+          "callee": "observeCleanliness",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:12696",
+          "line": 224,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:12853",
+          "line": 228,
+          "callee": "headAfter.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:13843",
+          "line": 253,
+          "callee": "deriveReviewReady",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:13906",
+          "line": 254,
+          "callee": "reconcileClaim",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c026",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/resolveWorktree().",
+      "name": "resolveWorktree",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 261,
+      "endLine": 266,
+      "distance": null,
+      "source": "export function resolveWorktree(repo, worktree) {\n  const absolute = resolve(repo, worktree);\n  const rel = relative(resolve(repo), absolute);\n  if (rel.startsWith(\"..\") || rel.startsWith(sep) || !existsSync(absolute)) return null;\n  return absolute;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:14239",
+          "line": 262,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14278",
+          "line": 263,
+          "callee": "relative",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14287",
+          "line": 263,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14319",
+          "line": 264,
+          "callee": "rel.startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14343",
+          "line": 264,
+          "callee": "rel.startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14367",
+          "line": 264,
+          "callee": "existsSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c027",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/proveInitContainment().",
+      "name": "proveInitContainment",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 268,
+      "endLine": 312,
+      "distance": null,
+      "source": "export function proveInitContainment({ operatorRoot, sandboxPath, runId, worktree }) {\n  const container = join(operatorRoot, \".factory-sandboxes\");\n  if (sandboxPath !== join(container, runId)) throw new Error(\"sandbox is not the exact derived run path\");\n  exactDirectory(operatorRoot);\n  exactDirectory(container);\n  exactDirectory(sandboxPath);\n  if (dirname(sandboxPath) !== container || realpathSync(dirname(sandboxPath)) !== container) throw new Error(\"sandbox parent is not the canonical container\");\n\n  const gitDirectory = join(sandboxPath, \".git\");\n  if (gitPath(sandboxPath, [\"rev-parse\", \"--show-toplevel\"]) !== sandboxPath) throw new Error(\"sandbox Git top level escapes the sandbox\");\n  exactDirectory(gitDirectory);\n  if (gitPath(sandboxPath, [\"rev-parse\", \"--absolute-git-dir\"]) !== gitDirectory) throw new Error(\"sandbox Git directory is not S/.git\");\n  if (gitPath(sandboxPath, [\"rev-parse\", \"--git-common-dir\"]) !== gitDirectory) throw new Error(\"sandbox Git common directory is not S/.git\");\n\n  const configuredWorktree = resolve(sandboxPath, worktree);\n  if (!within(configuredWorktree, sandboxPath)) throw new Error(\"configured worktree escapes th\n/* ... source excerpt omitted ... */\ninalGitDirectory = gitPath(configuredWorktree, [\"rev-parse\", \"--absolute-git-dir\"]);\n  if (gitPath(sandboxPath, [\"rev-parse\", \"--show-toplevel\"]) !== sandboxPath\n    || gitPath(sandboxPath, [\"rev-parse\", \"--absolute-git-dir\"]) !== gitDirectory\n    || gitPath(sandboxPath, [\"rev-parse\", \"--git-common-dir\"]) !== gitDirectory\n    || gitPath(configuredWorktree, [\"rev-parse\", \"--git-common-dir\"]) !== gitDirectory) {\n    throw new Error(\"final Git containment proof failed\");\n  }\n  assertWorktreeRelationship(sandboxPath, configuredWorktree, gitDirectory, finalTop, finalGitDirectory);\n  return { sandboxPath, configuredWorktree };\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/index.js:14531",
+          "line": 269,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14595",
+          "line": 270,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14625",
+          "line": 270,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14683",
+          "line": 271,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14715",
+          "line": 272,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14744",
+          "line": 273,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14779",
+          "line": 274,
+          "callee": "dirname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14817",
+          "line": 274,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14830",
+          "line": 274,
+          "callee": "dirname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14873",
+          "line": 274,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14957",
+          "line": 276,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:14990",
+          "line": 277,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15068",
+          "line": 277,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15126",
+          "line": 278,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15162",
+          "line": 279,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15244",
+          "line": 279,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15300",
+          "line": 280,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15380",
+          "line": 280,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15467",
+          "line": 282,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15506",
+          "line": 283,
+          "callee": "within",
+          "target": "c034",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15553",
+          "line": 283,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15609",
+          "line": 284,
+          "callee": "inspectComponents",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15663",
+          "line": 285,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15721",
+          "line": 286,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15863",
+          "line": 287,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:15962",
+          "line": 288,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16035",
+          "line": 289,
+          "callee": "within",
+          "target": "c034",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16085",
+          "line": 289,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16150",
+          "line": 290,
+          "callee": "assertWorktreeRelationship",
+          "target": "c033",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16266",
+          "line": 291,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16353",
+          "line": 291,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16441",
+          "line": 293,
+          "callee": "ensureDirectory",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16457",
+          "line": 293,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16522",
+          "line": 294,
+          "callee": "ensureDirectory",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16538",
+          "line": 294,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16601",
+          "line": 296,
+          "callee": "[\"plan\", \"artifacts\", \"evidence\", \"reviews\"].map",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c028"
+          ]
+        },
+        {
+          "id": "call:observe/index.js:16710",
+          "line": 297,
+          "callee": "ensureDirectory",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16726",
+          "line": 297,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16771",
+          "line": 299,
+          "callee": "directories.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16788",
+          "line": 299,
+          "callee": "ensureDirectory",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16804",
+          "line": 299,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16809",
+          "line": 299,
+          "callee": "directories.at",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16837",
+          "line": 299,
+          "callee": "directories.at",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16988",
+          "line": 301,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17029",
+          "line": 302,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17120",
+          "line": 303,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17192",
+          "line": 304,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17270",
+          "line": 305,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17352",
+          "line": 306,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17432",
+          "line": 307,
+          "callee": "gitPath",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17525",
+          "line": 308,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17580",
+          "line": 310,
+          "callee": "assertWorktreeRelationship",
+          "target": "c033",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c028",
+      "symbolId": "syntax:observe/index.js:16650:arrow_function",
+      "name": "<callback@296:57>",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 296,
+      "endLine": 296,
+      "distance": null,
+      "source": "    ...[\"plan\", \"artifacts\", \"evidence\", \"reviews\"].map((name) => ensureDirectory(join(runDir, name), runDir)),",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:16660",
+          "line": 296,
+          "callee": "ensureDirectory",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:16676",
+          "line": 296,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c029",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/exactDirectory().",
+      "name": "exactDirectory",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 314,
+      "endLine": 318,
+      "distance": null,
+      "source": "function exactDirectory(path) {\n  const stats = lstatSync(path);\n  if (stats.isSymbolicLink() || !stats.isDirectory() || realpathSync(path) !== path) throw new Error(`unsafe directory '${path}'`);\n  return path;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:17781",
+          "line": 315,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17804",
+          "line": 316,
+          "callee": "stats.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17831",
+          "line": 316,
+          "callee": "stats.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17854",
+          "line": 316,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:17889",
+          "line": 316,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c030",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/ensureDirectory().",
+      "name": "ensureDirectory",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 320,
+      "endLine": 331,
+      "distance": null,
+      "source": "function ensureDirectory(path, parent) {\n  exactDirectory(parent);\n  try {\n    exactDirectory(path);\n  } catch (error) {\n    if (error?.code !== \"ENOENT\") throw error;\n    mkdirSync(path);\n    exactDirectory(path);\n  }\n  if (dirname(path) !== parent || realpathSync(dirname(path)) !== parent || !within(realpathSync(path), parent, true)) throw new Error(`directory escapes its parent '${path}'`);\n  return path;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:17991",
+          "line": 321,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18027",
+          "line": 323,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18120",
+          "line": 326,
+          "callee": "mkdirSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18141",
+          "line": 327,
+          "callee": "exactDirectory",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18173",
+          "line": 329,
+          "callee": "dirname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18201",
+          "line": 329,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18214",
+          "line": 329,
+          "callee": "dirname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18244",
+          "line": 329,
+          "callee": "within",
+          "target": "c034",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18251",
+          "line": 329,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18292",
+          "line": 329,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c031",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/inspectComponents().",
+      "name": "inspectComponents",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 333,
+      "endLine": 341,
+      "distance": null,
+      "source": "function inspectComponents(root, target) {\n  const path = relative(root, target);\n  let cursor = root;\n  for (const part of path.split(sep).filter(Boolean)) {\n    cursor = join(cursor, part);\n    const stats = lstatSync(cursor);\n    if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error(`unsafe configured worktree component '${cursor}'`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:18421",
+          "line": 334,
+          "callee": "relative",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18487",
+          "line": 336,
+          "callee": "path.split(sep).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18487",
+          "line": 336,
+          "callee": "path.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18535",
+          "line": 337,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18573",
+          "line": 338,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18600",
+          "line": 339,
+          "callee": "stats.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18627",
+          "line": 339,
+          "callee": "stats.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18654",
+          "line": 339,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c032",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/gitPath().",
+      "name": "gitPath",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 343,
+      "endLine": 347,
+      "distance": null,
+      "source": "function gitPath(cwd, args) {\n  const result = git(cwd, args);\n  if (!result.ok || !result.stdout.trim()) throw new Error(`Git observation failed: git ${args.join(\" \")}`);\n  return realpathSync(resolve(cwd, result.stdout.trim()));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:18771",
+          "line": 344,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18808",
+          "line": 345,
+          "callee": "result.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18836",
+          "line": 345,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18877",
+          "line": 345,
+          "callee": "args.join",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18905",
+          "line": 346,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18918",
+          "line": 346,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:18931",
+          "line": 346,
+          "callee": "result.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c033",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/assertWorktreeRelationship().",
+      "name": "assertWorktreeRelationship",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 349,
+      "endLine": 353,
+      "distance": null,
+      "source": "function assertWorktreeRelationship(sandbox, worktree, gitDirectory, top, observedGitDirectory) {\n  if (top === sandbox && observedGitDirectory === gitDirectory) return;\n  if (worktree !== sandbox && top === worktree && within(observedGitDirectory, gitDirectory, true)) return;\n  throw new Error(\"configured worktree Git relationship is not contained\");\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:19178",
+          "line": 351,
+          "callee": "within",
+          "target": "c034",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:19244",
+          "line": 352,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c034",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/within().",
+      "name": "within",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 355,
+      "endLine": 358,
+      "distance": null,
+      "source": "function within(child, parent, strict = false) {\n  const path = relative(parent, child);\n  return (!strict && path === \"\") || (path !== \"\" && path !== \"..\" && !path.startsWith(`..${sep}`) && !path.startsWith(sep));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:19379",
+          "line": 356,
+          "callee": "relative",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:19475",
+          "line": 357,
+          "callee": "path.startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:19507",
+          "line": 357,
+          "callee": "path.startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c035",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/summarize().",
+      "name": "summarize",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 360,
+      "endLine": 363,
+      "distance": null,
+      "source": "function summarize(result) {\n  const text = (result.ok ? result.stdout : result.stderr).trim().split(\"\\n\")[0] ?? \"\";\n  return text.length > 200 ? `${text.slice(0, 197)}...` : text;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:19577",
+          "line": 361,
+          "callee": "(result.ok ? result.stdout : result.stderr).trim().split",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:19577",
+          "line": 361,
+          "callee": "(result.ok ? result.stdout : result.stderr).trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:19682",
+          "line": 362,
+          "callee": "text.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c036",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/evidenceRef.",
+      "name": "evidenceRef",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 366,
+      "endLine": 366,
+      "distance": null,
+      "source": "export const evidenceRef = (subject) => join(EVIDENCE_DIR, `${subject}.json`);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:19797",
+          "line": 366,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c037",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/reviewRef.",
+      "name": "reviewRef",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 22,
+      "endLine": 22,
+      "distance": null,
+      "source": "export const reviewRef = (subject) => join(REVIEWS_DIR, `${subject}.json`);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:1145",
+          "line": 22,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c038",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/readReview().",
+      "name": "readReview",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 24,
+      "endLine": 59,
+      "distance": null,
+      "source": "export function readReview(runDir, ref) {\n  let value;\n  try {\n    value = JSON.parse(readFileSync(join(runDir, ref), \"utf8\"));\n  } catch (error) {\n    throw new Error(`review '${ref}' could not be read: ${error.message}`);\n  }\n  // Accumulate, then throw once. Fail-fast costs one dispatch per problem: run 1437's validator record had\n  // two unknown keys, no reviewed_commit and no attempt, so correcting the keys would have earned a second\n  // refusal and then a third, each after another validator pass over a 27-file change.\n  const unknown = Object.keys(value).filter((key) => !REVIEW_KEYS.includes(key));\n  const problems = [];\n  if (unknown.length > 0) problems.push(`has unknown keys: ${unknown.sort().join(\", \")}`);\n  if (typeof value.subject !== \"string\" || !value.subject.trim()) problems.push(\"has no subject\");\n  if (typeof value.verdict !== \"string\" || !value.verdict.trim()) problems.push(\"has no verdict\");\n  if (!Number.isSafeInteger(value.attempt) || value.attempt < 1) problems.push(\"has no attempt\");\n  // The binding this whole module exists for. A review without it cannot be\n  // consumed, rather than being consumed against an assumed commit.\n\n/* ... source excerpt omitted ... */\n is the over-reach that cost run 291 its work.\n  if (typeof value.reviewer !== \"string\" || !value.reviewer.trim()) problems.push(\"has no reviewer\");\n  if (!Array.isArray(value.findings)) problems.push(\"must record findings as an array\");\n  if (!Array.isArray(value.required_fixes)) problems.push(\"must record required_fixes as an array\");\n  if (!Array.isArray(value.checked_against) || value.checked_against.length === 0) {\n    problems.push(\"must record checked_against as a non-empty array naming what the review read\");\n  }\n  if (problems.length > 0) throw new Error(`review '${ref}' ${problems.join(\"; \")}`);\n  return value;\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/review.js:1259",
+          "line": 27,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1270",
+          "line": 27,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1283",
+          "line": 27,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1342",
+          "line": 29,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1734",
+          "line": 34,
+          "callee": "Object.keys(value).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c039"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:1734",
+          "line": 34,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1847",
+          "line": 36,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1882",
+          "line": 36,
+          "callee": "unknown.sort().join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1882",
+          "line": 36,
+          "callee": "unknown.sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1956",
+          "line": 37,
+          "callee": "value.subject.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:1978",
+          "line": 37,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:2055",
+          "line": 38,
+          "callee": "value.verdict.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:2077",
+          "line": 38,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:2117",
+          "line": 39,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:2175",
+          "line": 39,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:2361",
+          "line": 42,
+          "callee": "SHA.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:2370",
+          "line": 42,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:2402",
+          "line": 42,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3241",
+          "line": 51,
+          "callee": "value.reviewer.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3264",
+          "line": 51,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3305",
+          "line": 52,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3336",
+          "line": 52,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3394",
+          "line": 53,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3431",
+          "line": 53,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3495",
+          "line": 54,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3577",
+          "line": 55,
+          "callee": "problems.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3709",
+          "line": 57,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3738",
+          "line": 57,
+          "callee": "problems.join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c039",
+      "symbolId": "syntax:observe/review.js:1760:arrow_function",
+      "name": "<callback@34:45>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 34,
+      "endLine": 34,
+      "distance": null,
+      "source": "  const unknown = Object.keys(value).filter((key) => !REVIEW_KEYS.includes(key));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:1770",
+          "line": 34,
+          "callee": "REVIEW_KEYS.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c040",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/readValidatorReview().",
+      "name": "readValidatorReview",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 100,
+      "endLine": 116,
+      "distance": null,
+      "source": "export function readValidatorReview(runDir, observedHead) {\n  const ref = reviewRef(\"implementation-validator\");\n  const review = readReview(runDir, ref);\n  if (review.subject !== \"implementation-validator\") {\n    throw new Error(`${ref} describes '${review.subject}', not the implementation-validator`);\n  }\n  if (!VALIDATOR_VERDICTS.includes(review.verdict)) {\n    throw new Error(`${ref} verdict must be one of ${VALIDATOR_VERDICTS.join(\" | \")}`);\n  }\n  if (!SHA.test(String(observedHead))) {\n    throw new Error(`${ref} cannot be recorded without an observed integration head`);\n  }\n  if (review.reviewed_commit !== observedHead) {\n    throw new Error(`${ref} judged ${review.reviewed_commit.slice(0, 12)} but the integration head is ${String(observedHead).slice(0, 12)}; re-run the validator`);\n  }\n  return review;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:6117",
+          "line": 101,
+          "callee": "reviewRef",
+          "target": "c037",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6173",
+          "line": 102,
+          "callee": "readReview",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6263",
+          "line": 104,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6359",
+          "line": 106,
+          "callee": "VALIDATOR_VERDICTS.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6416",
+          "line": 107,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6459",
+          "line": 107,
+          "callee": "VALIDATOR_VERDICTS.join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6505",
+          "line": 109,
+          "callee": "SHA.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6514",
+          "line": 109,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6549",
+          "line": 110,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6689",
+          "line": 113,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6716",
+          "line": 113,
+          "callee": "review.reviewed_commit.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6783",
+          "line": 113,
+          "callee": "String(observedHead).slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:6783",
+          "line": 113,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c041",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/observeMergeProof().",
+      "name": "observeMergeProof",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 143,
+      "endLine": 214,
+      "distance": null,
+      "source": "export function observeMergeProof(worktree, { baseRef, reviewedCommit, mergeCommit, options = {} } = {}) {\n  const fail = (reason, extra = {}) => ({ proven: false, reason, ...extra });\n\n  const ancestry = observeAncestry(worktree, reviewedCommit, mergeCommit, options);\n  if (ancestry !== \"ancestor\") return fail(`reviewed commit is ${ancestry} of the merge commit`);\n\n  // Exactly two parents, so first-parent means \"the integration branch before this\n  // merge\" by construction rather than by assumption. A fast-forward has one parent -\n  // the slice's own previous commit - and the proof would then measure the slice's last\n  // commit against its whole reviewed diff, silently checking the wrong thing. Proving a\n  // fast-forward would need the pre-merge head stored as a durable field; requiring\n  // --no-ff, which the skill already specifies, costs nothing. An octopus merge carries\n  // other branches, which would surface as unreviewed paths and misdescribe the cause.\n  const parents = revList(worktree, mergeCommit, options);\n  if (parents === null) return fail(\"the merge commit's parents could not be observed\");\n  if (parents.length !== 2) {\n    return \n/* ... source excerpt omitted ... */\nve already proved the merge contributed nothing outside reviewedPaths, so the\n  // difference came from the integration branch rather than from this slice.\n  const drift = pathsChanged(worktree, reviewedCommit, mergeCommit, options);\n  if (drift === null) return fail(\"the reviewed commit could not be compared to the merge\");\n  const altered = drift.filter((path) => reviewedPaths.includes(path));\n  if (altered.length > 0) {\n    return fail(`the merge's content differs from the reviewed commit's: ${altered.join(\", \")}`);\n  }\n\n  return { proven: true, reason: null, reviewed_paths: reviewedPaths, first_parent: firstParent };\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/review.js:8564",
+          "line": 146,
+          "callee": "observeAncestry",
+          "target": "c013",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:8667",
+          "line": 147,
+          "callee": "fail",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:9358",
+          "line": 156,
+          "callee": "revList",
+          "target": "c046",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:9430",
+          "line": 157,
+          "callee": "fail",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:9529",
+          "line": 159,
+          "callee": "fail",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:9737",
+          "line": 163,
+          "callee": "pathsChanged",
+          "target": "c047",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:9822",
+          "line": 164,
+          "callee": "pathsChanged",
+          "target": "c047",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:9953",
+          "line": 166,
+          "callee": "fail",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:10019",
+          "line": 169,
+          "callee": "contributedPaths.filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c043"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:10122",
+          "line": 171,
+          "callee": "fail",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:10182",
+          "line": 171,
+          "callee": "extra.join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:10225",
+          "line": 173,
+          "callee": "reviewedPaths.filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c044"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:10330",
+          "line": 175,
+          "callee": "fail",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:10383",
+          "line": 175,
+          "callee": "missing.join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:12432",
+          "line": 206,
+          "callee": "pathsChanged",
+          "target": "c047",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:12523",
+          "line": 207,
+          "callee": "fail",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:12605",
+          "line": 208,
+          "callee": "drift.filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c045"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:12698",
+          "line": 210,
+          "callee": "fail",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:12762",
+          "line": 210,
+          "callee": "altered.join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c042",
+      "symbolId": "local:observe/review.js:local 36",
+      "name": "fail",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 144,
+      "endLine": 144,
+      "distance": null,
+      "source": "  const fail = (reason, extra = {}) => ({ proven: false, reason, ...extra });",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c043",
+      "symbolId": "syntax:observe/review.js:10043:arrow_function",
+      "name": "<callback@169:41>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 169,
+      "endLine": 169,
+      "distance": null,
+      "source": "  const extra = contributedPaths.filter((path) => !reviewedPaths.includes(path));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:10054",
+          "line": 169,
+          "callee": "reviewedPaths.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c044",
+      "symbolId": "syntax:observe/review.js:10246:arrow_function",
+      "name": "<callback@173:40>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 173,
+      "endLine": 173,
+      "distance": null,
+      "source": "  const missing = reviewedPaths.filter((path) => !contributedPaths.includes(path));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:10257",
+          "line": 173,
+          "callee": "contributedPaths.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c045",
+      "symbolId": "syntax:observe/review.js:12618:arrow_function",
+      "name": "<callback@208:32>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 208,
+      "endLine": 208,
+      "distance": null,
+      "source": "  const altered = drift.filter((path) => reviewedPaths.includes(path));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:12628",
+          "line": 208,
+          "callee": "reviewedPaths.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c046",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/revList().",
+      "name": "revList",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 216,
+      "endLine": 222,
+      "distance": null,
+      "source": "function revList(worktree, commit, options) {\n  const probe = git(worktree, [\"rev-list\", \"--parents\", \"-n\", \"1\", commit], options);\n  if (!probe.ok) return null;\n  // \"<commit> <parent1> <parent2>...\" — drop the commit itself.\n  const fields = probe.stdout.trim().split(/\\s+/u).filter(Boolean);\n  return fields.length > 0 ? fields.slice(1) : null;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:12954",
+          "line": 217,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:13136",
+          "line": 220,
+          "callee": "probe.stdout.trim().split(/\\s+/u).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:13136",
+          "line": 220,
+          "callee": "probe.stdout.trim().split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:13136",
+          "line": 220,
+          "callee": "probe.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:13216",
+          "line": 221,
+          "callee": "fields.slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c047",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/pathsChanged().",
+      "name": "pathsChanged",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 224,
+      "endLine": 231,
+      "distance": null,
+      "source": "function pathsChanged(worktree, from, to, options) {\n  // -z, and no trimming: a filename may legitimately contain a newline, a tab, or\n  // leading and trailing spaces, and trimming one turned a real path into a pathspec\n  // that matched nothing.\n  const probe = git(worktree, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"-z\", from, to], options);\n  if (!probe.ok) return null;\n  return probe.stdout.split(\"\\0\").filter((path) => path !== \"\").sort();\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:13508",
+          "line": 228,
+          "callee": "git",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:13635",
+          "line": 230,
+          "callee": "probe.stdout.split(\"\\0\").filter((path) => path !== \"\").sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:13635",
+          "line": 230,
+          "callee": "probe.stdout.split(\"\\0\").filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c048"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:13635",
+          "line": 230,
+          "callee": "probe.stdout.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c048",
+      "symbolId": "syntax:observe/review.js:13667:arrow_function",
+      "name": "<callback@230:42>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 230,
+      "endLine": 230,
+      "distance": null,
+      "source": "  return probe.stdout.split(\"\\0\").filter((path) => path !== \"\").sort();",
+      "sourceTruncated": false,
+      "calls": []
+    }
+  ],
+  "scope": {
+    "eligibleCandidates": 89,
+    "includedCandidates": 48,
+    "omittedCandidates": 41,
+    "maxSourceChars": 1800,
+    "limitations": "Fixed candidate scope, truncated source excerpts, syntax-level source ordering. Callback references do not establish execution."
+  }
+}

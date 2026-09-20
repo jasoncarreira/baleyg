@@ -1,0 +1,16 @@
+[
+  {
+    "at": "2026-09-18T03:11:46.071070+00:00",
+    "artifact": "outputs/q01-smoke.claude.json",
+    "basis": "Final SDK cumulative token-equivalent USD report on a failed terminal turn; not an invoice",
+    "previousActualUsd": null,
+    "reportedEstimateUsd": 0.523703
+  },
+  {
+    "at": "2026-09-18T03:11:46.071459+00:00",
+    "artifact": "outputs/hard-v1/q02-atomic-branches.opus.json",
+    "basis": "Final SDK cumulative token-equivalent USD report on a failed terminal turn; not an invoice",
+    "previousActualUsd": null,
+    "reportedEstimateUsd": 1.4453295
+  }
+]

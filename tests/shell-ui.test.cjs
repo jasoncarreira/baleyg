@@ -1,0 +1,202 @@
+"use strict";
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+function harness(withApp = false) {
+  const elements = new Map(), requests = [], timers = new Map(); let timer = 0;
+  function node(tagName) {
+    const classes = new Set();
+    return {tagName, children:[], attrs:{}, listeners:{}, textContent:"", value:"", hidden:false, disabled:false,
+      classList:{add(c){classes.add(c);},remove(c){classes.delete(c);},contains(c){return classes.has(c);},toggle(c, force){const on = force ?? !classes.has(c); if(on)classes.add(c);else classes.delete(c);return on;}},
+      setAttribute(k,v){this.attrs[k]=String(v);}, getAttribute(k){return this.attrs[k];},
+      append(...items){this.children.push(...items);}, replaceChildren(...items){this.children=items;this.textContent="";},
+      addEventListener(type,fn){this.listeners[type]=fn;}, querySelector(){return null;}, focus(){this.focused=true;}, scrollIntoView(){}};
+  }
+  const get = id => { if(!elements.has(id))elements.set(id,node("div"));return elements.get(id); };
+  const document = {getElementById:get,createElement:node,createElementNS:(_,tag)=>node(tag),createTextNode:text=>({...node("#text"),textContent:text}),createDocumentFragment:()=>node("fragment"),body:node("body"),listeners:{},addEventListener(k,v){this.listeners[k]=v;}};
+  const context = vm.createContext({document,window:{confirm:()=>true},console,AbortController,DOMException,TextEncoder,
+    setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
+    fetch(path){requests.push(path);throw new Error("Unexpected request "+path);}});
+  const run = code => vm.runInContext(code,context);
+  if(withApp)run(fs.readFileSync("web/sequence.js","utf8"));
+  run(fs.readFileSync("web/shell.js","utf8"));
+  if(withApp){run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";status={revision:1,workspaceRoot:"/repo"};`);}
+  return {get,document,context,run,requests,shell:context.window.BaleygShell};
+}
+const all = node => [node,...node.children.flatMap(all)];
+const text = node => all(node).map(n=>n.textContent).join(" ");
+const range={startLine:3,startColumn:2,endLine:9,endColumn:7};
+const call=(id="entry",target="candidate")=>({id,callId:id,kind:"call",label:`Call full::${id} <script>`,path:"main.rs",range,target,resolution:"unresolved",children:[],alternate:[]});
+const view=(steps=[])=>({revision:1,seed:{id:"root",name:"root",path:"main.rs",range},participants:[{id:"root",kind:"method",label:"root"},{id:"candidate",kind:"externalCandidate",label:"Builder",identification:"Lexical type candidate, not resolved dispatch"},{id:"other",kind:"unresolvedReceiver",label:"Chain result"}],steps,warnings:[],hiddenSteps:0});
+const response=data=>({ok:true,status:200,json:async()=>data});
+const key=(element,value)=>{let prevented=false;element.listeners.keydown({key:value,preventDefault(){prevented=true;}});return prevented;};
+
+test("tabs have roving keyboard focus and never request source or providers",()=>{
+  const h=harness();
+  assert.equal(h.get("sequence-panel").hidden,false);assert.equal(h.get("dependency-library").hidden,true);
+  assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
+  assert.equal(h.get("view-classes").attrs["aria-selected"],"true");
+  assert.equal(h.get("classes-panel").hidden,false);
+  assert.ok(h.get("view-classes").focused);
+  assert.equal(key(h.get("view-classes"),"ArrowRight"),true);
+  assert.equal(h.get("view-libraries").attrs["aria-selected"],"true");assert.equal(h.get("view-libraries").tabIndex,0);assert.equal(h.get("view-sequence").tabIndex,-1);
+  assert.equal(h.get("dependency-library").hidden,false);assert.ok(h.get("view-libraries").focused);
+  key(h.get("view-libraries"),"End");assert.equal(h.get("tools-panel").hidden,false);
+  key(h.get("view-tools"),"Home");assert.equal(h.get("sequence-panel").hidden,false);
+  key(h.get("view-sequence"),"ArrowLeft");assert.equal(h.get("tools-panel").hidden,false);
+  h.shell.showView("terminal");assert.equal(h.get("tools-panel").hidden,false);assert.deepEqual(h.requests,[]);
+});
+test("source dock only changes presentation and can switch/close by keyboard",()=>{
+  const h=harness();assert.equal(h.get("source-dock").hidden,true);
+  h.shell.showSource("workspace");assert.equal(h.get("workspace-source-panel").hidden,false);
+  key(h.get("dock-workspace"),"ArrowRight");assert.equal(h.get("library-source-panel").hidden,false);
+  assert.equal(h.get("workspace-source-panel").hidden,true);
+  h.document.listeners.keydown({key:"Escape"});assert.equal(h.get("source-dock").hidden,true);
+  assert.deepEqual(h.requests,[]);
+});
+test("inspector uses safe original evidence, never claims candidate confidence",()=>{
+  const h=harness(),step=call();let opened=0;const original=JSON.stringify(step);
+  h.shell.selectStep(step,view([step]),()=>opened++);
+  assert.equal(opened,0);assert.equal(h.get("inspector-title").textContent,step.label);assert.equal(h.get("inspector-clear").disabled,false);
+  assert.match(h.get("inspector-target").textContent,/candidate, not resolved dispatch/);
+  assert.match(h.get("inspector-location").textContent,/main.rs:3:2–9:7 · revision 1/);
+  assert.match(h.get("inspector-evidence").textContent,/unresolved/);
+  assert.doesNotMatch(text(h.get("inspector-content"))+text(h.get("inspector-detail")),/confidence.*1\.0/);
+  assert.equal(all(h.get("inspector-detail")).some(n=>n.tagName==="script"),false);
+  h.get("inspector-open-source").listeners.click();assert.equal(opened,1);assert.equal(JSON.stringify(step),original);
+});
+test("group keeps first-entry target limitation, full source callback and all guard/alternate children",()=>{
+  const h=harness(),group={id:"chain",kind:"group",label:"Original full chain",path:"main.rs",range,children:[call(),call("finish","other")],alternate:[]};let selected;
+  h.shell.selectStep(group,view([group]),()=>{selected=group;});
+  assert.match(h.get("inspector-title").textContent,/\+1 chain calls/);assert.match(text(h.get("inspector-detail")),/Original full chain/);
+  assert.match(h.get("inspector-target").textContent,/First measured entry call only/);
+  assert.match(h.get("inspector-target").textContent,/different receivers and return types/);
+  assert.match(text(h.get("inspector-detail")),/full::finish/);
+  h.get("inspector-open-source").listeners.click();assert.equal(selected,group);assert.equal(selected.range,range);
+  const guard={...group,kind:"branch",label:"if !ready && original_guard",children:[{...call(),guard:"original guard text",hidden:true}],alternate:[{...call("exit"),kind:"return",label:"return original alternate"}]};
+  h.shell.selectStep(guard,view([guard]),()=>{});
+  assert.match(text(h.get("inspector-detail")),/original guard text/);assert.match(text(h.get("inspector-detail")),/return original alternate/);
+  assert.doesNotMatch(h.get("inspector-target").textContent,/First measured entry/);
+});
+test("inspector reset and disconnect erase source callback and workspace metadata",()=>{
+  const h=harness();let opened=0;h.shell.updateWorkspace({workspaceRoot:"/a/repo",revision:7,stats:{files:10}});
+  assert.equal(h.get("workspace-name").textContent,"repo");
+  h.shell.selectStep(call(),view(),()=>opened++);h.shell.resetInspector();h.get("inspector-open-source").listeners.click();
+  assert.equal(opened,0);assert.equal(h.get("inspector-open-source").disabled,true);assert.equal(h.get("inspector-clear").disabled,true);assert.equal(h.get("inspector-content").hidden,true);
+  h.shell.selectStep(call(),view(),()=>opened++);h.shell.showSource("workspace");h.shell.setConnected(false);h.get("inspector-open-source").listeners.click();
+  assert.equal(opened,0);assert.equal(h.get("source-dock").hidden,true);assert.equal(h.get("workspace-name").textContent,"No workspace");
+});
+test("responsive drawers use classes rather than hiding desktop panels",()=>{
+  const h=harness();h.context.window.matchMedia=()=>({matches:true});h.get("explorer-toggle").listeners.click();assert.ok(h.document.body.classList.contains("explorer-open"));
+  h.get("inspector-toggle").listeners.click();assert.equal(h.get("inspector-toggle").attrs["aria-expanded"],"true");
+  h.document.listeners.keydown({key:"Escape"});assert.equal(h.get("inspector-toggle").attrs["aria-expanded"],"false");
+  assert.equal(h.get("call-inspector").hidden,false);
+});
+async function selectedHarness() {
+  const h=harness(true),step=call(),data=view([step]);
+  h.context.fetch=async path=>{h.requests.push(path);if(path==="/api/sequence")return response(data);if(path.startsWith("/api/source?"))return response({revision:1,file:{path:"main.rs",text:"line1\nline2\nline3"}});throw new Error("Unexpected "+path);};
+  await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
+  const pick=all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source"));assert.ok(pick);
+  pick.listeners.click();
+  return h;
+}
+test("app row selection inspects without fetch; explicit Open call site reads guarded snapshot",async()=>{
+  const h=await selectedHarness();assert.deepEqual(h.requests,["/api/sequence"]);
+  assert.equal(h.get("inspector-content").hidden,false);
+  await h.get("inspector-open-source").listeners.click();assert.equal(h.requests.length,2);assert.match(h.requests[1],/^\/api\/source\?/);
+  assert.equal(h.get("source-dock").hidden,false);assert.equal(h.get("workspace-source-panel").hidden,false);
+});
+for(const change of ["method","revision","disconnect","index"] ) test(`app invalidates inspector callbacks after ${change}`,async()=>{
+  const h=await selectedHarness(),open=h.get("inspector-open-source").listeners.click;
+  if(change==="method")await h.run(`selectMethod({id:"new",name:"new",path:"main.rs",range:{startLine:1,endLine:1}})`);
+  if(change==="revision")h.run(`status.revision=2;clearBrowse();`);
+  if(change==="disconnect")h.get("logout").listeners.click();
+  if(change==="index") {h.context.fetch=async()=>response({id:"job",state:"running"});await h.get("index").listeners.click();}
+  await open();assert.equal(h.requests.some(p=>p.startsWith("/api/source?")),false);
+  assert.equal(h.get("inspector-content").hidden,true);
+});
+test("captured app source callback rejects revision/session changes even without a shell reset",async()=>{
+  const h=harness(true);let callback;
+  h.context.window.BaleygShell.selectStep=(_,__,source)=>{callback=source;};
+  h.context.fetch=async()=>response(view([call()]));await h.run(`selectMethod(${JSON.stringify(view().seed)})`);
+  all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source")).listeners.click();
+  h.context.fetch=()=>{throw new Error("Stale source fetch");};h.run("status.revision=2;epoch++;");
+  await callback();assert.equal(h.get("source-dock").hidden,true);
+});
+
+test("in-flight call source cannot reopen the dock after a new method clears it",async()=>{
+  const h=await selectedHarness();let resolve;
+  h.context.fetch=()=>new Promise(done=>{resolve=done;});
+  const pending=h.get("inspector-open-source").listeners.click();
+  h.run("clearBrowse();clearSource();");
+  resolve(response({revision:1,file:{path:"main.rs",text:"obsolete"}}));await pending;
+  assert.equal(h.get("source-dock").hidden,true);assert.doesNotMatch(text(h.get("source")),/obsolete/);
+});
+test("successful candidate source opens the library dock without changing method or active view",async()=>{
+  const h=harness(true),root={id:"rust",label:"Rust"};
+  h.run(`selectedMethod={id:"kept"};`);h.shell.showView("libraries");
+  h.context.fetch=async()=>response({rootId:"rust",rootLabel:"Rust",path:"lib.rs",hash:"hash",file:{text:"candidate"},definitions:[],warnings:[]});
+  await h.run(`loadExternalFile(${JSON.stringify(root)},"lib.rs")`);
+  assert.equal(h.get("library-source-panel").hidden,false);assert.equal(h.get("source-dock").hidden,false);
+  assert.equal(h.get("dependency-library").hidden,false);assert.equal(h.run("selectedMethod.id"),"kept");
+});
+
+for (const mode of ["manual", "catalog"]) test(`${mode} source loading/failure stays visible when source dock is closed`,async()=>{
+  const h=harness(true);h.shell.showView("libraries");let resolve;
+  h.context.fetch=()=>new Promise(done=>{resolve=done;});
+  if(mode==="catalog")h.run(`dependencyCatalog={catalogId:"catalog",state:"ready"};dependencyPackage={id:"pkg"};`);
+  const pending=h.run(mode==="manual" ? `loadExternalFile({id:"rust",label:"Rust"},"lib.rs")` : `loadDependencySource({id:"symbol",packageId:"pkg",name:"open",sourceRef:"ref",path:"lib.rs"})`);
+  const state=h.get(mode==="manual"?"external-state":"dependency-symbol-state");
+  assert.match(state.textContent,/Loading candidate/);assert.equal(h.get("source-dock").hidden,true);
+  resolve({ok:false,status:409,json:async()=>({error:{message:"Candidate expired"}})});await pending;
+  assert.match(state.textContent,/Candidate expired/);assert.equal(h.get("source-dock").hidden,true);assert.equal(h.get("dependency-library").hidden,false);
+});
+
+test("closing a library dock restores invoking control or active tab, not disabled method source",()=>{
+  const h=harness(),invoker=h.get("definition");h.shell.showView("libraries");h.get("method-source").disabled=true;
+  h.document.activeElement=invoker;h.shell.showSource("library");h.get("source-dock-close").listeners.click();assert.ok(invoker.focused);
+  invoker.hidden=true;h.shell.showSource("library");h.get("source-dock-close").listeners.click();assert.ok(h.get("view-libraries").focused);
+  h.shell.selectStep(call(),view(),()=>{});h.shell.showSource("library");h.document.listeners.keydown({key:"Escape"});assert.equal(h.get("source-dock").hidden,true);
+});
+
+
+test("inspector keeps raw evidence folded and source action before full details", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../web/index.html"), "utf8");
+  assert.ok(html.indexOf('id="inspector-open-source"') < html.indexOf('id="inspector-detail"'));
+  const source = fs.readFileSync(path.join(__dirname, "../web/shell.js"), "utf8");
+  assert.doesNotMatch(source, /evidence\(step, detail[^;]+\.open = true/);
+  assert.match(source, /full && target.identification/);
+});
+
+
+test("mobile drawers are exclusive and explicit source exposes the dock", () => {
+  const h = harness();
+  h.context.window.matchMedia = () => ({matches:true});
+  h.get("explorer-toggle").listeners.click();
+  assert.equal(h.document.body.classList.contains("explorer-open"), true);
+  h.shell.selectStep(call(), view(), () => {});
+  assert.equal(h.document.body.classList.contains("explorer-open"), false);
+  assert.equal(h.document.body.classList.contains("inspector-open"), true);
+  h.shell.showSource("workspace");
+  assert.equal(h.document.body.classList.contains("inspector-open"), false);
+  assert.equal(h.get("source-dock").hidden, false);
+  assert.equal(h.get("dock-workspace").focused, true);
+  h.get("explorer-toggle").listeners.click();
+  h.shell.showView("sequence");
+  assert.equal(h.document.body.classList.contains("explorer-open"), false);
+});
+
+
+test("desktop source clears latent drawers before a mobile resize", () => {
+  const h = harness();
+  h.context.window.matchMedia = () => ({matches:false});
+  h.shell.selectStep(call(), view(), () => {});
+  assert.equal(h.document.body.classList.contains("inspector-open"), true);
+  h.shell.showSource("workspace");
+  h.context.window.matchMedia = () => ({matches:true});
+  assert.equal(h.document.body.classList.contains("inspector-open"), false);
+  assert.equal(h.document.body.classList.contains("explorer-open"), false);
+  assert.equal(h.get("source-dock").hidden, false);
+});

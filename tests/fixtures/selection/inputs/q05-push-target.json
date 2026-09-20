@@ -1,0 +1,2832 @@
+{
+  "schemaVersion": 1,
+  "questionId": "q05-push-target",
+  "question": "How do bootstrap and check differ when enforcing the effective push target, and why are targets compared as bytes?",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "seedId": "c001",
+  "labels": [
+    "essential",
+    "supporting",
+    "incidental",
+    "uncertain"
+  ],
+  "candidates": [
+    {
+      "id": "c001",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/enforceEffectivePushTarget().",
+      "name": "enforceEffectivePushTarget",
+      "kind": "function",
+      "path": "core/effective-push.js",
+      "startLine": 59,
+      "endLine": 88,
+      "distance": 0,
+      "source": "export function enforceEffectivePushTarget(positionals, { spawnSync: run = spawnSync } = {}) {\n  if (!Array.isArray(positionals) || positionals.length !== 3) throw failure(ARITY_ERROR);\n  if (positionals.some((value) => typeof value !== \"string\" || value.length === 0)) throw failure(EMPTY_ERROR);\n  const [operation, operatorRepository, sandboxRepository] = positionals;\n  if (operation !== \"bootstrap\" && operation !== \"check\") throw failure(OPERATION_ERROR);\n\n  let operatorTarget = capture(run, operatorRepository);\n  if (operatorTarget === null) {\n    throw failure(`factory sandbox: operator effective push target unavailable; sandbox retained at ${sandboxRepository}`);\n  }\n  if (operation === \"bootstrap\") {\n    if (!argvSafe(operatorTarget)) {\n      throw failure(`factory sandbox: operator effective push target is not representable for configuration; sandbox retained at ${sandboxRepository}`);\n    }\n    if (!configure(run, sandboxRepository, operatorTarget.toString(\"utf8\"))) {\n      throw failure(`factory sandbox: sandbox effective push target unavailable at ${sandboxRepository}`);\n    }\n    operatorTarget = capture(run, operatorRepository);\n    if (operatorTarget === null) {\n      throw failure(`factory sandbox: operator effective push target unavailable; sandbox retained at ${sandboxRepository}`);\n    }\n  }\n  const sandboxTarget = capture(run, sandboxRepository);\n  if (sandboxTarget === null) {\n    throw failure(`factory sandbox: sandbox effective push target unavailable at ${sandboxRepository}`);\n  }\n  if (!sandboxTarget.equals(operatorTarget)) {\n    throw failure(`factory sandbox: sandbox effective push target does not match operator target; sandbox retained at ${sandboxRepository}`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/effective-push.js:2753",
+          "line": 60,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:2815",
+          "line": 60,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:2843",
+          "line": 61,
+          "callee": "positionals.some",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c006"
+          ]
+        },
+        {
+          "id": "call:core/effective-push.js:2927",
+          "line": 61,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3087",
+          "line": 63,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3137",
+          "line": 65,
+          "callee": "capture",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3214",
+          "line": 67,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3376",
+          "line": 70,
+          "callee": "argvSafe",
+          "target": "c004",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3416",
+          "line": 71,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3572",
+          "line": 73,
+          "callee": "configure",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3606",
+          "line": 73,
+          "callee": "operatorTarget.toString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3654",
+          "line": 74,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3776",
+          "line": 76,
+          "callee": "capture",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:3857",
+          "line": 78,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:4005",
+          "line": 81,
+          "callee": "capture",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:4080",
+          "line": 83,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:4186",
+          "line": 85,
+          "callee": "sandboxTarget.equals",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:4236",
+          "line": 86,
+          "callee": "failure",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c002",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/failure().",
+      "name": "failure",
+      "kind": "function",
+      "path": "core/effective-push.js",
+      "startLine": 7,
+      "endLine": 9,
+      "distance": 1,
+      "source": "function failure(message) {\n  return new Error(message);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/effective-push.js:414",
+          "line": 8,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c003",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/capture().",
+      "name": "capture",
+      "kind": "function",
+      "path": "core/effective-push.js",
+      "startLine": 23,
+      "endLine": 42,
+      "distance": 1,
+      "source": "function capture(run, repository) {\n  let result;\n  try {\n    result = execute(run, [\"-C\", repository, \"remote\", \"get-url\", \"--push\", \"origin\"]);\n  } catch {\n    return null;\n  }\n  if (!result || result.error || result.signal !== null && result.signal !== undefined\n    || result.status !== 0 || result.stdout === null || result.stdout === undefined) return null;\n  // A test double may still hand back a string; normalise to bytes either way.\n  const raw = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(String(result.stdout), \"utf8\");\n  // Exactly one LF, because git contributes exactly one record terminator. Stripping every\n  // trailing LF would make a target that itself ends in LF indistinguishable from one that\n  // does not: operator bytes `path\\n` are emitted as `path\\n\\n` and sandbox bytes `path` as\n  // `path\\n`, and a greedy strip reduces both to `path` and accepts two unequal targets.\n  // Absent terminator means this is not the output shape being parsed, so fail closed.\n  if (raw.length === 0 || raw[raw.length - 1] !== 0x0a) return null;\n  const target = raw.subarray(0, raw.length - 1);\n  return target.length > 0 ? Buffer.from(target) : null;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/effective-push.js:1017",
+          "line": 26,
+          "callee": "execute",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:1404",
+          "line": 33,
+          "callee": "Buffer.isBuffer",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:1453",
+          "line": 33,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:1465",
+          "line": 33,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:2038",
+          "line": 40,
+          "callee": "raw.subarray",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:2100",
+          "line": 41,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c004",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/argvSafe().",
+      "name": "argvSafe",
+      "kind": "function",
+      "path": "core/effective-push.js",
+      "startLine": 47,
+      "endLine": 49,
+      "distance": 1,
+      "source": "function argvSafe(target) {\n  return Buffer.from(target.toString(\"utf8\"), \"utf8\").equals(target);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/effective-push.js:2377",
+          "line": 48,
+          "callee": "Buffer.from(target.toString(\"utf8\"), \"utf8\").equals",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:2377",
+          "line": 48,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/effective-push.js:2389",
+          "line": 48,
+          "callee": "target.toString",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c005",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/configure().",
+      "name": "configure",
+      "kind": "function",
+      "path": "core/effective-push.js",
+      "startLine": 51,
+      "endLine": 57,
+      "distance": 1,
+      "source": "function configure(run, repository, target) {\n  try {\n    return execute(run, [\"-C\", repository, \"config\", \"--replace-all\", \"remote.origin.pushurl\", target])?.status === 0;\n  } catch {\n    return false;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/effective-push.js:2506",
+          "line": 53,
+          "callee": "execute",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c006",
+      "symbolId": "syntax:core/effective-push.js:2860:arrow_function",
+      "name": "<callback@61:24>",
+      "kind": "function",
+      "path": "core/effective-push.js",
+      "startLine": 61,
+      "endLine": 61,
+      "distance": 1,
+      "source": "  if (positionals.some((value) => typeof value !== \"string\" || value.length === 0)) throw failure(EMPTY_ERROR);",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c007",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`effective-push.js`/execute().",
+      "name": "execute",
+      "kind": "function",
+      "path": "core/effective-push.js",
+      "startLine": 11,
+      "endLine": 21,
+      "distance": 2,
+      "source": "function execute(run, args) {\n  // No `encoding`: stdout stays a Buffer. Decoding to utf8 replaces every distinct\n  // invalid byte sequence with the same U+FFFD, so two unequal targets could compare\n  // equal here while `git push` used the original raw bytes. A local-path remote on\n  // Unix may legitimately hold non-UTF-8 bytes, so this is reachable, not theoretical.\n  return run(\"git\", args, {\n    shell: false,\n    env: { ...process.env, LC_ALL: \"C\" },\n    stdio: [\"ignore\", \"pipe\", \"pipe\"],\n  });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/effective-push.js:819",
+          "line": 16,
+          "callee": "run",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c008",
+      "symbolId": "syntax:bin/factory.js:4515:arrow_function",
+      "name": "cwd",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 59,
+      "endLine": 59,
+      "distance": null,
+      "source": "  cwd: () => process.cwd(), resolvePath: resolve, joinPath: join,",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:4521",
+          "line": 59,
+          "callee": "process.cwd",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c009",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/CliError#`<constructor>`().",
+      "name": "constructor",
+      "kind": "method",
+      "path": "bin/factory.js",
+      "startLine": 65,
+      "endLine": 68,
+      "distance": null,
+      "source": "  constructor(message, options) {\n    super(message, options);\n    this.name = \"CliError\";\n  }",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:4810",
+          "line": 66,
+          "callee": "super",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c010",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/run().",
+      "name": "run",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 71,
+      "endLine": 78,
+      "distance": null,
+      "source": "export async function run(argv) {\n  const [command, ...rest] = argv;\n  if (!command || command === \"--help\" || command === \"-h\") return usage();\n  if (!Object.hasOwn(COMMANDS, command)) throw new CliError(`unknown command '${command}' (try --help)`);\n  const { positional, flags } = parse(command, rest);\n  const handler = HANDLERS[command];\n  return handler(positional, flags);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:5006",
+          "line": 73,
+          "callee": "usage",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5022",
+          "line": 74,
+          "callee": "Object.hasOwn",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5062",
+          "line": 74,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5153",
+          "line": 75,
+          "callee": "parse",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5221",
+          "line": 77,
+          "callee": "handler",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c011",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/parse().",
+      "name": "parse",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 80,
+      "endLine": 103,
+      "distance": null,
+      "source": "function parse(command, args) {\n  const allowed = COMMANDS[command];\n  const positional = [];\n  const flags = {};\n  for (let index = 0; index < args.length; index += 1) {\n    const arg = args[index];\n    if (!arg.startsWith(\"--\")) {\n      positional.push(arg);\n      continue;\n    }\n    if (!allowed.includes(arg)) throw new CliError(`unknown option '${arg}' for '${command}'`);\n    if (BOOLEAN_FLAGS.has(arg)) {\n      flags[key(arg)] = true;\n      continue;\n    }\n    const value = args[index + 1];\n    if (value === undefined || value.startsWith(\"--\")) throw new CliError(`${arg} requires a value`);\n    const flagKey = key(arg);\n    if (arg === \"--add\") flags[flagKey] = [...(flags[flagKey] ?? []), value];\n    else flags[flagKey] = value;\n    index += 1;\n  }\n  return { positional, flags };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:5461",
+          "line": 86,
+          "callee": "arg.startsWith",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5491",
+          "line": 87,
+          "callee": "positional.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5544",
+          "line": 90,
+          "callee": "allowed.includes",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5573",
+          "line": 90,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5639",
+          "line": 91,
+          "callee": "BOOLEAN_FLAGS.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5677",
+          "line": 92,
+          "callee": "key",
+          "target": "c012",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5783",
+          "line": 96,
+          "callee": "value.startsWith",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5813",
+          "line": 96,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:5874",
+          "line": 97,
+          "callee": "key",
+          "target": "c012",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c012",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/key.",
+      "name": "key",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 105,
+      "endLine": 105,
+      "distance": null,
+      "source": "const key = (flag) => flag.slice(2).replace(/-([a-z])/gu, (_match, letter) => letter.toUpperCase());",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:6072",
+          "line": 105,
+          "callee": "flag.slice(2).replace",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c013"
+          ]
+        },
+        {
+          "id": "call:bin/factory.js:6072",
+          "line": 105,
+          "callee": "flag.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c013",
+      "symbolId": "syntax:bin/factory.js:6108:arrow_function",
+      "name": "<callback@105:59>",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 105,
+      "endLine": 105,
+      "distance": null,
+      "source": "const key = (flag) => flag.slice(2).replace(/-([a-z])/gu, (_match, letter) => letter.toUpperCase());",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:6128",
+          "line": 105,
+          "callee": "letter.toUpperCase",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c014",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/planDigest().",
+      "name": "planDigest",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 107,
+      "endLine": 109,
+      "distance": null,
+      "source": "function planDigest(bytes) {\n  return `sha256:${createHash(\"sha256\").update(bytes).digest(\"hex\")}`;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:6200",
+          "line": 108,
+          "callee": "createHash(\"sha256\").update(bytes).digest",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:6200",
+          "line": 108,
+          "callee": "createHash(\"sha256\").update",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:6200",
+          "line": 108,
+          "callee": "createHash",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c015",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/assertExecutableTestPlan().",
+      "name": "assertExecutableTestPlan",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 117,
+      "endLine": 131,
+      "distance": null,
+      "source": "function assertExecutableTestPlan(slices, cwd, missingOnly = false) {\n  for (const slice of slices) for (const entry of Array.isArray(slice.test_plan) ? slice.test_plan : []) {\n    if (typeof entry !== \"string\") continue;\n    const prefix = `slice '${slice.id}' test_plan entry ${JSON.stringify(entry)} cannot be executed by observe as argv without a shell: `;\n    const tokens = entry.split(\" \").filter(Boolean);\n    const argv0 = tokens[0];\n    if (!argv0) throw new Error(`${prefix}argv[0] is missing`);\n    if (missingOnly) continue;\n    const refused = tokens.find((token) => REFUSED_TEST_TOKENS.includes(token));\n    if (refused) throw new Error(`${prefix}contains shell operator token ${JSON.stringify(refused)}`);\n    const found = resolveSpawnExecutable(argv0, { cwd });\n    if (found.reason === \"unsupported-platform\") throw new Error(`${prefix}argv[0] resolution is POSIX-only and cannot predict this platform's shell-free spawn (${found.platform}); seeding refuses rather than admit a command observe may fail to run`);\n    if (!found.ok) throw new Error(`${prefix}argv[0] ${JSON.stringify(argv0)} did not resolve to an executable via ${found.source} from repository cwd ${JSON.stringify(cwd)}`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:6951",
+          "line": 118,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7111",
+          "line": 120,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7211",
+          "line": 121,
+          "callee": "entry.split(\" \").filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7211",
+          "line": 121,
+          "callee": "entry.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7296",
+          "line": 123,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7389",
+          "line": 125,
+          "callee": "tokens.find",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c016"
+          ]
+        },
+        {
+          "id": "call:bin/factory.js:7473",
+          "line": 126,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7525",
+          "line": 126,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7571",
+          "line": 127,
+          "callee": "resolveSpawnExecutable",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7666",
+          "line": 128,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7888",
+          "line": 129,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:7918",
+          "line": 129,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:8016",
+          "line": 129,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c016",
+      "symbolId": "syntax:bin/factory.js:7401:arrow_function",
+      "name": "<callback@125:33>",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 125,
+      "endLine": 125,
+      "distance": null,
+      "source": "    const refused = tokens.find((token) => REFUSED_TEST_TOKENS.includes(token));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:7412",
+          "line": 125,
+          "callee": "REFUSED_TEST_TOKENS.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c017",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/presentedPlanDigest().",
+      "name": "presentedPlanDigest",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 140,
+      "endLine": 146,
+      "distance": null,
+      "source": "function presentedPlanDigest(runDir) {\n  try {\n    return planDigest(readFileSync(join(runDir, \"plan/slices.json\")));\n  } catch (error) {\n    throw new CliError(`could not read plan/slices.json to bind the brief presentation: ${error.message}`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:8743",
+          "line": 142,
+          "callee": "planDigest",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:8754",
+          "line": 142,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:8767",
+          "line": 142,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:8833",
+          "line": 144,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c018",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/briefDigestFor().",
+      "name": "briefDigestFor",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 151,
+      "endLine": 159,
+      "distance": null,
+      "source": "function briefDigestFor(decision, state, runDir) {\n  if (decision === \"pending\") return presentedPlanDigest(runDir);\n  if (decision !== \"approved\") return null;\n  if (!state.plan_digest) throw new CliError(\"the brief gate was not presented; move it to pending first\");\n  if (state.plan_digest !== presentedPlanDigest(runDir)) {\n    throw new CliError(\"plan/slices.json changed since the brief gate was presented; re-present it before approving\");\n  }\n  return state.plan_digest;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:9304",
+          "line": 152,
+          "callee": "presentedPlanDigest",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:9409",
+          "line": 154,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:9513",
+          "line": 155,
+          "callee": "presentedPlanDigest",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:9554",
+          "line": 156,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c019",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/planeInventory().",
+      "name": "planeInventory",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 180,
+      "endLine": 203,
+      "distance": null,
+      "source": "function planeInventory(root) {\n  const entries = [];\n  const record = (rel, full) => {\n    // The session lock is liveness, not run state, and it is the one entry in the plane designed to change\n    // on a timer. Comparing it made every snapshot invalid within one heartbeat: a live park published a\n    // complete, byte-correct plane and `status` reported `park_snapshot: null` eleven seconds later,\n    // because the copy held `heartbeat_at` 23:28:25 and the plane had moved to 23:28:36. The whole point\n    // of the field was to answer \"did the driver publish it\", and it answered \"no\" for a snapshot that was\n    // there -- the same disagree-with-your-own-description defect the 0.8.3 work existed to remove,\n    // reintroduced by the check built to remove it. Every existing test publishes and reads back with no\n    // heartbeat in between, which is why three review rounds and a real park all missed it.\n    if (rel === SESSION_LOCK_FILE) return;\n    const stat = lstatSync(full);\n    const mode = (stat.mode & 0o7777).toString(8);\n    if (stat.isSymbolicLink()) entries.push(`${rel} l ${mode} ${readlinkSync(full)}`);\n    else if (stat.isDirectory()) {\n      entries.push(`${rel} d ${mode}`);\n      for (const name of readdirSync(full)) record(rel === \".\" ? name : `${rel}/${name}`, join(full, name));\n    } else if (stat.isFile()) entries.push(`${rel} f ${mode} ${createHash(\"sha256\").update(readFileSync(full)).digest(\"hex\")}`);\n    else throw new CliError(`unsupported entry type in '${full}'`);\n  };\n  record(\".\", root);\n  return entries.sort().join(\"\\n\");\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:13104",
+          "line": 201,
+          "callee": "record",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13132",
+          "line": 202,
+          "callee": "entries.sort().join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13132",
+          "line": 202,
+          "callee": "entries.sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c020",
+      "symbolId": "local:bin/factory.js:local 76",
+      "name": "record",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 182,
+      "endLine": 200,
+      "distance": null,
+      "source": "  const record = (rel, full) => {\n    // The session lock is liveness, not run state, and it is the one entry in the plane designed to change\n    // on a timer. Comparing it made every snapshot invalid within one heartbeat: a live park published a\n    // complete, byte-correct plane and `status` reported `park_snapshot: null` eleven seconds later,\n    // because the copy held `heartbeat_at` 23:28:25 and the plane had moved to 23:28:36. The whole point\n    // of the field was to answer \"did the driver publish it\", and it answered \"no\" for a snapshot that was\n    // there -- the same disagree-with-your-own-description defect the 0.8.3 work existed to remove,\n    // reintroduced by the check built to remove it. Every existing test publishes and reads back with no\n    // heartbeat in between, which is why three review rounds and a real park all missed it.\n    if (rel === SESSION_LOCK_FILE) return;\n    const stat = lstatSync(full);\n    const mode = (stat.mode & 0o7777).toString(8);\n    if (stat.isSymbolicLink()) entries.push(`${rel} l ${mode} ${readlinkSync(full)}`);\n    else if (stat.isDirectory()) {\n      entries.push(`${rel} d ${mode}`);\n      for (const name of readdirSync(full)) record(rel === \".\" ? name : `${rel}/${name}`, join(full, name));\n    } else if (stat.isFile()) entries.push(`${rel} f ${mode} ${createHash(\"sha256\").update(readFileSync(full)).digest(\"hex\")}`);\n    else throw new CliError(`unsupported entry type in '${full}'`);\n  };",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:12561",
+          "line": 192,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12595",
+          "line": 193,
+          "callee": "(stat.mode & 0o7777).toString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12637",
+          "line": 194,
+          "callee": "stat.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12660",
+          "line": 194,
+          "callee": "entries.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12693",
+          "line": 194,
+          "callee": "readlinkSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12729",
+          "line": 195,
+          "callee": "stat.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12757",
+          "line": 196,
+          "callee": "entries.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12816",
+          "line": 197,
+          "callee": "readdirSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12835",
+          "line": 197,
+          "callee": "record",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12881",
+          "line": 197,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12915",
+          "line": 198,
+          "callee": "stat.isFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12930",
+          "line": 198,
+          "callee": "entries.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12963",
+          "line": 198,
+          "callee": "createHash(\"sha256\").update(readFileSync(full)).digest",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12963",
+          "line": 198,
+          "callee": "createHash(\"sha256\").update",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12963",
+          "line": 198,
+          "callee": "createHash",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:12991",
+          "line": 198,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13044",
+          "line": 199,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c021",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/observedParkSnapshot().",
+      "name": "observedParkSnapshot",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 205,
+      "endLine": 219,
+      "distance": null,
+      "source": "function observedParkSnapshot(repo, runId, runDir) {\n  const container = dirname(repo);\n  if (basename(container) !== \".factory-sandboxes\" || basename(repo) !== runId) return null;\n  const operatorRoot = dirname(container);\n  const candidate = join(operatorRoot, CONTROL_PLANE, \".parked\", runId);\n  try {\n    for (const component of [join(operatorRoot, CONTROL_PLANE), join(operatorRoot, CONTROL_PLANE, \".parked\"), candidate]) {\n      if (!lstatSync(component).isDirectory()) return null;\n    }\n    if (planeInventory(candidate) !== planeInventory(runDir)) return null;\n    return readFileSync(join(candidate, \"run.json\")).equals(readFileSync(join(runDir, \"run.json\"))) ? candidate : null;\n  } catch {\n    return null;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:13235",
+          "line": 206,
+          "callee": "dirname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13256",
+          "line": 207,
+          "callee": "basename",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13304",
+          "line": 207,
+          "callee": "basename",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13366",
+          "line": 208,
+          "callee": "dirname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13406",
+          "line": 209,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13496",
+          "line": 211,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13531",
+          "line": 211,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13602",
+          "line": 212,
+          "callee": "lstatSync(component).isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13602",
+          "line": 212,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13665",
+          "line": 214,
+          "callee": "planeInventory",
+          "target": "c019",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13695",
+          "line": 214,
+          "callee": "planeInventory",
+          "target": "c019",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13743",
+          "line": 215,
+          "callee": "readFileSync(join(candidate, \"run.json\")).equals",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13743",
+          "line": 215,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13756",
+          "line": 215,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13792",
+          "line": 215,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13805",
+          "line": 215,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c022",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/runDirFor().",
+      "name": "runDirFor",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 221,
+      "endLine": 224,
+      "distance": null,
+      "source": "function runDirFor(flags, runId) {\n  if (!runId) throw new CliError(\"a <run-id> is required\");\n  return join(resolve(flags.repo ?? process.cwd()), CONTROL_PLANE, runId);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:13943",
+          "line": 222,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13992",
+          "line": 223,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:13997",
+          "line": 223,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:14019",
+          "line": 223,
+          "callee": "process.cwd",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c023",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/assertRunNotParked().",
+      "name": "assertRunNotParked",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 226,
+      "endLine": 232,
+      "distance": null,
+      "source": "function assertRunNotParked(runDir, command) {\n  const run = readRun(runDir);\n  if (run.status === \"needs-human\") {\n    throw new CliError(`factory ${command} refuses while run status is needs-human; run factory resume first`);\n  }\n  return run;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:14122",
+          "line": 227,
+          "callee": "readRun",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:14187",
+          "line": 229,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c024",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/assertFreshSessionOwner().",
+      "name": "assertFreshSessionOwner",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 234,
+      "endLine": 246,
+      "distance": null,
+      "source": "function assertFreshSessionOwner(runDir, runId, session, command) {\n  const held = inspectSessionLock(runDir);\n  if (held.state === \"absent\") {\n    throw new CliError(`factory ${command} requires a held session lock for run '${runId}'; claim it with 'lock ${runId} claim --session ${session}'`);\n  }\n  if (held.state === \"stale\") {\n    throw new CliError(`factory ${command} refuses a stale session lock for run '${runId}' (owner ${held.owner.session}, heartbeat ${held.owner.heartbeat_at}); take it with 'lock ${runId} steal --session ${session}'`);\n  }\n  if (held.owner.session !== session) {\n    throw new CliError(`run '${runId}' is held by session ${held.owner.session}, not ${session}; take it with 'lock ${runId} steal --session ${session}'`);\n  }\n  return held.owner;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:14393",
+          "line": 235,
+          "callee": "inspectSessionLock",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:14464",
+          "line": 237,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:14652",
+          "line": 240,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:14915",
+          "line": 243,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c025",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/sameSessionOwner().",
+      "name": "sameSessionOwner",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 248,
+      "endLine": 253,
+      "distance": null,
+      "source": "function sameSessionOwner(runDir, bound) {\n  const held = inspectSessionLock(runDir);\n  if (held.state !== \"fresh\" || Date.parse(held.owner.heartbeat_at) < Date.parse(bound.heartbeat_at)) return false;\n  return [\"session\", \"run_id\", \"branch\", \"claimed_at\", \"pid\"]\n    .every((keyName) => isDeepStrictEqual(held.owner[keyName], bound[keyName]));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:15147",
+          "line": 249,
+          "callee": "inspectSessionLock",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15207",
+          "line": 250,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15245",
+          "line": 250,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15300",
+          "line": 251,
+          "callee": "[\"session\", \"run_id\", \"branch\", \"claimed_at\", \"pid\"]\n    .every",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c026"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c026",
+      "symbolId": "syntax:bin/factory.js:15364:arrow_function",
+      "name": "<callback@252:12>",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 252,
+      "endLine": 252,
+      "distance": null,
+      "source": "    .every((keyName) => isDeepStrictEqual(held.owner[keyName], bound[keyName]));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:15377",
+          "line": 252,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c027",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/validatePathAdditions().",
+      "name": "validatePathAdditions",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 255,
+      "endLine": 273,
+      "distance": null,
+      "source": "function validatePathAdditions(slice, additions) {\n  for (const path of additions) {\n    if (!repositoryRelativePath(path)) {\n      throw new CliError(`added path '${path}' must be non-empty, repository-relative, and contain no '..' segment`);\n    }\n  }\n  const privileged = privilegedPaths(additions);\n  if (privileged.length > 0) throw new CliError(`cannot amend privileged control-plane paths: ${privileged.join(\", \")}`);\n  const seen = new Set();\n  for (const path of additions) {\n    if (seen.has(path)) throw new CliError(`duplicate requested path '${path}'`);\n    seen.add(path);\n  }\n  for (const path of additions) {\n    if (unownedPaths([path], slice.paths).length === 0) {\n      throw new CliError(`slice '${slice.id}' already owns requested path '${path}'`);\n    }\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:15531",
+          "line": 257,
+          "callee": "repositoryRelativePath",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15575",
+          "line": 258,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15712",
+          "line": 261,
+          "callee": "privilegedPaths",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15775",
+          "line": 262,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15836",
+          "line": 262,
+          "callee": "privileged.join",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15877",
+          "line": 263,
+          "callee": "Set",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15930",
+          "line": 265,
+          "callee": "seen.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:15952",
+          "line": 265,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:16008",
+          "line": 266,
+          "callee": "seen.add",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:16070",
+          "line": 269,
+          "callee": "unownedPaths",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:16132",
+          "line": 270,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c028",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/integrationHead().",
+      "name": "integrationHead",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 283,
+      "endLine": 287,
+      "distance": null,
+      "source": "function integrationHead(repo, run) {\n  const worktree = resolveWorktree(repo, run.worktree);\n  if (!worktree) throw new CliError(`integration worktree '${run.worktree}' is not observable`);\n  return { worktree, commit: observeWorktree(worktree, run.branch, { ref: run.branch }).commit };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:16848",
+          "line": 284,
+          "callee": "resolveWorktree",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:16908",
+          "line": 285,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17011",
+          "line": 286,
+          "callee": "observeWorktree",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c029",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/requireIntegrationWorktree().",
+      "name": "requireIntegrationWorktree",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 289,
+      "endLine": 320,
+      "distance": null,
+      "source": "function requireIntegrationWorktree(repo, run, suppliedWorktree) {\n  let repository;\n  let committed;\n  let supplied;\n  try {\n    repository = realpathSync(resolve(repo));\n    const committedPath = resolveWorktree(repository, run.worktree);\n    const suppliedPath = resolveWorktree(repository, suppliedWorktree);\n    committed = committedPath ? realpathSync(committedPath) : null;\n    supplied = suppliedPath ? realpathSync(suppliedPath) : null;\n  } catch {\n    committed = null;\n    supplied = null;\n  }\n  if (!repository || !committed || !supplied || committed !== supplied\n    || resolveWorktree(repository, committed) !== committed || resolveWorktree(repository, supplied) !== supplied) {\n    throw new CliError(`integration worktree mismatch: committed '${run.worktree}' resolves to '${committed ?? \"unobservable\"}', supplied '${suppliedWorktree}' resolves to '${supplied ?? \"unobservable\"}'`);\n  }\n  const branch = git(committed, [\"symbolic-ref\", \"--quiet\", \"--short\", \"HEAD\"]);\n  const observedBranch = branch.ok && branch.stdout.trim() ? branch.stdout.trim() : \"detached HEAD\";\n  if (observedBranch !== run.branch) {\n    throw new CliError(`integration worktree must have branch '${run.branch}' checked out; observed ${observedBranch}`);\n  }\n  const head = git(committed, [\"rev-parse\", \"--verify\", \"HEAD^{commit}\"]);\n  const tip = git(committed, [\"rev-parse\", \"--verify\", `refs/heads/${run.branch}^{commit}`]);\n  const headSha = head.ok ? head.stdout.trim() : \"\";\n  const tipSha = tip.ok ? tip.stdout.trim() : \"\";\n  if (!/^[0-9a-f]{40}$/u.test(headSha) || !/^[0-9a-f]{40}$/u.test(tipSha) || headSha !== tipSha) {\n    throw new CliError(`integration HEAD must equal the current recorded branch tip for '${run.branch}'`);\n  }\n  return { worktree: committed, head: headSha };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:17226",
+          "line": 294,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17239",
+          "line": 294,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17281",
+          "line": 295,
+          "callee": "resolveWorktree",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17349",
+          "line": 296,
+          "callee": "resolveWorktree",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17428",
+          "line": 297,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17494",
+          "line": 298,
+          "callee": "realpathSync",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17666",
+          "line": 304,
+          "callee": "resolveWorktree",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17722",
+          "line": 304,
+          "callee": "resolveWorktree",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:17786",
+          "line": 305,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18004",
+          "line": 307,
+          "callee": "git",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18106",
+          "line": 308,
+          "callee": "branch.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18129",
+          "line": 308,
+          "callee": "branch.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18218",
+          "line": 310,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18348",
+          "line": 312,
+          "callee": "git",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18422",
+          "line": 313,
+          "callee": "git",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18530",
+          "line": 314,
+          "callee": "head.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18581",
+          "line": 315,
+          "callee": "tip.stdout.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18612",
+          "line": 316,
+          "callee": "/^[0-9a-f]{40}$/u.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18648",
+          "line": 316,
+          "callee": "/^[0-9a-f]{40}$/u.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:18714",
+          "line": 317,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c030",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/bootstrapOutcome().",
+      "name": "bootstrapOutcome",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 322,
+      "endLine": 332,
+      "distance": null,
+      "source": "function bootstrapOutcome(worktree, config, phase) {\n  const exit = runBootstrap(worktree, config.bootstrapCommand, config.bootstrapTimeoutMs);\n  const tracked = observeTrackedCleanliness(worktree);\n  let refusal = null;\n  if (!tracked.observed) refusal = `factory config entry 'bootstrap' could not observe tracked paths after ${phase}`;\n  else if (tracked.entries.length) refusal = `factory config entry 'bootstrap' left tracked paths dirty after ${phase}: ${tracked.entries.map(JSON.stringify).join(\", \")}`;\n  else if (exit !== 0) refusal = exit === null\n    ? `factory config entry 'bootstrap' failed during ${phase}; exit status unavailable`\n    : `factory config entry 'bootstrap' failed during ${phase} with exit status ${exit}`;\n  return { exit, refusal };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:18935",
+          "line": 323,
+          "callee": "runBootstrap",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:19029",
+          "line": 324,
+          "callee": "observeTrackedCleanliness",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:19328",
+          "line": 327,
+          "callee": "tracked.entries.map(JSON.stringify).join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:19328",
+          "line": 327,
+          "callee": "tracked.entries.map",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c031",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/branchPoint().",
+      "name": "branchPoint",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 334,
+      "endLine": 338,
+      "distance": null,
+      "source": "function branchPoint(run) {\n  const base = run.slices.find((slice) => Array.isArray(slice.depends_on) && slice.depends_on.length === 0)?.base_ref;\n  if (!/^[0-9a-f]{40}$/u.test(base ?? \"\")) throw new CliError(\"first seeded root slice has no immutable 40-character base_ref\");\n  return base;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:19678",
+          "line": 335,
+          "callee": "run.slices.find",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c032"
+          ]
+        },
+        {
+          "id": "call:bin/factory.js:19789",
+          "line": 336,
+          "callee": "/^[0-9a-f]{40}$/u.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:19831",
+          "line": 336,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c032",
+      "symbolId": "syntax:bin/factory.js:19694:arrow_function",
+      "name": "<callback@335:32>",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 335,
+      "endLine": 335,
+      "distance": null,
+      "source": "  const base = run.slices.find((slice) => Array.isArray(slice.depends_on) && slice.depends_on.length === 0)?.base_ref;",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:19705",
+          "line": 335,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c033",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/writeObservedEvidence().",
+      "name": "writeObservedEvidence",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 340,
+      "endLine": 352,
+      "distance": null,
+      "source": "async function writeObservedEvidence({ runDir, runId, subject, attempt, branch, baseRef, worktree, status, blockedReason, claim, testCommand, skipReason, shellCommand, testTimeoutMs }) {\n  const evidence = buildEvidence({\n    subject, attempt, branch, baseRef, worktree, status, blockedReason, claim, runId,\n    testCommand, skipReason, shellCommand, testTimeoutMs,\n  });\n  const ancestry = observeAncestry(worktree, baseRef, \"HEAD\");\n  if (ancestry !== \"ancestor\") {\n    evidence.review_ready = false;\n    evidence.blocked_reason = evidence.blocked_reason ?? `base ${baseRef} is ${ancestry} of HEAD`;\n  }\n  await writeProtectedJsonAtomic(runDir, evidenceRef(subject), evidence);\n  return { evidence, ancestry };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:20135",
+          "line": 341,
+          "callee": "buildEvidence",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:20320",
+          "line": 345,
+          "callee": "observeAncestry",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:20543",
+          "line": 350,
+          "callee": "writeProtectedJsonAtomic",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:20576",
+          "line": 350,
+          "callee": "evidenceRef",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c034",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/canonicalRepositoryVerifyEvidence().",
+      "name": "canonicalRepositoryVerifyEvidence",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 354,
+      "endLine": 396,
+      "distance": null,
+      "source": "function canonicalRepositoryVerifyEvidence(evidence, { runId, run, integration, verifyCommand }) {\n  const baseRef = branchPoint(run);\n  const keys = Object.keys(evidence).sort();\n  const commandNames = [\n    \"git rev-parse HEAD\",\n    `git --literal-pathspecs diff --name-only -z ${baseRef}...HEAD`,\n    `git diff --stat ${baseRef}...HEAD`,\n  ];\n  const commandsAreCanonical = Array.isArray(evidence.commands)\n    && evidence.commands.length === commandNames.length\n    && evidence.commands.every((command, index) => command && typeof command === \"object\" && !Array.isArray(command)\n      && JSON.stringify(Object.keys(command).sort()) === JSON.stringify([\"cmd\", \"exit\", \"summary\"])\n      && command.cmd === commandNames[index] && command.exit === 0 && typeof command.summary === \"string\");\n  const tests = evidence.tests;\n  const testsAreCanonical = tests && typeof tests === \"object\" && !Array.isArray(tests)\n    && JSON.stringify(Object.keys(tests).sort()) === JSON.stringify([\"cmd\", \"exit\", \"observed\", \"skipped_reason\"])\n    && tests.cmd === verifyCommand && typeof tests.observed === \"boolean\" && tests.skipped_reason === null\n    && ((tests.observed === true && N\n/* ... source excerpt omitted ... */\ny refuses a record whose stored\n    // review_ready disagrees with its contents, so no such record reaches here today; this\n    // keeps the predicate that decides replay-eligibility from being correct only by virtue\n    // of its caller.\n    && evidence.review_ready === deriveReviewReady(evidence)\n    && reconciliation && typeof reconciliation === \"object\" && !Array.isArray(reconciliation)\n    && JSON.stringify(Object.keys(reconciliation).sort()) === JSON.stringify([\"claimed\", \"mismatches\"])\n    && reconciliation.claimed === false && Array.isArray(reconciliation.mismatches)\n    && reconciliation.mismatches.length === 0;\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:20762",
+          "line": 355,
+          "callee": "branchPoint",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:20795",
+          "line": 356,
+          "callee": "Object.keys(evidence).sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:20795",
+          "line": 356,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21022",
+          "line": 362,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21118",
+          "line": 364,
+          "callee": "evidence.commands.every",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c035"
+          ]
+        },
+        {
+          "id": "call:bin/factory.js:21535",
+          "line": 368,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21563",
+          "line": 369,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21578",
+          "line": 369,
+          "callee": "Object.keys(tests).sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21578",
+          "line": 369,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21609",
+          "line": 369,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21814",
+          "line": 371,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21970",
+          "line": 374,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21995",
+          "line": 374,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:22010",
+          "line": 374,
+          "callee": "[...EVIDENCE_KEYS].sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:22117",
+          "line": 376,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:22544",
+          "line": 381,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:22552",
+          "line": 381,
+          "callee": "evidence.blocked_reason.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:22593",
+          "line": 382,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:22675",
+          "line": 383,
+          "callee": "evidence.files_changed.every",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c036"
+          ]
+        },
+        {
+          "id": "call:bin/factory.js:23305",
+          "line": 391,
+          "callee": "deriveReviewReady",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:23397",
+          "line": 392,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:23434",
+          "line": 393,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:23449",
+          "line": 393,
+          "callee": "Object.keys(reconciliation).sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:23449",
+          "line": 393,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:23489",
+          "line": 393,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:23574",
+          "line": 394,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c035",
+      "symbolId": "syntax:bin/factory.js:21142:arrow_function",
+      "name": "<callback@364:32>",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 364,
+      "endLine": 366,
+      "distance": null,
+      "source": "    && evidence.commands.every((command, index) => command && typeof command === \"object\" && !Array.isArray(command)\n      && JSON.stringify(Object.keys(command).sort()) === JSON.stringify([\"cmd\", \"exit\", \"summary\"])\n      && command.cmd === commandNames[index] && command.exit === 0 && typeof command.summary === \"string\");",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:21205",
+          "line": 364,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21237",
+          "line": 365,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21252",
+          "line": 365,
+          "callee": "Object.keys(command).sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21252",
+          "line": 365,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:21285",
+          "line": 365,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c036",
+      "symbolId": "syntax:bin/factory.js:22704:arrow_function",
+      "name": "<callback@383:37>",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 383,
+      "endLine": 383,
+      "distance": null,
+      "source": "    && evidence.files_changed.every((path) => typeof path === \"string\" && Boolean(path))",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:22742",
+          "line": 383,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c037",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/classifyRepositoryVerifyEvidence().",
+      "name": "classifyRepositoryVerifyEvidence",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 398,
+      "endLine": 419,
+      "distance": null,
+      "source": "function classifyRepositoryVerifyEvidence(runDir, context) {\n  let evidence;\n  try {\n    evidence = readEvidence(runDir, evidenceRef(\"test-verifier\"), { runId: context.runId });\n  } catch {\n    return { kind: \"unknown\", evidence: null };\n  }\n  // False-green enforcement: only complete canonical evidence bound to this merge may be reused or retried.\n  if (!canonicalRepositoryVerifyEvidence(evidence, context)) {\n    return { kind: \"unknown\", evidence };\n  }\n  if (evidence.tests.observed === true && evidence.tests.exit === 0 && evidence.review_ready === true) {\n    return { kind: \"green\", evidence };\n  }\n  if (evidence.tests.observed === true && Number.isInteger(evidence.tests.exit)) {\n    return { kind: \"failed\", evidence };\n  }\n  if (evidence.tests.observed === false && evidence.tests.exit === null && evidence.tests.skipped_reason === null) {\n    return { kind: \"unavailable\", evidence };\n  }\n  return { kind: \"unknown\", evidence };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:23765",
+          "line": 401,
+          "callee": "readEvidence",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:23786",
+          "line": 401,
+          "callee": "evidenceRef",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:24023",
+          "line": 406,
+          "callee": "canonicalRepositoryVerifyEvidence",
+          "target": "c034",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:24316",
+          "line": 412,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c038",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/repositoryVerifyRefusal().",
+      "name": "repositoryVerifyRefusal",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 421,
+      "endLine": 429,
+      "distance": null,
+      "source": "function repositoryVerifyRefusal(mergeCommit, evidence) {\n  if (evidence.tests?.observed === true && Number.isInteger(evidence.tests.exit) && evidence.tests.exit !== 0) {\n    return `factory config entry 'verify' failed after recorded merge ${mergeCommit} with exit status ${evidence.tests.exit}; merged slice remains recorded; stop before advancing.`;\n  }\n  if (evidence.tests?.exit === null || evidence.tests?.observed !== true) {\n    return `factory config entry 'verify' failed after recorded merge ${mergeCommit}; exit status unavailable; merged slice remains recorded; stop before advancing.`;\n  }\n  return `factory config entry 'verify' was not review_ready after recorded merge ${mergeCommit}: ${evidence.blocked_reason ?? \"review readiness was not established\"}; merged slice remains recorded; stop before advancing.`;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:24713",
+          "line": 422,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c039",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/mergedPayload().",
+      "name": "mergedPayload",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 431,
+      "endLine": 433,
+      "distance": null,
+      "source": "function mergedPayload(runId, sliceId, row) {\n  return { run_id: runId, slice: sliceId, status: row.status, attempts: row.attempts, base_ref: row.base_ref, merge_commit: row.merge_commit };\n}",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c040",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/repositoryVerifyUnknownRefusal().",
+      "name": "repositoryVerifyUnknownRefusal",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 435,
+      "endLine": 437,
+      "distance": null,
+      "source": "function repositoryVerifyUnknownRefusal(mergeCommit) {\n  return `post-merge verify outcome is unknown for recorded merge ${mergeCommit}; merged slice remains recorded; terminalize needs-human without re-executing factory config entry 'verify'.`;\n}",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c041",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/repositoryVerifyRetrySafety().",
+      "name": "repositoryVerifyRetrySafety",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 439,
+      "endLine": 455,
+      "distance": null,
+      "source": "function repositoryVerifyRetrySafety(repo, run, mergeCommit) {\n  // False-green enforcement: retries may test only the unchanged, clean bytes recorded by the merge.\n  let integration;\n  try {\n    integration = requireIntegrationWorktree(repo, run, run.worktree);\n  } catch (error) {\n    throw new CliError(`repository verification retry is unsafe after recorded merge ${mergeCommit}: ${error.message}; merged slice remains recorded; stop before advancing.`);\n  }\n  if (integration.head !== mergeCommit) {\n    throw new CliError(`repository verification retry is unsafe after recorded merge ${mergeCommit}: integration HEAD moved to ${integration.head}; merged slice remains recorded; stop before advancing.`);\n  }\n  const cleanliness = observeCleanliness(integration.worktree);\n  if (!cleanliness.clean) {\n    throw new CliError(`repository verification retry is unsafe after recorded merge ${mergeCommit}: ${cleanliness.reason}; merged slice remains recorded; stop before advancing.`);\n  }\n  return integration;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:26095",
+          "line": 443,
+          "callee": "requireIntegrationWorktree",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:26178",
+          "line": 445,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:26400",
+          "line": 448,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:26621",
+          "line": 450,
+          "callee": "observeCleanliness",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:26701",
+          "line": 452,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c042",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/runRepositoryVerifyAttempts().",
+      "name": "runRepositoryVerifyAttempts",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 457,
+      "endLine": 478,
+      "distance": null,
+      "source": "async function runRepositoryVerifyAttempts({ repo, runDir, runId, run, mergeCommit, verify, integration }) {\n  const baseRef = branchPoint(run);\n  let attemptIntegration = integration;\n  // False-green enforcement: one invocation gets at most two executions, never an unbounded recovery loop.\n  for (let attempt = 1; attempt <= 2; attempt += 1) {\n    const { evidence } = await writeObservedEvidence({\n      runDir, runId, subject: \"test-verifier\", attempt, branch: run.branch,\n      baseRef, worktree: attemptIntegration.worktree, status: \"completed\", blockedReason: null,\n      claim: null, testCommand: verify.command, skipReason: null, shellCommand: true,\n      testTimeoutMs: verify.timeoutMs,\n    });\n    const classified = classifyRepositoryVerifyEvidence(runDir, {\n      runId, run, integration: attemptIntegration, verifyCommand: verify.command,\n    });\n    if (classified.kind === \"green\") return evidence;\n    if (classified.kind === \"failed\") throw new CliError(repositoryVerifyRefusal(mergeCommit, classified.evidence));\n    if (classified.kind === \"unknown\") throw new CliError(repositoryVerifyUnknownRefusal(mergeCommit));\n    if (attempt === 2) throw new CliError(repositoryVerifyRefusal(mergeCommit, evidence));\n    attemptIntegration = repositoryVerifyRetrySafety(repo, run, mergeCommit);\n  }\n  return null;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:27028",
+          "line": 458,
+          "callee": "branchPoint",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:27279",
+          "line": 462,
+          "callee": "writeObservedEvidence",
+          "target": "c033",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:27631",
+          "line": 468,
+          "callee": "classifyRepositoryVerifyEvidence",
+          "target": "c037",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:27862",
+          "line": 472,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:27875",
+          "line": 472,
+          "callee": "repositoryVerifyRefusal",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:27980",
+          "line": 473,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:27993",
+          "line": 473,
+          "callee": "repositoryVerifyUnknownRefusal",
+          "target": "c040",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:28068",
+          "line": 474,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:28081",
+          "line": 474,
+          "callee": "repositoryVerifyRefusal",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:28155",
+          "line": 475,
+          "callee": "repositoryVerifyRetrySafety",
+          "target": "c041",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c043",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/verifyRecordedMerge().",
+      "name": "verifyRecordedMerge",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 480,
+      "endLine": 497,
+      "distance": null,
+      "source": "async function verifyRecordedMerge({ repo, runDir, runId, mergeCommit }) {\n  const run = readRun(runDir);\n  const integration = requireIntegrationWorktree(repo, run, run.worktree);\n  if (integration.head !== mergeCommit) {\n    throw new CliError(`integration HEAD must equal recorded merge ${mergeCommit} before repository verification`);\n  }\n  let verify;\n  try {\n    verify = readRepositoryConfig(integration.worktree, { optional: true });\n  } catch (error) {\n    if (error instanceof RepositoryConfigError) {\n      throw new CliError(`factory config entry 'verify' unavailable after recorded merge ${mergeCommit}: ${error.message}; merged slice remains recorded; stop before advancing.`);\n    }\n    throw error;\n  }\n  if (verify === null) return null;\n  return runRepositoryVerifyAttempts({ repo, runDir, runId, run, mergeCommit, verify, integration });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:28319",
+          "line": 481,
+          "callee": "readRun",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:28358",
+          "line": 482,
+          "callee": "requireIntegrationWorktree",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:28463",
+          "line": 484,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:28608",
+          "line": 488,
+          "callee": "readRepositoryConfig",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:28754",
+          "line": 491,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:28994",
+          "line": 496,
+          "callee": "runRepositoryVerifyAttempts",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c044",
+      "symbolId": "syntax:bin/factory.js:29111:method_definition",
+      "name": "[\"reverify-repair\"]",
+      "kind": "method",
+      "path": "bin/factory.js",
+      "startLine": 500,
+      "endLine": 511,
+      "distance": null,
+      "source": "  async [\"reverify-repair\"](positional, flags) {\n    if (positional.length !== 2) throw new CliError(\"factory reverify-repair requires exactly <run-id> <repair-record-id>\");\n    const [runId, recordId] = positional;\n    if (!/^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/u.test(runId)) throw new CliError(\"factory reverify-repair requires a canonical <run-id>\");\n    const record = /^repair-([0-9a-f]{40})-([1-9][0-9]*)$/u.exec(recordId);\n    if (!record || !Number.isSafeInteger(Number(record[2]))) throw new CliError(\"factory reverify-repair requires a canonical <repair-record-id>\");\n    if (flags.repo !== undefined && (typeof flags.repo !== \"string\" || !flags.repo.trim())) throw new CliError(\"--repo must be a non-empty string\");\n    const at = stamp(flags);\n    const repo = resolve(flags.repo ?? process.cwd());\n    const runDir = runDirFor(flags, runId);\n    return emit(flags, await reverifyRepair({ repo, runDir, runId, recordId, at }));\n  },",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:29197",
+          "line": 501,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29334",
+          "line": 503,
+          "callee": "/^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/u.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29392",
+          "line": 503,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29482",
+          "line": 504,
+          "callee": "/^repair-([0-9a-f]{40})-([1-9][0-9]*)$/u.exec",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29559",
+          "line": 505,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29580",
+          "line": 505,
+          "callee": "Number",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29606",
+          "line": 505,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29759",
+          "line": 506,
+          "callee": "flags.repo.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29785",
+          "line": 506,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29851",
+          "line": 507,
+          "callee": "stamp",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29882",
+          "line": 508,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29904",
+          "line": 508,
+          "callee": "process.cwd",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29939",
+          "line": 509,
+          "callee": "runDirFor",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29975",
+          "line": 510,
+          "callee": "emit",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:29993",
+          "line": 510,
+          "callee": "reverifyRepair",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c045",
+      "symbolId": "local:bin/factory.js:local 328",
+      "name": "\"effective-push\"",
+      "kind": "method",
+      "path": "bin/factory.js",
+      "startLine": 513,
+      "endLine": 516,
+      "distance": null,
+      "source": "  \"effective-push\"(positional) {\n    enforceEffectivePushTarget(positional);\n    return null;\n  },",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:30092",
+          "line": 514,
+          "callee": "enforceEffectivePushTarget",
+          "target": "c001",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c046",
+      "symbolId": "local:bin/factory.js:local 330",
+      "name": "validator",
+      "kind": "method",
+      "path": "bin/factory.js",
+      "startLine": 518,
+      "endLine": 545,
+      "distance": null,
+      "source": "  async validator([runId], flags) {\n    if (!flags.report) throw new CliError(\"factory validator requires --report\");\n    const runDir = runDirFor(flags, runId);\n    const run = assertRunNotParked(runDir, \"validator\");\n    const repo = resolve(flags.repo ?? process.cwd());\n    const at = stamp(flags);\n    // Neither the verdict nor the head is an argument any more. Both come from the\n    // validator's own record, which must name the integration head as observed right now —\n    // otherwise a report about one commit could be recorded as a verdict on another.\n    const head = integrationHead(repo, run);\n    const review = readValidatorReview(runDir, head.commit);\n    const next = await transition(runDir, {\n      participants: [{ familyId: \"verdict\", mode: \"record\" }],\n      apply: (state) => ({\n        ...state,\n        updated_at: at,\n        validator: {\n          verdict: review.verdict,\n          report: flags.report,\n          // Attack 4: the verdict names the head it judged, so a later consumer can\n          // refuse it once that head moves.\n          reviewed_head: review.reviewed_commit,\n          loops: (state.validator?.loops ?? 0) + (state.validator ? 1 : 0),\n        },\n      }),\n    });\n    return emit(flags, { run_id: runId, verdict: next.validator.verdict, reviewed_head: next.validator.reviewed_head, loops: next.validator.loops });\n  },",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:30220",
+          "line": 519,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:30292",
+          "line": 520,
+          "callee": "runDirFor",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:30333",
+          "line": 521,
+          "callee": "assertRunNotParked",
+          "target": "c023",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:30391",
+          "line": 522,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:30413",
+          "line": 522,
+          "callee": "process.cwd",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:30444",
+          "line": 523,
+          "callee": "stamp",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:30737",
+          "line": 527,
+          "callee": "integrationHead",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:30784",
+          "line": 528,
+          "callee": "readValidatorReview",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:30849",
+          "line": 529,
+          "callee": "transition",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:31385",
+          "line": 544,
+          "callee": "emit",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c047",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 bin/`factory.js`/apply0:",
+      "name": "apply",
+      "kind": "function",
+      "path": "bin/factory.js",
+      "startLine": 531,
+      "endLine": 542,
+      "distance": null,
+      "source": "      apply: (state) => ({\n        ...state,\n        updated_at: at,\n        validator: {\n          verdict: review.verdict,\n          report: flags.report,\n          // Attack 4: the verdict names the head it judged, so a later consumer can\n          // refuse it once that head moves.\n          reviewed_head: review.reviewed_commit,\n          loops: (state.validator?.loops ?? 0) + (state.validator ? 1 : 0),\n        },\n      }),",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c048",
+      "symbolId": "local:bin/factory.js:local 358",
+      "name": "pr",
+      "kind": "method",
+      "path": "bin/factory.js",
+      "startLine": 547,
+      "endLine": 580,
+      "distance": null,
+      "source": "  async pr([runId], flags) {\n    if (!flags.url) throw new CliError(\"factory pr requires --url\");\n    const runDir = runDirFor(flags, runId);\n    assertRunNotParked(runDir, \"pr\");\n    const repo = resolve(flags.repo ?? process.cwd());\n    const run = readRun(runDir);\n    const at = stamp(flags);\n\n    // Re-asked rather than assumed from Gate 3's approval: between the two the head can\n    // move, a slice can regress, and a gate can be re-opened, and `pr` is where the record\n    // becomes permanent. The rules live in one place, including the requirement that all\n    // three gates are approved *now* — this handler used to check pre_pr on its own, which\n    // is how a re-opened Story gate went unnoticed.\n    const reobservers = new Map();\n    reobservers.set(\"verdict\", async ({ nextState }) => {\n      assertPublicationReady({\n        runDir, state: nextState, runId, repo,\n        observeHead: () => integrationHead(repo, nextState).commit,\n      });\n    });\n\n    const next = await transition(runDir, {\n      participants: [{ familyId: \"verdict\", mode: \"publish\" }],\n      reobservers,\n      apply: (state) => {\n        // Attacks 9 and 10: recording the same PR twice is the crash-replay path and\n        // must be idempotent; recording a different one is a second PR and is refused\n        // by the verdict contract.\n        if (state.pr_url === flags.url) return { ...state, updated_at: at };\n        return { ...state, updated_at: at, pr_url: flags.url };\n      },\n    });\n    return emit(flags, { run_id: runId, pr_url: next.pr_url, idempotent: run.pr_url === flags.url });\n  },",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:bin/factory.js:31585",
+          "line": 548,
+          "callee": "CliError",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:31647",
+          "line": 549,
+          "callee": "runDirFor",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:31676",
+          "line": 550,
+          "callee": "assertRunNotParked",
+          "target": "c023",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:31727",
+          "line": 551,
+          "callee": "resolve",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:31749",
+          "line": 551,
+          "callee": "process.cwd",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:31781",
+          "line": 552,
+          "callee": "readRun",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:31813",
+          "line": 553,
+          "callee": "stamp",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:32268",
+          "line": 560,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:32283",
+          "line": 561,
+          "callee": "reobservers.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:32525",
+          "line": 568,
+          "callee": "transition",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:bin/factory.js:33033",
+          "line": 579,
+          "callee": "emit",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    }
+  ],
+  "scope": {
+    "eligibleCandidates": 124,
+    "includedCandidates": 48,
+    "omittedCandidates": 76,
+    "maxSourceChars": 1800,
+    "limitations": "Fixed candidate scope, truncated source excerpts, syntax-level source ordering. Callback references do not establish execution."
+  }
+}

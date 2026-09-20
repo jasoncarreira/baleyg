@@ -1,0 +1,92 @@
+[
+  {
+    "id": "q01-smoke",
+    "question": "Which function does writeProtectedJsonAtomic directly delegate to, and how does it prepare the data?",
+    "candidates": 35,
+    "truncatedSources": 4,
+    "omittedCandidates": 0,
+    "requestBytes": 64515,
+    "visible": 2
+  },
+  {
+    "id": "q02-atomic-branches",
+    "question": "How does protected file publication differ between create-only and replacement writes, including the beforeCommit hook?",
+    "candidates": 35,
+    "truncatedSources": 4,
+    "omittedCandidates": 0,
+    "requestBytes": 64547,
+    "visible": 5
+  },
+  {
+    "id": "q03-lock-reclaim",
+    "question": "Which checks allow withRunJsonLock to attempt reclaiming an existing lock, and where is the protected callback invoked?",
+    "candidates": 40,
+    "truncatedSources": 3,
+    "omittedCandidates": 0,
+    "requestBytes": 65515,
+    "visible": 13
+  },
+  {
+    "id": "q04-transition-cas",
+    "question": "How does transition reach the protected write, and where are the two unchanged-state checks relative to reobservation and final rename?",
+    "candidates": 48,
+    "truncatedSources": 5,
+    "omittedCandidates": 25,
+    "requestBytes": 78931,
+    "visible": 3
+  },
+  {
+    "id": "q05-push-target",
+    "question": "How do bootstrap and check differ when enforcing the effective push target, and why are targets compared as bytes?",
+    "candidates": 48,
+    "truncatedSources": 1,
+    "omittedCandidates": 76,
+    "requestBytes": 79123,
+    "visible": 6
+  },
+  {
+    "id": "q06-review-binding",
+    "question": "How do assertReviewBinding and readValidatorReview differ in checking verdicts while binding reviews to an observed commit?",
+    "candidates": 48,
+    "truncatedSources": 4,
+    "omittedCandidates": 41,
+    "requestBytes": 70502,
+    "visible": 2
+  },
+  {
+    "id": "q07-merge-proof",
+    "question": "Which observations and comparisons does observeMergeProof use to accept a two-parent merge without requiring whole-tree equality?",
+    "candidates": 48,
+    "truncatedSources": 4,
+    "omittedCandidates": 11,
+    "requestBytes": 70481,
+    "visible": 8
+  },
+  {
+    "id": "q08-publication",
+    "question": "What evidence dependencies and conditional alternatives must a view show for assertPublicationReady, including the repair-tested-head shortcut?",
+    "candidates": 48,
+    "truncatedSources": 5,
+    "omittedCandidates": 70,
+    "requestBytes": 87146,
+    "visible": 11
+  },
+  {
+    "id": "q09-repair-lifecycle",
+    "question": "Where does reverifyRepair hold the run lock, and how are detached execution and evidence publication separated?",
+    "candidates": 48,
+    "truncatedSources": 7,
+    "omittedCandidates": 52,
+    "requestBytes": 103011,
+    "visible": 11
+  },
+  {
+    "id": "q10-executable-search",
+    "question": "How does resolveSpawnExecutable choose direct-path versus PATH candidates, and what checks can return success?",
+    "candidates": 43,
+    "truncatedSources": 2,
+    "omittedCandidates": 0,
+    "requestBytes": 61365,
+    "visible": 2
+  }
+]

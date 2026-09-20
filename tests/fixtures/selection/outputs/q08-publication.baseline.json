@@ -1,0 +1,260 @@
+{
+  "provider": "deterministic",
+  "questionId": "q08-publication",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "decisions": [
+    {
+      "candidateId": "c001",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c002",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c003",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c004",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c005",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c006",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c007",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c008",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c009",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c010",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c011",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c012",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c013",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c014",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c015",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c016",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c017",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c018",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c019",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c020",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c021",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c022",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c023",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c024",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c025",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c026",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c027",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c028",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c029",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c030",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c031",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c032",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c033",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c034",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c035",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c036",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c037",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c038",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c039",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c040",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c041",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c042",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c043",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c044",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c045",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c046",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c047",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c048",
+      "relevance": "incidental"
+    }
+  ],
+  "view": {
+    "questionId": "q08-publication",
+    "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+    "visible": [
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/assertPublicationReady().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/evidenceRef.",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/assertRepairPublicationReady().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/isApproving().",
+      "local:observe/review.js:local 99",
+      "syntax:observe/review.js:15482:arrow_function",
+      "syntax:observe/review.js:15640:arrow_function",
+      "syntax:observe/review.js:15869:arrow_function",
+      "syntax:observe/review.js:16004:arrow_function",
+      "syntax:observe/review.js:18582:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/readEvidence()."
+    ],
+    "collapsed": [
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/deriveReviewReady().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/readRepairState().",
+      "syntax:observe/review.js:22191:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/evidenceEntries()."
+    ],
+    "hidden": [
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/fail.",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/canonicalFile().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateJournal().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateInventory().",
+      "syntax:observe/repair-record.js:15492:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/validateRun().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/sameKeys.",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/positive.",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateBindings().",
+      "syntax:observe/repair-record.js:7844:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateMarker().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateResult().",
+      "syntax:observe/repair-record.js:11523:arrow_function",
+      "syntax:observe/repair-record.js:12750:arrow_function",
+      "syntax:observe/repair-record.js:12790:arrow_function",
+      "syntax:observe/repair-record.js:12928:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/runLocalRef().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/SchemaError#`<constructor>`().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/gates().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/steps().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/slices().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/validator().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/terminalResult().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/object().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/required().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/optionalString().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/pattern().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/enumValue().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/positiveInt().",
+      "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/nonNegativeInt().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/git().",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/digest.",
+      "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/equal."
+    ],
+    "seedForced": false,
+    "overDisplayBudget": false,
+    "edgePolicy": "Use only measured call edges; hidden intermediates never become direct edges. Callback links remain explicitly non-call links."
+  }
+}

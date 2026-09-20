@@ -1,0 +1,3421 @@
+{
+  "schemaVersion": 1,
+  "questionId": "q08-publication",
+  "question": "What evidence dependencies and conditional alternatives must a view show for assertPublicationReady, including the repair-tested-head shortcut?",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "seedId": "c001",
+  "labels": [
+    "essential",
+    "supporting",
+    "incidental",
+    "uncertain"
+  ],
+  "candidates": [
+    {
+      "id": "c001",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/assertPublicationReady().",
+      "name": "assertPublicationReady",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 245,
+      "endLine": 335,
+      "distance": 0,
+      "source": "export function assertPublicationReady({ runDir, state, runId, repo, observeHead }) {\n  const refuse = (message) => { throw new Error(`this run is not publishable: ${message}`); };\n\n  if (state.status === \"needs-human\") {\n    refuse(\"a needs-human run is parked; run factory resume before publication\");\n  }\n  if (TERMINAL_STATUSES.includes(state.status)) {\n    refuse(`a ${state.status} run must be surfaced, not published`);\n  }\n  // Every gate, currently approved — not just pre_pr, and not \"was approved once\".\n  // Re-opening a decided gate is what keeps a late change from stranding a run, but it also\n  // means an approval can be withdrawn, and publication was reading only pre_pr: opencode\n  // approved Gate 3, re-opened Story, decided stop, and recorded a PR against a stopped\n  // run. Asking for the current status of all three is what makes re-opening safe.\n  const unapproved = GATE_NAMES.filter((name) => state.gates?.[name]?.status !== \"approved\");\n  if (unapproved.length > 0) {\n    refuse(`every gate must be approved; not approved: ${unapproved.map((name) => `${name}(${state.gates?.[name]?.status ?? \"absent\"})`).join(\", \")}`);\n  }\n  if (!Array.isAr\n/* ... source excerpt omitted ... */\new_ready`\n  // admits a recorded skip, which is exactly the exemption this stage does not get.\n  if (evidence.tests?.observed !== true) refuse(`${ref} records no observed test run`);\n  if (evidence.tests.exit !== 0) refuse(`${ref} records tests exiting ${evidence.tests.exit}`);\n  if (evidence.review_ready !== true) {\n    refuse(`${ref} is not review_ready${evidence.blocked_reason ? `: ${evidence.blocked_reason}` : \"\"}`);\n  }\n  if (evidence.commit !== head) {\n    refuse(`${ref} tested ${String(evidence.commit).slice(0, 12)} but the integration head is ${head.slice(0, 12)}`);\n  }\n  return { head, tested: evidence.commit };\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/review.js:14797",
+          "line": 249,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:14885",
+          "line": 251,
+          "callee": "TERMINAL_STATUSES.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:14933",
+          "line": 252,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:15464",
+          "line": 259,
+          "callee": "GATE_NAMES.filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c006"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:15572",
+          "line": 261,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:15625",
+          "line": 261,
+          "callee": "unapproved.map((name) => `${name}(${state.gates?.[name]?.status ?? \"absent\"})`).join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:15625",
+          "line": 261,
+          "callee": "unapproved.map",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c007"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:15731",
+          "line": 263,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:15789",
+          "line": 263,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:15849",
+          "line": 264,
+          "callee": "state.slices.filter",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c008"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:15941",
+          "line": 266,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:15991",
+          "line": 266,
+          "callee": "unmerged.map((slice) => `${slice.id}(${slice.status})`).join",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:15991",
+          "line": 266,
+          "callee": "unmerged.map",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c009"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:16300",
+          "line": 271,
+          "callee": "observeHead",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:16328",
+          "line": 272,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:16953",
+          "line": 279,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17042",
+          "line": 280,
+          "callee": "isApproving",
+          "target": "c004",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17074",
+          "line": 280,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17185",
+          "line": 282,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17216",
+          "line": 282,
+          "callee": "String(validator.reviewed_head).slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17216",
+          "line": 282,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17292",
+          "line": 282,
+          "callee": "head.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17863",
+          "line": 290,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17889",
+          "line": 290,
+          "callee": "String(approvedHead).slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17889",
+          "line": 290,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:17954",
+          "line": 290,
+          "callee": "head.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:18557",
+          "line": 297,
+          "callee": "(state.steps ?? []).find",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c010"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:18689",
+          "line": 299,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:18856",
+          "line": 304,
+          "callee": "assertRepairPublicationReady",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:18948",
+          "line": 306,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:19621",
+          "line": 318,
+          "callee": "evidenceRef",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:19670",
+          "line": 319,
+          "callee": "readEvidence",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:19752",
+          "line": 320,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:20280",
+          "line": 326,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:20360",
+          "line": 327,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:20467",
+          "line": 329,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:20611",
+          "line": 332,
+          "callee": "refuse",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:20635",
+          "line": 332,
+          "callee": "String(evidence.commit).slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:20635",
+          "line": 332,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:20703",
+          "line": 332,
+          "callee": "head.slice",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c002",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/evidenceRef.",
+      "name": "evidenceRef",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 366,
+      "endLine": 366,
+      "distance": 1,
+      "source": "export const evidenceRef = (subject) => join(EVIDENCE_DIR, `${subject}.json`);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:19797",
+          "line": 366,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c003",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/assertRepairPublicationReady().",
+      "name": "assertRepairPublicationReady",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 289,
+      "endLine": 300,
+      "distance": 1,
+      "source": "export function assertRepairPublicationReady(options) {\n  const observed = readRepairState(options);\n  let tested = null;\n  for (const chain of observed.chains.values()) {\n    const row = chain.at(-1);\n    const history = observed.inventory.get(row.record_id);\n    const effective = row.status === \"verified\" || (row.status === \"needs-human\" && history?.pass !== null && history?.pass !== undefined);\n    if (!effective) throw new Error(`repair record '${row.record_id}' remains ${row.status} and blocks publication`);\n    if (row.status === \"needs-human\" && history?.pass && row.repair_commit === options.head) tested = row.repair_commit;\n  }\n  return { tested, observed };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:16273",
+          "line": 290,
+          "callee": "readRepairState",
+          "target": "c013",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16342",
+          "line": 292,
+          "callee": "observed.chains.values",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16386",
+          "line": 293,
+          "callee": "chain.at",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16420",
+          "line": 294,
+          "callee": "observed.inventory.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16625",
+          "line": 296,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c004",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/isApproving().",
+      "name": "isApproving",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 61,
+      "endLine": 63,
+      "distance": 1,
+      "source": "export function isApproving(verdict) {\n  return APPROVING_VERDICTS.includes(String(verdict).toUpperCase());\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:3829",
+          "line": 62,
+          "callee": "APPROVING_VERDICTS.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3857",
+          "line": 62,
+          "callee": "String(verdict).toUpperCase",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:3857",
+          "line": 62,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c005",
+      "symbolId": "local:observe/review.js:local 99",
+      "name": "refuse",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 246,
+      "endLine": 246,
+      "distance": 1,
+      "source": "  const refuse = (message) => { throw new Error(`this run is not publishable: ${message}`); };",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:14695",
+          "line": 246,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c006",
+      "symbolId": "syntax:observe/review.js:15482:arrow_function",
+      "name": "<callback@259:40>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 259,
+      "endLine": 259,
+      "distance": 1,
+      "source": "  const unapproved = GATE_NAMES.filter((name) => state.gates?.[name]?.status !== \"approved\");",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c007",
+      "symbolId": "syntax:observe/review.js:15640:arrow_function",
+      "name": "<callback@261:73>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 261,
+      "endLine": 261,
+      "distance": 1,
+      "source": "    refuse(`every gate must be approved; not approved: ${unapproved.map((name) => `${name}(${state.gates?.[name]?.status ?? \"absent\"})`).join(\", \")}`);",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c008",
+      "symbolId": "syntax:observe/review.js:15869:arrow_function",
+      "name": "<callback@264:40>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 264,
+      "endLine": 264,
+      "distance": 1,
+      "source": "  const unmerged = state.slices.filter((slice) => slice.status !== \"merged\");",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c009",
+      "symbolId": "syntax:observe/review.js:16004:arrow_function",
+      "name": "<callback@266:68>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 266,
+      "endLine": 266,
+      "distance": 1,
+      "source": "    refuse(`every slice must be merged; not merged: ${unmerged.map((slice) => `${slice.id}(${slice.status})`).join(\", \")}`);",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c010",
+      "symbolId": "syntax:observe/review.js:18582:arrow_function",
+      "name": "<callback@297:45>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 297,
+      "endLine": 297,
+      "distance": 1,
+      "source": "  const verifier = (state.steps ?? []).find((step) => step.agent === \"test-verifier\") ?? null;",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c011",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`review.js`/readEvidence().",
+      "name": "readEvidence",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 348,
+      "endLine": 379,
+      "distance": 1,
+      "source": "export function readEvidence(runDir, ref, { runId = null } = {}) {\n  if (typeof ref !== \"string\" || !ref.trim()) throw new Error(\"evidence ref is missing\");\n  if (isAbsolute(ref) || ref.split(/[\\\\/]/u).includes(\"..\")) {\n    throw new Error(`evidence ref '${ref}' must be run-local without traversal`);\n  }\n  const normalized = ref.split(sep).join(\"/\");\n  if (!normalized.startsWith(`${EVIDENCE_DIR}/`)) {\n    throw new Error(`evidence ref '${ref}' must be under ${EVIDENCE_DIR}/`);\n  }\n  let value;\n  try {\n    value = JSON.parse(readFileSync(join(runDir, normalized), \"utf8\"));\n  } catch (error) {\n    throw new Error(`evidence '${ref}' could not be read: ${error.message}`);\n  }\n  const unknown = Object.keys(value).filter((key) => !EVIDENCE_KEYS.includes(key));\n  if (unknown.length > 0) throw new Error(`evidence '${ref}' has unknown keys: ${unknown.sort().join(\", \")}`);\n  for (const key of [\"subject\", \"status\", \"observed_by\"]) {\n    if (typeof value[key] !== \"string\" || !value[key].trim()) throw new Error(`evidence '${ref}' has no ${key}`);\n  }\n  if (value.observed_by !== \"orchestrator\") throw new Error(`evidence '${ref}' was not written by the orchestrator`);\n  if (typeof value.review_ready !== \"boolean\") throw new Error(`evidence '${ref}' has no review_ready`);\n  if (!Number.isSafeInteger(value.attempt) || value.attempt < 1) throw new Error(`evidence '${ref}' has no attempt`);\n  if (runId !== null && value.run_id !== runId) {\n    throw new Error(`evidence '${ref}' belongs to run '${value.run_id}', not '${runId}'`);\n  }\n  const derived = deriveReviewReady(value);\n  if (value.review_ready !== derived) {\n    throw new Error(`evidence '${ref}' claims review_ready: ${value.review_ready} but its own contents derive ${derived}`);\n  }\n  return value;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:21567",
+          "line": 349,
+          "callee": "ref.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21585",
+          "line": 349,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21629",
+          "line": 350,
+          "callee": "isAbsolute",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21648",
+          "line": 350,
+          "callee": "ref.split(/[\\\\/]/u).includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21648",
+          "line": 350,
+          "callee": "ref.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21696",
+          "line": 351,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21793",
+          "line": 353,
+          "callee": "ref.split(sep).join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21793",
+          "line": 353,
+          "callee": "ref.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21826",
+          "line": 354,
+          "callee": "normalized.startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21881",
+          "line": 355,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21985",
+          "line": 359,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:21996",
+          "line": 359,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22009",
+          "line": 359,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22075",
+          "line": 361,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22165",
+          "line": 363,
+          "callee": "Object.keys(value).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c014"
+          ]
+        },
+        {
+          "id": "call:observe/review.js:22165",
+          "line": 363,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22263",
+          "line": 364,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22312",
+          "line": 364,
+          "callee": "unknown.sort().join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22312",
+          "line": 364,
+          "callee": "unknown.sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22445",
+          "line": 366,
+          "callee": "value[key].trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22470",
+          "line": 366,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22570",
+          "line": 368,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22691",
+          "line": 369,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22750",
+          "line": 370,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22814",
+          "line": 370,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:22921",
+          "line": 372,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:23024",
+          "line": 374,
+          "callee": "deriveReviewReady",
+          "target": "c012",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/review.js:23100",
+          "line": 376,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c012",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/deriveReviewReady().",
+      "name": "deriveReviewReady",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 128,
+      "endLine": 140,
+      "distance": 2,
+      "source": "export function deriveReviewReady(evidence) {\n  if (evidence.status !== \"completed\") return false;\n  // A tree with uncommitted changes cannot produce evidence about the commit it\n  // claims, whatever the tests said.\n  if (evidence.worktree_clean !== true) return false;\n  if (!Array.isArray(evidence.files_changed) || evidence.files_changed.length === 0) return false;\n  if (evidence.diff_observed !== true) return false;\n  const tests = evidence.tests ?? {};\n  if (tests.observed === true) return tests.exit === 0;\n  // A skip is only acceptable when a reason was recorded. Absent tests with no\n  // reason is the shape a fabricated pass would take.\n  return typeof tests.skipped_reason === \"string\" && tests.skipped_reason.trim().length > 0;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:7190",
+          "line": 133,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:7617",
+          "line": 139,
+          "callee": "tests.skipped_reason.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c013",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/readRepairState().",
+      "name": "readRepairState",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 254,
+      "endLine": 287,
+      "distance": 2,
+      "source": "export function readRepairState({ runDir, state = null, runId, repo, recordId = null } = {}) {\n  let runBytes;\n  let rawRun;\n  try {\n    runBytes = readFileSync(join(runDir, \"run.json\"));\n    rawRun = validateRun(JSON.parse(runBytes.toString(\"utf8\")));\n  } catch (error) {\n    fail(`run.json could not be validated: ${error.message}`);\n  }\n  const run = validateRun(state ?? rawRun);\n  if (run.run_id !== runId || rawRun.run_id !== runId) fail(`run ID does not equal loaded run_id '${rawRun.run_id}'`);\n  const journalPath = join(runDir, REPAIR_JOURNAL_REF);\n  const journalFile = canonicalFile(journalPath, REPAIR_JOURNAL_REF, { optional: true });\n  if (!journalFile) {\n    const inventory = validateInventory(runDir, runId, []);\n    if (recordId !== null) fail(`repair journal is absent; record '${recordId}' does not exist`);\n    return { run, runBytes, journal: null, journalBytes: null, records: [], chains: new Map(), inventory, selected: null };\n  }\n  if (!repo) fail(\"repository is required to validate the repair journal\");\n  const { records, chains } = validateJournal(journalFile.value, run, repo);\n  const inventory = validateInventory(runDir, runId, records\n/* ... source excerpt omitted ... */\nrecord '${recordId}' does not identify exactly one journal row`);\n    selected = matches[0];\n    if (chains.get(selected.introducing_merge)?.at(-1) !== selected\n      || selected.status !== \"needs-human\" || selected.repair_commit === null) {\n      fail(`record '${recordId}' is not the latest eligible post-commit needs-human row`);\n    }\n  }\n  return { run, runBytes, journal: journalFile.value, journalBytes: journalFile.bytes,\n    records, chains, inventory, selected, selectedHistory: selected ? inventory.get(recordId) ?? { markers: new Map(), results: new Map(), names: [], attempts: 0, tail: false, pass: null } : null };\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:14382",
+          "line": 258,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14395",
+          "line": 258,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14435",
+          "line": 259,
+          "callee": "validateRun",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14447",
+          "line": 259,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14458",
+          "line": 259,
+          "callee": "runBytes.toString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14511",
+          "line": 261,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14588",
+          "line": 263,
+          "callee": "validateRun",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14673",
+          "line": 264,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14759",
+          "line": 265,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14815",
+          "line": 266,
+          "callee": "canonicalFile",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14927",
+          "line": 268,
+          "callee": "validateInventory",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14992",
+          "line": 269,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15147",
+          "line": 270,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15204",
+          "line": 272,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15297",
+          "line": 273,
+          "callee": "validateJournal",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15364",
+          "line": 274,
+          "callee": "validateInventory",
+          "target": "c018",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15477",
+          "line": 277,
+          "callee": "records.filter",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c019"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:15560",
+          "line": 278,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15667",
+          "line": 280,
+          "callee": "chains.get(selected.introducing_merge)?.at",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15667",
+          "line": 280,
+          "callee": "chains.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:15814",
+          "line": 282,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16066",
+          "line": 286,
+          "callee": "inventory.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16104",
+          "line": 286,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:16124",
+          "line": 286,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c014",
+      "symbolId": "syntax:observe/review.js:22191:arrow_function",
+      "name": "<callback@363:45>",
+      "kind": "function",
+      "path": "observe/review.js",
+      "startLine": 363,
+      "endLine": 363,
+      "distance": 2,
+      "source": "  const unknown = Object.keys(value).filter((key) => !EVIDENCE_KEYS.includes(key));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/review.js:22201",
+          "line": 363,
+          "callee": "EVIDENCE_KEYS.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c015",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/fail.",
+      "name": "fail",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 20,
+      "endLine": 20,
+      "distance": 3,
+      "source": "const fail = (message) => { throw new Error(`repair state is invalid: ${message}`); };",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:1375",
+          "line": 20,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c016",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/canonicalFile().",
+      "name": "canonicalFile",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 28,
+      "endLine": 50,
+      "distance": 3,
+      "source": "function canonicalFile(path, label, { optional = false } = {}) {\n  let stats;\n  let bytes;\n  try {\n    stats = lstatSync(path);\n    if (!stats.isFile() || stats.isSymbolicLink()) fail(`${label} is not a regular non-symlink file`);\n    bytes = readFileSync(path);\n  } catch (error) {\n    if (optional && error?.code === \"ENOENT\") return null;\n    if (String(error.message).startsWith(\"repair state is invalid:\")) throw error;\n    fail(`${label} could not be read: ${error.message}`);\n  }\n  let text;\n  let value;\n  try {\n    text = new TextDecoder(\"utf-8\", { fatal: true }).decode(bytes);\n    value = JSON.parse(text);\n  } catch {\n    fail(`${label} is not canonical UTF-8 JSON`);\n  }\n  if (!bytes.equals(Buffer.from(`${JSON.stringify(value, null, 2)}\\n`, \"utf8\"))) fail(`${label} bytes are not canonical`);\n  return { bytes, value };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:2041",
+          "line": 32,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2067",
+          "line": 33,
+          "callee": "stats.isFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2085",
+          "line": 33,
+          "callee": "stats.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2109",
+          "line": 33,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2173",
+          "line": 34,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2280",
+          "line": 37,
+          "callee": "String(error.message).startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2280",
+          "line": 37,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2359",
+          "line": 38,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2461",
+          "line": 43,
+          "callee": "new TextDecoder(\"utf-8\", { fatal: true }).decode",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2461",
+          "line": 43,
+          "callee": "TextDecoder",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2530",
+          "line": 44,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2564",
+          "line": 46,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2621",
+          "line": 48,
+          "callee": "bytes.equals",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2634",
+          "line": 48,
+          "callee": "Buffer.from",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2649",
+          "line": 48,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:2695",
+          "line": 48,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c017",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateJournal().",
+      "name": "validateJournal",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 127,
+      "endLine": 151,
+      "distance": 3,
+      "source": "function validateJournal(value, run, repo) {\n  if (!sameKeys(value, JOURNAL_KEYS) || value.version !== 1 || !Array.isArray(value.records) || value.records.length === 0) {\n    fail(\"journal has the wrong version, key order, or shape\");\n  }\n  const records = value.records.map((row, index) => validateRecord(row, index, run));\n  const ids = new Set();\n  const chains = new Map();\n  let active = 0;\n  for (const row of records) {\n    if (ids.has(row.record_id)) fail(`duplicate record '${row.record_id}'`);\n    ids.add(row.record_id);\n    if ([\"planned\", \"committed\"].includes(row.status)) active += 1;\n    const chain = chains.get(row.introducing_merge) ?? [];\n    const prior = chain.at(-1);\n    if (row.attempt !== chain.length + 1) fail(`record '${row.record_id}' is not the next contiguous attempt`);\n    if (prior && (prior.status !== \"failed\" || row.starting_head !== prior.repair_commit)) {\n      fail(`record '${row.record_id}' does not validly follow the prior repair attempt`);\n    }\n    chain.push(row);\n    chains.set(row.introducing_merge, chain);\n    validateBindings(repo, row, run);\n  }\n  if (active > 1) fail(\"more than one repair record is active\");\n  return { records, chains };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:7621",
+          "line": 128,
+          "callee": "sameKeys",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7678",
+          "line": 128,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7744",
+          "line": 129,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7826",
+          "line": 131,
+          "callee": "value.records.map",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c024"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:7908",
+          "line": 132,
+          "callee": "Set",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7936",
+          "line": 133,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8004",
+          "line": 136,
+          "callee": "ids.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8028",
+          "line": 136,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8077",
+          "line": 137,
+          "callee": "ids.add",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8109",
+          "line": 138,
+          "callee": "[\"planned\", \"committed\"].includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8187",
+          "line": 139,
+          "callee": "chains.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8246",
+          "line": 140,
+          "callee": "chain.at",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8302",
+          "line": 141,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8471",
+          "line": 143,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8565",
+          "line": 145,
+          "callee": "chain.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8586",
+          "line": 146,
+          "callee": "chains.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8632",
+          "line": 147,
+          "callee": "validateBindings",
+          "target": "c023",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:8688",
+          "line": 149,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c018",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateInventory().",
+      "name": "validateInventory",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 205,
+      "endLine": 252,
+      "distance": 3,
+      "source": "function validateInventory(runDir, runId, records) {\n  const rows = new Map(records.map((row) => [row.record_id, row]));\n  const histories = new Map();\n  const filename = /^repair-reverification\\.(repair-[0-9a-f]{40}-[1-9][0-9]*)\\.([1-9][0-9]*)(\\.started)?\\.json$/u;\n  for (const name of evidenceEntries(runDir)) {\n    const match = filename.exec(name);\n    if (!match) fail(`evidence entry '${name}' has a malformed repair re-verification name`);\n    const row = rows.get(match[1]);\n    const attempt = Number(match[2]);\n    if (!row || !positive(attempt) || !(row.status === \"needs-human\" && row.repair_commit !== null)) {\n      fail(`evidence entry '${name}' does not identify an eligible repair record`);\n    }\n    const history = histories.get(row.record_id) ?? { markers: new Map(), results: new Map(), names: [] };\n    const kind = match[3] ? \"markers\" : \"results\";\n    const parsed = canonicalFile(join(runDir, \"evidence\", name), `evidence '${name}'`).value;\n    if (history[kind].has(attempt)) fail(`evidence entry '${name}' duplicates an attempt`);\n    history[kind].set(attempt, parsed);\n    history.names.push(name);\n    histories.set(row.record_id, history)\n/* ... source excerpt omitted ... */\nee_clean;\n        if (qualifies) {\n          if (pass !== null) fail(`evidence for '${recordId}' contains a second pass`);\n          pass = attempt;\n        }\n      } else if (attempt !== attempts.at(-1)) fail(`evidence for '${recordId}' has a non-final marker-only attempt`);\n    }\n    if (pass !== null && (pass !== attempts.at(-1) || !history.results.has(pass))) fail(`evidence for '${recordId}' continues after its first pass`);\n    history.attempts = attempts.length;\n    history.tail = attempts.length > 0 && !history.results.has(attempts.at(-1));\n    history.pass = pass;\n    history.names.sort();\n  }\n  return histories;\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:11503",
+          "line": 206,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11511",
+          "line": 206,
+          "callee": "records.map",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": [
+            "c028"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:11576",
+          "line": 207,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11723",
+          "line": 209,
+          "callee": "evidenceEntries",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11768",
+          "line": 210,
+          "callee": "filename.exec",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11805",
+          "line": 211,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11899",
+          "line": 212,
+          "callee": "rows.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11939",
+          "line": 213,
+          "callee": "Number",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11974",
+          "line": 214,
+          "callee": "positive",
+          "target": "c022",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12066",
+          "line": 215,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12170",
+          "line": 217,
+          "callee": "histories.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12213",
+          "line": 217,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12233",
+          "line": 217,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12327",
+          "line": 219,
+          "callee": "canonicalFile",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12341",
+          "line": 219,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12410",
+          "line": 220,
+          "callee": "history[kind].has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12438",
+          "line": 220,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12498",
+          "line": 221,
+          "callee": "history[kind].set",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12538",
+          "line": 222,
+          "callee": "history.names.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12568",
+          "line": 223,
+          "callee": "histories.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12676",
+          "line": 226,
+          "callee": "rows.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12717",
+          "line": 227,
+          "callee": "[...history.markers.keys()].sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c029"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:12721",
+          "line": 227,
+          "callee": "history.markers.keys",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12776",
+          "line": 228,
+          "callee": "attempts.some",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c030"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:12834",
+          "line": 228,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12895",
+          "line": 229,
+          "callee": "[...history.results.keys()].some",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c031"
+          ]
+        },
+        {
+          "id": "call:observe/repair-record.js:12899",
+          "line": 229,
+          "callee": "history.results.keys",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:12973",
+          "line": 229,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13121",
+          "line": 232,
+          "callee": "history.markers.get",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13157",
+          "line": 233,
+          "callee": "validateMarker",
+          "target": "c025",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13279",
+          "line": 234,
+          "callee": "history.results.get",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13337",
+          "line": 236,
+          "callee": "validateResult",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13666",
+          "line": 240,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13790",
+          "line": 243,
+          "callee": "attempts.at",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13807",
+          "line": 243,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13920",
+          "line": 245,
+          "callee": "attempts.at",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13940",
+          "line": 245,
+          "callee": "history.results.has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:13968",
+          "line": 245,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14118",
+          "line": 247,
+          "callee": "history.results.has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14138",
+          "line": 247,
+          "callee": "attempts.at",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:14185",
+          "line": 249,
+          "callee": "history.names.sort",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c019",
+      "symbolId": "syntax:observe/repair-record.js:15492:arrow_function",
+      "name": "<callback@277:36>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 277,
+      "endLine": 277,
+      "distance": 3,
+      "source": "    const matches = records.filter((row) => row.record_id === recordId);",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c020",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/validateRun().",
+      "name": "validateRun",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 116,
+      "endLine": 155,
+      "distance": 3,
+      "source": "export function validateRun(run) {\n  const errors = [];\n  object(errors, run, \"run\", RUN_KEYS);\n  if (errors.length) throw new SchemaError(errors);\n\n  if (run.version !== SCHEMA_VERSION) errors.push({ path: \"run.version\", message: `must be ${SCHEMA_VERSION}` });\n  pattern(errors, run, \"run_id\", ID, \"run\");\n  enumValue(errors, run, \"status\", RUN_STATUSES, \"run\");\n  enumValue(errors, run, \"mode\", MODES, \"run\");\n  for (const key of [\"branch\", \"worktree\"]) required(errors, run, key, \"run\");\n  for (const key of [\"created_at\", \"updated_at\"]) pattern(errors, run, key, ISO, \"run\");\n  for (const key of [\"max_parallel_slices\", \"max_retries\"]) positiveInt(errors, run, key, \"run\");\n  if (run.operator_decision !== null && run.operator_decision !== undefined) {\n    const path = \"run.operator_decision\";\n    if (object(errors, run.operator_decision, path, [\"at\", \"digest\", \"artifact\"])) {\n      pattern(errors, run.operator_decision, \"at\", ISO, path);\n      pattern(errors, run.operator_decision, \"digest\", /^sha256:[0-9a-f]{64}$/u, path);\n      runLocalRef(errors, run.operator_decision, \"artifact\", path);\n    }\n  }\n  for (const key of [\"issue_key\", \"pr_base\", \"pr_url\", \"\n/* ... source excerpt omitted ... */\n_command\") !== Object.hasOwn(run, \"bootstrap_exit\")) {\n    errors.push({ path: \"run.bootstrap_command\", message: \"must be present exactly when bootstrap_exit is present\" });\n  } else if (Object.hasOwn(run, \"bootstrap_command\")) {\n    required(errors, run, \"bootstrap_command\", \"run\");\n    if (run.bootstrap_exit !== null) nonNegativeInt(errors, run, \"bootstrap_exit\", \"run\");\n  }\n\n  gates(errors, run.gates);\n  steps(errors, run.steps);\n  slices(errors, run.slices);\n  validator(errors, run.validator);\n  terminalResult(errors, run.terminal_result, run.status);\n\n  if (errors.length) throw new SchemaError(errors);\n  return run;\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:state/schema.js:6846",
+          "line": 118,
+          "callee": "object",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6911",
+          "line": 119,
+          "callee": "SchemaError",
+          "target": "c033",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6975",
+          "line": 121,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7053",
+          "line": 122,
+          "callee": "pattern",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7098",
+          "line": 123,
+          "callee": "enumValue",
+          "target": "c043",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7155",
+          "line": 124,
+          "callee": "enumValue",
+          "target": "c043",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7245",
+          "line": 125,
+          "callee": "required",
+          "target": "c040",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7330",
+          "line": 126,
+          "callee": "pattern",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7429",
+          "line": 127,
+          "callee": "positiveInt",
+          "target": "c044",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7596",
+          "line": 130,
+          "callee": "object",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7679",
+          "line": 131,
+          "callee": "pattern",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7742",
+          "line": 132,
+          "callee": "pattern",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7830",
+          "line": 133,
+          "callee": "runLocalRef",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:7996",
+          "line": 136,
+          "callee": "optionalString",
+          "target": "c041",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8043",
+          "line": 137,
+          "callee": "Object.hasOwn",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8118",
+          "line": 138,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8197",
+          "line": 140,
+          "callee": "Object.hasOwn",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8241",
+          "line": 140,
+          "callee": "Object.hasOwn",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8285",
+          "line": 141,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8413",
+          "line": 142,
+          "callee": "Object.hasOwn",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8460",
+          "line": 143,
+          "callee": "required",
+          "target": "c040",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8548",
+          "line": 144,
+          "callee": "nonNegativeInt",
+          "target": "c045",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8609",
+          "line": 147,
+          "callee": "gates",
+          "target": "c034",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8637",
+          "line": 148,
+          "callee": "steps",
+          "target": "c035",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8665",
+          "line": 149,
+          "callee": "slices",
+          "target": "c036",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8695",
+          "line": 150,
+          "callee": "validator",
+          "target": "c037",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8731",
+          "line": 151,
+          "callee": "terminalResult",
+          "target": "c038",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8816",
+          "line": 153,
+          "callee": "SchemaError",
+          "target": "c033",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c021",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/sameKeys.",
+      "name": "sameKeys",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 21,
+      "endLine": 22,
+      "distance": 4,
+      "source": "const sameKeys = (value, keys) => value && typeof value === \"object\" && !Array.isArray(value)\n  && JSON.stringify(Object.keys(value)) === JSON.stringify(keys);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:1501",
+          "line": 21,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1527",
+          "line": 22,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1542",
+          "line": 22,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1566",
+          "line": 22,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c022",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/positive.",
+      "name": "positive",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 24,
+      "endLine": 24,
+      "distance": 4,
+      "source": "const positive = (value) => Number.isSafeInteger(value) && value > 0;",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:1696",
+          "line": 24,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c023",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateBindings().",
+      "name": "validateBindings",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 102,
+      "endLine": 125,
+      "distance": 4,
+      "source": "function validateBindings(repo, row, run) {\n  const slices = run.slices.filter((slice) => slice.status === \"merged\" && slice.merge_commit === row.introducing_merge);\n  if (slices.length !== 1) fail(`record '${row.record_id}' introducing merge does not identify exactly one merged slice`);\n  if (!git(repo, [\"merge-base\", \"--is-ancestor\", row.introducing_merge, row.starting_head]).ok) {\n    fail(`record '${row.record_id}' starting head does not descend from its introducing merge`);\n  }\n  if (row.repair_commit === null) return;\n  if (row.repair_commit === row.introducing_merge) fail(`record '${row.record_id}' repair commit equals its introducing merge`);\n  const parents = gitValue(repo, [\"rev-list\", \"--parents\", \"-n\", \"1\", row.repair_commit], `record '${row.record_id}' repair commit`)\n    .trim().split(/\\s+/u).slice(1);\n  if (parents.length !== 1 || parents[0] !== row.starting_head) fail(`record '${row.record_id}' repair commit has the wrong parent`);\n  const paths = gitValue(repo, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"--no-renames\", \"-z\", row.starting_head, row.repair_commit], `record '${row.record_id}' repair diff`)\n    .split(\"\\0\").filter(Boolean).sort();\n  if (paths.length === 0 || !equal(paths, row.test_paths)) fail(`record '${row.record_id}' repair diff does not equal test_paths`);\n  let config;\n  try {\n    config = parseRepositoryConfig(gitValue(repo, [\"show\", `${row.repair_commit}:.factory.json`], `record '${row.record_id}' committed config`));\n  } catch (error) {\n    fail(`record '${row.record_id}' committed config is invalid: ${error.message}`);\n  }\n  if (config.command !== row.trigger.command || config.timeoutMs !== row.trigger.timeout_ms) {\n    fail(`record '${row.record_id}' trigger does not match its committed config`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:5853",
+          "line": 103,
+          "callee": "run.slices.filter",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:5985",
+          "line": 104,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6088",
+          "line": 105,
+          "callee": "git",
+          "target": "c046",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6183",
+          "line": 106,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6373",
+          "line": 109,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6469",
+          "line": 110,
+          "callee": "gitValue(repo, [\"rev-list\", \"--parents\", \"-n\", \"1\", row.repair_commit], `record '${row.record_id}' repair commit`)\n    .trim().split(/\\s+/u).slice",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6469",
+          "line": 110,
+          "callee": "gitValue(repo, [\"rev-list\", \"--parents\", \"-n\", \"1\", row.repair_commit], `record '${row.record_id}' repair commit`)\n    .trim().split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6469",
+          "line": 110,
+          "callee": "gitValue(repo, [\"rev-list\", \"--parents\", \"-n\", \"1\", row.repair_commit], `record '${row.record_id}' repair commit`)\n    .trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6469",
+          "line": 110,
+          "callee": "gitValue",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6684",
+          "line": 112,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6770",
+          "line": 113,
+          "callee": "gitValue(repo, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"--no-renames\", \"-z\", row.starting_head, row.repair_commit], `record '${row.record_id}' repair diff`)\n    .split(\"\\0\").filter(Boolean).sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6770",
+          "line": 113,
+          "callee": "gitValue(repo, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"--no-renames\", \"-z\", row.starting_head, row.repair_commit], `record '${row.record_id}' repair diff`)\n    .split(\"\\0\").filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6770",
+          "line": 113,
+          "callee": "gitValue(repo, [\"--literal-pathspecs\", \"diff\", \"--name-only\", \"--no-renames\", \"-z\", row.starting_head, row.repair_commit], `record '${row.record_id}' repair diff`)\n    .split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:6770",
+          "line": 113,
+          "callee": "gitValue",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7004",
+          "line": 115,
+          "callee": "equal",
+          "target": "c048",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7034",
+          "line": 115,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7142",
+          "line": 118,
+          "callee": "parseRepositoryConfig",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7164",
+          "line": 118,
+          "callee": "gitValue",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7299",
+          "line": 120,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:7483",
+          "line": 123,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c024",
+      "symbolId": "syntax:observe/repair-record.js:7844:arrow_function",
+      "name": "<callback@131:37>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 131,
+      "endLine": 131,
+      "distance": 4,
+      "source": "  const records = value.records.map((row, index) => validateRecord(row, index, run));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:7860",
+          "line": 131,
+          "callee": "validateRecord",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c025",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateMarker().",
+      "name": "validateMarker",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 158,
+      "endLine": 167,
+      "distance": 4,
+      "source": "function validateMarker(value, row, runId, attempt, label) {\n  if (!sameKeys(value, MARKER_KEYS) || value.version !== 1 || value.run_id !== runId\n    || value.record_id !== row.record_id || value.attempt !== attempt\n    || !DIGEST.test(value.run_sha256) || !DIGEST.test(value.journal_sha256)\n    || value.record_sha256 !== digest(row) || value.introducing_merge !== row.introducing_merge\n    || value.repair_commit !== row.repair_commit || !equal(value.trigger, row.trigger)\n    || !sameKeys(value.trigger, [\"command\", \"timeout_ms\"]) || !canonicalTimestamp(value.started_at)) {\n    fail(`${label} has an invalid marker binding or schema`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:9024",
+          "line": 159,
+          "callee": "sameKeys",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9180",
+          "line": 161,
+          "callee": "DIGEST.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9214",
+          "line": 161,
+          "callee": "DIGEST.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9279",
+          "line": 162,
+          "callee": "digest",
+          "target": "c047",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9397",
+          "line": 163,
+          "callee": "equal",
+          "target": "c048",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9439",
+          "line": 164,
+          "callee": "sameKeys",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9494",
+          "line": 164,
+          "callee": "canonicalTimestamp",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:9538",
+          "line": 165,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c026",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/validateResult().",
+      "name": "validateResult",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 176,
+      "endLine": 186,
+      "distance": 4,
+      "source": "function validateResult(value, marker, row, runId, attempt, label) {\n  if (!sameKeys(value, RESULT_KEYS) || value.version !== 1 || value.run_id !== runId\n    || value.record_id !== row.record_id || value.attempt !== attempt || value.marker_sha256 !== digest(marker)\n    || value.run_sha256 !== marker.run_sha256 || value.journal_sha256 !== marker.journal_sha256\n    || value.record_sha256 !== marker.record_sha256 || value.introducing_merge !== marker.introducing_merge\n    || value.repair_commit !== marker.repair_commit || !equal(value.trigger, marker.trigger)\n    || !sameKeys(value.trigger, [\"command\", \"timeout_ms\"]) || !validateExecutionResult(value.result)\n    || !canonicalTimestamp(value.observed_at) || value.observed_at !== marker.started_at || value.observed_by !== \"factory\") {\n    fail(`${label} has an invalid result binding or schema`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:10070",
+          "line": 177,
+          "callee": "sameKeys",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10245",
+          "line": 178,
+          "callee": "digest",
+          "target": "c047",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10520",
+          "line": 181,
+          "callee": "equal",
+          "target": "c048",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10565",
+          "line": 182,
+          "callee": "sameKeys",
+          "target": "c021",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10620",
+          "line": 182,
+          "callee": "validateExecutionResult",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10666",
+          "line": 183,
+          "callee": "canonicalTimestamp",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10789",
+          "line": 184,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c027",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/evidenceEntries().",
+      "name": "evidenceEntries",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 188,
+      "endLine": 203,
+      "distance": 4,
+      "source": "function evidenceEntries(runDir) {\n  const dir = join(runDir, \"evidence\");\n  let stats;\n  try {\n    stats = lstatSync(dir);\n  } catch (error) {\n    if (error?.code === \"ENOENT\") return [];\n    fail(`evidence directory could not be inspected: ${error.message}`);\n  }\n  if (!stats.isDirectory() || stats.isSymbolicLink()) fail(\"evidence path is not a regular directory\");\n  try {\n    return readdirSync(dir).filter((name) => name.toLowerCase().startsWith(REPAIR_EVIDENCE_PREFIX)).sort();\n  } catch (error) {\n    fail(`evidence directory could not be read: ${error.message}`);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:10903",
+          "line": 189,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:10962",
+          "line": 192,
+          "callee": "lstatSync",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11047",
+          "line": 195,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11127",
+          "line": 197,
+          "callee": "stats.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11150",
+          "line": 197,
+          "callee": "stats.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11174",
+          "line": 197,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11243",
+          "line": 199,
+          "callee": "readdirSync(dir).filter((name) => name.toLowerCase().startsWith(REPAIR_EVIDENCE_PREFIX)).sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11243",
+          "line": 199,
+          "callee": "readdirSync(dir).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11243",
+          "line": 199,
+          "callee": "readdirSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:11364",
+          "line": 201,
+          "callee": "fail",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c028",
+      "symbolId": "syntax:observe/repair-record.js:11523:arrow_function",
+      "name": "<callback@206:36>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 206,
+      "endLine": 206,
+      "distance": 4,
+      "source": "  const rows = new Map(records.map((row) => [row.record_id, row]));",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c029",
+      "symbolId": "syntax:observe/repair-record.js:12750:arrow_function",
+      "name": "<callback@227:55>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 227,
+      "endLine": 227,
+      "distance": 4,
+      "source": "    const attempts = [...history.markers.keys()].sort((a, b) => a - b);",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c030",
+      "symbolId": "syntax:observe/repair-record.js:12790:arrow_function",
+      "name": "<callback@228:23>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 228,
+      "endLine": 228,
+      "distance": 4,
+      "source": "    if (attempts.some((attempt, index) => attempt !== index + 1)) fail(`evidence for '${recordId}' has a marker gap`);",
+      "sourceTruncated": false,
+      "calls": []
+    },
+    {
+      "id": "c031",
+      "symbolId": "syntax:observe/repair-record.js:12928:arrow_function",
+      "name": "<callback@229:42>",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 229,
+      "endLine": 229,
+      "distance": 4,
+      "source": "    if ([...history.results.keys()].some((attempt) => !history.markers.has(attempt))) fail(`evidence for '${recordId}' has a result without its marker`);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:12942",
+          "line": 229,
+          "callee": "history.markers.has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c032",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/runLocalRef().",
+      "name": "runLocalRef",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 86,
+      "endLine": 102,
+      "distance": 4,
+      "source": "function runLocalRef(errors, holder, key, path) {\n  const value = holder[key];\n  if (value === null || value === undefined) return;\n  if (typeof value !== \"string\" || !value.trim()) {\n    errors.push({ path: `${path}.${key}`, message: \"must be a non-empty string\" });\n    return;\n  }\n  const parts = value.split(/[\\\\/]/u);\n  if (value.startsWith(\"/\") || parts.includes(\"..\") || parts.includes(\".\")) {\n    errors.push({ path: `${path}.${key}`, message: \"must be run-local without traversal\" });\n    return;\n  }\n  const dir = REF_DIRS[key];\n  if (dir && !value.startsWith(`${dir}/`)) {\n    errors.push({ path: `${path}.${key}`, message: `must be under ${dir}/` });\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:5927",
+          "line": 89,
+          "callee": "value.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:5947",
+          "line": 90,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6059",
+          "line": 93,
+          "callee": "value.split",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6088",
+          "line": 94,
+          "callee": "value.startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6113",
+          "line": 94,
+          "callee": "parts.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6137",
+          "line": 94,
+          "callee": "parts.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6164",
+          "line": 95,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6312",
+          "line": 99,
+          "callee": "value.startsWith",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6347",
+          "line": 100,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c033",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/SchemaError#`<constructor>`().",
+      "name": "constructor",
+      "kind": "method",
+      "path": "state/schema.js",
+      "startLine": 109,
+      "endLine": 113,
+      "distance": 4,
+      "source": "  constructor(errors) {\n    super(errors.map(({ path, message }) => `${path}: ${message}`).join(\"; \"));\n    this.name = \"SchemaError\";\n    this.errors = errors;\n  }",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:6648",
+          "line": 110,
+          "callee": "super",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6654",
+          "line": 110,
+          "callee": "errors.map(({ path, message }) => `${path}: ${message}`).join",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:6654",
+          "line": 110,
+          "callee": "errors.map",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c034",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/gates().",
+      "name": "gates",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 157,
+      "endLine": 171,
+      "distance": 4,
+      "source": "function gates(errors, value) {\n  if (!isRecord(value)) return void errors.push({ path: \"run.gates\", message: \"must be an object\" });\n  const unknown = Object.keys(value).filter((key) => !GATE_NAMES.includes(key));\n  if (unknown.length) errors.push({ path: \"run.gates\", message: `unknown gates: ${unknown.join(\", \")}` });\n  for (const name of GATE_NAMES) {\n    const gate = value[name];\n    if (gate === undefined) continue;\n    const path = `run.gates.${name}`;\n    if (!object(errors, gate, path, GATE_KEYS)) continue;\n    if (gate.reviewed_head !== null && gate.reviewed_head !== undefined) optionalPattern(errors, gate, \"reviewed_head\", SHA, path);\n    enumValue(errors, gate, \"status\", GATE_STATUSES, path);\n    if (gate.at !== null) optionalPattern(errors, gate, \"at\", ISO, path);\n    if (gate.artifact !== undefined && gate.artifact !== null) optionalString(errors, gate, \"artifact\", path);\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:8897",
+          "line": 158,
+          "callee": "isRecord",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:8926",
+          "line": 158,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9010",
+          "line": 159,
+          "callee": "Object.keys(value).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9010",
+          "line": 159,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9095",
+          "line": 160,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9155",
+          "line": 160,
+          "callee": "unknown.join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9330",
+          "line": 165,
+          "callee": "object",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9452",
+          "line": 166,
+          "callee": "optionalPattern",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9515",
+          "line": 167,
+          "callee": "enumValue",
+          "target": "c043",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9597",
+          "line": 168,
+          "callee": "optionalPattern",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9708",
+          "line": 169,
+          "callee": "optionalString",
+          "target": "c041",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c035",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/steps().",
+      "name": "steps",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 173,
+      "endLine": 186,
+      "distance": 4,
+      "source": "function steps(errors, value) {\n  if (!Array.isArray(value)) return void errors.push({ path: \"run.steps\", message: \"must be an array\" });\n  const seen = new Set();\n  value.forEach((step, index) => {\n    const path = `run.steps[${index}]`;\n    if (!object(errors, step, path, STEP_KEYS)) return;\n    required(errors, step, \"agent\", path);\n    enumValue(errors, step, \"status\", STEP_STATUSES, path);\n    positiveInt(errors, step, \"attempts\", path);\n    for (const key of [\"review_ref\", \"evidence_ref\"]) runLocalRef(errors, step, key, path);\n    if (seen.has(step.agent)) errors.push({ path: `${path}.agent`, message: \"duplicate step agent\" });\n    seen.add(step.agent);\n  });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:9802",
+          "line": 174,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9836",
+          "line": 174,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9916",
+          "line": 175,
+          "callee": "Set",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:9929",
+          "line": 176,
+          "callee": "value.forEach",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c036",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/slices().",
+      "name": "slices",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 188,
+      "endLine": 246,
+      "distance": 4,
+      "source": "function slices(errors, value) {\n  if (!Array.isArray(value)) return void errors.push({ path: \"run.slices\", message: \"must be an array\" });\n  const ids = new Set(value.filter(isRecord).map((slice) => slice.id));\n  // Finding 5: the id set existed only for dependency validation, so two slices could\n  // share an id. Every later update maps by id and would then hit both rows.\n  const seenIds = new Set();\n  for (const slice of value.filter(isRecord)) {\n    if (seenIds.has(slice.id)) errors.push({ path: \"run.slices\", message: `duplicate slice id '${slice.id}'` });\n    seenIds.add(slice.id);\n  }\n  value.forEach((slice, index) => {\n    const path = `run.slices[${index}]`;\n    if (!object(errors, slice, path, SLICE_KEYS)) return;\n    pattern(errors, slice, \"id\", ID, path);\n    required(errors, slice, \"stack\", path);\n    enumValue(errors, slice, \"status\", SLICE_STATUSES, path);\n    positiveInt(errors, slice, \"attempts\", path);\n    for (const key of [\"worktree\", \"branch\"]) nullableString(errors, slice, key, path);\n    for (const key of [\"evidence_ref\", \"review_ref\"]) runLocalRef(errors, slice, key, path);\n    if (slice.base_ref !== null && slice.base_ref !== un\n/* ... source excerpt omitted ... */\non`, message: \"must be an array\" });\n    } else {\n      for (const dep of slice.depends_on) {\n        if (!ids.has(dep)) errors.push({ path: `${path}.depends_on`, message: `unknown slice '${dep}'` });\n        if (dep === slice.id) errors.push({ path: `${path}.depends_on`, message: \"slice cannot depend on itself\" });\n      }\n    }\n    // A merged slice must record what it merged; otherwise the merge proof has\n    // nothing to bind to.\n    if (slice.status === \"merged\" && !SHA.test(String(slice.merge_commit))) {\n      errors.push({ path: `${path}.merge_commit`, message: \"is required when a slice is merged\" });\n    }\n  });\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:state/schema.js:10480",
+          "line": 189,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:10514",
+          "line": 189,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:10594",
+          "line": 190,
+          "callee": "Set",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:10602",
+          "line": 190,
+          "callee": "value.filter(isRecord).map",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:10602",
+          "line": 190,
+          "callee": "value.filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:10835",
+          "line": 193,
+          "callee": "Set",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:10868",
+          "line": 194,
+          "callee": "value.filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:10902",
+          "line": 195,
+          "callee": "seenIds.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:10925",
+          "line": 195,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:11011",
+          "line": 196,
+          "callee": "seenIds.add",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:11040",
+          "line": 198,
+          "callee": "value.forEach",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c037",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/validator().",
+      "name": "validator",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 274,
+      "endLine": 281,
+      "distance": 4,
+      "source": "function validator(errors, value) {\n  if (value === null || value === undefined) return;\n  if (!object(errors, value, \"run.validator\", VALIDATOR_KEYS)) return;\n  enumValue(errors, value, \"verdict\", VALIDATOR_VERDICTS, \"run.validator\");\n  nullableString(errors, value, \"report\", \"run.validator\");\n  pattern(errors, value, \"reviewed_head\", SHA, \"run.validator\");\n  nonNegativeInt(errors, value, \"loops\", \"run.validator\");\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:15587",
+          "line": 276,
+          "callee": "object",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:15653",
+          "line": 277,
+          "callee": "enumValue",
+          "target": "c043",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:15729",
+          "line": 278,
+          "callee": "nullableString",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:15789",
+          "line": 279,
+          "callee": "pattern",
+          "target": "c042",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:15854",
+          "line": 280,
+          "callee": "nonNegativeInt",
+          "target": "c045",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c038",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/terminalResult().",
+      "name": "terminalResult",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 283,
+      "endLine": 296,
+      "distance": 4,
+      "source": "function terminalResult(errors, value, status) {\n  if (value === null || value === undefined) {\n    if (TERMINAL_STATUSES.includes(status) && status !== \"completed\") {\n      errors.push({ path: \"run.terminal_result\", message: `is required when status is ${status}` });\n    }\n    return;\n  }\n  if (!object(errors, value, \"run.terminal_result\", TERMINAL_RESULT_KEYS)) return;\n  enumValue(errors, value, \"status\", TERMINAL_STATUSES, \"run.terminal_result\");\n  required(errors, value, \"reason\", \"run.terminal_result\");\n  if (value.status !== status && !(status === \"running\" && value.status === \"needs-human\")) {\n    errors.push({ path: \"run.terminal_result.status\", message: \"must match run.status or preserve a resumed needs-human result\" });\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:16018",
+          "line": 285,
+          "callee": "TERMINAL_STATUSES.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16088",
+          "line": 286,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16212",
+          "line": 290,
+          "callee": "object",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16290",
+          "line": 291,
+          "callee": "enumValue",
+          "target": "c043",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16370",
+          "line": 292,
+          "callee": "required",
+          "target": "c040",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16526",
+          "line": 294,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c039",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/object().",
+      "name": "object",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 298,
+      "endLine": 309,
+      "distance": 4,
+      "source": "function object(errors, value, path, allowed) {\n  if (!isRecord(value)) {\n    errors.push({ path, message: \"must be an object\" });\n    return false;\n  }\n  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));\n  if (unknown.length) {\n    errors.push({ path, message: `unknown keys: ${unknown.sort().join(\", \")}` });\n    return false;\n  }\n  return true;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:16716",
+          "line": 299,
+          "callee": "isRecord",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16739",
+          "line": 300,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16832",
+          "line": 303,
+          "callee": "Object.keys(value).filter",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16832",
+          "line": 303,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16920",
+          "line": 305,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16966",
+          "line": 305,
+          "callee": "unknown.sort().join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:16966",
+          "line": 305,
+          "callee": "unknown.sort",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c040",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/required().",
+      "name": "required",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 311,
+      "endLine": 313,
+      "distance": 4,
+      "source": "function required(errors, holder, key, path) {\n  if (!stringValue(holder[key])) errors.push({ path: `${path}.${key}`, message: \"must be a non-empty string\" });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:17092",
+          "line": 312,
+          "callee": "stringValue",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:17118",
+          "line": 312,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c041",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/optionalString().",
+      "name": "optionalString",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 315,
+      "endLine": 318,
+      "distance": 4,
+      "source": "function optionalString(errors, holder, key, path) {\n  if (holder[key] === undefined || holder[key] === null) return;\n  required(errors, holder, key, path);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:17321",
+          "line": 317,
+          "callee": "required",
+          "target": "c040",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c042",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/pattern().",
+      "name": "pattern",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 325,
+      "endLine": 329,
+      "distance": 4,
+      "source": "function pattern(errors, holder, key, regex, path) {\n  if (typeof holder[key] !== \"string\" || !regex.test(holder[key])) {\n    errors.push({ path: `${path}.${key}`, message: `must match ${regex.source}` });\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:17616",
+          "line": 326,
+          "callee": "regex.test",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:17647",
+          "line": 327,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c043",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/enumValue().",
+      "name": "enumValue",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 336,
+      "endLine": 340,
+      "distance": 4,
+      "source": "function enumValue(errors, holder, key, allowed, path) {\n  if (!allowed.includes(holder[key])) {\n    errors.push({ path: `${path}.${key}`, message: `must be one of ${allowed.join(\" | \")}` });\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:17972",
+          "line": 337,
+          "callee": "allowed.includes",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:18009",
+          "line": 338,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:18074",
+          "line": 338,
+          "callee": "allowed.join",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c044",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/positiveInt().",
+      "name": "positiveInt",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 342,
+      "endLine": 346,
+      "distance": 4,
+      "source": "function positiveInt(errors, holder, key, path) {\n  if (!Number.isSafeInteger(holder[key]) || holder[key] < 1) {\n    errors.push({ path: `${path}.${key}`, message: \"must be a positive integer\" });\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:18164",
+          "line": 343,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:18224",
+          "line": 344,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c045",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`schema.js`/nonNegativeInt().",
+      "name": "nonNegativeInt",
+      "kind": "function",
+      "path": "state/schema.js",
+      "startLine": 348,
+      "endLine": 352,
+      "distance": 4,
+      "source": "function nonNegativeInt(errors, holder, key, path) {\n  if (!Number.isSafeInteger(holder[key]) || holder[key] < 0) {\n    errors.push({ path: `${path}.${key}`, message: \"must be a non-negative integer\" });\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/schema.js:18371",
+          "line": 349,
+          "callee": "Number.isSafeInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/schema.js:18431",
+          "line": 350,
+          "callee": "errors.push",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c046",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`index.js`/git().",
+      "name": "git",
+      "kind": "function",
+      "path": "observe/index.js",
+      "startLine": 20,
+      "endLine": 30,
+      "distance": 5,
+      "source": "export function git(cwd, args, { runner = spawnSync } = {}) {\n  const result = runner(\"git\", args, { cwd, encoding: \"utf8\", shell: false, env: { ...process.env, LC_ALL: \"C\" } });\n  const status = Number.isInteger(result?.status) ? result.status : null;\n  return {\n    ok: status === 0,\n    status,\n    stdout: String(result?.stdout ?? \"\"),\n    stderr: String(result?.stderr ?? \"\"),\n    argv: [\"git\", ...args],\n  };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/index.js:1053",
+          "line": 21,
+          "callee": "runner",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1170",
+          "line": 22,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1284",
+          "line": 26,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/index.js:1326",
+          "line": 27,
+          "callee": "String",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c047",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/digest.",
+      "name": "digest",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 25,
+      "endLine": 25,
+      "distance": 5,
+      "source": "const digest = (value) => `sha256:${createHash(\"sha256\").update(JSON.stringify(value), \"utf8\").digest(\"hex\")}`;",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:1774",
+          "line": 25,
+          "callee": "createHash(\"sha256\").update(JSON.stringify(value), \"utf8\").digest",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1774",
+          "line": 25,
+          "callee": "createHash(\"sha256\").update",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1774",
+          "line": 25,
+          "callee": "createHash",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1802",
+          "line": 25,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c048",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 observe/`repair-record.js`/equal.",
+      "name": "equal",
+      "kind": "function",
+      "path": "observe/repair-record.js",
+      "startLine": 26,
+      "endLine": 26,
+      "distance": 5,
+      "source": "const equal = (left, right) => JSON.stringify(left) === JSON.stringify(right);",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:observe/repair-record.js:1881",
+          "line": 26,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:observe/repair-record.js:1906",
+          "line": 26,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    }
+  ],
+  "scope": {
+    "eligibleCandidates": 118,
+    "includedCandidates": 48,
+    "omittedCandidates": 70,
+    "maxSourceChars": 1800,
+    "limitations": "Fixed candidate scope, truncated source excerpts, syntax-level source ordering. Callback references do not establish execution."
+  }
+}

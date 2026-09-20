@@ -1,0 +1,17 @@
+{
+  "name": "baleyg-view-selection-experiment",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs",
+    "prepare:inputs": "node prepare.mjs",
+    "review": "node serve-review.mjs",
+    "review:hard": "node serve-hard-review.mjs",
+    "prepare:hard": "node prepare-hard.mjs --run"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.79.0",
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@modelcontextprotocol/sdk": "1.30.0"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "tests": {
+    "rust": 261,
+    "ui": 143,
+    "fmt": true,
+    "clippyWarningsDenied": true,
+    "build": true
+  },
+  "semantics": "Source hints and candidate types only; no receiver/type/dispatch resolution added.",
+  "revision": 6,
+  "browser": {
+    "collapsed": {
+      "measuredCallRows": 2,
+      "entryPreviews": 1,
+      "visibleLanes": [
+        "check_file_with_unlinked",
+        "OpenOptions",
+        "file",
+        "check_file_metadata"
+      ]
+    },
+    "expanded": {
+      "measuredCallRows": 10,
+      "entryPreviews": 0,
+      "visibleLanes": 5
+    },
+    "keyboardFocusPreserved": true,
+    "chainSourceHighlightedLines": 8,
+    "desktopWidth": 1440,
+    "mobileWidth": 390,
+    "pageHorizontalOverflow": false
+  },
+  "evidence": "Preview uses first measured target only. Original group/source range/call IDs/resolution remain unchanged. Source-hint limits preserve all measured calls."
+}

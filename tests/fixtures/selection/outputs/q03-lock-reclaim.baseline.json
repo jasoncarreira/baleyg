@@ -1,0 +1,220 @@
+{
+  "provider": "deterministic",
+  "questionId": "q03-lock-reclaim",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "decisions": [
+    {
+      "candidateId": "c001",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c002",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c003",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c004",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c005",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c006",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c007",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c008",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c009",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c010",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c011",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c012",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c013",
+      "relevance": "essential"
+    },
+    {
+      "candidateId": "c014",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c015",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c016",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c017",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c018",
+      "relevance": "supporting"
+    },
+    {
+      "candidateId": "c019",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c020",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c021",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c022",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c023",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c024",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c025",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c026",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c027",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c028",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c029",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c030",
+      "relevance": "incidental"
+    },
+    {
+      "candidateId": "c031",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c032",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c033",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c034",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c035",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c036",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c037",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c038",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c039",
+      "relevance": "uncertain"
+    },
+    {
+      "candidateId": "c040",
+      "relevance": "uncertain"
+    }
+  ],
+  "view": {
+    "questionId": "q03-lock-reclaim",
+    "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+    "visible": [
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/withRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/canStealRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/readLockOwnerEvidence().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stealByRename().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/releaseOwnedRunJsonLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/quarantineAndRemoveOwnedLock().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockOwnerEntryExists().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwner().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockDirectoryIdentity().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockDirectoryIdentity().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/normalizePositiveInteger().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/delay().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/ownerlessLockIsReclaimable()."
+    ],
+    "collapsed": [
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/renameOwnedLockToQuarantine().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/inspectLockOwnerLiveness().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isDurableLockOwner().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwnerEvidence().",
+      "syntax:core/run-lock.js:11558:arrow_function",
+      "syntax:core/write-core.js:814:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/readSessionLock().",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/inspectSessionLock().",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/claimSessionLock().",
+      "syntax:state/session-lock.js:2481:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/refreshSessionLock().",
+      "syntax:state/session-lock.js:3415:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/releaseSessionLock().",
+      "syntax:state/session-lock.js:3987:arrow_function",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/isValidLock().",
+      "syntax:state/session-lock.js:4457:arrow_function"
+    ],
+    "hidden": [
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isRecord().",
+      "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stringValue().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/coordinateRunJsonTransition().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/rename0:",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/assertUnchanged().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/readRunState().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/contractRegistry().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/participantRegistry().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/projectAll().",
+      "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/deepFreeze().",
+      "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/SessionLockHeldError#`<constructor>`()."
+    ],
+    "seedForced": false,
+    "overDisplayBudget": true,
+    "edgePolicy": "Use only measured call edges; hidden intermediates never become direct edges. Callback links remain explicitly non-call links."
+  }
+}

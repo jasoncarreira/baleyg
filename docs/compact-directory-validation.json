@@ -1,0 +1,30 @@
+{
+  "status": "sanitized historical summary; not a new validation run",
+  "evidenceNote": "Private-workspace trial, browser, preservation and deployment details are omitted. Historical Baleyg development checks below are copied from the original report, not rerun or independently reverified during publication cleanup. No synthetic example is presented as an observed run.",
+  "scope": "Client-side compaction of complete single-child directory chains",
+  "historicalDevelopmentChecks": {
+    "rustPassed": 365,
+    "rustIgnored": 1,
+    "uiPassed": 289,
+    "browseUiPassed": 53,
+    "failed": 0,
+    "fmt": "passed",
+    "clippy": "passed -D warnings",
+    "build": "passed",
+    "remoteCI": "not run"
+  },
+  "recordedImplementationBehavior": {
+    "compactOnlyCompleteSoleDirectory": true,
+    "separator": "/",
+    "maxDirectoriesPerExpansion": 32,
+    "metadataReadsOnlyAfterExplicitExpand": true,
+    "realPathsRetained": true,
+    "branchFileSymlinkIncompletePaginationTruncationLoadingErrorStopCompaction": true,
+    "retryResumesOpenChain": true,
+    "refreshResumesVisibleOpenAnchors": true,
+    "collapseWhilePendingStopsDescendants": true,
+    "filterDoesNotCrawl": true,
+    "staleSessionRevisionRootGuards": true,
+    "accessibleFullPathLabel": true
+  }
+}

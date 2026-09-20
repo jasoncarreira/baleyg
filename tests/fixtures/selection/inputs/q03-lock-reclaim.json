@@ -1,0 +1,2442 @@
+{
+  "schemaVersion": 1,
+  "questionId": "q03-lock-reclaim",
+  "question": "Which checks allow withRunJsonLock to attempt reclaiming an existing lock, and where is the protected callback invoked?",
+  "graphHash": "9e0c8d5f664e054ae8dfa1f8a9e3c92ea5e1493852dea5ede77b6335667f13db",
+  "seedId": "c001",
+  "labels": [
+    "essential",
+    "supporting",
+    "incidental",
+    "uncertain"
+  ],
+  "candidates": [
+    {
+      "id": "c001",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/withRunJsonLock().",
+      "name": "withRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 18,
+      "endLine": 77,
+      "distance": 0,
+      "source": "export async function withRunJsonLock(runDir, fn, options = {}) {\n  if (typeof fn !== \"function\") throw new Error(\"withRunJsonLock requires a callback\");\n  const { onBeforeSteal } = options;\n  if (onBeforeSteal !== undefined && typeof onBeforeSteal !== \"function\") {\n    throw new Error(\"onBeforeSteal must be a function\");\n  }\n  const timeoutMs = normalizePositiveInteger(options.timeoutMs, DEFAULT_LOCK_TIMEOUT_MS);\n  normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);\n  normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);\n  const lockDir = join(runDir, LOCK_DIR);\n  const ownerPath = join(lockDir, LOCK_OWNER_FILE);\n  const deadline = Date.now() + timeoutMs;\n  let stealAttempted = false;\n  let createdIdentity = null;\n  let owner = null;\n  let ownerPublished = false;\n  let publishedEvidence = null;\n\n  while (true) {\n    try {\n      await mkdir(lockDir);\n      createdIdentity = await lockDirectoryIdentity(lockDir);\n      break;\n    } catch (error) {\n      if (error?.code !== \"EEXIST\") throw error;\n      if (!stealAttempted) {\n        const observedIdentity = await lockDirectoryIdentity(lockDir);\n        co\n/* ... source excerpt omitted ... */\ningify(owner, null, 2)}\\n`, { encoding: \"utf8\", flag: \"wx\" });\n    publishedEvidence = await readLockOwnerEvidence(ownerPath);\n    if (!sameLockOwner(owner, publishedEvidence?.owner)) throw new Error(`run.json lock owner publication failed at ${lockDir}`);\n    ownerPublished = true;\n    return await fn({ lock_dir: lockDir, owner });\n  } finally {\n    if (ownerPublished) {\n      await releaseOwnedRunJsonLock(runDir, lockDir, createdIdentity, publishedEvidence);\n    } else if (!ownerPublished && !(await lockOwnerEntryExists(ownerPath))) {\n      await quarantineAndRemoveOwnedLock(runDir, lockDir, createdIdentity);\n    }\n  }\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:880",
+          "line": 19,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1053",
+          "line": 22,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1124",
+          "line": 24,
+          "callee": "normalizePositiveInteger",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1196",
+          "line": 25,
+          "callee": "normalizePositiveInteger",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1268",
+          "line": 26,
+          "callee": "normalizePositiveInteger",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1373",
+          "line": 27,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1417",
+          "line": 28,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1468",
+          "line": 29,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1674",
+          "line": 38,
+          "callee": "mkdir",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1720",
+          "line": 39,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1904",
+          "line": 44,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:1975",
+          "line": 45,
+          "callee": "readLockOwnerEvidence",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2021",
+          "line": 46,
+          "callee": "canStealRunJsonLock",
+          "target": "c002",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2151",
+          "line": 48,
+          "callee": "stealByRename",
+          "target": "c004",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2290",
+          "line": 49,
+          "callee": "ownerlessLockIsReclaimable",
+          "target": "c013",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2422",
+          "line": 51,
+          "callee": "stealByRename",
+          "target": "c004",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2531",
+          "line": 54,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2561",
+          "line": 54,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2637",
+          "line": 55,
+          "callee": "delay",
+          "target": "c012",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2643",
+          "line": 55,
+          "callee": "Math.min",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2681",
+          "line": 55,
+          "callee": "Math.max",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2704",
+          "line": 55,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2770",
+          "line": 59,
+          "callee": "hostname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2795",
+          "line": 59,
+          "callee": "new Date().toISOString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2795",
+          "line": 59,
+          "callee": "Date",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2828",
+          "line": 59,
+          "callee": "randomUUID",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2862",
+          "line": 62,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2911",
+          "line": 62,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:2958",
+          "line": 63,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3059",
+          "line": 65,
+          "callee": "writeFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3083",
+          "line": 65,
+          "callee": "JSON.stringify",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3184",
+          "line": 66,
+          "callee": "readLockOwnerEvidence",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3227",
+          "line": 67,
+          "callee": "sameLockOwner",
+          "target": "c008",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3281",
+          "line": 67,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3392",
+          "line": 69,
+          "callee": "fn",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3478",
+          "line": 72,
+          "callee": "releaseOwnedRunJsonLock",
+          "target": "c005",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3598",
+          "line": 73,
+          "callee": "lockOwnerEntryExists",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3646",
+          "line": 74,
+          "callee": "quarantineAndRemoveOwnedLock",
+          "target": "c006",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c002",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/canStealRunJsonLock().",
+      "name": "canStealRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 79,
+      "endLine": 81,
+      "distance": 1,
+      "source": "function canStealRunJsonLock(owner, options = {}) {\n  return isDurableLockOwner(owner) && inspectLockOwnerLiveness(owner, options) === \"dead\";\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:3784",
+          "line": 80,
+          "callee": "isDurableLockOwner",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:3813",
+          "line": 80,
+          "callee": "inspectLockOwnerLiveness",
+          "target": "c015",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c003",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/readLockOwnerEvidence().",
+      "name": "readLockOwnerEvidence",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 83,
+      "endLine": 96,
+      "distance": 1,
+      "source": "async function readLockOwnerEvidence(ownerPath) {\n  let handle;\n  try {\n    handle = await open(ownerPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));\n    const parsed = JSON.parse(await handle.readFile(\"utf8\"));\n    if (!isDurableLockOwner(parsed)) return null;\n    const value = await handle.stat();\n    return { owner: parsed, identity: { dev: value.dev, ino: value.ino } };\n  } catch {\n    return null;\n  } finally {\n    await handle?.close();\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:3960",
+          "line": 86,
+          "callee": "open",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4046",
+          "line": 87,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4063",
+          "line": 87,
+          "callee": "handle.readFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4098",
+          "line": 88,
+          "callee": "isDurableLockOwner",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4163",
+          "line": 89,
+          "callee": "handle.stat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:4307",
+          "line": 94,
+          "callee": "handle?.close",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c004",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stealByRename().",
+      "name": "stealByRename",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 111,
+      "endLine": 136,
+      "distance": 1,
+      "source": "async function stealByRename(runDir, lockDir, observedIdentity, observedEvidence, onBeforeSteal) {\n  if (onBeforeSteal) await onBeforeSteal({ runDir, lockDir, owner: observedEvidence?.owner ?? null });\n  // The owner must still be the one we judged stale, and the directory's dev/ino cannot establish\n  // that: Linux reuses inode numbers, so a lock deleted and recreated here presents the identity we\n  // recorded and the post-rename check sees nothing wrong while a live lock is renamed away. The\n  // nonce is the discriminator. The note that once stood here — a pre-check is undetectable — was\n  // falsified only on APFS, which does not reuse the inode; CI failed on Linux and passed on macOS.\n  // The post-rename check stays, the two together are narrower, and the write core is still the\n  // real boundary, so the residual check-then-act window cannot produce a lost update.\n  if (observedEvidence\n    && !sameLockOwnerEvidence(observedEvidence, await readLockOwnerEvidence(join(lockDir, LOCK_OWNER_FILE)))) {\n    return false;\n  }\n  let quarantine;\n  try {\n    quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, observedIdentity);\n  } catch (error) {\n    // Losing the race is a retry, not a failure: ENOENT is the rename losing the path, ELOCKIDENTITY\n    // is noticing the winner before renaming. Only ENOENT was handled, so the second case failed the\n    // whole run — rare until the owner pre-check widened that window, and then CI hit it.\n    if (error?.code === \"ENOENT\" || error?.code === \"ELOCKIDENTITY\") return false;\n    throw error;\n  }\n  await rm(quarantine, { recursive: true, force: true });\n  return true;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:5260",
+          "line": 112,
+          "callee": "onBeforeSteal",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6050",
+          "line": 121,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6096",
+          "line": 121,
+          "callee": "readLockOwnerEvidence",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6118",
+          "line": 121,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6225",
+          "line": 126,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6716",
+          "line": 134,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c005",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/releaseOwnedRunJsonLock().",
+      "name": "releaseOwnedRunJsonLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 138,
+      "endLine": 148,
+      "distance": 1,
+      "source": "async function releaseOwnedRunJsonLock(runDir, lockDir, expectedIdentity, expectedEvidence) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) return;\n  if (!sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(lockDir, LOCK_OWNER_FILE)))) return;\n  const quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity);\n  if (!sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(quarantine, LOCK_OWNER_FILE)))) {\n    throw new Error(`run.json lock cleanup identity changed at ${quarantine}`);\n  }\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))\n    || !sameLockOwnerEvidence(expectedEvidence, await readLockOwnerEvidence(join(quarantine, LOCK_OWNER_FILE)))) return;\n  await rm(quarantine, { recursive: true, force: true });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:6885",
+          "line": 139,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6935",
+          "line": 139,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:6983",
+          "line": 140,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7029",
+          "line": 140,
+          "callee": "readLockOwnerEvidence",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7051",
+          "line": 140,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7120",
+          "line": 141,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7191",
+          "line": 142,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7237",
+          "line": 142,
+          "callee": "readLockOwnerEvidence",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7259",
+          "line": 142,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7308",
+          "line": 143,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7389",
+          "line": 145,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7439",
+          "line": 145,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7482",
+          "line": 146,
+          "callee": "sameLockOwnerEvidence",
+          "target": "c017",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7528",
+          "line": 146,
+          "callee": "readLockOwnerEvidence",
+          "target": "c003",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7550",
+          "line": 146,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7603",
+          "line": 147,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c006",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/quarantineAndRemoveOwnedLock().",
+      "name": "quarantineAndRemoveOwnedLock",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 150,
+      "endLine": 155,
+      "distance": 1,
+      "source": "async function quarantineAndRemoveOwnedLock(runDir, lockDir, expectedIdentity) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) return;\n  const quarantine = await renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity);\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))) return;\n  await rm(quarantine, { recursive: true, force: true });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:7744",
+          "line": 151,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7794",
+          "line": 151,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7862",
+          "line": 152,
+          "callee": "renameOwnedLockToQuarantine",
+          "target": "c014",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7933",
+          "line": 153,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:7983",
+          "line": 153,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8035",
+          "line": 154,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c007",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockOwnerEntryExists().",
+      "name": "lockOwnerEntryExists",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 187,
+      "endLine": 195,
+      "distance": 1,
+      "source": "async function lockOwnerEntryExists(ownerPath) {\n  try {\n    await lstat(ownerPath);\n    return true;\n  } catch (error) {\n    if (error?.code === \"ENOENT\") return false;\n    return true;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:9966",
+          "line": 189,
+          "callee": "lstat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c008",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwner().",
+      "name": "sameLockOwner",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 207,
+      "endLine": 209,
+      "distance": 1,
+      "source": "function sameLockOwner(left, right) {\n  return isDurableLockOwner(left) && isDurableLockOwner(right) && left.nonce === right.nonce;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10499",
+          "line": 208,
+          "callee": "isDurableLockOwner",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10527",
+          "line": 208,
+          "callee": "isDurableLockOwner",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c009",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/lockDirectoryIdentity().",
+      "name": "lockDirectoryIdentity",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 218,
+      "endLine": 226,
+      "distance": 1,
+      "source": "async function lockDirectoryIdentity(lockDir) {\n  try {\n    const value = await lstat(lockDir);\n    if (!value.isDirectory() || value.isSymbolicLink()) return null;\n    return { dev: value.dev, ino: value.ino, mtimeMs: value.mtimeMs };\n  } catch {\n    return null;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10891",
+          "line": 220,
+          "callee": "lstat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10916",
+          "line": 221,
+          "callee": "value.isDirectory",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10939",
+          "line": 221,
+          "callee": "value.isSymbolicLink",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c010",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockDirectoryIdentity().",
+      "name": "sameLockDirectoryIdentity",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 228,
+      "endLine": 230,
+      "distance": 1,
+      "source": "function sameLockDirectoryIdentity(left, right) {\n  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11142",
+          "line": 229,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c011",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/normalizePositiveInteger().",
+      "name": "normalizePositiveInteger",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 232,
+      "endLine": 236,
+      "distance": 1,
+      "source": "function normalizePositiveInteger(value, fallback) {\n  if (value === undefined || value === null) return fallback;\n  if (!Number.isInteger(value) || value <= 0) throw new Error(\"lock timing options must be positive integers\");\n  return value;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11343",
+          "line": 234,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:11388",
+          "line": 234,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c012",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/delay().",
+      "name": "delay",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 239,
+      "endLine": 241,
+      "distance": 1,
+      "source": "function delay(ms) {\n  return new Promise((resolve) => setTimeout(resolve, ms));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11546",
+          "line": 240,
+          "callee": "Promise",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": [
+            "c018"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c013",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/ownerlessLockIsReclaimable().",
+      "name": "ownerlessLockIsReclaimable",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 251,
+      "endLine": 261,
+      "distance": 1,
+      "source": "async function ownerlessLockIsReclaimable(lockDir, ownerPath, options = {}) {\n  if (await lockOwnerEntryExists(ownerPath)) return false;\n  const graceMs = normalizePositiveInteger(options.missingOwnerStealMs, DEFAULT_MISSING_OWNER_STEAL_MS);\n  try {\n    const observed = await stat(lockDir);\n    const ageMs = Date.now() - observed.mtimeMs;\n    return Number.isFinite(ageMs) && ageMs > graceMs;\n  } catch {\n    return false;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:12205",
+          "line": 252,
+          "callee": "lockOwnerEntryExists",
+          "target": "c007",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12270",
+          "line": 253,
+          "callee": "normalizePositiveInteger",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12392",
+          "line": 255,
+          "callee": "stat",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12425",
+          "line": 256,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12467",
+          "line": 257,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c014",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/renameOwnedLockToQuarantine().",
+      "name": "renameOwnedLockToQuarantine",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 157,
+      "endLine": 169,
+      "distance": 2,
+      "source": "async function renameOwnedLockToQuarantine(runDir, lockDir, expectedIdentity) {\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(lockDir))) {\n    // Coded so a *steal* can treat it as losing a race and retry. Release and cleanup check identity\n    // first, so for them it stays the error it is.\n    throw Object.assign(new Error(`run.json lock directory identity changed at ${lockDir}`), { code: \"ELOCKIDENTITY\" });\n  }\n  const quarantine = join(runDir, `.run-json.lock-quarantine-${randomUUID()}`);\n  await rename(lockDir, quarantine);\n  if (!sameLockDirectoryIdentity(expectedIdentity, await lockDirectoryIdentity(quarantine))) {\n    throw new Error(`run.json lock quarantine identity changed at ${quarantine}`);\n  }\n  return quarantine;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:8175",
+          "line": 158,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8225",
+          "line": 158,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8424",
+          "line": 161,
+          "callee": "Object.assign",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8438",
+          "line": 161,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8560",
+          "line": 163,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8602",
+          "line": 163,
+          "callee": "randomUUID",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8627",
+          "line": 164,
+          "callee": "rename",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8663",
+          "line": 165,
+          "callee": "sameLockDirectoryIdentity",
+          "target": "c010",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8713",
+          "line": 165,
+          "callee": "lockDirectoryIdentity",
+          "target": "c009",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:8761",
+          "line": 166,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c015",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/inspectLockOwnerLiveness().",
+      "name": "inspectLockOwnerLiveness",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 174,
+      "endLine": 185,
+      "distance": 2,
+      "source": "function inspectLockOwnerLiveness(owner, options = {}) {\n  if (!isDurableLockOwner(owner)) return \"indeterminate\";\n  // A lock taken on another host cannot be adjudicated from here at all.\n  if (owner.hostname !== hostname()) return \"indeterminate\";\n  const staleAfterMs = normalizePositiveInteger(options.staleLockMs, DEFAULT_STALE_LOCK_MS);\n  const heldForMs = Date.now() - Date.parse(owner.acquired_at);\n  if (!Number.isFinite(heldForMs)) return \"indeterminate\";\n  // A future `acquired_at` yields a negative age, which is never greater than the\n  // TTL, so clock skew already fails closed here. An explicit `heldForMs < 0`\n  // branch was removed after its falsification showed removing it changed nothing.\n  return heldForMs > staleAfterMs ? \"dead\" : \"alive\";\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:9194",
+          "line": 175,
+          "callee": "isDurableLockOwner",
+          "target": "c016",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9344",
+          "line": 177,
+          "callee": "hostname",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9403",
+          "line": 178,
+          "callee": "normalizePositiveInteger",
+          "target": "c011",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9493",
+          "line": 179,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9506",
+          "line": 179,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:9544",
+          "line": 180,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c016",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isDurableLockOwner().",
+      "name": "isDurableLockOwner",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 197,
+      "endLine": 205,
+      "distance": 2,
+      "source": "function isDurableLockOwner(owner) {\n  return isRecord(owner)\n    && Number.isInteger(owner.pid)\n    && owner.pid > 0\n    && stringValue(owner.hostname)\n    && Number.isFinite(Date.parse(owner.acquired_at || \"\"))\n    && typeof owner.nonce === \"string\"\n    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(owner.nonce);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10139",
+          "line": 198,
+          "callee": "isRecord",
+          "target": "c019",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10162",
+          "line": 199,
+          "callee": "Number.isInteger",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10218",
+          "line": 201,
+          "callee": "stringValue",
+          "target": "c020",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10253",
+          "line": 202,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10269",
+          "line": 202,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10352",
+          "line": 204,
+          "callee": "/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c017",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/sameLockOwnerEvidence().",
+      "name": "sameLockOwnerEvidence",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 211,
+      "endLine": 216,
+      "distance": 2,
+      "source": "function sameLockOwnerEvidence(left, right) {\n  return Boolean(left && right\n    && sameLockOwner(left.owner, right.owner)\n    && left.identity.dev === right.identity.dev\n    && left.identity.ino === right.identity.ino);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:10642",
+          "line": 212,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:10671",
+          "line": 213,
+          "callee": "sameLockOwner",
+          "target": "c008",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c018",
+      "symbolId": "syntax:core/run-lock.js:11558:arrow_function",
+      "name": "<callback@240:22>",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 240,
+      "endLine": 240,
+      "distance": 2,
+      "source": "  return new Promise((resolve) => setTimeout(resolve, ms));",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:11571",
+          "line": 240,
+          "callee": "setTimeout",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c019",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/isRecord().",
+      "name": "isRecord",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 263,
+      "endLine": 265,
+      "distance": 3,
+      "source": "function isRecord(value) {\n  return Boolean(value) && typeof value === \"object\" && !Array.isArray(value);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:12583",
+          "line": 264,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/run-lock.js:12631",
+          "line": 264,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c020",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`run-lock.js`/stringValue().",
+      "name": "stringValue",
+      "kind": "function",
+      "path": "core/run-lock.js",
+      "startLine": 267,
+      "endLine": 269,
+      "distance": 3,
+      "source": "function stringValue(value) {\n  return typeof value === \"string\" && value.trim().length > 0;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/run-lock.js:12724",
+          "line": 268,
+          "callee": "value.trim",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c021",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/coordinateRunJsonTransition().",
+      "name": "coordinateRunJsonTransition",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 9,
+      "endLine": 83,
+      "distance": null,
+      "source": "export async function coordinateRunJsonTransition(runDir, options) {\n  const {\n    contracts,\n    descriptor,\n    validateRun,\n    reobservers = new Map(),\n    atomicWriteHooks,\n    finalGuard,\n  } = options ?? {};\n  const registry = contractRegistry(contracts);\n  const participants = participantRegistry(descriptor, registry);\n  if (typeof validateRun !== \"function\") throw new Error(\"validateRun must be a function\");\n  if (!(reobservers instanceof Map)) throw new Error(\"reobservers must be a Map\");\n\n  return withRunJsonLock(runDir, async () => {\n    const initial = deepFreeze(await readRunState(runDir, validateRun));\n    const before = projectAll(registry, initial);\n    const applied = descriptor.apply(structuredClone(initial));\n    if (!applied || typeof applied !== \"object\" || Array.isArray(applied)) {\n      throw new Error(\"transition apply must return a state object\");\n    }\n    validateRun(applied);\n    const candidate = deepFreeze(applied);\n    const after = projectAll(registry, candidate);\n\n    for (const [familyId, contract] of registry) {\n      contract.validateTransition({\n        mode: participants.get(familyId),\n        before: before.get(f\n/* ... source excerpt omitted ... */\nd this rename would silently overwrite it.\n          // Only the synchronous final guard may run between this line and the rename.\n          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));\n          assertUnchanged(finalObserved, initial);\n          if (typeof finalGuard === \"function\") {\n            const guarded = finalGuard({ state: finalObserved, candidate });\n            if (guarded && typeof guarded.then === \"function\") throw new Error(\"final commit guard must be synchronous\");\n          }\n          await rename(source, destination);\n        },\n      },\n    });\n    return candidate;\n  });\n}",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:421",
+          "line": 14,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:510",
+          "line": 18,
+          "callee": "contractRegistry",
+          "target": "c026",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:562",
+          "line": 19,
+          "callee": "participantRegistry",
+          "target": "c027",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:652",
+          "line": 20,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:740",
+          "line": 21,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:790",
+          "line": 23,
+          "callee": "withRunJsonLock",
+          "target": "c001",
+          "resolution": "internal",
+          "callbackArguments": [
+            "c022"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c022",
+      "symbolId": "syntax:core/write-core.js:814:arrow_function",
+      "name": "<callback@23:34>",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 23,
+      "endLine": 82,
+      "distance": null,
+      "source": "  return withRunJsonLock(runDir, async () => {\n    const initial = deepFreeze(await readRunState(runDir, validateRun));\n    const before = projectAll(registry, initial);\n    const applied = descriptor.apply(structuredClone(initial));\n    if (!applied || typeof applied !== \"object\" || Array.isArray(applied)) {\n      throw new Error(\"transition apply must return a state object\");\n    }\n    validateRun(applied);\n    const candidate = deepFreeze(applied);\n    const after = projectAll(registry, candidate);\n\n    for (const [familyId, contract] of registry) {\n      contract.validateTransition({\n        mode: participants.get(familyId),\n        before: before.get(familyId),\n        after: after.get(familyId),\n        current: initial,\n        candidate,\n      });\n    }\n\n    await writeProtectedJsonAtomic(runDir, RUN_FILE, candidate, {\n      hooks: atomicWriteHooks,\n      fsOps: {\n        rename: async (source, destination) => {\n\n          // First comparison: gives the reobservers a state to reason about that is\n          // known current as of this moment.\n          const observed = deepFreeze(await readRunState(runDir, validateRun));\n          assertUnchange\n/* ... source excerpt omitted ... */\nand this rename would silently overwrite it.\n          // Only the synchronous final guard may run between this line and the rename.\n          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));\n          assertUnchanged(finalObserved, initial);\n          if (typeof finalGuard === \"function\") {\n            const guarded = finalGuard({ state: finalObserved, candidate });\n            if (guarded && typeof guarded.then === \"function\") throw new Error(\"final commit guard must be synchronous\");\n          }\n          await rename(source, destination);\n        },\n      },\n    });\n    return candidate;\n  });",
+      "sourceTruncated": true,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:848",
+          "line": 24,
+          "callee": "deepFreeze",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:865",
+          "line": 24,
+          "callee": "readRunState",
+          "target": "c025",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:920",
+          "line": 25,
+          "callee": "projectAll",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:971",
+          "line": 26,
+          "callee": "descriptor.apply",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:988",
+          "line": 26,
+          "callee": "structuredClone",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1066",
+          "line": 27,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1104",
+          "line": 28,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1172",
+          "line": 30,
+          "callee": "validateRun",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1216",
+          "line": 31,
+          "callee": "deepFreeze",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1255",
+          "line": 32,
+          "callee": "projectAll",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1346",
+          "line": 35,
+          "callee": "contract.validateTransition",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1390",
+          "line": 36,
+          "callee": "participants.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1434",
+          "line": 37,
+          "callee": "before.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1471",
+          "line": 38,
+          "callee": "after.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1564",
+          "line": 44,
+          "callee": "writeProtectedJsonAtomic",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c023",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/rename0:",
+      "name": "rename",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 47,
+      "endLine": 78,
+      "distance": null,
+      "source": "        rename: async (source, destination) => {\n\n          // First comparison: gives the reobservers a state to reason about that is\n          // known current as of this moment.\n          const observed = deepFreeze(await readRunState(runDir, validateRun));\n          assertUnchanged(observed, initial);\n\n          const observedProjections = projectAll(registry, observed);\n          for (const [familyId, contract] of registry) {\n            await contract.reobserve({\n              mode: participants.get(familyId),\n              current: observedProjections.get(familyId),\n              candidate: after.get(familyId),\n              observe: reobservers.get(familyId),\n              state: observed,\n              nextState: candidate,\n            });\n          }\n\n          // Second comparison, immediately before the rename and after anything the\n          // reobservers did. Comparing only once left a window: a reobserver - or a\n          // concurrent writer running while one awaited - could commit a valid\n          // record after the check, and this rename would silently overwrite it.\n          // Only the synchronous final guard may run between this line and the rename.\n          const finalObserved = deepFreeze(await readRunState(runDir, validateRun));\n          assertUnchanged(finalObserved, initial);\n          if (typeof finalGuard === \"function\") {\n            const guarded = finalGuard({ state: finalObserved, candidate });\n            if (guarded && typeof guarded.then === \"function\") throw new Error(\"final commit guard must be synchronous\");\n          }\n          await rename(source, destination);\n        },",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:1874",
+          "line": 51,
+          "callee": "deepFreeze",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1891",
+          "line": 51,
+          "callee": "readRunState",
+          "target": "c025",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:1937",
+          "line": 52,
+          "callee": "assertUnchanged",
+          "target": "c024",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2012",
+          "line": 54,
+          "callee": "projectAll",
+          "target": "c028",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2119",
+          "line": 56,
+          "callee": "contract.reobserve",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2160",
+          "line": 57,
+          "callee": "participants.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2211",
+          "line": 58,
+          "callee": "observedProjections.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2271",
+          "line": 59,
+          "callee": "after.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2315",
+          "line": 60,
+          "callee": "reobservers.get",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2890",
+          "line": 71,
+          "callee": "deepFreeze",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2907",
+          "line": 71,
+          "callee": "readRunState",
+          "target": "c025",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:2953",
+          "line": 72,
+          "callee": "assertUnchanged",
+          "target": "c024",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3072",
+          "line": 74,
+          "callee": "finalGuard",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3190",
+          "line": 75,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3271",
+          "line": 77,
+          "callee": "rename",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c024",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/assertUnchanged().",
+      "name": "assertUnchanged",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 85,
+      "endLine": 89,
+      "distance": null,
+      "source": "function assertUnchanged(observed, initial) {\n  if (!isDeepStrictEqual(observed, initial)) {\n    throw new Error(\"run state changed before protected replacement\");\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:3412",
+          "line": 86,
+          "callee": "isDeepStrictEqual",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3462",
+          "line": 87,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c025",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/readRunState().",
+      "name": "readRunState",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 91,
+      "endLine": 94,
+      "distance": null,
+      "source": "async function readRunState(runDir, validateRun) {\n  const state = JSON.parse(await readFile(join(runDir, RUN_FILE), \"utf8\"));\n  return validateRun(state);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:3597",
+          "line": 92,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3614",
+          "line": 92,
+          "callee": "readFile",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3623",
+          "line": 92,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3666",
+          "line": 93,
+          "callee": "validateRun",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c026",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/contractRegistry().",
+      "name": "contractRegistry",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 96,
+      "endLine": 112,
+      "distance": null,
+      "source": "function contractRegistry(contracts) {\n  if (!Array.isArray(contracts) || !Object.isFrozen(contracts)) {\n    throw new Error(\"contracts must be a frozen array\");\n  }\n  const registry = new Map();\n  for (const contract of contracts) {\n    if (!contract || !Object.isFrozen(contract) || typeof contract.id !== \"string\" || !contract.id) {\n      throw new Error(\"each contract must be frozen and have an id\");\n    }\n    for (const method of [\"project\", \"validateProjection\", \"validateTransition\", \"reobserve\"]) {\n      if (typeof contract[method] !== \"function\") throw new Error(`contract '${contract.id}' is missing ${method}`);\n    }\n    if (registry.has(contract.id)) throw new Error(`duplicate contract '${contract.id}'`);\n    registry.set(contract.id, contract);\n  }\n  return registry;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:3735",
+          "line": 97,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3764",
+          "line": 97,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3804",
+          "line": 98,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3874",
+          "line": 100,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:3945",
+          "line": 102,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4037",
+          "line": 103,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4254",
+          "line": 106,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4329",
+          "line": 108,
+          "callee": "registry.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4362",
+          "line": 108,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4416",
+          "line": 109,
+          "callee": "registry.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c027",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/participantRegistry().",
+      "name": "participantRegistry",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 114,
+      "endLine": 130,
+      "distance": null,
+      "source": "function participantRegistry(descriptor, contracts) {\n  if (!descriptor || !Object.isFrozen(descriptor) || typeof descriptor.apply !== \"function\"\n    || !Array.isArray(descriptor.participants) || !Object.isFrozen(descriptor.participants)) {\n    throw new Error(\"descriptor and participants must be frozen\");\n  }\n  const participants = new Map();\n  for (const participant of descriptor.participants) {\n    if (!participant || !Object.isFrozen(participant) || typeof participant.familyId !== \"string\"\n      || !participant.familyId || typeof participant.mode !== \"string\" || !participant.mode) {\n      throw new Error(\"each participant must be frozen and declare familyId and mode\");\n    }\n    if (!contracts.has(participant.familyId)) throw new Error(`unknown contract '${participant.familyId}'`);\n    if (participants.has(participant.familyId)) throw new Error(`duplicate participant '${participant.familyId}'`);\n    participants.set(participant.familyId, participant.mode);\n  }\n  return participants;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:4555",
+          "line": 115,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4633",
+          "line": 116,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4676",
+          "line": 116,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4730",
+          "line": 117,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4814",
+          "line": 119,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:4905",
+          "line": 121,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5085",
+          "line": 123,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5176",
+          "line": 125,
+          "callee": "contracts.has",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5219",
+          "line": 125,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5284",
+          "line": 126,
+          "callee": "participants.has",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5330",
+          "line": 126,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5396",
+          "line": 127,
+          "callee": "participants.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c028",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/projectAll().",
+      "name": "projectAll",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 132,
+      "endLine": 140,
+      "distance": null,
+      "source": "function projectAll(contracts, state) {\n  const projections = new Map();\n  for (const [familyId, contract] of contracts) {\n    const projection = contract.project(state);\n    contract.validateProjection(projection);\n    projections.set(familyId, projection);\n  }\n  return projections;\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:5546",
+          "line": 133,
+          "callee": "Map",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5630",
+          "line": 135,
+          "callee": "contract.project",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5659",
+          "line": 136,
+          "callee": "contract.validateProjection",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5704",
+          "line": 137,
+          "callee": "projections.set",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c029",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 core/`write-core.js`/deepFreeze().",
+      "name": "deepFreeze",
+      "kind": "function",
+      "path": "core/write-core.js",
+      "startLine": 142,
+      "endLine": 146,
+      "distance": null,
+      "source": "function deepFreeze(value) {\n  if (!value || typeof value !== \"object\" || Object.isFrozen(value)) return value;\n  for (const nested of Object.values(value)) deepFreeze(nested);\n  return Object.freeze(value);\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:core/write-core.js:5846",
+          "line": 143,
+          "callee": "Object.isFrozen",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5907",
+          "line": 144,
+          "callee": "Object.values",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5929",
+          "line": 144,
+          "callee": "deepFreeze",
+          "target": "c029",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:core/write-core.js:5958",
+          "line": 145,
+          "callee": "Object.freeze",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c030",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/SessionLockHeldError#`<constructor>`().",
+      "name": "constructor",
+      "kind": "method",
+      "path": "state/session-lock.js",
+      "startLine": 25,
+      "endLine": 29,
+      "distance": null,
+      "source": "  constructor(owner) {\n    super(`run '${owner.run_id}' is held by session ${owner.session} (heartbeat ${owner.heartbeat_at})`);\n    this.name = \"SessionLockHeldError\";\n    this.owner = owner;\n  }",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:1391",
+          "line": 26,
+          "callee": "super",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c031",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/readSessionLock().",
+      "name": "readSessionLock",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 32,
+      "endLine": 39,
+      "distance": null,
+      "source": "export function readSessionLock(runDir) {\n  try {\n    const value = JSON.parse(readFileSync(join(runDir, SESSION_LOCK_FILE), \"utf8\"));\n    return isValidLock(value) ? value : null;\n  } catch {\n    return null;\n  }\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:1632",
+          "line": 34,
+          "callee": "JSON.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:1643",
+          "line": 34,
+          "callee": "readFileSync",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:1656",
+          "line": 34,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:1710",
+          "line": 35,
+          "callee": "isValidLock",
+          "target": "c039",
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c032",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/inspectSessionLock().",
+      "name": "inspectSessionLock",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 43,
+      "endLine": 50,
+      "distance": null,
+      "source": "export function inspectSessionLock(runDir, { now = Date.now(), ttlMs = DEFAULT_SESSION_TTL_MS } = {}) {\n  const owner = readSessionLock(runDir);\n  if (!owner) return { state: \"absent\", owner: null };\n  const ageMs = now - Date.parse(owner.heartbeat_at);\n  // A future heartbeat is not evidence of staleness, so it counts as fresh.\n  if (!Number.isFinite(ageMs) || ageMs <= ttlMs) return { state: \"fresh\", owner };\n  return { state: \"stale\", owner };\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:1937",
+          "line": 43,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2006",
+          "line": 44,
+          "callee": "readSessionLock",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2108",
+          "line": 46,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2224",
+          "line": 48,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c033",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/claimSessionLock().",
+      "name": "claimSessionLock",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 52,
+      "endLine": 71,
+      "distance": null,
+      "source": "export async function claimSessionLock(runDir, { session, runId, branch, now, ttlMs, force = false } = {}) {\n  return withRunJsonLock(runDir, async () => {\n    if (!session) throw new Error(\"factory lock requires a session id\");\n    const at = new Date(now ?? Date.now()).toISOString();\n    const observed = inspectSessionLock(runDir, { now: now ?? Date.now(), ttlMs });\n    if (observed.state === \"fresh\" && observed.owner.session !== session && !force) {\n      throw new SessionLockHeldError(observed.owner);\n    }\n    const owner = {\n      session,\n      run_id: runId,\n      branch: branch ?? null,\n      // Re-claiming your own lock preserves when you first took it.\n      claimed_at: observed.owner?.session === session ? observed.owner.claimed_at : at,\n      heartbeat_at: at,\n    };\n    await writeProtectedJsonAtomic(runDir, SESSION_LOCK_FILE, owner);\n    return { ...owner, stolen_from: observed.state === \"stale\" || force ? observed.owner : null };\n  });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:2457",
+          "line": 53,
+          "callee": "withRunJsonLock",
+          "target": "c001",
+          "resolution": "internal",
+          "callbackArguments": [
+            "c034"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c034",
+      "symbolId": "syntax:state/session-lock.js:2481:arrow_function",
+      "name": "<callback@53:34>",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 53,
+      "endLine": 70,
+      "distance": null,
+      "source": "  return withRunJsonLock(runDir, async () => {\n    if (!session) throw new Error(\"factory lock requires a session id\");\n    const at = new Date(now ?? Date.now()).toISOString();\n    const observed = inspectSessionLock(runDir, { now: now ?? Date.now(), ttlMs });\n    if (observed.state === \"fresh\" && observed.owner.session !== session && !force) {\n      throw new SessionLockHeldError(observed.owner);\n    }\n    const owner = {\n      session,\n      run_id: runId,\n      branch: branch ?? null,\n      // Re-claiming your own lock preserves when you first took it.\n      claimed_at: observed.owner?.session === session ? observed.owner.claimed_at : at,\n      heartbeat_at: at,\n    };\n    await writeProtectedJsonAtomic(runDir, SESSION_LOCK_FILE, owner);\n    return { ...owner, stolen_from: observed.state === \"stale\" || force ? observed.owner : null };\n  });",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:2519",
+          "line": 54,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2583",
+          "line": 55,
+          "callee": "new Date(now ?? Date.now()).toISOString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2583",
+          "line": 55,
+          "callee": "Date",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2599",
+          "line": 55,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2647",
+          "line": 56,
+          "callee": "inspectSessionLock",
+          "target": "c032",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2688",
+          "line": 56,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:2808",
+          "line": 58,
+          "callee": "SessionLockHeldError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:3140",
+          "line": 68,
+          "callee": "writeProtectedJsonAtomic",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c035",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/refreshSessionLock().",
+      "name": "refreshSessionLock",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 73,
+      "endLine": 83,
+      "distance": null,
+      "source": "export async function refreshSessionLock(runDir, { session, now } = {}) {\n  return withRunJsonLock(runDir, async () => {\n    const owner = readSessionLock(runDir);\n    if (!owner) throw new Error(\"no factory.lock to refresh\");\n    // Refreshing someone else's lock would silently extend a run you do not own.\n    if (session && owner.session !== session) throw new SessionLockHeldError(owner);\n    const next = { ...owner, heartbeat_at: new Date(now ?? Date.now()).toISOString() };\n    await writeProtectedJsonAtomic(runDir, SESSION_LOCK_FILE, next);\n    return next;\n  });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:3391",
+          "line": 74,
+          "callee": "withRunJsonLock",
+          "target": "c001",
+          "resolution": "internal",
+          "callbackArguments": [
+            "c036"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c036",
+      "symbolId": "syntax:state/session-lock.js:3415:arrow_function",
+      "name": "<callback@74:34>",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 74,
+      "endLine": 82,
+      "distance": null,
+      "source": "  return withRunJsonLock(runDir, async () => {\n    const owner = readSessionLock(runDir);\n    if (!owner) throw new Error(\"no factory.lock to refresh\");\n    // Refreshing someone else's lock would silently extend a run you do not own.\n    if (session && owner.session !== session) throw new SessionLockHeldError(owner);\n    const next = { ...owner, heartbeat_at: new Date(now ?? Date.now()).toISOString() };\n    await writeProtectedJsonAtomic(runDir, SESSION_LOCK_FILE, next);\n    return next;\n  });",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:3447",
+          "line": 75,
+          "callee": "readSessionLock",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:3494",
+          "line": 76,
+          "callee": "Error",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:3669",
+          "line": 78,
+          "callee": "SessionLockHeldError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:3745",
+          "line": 79,
+          "callee": "new Date(now ?? Date.now()).toISOString",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:3745",
+          "line": 79,
+          "callee": "Date",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:3761",
+          "line": 79,
+          "callee": "Date.now",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:3800",
+          "line": 80,
+          "callee": "writeProtectedJsonAtomic",
+          "target": null,
+          "resolution": "internal",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c037",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/releaseSessionLock().",
+      "name": "releaseSessionLock",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 85,
+      "endLine": 93,
+      "distance": null,
+      "source": "export async function releaseSessionLock(runDir, { session } = {}) {\n  return withRunJsonLock(runDir, async () => {\n    const owner = readSessionLock(runDir);\n    if (!owner) return { released: false, reason: \"absent\" };\n    if (session && owner.session !== session) throw new SessionLockHeldError(owner);\n    await rm(join(runDir, SESSION_LOCK_FILE), { force: true });\n    return { released: true, reason: null };\n  });\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:3963",
+          "line": 86,
+          "callee": "withRunJsonLock",
+          "target": "c001",
+          "resolution": "internal",
+          "callbackArguments": [
+            "c038"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "c038",
+      "symbolId": "syntax:state/session-lock.js:3987:arrow_function",
+      "name": "<callback@86:34>",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 86,
+      "endLine": 92,
+      "distance": null,
+      "source": "  return withRunJsonLock(runDir, async () => {\n    const owner = readSessionLock(runDir);\n    if (!owner) return { released: false, reason: \"absent\" };\n    if (session && owner.session !== session) throw new SessionLockHeldError(owner);\n    await rm(join(runDir, SESSION_LOCK_FILE), { force: true });\n    return { released: true, reason: null };\n  });",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:4019",
+          "line": 87,
+          "callee": "readSessionLock",
+          "target": "c031",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4158",
+          "line": 89,
+          "callee": "SessionLockHeldError",
+          "target": "c030",
+          "resolution": "internal",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4201",
+          "line": 90,
+          "callee": "rm",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4204",
+          "line": 90,
+          "callee": "join",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c039",
+      "symbolId": "scip-typescript npm feature-factory 0.9.0 state/`session-lock.js`/isValidLock().",
+      "name": "isValidLock",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 95,
+      "endLine": 104,
+      "distance": null,
+      "source": "function isValidLock(value) {\n  return Boolean(value)\n    && typeof value === \"object\"\n    && !Array.isArray(value)\n    && Object.keys(value).every((key) => SESSION_LOCK_KEYS.includes(key))\n    && typeof value.session === \"string\" && value.session.trim().length > 0\n    && typeof value.run_id === \"string\" && value.run_id.trim().length > 0\n    && Number.isFinite(Date.parse(value.claimed_at || \"\"))\n    && Number.isFinite(Date.parse(value.heartbeat_at || \"\"));\n}",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:4348",
+          "line": 96,
+          "callee": "Boolean",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4404",
+          "line": 98,
+          "callee": "Array.isArray",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4432",
+          "line": 99,
+          "callee": "Object.keys(value).every",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": [
+            "c040"
+          ]
+        },
+        {
+          "id": "call:state/session-lock.js:4432",
+          "line": 99,
+          "callee": "Object.keys",
+          "target": null,
+          "resolution": "ambiguous",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4543",
+          "line": 100,
+          "callee": "value.session.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4618",
+          "line": 101,
+          "callee": "value.run_id.trim",
+          "target": null,
+          "resolution": "unresolved",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4656",
+          "line": 102,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4672",
+          "line": 102,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4715",
+          "line": 103,
+          "callee": "Number.isFinite",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        },
+        {
+          "id": "call:state/session-lock.js:4731",
+          "line": 103,
+          "callee": "Date.parse",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    },
+    {
+      "id": "c040",
+      "symbolId": "syntax:state/session-lock.js:4457:arrow_function",
+      "name": "<callback@99:33>",
+      "kind": "function",
+      "path": "state/session-lock.js",
+      "startLine": 99,
+      "endLine": 99,
+      "distance": null,
+      "source": "    && Object.keys(value).every((key) => SESSION_LOCK_KEYS.includes(key))",
+      "sourceTruncated": false,
+      "calls": [
+        {
+          "id": "call:state/session-lock.js:4466",
+          "line": 99,
+          "callee": "SESSION_LOCK_KEYS.includes",
+          "target": null,
+          "resolution": "external",
+          "callbackArguments": []
+        }
+      ]
+    }
+  ],
+  "scope": {
+    "eligibleCandidates": 40,
+    "includedCandidates": 40,
+    "omittedCandidates": 0,
+    "maxSourceChars": 1800,
+    "limitations": "Fixed candidate scope, truncated source excerpts, syntax-level source ordering. Callback references do not establish execution."
+  }
+}

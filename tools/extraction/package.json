@@ -1,0 +1,19 @@
+{
+  "name": "baleyg-extraction-spike",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@sourcegraph/scip-typescript": "0.4.0",
+    "tree-sitter": "0.25.1",
+    "tree-sitter-javascript": "0.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.5"
+  },
+  "scripts": {
+    "experiment": "node run.mjs",
+    "test:reindex": "node --test extract-reindex.test.mjs",
+    "test": "node --test extract.test.mjs lifecycle.test.mjs && node viewer-smoke.mjs",
+    "view": "node serve.mjs"
+  }
+}

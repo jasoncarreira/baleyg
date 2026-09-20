@@ -1,0 +1,67 @@
+# Class diagram slice
+
+Status: implemented, reviewed and deployed. See [usage](class-diagrams.md) and
+[public validation summary](class-diagram-validation.json). Deployment-specific evidence is not included.
+
+User: add working class diagrams with right-click menu that pulls up related classes.
+Inspected workspaces are read-only inputs. Do not write their source, execute their commands,
+imports or builds, install dependencies, or invoke providers. No Git initialization/commit.
+Existing tokens, budgets, saved views/annotations and workspace states must remain intact.
+
+Initial meaningful support: Java/Python declared classes/types, direct members, inheritance and explicit
+declared field/parameter/return type references. No inferred receiver types, runtime dispatch, ownership,
+composition/multiplicity, generated methods or Maven/pip resolution. Candidate links are syntax matches,
+not compiler resolution. Ambiguous/unmatched names remain terminal hints, hidden by default but revealable.
+JS/Rust class/type extraction for this view is explicitly outside this initial slice (existing sequences unchanged).
+
+Backend core owner: src/classes.rs + tests/classes.rs only. Public serde camelCase DTOs:
+ClassMember {name:String, type_hint:Option<String>, symbol_id:Option<String>, path:String, range:SourceRange}
+ClassDefinition {symbol:Symbol, qualified_name:String, language:String, declaration_kind:String,
+ fields:Vec<ClassMember>, methods:Vec<ClassMember>, truncated:bool}
+ClassRelation {id:String, owner:String, target:Option<String>, type_name:String, kind:String,
+ path:String, range:SourceRange, candidate_ids:Vec<String>, match_kind:String}
+Catalog {classes:Vec<ClassDefinition>, relations:Vec<ClassRelation>, warnings:Vec<String>, truncated:bool}
+Catalog::build(files:&[SourceFile],nodes:&[Symbol],cancel:&CancelFlag)->anyhow::Result<Catalog>.
+Stable IDs bound to measured class Symbol IDs and cached-source ranges. Relation kind extends/implements/
+field/parameter/returns; matchKind syntaxCandidate/unmatched/ambiguous. Unique *scoped* matching only:
+Java package/import/lexical context; Python explicit module/relative import/lexical context. No global bare
+name guessing. Generic type parameters and shadowing must not falsely match workspace classes. Cap per-file
+AST visits/depth, declarations/members/references and global text/records; cancellation checks. Limits/recovery
+explicit. No function-body traversal for class relationship discovery. Preserve nested lexical classes safely.
+
+Store/HTTP owner: src/store.rs, src/http.rs, src/class_diagram.rs, tests/class_diagram_http.rs.
+Persist Catalog projection atomically with existing index publication, building before transaction. Graph,
+question/provider packets unchanged. Add schema3 migration (preserve schema1/2 data and durable workspace data).
+Store catalog must support old snapshot as empty with explicit Index workspace notice, not rescan live files.
+GET /api/classes?path=&q=&offset=0&limit=100&revision=N -> {revision,items:ClassDefinition[],nextOffset,truncated,warnings}.
+POST /api/class-diagram {seed:String,expectedRevision:u64,expanded:Vec<String>=[],includeUnmatched:bool=false}
+-> {revision,seed:String,nodes:ClassDiagramNode[],edges:ClassRelation[],warnings:Vec<String>,truncated:bool}.
+ClassDiagramNode {id:String,class:Option<ClassDefinition>,label:String,kind:String,expandable:bool}.
+Actual class nodes id=class.symbol.id, kind=class; unmatched type hints kind=unmatched/ambiguous, class=null,
+terminal. Edges owner->target; for hint target use placeholder node.id in DIAGRAM response only, no changing
+stored relation certainty. Requests from class or method ID resolve nearest enclosing class, else readable400.
+Seed plus ONE-HOP incoming/outgoing declared references; expanded is additional class seeds (max12), retain
+all earlier expansions; max24nodes/64edges. Actual linked classes before unmatched hints. Explicit truncation.
+Revision read transaction guard, seed/session/workspace safety, bounded search (literal LIKE escapes), strict
+request validation/auth/routes/error mapping. Serve /classes.js and /classes.css (root wires final assets).
+Coordinate on core DTOs. No opaque snapshots outside cache or graph export changes.
+
+Frontend owner: web/classes.js, web/classes.css, tests/classes-ui.test.cjs only. Vanilla self-contained
+window.BaleygClasses controller with init({request,readSource,selectMethod,currentRevision,currentSession}),
+open({seed?,path?}), reset(). root adds UI IDs classes-panel,classes-state,classes-query,classes-search,
+classes-results,classes-diagram,classes-unmatched. request(path,options) existing authenticated JSON helper;
+root wraps current session invalidation. open uses GET class lookup for path or seed then POST diagram;
+class tab must also allow global search. Context menu on actual class nodes: Show related classes (one-hop
+expansion), Read class source, Focus this class; member method click -> selectMethod(symbol). Explicit source
+via readSource({path,range},revision). No source fetch on plain selection, no provider requests ever.
+Native right-click and Shift+F10/ContextMenu; visible menu button per node for discoverability/touch. Fixed/
+top-layer menu viewport-clamped, Arrow/Home/End/Escape, focus return, dismiss outside/scroll/session/revision.
+All source is text, no innerHTML/eval; immutable DTOs. Distinguish syntax candidates with dashed edges/labels.
+Maintain charcoal/flame-orange, local fonts, 13px labels, no invented cardinalities. Contained scroll on
+mobile/large graphs. Bounded deterministic layout and stable node identities during expansion. Loading,
+empty, unindexed,error,partial and unsupported-language states; stale responses ignored. No root app/shell edits.
+
+Root owns src/lib.rs wiring, frontend app.js/shell.js/index.html/style.css integration, docs, gates/deployment.
+Root adds Classes tab, file/method context actions via exported controller/context support; no existing
+sequence/tree/provider behavior lost. No global fmt until all owners frozen. Tests all synthetic/public;
+Keep private-workspace validation artifacts outside the public repository. Reply explicit API, tests, limitations and freeze.
