@@ -134,24 +134,38 @@ async fn binding(State(s): State<Arc<DaemonState>>) -> Response {
         s.store_workspace_root().to_string(),
     );
     let at = deadline();
+    let gate = enrollment.clone();
     let result = blocking_within(at, move || {
-        let revision = enrollment.current_revision(at)?;
-        Ok((enrollment.basis(revision), revision))
+        enrollment.admit_current(at, |revision| (enrollment.basis(revision), revision))
     })
     .await;
+    // Checked after the awaited phase and before any result is matched, so success and failure
+    // alike are refused once the operation's deadline has passed. A second confirmation is
+    // deliberately not added: it would run in its own blocking phase and reopen exactly the
+    // worker-to-handler window it was meant to close.
+    if Instant::now() >= at {
+        return fail(timed_out());
+    }
     match result {
-        Ok((basis, revision)) => Json(json!({
-            "schemaVersion": 1,
-            "binding": {
-                "daemonInstanceId": basis.daemon_instance_id,
-                "storeGeneration": basis.store_generation,
-            },
-            "stateDir": store_paths.0,
-            "workspaceRoot": store_paths.1,
-            "indexRevision": revision,
-            "evidenceReadable": revision > 0,
-        }))
-        .into_response(),
+        Ok(((basis, revision), ticket)) => {
+            // Committed under the same lock invalidation takes, so the response is either refused
+            // or handed off with nothing able to interleave between the two.
+            if let Err(e) = ticket.commit(&gate) {
+                return fail(e);
+            }
+            Json(json!({
+                "schemaVersion": 1,
+                "binding": {
+                    "daemonInstanceId": basis.daemon_instance_id,
+                    "storeGeneration": basis.store_generation,
+                },
+                "stateDir": store_paths.0,
+                "workspaceRoot": store_paths.1,
+                "indexRevision": revision,
+                "evidenceReadable": revision > 0,
+            }))
+            .into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -230,6 +244,7 @@ async fn issue(State(s): State<Arc<DaemonState>>, body: String) -> Response {
     }
 
     let at = deadline();
+    let gate = enrollment.clone();
     let expected = request.expected_revision;
     let state = s.clone();
     // Read the revision and create the credential inside one admission boundary. Issuing outside
@@ -248,14 +263,61 @@ async fn issue(State(s): State<Arc<DaemonState>>, body: String) -> Response {
                 "The index revision changed",
             ));
         }
-        enrollment
-            .admit(revision, || state.grants.issue(request, Instant::now()))?
-            .value
+        // A timed-out blocking task keeps running: without this the operation could mint a live
+        // grant nobody can reach, after the request it belonged to had already failed.
+        if Instant::now() >= at {
+            return Err(timed_out());
+        }
+        // The producer has an effect, so it reports the grant it created and the undo removes it
+        // when verification after production fails. Discarding the value on the error path instead
+        // leaves an unreachable row in the ledger.
+        let cleanup = state.clone();
+        let (issued, ticket) = enrollment.admit_with(
+            at,
+            |current| {
+                if current != revision {
+                    return (
+                        Err(McpError::new(
+                            ErrorCode::RevisionConflict,
+                            "The index revision changed",
+                        )),
+                        None,
+                    );
+                }
+                match state.grants.issue(request, Instant::now()) {
+                    Ok(issued) => {
+                        let id = issued.grant_id.clone();
+                        (Ok(issued), Some(id))
+                    }
+                    Err(e) => (Err(e), None),
+                }
+            },
+            move |handle, _| {
+                if let Some(id) = handle {
+                    cleanup.grants.remove(&id);
+                }
+            },
+        )?;
+        Ok((issued?, ticket))
     })
     .await;
 
+    // Checked after the awaited phase and before any result is matched, so a delayed error is
+    // refused for the same reason a delayed success is.
+    if Instant::now() >= at {
+        if let Ok((issued, _)) = &issued {
+            s.grants.remove(&issued.grant_id);
+        }
+        return fail(timed_out());
+    }
     match issued {
-        Ok(issued) => (
+        Ok((issued, ticket)) => {
+            if let Err(e) = ticket.commit(&gate) {
+                // Refused at handoff: nobody received this credential, so it leaves no row.
+                s.grants.remove(&issued.grant_id);
+                return fail(e);
+            }
+            (
             StatusCode::CREATED,
             Json(json!({
                 "schemaVersion": 1,
@@ -272,7 +334,8 @@ async fn issue(State(s): State<Arc<DaemonState>>, body: String) -> Response {
                 },
             })),
         )
-            .into_response(),
+                .into_response()
+        }
         Err(e) => fail(e),
     }
 }

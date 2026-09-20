@@ -18,6 +18,12 @@ use std::{
 pub const MAX_REQUESTS: u64 = 200;
 pub const MAX_TOTAL_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+/// Floor on a grant's per-response ceiling.
+///
+/// Every answer, including the smallest error envelope, has to fit inside the ceiling the owner
+/// chose. Permitting a ceiling below that would force the server either to exceed the limit it was
+/// given or to answer with something untrue, so the ceiling is rejected at issuance instead.
+pub const MIN_RESPONSE_BYTES: u64 = 512;
 pub const MAX_TTL_SECONDS: u64 = 900;
 pub const MAX_CONCURRENT_READS: u32 = 2;
 pub const TOKEN_PREFIX: &str = "bgp_";
@@ -85,7 +91,8 @@ impl Limits {
             || self.max_response_bytes > MAX_RESPONSE_BYTES;
         let empty = self.max_requests == 0
             || self.max_total_response_bytes == 0
-            || self.max_response_bytes == 0;
+            || self.max_response_bytes < MIN_RESPONSE_BYTES
+            || self.max_total_response_bytes < MIN_RESPONSE_BYTES;
         if over || empty {
             return Err(McpError::new(
                 ErrorCode::InvalidRequest,
@@ -185,6 +192,8 @@ pub struct Admission<'a> {
     pub admitted_revision: u64,
     pub max_response_bytes: u64,
     binding: Binding,
+    capabilities: BTreeSet<Capability>,
+    source_approved: bool,
     reserved: u64,
     settled: bool,
 }
@@ -201,6 +210,31 @@ impl std::fmt::Debug for Admission<'_> {
 }
 
 impl Admission<'_> {
+    /// Checked after reservation, so a forbidden call is charged like any other authenticated
+    /// error. Enforced here as well as at issuance, so an inconsistent policy cannot widen
+    /// disclosure.
+    pub fn check_capability(&self, capability: Capability) -> Result<(), McpError> {
+        if !self.capabilities.contains(&capability) {
+            return Err(McpError::new(
+                ErrorCode::Forbidden,
+                "The grant does not carry this capability",
+            ));
+        }
+        if capability.needs_source_approval() && !self.source_approved {
+            return Err(McpError::new(
+                ErrorCode::Forbidden,
+                "The grant does not approve source disclosure",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The generation this grant was admitted against. An enrollment that has been invalidated
+    /// rotates its generation, which must retire every grant issued before it.
+    pub fn store_generation(&self) -> &str {
+        &self.binding.store_generation
+    }
+
     /// Checked after the body is parsed. Admission itself happens first so that malformed and
     /// mismatched requests are still charged to the grant that sent them.
     pub fn check_binding(&self, presented: &Binding) -> Result<(), McpError> {
@@ -291,6 +325,15 @@ impl Grants {
         })
     }
 
+    /// Remove a grant entirely.
+    ///
+    /// Used when a credential is discarded before its token reaches anyone: a revoked row would
+    /// linger until expiry describing a grant no caller ever held.
+    pub fn remove(&self, grant_id: &str) {
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        table.retain(|_, grant| grant.grant_id != grant_id);
+    }
+
     /// Idempotent: revoking an unknown or already revoked grant is not an error.
     pub fn revoke(&self, grant_id: &str) {
         let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
@@ -302,19 +345,16 @@ impl Grants {
     }
 
     /// Admit one request against a presented token, reserving its budget before any work starts.
+    /// Identify the presented grant and reserve its budget.
+    ///
+    /// Deliberately does not check the capability. A forbidden call is authenticated ordinary error
+    /// traffic and must be charged, so the capability is checked through the returned admission
+    /// once accounting is in place. The same reservation serves a request naming a tool that does
+    /// not exist.
     pub fn admit(
         &self,
         token: &str,
-        capability: Capability,
-        now: Instant,
-    ) -> Result<Admission<'_>, McpError> {
-        self.reserve(token, Some(capability), now)
-    }
-
-    fn reserve(
-        &self,
-        token: &str,
-        capability: Option<Capability>,
+        lifetime: Option<&super::enrollment::Enrollment>,
         now: Instant,
     ) -> Result<Admission<'_>, McpError> {
         let key = digest(token);
@@ -323,20 +363,22 @@ impl Grants {
         if grant.revoked || now >= grant.expires_at {
             return Err(unauthorized());
         }
-        if let Some(capability) = capability {
-            if !grant.capabilities.contains(&capability) {
+        // An enrollment that ends rotates its generation, retiring every grant issued against the
+        // old one. Reported as unusable rather than a binding mismatch: the caller's binding still
+        // matches the grant's, so this is a lifetime end, not a wrong request.
+        // Read from the enrollment here rather than taken as a caller-supplied string: a sampled
+        // generation can already be stale when it arrives, which would let a grant outlive the
+        // binding it was issued against. An ended enrollment is reported as unavailable rather
+        // than merely unauthorized, so the caller is told to restart rather than to reissue.
+        if let Some(lifetime) = lifetime {
+            if !lifetime.is_available() {
                 return Err(McpError::new(
-                    ErrorCode::Forbidden,
-                    "The grant does not carry this capability",
+                    ErrorCode::StoreUnavailable,
+                    "The bound store is unavailable",
                 ));
             }
-            // Enforced here as well as at issuance, so an inconsistent policy cannot widen
-            // disclosure.
-            if capability.needs_source_approval() && !grant.source_approved {
-                return Err(McpError::new(
-                    ErrorCode::Forbidden,
-                    "The grant does not approve source disclosure",
-                ));
+            if grant.binding.store_generation != lifetime.store_generation() {
+                return Err(unauthorized());
             }
         }
         if grant.in_flight >= MAX_CONCURRENT_READS {
@@ -376,16 +418,11 @@ impl Grants {
             admitted_revision: grant.admitted_revision,
             max_response_bytes: reserved,
             binding: grant.binding.clone(),
+            capabilities: grant.capabilities.clone(),
+            source_approved: grant.source_approved,
             reserved,
             settled: false,
         })
-    }
-
-    /// Admit a request that carries no capability, so an authenticated error on an unrecognized
-    /// tool is still charged. Ordinary error traffic must not be free merely because it names a
-    /// route that does not exist.
-    pub fn admit_any(&self, token: &str, now: Instant) -> Result<Admission<'_>, McpError> {
-        self.reserve(token, None, now)
     }
 
     fn settle(&self, key: &[u8; 32], reserved: u64, actual: u64) {
@@ -398,11 +435,30 @@ impl Grants {
     }
 
     /// Re-check just before emitting a response. Expiry or revocation during a read discards it.
-    pub fn still_valid(&self, grant_id: &str, now: Instant) -> Result<(), McpError> {
+    pub fn still_valid(
+        &self,
+        grant_id: &str,
+        lifetime: Option<&super::enrollment::Enrollment>,
+        now: Instant,
+    ) -> Result<(), McpError> {
+        if let Some(lifetime) = lifetime
+            && !lifetime.is_available()
+        {
+            return Err(McpError::new(
+                ErrorCode::StoreUnavailable,
+                "The bound store is unavailable",
+            ));
+        }
+        let current_generation = lifetime.map(|l| l.store_generation()).unwrap_or_default();
         let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
-        let live = table
-            .values()
-            .any(|g| g.grant_id == grant_id && !g.revoked && now < g.expires_at);
+        // Generation-aware, like admission: work already in flight must not survive an enrollment
+        // that ended while it ran.
+        let live = table.values().any(|g| {
+            g.grant_id == grant_id
+                && !g.revoked
+                && now < g.expires_at
+                && g.binding.store_generation == current_generation
+        });
         if live { Ok(()) } else { Err(unauthorized()) }
     }
 
@@ -528,11 +584,15 @@ mod tests {
         );
         let now = Instant::now();
         for capability in [Capability::Inspect, Capability::ReadSource] {
-            let err = grants.admit(token, capability, now).unwrap_err();
+            let err = grants
+                .admit(token, None, now)
+                .unwrap()
+                .check_capability(capability)
+                .unwrap_err();
             assert_eq!(err.code, ErrorCode::Forbidden);
         }
         // Structural capabilities on the same grant still work.
-        assert!(grants.admit(token, Capability::FindSymbols, now).is_ok());
+        assert!(grants.admit(token, None, now).is_ok());
     }
 
     #[test]
@@ -541,10 +601,7 @@ mod tests {
         let issued = grants.issue(request(&all(), true), Instant::now()).unwrap();
         let now = Instant::now();
         assert_eq!(
-            grants
-                .admit("bgp_nope", Capability::WorkspaceDescribe, now)
-                .unwrap_err()
-                .code,
+            grants.admit("bgp_nope", None, now).unwrap_err().code,
             ErrorCode::Unauthorized
         );
         // Fake clock: past the monotonic deadline.
@@ -552,8 +609,8 @@ mod tests {
             grants
                 .admit(
                     &issued.token,
-                    Capability::WorkspaceDescribe,
-                    now + Duration::from_secs(MAX_TTL_SECONDS + 1)
+                    None,
+                    now + Duration::from_secs(MAX_TTL_SECONDS + 1),
                 )
                 .unwrap_err()
                 .code,
@@ -561,17 +618,17 @@ mod tests {
         );
         grants.revoke(&issued.grant_id);
         assert_eq!(
-            grants
-                .admit(&issued.token, Capability::WorkspaceDescribe, now)
-                .unwrap_err()
-                .code,
+            grants.admit(&issued.token, None, now).unwrap_err().code,
             ErrorCode::Unauthorized
         );
         // Revocation is idempotent and unknown identifiers are accepted silently.
         grants.revoke(&issued.grant_id);
         grants.revoke("no-such-grant");
         assert_eq!(
-            grants.still_valid(&issued.grant_id, now).unwrap_err().code,
+            grants
+                .still_valid(&issued.grant_id, None, now)
+                .unwrap_err()
+                .code,
             ErrorCode::Unauthorized
         );
     }
@@ -586,14 +643,36 @@ mod tests {
         };
         // Admission succeeds and reserves, so a mismatched request is still charged to its grant;
         // the binding is checked once the body has been parsed.
-        let admission = grants
-            .admit(&issued.token, Capability::WorkspaceDescribe, Instant::now())
-            .unwrap();
+        let admission = grants.admit(&issued.token, None, Instant::now()).unwrap();
         assert_eq!(
             admission.check_binding(&other).unwrap_err().code,
             ErrorCode::BindingMismatch
         );
         assert!(admission.check_binding(&binding()).is_ok());
+    }
+
+    #[test]
+    fn a_forbidden_capability_is_still_charged() {
+        let grants = Grants::new();
+        let mut small = request(&[Capability::WorkspaceDescribe], false);
+        small.limits.max_requests = 1;
+        let issued = grants.issue(small, Instant::now()).unwrap();
+        let now = Instant::now();
+
+        // Reservation happens first, so the forbidden call spends the budget.
+        let admission = grants.admit(&issued.token, None, now).unwrap();
+        assert_eq!(
+            admission
+                .check_capability(Capability::Inspect)
+                .unwrap_err()
+                .code,
+            ErrorCode::Forbidden
+        );
+        drop(admission);
+        assert_eq!(
+            grants.admit(&issued.token, None, now).unwrap_err().code,
+            ErrorCode::BudgetExhausted
+        );
     }
 
     #[test]
@@ -607,7 +686,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             grants
-                .admit(&issued.token, Capability::FindSymbols, Instant::now())
+                .admit(&issued.token, None, Instant::now())
+                .unwrap()
+                .check_capability(Capability::FindSymbols)
                 .unwrap_err()
                 .code,
             ErrorCode::Forbidden
@@ -623,17 +704,10 @@ mod tests {
         let now = Instant::now();
         for _ in 0..2 {
             // Dropped without settle, as a cancelled request would be.
-            drop(
-                grants
-                    .admit(&issued.token, Capability::WorkspaceDescribe, now)
-                    .unwrap(),
-            );
+            drop(grants.admit(&issued.token, None, now).unwrap());
         }
         assert_eq!(
-            grants
-                .admit(&issued.token, Capability::WorkspaceDescribe, now)
-                .unwrap_err()
-                .code,
+            grants.admit(&issued.token, None, now).unwrap_err().code,
             ErrorCode::BudgetExhausted
         );
     }
@@ -645,23 +719,16 @@ mod tests {
         small.limits.max_total_response_bytes = MAX_RESPONSE_BYTES;
         let issued = grants.issue(small, Instant::now()).unwrap();
         let now = Instant::now();
-        let first = grants
-            .admit(&issued.token, Capability::WorkspaceDescribe, now)
-            .unwrap();
+        let first = grants.admit(&issued.token, None, now).unwrap();
         // The whole ceiling is reserved by the in-flight request.
         assert_eq!(
-            grants
-                .admit(&issued.token, Capability::WorkspaceDescribe, now)
-                .unwrap_err()
-                .code,
+            grants.admit(&issued.token, None, now).unwrap_err().code,
             ErrorCode::BudgetExhausted
         );
         // Settling the actual size returns the unused reservation, and the next admission is
         // capped at what remains rather than refused.
         first.settle(16);
-        let next = grants
-            .admit(&issued.token, Capability::WorkspaceDescribe, now)
-            .unwrap();
+        let next = grants.admit(&issued.token, None, now).unwrap();
         assert_eq!(next.max_response_bytes, MAX_RESPONSE_BYTES - 16);
     }
 
@@ -672,25 +739,14 @@ mod tests {
         let now = Instant::now();
         let mut held = Vec::new();
         for _ in 0..MAX_CONCURRENT_READS {
-            held.push(
-                grants
-                    .admit(&issued.token, Capability::WorkspaceDescribe, now)
-                    .unwrap(),
-            );
+            held.push(grants.admit(&issued.token, None, now).unwrap());
         }
         assert_eq!(
-            grants
-                .admit(&issued.token, Capability::WorkspaceDescribe, now)
-                .unwrap_err()
-                .code,
+            grants.admit(&issued.token, None, now).unwrap_err().code,
             ErrorCode::TooManyRequests
         );
         held.clear();
-        assert!(
-            grants
-                .admit(&issued.token, Capability::WorkspaceDescribe, now)
-                .is_ok()
-        );
+        assert!(grants.admit(&issued.token, None, now).is_ok());
     }
 
     #[test]
@@ -702,12 +758,9 @@ mod tests {
         let now = Instant::now();
 
         // No capability is named, but the request is authenticated, so it is charged.
-        drop(grants.admit_any(&issued.token, now).unwrap());
+        drop(grants.admit(&issued.token, None, now).unwrap());
         assert_eq!(
-            grants
-                .admit(&issued.token, Capability::WorkspaceDescribe, now)
-                .unwrap_err()
-                .code,
+            grants.admit(&issued.token, None, now).unwrap_err().code,
             ErrorCode::BudgetExhausted
         );
     }
@@ -723,14 +776,45 @@ mod tests {
         // The grant identifier is not a credential.
         assert_eq!(
             grants
-                .admit(
-                    &issued.grant_id,
-                    Capability::WorkspaceDescribe,
-                    Instant::now()
-                )
+                .admit(&issued.grant_id, None, Instant::now())
                 .unwrap_err()
                 .code,
             ErrorCode::Unauthorized
+        );
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn request() -> IssueRequest {
+        IssueRequest {
+            binding: Binding {
+                daemon_instance_id: "daemon".into(),
+                store_generation: "generation".into(),
+            },
+            expected_revision: 7,
+            capabilities: BTreeSet::from([Capability::WorkspaceDescribe]),
+            ttl_seconds: 900,
+            limits: Limits::default(),
+            client_label: "terminal-pilot".into(),
+            recipient: "approved local client".into(),
+            source_approved: false,
+        }
+    }
+
+    #[test]
+    fn a_discarded_grant_leaves_no_row_behind() {
+        let grants = Grants::new();
+        let issued = grants.issue(request(), Instant::now()).unwrap();
+        assert_eq!(grants.issued_count(), 1);
+        grants.remove(&issued.grant_id);
+        assert_eq!(
+            grants.issued_count(),
+            0,
+            "a credential discarded before its token was returned left a row"
         );
     }
 }
