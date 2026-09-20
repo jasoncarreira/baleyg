@@ -170,6 +170,7 @@ impl std::fmt::Debug for Issued {
 
 struct Grant {
     grant_id: String,
+    expires_at_unix: u64,
     binding: Binding,
     admitted_revision: u64,
     capabilities: BTreeSet<Capability>,
@@ -264,6 +265,14 @@ impl Drop for Admission<'_> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Summary {
+    pub expires_at_unix: u64,
+    pub admitted_revision: u64,
+    pub capabilities: Vec<Capability>,
+    pub limits: Limits,
+}
+
 #[derive(Default)]
 pub struct Grants {
     table: Mutex<HashMap<[u8; 32], Grant>>,
@@ -300,6 +309,7 @@ impl Grants {
             .unwrap_or(request.ttl_seconds);
         let grant = Grant {
             grant_id: grant_id.clone(),
+            expires_at_unix,
             binding: request.binding,
             admitted_revision: request.expected_revision,
             capabilities: request.capabilities.clone(),
@@ -432,6 +442,20 @@ impl Grants {
             grant.reserved_bytes = grant.reserved_bytes.saturating_sub(reserved - actual);
             grant.in_flight = grant.in_flight.saturating_sub(1);
         }
+    }
+
+    /// Non-secret policy of one live grant, for describe. Never exposes the token or its digest.
+    pub fn summary(&self, grant_id: &str) -> Option<Summary> {
+        let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        table
+            .values()
+            .find(|g| g.grant_id == grant_id)
+            .map(|g| Summary {
+                expires_at_unix: g.expires_at_unix,
+                admitted_revision: g.admitted_revision,
+                capabilities: g.capabilities.iter().copied().collect(),
+                limits: g.limits,
+            })
     }
 
     /// Re-check just before emitting a response. Expiry or revocation during a read discards it.
@@ -570,6 +594,7 @@ mod tests {
             digest(token),
             Grant {
                 grant_id: "injected".into(),
+                expires_at_unix: 0,
                 binding: binding(),
                 admitted_revision: 7,
                 capabilities: all().into_iter().collect(),

@@ -374,6 +374,173 @@ async fn revoke(State(s): State<Arc<DaemonState>>, Path(grant_id): Path<String>)
     StatusCode::NO_CONTENT.into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DescribeBody {
+    schema_version: u32,
+    binding: BindingBody,
+}
+
+/// Success envelope shared by every tool.
+///
+/// Serializes, enforces this admission's response ceiling, rechecks that the grant is still live,
+/// and only then settles the actual byte cost. A response that races revocation is discarded
+/// rather than emitted.
+fn emit(
+    grants: &crate::mcp::grants::Grants,
+    admission: crate::mcp::grants::Admission<'_>,
+    basis: crate::mcp::EvidenceBasis,
+    data: serde_json::Value,
+) -> Response {
+    let body = json!({
+        "schemaVersion": 1,
+        "requestId": uuid::Uuid::new_v4().to_string(),
+        "evidenceBasis": {
+            "daemonInstanceId": basis.daemon_instance_id,
+            "storeGeneration": basis.store_generation,
+            "indexRevision": basis.index_revision,
+        },
+        "data": data,
+        "warnings": [],
+        "truncated": false,
+        "truncationReason": Value::Null,
+    });
+    let encoded = body.to_string();
+    let size = encoded.len() as u64;
+    if size > admission.max_response_bytes {
+        return fail(McpError::new(
+            ErrorCode::BudgetExhausted,
+            "The response exceeds the remaining response budget",
+        ));
+    }
+    if let Err(e) = grants.still_valid(&admission.grant_id, Instant::now()) {
+        return fail(e);
+    }
+    admission.settle(size);
+    let mut response = (StatusCode::OK, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+}
+
+/// Shared preamble for every tool route: request size, schema, principal and admission.
+fn admit<'a>(
+    s: &'a Arc<DaemonState>,
+    principal: &crate::http::Principal,
+    body: &str,
+    binding: &BindingBody,
+    schema_version: u32,
+    capability: Capability,
+) -> Result<crate::mcp::grants::Admission<'a>, McpError> {
+    if body.len() > MAX_TOOL_REQUEST_BYTES {
+        return Err(McpError::new(
+            ErrorCode::BodyTooLarge,
+            "The tool request exceeds the permitted size",
+        ));
+    }
+    if schema_version != 1 {
+        return Err(McpError::new(
+            ErrorCode::InvalidRequest,
+            "Unsupported schema version",
+        ));
+    }
+    // The guard admits only grants on this prefix; treat anything else as a programming error
+    // rather than silently accepting it.
+    let Some(token) = principal.grant_token() else {
+        return Err(McpError::new(
+            ErrorCode::Forbidden,
+            "This credential may not be used on this route",
+        ));
+    };
+    let presented = crate::mcp::grants::Binding {
+        daemon_instance_id: binding.daemon_instance_id.clone(),
+        store_generation: binding.store_generation.clone(),
+    };
+    s.grants
+        .admit(token, &presented, capability, Instant::now())
+}
+
+/// Bootstraps a session: reports the admitted binding, the current and admitted revisions, and
+/// whether evidence reads are possible. Exposes no evidence, no file list and no owner paths, and
+/// is the only tool that takes no expected revision.
+async fn describe(
+    State(s): State<Arc<DaemonState>>,
+    axum::Extension(principal): axum::Extension<crate::http::Principal>,
+    body: String,
+) -> Response {
+    let parsed: DescribeBody = match serde_json::from_str(&body) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return fail(McpError::new(
+                ErrorCode::InvalidRequest,
+                "The request is malformed or carries unknown fields",
+            ));
+        }
+    };
+    let admission = match admit(
+        &s,
+        &principal,
+        &body,
+        &parsed.binding,
+        parsed.schema_version,
+        Capability::WorkspaceDescribe,
+    ) {
+        Ok(admission) => admission,
+        Err(e) => return fail(e),
+    };
+
+    let Some(enrollment) = s.enrollment.clone() else {
+        return fail(unavailable());
+    };
+    let revision = match tokio::task::spawn_blocking(move || {
+        enrollment
+            .current_revision(deadline())
+            .map(|revision| (enrollment.basis(revision), revision))
+    })
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => return fail(e),
+        Err(_) => return fail(unavailable()),
+    };
+    let (basis, current) = revision;
+
+    let Some(summary) = s.grants.summary(&admission.grant_id) else {
+        return fail(McpError::new(
+            ErrorCode::Unauthorized,
+            "The grant is not usable",
+        ));
+    };
+    // A stale admitted revision is reported honestly rather than failing: describe still bootstraps
+    // a session, it just cannot back an evidence read until the owner reissues.
+    let readable = current > 0 && current == summary.admitted_revision;
+    let label = std::path::Path::new(s.store_workspace_root())
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let data = json!({
+        "workspaceLabel": label,
+        "binding": {
+            "daemonInstanceId": basis.daemon_instance_id.clone(),
+            "storeGeneration": basis.store_generation.clone(),
+        },
+        "indexRevision": current,
+        "admittedRevision": summary.admitted_revision,
+        "evidenceReadable": readable,
+        "toolSchemaVersion": 1,
+        "serverVersion": env!("CARGO_PKG_VERSION"),
+        "capabilities": summary.capabilities.iter().map(|c| c.wire()).collect::<Vec<_>>(),
+        "effectiveLimits": LimitsBody {
+            max_requests: summary.limits.max_requests,
+            max_total_response_bytes: summary.limits.max_total_response_bytes,
+            max_response_bytes: summary.limits.max_response_bytes,
+        },
+        "expiresAt": summary.expires_at_unix,
+    });
+    emit(&s.grants, admission, basis, data)
+}
+
 /// Unknown tool names under the tool prefix are denied in the contract envelope rather than
 /// falling through to the daemon's generic handler. The principal is always a grant here: the
 /// guard rejects the owner bearer on this prefix before dispatch.
@@ -472,8 +639,12 @@ pub fn routes() -> Router<Arc<DaemonState>> {
             "/api/mcp-pilot/grants/{grant_id}",
             axum::routing::delete(revoke),
         )
-        // Every method and every tail under the tool prefix, so a router-level 404 or 405 can
-        // never answer an authenticated request before it has been identified and charged.
+        .route(
+            "/api/mcp-pilot/tools/baleyg_workspace_describe",
+            post(describe),
+        )
+        // Every other method and tail under the prefix, so a router-level 404 or 405 can never
+        // answer an authenticated request before it has been identified and charged.
         .route("/api/mcp-pilot/tools", axum::routing::any(unknown_tool))
         .route("/api/mcp-pilot/tools/", axum::routing::any(unknown_tool))
         .route(
