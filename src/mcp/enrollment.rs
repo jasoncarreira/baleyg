@@ -39,6 +39,220 @@ pub(crate) const READ_ONLY_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY
     .union(OpenFlags::SQLITE_OPEN_NO_MUTEX)
     .union(OpenFlags::SQLITE_OPEN_NOFOLLOW);
 
+/// The publication boundary, shared between the store and the MCP pilot.
+///
+/// Publication is exclusive and waits for every in-flight response to finish; admission is shared
+/// and hands back a ticket that keeps publication waiting until the response has been handed to
+/// the server. Checking for a change after building a response cannot work on its own, because the
+/// check necessarily ends before the response is emitted. Holding a ticket across that gap is what
+/// makes admission and emission atomic with respect to publication.
+#[derive(Debug)]
+pub struct Boundary {
+    state: Mutex<BoundaryState>,
+    ready: Condvar,
+    /// Advisory lock file in the state directory. The in-process state coordinates this process's
+    /// own threads; a second `Store` in another process shares nothing but the filesystem, so the
+    /// same shared/exclusive discipline is taken out on this file as well.
+    lock_path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct BoundaryState {
+    publishing: bool,
+    in_flight: u32,
+    /// Publishers waiting for the boundary. Admission yields to them, so a steady stream of
+    /// responses cannot starve publication indefinitely.
+    waiting: u32,
+}
+
+/// Held by publication for the whole of its commit.
+pub struct Publishing<'a> {
+    boundary: &'a Boundary,
+    _cross_process: File,
+}
+
+/// Held by an admitted response until it has been handed to the server. `Send` on purpose: it
+/// travels with the response across the await that follows admission.
+pub struct Ticket {
+    boundary: Arc<Boundary>,
+    _cross_process: Option<File>,
+    consumed: bool,
+}
+
+/// Shared or exclusive advisory lock on the boundary file, released when the handle is dropped.
+fn flock(path: &Path, exclusive: bool, blocking: bool) -> std::io::Result<File> {
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    let mut op = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    if !blocking {
+        op |= libc::LOCK_NB;
+    }
+    // SAFETY: the descriptor is owned by `file` and valid for this call, and the operation is one
+    // of flock's documented constants. Closing the file releases the lock.
+    let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), op) };
+    if rc == 0 {
+        Ok(file)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+impl Boundary {
+    pub fn at(state_dir: &Path) -> Self {
+        Self {
+            state: Mutex::new(BoundaryState::default()),
+            ready: Condvar::new(),
+            lock_path: state_dir.join("publication.lock"),
+        }
+    }
+
+    /// Exclusive access for publication. Waits for in-flight responses rather than racing them.
+    pub fn publish(&self) -> std::io::Result<Publishing<'_>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.waiting += 1;
+        while state.publishing || state.in_flight > 0 {
+            state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.waiting -= 1;
+        state.publishing = true;
+        drop(state);
+        // Blocks until every other process's in-flight response has finished. A lock that cannot
+        // be taken fails the publication: continuing would silently drop cross-process
+        // coordination and let a separate Store commit under a live ticket.
+        match flock(&self.lock_path, true, true) {
+            Ok(file) => Ok(Publishing {
+                boundary: self,
+                _cross_process: file,
+            }),
+            Err(e) => {
+                let mut state = self.state.lock().unwrap_or_else(|x| x.into_inner());
+                state.publishing = false;
+                self.ready.notify_all();
+                Err(e)
+            }
+        }
+    }
+
+    /// Shared access for admission, bounded by the caller's deadline. Contention is an elapsed
+    /// deadline, never a revision conflict: a concurrent admission is not a publication.
+    fn enter(self: &Arc<Self>, deadline: Instant) -> Result<Ticket, McpError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Yields to a waiting publisher, so admissions cannot starve publication.
+        while state.publishing || state.waiting > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+            }
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            if timeout.timed_out() && (state.publishing || state.waiting > 0) {
+                return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+        }
+        state.in_flight += 1;
+        drop(state);
+        // Shared, and bounded by the caller's deadline rather than blocking: a publication in
+        // another process holds the exclusive side while it commits.
+        let cross_process = loop {
+            match flock(&self.lock_path, false, false) {
+                Ok(file) => break Some(file),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        self.leave();
+                        return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // Any other failure means the lock is unusable, so cross-process coordination is
+                // not in force. Admitting anyway would hand out a ticket that cannot hold off a
+                // separate Store, so the request is refused instead.
+                Err(_) => {
+                    self.leave();
+                    return Err(McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE));
+                }
+            }
+        };
+        Ok(Ticket {
+            boundary: self.clone(),
+            _cross_process: cross_process,
+            consumed: false,
+        })
+    }
+
+    fn leave(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.in_flight = state.in_flight.saturating_sub(1);
+        self.ready.notify_all();
+    }
+}
+
+impl Drop for Publishing<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .boundary
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.publishing = false;
+        self.boundary.ready.notify_all();
+    }
+}
+
+impl Ticket {
+    /// Commit this response for emission, or refuse it.
+    ///
+    /// Consumes the ticket while holding the boundary's state lock, which invalidation also takes
+    /// before setting its flag. The check and the release are therefore one step: an invalidation
+    /// either happens before it, and the response is refused, or after it, once the response is
+    /// already committed. A separate check followed by a release leaves a window between them for
+    /// exactly the schedule this avoids.
+    pub fn commit(mut self, enrollment: &Enrollment) -> Result<(), McpError> {
+        let mut state = self
+            .boundary
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let available = enrollment.is_available();
+        state.in_flight = state.in_flight.saturating_sub(1);
+        self.consumed = true;
+        self.boundary.ready.notify_all();
+        drop(state);
+        if available {
+            Ok(())
+        } else {
+            Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED))
+        }
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.boundary.leave();
+        }
+    }
+}
+
+impl std::fmt::Debug for Ticket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Ticket")
+    }
+}
+
 /// Unix device/inode pair. Equality is the only identity claim made here; it is not tamper
 /// attestation, and an inode-preserving overwrite is indistinguishable by design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,13 +385,6 @@ impl Drop for Watchdog {
     }
 }
 
-/// A value produced under the admission boundary, with the publication counter observed there.
-/// Pass the epoch to `still_admitted` immediately before emitting.
-pub struct Admitted<T> {
-    pub value: T,
-    pub epoch: u64,
-}
-
 /// One enrolled binding to one store. Created at daemon startup, never re-enrolled.
 pub struct Enrollment {
     daemon_instance_id: String,
@@ -203,10 +410,7 @@ pub struct Enrollment {
     ///
     /// Lock order is always this mutex before `conn`. A latching path must therefore hold no
     /// connection when it takes it, which is why `read` releases the connection first.
-    admission: Arc<Mutex<()>>,
-    /// Committed-publication counter shared with the store. Compared under the boundary so the
-    /// final pre-emission gate can detect a publication without touching the database.
-    epoch: Arc<std::sync::atomic::AtomicU64>,
+    admission: Arc<Boundary>,
 }
 
 fn open_no_follow(path: &Path, directory: bool) -> Result<File> {
@@ -256,11 +460,7 @@ impl Enrollment {
     ///
     /// Succeeds against an unindexed store: `cache.db` exists with revision 0, which the grant
     /// issuer reports as `no_published_index` rather than a storage failure.
-    pub fn enroll(
-        state_dir: &Path,
-        publication: Arc<Mutex<()>>,
-        epoch: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Result<Self> {
+    pub fn enroll(state_dir: &Path, publication: Arc<Boundary>) -> Result<Self> {
         ensure!(
             cfg!(unix),
             "the MCP pilot binding requires Unix file identities"
@@ -312,7 +512,6 @@ impl Enrollment {
             gate: Gate::new(),
             latched: AtomicBool::new(false),
             admission: publication,
-            epoch,
         };
         // Check identities after connection setup as well as before, so a swap racing the open is
         // caught rather than adopted.
@@ -342,19 +541,27 @@ impl Enrollment {
     /// There is no in-process recovery: a later republication, a restored file or a browser read
     /// that recreates the cache must not clear the latch.
     pub fn invalidate(&self) {
-        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.latch_locked();
     }
 
-    /// Latch through the shared boundary. Callers must hold no connection: lock order is admission
-    /// before connection.
+    /// Latch immediately.
+    ///
+    /// Deliberately takes no boundary. Invalidation is a fail-closed signal that every other
+    /// request must observe at once, and an in-flight admitted response would otherwise block the
+    /// observer from recording it. Suppression of an already-admitted response is handled where it
+    /// belongs, by re-reading this flag immediately before emitting.
     fn latch(&self) {
-        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.latch_locked();
     }
 
-    /// Latch without taking the boundary, for paths that already hold it.
     fn latch_locked(&self) {
+        // Taken so that latching and a ticket's commit cannot interleave. Held only for the flag
+        // itself: this never waits for in-flight responses, so an observer is never blocked.
+        let _state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !self.latched.swap(true, Ordering::SeqCst) {
             let mut generation = self.generation.lock().unwrap_or_else(|e| e.into_inner());
             *generation = uuid::Uuid::new_v4().to_string();
@@ -404,67 +611,91 @@ impl Enrollment {
     /// Final admission.
     ///
     /// Re-verifies availability, identity and the current revision, then produces the caller's
-    /// value without releasing the admission lock. Invalidation takes the same lock, so a response
-    /// or a credential can never be produced after another request has observed the store to be
-    /// gone, and a publication that raced the read is a conflict rather than a relabelled snapshot.
-    /// Bytes already sent cannot be recalled; this bounds what is allowed to start being sent.
+    /// value without releasing the boundary. Publication and invalidation take the same boundary,
+    /// so a response or credential can never be produced from a snapshot that is being replaced or
+    /// that another request has observed to be gone.
+    ///
+    /// The revision is re-read from the database rather than compared against an in-process
+    /// counter, so a publication by a second `Store` or a separate process is detected too. Bytes
+    /// already sent cannot be recalled; this bounds what is allowed to start being sent.
     pub fn admit<T>(
         &self,
         basis_revision: u64,
+        deadline: Instant,
         produce: impl FnOnce() -> T,
-    ) -> Result<Admitted<T>, McpError> {
-        let admitted = self.admit_current(|current| {
+    ) -> Result<(T, Ticket), McpError> {
+        let (value, ticket) = self.admit_current(deadline, |current| {
             if current != basis_revision {
                 return Err(McpError::new(ErrorCode::RevisionConflict, CONFLICT));
             }
             Ok(produce())
         })?;
-        Ok(Admitted {
-            value: admitted.value?,
-            epoch: admitted.epoch,
-        })
+        Ok((value?, ticket))
     }
 
     /// Admission for a response that carries no evidence.
     ///
-    /// Re-verifies availability and identity under the admission lock and hands the closure the
-    /// revision observed in that same hold. A response that describes current state has nothing to
-    /// conflict with, so a publication racing it is reported rather than refused.
+    /// Re-verifies availability and identity under the boundary and hands the closure the revision
+    /// observed in that same hold. A response that describes current state has nothing to conflict
+    /// with, so a publication racing it is reported rather than refused.
     pub fn admit_current<T>(
         &self,
+        deadline: Instant,
         produce: impl FnOnce(u64) -> T,
-    ) -> Result<Admitted<T>, McpError> {
-        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.is_available() {
-            return Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED));
-        }
-        let current = match self.identity_and_revision() {
-            Ok(current) => current,
-            Err(e) => {
-                self.latch_locked();
-                return Err(e);
-            }
-        };
-        Ok(Admitted {
-            value: produce(current),
-            epoch: self.epoch.load(std::sync::atomic::Ordering::SeqCst),
-        })
+    ) -> Result<(T, Ticket), McpError> {
+        self.admit_with(deadline, |current| (produce(current), ()), |(), _| {})
     }
 
-    /// Final pre-emission gate, safe to call synchronously where nothing may suspend.
+    /// Admission for a producer with an effect that must be undone if the snapshot moves.
     ///
-    /// Takes the boundary shared with publication and checks only in-memory state: the latch and
-    /// the publication counter observed at admission. A publication that completed while the
-    /// caller was waking from its worker is a conflict, not a relabelled snapshot.
-    pub fn still_admitted(&self, epoch: u64) -> Result<(), McpError> {
-        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+    /// `produce` returns its value together with a handle; if verification after production fails,
+    /// `undo` is called with that handle so nothing it created survives. The alternative is
+    /// discarding the value on the error path, which leaves the effect behind.
+    pub fn admit_with<T, H>(
+        &self,
+        deadline: Instant,
+        produce: impl FnOnce(u64) -> (T, H),
+        undo: impl FnOnce(H, &McpError),
+    ) -> Result<(T, Ticket), McpError> {
+        let ticket = self.admission.enter(deadline)?;
+        let current = self.verify()?;
+        // Checked before any effect: verification performs filesystem and database work, so an
+        // admission can cross its deadline before the producer ever runs.
+        if Instant::now() >= deadline {
+            return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+        }
+        let (produced, handle) = produce(current);
+        // Verified again after the producer, still inside the same hold. The boundary serializes
+        // same-instance publication, but a second Store or another process has its own mutex, so
+        // only re-reading the database proves the snapshot did not move while the value was being
+        // built. A value built over a replaced snapshot is discarded rather than returned.
+        let outcome = match self.verify() {
+            Ok(after) if after != current => {
+                Err(McpError::new(ErrorCode::RevisionConflict, CONFLICT))
+            }
+            Ok(_) if Instant::now() >= deadline => {
+                Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(()) => Ok((produced, ticket)),
+            Err(e) => {
+                undo(handle, &e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Availability, path and connection identity, and the current revision, latching on failure.
+    /// Caller holds the boundary.
+    fn verify(&self) -> Result<u64, McpError> {
         if !self.is_available() {
             return Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED));
         }
-        if self.epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
-            return Err(McpError::new(ErrorCode::RevisionConflict, CONFLICT));
-        }
-        Ok(())
+        self.identity_and_revision()
+            .inspect_err(|_| self.latch_locked())
     }
 
     /// Run one guarded read.
@@ -511,16 +742,19 @@ impl Enrollment {
         drop(watchdog);
         drop(conn);
 
+        // Checked on every exit, not only on success: a rename or replacement observed during a
+        // read that timed out or errored must still latch the binding, or the next request would
+        // find it available.
+        let identity = self.check_identity();
         if timed_out {
             return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
         }
+        identity?;
         let value = match outcome {
             Ok(Ok(value)) => value,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE)),
         };
-        // Re-check before the caller may emit anything derived from this read.
-        self.check_identity()?;
         // Last word on the clock. The identity check above performs filesystem and database work,
         // so time can elapse after the earlier sample; a read must never succeed past its deadline.
         if Instant::now() >= deadline {
