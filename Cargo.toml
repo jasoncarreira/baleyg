@@ -3,6 +3,7 @@ name = "baleyg"
 version = "0.1.0"
 edition = "2024"
 description = "Local diagram-first code index and daemon"
+license = "MIT"
 publish = false
 
 [dependencies]

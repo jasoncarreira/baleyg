@@ -95,6 +95,11 @@ See [research evidence](docs/research/README.md) before running historical tooli
 and semantic-index generation require separate authorization. Private application artifacts are
 excluded; local archives and runtime state must not be committed.
 
+## License
+
+MIT, see [LICENSE](LICENSE). Bundled fonts keep their own SIL OFL licenses under `web/fonts/`;
+the Feature Factory fixtures under `tests/fixtures/` carry their original project's terms.
+
 ## Read more
 
 - [Architecture and accepted direction](SPEC.md)
