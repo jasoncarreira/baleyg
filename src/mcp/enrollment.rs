@@ -31,6 +31,14 @@ const LATCHED: &str = "The bound store was invalidated; restart and owner reissu
 const TIMED_OUT: &str = "The operation deadline elapsed";
 const CONFLICT: &str = "The index revision changed";
 
+/// Flags for the enrolled connection. `SQLITE_OPEN_NOFOLLOW` matters independently of the anchor
+/// descriptors: if the cache pathname becomes a symlink between anchor acquisition and this open,
+/// SQLite would otherwise follow it and create WAL/SHM beside the target before the identity check
+/// rejects enrollment.
+pub(crate) const READ_ONLY_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY
+    .union(OpenFlags::SQLITE_OPEN_NO_MUTEX)
+    .union(OpenFlags::SQLITE_OPEN_NOFOLLOW);
+
 /// Unix device/inode pair. Equality is the only identity claim made here; it is not tamper
 /// attestation, and an inode-preserving overwrite is indistinguishable by design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +77,11 @@ impl Gate {
         }
     }
     fn acquire(&self, deadline: Instant) -> Option<GateGuard<'_>> {
+        // An already-elapsed deadline is refused even when nothing holds the connection: an idle
+        // gate must not resurrect a request whose time is already gone.
+        if Instant::now() >= deadline {
+            return None;
+        }
         let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
         while *busy {
             let now = Instant::now();
@@ -226,6 +239,13 @@ impl Enrollment {
             cfg!(unix),
             "the MCP pilot binding requires Unix file identities"
         );
+        // Resolve ancestors once, here, rather than trusting the caller to pass a canonical path.
+        // SQLITE_OPEN_NOFOLLOW rejects a symbolic link anywhere in the path, so an uncanonicalized
+        // state directory would fail the open even when the database itself is a regular file.
+        // Ancestors are resolved at enrollment; the final component must still not be a link.
+        let state_dir = &state_dir
+            .canonicalize()
+            .context("resolve the canonical state directory")?;
         let cache_path = state_dir.join("cache.db");
         let workspace_path = state_dir.join("workspace.db");
 
@@ -240,11 +260,8 @@ impl Enrollment {
 
         // Read-only: this must never create or migrate a main database. A missing cache is a
         // storage failure, not an empty store.
-        let conn = Connection::open_with_flags(
-            &cache_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .context("open the bound cache read-only")?;
+        let conn = Connection::open_with_flags(&cache_path, READ_ONLY_FLAGS)
+            .context("open the bound cache read-only")?;
         // Force the VFS to open the main file so the identity check below is meaningful, and
         // surface a refused WAL setup here rather than on the first tool call.
         conn.query_row("SELECT count(*) FROM sqlite_schema", [], |r| {
@@ -349,7 +366,11 @@ impl Enrollment {
         deadline: Instant,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<(u64, T), McpError> {
-        self.check_identity()?;
+        // Ownership first. `check_identity` locks the connection, so checking before the gate would
+        // park a queued reader on that mutex where its own deadline cannot reach it.
+        if !self.is_available() {
+            return Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED));
+        }
         let Some(_gate) = self.gate.acquire(deadline) else {
             // Refused while queued: this request never reached the connection, so nothing was
             // interrupted and the admitted request count is still spent.
@@ -371,16 +392,19 @@ impl Enrollment {
         // The transaction is read-only, so rollback is the only correct exit. An interrupted read
         // leaves it open but the connection usable, so this also restores autocommit.
         let _ = conn.execute_batch("ROLLBACK");
-        let timed_out = watchdog.fired();
+        // Disarm and join before ownership is released, so the watchdog can never interrupt the
+        // next request. A callback that does no SQL outlives an interrupt, so completion is judged
+        // by the clock as well as by whether the watchdog fired.
+        let timed_out = watchdog.fired() || Instant::now() >= deadline;
         drop(watchdog);
         drop(conn);
 
+        if timed_out {
+            return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+        }
         let value = match outcome {
             Ok(Ok(value)) => value,
             Ok(Err(e)) => return Err(e),
-            Err(_) if timed_out => {
-                return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
-            }
             Err(_) => return Err(McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE)),
         };
         // Re-check before the caller may emit anything derived from this read.
@@ -405,10 +429,47 @@ impl Enrollment {
 /// Mirrors the revision projection of `Store::read_status`: an absent singleton row is revision 0,
 /// which is an unindexed store rather than a missing one.
 fn current_revision(conn: &Connection) -> rusqlite::Result<u64> {
+    use rusqlite::OptionalExtension;
+    // Only an absent singleton row is an unindexed store. A missing table, or a row that will not
+    // convert, is a storage failure and must propagate rather than read as revision zero.
     let revision: Option<i64> = conn
         .query_row("SELECT revision FROM revision WHERE singleton=1", [], |r| {
             r.get(0)
         })
-        .ok();
+        .optional()?;
     Ok(revision.unwrap_or(0).max(0) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The anchor descriptors cannot protect SQLite's own open, so the flag has to do it. This
+    /// asserts the platform behavior the setup-race defence depends on.
+    #[test]
+    #[cfg(unix)]
+    fn the_enrolled_flags_refuse_a_symlinked_database() {
+        let dir = tempfile::tempdir().unwrap();
+        // The flag rejects a symbolic link anywhere in the path, and temporary directories often
+        // sit behind one, so compare against a canonical base.
+        let base = dir.path().canonicalize().unwrap();
+        let target = base.join("target.db");
+        Connection::open(&target)
+            .unwrap()
+            .execute_batch("CREATE TABLE t(x)")
+            .unwrap();
+        let link = base.join("cache.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            Connection::open_with_flags(&link, READ_ONLY_FLAGS).is_err(),
+            "a symlinked database must not be opened"
+        );
+        // Following the link would have created sidecars beside the target.
+        assert!(!base.join("target.db-wal").exists());
+        assert!(!base.join("target.db-shm").exists());
+
+        // The same path opens when it is a regular file, so the refusal is the symlink, not the flags.
+        assert!(Connection::open_with_flags(&target, READ_ONLY_FLAGS).is_ok());
+    }
 }

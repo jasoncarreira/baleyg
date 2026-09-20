@@ -260,15 +260,82 @@ fn a_queued_read_past_its_deadline_never_interrupts_the_running_one() {
     };
     thread::sleep(Duration::from_millis(100));
 
-    // Queued behind the holder with a deadline that elapses while waiting.
+    // Queued behind the holder with a deadline that elapses while waiting. It must be refused at
+    // its own deadline rather than parked until the holder releases the connection.
+    let queued_at = Instant::now();
     let queued = e.read(
         None,
         Instant::now() + Duration::from_millis(150),
         |_| Ok(()),
     );
+    let waited = queued_at.elapsed();
     assert_eq!(queued.unwrap_err().code, ErrorCode::DeadlineExceeded);
+    assert!(
+        waited < Duration::from_millis(500),
+        "the queued reader waited {waited:?}, so its own deadline did not take effect"
+    );
 
     let (revision, value) = holder.join().unwrap().expect("holder was interrupted");
     assert_eq!((revision, value), (1, 42));
     assert!(e.is_available());
+}
+
+#[test]
+fn an_elapsed_deadline_is_refused_even_when_the_connection_is_idle() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Enrollment::enroll(state.path()).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let seen = ran.clone();
+
+    let past = Instant::now() - Duration::from_secs(1);
+    let err = e
+        .read(None, past, move |_| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "an expired request must not reach the connection"
+    );
+    assert!(e.is_available());
+}
+
+#[test]
+fn a_read_that_outlives_its_deadline_is_refused_even_when_it_succeeds() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Enrollment::enroll(state.path()).unwrap();
+
+    // No SQL, so there is nothing for the watchdog to interrupt: completion is judged by the clock.
+    let err = e
+        .read(None, Instant::now() + Duration::from_millis(20), |_| {
+            thread::sleep(Duration::from_millis(120));
+            Ok(7)
+        })
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::DeadlineExceeded);
+    // A late request is refused, not fatal: the binding stays usable.
+    assert!(e.is_available());
+    assert_eq!(e.current_revision(soon()).unwrap(), 1);
+}
+
+#[test]
+fn a_storage_failure_is_unavailable_rather_than_an_unindexed_store() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Enrollment::enroll(state.path()).unwrap();
+    assert_eq!(e.current_revision(soon()).unwrap(), 1);
+
+    // A cache that cannot answer the revision query is broken, not empty.
+    let writer = rusqlite::Connection::open(state.path().join("cache.db")).unwrap();
+    writer.execute_batch("DROP TABLE revision").unwrap();
+    drop(writer);
+
+    let err = e.current_revision(soon()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::StoreUnavailable);
 }
