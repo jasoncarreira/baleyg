@@ -876,6 +876,14 @@ impl Store {
     pub fn publication_lock(&self) -> Arc<crate::mcp::enrollment::Boundary> {
         self.publication.clone()
     }
+    /// Canonical state directory. The MCP pilot enrolls its own read-only connection against
+    /// these files; it must not reuse `cache()`, which reopens by path and can create.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace_root
+    }
     pub fn status(&self) -> Result<IndexStatus> {
         self.read_status(&self.cache()?)
     }

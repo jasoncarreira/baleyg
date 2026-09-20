@@ -250,16 +250,20 @@ fn a_queued_read_past_its_deadline_never_interrupts_the_running_one() {
     publish(&store, Some(0));
     let e = Arc::new(Enrollment::enroll(state.path(), store.publication_lock()).unwrap());
 
+    // Signalled from inside the read, so the holder provably owns the connection before the
+    // queued request is attempted. Sleeping instead would make this depend on scheduler timing.
+    let (entered, holding) = std::sync::mpsc::channel();
     let holder = {
         let e = e.clone();
         thread::spawn(move || {
-            e.read(None, Instant::now() + Duration::from_secs(30), |_| {
+            e.read(None, Instant::now() + Duration::from_secs(30), move |_| {
+                entered.send(()).unwrap();
                 thread::sleep(Duration::from_millis(700));
                 Ok(42)
             })
         })
     };
-    thread::sleep(Duration::from_millis(100));
+    holding.recv().unwrap();
 
     // Queued behind the holder with a deadline that elapses while waiting. It must be refused at
     // its own deadline rather than parked until the holder releases the connection.

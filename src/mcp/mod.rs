@@ -6,6 +6,8 @@
 //! binding. See [`enrollment`] for the connection this module owns instead.
 
 pub mod enrollment;
+pub mod grants;
+pub mod http;
 
 /// Structured error vocabulary for the pilot's HTTP and tool surfaces.
 ///

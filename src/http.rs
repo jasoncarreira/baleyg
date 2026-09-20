@@ -113,6 +113,10 @@ pub struct DaemonState {
     packets: Mutex<PacketCache>,
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
+    /// Absent when this daemon could not establish a read-only binding. The browser is
+    /// unaffected; the MCP pilot simply reports the store as unavailable.
+    pub(crate) enrollment: Option<Arc<crate::mcp::enrollment::Enrollment>>,
+    pub(crate) grants: crate::mcp::grants::Grants,
 }
 pub fn new(
     store: Store,
@@ -205,6 +209,16 @@ pub fn new_with_dependency_options(
     anyhow::ensure!(valid_token(&token), "invalid bearer token");
     let hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
+    let enrollment = match crate::mcp::enrollment::Enrollment::enroll(
+        store.state_dir(),
+        store.publication_lock(),
+    ) {
+        Ok(enrollment) => Some(Arc::new(enrollment)),
+        Err(e) => {
+            tracing::warn!("MCP pilot binding unavailable: {e:#}");
+            None
+        }
+    };
     Ok(Arc::new(DaemonState {
         store,
         options: index_options,
@@ -235,9 +249,17 @@ pub fn new_with_dependency_options(
             jobs: BTreeMap::new(),
             cancel: Arc::new(AtomicBool::new(false)),
         }),
+        enrollment,
+        grants: crate::mcp::grants::Grants::new(),
     }))
 }
 impl DaemonState {
+    pub(crate) fn store_state_dir(&self) -> &std::path::Path {
+        self.store.state_dir()
+    }
+    pub(crate) fn store_workspace_root(&self) -> &str {
+        self.store.workspace_root()
+    }
     /// Start a replacement generation without doing filesystem or database work on the caller.
     /// A previous generation can finish, but can never publish over its replacement.
     pub fn start_dependency_index(self: &Arc<Self>) {
@@ -564,6 +586,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }),
         )
         .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
+        .merge(crate::mcp::http::routes())
         .route("/api/status", get(status))
         .route("/api/jev/status", get(jev_status))
         .route("/api/acp/status", get(acp_status))
