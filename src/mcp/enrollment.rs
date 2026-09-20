@@ -97,6 +97,11 @@ impl Gate {
                 return None;
             }
         }
+        // A wake can arrive exactly as the deadline passes, whether from a timeout or from the
+        // holder releasing. Ownership is granted only if there is still time left.
+        if Instant::now() >= deadline {
+            return None;
+        }
         *busy = true;
         Some(GateGuard(self))
     }
@@ -166,6 +171,13 @@ impl Drop for Watchdog {
     }
 }
 
+/// A value produced under the admission boundary, with the publication counter observed there.
+/// Pass the epoch to `still_admitted` immediately before emitting.
+pub struct Admitted<T> {
+    pub value: T,
+    pub epoch: u64,
+}
+
 /// One enrolled binding to one store. Created at daemon startup, never re-enrolled.
 pub struct Enrollment {
     daemon_instance_id: String,
@@ -185,11 +197,16 @@ pub struct Enrollment {
     interrupt: Arc<rusqlite::InterruptHandle>,
     gate: Gate,
     latched: AtomicBool,
-    /// Held across final admission and across invalidation, so a response cannot be produced from
-    /// a snapshot that another request has already observed to be gone. Lock order is always this
-    /// mutex before `conn`; `read` never takes it, so a reader that latches cannot deadlock a
-    /// waiting admission.
-    admission: Mutex<()>,
+    /// One boundary shared with `Store::publish`, so admission, every latching path and
+    /// publication are mutually exclusive: a response or credential can never be produced from a
+    /// snapshot that is being replaced or that another request has observed to be gone.
+    ///
+    /// Lock order is always this mutex before `conn`. A latching path must therefore hold no
+    /// connection when it takes it, which is why `read` releases the connection first.
+    admission: Arc<Mutex<()>>,
+    /// Committed-publication counter shared with the store. Compared under the boundary so the
+    /// final pre-emission gate can detect a publication without touching the database.
+    epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn open_no_follow(path: &Path, directory: bool) -> Result<File> {
@@ -239,7 +256,11 @@ impl Enrollment {
     ///
     /// Succeeds against an unindexed store: `cache.db` exists with revision 0, which the grant
     /// issuer reports as `no_published_index` rather than a storage failure.
-    pub fn enroll(state_dir: &Path) -> Result<Self> {
+    pub fn enroll(
+        state_dir: &Path,
+        publication: Arc<Mutex<()>>,
+        epoch: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<Self> {
         ensure!(
             cfg!(unix),
             "the MCP pilot binding requires Unix file identities"
@@ -290,7 +311,8 @@ impl Enrollment {
             conn: Mutex::new(conn),
             gate: Gate::new(),
             latched: AtomicBool::new(false),
-            admission: Mutex::new(()),
+            admission: publication,
+            epoch,
         };
         // Check identities after connection setup as well as before, so a swap racing the open is
         // caught rather than adopted.
@@ -321,12 +343,18 @@ impl Enrollment {
     /// that recreates the cache must not clear the latch.
     pub fn invalidate(&self) {
         let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        self.latch();
+        self.latch_locked();
     }
 
-    /// Latch without taking the admission lock. Used on paths that already hold it, and by `read`,
-    /// which must never acquire it while owning the connection.
+    /// Latch through the shared boundary. Callers must hold no connection: lock order is admission
+    /// before connection.
     fn latch(&self) {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        self.latch_locked();
+    }
+
+    /// Latch without taking the boundary, for paths that already hold it.
+    fn latch_locked(&self) {
         if !self.latched.swap(true, Ordering::SeqCst) {
             let mut generation = self.generation.lock().unwrap_or_else(|e| e.into_inner());
             *generation = uuid::Uuid::new_v4().to_string();
@@ -384,29 +412,17 @@ impl Enrollment {
         &self,
         basis_revision: u64,
         produce: impl FnOnce() -> T,
-    ) -> Result<T, McpError> {
-        self.admit_current(|current| {
+    ) -> Result<Admitted<T>, McpError> {
+        let admitted = self.admit_current(|current| {
             if current != basis_revision {
                 return Err(McpError::new(ErrorCode::RevisionConflict, CONFLICT));
             }
             Ok(produce())
-        })?
-    }
-
-    /// Cheap final gate, safe to call synchronously at the moment of emission.
-    ///
-    /// Takes the admission lock and checks only the latch: no connection, no filesystem, no I/O.
-    /// The deep checks belong in `admit`, but those must run on a blocking thread, and awaiting
-    /// them reopens a window in which another request can observe invalidation before the response
-    /// is actually returned. This closes that window because nothing suspends between it and the
-    /// return. It cannot recall bytes already written; it bounds what is allowed to start.
-    pub fn still_admitted(&self) -> Result<(), McpError> {
-        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        if self.is_available() {
-            Ok(())
-        } else {
-            Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED))
-        }
+        })?;
+        Ok(Admitted {
+            value: admitted.value?,
+            epoch: admitted.epoch,
+        })
     }
 
     /// Admission for a response that carries no evidence.
@@ -414,7 +430,10 @@ impl Enrollment {
     /// Re-verifies availability and identity under the admission lock and hands the closure the
     /// revision observed in that same hold. A response that describes current state has nothing to
     /// conflict with, so a publication racing it is reported rather than refused.
-    pub fn admit_current<T>(&self, produce: impl FnOnce(u64) -> T) -> Result<T, McpError> {
+    pub fn admit_current<T>(
+        &self,
+        produce: impl FnOnce(u64) -> T,
+    ) -> Result<Admitted<T>, McpError> {
         let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         if !self.is_available() {
             return Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED));
@@ -422,11 +441,30 @@ impl Enrollment {
         let current = match self.identity_and_revision() {
             Ok(current) => current,
             Err(e) => {
-                self.latch();
+                self.latch_locked();
                 return Err(e);
             }
         };
-        Ok(produce(current))
+        Ok(Admitted {
+            value: produce(current),
+            epoch: self.epoch.load(std::sync::atomic::Ordering::SeqCst),
+        })
+    }
+
+    /// Final pre-emission gate, safe to call synchronously where nothing may suspend.
+    ///
+    /// Takes the boundary shared with publication and checks only in-memory state: the latch and
+    /// the publication counter observed at admission. A publication that completed while the
+    /// caller was waking from its worker is a conflict, not a relabelled snapshot.
+    pub fn still_admitted(&self, epoch: u64) -> Result<(), McpError> {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.is_available() {
+            return Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED));
+        }
+        if self.epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+            return Err(McpError::new(ErrorCode::RevisionConflict, CONFLICT));
+        }
+        Ok(())
     }
 
     /// Run one guarded read.
@@ -483,6 +521,11 @@ impl Enrollment {
         };
         // Re-check before the caller may emit anything derived from this read.
         self.check_identity()?;
+        // Last word on the clock. The identity check above performs filesystem and database work,
+        // so time can elapse after the earlier sample; a read must never succeed past its deadline.
+        if Instant::now() >= deadline {
+            return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+        }
         Ok(value)
     }
 
@@ -511,7 +554,13 @@ fn current_revision(conn: &Connection) -> rusqlite::Result<u64> {
             r.get(0)
         })
         .optional()?;
-    Ok(revision.unwrap_or(0).max(0) as u64)
+    // Zero is reserved for an absent row. A stored negative is a corrupt store, not revision zero.
+    match revision {
+        None => Ok(0),
+        Some(value) => {
+            u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+        }
+    }
 }
 
 #[cfg(test)]

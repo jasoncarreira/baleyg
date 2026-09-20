@@ -91,7 +91,12 @@ fn replace_with_new_inode(state: &std::path::Path, name: &str) {
 fn enrolls_against_an_unindexed_store_and_reports_revision_zero() {
     let (state, _work, store) = fixture();
     assert_eq!(store.status().unwrap().revision, 0);
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     assert!(e.is_available());
     assert_eq!(e.current_revision(soon()).unwrap(), 0);
 }
@@ -100,7 +105,12 @@ fn enrolls_against_an_unindexed_store_and_reports_revision_zero() {
 fn reads_the_published_revision_in_one_transaction() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     let (revision, names) = e
         .read(None, soon(), |c| {
             let mut stmt = c.prepare("SELECT id FROM nodes ORDER BY id")?;
@@ -116,7 +126,12 @@ fn reads_the_published_revision_in_one_transaction() {
 fn expected_revision_mismatch_is_a_conflict() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     let err = e.read(Some(99), soon(), |_| Ok(())).unwrap_err();
     assert_eq!(err.code, ErrorCode::RevisionConflict);
     // A conflict is not a storage failure: the binding stays usable.
@@ -128,7 +143,12 @@ fn expected_revision_mismatch_is_a_conflict() {
 fn publication_advances_revision_without_rotating_the_generation() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     let generation = e.store_generation();
     assert_eq!(e.current_revision(soon()).unwrap(), 1);
     publish(&store, Some(1));
@@ -141,7 +161,12 @@ fn publication_advances_revision_without_rotating_the_generation() {
 fn replacing_the_cache_latches_the_binding() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     let generation = e.store_generation();
     assert!(e.read(None, soon(), |_| Ok(())).is_ok());
 
@@ -157,7 +182,12 @@ fn replacing_the_cache_latches_the_binding() {
 fn replacing_the_durable_database_also_latches_the_binding() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     replace_with_new_inode(state.path(), "workspace.db");
     assert_eq!(
         e.read(None, soon(), |_| Ok(())).unwrap_err().code,
@@ -170,7 +200,12 @@ fn replacing_the_durable_database_also_latches_the_binding() {
 fn deleting_the_cache_latches_the_binding() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     fs::remove_file(state.path().join("cache.db")).unwrap();
     assert_eq!(
         e.read(None, soon(), |_| Ok(())).unwrap_err().code,
@@ -183,7 +218,12 @@ fn deleting_the_cache_latches_the_binding() {
 fn republishing_does_not_clear_the_latch() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     e.invalidate();
     let rotated = e.store_generation();
 
@@ -204,10 +244,12 @@ fn republishing_does_not_clear_the_latch() {
 fn enrollment_refuses_a_missing_cache_instead_of_creating_one() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
+    let lock = store.publication_lock();
+    let epoch = store.publication_epoch();
     drop(store);
     let cache = state.path().join("cache.db");
     fs::remove_file(&cache).unwrap();
-    assert!(Enrollment::enroll(state.path()).is_err());
+    assert!(Enrollment::enroll(state.path(), lock, epoch).is_err());
     assert!(
         !cache.exists(),
         "read-only enrollment must not create a cache"
@@ -218,7 +260,12 @@ fn enrollment_refuses_a_missing_cache_instead_of_creating_one() {
 fn a_deadline_interrupts_a_long_read_and_the_connection_survives() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
 
     let started = Instant::now();
     let err = e
@@ -247,7 +294,14 @@ fn a_deadline_interrupts_a_long_read_and_the_connection_survives() {
 fn a_queued_read_past_its_deadline_never_interrupts_the_running_one() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Arc::new(Enrollment::enroll(state.path()).unwrap());
+    let e = Arc::new(
+        Enrollment::enroll(
+            state.path(),
+            store.publication_lock(),
+            store.publication_epoch(),
+        )
+        .unwrap(),
+    );
 
     let holder = {
         let e = e.clone();
@@ -284,7 +338,12 @@ fn a_queued_read_past_its_deadline_never_interrupts_the_running_one() {
 fn an_elapsed_deadline_is_refused_even_when_the_connection_is_idle() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     let ran = Arc::new(AtomicBool::new(false));
     let seen = ran.clone();
 
@@ -308,7 +367,12 @@ fn an_elapsed_deadline_is_refused_even_when_the_connection_is_idle() {
 fn a_read_that_outlives_its_deadline_is_refused_even_when_it_succeeds() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
 
     // No SQL, so there is nothing for the watchdog to interrupt: completion is judged by the clock.
     let err = e
@@ -328,7 +392,12 @@ fn a_read_that_outlives_its_deadline_is_refused_even_when_it_succeeds() {
 fn a_storage_failure_is_unavailable_rather_than_an_unindexed_store() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     assert_eq!(e.current_revision(soon()).unwrap(), 1);
 
     // A cache that cannot answer the revision query is broken, not empty.
@@ -344,7 +413,12 @@ fn a_storage_failure_is_unavailable_rather_than_an_unindexed_store() {
 fn admission_refuses_after_another_request_observes_invalidation() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     let (revision, ()) = e.read(None, soon(), |_| Ok(())).unwrap();
 
     // Another request observes the cache is gone and latches the binding while this response is
@@ -361,6 +435,7 @@ fn admission_refuses_after_another_request_observes_invalidation() {
         .admit(revision, move || {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         })
+        .map(|a| a.value)
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::StoreUnavailable);
     assert!(
@@ -373,14 +448,19 @@ fn admission_refuses_after_another_request_observes_invalidation() {
 fn admission_refuses_a_snapshot_a_later_publication_replaced() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
     let (revision, ()) = e.read(None, soon(), |_| Ok(())).unwrap();
     assert_eq!(revision, 1);
 
     // The owner republishes between the read and the response.
     publish(&store, Some(1));
 
-    let err = e.admit(revision, || ()).unwrap_err();
+    let err = e.admit(revision, || ()).map(|a| a.value).unwrap_err();
     assert_eq!(err.code, ErrorCode::RevisionConflict);
     // A conflict is not identity loss: the binding stays usable at the new revision.
     assert!(e.is_available());
@@ -391,7 +471,14 @@ fn admission_refuses_a_snapshot_a_later_publication_replaced() {
 fn admission_serializes_against_concurrent_invalidation() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Arc::new(Enrollment::enroll(state.path()).unwrap());
+    let e = Arc::new(
+        Enrollment::enroll(
+            state.path(),
+            store.publication_lock(),
+            store.publication_epoch(),
+        )
+        .unwrap(),
+    );
 
     // Invalidation cannot interleave between the admission checks and the value being produced.
     let (entered, inside) = std::sync::mpsc::channel();
@@ -415,32 +502,118 @@ fn admission_serializes_against_concurrent_invalidation() {
     thread::sleep(Duration::from_millis(50));
     release.send(()).unwrap();
 
-    assert_eq!(admitter.join().unwrap().unwrap(), "emitted");
+    assert_eq!(admitter.join().unwrap().unwrap().value, "emitted");
     invalidator.join().unwrap();
     assert!(!e.is_available());
     assert_eq!(
-        e.admit(1, || ()).unwrap_err().code,
+        e.admit(1, || ()).map(|a| a.value).unwrap_err().code,
         ErrorCode::StoreUnavailable
     );
 }
 
 #[test]
-fn the_final_gate_refuses_after_invalidation_without_touching_the_store() {
+fn the_final_gate_refuses_after_invalidation_or_publication_without_touching_the_store() {
     let (state, _work, store) = fixture();
     publish(&store, Some(0));
-    let e = Enrollment::enroll(state.path()).unwrap();
-    assert!(e.still_admitted().is_ok());
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
+    let admitted = e.admit(1, || ()).unwrap();
+    assert!(e.still_admitted(admitted.epoch).is_ok());
 
-    e.invalidate();
-
+    // A publication completing while a response wakes from its worker is a conflict, not a
+    // relabelled snapshot. Detected without reading the database.
+    publish(&store, Some(1));
     assert_eq!(
-        e.still_admitted().unwrap_err().code,
+        e.still_admitted(admitted.epoch).unwrap_err().code,
+        ErrorCode::RevisionConflict
+    );
+
+    let admitted = e.admit(2, || ()).unwrap();
+    e.invalidate();
+    assert_eq!(
+        e.still_admitted(admitted.epoch).unwrap_err().code,
         ErrorCode::StoreUnavailable
     );
     // Still answers with the databases gone: the gate performs no I/O.
     fs::remove_file(state.path().join("cache.db")).unwrap();
     assert_eq!(
-        e.still_admitted().unwrap_err().code,
+        e.still_admitted(admitted.epoch).unwrap_err().code,
+        ErrorCode::StoreUnavailable
+    );
+}
+
+#[test]
+fn admission_cannot_complete_while_a_publication_is_in_flight() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Arc::new(
+        Enrollment::enroll(
+            state.path(),
+            store.publication_lock(),
+            store.publication_epoch(),
+        )
+        .unwrap(),
+    );
+
+    // Hold an admission open, then publish from another thread. Publication shares this boundary,
+    // so it cannot complete while a response is being produced from the revision it replaces.
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let admitter = {
+        let e = e.clone();
+        thread::spawn(move || {
+            e.admit(1, move || {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                "produced"
+            })
+        })
+    };
+    inside.recv().unwrap();
+
+    let publisher = {
+        let store = store.clone();
+        thread::spawn(move || publish(&store, Some(1)))
+    };
+    thread::sleep(Duration::from_millis(80));
+    assert!(
+        !publisher.is_finished(),
+        "publication completed while an admission was open"
+    );
+    release.send(()).unwrap();
+
+    assert_eq!(admitter.join().unwrap().unwrap().value, "produced");
+    assert_eq!(publisher.join().unwrap(), 2);
+    // The next admission sees the new revision and refuses the old basis.
+    assert_eq!(
+        e.admit(1, || ()).map(|a| a.value).unwrap_err().code,
+        ErrorCode::RevisionConflict
+    );
+}
+
+#[test]
+fn a_negative_stored_revision_is_a_storage_failure_not_revision_zero() {
+    let (state, _work, store) = fixture();
+    publish(&store, Some(0));
+    let e = Enrollment::enroll(
+        state.path(),
+        store.publication_lock(),
+        store.publication_epoch(),
+    )
+    .unwrap();
+
+    let writer = rusqlite::Connection::open(state.path().join("cache.db")).unwrap();
+    writer
+        .execute_batch("UPDATE revision SET revision=-1 WHERE singleton=1")
+        .unwrap();
+    drop(writer);
+
+    assert_eq!(
+        e.current_revision(soon()).unwrap_err().code,
         ErrorCode::StoreUnavailable
     );
 }

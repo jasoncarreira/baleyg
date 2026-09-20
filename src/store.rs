@@ -6,7 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +14,14 @@ use std::{
 pub struct Store {
     state_dir: PathBuf,
     workspace_root: String,
+    /// Held across publication's commit, and shared with the MCP pilot's admission boundary so a
+    /// response or a credential can never be produced from a snapshot a publication is replacing.
+    /// Clones of a `Store` share it; it is per-process, not a cross-process lock.
+    publication: Arc<std::sync::Mutex<()>>,
+    /// Bumped once per committed publication, under `publication`. A reader holding that lock can
+    /// tell whether the snapshot moved without touching the database, which is what makes a final
+    /// pre-emission check cheap enough to run where nothing may suspend.
+    publication_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 const DATABASE_SCHEMA_VERSION: u32 = 3;
 const CLASS_SCHEMA: &str = "
@@ -810,6 +818,8 @@ impl Store {
         let store = Self {
             state_dir: state_dir.canonicalize()?,
             workspace_root,
+            publication: Arc::new(std::sync::Mutex::new(())),
+            publication_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let mut db = store.workspace()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -865,6 +875,15 @@ impl Store {
             diagnostics,
         })
     }
+    /// The publication boundary. A reader that must not observe a half-replaced snapshot, or must
+    /// not emit one that publication has since replaced, shares this lock.
+    pub fn publication_lock(&self) -> Arc<std::sync::Mutex<()>> {
+        self.publication.clone()
+    }
+    /// Counter of committed publications, for a reader sharing the publication boundary.
+    pub fn publication_epoch(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.publication_epoch.clone()
+    }
     pub fn status(&self) -> Result<IndexStatus> {
         self.read_status(&self.cache()?)
     }
@@ -880,6 +899,9 @@ impl Store {
         );
         check_cancel(cancel)?;
         let stats = validate_graph(graph, cancel)?;
+        // Taken before any write and held to commit. Anything sharing this boundary observes the
+        // snapshot either wholly before or wholly after publication, never mid-replacement.
+        let _publication = self.publication.lock().unwrap_or_else(|e| e.into_inner());
         // Parse cached source before taking the writer lock. Projection and graph
         // still publish in one transaction with the same CAS/cancellation guard.
         let classes = crate::classes::Catalog::build(&graph.files, &graph.nodes, cancel)?;
@@ -987,6 +1009,9 @@ impl Store {
         )?;
         check_cancel(cancel)?;
         tx.commit()?;
+        // Still inside the publication boundary, so nobody holding it observes the commit without
+        // also observing the bump.
+        self.publication_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(revision)
     }
     /// Search only the persisted projection. Wildcards are literal user text.
