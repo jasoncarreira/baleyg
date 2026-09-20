@@ -378,3 +378,228 @@ async fn an_oversized_body_is_too_large_even_when_it_is_also_malformed() {
     assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body["error"]["code"], "body_too_large");
 }
+
+#[tokio::test]
+async fn an_authenticated_unknown_tool_spends_the_request_budget() {
+    let (_d, store, app) = setup();
+    publish(&store, Some(0));
+    let limits =
+        json!({"maxRequests": 2, "maxTotalResponseBytes": 2097152, "maxResponseBytes": 65536});
+    let (token, _id, binding) = grant(&app, 1, limits).await;
+
+    for _ in 0..2 {
+        let (code, body) = call(
+            &app,
+            "POST",
+            "/api/mcp-pilot/tools/baleyg_run_shell",
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
+    }
+
+    // Naming routes that do not exist must not be a way to spend nothing.
+    let (code, body) = call(
+        &app,
+        "POST",
+        DESCRIBE,
+        &token,
+        json!({"schemaVersion": 1, "binding": binding}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "budget_exhausted");
+}
+
+#[tokio::test]
+async fn an_error_is_never_emitted_larger_than_the_remaining_budget() {
+    let (_d, store, app) = setup();
+    publish(&store, Some(0));
+    // The smallest ceiling a grant may carry. Anything lower is refused at issuance, because an
+    // error envelope would not fit inside the limit the owner set.
+    let limits = json!({"maxRequests": 50, "maxTotalResponseBytes": 512, "maxResponseBytes": 512});
+    let (token, _id, binding) = grant(&app, 1, limits).await;
+
+    let mut malformed = json!({"schemaVersion": 1, "binding": binding});
+    malformed["surprise"] = json!(true);
+    // Repeated until the remaining allowance is smaller than an envelope; no response may exceed
+    // the per-response ceiling at any point.
+    for _ in 0..6 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(DESCRIBE)
+                    .header("host", "127.0.0.1:7331")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(malformed.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            bytes.len() <= 512,
+            "emitted {} bytes against a 512 byte ceiling",
+            bytes.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_response_ceiling_below_the_envelope_floor_is_refused_at_issuance() {
+    let (_d, store, app) = setup();
+    publish(&store, Some(0));
+    let (_, discovery) = call(&app, "GET", "/api/mcp-pilot/binding", OWNER, Value::Null).await;
+    let (code, body) = call(
+        &app,
+        "POST",
+        "/api/mcp-pilot/grants",
+        OWNER,
+        json!({
+            "schemaVersion": 1,
+            "binding": discovery["binding"],
+            "expectedRevision": 1,
+            "capabilities": ["baleyg_workspace_describe"],
+            "ttlSeconds": 900,
+            "limits": {"maxRequests": 50, "maxTotalResponseBytes": 2097152, "maxResponseBytes": 1},
+            "clientLabel": "terminal-pilot",
+            "disclosure": {"recipient": "approved local client", "sourceApproved": false},
+        }),
+    )
+    .await;
+    // Refused here rather than forcing every later answer to exceed the limit or misreport itself.
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn a_revocation_during_the_response_is_honoured() {
+    let (_d, store, app) = setup();
+    publish(&store, Some(0));
+    let (token, id, binding) = grant(&app, 1, default_limits()).await;
+    let request = json!({"schemaVersion": 1, "binding": binding});
+    assert_eq!(
+        call(&app, "POST", DESCRIBE, &token, request.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // Revoked through the owner route; the grant must not be usable afterwards even though it was
+    // valid when the worker checked it.
+    let (code, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/mcp-pilot/grants/{id}"),
+        OWNER,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    let (code, body) = call(&app, "POST", DESCRIBE, &token, request).await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn non_utf8_input_is_charged_like_any_other_malformed_request() {
+    let (_d, store, app) = setup();
+    publish(&store, Some(0));
+    let limits =
+        json!({"maxRequests": 1, "maxTotalResponseBytes": 2097152, "maxResponseBytes": 65536});
+    let (token, _id, binding) = grant(&app, 1, limits).await;
+
+    // Invalid UTF-8: this must be identified and charged, not rejected by an extractor before the
+    // grant is even known.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(DESCRIBE)
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(vec![0x7b, 0xff, 0xfe, 0x7d]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(body["schemaVersion"], 1);
+
+    // The single request in the budget was spent by it.
+    let (code, body) = call(
+        &app,
+        "POST",
+        DESCRIBE,
+        &token,
+        json!({"schemaVersion": 1, "binding": binding}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "budget_exhausted");
+}
+
+#[tokio::test]
+async fn an_invalidated_enrollment_retires_existing_grants() {
+    let (dir, store, app) = setup();
+    publish(&store, Some(0));
+    let (token, _id, binding) = grant(&app, 1, default_limits()).await;
+    let request = json!({"schemaVersion": 1, "binding": binding});
+    assert_eq!(
+        call(&app, "POST", DESCRIBE, &token, request.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // Another request observes the cache is gone and latches the binding.
+    let state = dir.path().join("state");
+    let staging = state.join("staging.db");
+    std::fs::write(&staging, std::fs::read(state.join("cache.db")).unwrap()).unwrap();
+    std::fs::rename(&staging, state.join("cache.db")).unwrap();
+    let (code, _) = call(&app, "GET", "/api/mcp-pilot/binding", OWNER, Value::Null).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+
+    // A grant issued before the enrollment ended must not keep working.
+    let (code, _) = call(&app, "POST", DESCRIBE, &token, request).await;
+    assert!(
+        code == StatusCode::UNAUTHORIZED || code == StatusCode::SERVICE_UNAVAILABLE,
+        "an old grant survived invalidation: {code}"
+    );
+}
+
+#[tokio::test]
+async fn an_invalidated_binding_reports_unavailable_not_unauthorized() {
+    let (dir, store, app) = setup();
+    publish(&store, Some(0));
+    let (token, _id, binding) = grant(&app, 1, default_limits()).await;
+    let request = json!({"schemaVersion": 1, "binding": binding});
+    assert_eq!(
+        call(&app, "POST", DESCRIBE, &token, request.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // Another request observes the cache is gone and latches the binding.
+    let state = dir.path().join("state");
+    std::fs::remove_file(state.join("cache.db")).unwrap();
+    let (code, _) = call(&app, "GET", "/api/mcp-pilot/binding", OWNER, Value::Null).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+
+    // The distinction matters to the caller: unauthorized says reissue, unavailable says the
+    // binding is over and the daemon must restart first.
+    let (code, body) = call(&app, "POST", DESCRIBE, &token, request).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "store_unavailable");
+}

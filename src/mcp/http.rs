@@ -89,7 +89,24 @@ pub(crate) fn fail(e: McpError) -> Response {
 fn charged(admission: crate::mcp::grants::Admission<'_>, e: McpError) -> Response {
     let status = e.code.status();
     let body = error_body(&e);
-    admission.settle(body.to_string().len() as u64);
+    let size = body.to_string().len() as u64;
+    // No error is exempt from the ceiling. A deadline used to be, so that it would not be reported
+    // as a budget denial, but the exemption let a response exceed a limit the owner set. Grants now
+    // carry a floor on that ceiling, so every envelope fits and neither compromise is needed.
+    if size > admission.max_response_bytes {
+        // Emit a smaller envelope rather than sending the full one and clamping the charge
+        // afterwards. If even this exceeds what remains, settlement clamps and the overshoot is the
+        // contract's fixed, bounded error allowance.
+        let denial = McpError::new(
+            ErrorCode::BudgetExhausted,
+            "The grant response budget is exhausted",
+        );
+        let status = denial.code.status();
+        let body = error_body(&denial);
+        admission.settle(body.to_string().len() as u64);
+        return respond(status, body);
+    }
+    admission.settle(size);
     respond(status, body)
 }
 
@@ -424,7 +441,6 @@ fn envelope(
 fn identify<'a>(
     s: &'a Arc<DaemonState>,
     principal: &crate::http::Principal,
-    capability: Capability,
 ) -> Result<crate::mcp::grants::Admission<'a>, McpError> {
     // The guard admits only grants on this prefix; treat anything else as a programming error
     // rather than silently accepting it.
@@ -434,13 +450,17 @@ fn identify<'a>(
             "This credential may not be used on this route",
         ));
     };
-    s.grants.admit(token, capability, Instant::now())
+    // The enrollment itself, not a sampled generation: a sample can be stale by the time it is
+    // compared. Admission also distinguishes an ended binding, which is unavailable and needs a
+    // restart, from a grant that is merely unusable and needs reissuing.
+    s.grants
+        .admit(token, s.enrollment.as_deref(), Instant::now())
 }
 
 /// Shared request preamble after identification: size, schema and binding, each charged.
 fn accept<T: serde::de::DeserializeOwned>(
     admission: &crate::mcp::grants::Admission<'_>,
-    body: &str,
+    body: &[u8],
     schema_version: impl FnOnce(&T) -> u32,
     binding: impl FnOnce(&T) -> crate::mcp::grants::Binding,
 ) -> Result<T, McpError> {
@@ -451,7 +471,9 @@ fn accept<T: serde::de::DeserializeOwned>(
             "The tool request exceeds the permitted size",
         ));
     }
-    let parsed: T = serde_json::from_str(body).map_err(|_| {
+    // Decoded here rather than by an extractor: non-UTF-8 bytes must be charged like any other
+    // authenticated malformed request, not rejected before the grant is even identified.
+    let parsed: T = serde_json::from_slice(body).map_err(|_| {
         McpError::new(
             ErrorCode::InvalidRequest,
             "The request is malformed or carries unknown fields",
@@ -480,12 +502,28 @@ fn to_binding(binding: &BindingBody) -> crate::mcp::grants::Binding {
 async fn describe(
     State(s): State<Arc<DaemonState>>,
     axum::Extension(principal): axum::Extension<crate::http::Principal>,
-    body: String,
+    request: axum::extract::Request,
 ) -> Response {
     let at = deadline();
-    let admission = match identify(&s, &principal, Capability::WorkspaceDescribe) {
+    let admission = match identify(&s, &principal) {
         Ok(admission) => admission,
         Err(e) => return fail(e),
+    };
+    if let Err(e) = admission.check_capability(Capability::WorkspaceDescribe) {
+        return charged(admission, e);
+    }
+    // Read only now, with the budget reserved, and only to the documented ceiling.
+    let body = match read_body(request).await {
+        Ok(body) => body,
+        Err(()) => {
+            return charged(
+                admission,
+                McpError::new(
+                    ErrorCode::BodyTooLarge,
+                    "The tool request exceeds the permitted size",
+                ),
+            );
+        }
     };
     if let Err(e) = accept::<DescribeBody>(
         &admission,
@@ -506,12 +544,15 @@ async fn describe(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let state = s.clone();
+    let gate = enrollment.clone();
     // The whole response is built inside the admission the store identity is checked in, so a
     // describe pending when another request observes invalidation cannot still report readable
     // evidence.
     let outcome = blocking_within(at, move || {
-        enrollment.admit_current(|revision| {
-            state.grants.still_valid(&grant_id, Instant::now())?;
+        let (admitted, ticket) = enrollment.admit_current(at, |revision| {
+            state
+                .grants
+                .still_valid(&grant_id, state.enrollment.as_deref(), Instant::now())?;
             let Some(summary) = state.grants.summary(&grant_id) else {
                 return Err(McpError::new(
                     ErrorCode::Unauthorized,
@@ -549,27 +590,49 @@ async fn describe(
                     "The response exceeds the remaining response budget",
                 ));
             }
-            Ok((encoded, size))
-        })?
+            Ok((encoded, size, revision))
+        })?;
+        admitted.map(|value| (value, ticket))
     })
     .await;
 
+    // Checked after the awaited phase and before any result is matched, so a delayed error is
+    // refused for the same reason a delayed success is. A second confirmation is deliberately not
+    // added: it would run in its own blocking phase and reopen the window it was meant to close.
+    if Instant::now() >= at {
+        return charged(admission, timed_out());
+    }
     match outcome {
-        Ok((encoded, size)) => {
+        Ok(((encoded, size, _revision), ticket)) => {
+            // Committed under the same lock invalidation takes, so the response is either refused
+            // or handed off with nothing able to interleave between the two.
+            if let Err(e) = ticket.commit(&gate) {
+                return charged(admission, e);
+            }
+            if let Err(e) =
+                s.grants
+                    .still_valid(&admission.grant_id, s.enrollment.as_deref(), Instant::now())
+            {
+                return charged(admission, e);
+            }
             admission.settle(size);
-            let mut response = (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
-                encoded,
-            )
-                .into_response();
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-            response
+            json_ok(encoded)
         }
         Err(e) => charged(admission, e),
     }
+}
+
+fn json_ok(encoded: String) -> Response {
+    let mut response = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        encoded,
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 /// Unknown tool names under the tool prefix are denied in the contract envelope rather than
@@ -614,38 +677,7 @@ async fn unknown_tool(
             "No such tool is available on this binding",
         )
     };
-    // Settled with the size actually emitted: dropping the admission would charge the whole
-    // reservation for a short error. Emission is also capped by what remains, so an ordinary error
-    // never exceeds the allowance and is replaced by the smaller budget denial when it would.
-    let mut status = outcome.code.status();
-    let mut rendered = envelope_for(&outcome);
-    if rendered.to_string().len() as u64 > admission.max_response_bytes {
-        let denial = McpError::new(
-            ErrorCode::BudgetExhausted,
-            "The grant response budget is exhausted",
-        );
-        status = denial.code.status();
-        rendered = envelope_for(&denial);
-    }
-    admission.settle(rendered.to_string().len() as u64);
-    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut response = (status, Json(rendered)).into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    response
-}
-
-fn envelope_for(e: &McpError) -> Value {
-    json!({
-        "schemaVersion": 1,
-        "error": {
-            "code": e.code.as_str(),
-            "message": e.message,
-            "retryable": e.code.retryable(),
-        },
-        "requestId": uuid::Uuid::new_v4().to_string(),
-    })
+    charged(admission, outcome)
 }
 
 /// Read a tool request body, bounded by the documented ceiling.
@@ -670,9 +702,11 @@ pub fn routes() -> Router<Arc<DaemonState>> {
             "/api/mcp-pilot/grants/{grant_id}",
             axum::routing::delete(revoke),
         )
+        // A method fallback, so a wrong method on a real tool is admitted and charged like any
+        // other miss instead of being answered with a bare 405 before identification.
         .route(
             "/api/mcp-pilot/tools/baleyg_workspace_describe",
-            post(describe),
+            post(describe).fallback(unknown_tool),
         )
         // Every other method and tail under the prefix, so a router-level 404 or 405 can never
         // answer an authenticated request before it has been identified and charged.
