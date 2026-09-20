@@ -19,6 +19,7 @@ pub mod indexer;
 mod indexer_java;
 mod indexer_python;
 mod indexer_rust;
+pub mod mcp;
 pub mod model;
 pub mod navigation;
 mod rust_sources;

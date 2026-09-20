@@ -1,0 +1,414 @@
+//! The enrolled read-only cache connection and its identity guard.
+//!
+//! `Store::cache()` opens a fresh connection by pathname for every read and `connect()` performs
+//! writable setup and migration; `secure_database_file()` uses `.create(true)`, so a deleted cache
+//! silently becomes a new empty database. None of that can back an MCP binding, so this module
+//! owns a separate connection with its own lifetime, identity anchors and failure policy.
+//!
+//! Measured behavior this relies on (see `docs/mcp-pilot-slice0-findings.md`): a read-only open
+//! creates `-wal`/`-shm` and is refused outright in a non-writable directory; `SQLITE_FCNTL_HAS_MOVED`
+//! detects replacement, unlink and rename but not an inode-preserving overwrite; and an interrupted
+//! read returns `SQLITE_INTERRUPT` while leaving the connection immediately reusable.
+
+use super::{ErrorCode, EvidenceBasis, McpError};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OpenFlags};
+use std::{
+    ffi::CString,
+    fs::{File, Metadata},
+    os::raw::{c_int, c_void},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Instant,
+};
+
+const UNAVAILABLE: &str = "The bound store is unavailable";
+const LATCHED: &str = "The bound store was invalidated; restart and owner reissue are required";
+const TIMED_OUT: &str = "The operation deadline elapsed";
+const CONFLICT: &str = "The index revision changed";
+
+/// Unix device/inode pair. Equality is the only identity claim made here; it is not tamper
+/// attestation, and an inode-preserving overwrite is indistinguishable by design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+fn file_id(meta: &Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }
+}
+#[cfg(not(unix))]
+fn file_id(_: &Metadata) -> FileId {
+    FileId { dev: 0, ino: 0 }
+}
+
+/// Serializes pilot reads. A queued request keeps its own deadline running and is refused when it
+/// elapses, so a waiter can never interrupt the statement currently holding the connection.
+struct Gate {
+    busy: Mutex<bool>,
+    ready: Condvar,
+}
+
+struct GateGuard<'a>(&'a Gate);
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            busy: Mutex::new(false),
+            ready: Condvar::new(),
+        }
+    }
+    fn acquire(&self, deadline: Instant) -> Option<GateGuard<'_>> {
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(busy, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            busy = next;
+            if timeout.timed_out() && *busy {
+                return None;
+            }
+        }
+        *busy = true;
+        Some(GateGuard(self))
+    }
+}
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        let mut busy = self.0.busy.lock().unwrap_or_else(|e| e.into_inner());
+        *busy = false;
+        self.0.ready.notify_one();
+    }
+}
+
+/// Interrupts the enrolled connection when a deadline elapses. Armed only while this request owns
+/// the connection, so it can never cancel another request's work.
+struct Watchdog {
+    state: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<thread::JoinHandle<()>>,
+    fired: Arc<AtomicBool>,
+}
+
+impl Watchdog {
+    fn arm(interrupt: Arc<rusqlite::InterruptHandle>, deadline: Instant) -> Self {
+        let state = Arc::new((Mutex::new(false), Condvar::new()));
+        let fired = Arc::new(AtomicBool::new(false));
+        let (worker_state, worker_fired) = (state.clone(), fired.clone());
+        let thread = thread::spawn(move || {
+            let (lock, cv) = &*worker_state;
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while !*done {
+                let now = Instant::now();
+                if now >= deadline {
+                    worker_fired.store(true, Ordering::SeqCst);
+                    interrupt.interrupt();
+                    return;
+                }
+                let (next, _) = cv
+                    .wait_timeout(done, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner());
+                done = next;
+            }
+        });
+        Self {
+            state,
+            thread: Some(thread),
+            fired,
+        }
+    }
+    /// True when the watchdog actually interrupted, which distinguishes a deadline from an
+    /// interrupt raised for any other reason.
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        {
+            let (lock, cv) = &*self.state;
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *done = true;
+            cv.notify_all();
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// One enrolled binding to one store. Created at daemon startup, never re-enrolled.
+pub struct Enrollment {
+    daemon_instance_id: String,
+    generation: Mutex<String>,
+    state_dir: PathBuf,
+    cache_path: PathBuf,
+    workspace_path: PathBuf,
+    dir_id: FileId,
+    cache_id: FileId,
+    workspace_id: FileId,
+    // Retained so the anchored inodes cannot be recycled while this binding lives. SQLite does not
+    // read through these descriptors; they pin identity, they do not supply the connection.
+    _dir: File,
+    _cache: File,
+    _workspace: File,
+    conn: Mutex<Connection>,
+    interrupt: Arc<rusqlite::InterruptHandle>,
+    gate: Gate,
+    latched: AtomicBool,
+}
+
+fn open_no_follow(path: &Path, directory: bool) -> Result<File> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        if directory {
+            flags |= libc::O_DIRECTORY;
+        }
+        options.custom_flags(flags);
+    }
+    let _ = directory;
+    options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
+}
+
+/// `sqlite3_file_control(db, "main", SQLITE_FCNTL_HAS_MOVED, &moved)`.
+///
+/// Asks the VFS whether the database it actually opened still resolves from its pathname. An
+/// unsupported control, an error, or an out-of-range result fails closed.
+fn has_moved(conn: &Connection) -> Result<bool, McpError> {
+    let mut moved: c_int = -1;
+    let name = CString::new("main").expect("literal contains no NUL");
+    // SAFETY: `conn` is borrowed for the whole call, so its sqlite3 handle stays live. This file
+    // control reads the zero-terminated schema name and writes exactly one c_int through the out
+    // pointer, which `moved` provides. The value is only trusted when the call returns SQLITE_OK.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            name.as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            std::ptr::from_mut(&mut moved).cast::<c_void>(),
+        )
+    };
+    if rc != rusqlite::ffi::SQLITE_OK || moved < 0 {
+        return Err(McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE));
+    }
+    Ok(moved != 0)
+}
+
+impl Enrollment {
+    /// Enroll once, after ordinary store initialization and before any grant may be issued.
+    ///
+    /// Succeeds against an unindexed store: `cache.db` exists with revision 0, which the grant
+    /// issuer reports as `no_published_index` rather than a storage failure.
+    pub fn enroll(state_dir: &Path) -> Result<Self> {
+        ensure!(
+            cfg!(unix),
+            "the MCP pilot binding requires Unix file identities"
+        );
+        let cache_path = state_dir.join("cache.db");
+        let workspace_path = state_dir.join("workspace.db");
+
+        let dir = open_no_follow(state_dir, true)?;
+        let cache = open_no_follow(&cache_path, false)?;
+        let workspace = open_no_follow(&workspace_path, false)?;
+        let (dir_meta, cache_meta, workspace_meta) =
+            (dir.metadata()?, cache.metadata()?, workspace.metadata()?);
+        ensure!(dir_meta.is_dir(), "state directory must be a directory");
+        ensure!(cache_meta.is_file(), "cache must be a regular file");
+        ensure!(workspace_meta.is_file(), "workspace must be a regular file");
+
+        // Read-only: this must never create or migrate a main database. A missing cache is a
+        // storage failure, not an empty store.
+        let conn = Connection::open_with_flags(
+            &cache_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("open the bound cache read-only")?;
+        // Force the VFS to open the main file so the identity check below is meaningful, and
+        // surface a refused WAL setup here rather than on the first tool call.
+        conn.query_row("SELECT count(*) FROM sqlite_schema", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .context("establish read-only access to the bound cache")?;
+
+        let enrollment = Self {
+            daemon_instance_id: uuid::Uuid::new_v4().to_string(),
+            generation: Mutex::new(uuid::Uuid::new_v4().to_string()),
+            state_dir: state_dir.to_path_buf(),
+            cache_path,
+            workspace_path,
+            dir_id: file_id(&dir_meta),
+            cache_id: file_id(&cache_meta),
+            workspace_id: file_id(&workspace_meta),
+            _dir: dir,
+            _cache: cache,
+            _workspace: workspace,
+            interrupt: Arc::new(conn.get_interrupt_handle()),
+            conn: Mutex::new(conn),
+            gate: Gate::new(),
+            latched: AtomicBool::new(false),
+        };
+        // Check identities after connection setup as well as before, so a swap racing the open is
+        // caught rather than adopted.
+        enrollment
+            .check_identity()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(enrollment)
+    }
+
+    pub fn daemon_instance_id(&self) -> String {
+        self.daemon_instance_id.clone()
+    }
+
+    pub fn store_generation(&self) -> String {
+        self.generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn is_available(&self) -> bool {
+        !self.latched.load(Ordering::SeqCst)
+    }
+
+    /// Latch this binding off for the rest of the daemon's lifetime and rotate the generation once.
+    ///
+    /// There is no in-process recovery: a later republication, a restored file or a browser read
+    /// that recreates the cache must not clear the latch.
+    pub fn invalidate(&self) {
+        if !self.latched.swap(true, Ordering::SeqCst) {
+            let mut generation = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+            *generation = uuid::Uuid::new_v4().to_string();
+        }
+    }
+
+    fn path_identity(&self) -> Result<(), McpError> {
+        let unavailable = || McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE);
+        for (path, expected) in [
+            (&self.state_dir, self.dir_id),
+            (&self.cache_path, self.cache_id),
+            (&self.workspace_path, self.workspace_id),
+        ] {
+            // lstat: a path replaced by a symlink must not resolve to its target.
+            let meta = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
+            if meta.file_type().is_symlink() || file_id(&meta) != expected {
+                return Err(unavailable());
+            }
+        }
+        Ok(())
+    }
+
+    /// Full identity check. Any failure latches the binding before returning.
+    fn check_identity(&self) -> Result<(), McpError> {
+        if !self.is_available() {
+            return Err(McpError::new(ErrorCode::StoreUnavailable, LATCHED));
+        }
+        let verdict = (|| {
+            self.path_identity()?;
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            if has_moved(&conn)? {
+                return Err(McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE));
+            }
+            Ok(())
+        })();
+        if verdict.is_err() {
+            self.invalidate();
+        }
+        verdict
+    }
+
+    /// Run one guarded read.
+    ///
+    /// Revision and evidence are read in a single transaction on the enrolled connection, with the
+    /// identity checked before and after. `expected` is compared against the transaction-pinned
+    /// revision; callers that admit a grant compare it against the admitted revision separately.
+    pub fn read<T>(
+        &self,
+        expected: Option<u64>,
+        deadline: Instant,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<(u64, T), McpError> {
+        self.check_identity()?;
+        let Some(_gate) = self.gate.acquire(deadline) else {
+            // Refused while queued: this request never reached the connection, so nothing was
+            // interrupted and the admitted request count is still spent.
+            return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+        };
+        self.check_identity()?;
+
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let watchdog = Watchdog::arm(self.interrupt.clone(), deadline);
+        let outcome: rusqlite::Result<Result<(u64, T), McpError>> = (|| {
+            conn.execute_batch("BEGIN DEFERRED")?;
+            let revision = current_revision(&conn)?;
+            if expected.is_some_and(|r| r != revision) {
+                return Ok(Err(McpError::new(ErrorCode::RevisionConflict, CONFLICT)));
+            }
+            let value = f(&conn)?;
+            Ok(Ok((revision, value)))
+        })();
+        // The transaction is read-only, so rollback is the only correct exit. An interrupted read
+        // leaves it open but the connection usable, so this also restores autocommit.
+        let _ = conn.execute_batch("ROLLBACK");
+        let timed_out = watchdog.fired();
+        drop(watchdog);
+        drop(conn);
+
+        let value = match outcome {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => return Err(e),
+            Err(_) if timed_out => {
+                return Err(McpError::new(ErrorCode::DeadlineExceeded, TIMED_OUT));
+            }
+            Err(_) => return Err(McpError::new(ErrorCode::StoreUnavailable, UNAVAILABLE)),
+        };
+        // Re-check before the caller may emit anything derived from this read.
+        self.check_identity()?;
+        Ok(value)
+    }
+
+    /// Current published revision. Zero means no index has been published in this generation.
+    pub fn current_revision(&self, deadline: Instant) -> Result<u64, McpError> {
+        self.read(None, deadline, |_| Ok(())).map(|(r, ())| r)
+    }
+
+    pub fn basis(&self, index_revision: u64) -> EvidenceBasis {
+        EvidenceBasis {
+            daemon_instance_id: self.daemon_instance_id(),
+            store_generation: self.store_generation(),
+            index_revision,
+        }
+    }
+}
+
+/// Mirrors the revision projection of `Store::read_status`: an absent singleton row is revision 0,
+/// which is an unindexed store rather than a missing one.
+fn current_revision(conn: &Connection) -> rusqlite::Result<u64> {
+    let revision: Option<i64> = conn
+        .query_row("SELECT revision FROM revision WHERE singleton=1", [], |r| {
+            r.get(0)
+        })
+        .ok();
+    Ok(revision.unwrap_or(0).max(0) as u64)
+}
