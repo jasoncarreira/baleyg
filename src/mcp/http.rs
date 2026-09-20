@@ -622,6 +622,150 @@ async fn describe(
     }
 }
 
+/// Maximum literal source fragment carried on one call row.
+const MAX_CALLEE_TEXT_BYTES: usize = 1024;
+/// Depth-one only: `baleyg_inspect` never expands recursively.
+const MAX_CALLS: usize = 50;
+const MAX_SOURCE_LINES: usize = 200;
+const MAX_SOURCE_BYTES: usize = 16 * 1024;
+const MAX_QUERY_BYTES: usize = 256;
+const MAX_SYMBOL_ID_BYTES: usize = 8192;
+const MAX_PATH_BYTES: usize = 4096;
+const DEFAULT_LIMIT: u32 = 20;
+const MAX_LIMIT: u32 = 50;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FindBody {
+    schema_version: u32,
+    binding: BindingBody,
+    expected_revision: u64,
+    query: String,
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InspectBody {
+    schema_version: u32,
+    binding: BindingBody,
+    expected_revision: u64,
+    symbol_id: String,
+    view: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReadSourceBody {
+    schema_version: u32,
+    binding: BindingBody,
+    expected_revision: u64,
+    path: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn invalid(message: &'static str) -> McpError {
+    McpError::new(ErrorCode::InvalidRequest, message)
+}
+
+/// Clip at a code-point boundary, never mid-character.
+fn clip(text: &str, max: usize) -> (&str, bool) {
+    if text.len() <= max {
+        return (text, false);
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// Explicit projection of a measured declaration. Native DTOs are never serialized through:
+/// unlisted fields stay out of the pilot surface until they have their own bounds review.
+fn symbol_json(symbol: &crate::model::Symbol) -> Value {
+    json!({
+        "symbolId": symbol.id,
+        "name": symbol.name,
+        "kind": symbol.kind,
+        "path": symbol.path,
+        "range": {
+            "startLine": symbol.range.start_line,
+            "startColumn": symbol.range.start_column,
+            "endLine": symbol.range.end_line,
+            "endColumn": symbol.range.end_column,
+            "startByte": symbol.range.start_byte,
+            "endByte": symbol.range.end_byte,
+        },
+        "parentSymbolId": symbol.parent,
+        "accessor": symbol.accessor,
+        "evidence": {
+            "source": symbol.provenance.source,
+            "semantic": symbol.provenance.semantic,
+        },
+    })
+}
+
+/// One measured call site. `calleeText` is a literal source fragment, which is why inspect needs
+/// source approval. Control regions, callback arguments and candidate bodies are excluded.
+fn call_json(call: &crate::model::CallSite) -> (Value, bool) {
+    let (text, clipped) = clip(&call.callee_text, MAX_CALLEE_TEXT_BYTES);
+    (
+        json!({
+            "callId": call.id,
+            "callerSymbolId": call.caller,
+            "targetSymbolId": call.target,
+            "resolution": call.resolution,
+            "path": call.path,
+            "range": {
+                "startLine": call.range.start_line,
+                "startColumn": call.range.start_column,
+                "endLine": call.range.end_line,
+                "endColumn": call.range.end_column,
+                "startByte": call.range.start_byte,
+                "endByte": call.range.end_byte,
+            },
+            "ordinal": call.ordinal,
+            "calleeText": text,
+            "calleeTextTruncated": clipped,
+            "candidateCount": call.candidate_symbols.len(),
+            "evidence": {
+                "source": call.provenance.source,
+                "semantic": call.provenance.semantic,
+            },
+        }),
+        clipped,
+    )
+}
+
+/// Relative indexed paths only. Never resolved against the filesystem: this addresses a cached row.
+fn valid_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_PATH_BYTES
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains(':')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+/// Shared evidence-read preamble: both the admitted revision and the transaction-pinned revision
+/// must equal the request's expected revision.
+fn check_revision(expected: u64, admitted: u64) -> Result<(), McpError> {
+    if expected == 0 {
+        return Err(invalid("An expected revision above zero is required"));
+    }
+    if expected != admitted {
+        return Err(McpError::new(
+            ErrorCode::RevisionConflict,
+            "The index revision changed",
+        ));
+    }
+    Ok(())
+}
+
 fn json_ok(encoded: String) -> Response {
     let mut response = (
         StatusCode::OK,
@@ -633,6 +777,392 @@ fn json_ok(encoded: String) -> Response {
         .headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
+}
+
+/// The tail shared by every evidence tool.
+///
+/// One guarded read at the admitted revision, then the response built inside enrollment admission
+/// so that grant validity, store identity and the current revision are all re-verified before any
+/// evidence starts being sent. A publication or an invalidation that lands after the read is a
+/// refusal, not a relabelled snapshot.
+async fn serve_evidence<'a, T: Send + 'static>(
+    s: &'a Arc<DaemonState>,
+    admission: crate::mcp::grants::Admission<'a>,
+    at: Instant,
+    expected: u64,
+    read: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+    render: impl FnOnce(T) -> Result<(Value, Option<&'static str>), McpError> + Send + 'static,
+) -> Response {
+    let Some(enrollment) = s.enrollment.clone() else {
+        return charged(admission, unavailable());
+    };
+    let grant_id = admission.grant_id.clone();
+    let max_bytes = admission.max_response_bytes;
+    let state = s.clone();
+    let gate = enrollment.clone();
+    let outcome = blocking_within(at, move || {
+        let (revision, value) = enrollment.read(Some(expected), at, read)?;
+        let basis = enrollment.basis(revision);
+        let (admitted, ticket) = enrollment.admit(revision, at, move || {
+            state
+                .grants
+                .still_valid(&grant_id, state.enrollment.as_deref(), Instant::now())?;
+            let (data, truncation) = render(value)?;
+            let encoded = envelope(&basis, data, truncation).to_string();
+            let size = encoded.len() as u64;
+            if size > max_bytes {
+                return Err(McpError::new(
+                    ErrorCode::BudgetExhausted,
+                    "The response exceeds the remaining response budget",
+                ));
+            }
+            Ok((encoded, size))
+        })?;
+        let (encoded, size) = admitted?;
+        Ok((encoded, size, revision, ticket))
+    })
+    .await;
+    // Checked after the awaited phase and before any result is matched, so a delayed error is
+    // refused for the same reason a delayed success is. A second confirmation is deliberately not
+    // added: it runs in its own blocking phase and reopens the very worker-to-handler window it
+    // was meant to close. The guarantee lives in admission, which verifies before and after its
+    // producer inside one boundary hold.
+    if Instant::now() >= at {
+        return charged(admission, timed_out());
+    }
+    match outcome {
+        Ok((encoded, size, _revision, ticket)) => {
+            // Committed under the same lock invalidation takes, so evidence is either refused or
+            // handed off with nothing able to interleave between the two.
+            if let Err(e) = ticket.commit(&gate) {
+                return charged(admission, e);
+            }
+            if let Err(e) =
+                s.grants
+                    .still_valid(&admission.grant_id, s.enrollment.as_deref(), Instant::now())
+            {
+                return charged(admission, e);
+            }
+            admission.settle(size);
+            json_ok(encoded)
+        }
+        Err(e) => charged(admission, e),
+    }
+}
+
+async fn find_symbols(
+    State(s): State<Arc<DaemonState>>,
+    axum::Extension(principal): axum::Extension<crate::http::Principal>,
+    request: axum::extract::Request,
+) -> Response {
+    let at = deadline();
+    let admission = match identify(&s, &principal) {
+        Ok(admission) => admission,
+        Err(e) => return fail(e),
+    };
+    if let Err(e) = admission.check_capability(Capability::FindSymbols) {
+        return charged(admission, e);
+    }
+    // Read only now, with the budget reserved, and only to the documented ceiling.
+    let body = match read_body(request).await {
+        Ok(body) => body,
+        Err(()) => {
+            return charged(
+                admission,
+                McpError::new(
+                    ErrorCode::BodyTooLarge,
+                    "The tool request exceeds the permitted size",
+                ),
+            );
+        }
+    };
+    let parsed = match accept::<FindBody>(
+        &admission,
+        &body,
+        |b| b.schema_version,
+        |b| to_binding(&b.binding),
+    ) {
+        Ok(parsed) => parsed,
+        Err(e) => return charged(admission, e),
+    };
+    if let Err(e) = check_revision(parsed.expected_revision, admission.admitted_revision) {
+        return charged(admission, e);
+    }
+    if parsed.query.is_empty() || parsed.query.len() > MAX_QUERY_BYTES {
+        return charged(admission, invalid("The query is empty or too long"));
+    }
+    let limit = parsed.limit.unwrap_or(DEFAULT_LIMIT);
+    if limit == 0 || limit > MAX_LIMIT {
+        return charged(
+            admission,
+            invalid("The requested limit is outside the permitted range"),
+        );
+    }
+    let query = parsed.query.clone();
+    // One extra row distinguishes a full page from a clipped one.
+    let probe = i64::from(limit) + 1;
+    serve_evidence(
+        &s,
+        admission,
+        at,
+        parsed.expected_revision,
+        move |c| {
+            let mut stmt = c.prepare(crate::store::sql::NODE_SEARCH)?;
+            let rows =
+                stmt.query_map(rusqlite::params![query, probe], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()
+        },
+        move |rows: Vec<String>| {
+            let truncated = rows.len() > limit as usize;
+            let symbols: Vec<Value> = rows
+                .iter()
+                .take(limit as usize)
+                .filter_map(|row| serde_json::from_str::<crate::model::Symbol>(row).ok())
+                .map(|symbol| symbol_json(&symbol))
+                .collect();
+            let data = json!({"symbols": symbols, "returned": symbols.len()});
+            Ok((data, truncated.then_some("result_limit")))
+        },
+    )
+    .await
+}
+
+async fn inspect(
+    State(s): State<Arc<DaemonState>>,
+    axum::Extension(principal): axum::Extension<crate::http::Principal>,
+    request: axum::extract::Request,
+) -> Response {
+    let at = deadline();
+    let admission = match identify(&s, &principal) {
+        Ok(admission) => admission,
+        Err(e) => return fail(e),
+    };
+    if let Err(e) = admission.check_capability(Capability::Inspect) {
+        return charged(admission, e);
+    }
+    // Read only now, with the budget reserved, and only to the documented ceiling.
+    let body = match read_body(request).await {
+        Ok(body) => body,
+        Err(()) => {
+            return charged(
+                admission,
+                McpError::new(
+                    ErrorCode::BodyTooLarge,
+                    "The tool request exceeds the permitted size",
+                ),
+            );
+        }
+    };
+    let parsed = match accept::<InspectBody>(
+        &admission,
+        &body,
+        |b| b.schema_version,
+        |b| to_binding(&b.binding),
+    ) {
+        Ok(parsed) => parsed,
+        Err(e) => return charged(admission, e),
+    };
+    if let Err(e) = check_revision(parsed.expected_revision, admission.admitted_revision) {
+        return charged(admission, e);
+    }
+    if parsed.symbol_id.is_empty() || parsed.symbol_id.len() > MAX_SYMBOL_ID_BYTES {
+        return charged(
+            admission,
+            invalid("The symbol identifier is empty or too long"),
+        );
+    }
+    let declaration = match parsed.view.as_str() {
+        "declaration" => true,
+        "outgoing_calls" => false,
+        _ => return charged(admission, invalid("Unknown inspect view")),
+    };
+    let symbol_id = parsed.symbol_id.clone();
+    serve_evidence(
+        &s,
+        admission,
+        at,
+        parsed.expected_revision,
+        move |c| {
+            let symbol: Option<String> = c
+                .query_row(crate::store::sql::NODE_BY_ID, [&symbol_id], |r| r.get(0))
+                .ok();
+            let Some(symbol) = symbol else {
+                return Ok((None, vec![]));
+            };
+            if declaration {
+                return Ok((Some(symbol), vec![]));
+            }
+            let sql = format!("{} LIMIT ?2", crate::store::sql::CALLS_BY_CALLER);
+            let mut stmt = c.prepare(&sql)?;
+            let probe = MAX_CALLS as i64 + 1;
+            let rows = stmt.query_map(rusqlite::params![symbol_id, probe], |r| {
+                r.get::<_, String>(0)
+            })?;
+            Ok((
+                Some(symbol),
+                rows.collect::<rusqlite::Result<Vec<String>>>()?,
+            ))
+        },
+        move |(symbol, calls): (Option<String>, Vec<String>)| {
+            let Some(symbol) =
+                symbol.and_then(|s| serde_json::from_str::<crate::model::Symbol>(&s).ok())
+            else {
+                return Err(McpError::new(
+                    ErrorCode::NotFound,
+                    "No such symbol at the authorized basis",
+                ));
+            };
+            if declaration {
+                let data = json!({"view": "declaration", "declaration": symbol_json(&symbol)});
+                return Ok((data, None));
+            }
+            let clipped_list = calls.len() > MAX_CALLS;
+            let mut fragment_clipped = false;
+            let rendered: Vec<Value> = calls
+                .iter()
+                .take(MAX_CALLS)
+                .filter_map(|row| serde_json::from_str::<crate::model::CallSite>(row).ok())
+                .map(|call| {
+                    let (value, clipped) = call_json(&call);
+                    fragment_clipped |= clipped;
+                    value
+                })
+                .collect();
+            let reason = if clipped_list {
+                Some("result_limit")
+            } else if fragment_clipped {
+                Some("source_fragment_limit")
+            } else {
+                None
+            };
+            let data = json!({
+                "view": "outgoing_calls",
+                "declaration": symbol_json(&symbol),
+                "calls": rendered,
+                "returned": rendered.len(),
+            });
+            Ok((data, reason))
+        },
+    )
+    .await
+}
+
+async fn read_source(
+    State(s): State<Arc<DaemonState>>,
+    axum::Extension(principal): axum::Extension<crate::http::Principal>,
+    request: axum::extract::Request,
+) -> Response {
+    let at = deadline();
+    let admission = match identify(&s, &principal) {
+        Ok(admission) => admission,
+        Err(e) => return fail(e),
+    };
+    if let Err(e) = admission.check_capability(Capability::ReadSource) {
+        return charged(admission, e);
+    }
+    // Read only now, with the budget reserved, and only to the documented ceiling.
+    let body = match read_body(request).await {
+        Ok(body) => body,
+        Err(()) => {
+            return charged(
+                admission,
+                McpError::new(
+                    ErrorCode::BodyTooLarge,
+                    "The tool request exceeds the permitted size",
+                ),
+            );
+        }
+    };
+    let parsed = match accept::<ReadSourceBody>(
+        &admission,
+        &body,
+        |b| b.schema_version,
+        |b| to_binding(&b.binding),
+    ) {
+        Ok(parsed) => parsed,
+        Err(e) => return charged(admission, e),
+    };
+    if let Err(e) = check_revision(parsed.expected_revision, admission.admitted_revision) {
+        return charged(admission, e);
+    }
+    if !valid_relative_path(&parsed.path) {
+        return charged(
+            admission,
+            invalid("The path is not a valid indexed relative path"),
+        );
+    }
+    if parsed.start_line == 0 || parsed.end_line < parsed.start_line {
+        return charged(admission, invalid("The requested line range is invalid"));
+    }
+    let path = parsed.path.clone();
+    let (start_line, end_line) = (parsed.start_line, parsed.end_line);
+    serve_evidence(
+        &s,
+        admission,
+        at,
+        parsed.expected_revision,
+        move |c| {
+            Ok(c.query_row(crate::store::sql::FILE_BY_PATH, [&path], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok())
+        },
+        move |row: Option<String>| {
+            let Some(file) =
+                row.and_then(|r| serde_json::from_str::<crate::model::SourceFile>(&r).ok())
+            else {
+                // Never falls back to reading the path from disk.
+                return Err(McpError::new(
+                    ErrorCode::NotFound,
+                    "No such cached file at the authorized basis",
+                ));
+            };
+            let lines: Vec<&str> = file.text.split_inclusive('\n').collect();
+            // Both endpoints must lie within the cached file. Clamping the end instead would
+            // return a shortened range and report it as complete.
+            if start_line > lines.len() || end_line > lines.len() {
+                return Err(invalid("The requested range is outside the cached file"));
+            }
+            let mut end = end_line.min(start_line + MAX_SOURCE_LINES - 1);
+            let line_clipped = end < end_line;
+
+            let start_byte: usize = lines[..start_line - 1].iter().map(|l| l.len()).sum();
+            let mut bytes: usize = lines[start_line - 1..end].iter().map(|l| l.len()).sum();
+            let mut byte_clipped = false;
+            // Clip whole lines only, so a returned range never ends mid-line or mid-character.
+            while bytes > MAX_SOURCE_BYTES && end > start_line {
+                end -= 1;
+                bytes = lines[start_line - 1..end].iter().map(|l| l.len()).sum();
+                byte_clipped = true;
+            }
+            if bytes > MAX_SOURCE_BYTES {
+                return Err(McpError::new(
+                    ErrorCode::RangeTooLarge,
+                    "A single line exceeds the source text budget",
+                ));
+            }
+            let text: String = lines[start_line - 1..end].concat();
+            let reason = if byte_clipped {
+                Some("byte_limit")
+            } else if line_clipped {
+                Some("line_limit")
+            } else {
+                None
+            };
+            let data = json!({
+                "path": file.path,
+                "fileHash": file.hash,
+                "language": file.language,
+                "startLine": start_line,
+                "endLine": end,
+                "startByte": start_byte,
+                "endByte": start_byte + text.len(),
+                "text": text,
+            });
+            Ok((data, reason))
+        },
+    )
+    .await
 }
 
 /// Unknown tool names under the tool prefix are denied in the contract envelope rather than
@@ -707,6 +1237,18 @@ pub fn routes() -> Router<Arc<DaemonState>> {
         .route(
             "/api/mcp-pilot/tools/baleyg_workspace_describe",
             post(describe).fallback(unknown_tool),
+        )
+        .route(
+            "/api/mcp-pilot/tools/baleyg_find_symbols",
+            post(find_symbols).fallback(unknown_tool),
+        )
+        .route(
+            "/api/mcp-pilot/tools/baleyg_inspect",
+            post(inspect).fallback(unknown_tool),
+        )
+        .route(
+            "/api/mcp-pilot/tools/baleyg_read_source",
+            post(read_source).fallback(unknown_tool),
         )
         // Every other method and tail under the prefix, so a router-level 404 or 405 can never
         // answer an authenticated request before it has been identified and charged.

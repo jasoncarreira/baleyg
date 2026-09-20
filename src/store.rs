@@ -96,6 +96,19 @@ fn secure_database_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Query text shared with the MCP pilot.
+///
+/// The pilot executes these on its own enrolled read-only connection with mandatory revision
+/// guards, so the connection and the guards differ — but the SQL must have exactly one definition,
+/// or a change to matching or ordering here would silently not reach the tool surface.
+pub(crate) mod sql {
+    pub const NODE_SEARCH: &str = "SELECT payload FROM nodes WHERE instr(lower(name),lower(?1)) > 0 OR instr(lower(id),lower(?1)) > 0 ORDER BY CASE WHEN lower(name)=lower(?1) THEN 0 WHEN instr(lower(name),lower(?1))=1 THEN 1 ELSE 2 END,name,id LIMIT ?2";
+    pub const NODE_BY_ID: &str = "SELECT payload FROM nodes WHERE id=?1";
+    pub const FILE_BY_PATH: &str = "SELECT payload FROM files WHERE path=?1";
+    /// Outgoing only: there is no incoming call hierarchy in the index.
+    pub const CALLS_BY_CALLER: &str = "SELECT payload FROM calls WHERE caller=?1 ORDER BY path,json_extract(payload,'$.range.startByte'),json_extract(payload,'$.range.endByte') DESC,id";
+}
+
 fn connect(path: &Path, schema: &str) -> Result<Connection> {
     secure_database_file(path)?;
     let mut db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -1295,7 +1308,7 @@ impl Store {
         let mut db = self.cache()?;
         let tx = db.transaction()?;
         let revision = self.read_status(&tx)?.revision;
-        let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE instr(lower(name),lower(?1)) > 0 OR instr(lower(id),lower(?1)) > 0 ORDER BY CASE WHEN lower(name)=lower(?1) THEN 0 WHEN instr(lower(name),lower(?1))=1 THEN 1 ELSE 2 END,name,id LIMIT ?2")?;
+        let mut stmt = tx.prepare(sql::NODE_SEARCH)?;
         let values = stmt.query_map(params![query, limit.min(150) as i64], |r| {
             r.get::<_, String>(0)
         })?;
@@ -1330,22 +1343,14 @@ impl Store {
         id: &str,
         expected_revision: Option<u64>,
     ) -> Result<Option<(u64, Symbol)>> {
-        self.entity_at(
-            "SELECT payload FROM nodes WHERE id=?1",
-            id,
-            expected_revision,
-        )
+        self.entity_at(sql::NODE_BY_ID, id, expected_revision)
     }
     pub fn source_at(
         &self,
         path: &str,
         expected_revision: Option<u64>,
     ) -> Result<Option<(u64, SourceFile)>> {
-        self.entity_at(
-            "SELECT payload FROM files WHERE path=?1",
-            path,
-            expected_revision,
-        )
+        self.entity_at(sql::FILE_BY_PATH, path, expected_revision)
     }
     /// Catalog reads pin revision and rows to one SQLite read transaction.
     /// Enrich only the visible tree page from one cached index snapshot.
@@ -1496,8 +1501,7 @@ impl Store {
             if depth >= query.depth {
                 continue;
             }
-            let mut stmt =
-                tx.prepare("SELECT payload FROM calls WHERE caller=?1 ORDER BY path,json_extract(payload,'$.range.startByte'),json_extract(payload,'$.range.endByte') DESC,id")?;
+            let mut stmt = tx.prepare(sql::CALLS_BY_CALLER)?;
             let values = stmt.query_map([&id], |r| r.get::<_, String>(0))?;
             for value in values {
                 let call: CallSite = serde_json::from_str(&value?)?;
