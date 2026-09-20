@@ -6,7 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +14,9 @@ use std::{
 pub struct Store {
     state_dir: PathBuf,
     workspace_root: String,
+    /// Combines a per-instance admission count with the state directory's advisory file lock.
+    /// Clones share the in-process side; separately opened stores and processes meet at the file.
+    publication: Arc<crate::mcp::enrollment::Boundary>,
 }
 const DATABASE_SCHEMA_VERSION: u32 = 3;
 const CLASS_SCHEMA: &str = "
@@ -807,8 +810,10 @@ impl Store {
             .context("workspace path is not UTF-8")?
             .to_owned();
         secure_state_dir(state_dir)?;
+        let canonical = state_dir.canonicalize()?;
         let store = Self {
-            state_dir: state_dir.canonicalize()?,
+            publication: Arc::new(crate::mcp::enrollment::Boundary::at(&canonical)?),
+            state_dir: canonical,
             workspace_root,
         };
         let mut db = store.workspace()?;
@@ -865,6 +870,12 @@ impl Store {
             diagnostics,
         })
     }
+    /// The publication boundary. A reader that must not observe a half-replaced snapshot, or must
+    /// not emit one that publication has since replaced, shares this lock.
+    #[allow(dead_code)] // consumed by the crate-private MCP foundation and PR2 typed adapter
+    pub(crate) fn publication_lock(&self) -> Arc<crate::mcp::enrollment::Boundary> {
+        self.publication.clone()
+    }
     pub fn status(&self) -> Result<IndexStatus> {
         self.read_status(&self.cache()?)
     }
@@ -880,10 +891,16 @@ impl Store {
         );
         check_cancel(cancel)?;
         let stats = validate_graph(graph, cancel)?;
-        // Parse cached source before taking the writer lock. Projection and graph
-        // still publish in one transaction with the same CAS/cancellation guard.
+        // Prepare the projection before taking either publication boundary. The exclusive scope is
+        // reserved for database publication, not graph validation or catalog construction.
         let classes = crate::classes::Catalog::build(&graph.files, &graph.nodes, cancel)?;
         check_cancel(cancel)?;
+        // Taken immediately before database access and held through commit. Both the in-process
+        // counter and the cross-process advisory lock fail closed when they cannot be acquired.
+        let publication = self
+            .publication
+            .publish()
+            .context("take the publication boundary")?;
         let mut db = self.cache()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = self.read_status(&tx)?.revision;
@@ -986,7 +1003,17 @@ impl Store {
             ],
         )?;
         check_cancel(cancel)?;
-        tx.commit()?;
+        match tx.commit() {
+            Ok(()) => publication
+                .committed()
+                .context("verify publication authority after commit")?,
+            Err(error) => {
+                // SQLite does not promise that every COMMIT error has a known non-durable
+                // outcome. Retain the exclusive publication lock and fail closed for this process.
+                publication.fail_closed();
+                return Err(error.into());
+            }
+        }
         Ok(revision)
     }
     /// Search only the persisted projection. Wildcards are literal user text.

@@ -4,6 +4,8 @@ Status: **PROPOSED DESIGN — not implemented**. This contract narrows Phase 1 o
 [agent integration plan](agent-integration-plan.md). Endpoints, commands, fields, grants and
 acceptance tests below are proposals, not claims about the running daemon. This document does
 not authorize implementation, indexing, process launches, provider use or deployment.
+The server-side linearization model is specified separately in
+[MCP admission and response handoff](mcp-admission-linearization.md).
 
 ## Boundary and current facts
 
@@ -86,8 +88,9 @@ Proposed identity rules:
   Unix pilot; restart already invalidates every grant.
 - Normal atomic, in-place publication advances `indexRevision` without changing generation.
   An owner grant pins one revision; reindexing requires owner reissuance for more evidence reads.
-- An invalidation revokes all grants, suppresses unsent results, rotates generation once and
-  **latches MCP unavailable for the remaining daemon lifetime**. No automatic enrollment of the
+- An invalidation revokes all grants, rejects results that have not reached application response
+  commit, rotates generation once and **latches MCP unavailable for the remaining daemon lifetime**.
+  A response committed earlier may still be delivered from transport buffers. No automatic enrollment of the
   replacement cache. Recovery requires daemon restart, a valid published store and fresh owner
   approval. Existing owner APIs must not clear this latch by minting another grant.
 - Matching revision numbers alone never make an old binding valid. A restart invalidates all old
@@ -102,7 +105,7 @@ call. That would turn identity loss into revision 0 and hide the failure. Those 
 a safe implementation of this MCP binding, including owner binding discovery and grant issuance. Add a dedicated read-only connection service; this is required new code, not a claim
 about today's daemon.
 
-Enroll once at daemon startup after ordinary store initialization and before granting tool access:
+Enroll once at daemon startup after ordinary store initialization and before granting tool access. The Store publication boundary permanently accepts only one enrollment/lifecycle; repeat construction is rejected even after invalidation or drop. Boundary, raw connection, generic snapshot/admission/preparation, lifecycle callback, and finalization APIs are crate-private. PR2 exposes only bounded typed operations and its outer Tower handoff:
 
 1. Retain a no-follow directory FD for the canonical state directory and no-follow regular-file FDs
    for `cache.db` and `workspace.db`. Record their Unix device/inode identities and validate file
@@ -118,16 +121,21 @@ Enroll once at daemon startup after ordinary store initialization and before gra
    and this combined setup check. Unsupported control (`SQLITE_NOTFOUND`), errors or indeterminate
    identity fail closed. Do not substitute checks only on a separately opened FD, `/dev/fd` aliases,
    or `immutable=1` for proof about a live WAL-backed connection.
-4. Before and after each read, and before owner grant/result admission (including describe), check
-   the retained directory/database path identities and the actual enrolled connection's moved
-   status again. Run revision and evidence reads in one transaction on that connection. Never call
-   the existing reopen-by-path helper, lazily replace a connection or rebind after an error.
-5. Serialize final response/grant admission with publication and internal invalidation. Every
+4. Before and after each read, and during crate-private `prepare_handoff`, check the retained
+   directory/database path identities and the actual enrolled connection's moved status again. Run
+   revision and evidence reads in one transaction on that connection. `prepare_handoff` performs the
+   final SQLite revision/`SQLITE_FCNTL_HAS_MOVED` proof while retaining publication authority. Never
+   call the existing reopen-by-path helper, lazily replace a connection or rebind after an error.
+5. At application commit, repeat the cheap path/lock/cache/workspace identity, lifecycle latch, grant,
+   revision association and absolute-deadline checks; then serialize typed finalization with
+   publication and internal invalidation. No SQLite or generic callback is public at this point. Every
    supported destructive cache rebuild/restore or root/state rebind must invalidate **before**
    mutation; normal SQL publication remains revision-guarded. On observed loss/change or a failed
-   identity check, apply the unavailable latch above. No evidence or grant leaves after invalidation
-   admission; bytes already sent cannot be recalled. Do not use mtime/size as an epoch: ordinary
-   writes/checkpoints change them.
+   identity check, apply the unavailable latch above. Define **application response commit** as the
+   synchronous outer service transition that returns the immutable response to the HTTP stack. No
+   evidence response or grant may commit after invalidation has linearized. A response committed
+   earlier may be delivered later; HTTP/TCP buffering and peer receipt are outside this model. Do not
+   use mtime/size as an epoch: ordinary writes/checkpoints change them.
 
 **Read-only WAL qualification:** read-only main-database access still uses SQLite's WAL/shared-memory
 coordination. Depending on existing sidecars and VFS behavior, a cold open may need permission to
@@ -227,8 +235,10 @@ Response 201 is `{schemaVersion, grantId, token, expiresAt, binding, admittedRev
 capabilities, effectiveLimits}`. Token is a new opaque 256-bit random secret (distinct `bgp_` token
 format); it carries no editable claims. Keep only its cryptographic digest and grant policy in an
 in-memory daemon table. Do not persist grants across restarts. `grantId` is non-secret and cannot
-be exchanged for the token. No token retrieval endpoint exists. An ambiguous issuance retry may
-leave an unused grant until expiry; never recover it by printing secrets.
+be exchanged for the token. No token retrieval endpoint exists. A grant does not become active until
+its complete 201 response reaches application response commit. If the connection fails after that
+commit but before client receipt, an ambiguous issuance retry may leave one unused grant until expiry;
+never recover it by printing secrets.
 
 ### Trusted handoff, separate from the agent
 
@@ -338,18 +348,22 @@ Never report a clipped list as complete. Clip source only at a complete line/UTF
 report the actual range; a single line exceeding the text budget returns `range_too_large`.
 
 Backend hard ceilings: 16 KiB tool request, 64 KiB complete response, 2 concurrent reads per grant,
-5-second operation deadline, and the grant's shared 200-request/2 MiB response lifetime budget.
+5-second operation deadline through application response commit, and the grant's shared 200-request/2 MiB response lifetime budget. Socket drain and peer receipt are outside that deadline.
 Caps include error/metadata envelopes; source content also has its separate 16 KiB ceiling.
 Reserve request/output budgets before work and settle actual bytes atomically; concurrent requests
 cannot exceed them. A depleted budget never produces an empty successful result. Retain a small
 fixed error allowance for budget-denied responses. Reject over-cap requested limits, do not silently
-expand them; native lower limits still win. Cancellation does not refund the admitted request count.
+expand them; native lower limits still win. Cancellation does not refund the admitted request count. The operation deadline is also an absolute publication-authority lease deadline: queued or canceled preparation, a running sample, retained carrier clones, and a lifecycle-ordered failure cannot extend it. Expiry releases only the small lease and never drops arbitrary response/evidence state; a late handoff cannot emit it.
 
 Read revision and evidence in one SQLite read transaction. Separate status -> data -> status checks
 are not sufficient to claim atomic evidence. If native helpers are combined, they need a shared
-snapshot/guarded service, not independent unguarded calls. Before response emission, check grant
-expiry/revocation and generation/revision again; if publication raced, discard rather than relabel
-old data. Serialize that final check/admission with invalidation; bytes already sent cannot be recalled.
+snapshot/guarded service, not independent unguarded calls. `prepare_handoff` repeats SQLite revision
+and `SQLITE_FCNTL_HAS_MOVED` while retaining the publication lease. Application commit then repeats
+only cheap identity, lifecycle latch, deadline, grant expiry/revocation and admitted-revision
+association checks before its infallible typed finalizer. A publication linearized before that commit
+causes conflict; a publication linearized afterward does not relabel or recall a response that
+truthfully carries the older `evidenceBasis`. Serialize this final decision with invalidation. A
+response already committed to the HTTP stack cannot be recalled.
 
 ## Errors and lifecycle
 
@@ -389,9 +403,10 @@ Invalidated generations may return 401 first if the grant was removed; callers m
 Retry only explicitly retryable transient errors within the original grant/deadline; no background
 reauthorization or provider activity. Revision conflict is not a request to reindex.
 
-On MCP cancellation, abort/interrupt the read where supported and suppress its late response. A
-bounded blocking DB read may finish internally; it must not emit after cancellation. HTTP disconnect
-also cancels response delivery. Cancellation cannot unsend data or roll back a completed disclosure.
+On MCP cancellation, abort/interrupt the read where supported and reject its response if application
+response commit has not happened. A bounded blocking DB read may finish internally, but its result is
+discarded. HTTP disconnect cancels response delivery where the transport observes it. Cancellation
+cannot recall a response already committed or roll back a completed disclosure.
 On stdio EOF, close HTTP work and erase credentials/cached evidence; owner supervisor revokes if
 available. On daemon restart, adapter restart, auth failure, logout or session replacement, clear
 caches and require owner handoff instead of silently reacquiring an owner token.
@@ -485,7 +500,8 @@ A prepared disposable store may be supplied by the test harness.
    Do not assert that the guard detects unobserved ABA, inode-preserving external restores or sidecar
    manipulation; these are unsupported live mutations. No fallback/re-enrollment/registry lookup occurs.
 6. **Revision race:** omit/null/alter expected revision on each evidence read; reject all. Publish a
-   new fixture revision between admission/read/emission and require conflict, never mixed evidence.
+   new fixture revision between admission/read/application response commit and require conflict,
+   never mixed evidence.
    Describe alone reports current/admitted revision without source; only owner reissue restores reads.
 7. **Bounds:** malformed paths, external source IDs, unknown fields, deep/recursive inspect requests,
    overlong literals/ranges, oversized lines and excessive response bytes fail or report exact
@@ -495,7 +511,8 @@ A prepared disposable store may be supplied by the test harness.
    `-shm`, plus insufficient sidecar permissions. Verify supported SQLite coordination or a closed
    failure, never main-database creation/migration, writable-main fallback or `immutable=1`.
 8. **Expiry/revoke:** use a fake clock for 900-second expiry and wall-clock changes. Owner revocation
-   denies new reads and cached hits, drops pending unsent results, and is idempotent. Replayed stolen
+   denies new reads and cached hits, rejects pending results that have not reached application response
+   commit, and is idempotent. Replayed stolen
    grant succeeds only within its authorized scope before revocation/expiry, documenting bearer risk.
 9. **Transport/secret hygiene:** hostile Origin/Host, duplicate auth, redirects and proxy environment
    cannot send the grant elsewhere. Insecure/symlink/hard-linked/oversized grant files fail. Paths
