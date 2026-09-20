@@ -32,6 +32,33 @@ fn deadline() -> Instant {
     Instant::now() + OPERATION_DEADLINE
 }
 
+fn timed_out() -> McpError {
+    McpError::new(
+        ErrorCode::DeadlineExceeded,
+        "The operation deadline elapsed",
+    )
+}
+
+/// Run blocking store work under one deadline computed at request admission.
+///
+/// The deadline is decided before the work is queued, so time spent waiting for a blocking worker
+/// counts against it. Computed inside the worker instead, a saturated pool could delay a response
+/// past its deadline and still return success.
+async fn blocking_within<T: Send + 'static>(
+    deadline: Instant,
+    f: impl FnOnce() -> Result<T, McpError> + Send + 'static,
+) -> Result<T, McpError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(timed_out());
+    }
+    match tokio::time::timeout(remaining, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(unavailable()),
+        Err(_) => Err(timed_out()),
+    }
+}
+
 /// Contract error envelope. Distinct from the daemon's existing shape, and never carries SQL,
 /// token fragments, absolute state paths or source.
 fn fail(e: McpError) -> Response {
@@ -106,13 +133,14 @@ async fn binding(State(s): State<Arc<DaemonState>>) -> Response {
         s.store_state_dir().to_string_lossy().into_owned(),
         s.store_workspace_root().to_string(),
     );
-    let result = tokio::task::spawn_blocking(move || {
-        let revision = enrollment.current_revision(deadline())?;
-        Ok::<_, McpError>((enrollment.basis(revision), revision))
+    let at = deadline();
+    let result = blocking_within(at, move || {
+        let revision = enrollment.current_revision(at)?;
+        Ok((enrollment.basis(revision), revision))
     })
     .await;
     match result {
-        Ok(Ok((basis, revision))) => Json(json!({
+        Ok((basis, revision)) => Json(json!({
             "schemaVersion": 1,
             "binding": {
                 "daemonInstanceId": basis.daemon_instance_id,
@@ -124,8 +152,7 @@ async fn binding(State(s): State<Arc<DaemonState>>) -> Response {
             "evidenceReadable": revision > 0,
         }))
         .into_response(),
-        Ok(Err(e)) => fail(e),
-        Err(_) => fail(unavailable()),
+        Err(e) => fail(e),
     }
 }
 
@@ -202,26 +229,32 @@ async fn issue(State(s): State<Arc<DaemonState>>, body: String) -> Response {
         ));
     }
 
-    let revision =
-        match tokio::task::spawn_blocking(move || enrollment.current_revision(deadline())).await {
-            Ok(Ok(revision)) => revision,
-            Ok(Err(e)) => return fail(e),
-            Err(_) => return fail(unavailable()),
-        };
-    if revision == 0 {
-        return fail(McpError::new(
-            ErrorCode::NoPublishedIndex,
-            "The bound store has no published index; publish one before issuing a grant",
-        ));
-    }
-    if revision != request.expected_revision {
-        return fail(McpError::new(
-            ErrorCode::RevisionConflict,
-            "The index revision changed",
-        ));
-    }
+    let at = deadline();
+    let expected = request.expected_revision;
+    let state = s.clone();
+    // Read the revision and create the credential inside one admission boundary. Issuing outside
+    // it would let an invalidation or a publication land in the gap and still mint a token.
+    let issued = blocking_within(at, move || {
+        let revision = enrollment.current_revision(at)?;
+        if revision == 0 {
+            return Err(McpError::new(
+                ErrorCode::NoPublishedIndex,
+                "The bound store has no published index; publish one before issuing a grant",
+            ));
+        }
+        if revision != expected {
+            return Err(McpError::new(
+                ErrorCode::RevisionConflict,
+                "The index revision changed",
+            ));
+        }
+        enrollment
+            .admit(revision, || state.grants.issue(request, Instant::now()))?
+            .value
+    })
+    .await;
 
-    match s.grants.issue(request, Instant::now()) {
+    match issued {
         Ok(issued) => (
             StatusCode::CREATED,
             Json(json!({

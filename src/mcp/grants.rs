@@ -184,6 +184,7 @@ pub struct Admission<'a> {
     pub grant_id: String,
     pub admitted_revision: u64,
     pub max_response_bytes: u64,
+    binding: Binding,
     reserved: u64,
     settled: bool,
 }
@@ -200,6 +201,19 @@ impl std::fmt::Debug for Admission<'_> {
 }
 
 impl Admission<'_> {
+    /// Checked after the body is parsed. Admission itself happens first so that malformed and
+    /// mismatched requests are still charged to the grant that sent them.
+    pub fn check_binding(&self, presented: &Binding) -> Result<(), McpError> {
+        if &self.binding == presented {
+            Ok(())
+        } else {
+            Err(McpError::new(
+                ErrorCode::BindingMismatch,
+                "The request does not match the admitted binding",
+            ))
+        }
+    }
+
     pub fn settle(mut self, actual_bytes: u64) {
         self.grants
             .settle(&self.digest, self.reserved, actual_bytes);
@@ -291,8 +305,16 @@ impl Grants {
     pub fn admit(
         &self,
         token: &str,
-        binding: &Binding,
         capability: Capability,
+        now: Instant,
+    ) -> Result<Admission<'_>, McpError> {
+        self.reserve(token, Some(capability), now)
+    }
+
+    fn reserve(
+        &self,
+        token: &str,
+        capability: Option<Capability>,
         now: Instant,
     ) -> Result<Admission<'_>, McpError> {
         let key = digest(token);
@@ -301,24 +323,21 @@ impl Grants {
         if grant.revoked || now >= grant.expires_at {
             return Err(unauthorized());
         }
-        if &grant.binding != binding {
-            return Err(McpError::new(
-                ErrorCode::BindingMismatch,
-                "The request does not match the admitted binding",
-            ));
-        }
-        if !grant.capabilities.contains(&capability) {
-            return Err(McpError::new(
-                ErrorCode::Forbidden,
-                "The grant does not carry this capability",
-            ));
-        }
-        // Enforced here as well as at issuance, so an inconsistent policy cannot widen disclosure.
-        if capability.needs_source_approval() && !grant.source_approved {
-            return Err(McpError::new(
-                ErrorCode::Forbidden,
-                "The grant does not approve source disclosure",
-            ));
+        if let Some(capability) = capability {
+            if !grant.capabilities.contains(&capability) {
+                return Err(McpError::new(
+                    ErrorCode::Forbidden,
+                    "The grant does not carry this capability",
+                ));
+            }
+            // Enforced here as well as at issuance, so an inconsistent policy cannot widen
+            // disclosure.
+            if capability.needs_source_approval() && !grant.source_approved {
+                return Err(McpError::new(
+                    ErrorCode::Forbidden,
+                    "The grant does not approve source disclosure",
+                ));
+            }
         }
         if grant.in_flight >= MAX_CONCURRENT_READS {
             return Err(McpError::new(
@@ -356,9 +375,17 @@ impl Grants {
             grant_id: grant.grant_id.clone(),
             admitted_revision: grant.admitted_revision,
             max_response_bytes: reserved,
+            binding: grant.binding.clone(),
             reserved,
             settled: false,
         })
+    }
+
+    /// Admit a request that carries no capability, so an authenticated error on an unrecognized
+    /// tool is still charged. Ordinary error traffic must not be free merely because it names a
+    /// route that does not exist.
+    pub fn admit_any(&self, token: &str, now: Instant) -> Result<Admission<'_>, McpError> {
+        self.reserve(token, None, now)
     }
 
     fn settle(&self, key: &[u8; 32], reserved: u64, actual: u64) {
@@ -501,17 +528,11 @@ mod tests {
         );
         let now = Instant::now();
         for capability in [Capability::Inspect, Capability::ReadSource] {
-            let err = grants
-                .admit(token, &binding(), capability, now)
-                .unwrap_err();
+            let err = grants.admit(token, capability, now).unwrap_err();
             assert_eq!(err.code, ErrorCode::Forbidden);
         }
         // Structural capabilities on the same grant still work.
-        assert!(
-            grants
-                .admit(token, &binding(), Capability::FindSymbols, now)
-                .is_ok()
-        );
+        assert!(grants.admit(token, Capability::FindSymbols, now).is_ok());
     }
 
     #[test]
@@ -521,7 +542,7 @@ mod tests {
         let now = Instant::now();
         assert_eq!(
             grants
-                .admit("bgp_nope", &binding(), Capability::WorkspaceDescribe, now)
+                .admit("bgp_nope", Capability::WorkspaceDescribe, now)
                 .unwrap_err()
                 .code,
             ErrorCode::Unauthorized
@@ -531,7 +552,6 @@ mod tests {
             grants
                 .admit(
                     &issued.token,
-                    &binding(),
                     Capability::WorkspaceDescribe,
                     now + Duration::from_secs(MAX_TTL_SECONDS + 1)
                 )
@@ -542,12 +562,7 @@ mod tests {
         grants.revoke(&issued.grant_id);
         assert_eq!(
             grants
-                .admit(
-                    &issued.token,
-                    &binding(),
-                    Capability::WorkspaceDescribe,
-                    now
-                )
+                .admit(&issued.token, Capability::WorkspaceDescribe, now)
                 .unwrap_err()
                 .code,
             ErrorCode::Unauthorized
@@ -562,25 +577,23 @@ mod tests {
     }
 
     #[test]
-    fn a_different_binding_is_refused() {
+    fn a_different_binding_is_refused_after_admission() {
         let grants = Grants::new();
         let issued = grants.issue(request(&all(), true), Instant::now()).unwrap();
         let other = Binding {
             daemon_instance_id: "daemon".into(),
             store_generation: "rotated".into(),
         };
+        // Admission succeeds and reserves, so a mismatched request is still charged to its grant;
+        // the binding is checked once the body has been parsed.
+        let admission = grants
+            .admit(&issued.token, Capability::WorkspaceDescribe, Instant::now())
+            .unwrap();
         assert_eq!(
-            grants
-                .admit(
-                    &issued.token,
-                    &other,
-                    Capability::WorkspaceDescribe,
-                    Instant::now()
-                )
-                .unwrap_err()
-                .code,
+            admission.check_binding(&other).unwrap_err().code,
             ErrorCode::BindingMismatch
         );
+        assert!(admission.check_binding(&binding()).is_ok());
     }
 
     #[test]
@@ -594,12 +607,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             grants
-                .admit(
-                    &issued.token,
-                    &binding(),
-                    Capability::FindSymbols,
-                    Instant::now()
-                )
+                .admit(&issued.token, Capability::FindSymbols, Instant::now())
                 .unwrap_err()
                 .code,
             ErrorCode::Forbidden
@@ -617,23 +625,13 @@ mod tests {
             // Dropped without settle, as a cancelled request would be.
             drop(
                 grants
-                    .admit(
-                        &issued.token,
-                        &binding(),
-                        Capability::WorkspaceDescribe,
-                        now,
-                    )
+                    .admit(&issued.token, Capability::WorkspaceDescribe, now)
                     .unwrap(),
             );
         }
         assert_eq!(
             grants
-                .admit(
-                    &issued.token,
-                    &binding(),
-                    Capability::WorkspaceDescribe,
-                    now
-                )
+                .admit(&issued.token, Capability::WorkspaceDescribe, now)
                 .unwrap_err()
                 .code,
             ErrorCode::BudgetExhausted
@@ -648,22 +646,12 @@ mod tests {
         let issued = grants.issue(small, Instant::now()).unwrap();
         let now = Instant::now();
         let first = grants
-            .admit(
-                &issued.token,
-                &binding(),
-                Capability::WorkspaceDescribe,
-                now,
-            )
+            .admit(&issued.token, Capability::WorkspaceDescribe, now)
             .unwrap();
         // The whole ceiling is reserved by the in-flight request.
         assert_eq!(
             grants
-                .admit(
-                    &issued.token,
-                    &binding(),
-                    Capability::WorkspaceDescribe,
-                    now
-                )
+                .admit(&issued.token, Capability::WorkspaceDescribe, now)
                 .unwrap_err()
                 .code,
             ErrorCode::BudgetExhausted
@@ -672,12 +660,7 @@ mod tests {
         // capped at what remains rather than refused.
         first.settle(16);
         let next = grants
-            .admit(
-                &issued.token,
-                &binding(),
-                Capability::WorkspaceDescribe,
-                now,
-            )
+            .admit(&issued.token, Capability::WorkspaceDescribe, now)
             .unwrap();
         assert_eq!(next.max_response_bytes, MAX_RESPONSE_BYTES - 16);
     }
@@ -691,23 +674,13 @@ mod tests {
         for _ in 0..MAX_CONCURRENT_READS {
             held.push(
                 grants
-                    .admit(
-                        &issued.token,
-                        &binding(),
-                        Capability::WorkspaceDescribe,
-                        now,
-                    )
+                    .admit(&issued.token, Capability::WorkspaceDescribe, now)
                     .unwrap(),
             );
         }
         assert_eq!(
             grants
-                .admit(
-                    &issued.token,
-                    &binding(),
-                    Capability::WorkspaceDescribe,
-                    now
-                )
+                .admit(&issued.token, Capability::WorkspaceDescribe, now)
                 .unwrap_err()
                 .code,
             ErrorCode::TooManyRequests
@@ -715,13 +688,27 @@ mod tests {
         held.clear();
         assert!(
             grants
-                .admit(
-                    &issued.token,
-                    &binding(),
-                    Capability::WorkspaceDescribe,
-                    now
-                )
+                .admit(&issued.token, Capability::WorkspaceDescribe, now)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_unknown_tool_still_spends_budget() {
+        let grants = Grants::new();
+        let mut small = request(&[Capability::WorkspaceDescribe], false);
+        small.limits.max_requests = 1;
+        let issued = grants.issue(small, Instant::now()).unwrap();
+        let now = Instant::now();
+
+        // No capability is named, but the request is authenticated, so it is charged.
+        drop(grants.admit_any(&issued.token, now).unwrap());
+        assert_eq!(
+            grants
+                .admit(&issued.token, Capability::WorkspaceDescribe, now)
+                .unwrap_err()
+                .code,
+            ErrorCode::BudgetExhausted
         );
     }
 
@@ -738,7 +725,6 @@ mod tests {
             grants
                 .admit(
                     &issued.grant_id,
-                    &binding(),
                     Capability::WorkspaceDescribe,
                     Instant::now()
                 )

@@ -356,3 +356,60 @@ async fn a_latched_binding_reports_an_unavailable_store_not_a_mismatch() {
     let (code, _) = owner(&app, "GET", "/api/mcp-pilot/binding", Value::Null).await;
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn issuance_after_observed_invalidation_creates_no_token() {
+    let (dir, store, app) = setup();
+    publish(&store, Some(0));
+    let (_, discovery) = owner(&app, "GET", "/api/mcp-pilot/binding", Value::Null).await;
+
+    // Another request observes the cache is gone and latches the binding.
+    replace_with_new_inode(&dir.path().join("state"), "cache.db");
+    let (code, _) = owner(&app, "GET", "/api/mcp-pilot/binding", Value::Null).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+
+    let (code, body) = owner(
+        &app,
+        "POST",
+        "/api/mcp-pilot/grants",
+        issue_body(&discovery["binding"], 1, json!(ALL), true),
+    )
+    .await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        body["token"].is_null(),
+        "no credential may be minted after observed invalidation"
+    );
+}
+
+#[tokio::test]
+async fn issuance_reflects_a_publication_that_lands_before_the_grant_is_created() {
+    let (_d, store, app) = setup();
+    publish(&store, Some(0));
+    let (_, discovery) = owner(&app, "GET", "/api/mcp-pilot/binding", Value::Null).await;
+
+    // The owner republishes after discovery reported revision 1.
+    publish(&store, Some(1));
+
+    let (code, body) = owner(
+        &app,
+        "POST",
+        "/api/mcp-pilot/grants",
+        issue_body(&discovery["binding"], 1, json!(ALL), true),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "revision_conflict");
+    assert!(body["token"].is_null());
+
+    // Issuing against the current revision succeeds.
+    let (code, body) = owner(
+        &app,
+        "POST",
+        "/api/mcp-pilot/grants",
+        issue_body(&discovery["binding"], 2, json!(ALL), true),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED);
+    assert_eq!(body["admittedRevision"], 2);
+}
