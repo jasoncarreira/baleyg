@@ -19,15 +19,24 @@ title and body become untrusted story input.
 - An inherited `GH_TOKEN` for `jasoncarreira` when the factory reaches an identity or publication gate.
 - `FACTORY_PUBLISHING_IDENTITY=jasoncarreira` in the environment before starting a fresh run.
 
-Before a publishing-capable run, verify the inherited token without printing it:
+Before launching Prime Agent, fail closed on a missing token, bind Git transport to the same inherited
+token in memory, and verify its GitHub identity without printing the credential:
 
 ```sh
+if [ -z "${GH_TOKEN:-}" ]; then
+  printf '%s\n' 'GH_TOKEN must be inherited and nonempty' >&2
+  exit 1
+fi
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper \
+  GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
 export FACTORY_PUBLISHING_IDENTITY=jasoncarreira
 gh api --method GET /user --jq .login
 ```
 
-The command must print `jasoncarreira`. Never commit `GH_TOKEN`, derive the declared publishing identity
-from the active credential, or put credentials in `.factory.json`.
+The command must print `jasoncarreira`. Keep this environment on the Prime Agent process so guarded
+`gh` operations and package-owned `git push` use the same identity. Do not run persistent
+`gh auth setup-git`. Never commit `GH_TOKEN`, derive the declared publishing identity from the active
+credential, or put credentials in `.factory.json`.
 
 The publishing identity is deliberately not stored in `.factory.json`. Feature Factory records the
 inherited declaration in the run and compares it with the authenticated GitHub login before external
@@ -45,9 +54,12 @@ The factory creates a private sandbox under `.factory-sandboxes/`, preserves its
 `.factory/`, decomposes the approved issue into tested slices, and creates a draft PR after all gates
 pass. Both directories are ignored by the tracked root `.gitignore`; they must never be committed.
 
-Issue intake reads the issue body once when the run is created. Put requirement corrections in the
-body, not comments. Resume is for transient external blockers; a changed requirement needs a deliberate
-fresh run so the story and plan are regenerated.
+Issue intake reads the issue body once when the run is created. A canonical-looking issue reference
+that cannot be read fails the launch; it does not fall back to free text. Put requirement corrections in
+the body, not comments. Resume is for transient external blockers. For changed requirements, preserve
+anything worth keeping, deliberately remove the retained deterministic sandbox, and launch the issue
+again so the story and plan are regenerated; invoking `/feature #123` again without removal resumes the
+old manifest and story.
 
 A good factory issue contains:
 
