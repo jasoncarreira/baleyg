@@ -10,6 +10,8 @@ __pycache__/
 
 /target/
 /.baleyg/
+/.factory-sandboxes/
+.factory/
 /.pre-git-archive/
 *.db
 *.db-shm
