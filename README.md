@@ -84,6 +84,13 @@ The browser client is embedded in the executable. Rebuild after editing `web/`.
 Tests are offline and use temporary workspaces; no provider credentials or inference is used.
 The existing selection-experiment budget is closed and is not changed by this implementation.
 
+## Feature Factory
+
+Repository features can be driven from GitHub Issues through Feature Factory. The tracked configuration
+resolves issue numbers, `#number` references, and canonical issue URLs in `jasoncarreira/baleyg`.
+See [Feature Factory operations](docs/feature-factory.md) for prerequisites, run invocation, gates, and
+issue-writing guidance.
+
 ## Repository layout
 
 - `src/`, `web/`, `runtime/`: daemon, browser and ACP answer adapter.
