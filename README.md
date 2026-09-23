@@ -30,8 +30,10 @@ For the existing feature-factory snapshot with semantic resolution, see
 State defaults to a per-workspace OS application-data directory **outside the repository**.
 Use `--state-dir /path/to/state` to override it. A state directory belongs to one canonical
 workspace. Indexing never runs package scripts, installs source dependencies, or edits source.
-The accepted design moves the disposable index into each checkout at `.baleyg/index.db` while
-tokens, ledgers and durable notes stay outside it; see [local topology](docs/local-topology.md).
+The accepted direction moves the disposable index into each checkout at `.baleyg/index.db` while
+tokens, ledgers and durable notes stay outside it. `--state-dir` will then name durable and secret
+state only and must be outside the workspace; existing in-tree state directories migrate through an
+explicit command. See [local topology](docs/local-topology.md#storage-layout).
 
 ## What works
 
@@ -58,7 +60,7 @@ Java/Python indexing never runs Gradle, Maven, Python imports, decorators or pac
 
 ## Planned agent and semantic integration
 
-The accepted design supports agents running directly in a terminal (including terminal tabs in
+The accepted direction supports agents running directly in a terminal (including terminal tabs in
 Baleyg or optional Herdr panes), and agents connected through ACP, primarily Mimir. Both use the
 same portable MCP tools. MCP, general coding-agent ACP sessions and embedded terminals are
 **not implemented yet**; the existing one-shot ACP answer feature is separate.
@@ -144,5 +146,5 @@ per-checkout stdio MCP and multi-language SCIP import, and separately gated snap
 search, diagram artifacts and embedded terminal/ACP integration. Continue static sequence coverage
 and library adapters beyond Rust/Cargo; source-backed provider validation still requires authorization
 and working authentication.
-The local literal preview does not understand questions. TypeScript parsing, file watching (accepted design, not built),
+The local literal preview does not understand questions. TypeScript parsing, file watching (accepted direction, not built),
 terminals, React/Tauri and database diagrams remain outside the current implementation.

@@ -1,27 +1,27 @@
 # MCP read-only contract
 
-Status: **PROPOSED DESIGN — not implemented**. This contract defines the agent-facing MCP surface
-for the [local topology](local-topology.md). It supersedes the earlier grant-based pilot contract:
-owner-issued grants, limited principals, budgets, enrollment latching, grant handoff files and
-HTTP tool routes are removed. Stage 1 of [#8](https://github.com/jasoncarreira/baleyg/issues/8)
-ratifies the final text, including the exact MCP specification revision it binds to.
+Status: **direction accepted by the owner (2026-09-23); mechanics proposed until Stage 1 ratifies
+them**, including the exact MCP specification revision this contract binds to. It defines the
+agent-facing MCP surface for the [local topology](local-topology.md) and supersedes the earlier
+grant-based pilot contract: owner-issued grants, limited principals, budgets, enrollment latching,
+grant handoff files and HTTP tool routes are removed.
 
 ## Boundary
 
 - `baleyg mcp` is a stdio MCP server launched by an agent client. It serves exactly one workspace,
   resolved from its working directory, for its whole lifetime. It opens no network listener.
-- It reads committed snapshots of `<root>/.baleyg/index.db`. It may also become the index's writer
-  for native refresh (see [local topology](local-topology.md#single-writer)); that role never
-  changes what tools can do.
-- Tools read only cached source and indexed evidence. No tool indexes on request, runs a semantic
-  producer, builds, downloads, writes durable data, calls a provider, executes repository code,
-  opens a terminal, reads the live working tree, or selects another workspace.
+- It reads committed snapshots of the workspace's index, found through the locator
+  ([local topology](local-topology.md#locator-and-fallback)). It may also be the watcher leader and
+  may publish native refresh; neither role changes what tools can do.
+- Tools read only cached source and indexed evidence. No tool triggers indexing, runs a semantic
+  producer, builds, downloads, writes durable data, calls a provider, executes repository code, opens
+  a terminal, reads the live working tree, or selects another workspace.
 - The first catalog has exactly four tools: `baleyg_workspace_describe`, `baleyg_find_symbols`,
   `baleyg_inspect`, `baleyg_read_source`. Hierarchy, usages, type-hierarchy and coverage views are
   added to `baleyg_inspect` as later stages ratify their schemas.
 
-Direct terminal agents, agents in Herdr panes, and agents reached through ACP all launch or are
-configured with the same server and see the same catalog. Illustrative client configuration:
+Direct terminal agents, agents in Herdr panes, and agents reached through ACP all use the same
+server and catalog. Illustrative client configuration:
 
 ```json
 { "mcpServers": { "baleyg": { "command": "baleyg", "args": ["mcp"] } } }
@@ -36,31 +36,55 @@ the proposed Mimir provider extension, and is outside this contract.
   `NOTE_EXIT`). Never daemonize, never fork a long-lived child, never outlive the client.
 - Stdout carries only MCP messages. Diagnostics go to stderr, with no source text or paths outside
   the workspace.
-- Startup with no index: if the process becomes the writer, it runs an initial native index and
-  reports `indexing` from describe until the first revision is published. Otherwise describe reports
-  `no_published_index` and evidence tools fail with that code.
+- **Launch-time indexing.** If no revision is published, the process schedules a native index when
+  it starts, on a background thread. This belongs to process start, not to any tool call. MCP
+  initialization and `tools/list` answer immediately. Describe reports `indexing` with progress;
+  evidence tools return `no_published_index` until the first revision lands.
 - A client restart simply starts a new process. There is no credential to consume or reissue.
 
 ## Evidence basis and revision pins
 
-`evidenceBasis` is `{indexGeneration, indexRevision}`. `indexGeneration` is created with the index
-and changes whenever the index is rebuilt from nothing, so equal revision numbers from different
+`evidenceBasis` is `{indexGeneration, indexRevision}`. The generation is bound to the index file's
+identity and rotates after a copy, restore or replacement
+([local topology](local-topology.md#index-identity)), so equal revision numbers from different
 indexes never match.
 
 Describe takes no revision and reports the current basis. Every other tool requires
-`expectedRevision` (integer > 0) and `indexGeneration`. Revision and evidence are read in one SQLite
-read transaction. Pin validation follows the revision churn rule in
-[local topology](local-topology.md#revision-churn):
+`indexGeneration` and `expectedRevision` (integer > 0). Revision and evidence are read in one SQLite
+read transaction, after the process has checked that its open database is still the file the locator
+names. A pin equal to the current revision is always answered. A pin to an older revision is
+answered only under the per-operation rules of
+[revision compatibility](local-topology.md#revision-compatibility):
 
-- Same generation, pinned revision current: answer normally.
-- Same generation, pinned revision older but within the retained change log, and no path the answer
-  read changed since: answer from the current revision, with `evidenceBasis` set to the current
-  revision and `compatibleWith` set to the pinned revision.
-- Otherwise: `revision_conflict` carrying the current basis. The client re-queries. A conflict is not
-  a request to reindex.
+| Tool / view | Older pin honoured when |
+| --- | --- |
+| `baleyg_read_source` | That path's content hash is unchanged since the pin |
+| `baleyg_inspect`, `view: declaration` | The declaration exists and its path is unchanged since the pin |
+| `baleyg_inspect`, `view: outgoing_calls` | Never |
+| `baleyg_find_symbols` | Never |
+| Any result that would be `not_found` | Never |
 
-Semantic facts carry their own basis label. Facts reused across an edit are reported as possibly
-stale with the revision and inputs they were derived from; they are never reported as fresh.
+An honoured older pin is answered from the current revision, with `evidenceBasis` set to the current
+revision and `compatibleWith` set to the pinned one. Every other stale pin fails with
+`revision_conflict` carrying the current basis; the client re-queries. A conflict is not a request to
+reindex.
+
+## Semantic freshness in results
+
+Every evidence item that carries semantic information reports where it came from. Stage 1 fixes the
+exact field schemas; these fields are required:
+
+- `evidenceTier`: `syntax` or `semantic`.
+- `semanticBasis`: producer and profile identity, artifact hash, the document content hash the fact
+  was derived from, and the revision at which it was imported. `null` for syntax-only items.
+- `freshness`: `fresh`, `possiblyStale`, `stale` or `unavailable`.
+- `staleBecause`: machine-readable reasons, such as `documentChanged`, `referencedDocumentChanged`,
+  `exportSurfaceChanged`, `configChanged`, `newCandidateDeclaration`. Empty when fresh.
+- `disposition` for bindings and references: `resolved`, `external`, `ambiguous`, `unresolved`,
+  `unsupported`, `dynamic` or `declarationOnly`, never promoted by freshness.
+
+Describe reports coverage and freshness per producer, language, source set and document summary, not
+one global flag. A result that mixes fresh and possibly-stale facts says so per item.
 
 ## Tools
 
@@ -69,9 +93,9 @@ may declare read-only behaviour, but they are hints, not permissions.
 
 | Tool | Additional input | Output data |
 | --- | --- | --- |
-| `baleyg_workspace_describe` | None | Workspace label (not an absolute path), current basis, index state (`ready`, `indexing`, `no_published_index`), per-language extraction tier and semantic coverage, tool and schema versions, limits |
-| `baleyg_find_symbols` | `indexGeneration`, `expectedRevision`, `query` (literal name/ID substring, 1–256 UTF-8 bytes), optional `limit` (default 20, 1–50) | Symbol summaries: original ID, name, kind, relative path, recorded range, certainty; no source body |
-| `baleyg_inspect` | `indexGeneration`, `expectedRevision`, `symbolId` (1–8192 bytes), `view` (`declaration` or `outgoing_calls`) | Declaration metadata, or depth-one static calls with original call/target IDs and ranges, resolution labels and bounded literal `calleeText`; max 50 calls, no recursive expansion |
+| `baleyg_workspace_describe` | None | Workspace label (not an absolute path), current basis, index state (`ready`, `indexing` with progress, `no_published_index`, `store_unavailable`), per-language extraction tier, semantic coverage and freshness, tool and schema versions, limits |
+| `baleyg_find_symbols` | `indexGeneration`, `expectedRevision`, `query` (literal name/ID substring, 1–256 UTF-8 bytes), optional `limit` (default 20, 1–50) | Symbol summaries: original ID, name, kind, relative path, recorded range, certainty, freshness fields; no source body |
+| `baleyg_inspect` | `indexGeneration`, `expectedRevision`, `symbolId` (1–8192 bytes), `view` (`declaration` or `outgoing_calls`) | Declaration metadata, or depth-one static calls with original call/target IDs and ranges, disposition and freshness fields, and bounded literal `calleeText`; max 50 calls, no recursive expansion |
 | `baleyg_read_source` | `indexGeneration`, `expectedRevision`, `path`, `startLine`, `endLine` | Cached text only, file content hash, exact returned line/byte range; max 200 lines and 16 KiB text |
 
 Source paths are validated relative indexed paths: no absolute path, backslash, colon, NUL, empty,
@@ -111,8 +135,10 @@ Success envelope:
 
 16 KiB tool request, 64 KiB complete response (including error and metadata envelopes), 16 KiB
 source text, 5-second operation deadline, and a small per-process concurrency cap. Over-cap requested
-limits are rejected, not silently expanded. There are no lifetime request or byte budgets: the client
-that launched the process owns its own usage policy.
+limits are rejected, not silently expanded. There are no per-session request or byte budgets: the
+authority model is the OS user and the whole checkout, and the launching client owns its usage policy.
+Per-call limits do not bound aggregate resource use across many `baleyg mcp` processes run by the
+same user.
 
 ## Errors
 
@@ -123,13 +149,13 @@ protocol errors. Never expose SQL, absolute paths outside the workspace, or sour
 | Code | Meaning / action |
 | --- | --- |
 | `invalid_request`, `range_too_large` | Missing pin, unknown fields, malformed path/range, exceeded input limits; fix the request |
-| `revision_conflict` | Pin is from another generation, too old, or its inputs changed; carries the current basis; re-query |
-| `no_published_index` | No revision published yet; retry after indexing completes |
+| `revision_conflict` | Pin is from another generation, outside the retained window, or not honourable for this operation; carries the current basis; re-query |
+| `no_published_index` | No revision published yet (for example, launch-time indexing is running); retryable |
 | `not_found` | Missing symbol or cached path at the current basis; never a live-read fallback |
 | `body_too_large` | Request exceeds its byte limit |
 | `too_many_requests` | Concurrency cap reached; retryable |
 | `deadline_exceeded` | Bounded work cancelled; no partial evidence |
-| `store_unavailable` | Index missing, unreadable or unsupported schema; describe explains; no repair from a tool call |
+| `store_unavailable` | Index missing, unreadable, refused by safe-open rules, awaiting generation rotation after a copy, or of an unsupported schema; describe explains; no repair from a tool call |
 
 ## Cancellation
 
@@ -154,23 +180,37 @@ Required future tests, using fixtures and a synthetic MCP client; no model or pr
 builds of inspected projects, no repository commands.
 
 1. **Happy path:** describe -> find -> inspect -> read_source returns matching basis and hashes with
-   uncertainty preserved, from a direct-terminal client and from a fixture representing an ACP-side
-   bridge, with identical schemas.
+   uncertainty and freshness preserved, from a direct-terminal client and from a fixture representing
+   an ACP-side bridge, with identical schemas.
 2. **Workspace resolution:** launched in a nested directory, a worktree, and a non-Git root, the
    server serves exactly the enclosing workspace. Two worktrees with identical paths and symbol IDs
    never see each other's evidence. No tool argument can change the workspace.
 3. **Lifecycle:** stdin EOF, `kill -9` of the client, and parent death each end the server with no
-   surviving process. A client restart works without any owner action. Stdout stays valid MCP.
-4. **Revision churn:** a pin whose inputs are unchanged is answered with `compatibleWith`; a pin whose
-   inputs changed, a pin outside the retained window, and a pin from a rebuilt index each conflict.
-   Evidence is never mixed across revisions.
-5. **Writer interaction:** readers keep answering while the writer publishes deltas; killing the
-   writer lets another process take over and catch up; no two processes publish concurrently.
-6. **No side effects:** tool calls start no producer, build, download, provider call, or durable write,
-   and never read the live working tree. Index, provider and artifact counters stay zero for tools.
-7. **Bounds:** malformed paths, unknown fields, oversized literals/ranges/lines and responses fail or
-   report exact truncation. Capped results are never reported complete.
-8. **Cancellation and deadlines:** a cancelled or timed-out read emits nothing afterwards and starts no
-   other work.
-9. **Placement hygiene:** `.baleyg/` contains no token, ledger or durable view/annotation data, and is
-   ignored by Git and ripgrep without changes to the repository's own ignore files.
+   surviving process. A client restart works without owner action. Stdout stays valid MCP.
+4. **Launch-time indexing:** with no index, initialization and `tools/list` answer within their
+   deadlines while indexing runs; describe reports progress; evidence tools return
+   `no_published_index`, then succeed after the first revision.
+5. **Revision compatibility:** for each row of the compatibility table, an older pin is honoured or
+   conflicts exactly as specified, including deleted and renamed results, `not_found`, a new exact
+   symbol displacing an older result, and an unchanged call whose target changed because another file
+   added a declaration. Evidence is never mixed across revisions.
+6. **Identity:** copying, restoring or replacing the index file rotates the generation before any new
+   publish; old pins conflict. A live `git clean -fdx` while servers run makes them reopen through the
+   locator; no reader keeps serving, and no writer publishes into, an unlinked database. A same-
+   filesystem rename of the checkout keeps the generation.
+7. **Safe open:** a `.baleyg` that is a symlink, contains symlinks, is hard-linked, is owned by another
+   user, has permissive modes, or is tracked by Git is refused and falls back to the out-of-tree index;
+   no write follows a link.
+8. **Semantic freshness:** after a native edit, the changed document is syntax-only, and referencing,
+   importing and newly-resolvable documents report `possiblyStale` with the right `staleBecause`;
+   a configuration change stales the whole source set.
+9. **Concurrency:** readers keep answering while other processes publish; killing the watcher leader
+   lets another process take over and catch up; an explicit index request completes while a
+   long-running agent session holds leadership.
+10. **No side effects:** tool calls start no indexing, producer, build, download, provider call, or
+    durable write, and never read the live working tree.
+11. **Bounds, cancellation, deadlines:** malformed paths, unknown fields, oversized literals, ranges,
+    lines and responses fail or report exact truncation; capped results are never reported complete;
+    a cancelled or timed-out read emits nothing afterwards.
+12. **Placement hygiene:** `.baleyg/` contains no token, ledger or durable view/annotation data, and is
+    ignored by Git and ripgrep without changes to the repository's own ignore files.

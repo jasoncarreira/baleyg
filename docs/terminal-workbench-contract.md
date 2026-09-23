@@ -26,7 +26,7 @@ chosen interaction mode; do not duplicate a runtime just to make an ACP transcri
 
 Use a real PTY backend and local terminal renderer (candidate: Rust `portable-pty` and xterm.js).
 Choose/pin dependencies during implementation. A terminal ID, project/worktree binding, ownership,
-launch configuration and read/input permissions are independent from an MCP grant or index revision.
+launch configuration and read/input permissions are independent from MCP access and index revision.
 
 - Launch only from explicit user action and a trusted command/profile. No model-supplied automatic
   launch string, source-selection side effect, auto-start on deep link, or provider retry.
@@ -43,8 +43,10 @@ launch configuration and read/input permissions are independent from an MCP gran
 - Closing a tab/disconnecting the browser detaches by default; terminating an owned process requires
   a separate action. Define daemon restart semantics honestly—durable transcript metadata alone does
   not preserve a PTY process. Do not claim kill/revoke always stops detached descendants.
-- Source edits made by an agent do not silently replace the cached index. Show index freshness and
-  require the existing explicit reindex operation until a separate watcher policy is implemented.
+- Show index freshness per checkout. Agent source edits reach the cached index only through
+  published revisions; the accepted watcher design refreshes native evidence automatically
+  ([local topology](local-topology.md#watcher-leadership-and-publication)), and until it is
+  implemented the explicit reindex operation remains the only refresh.
 
 ## Optional Herdr attachment
 

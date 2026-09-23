@@ -1,6 +1,6 @@
 # Proposed agent integration — containers
 
-Proposal only. The stdio MCP server, per-checkout indexes, writer election, file watcher, registry,
+Proposal only. The stdio MCP server, per-checkout indexes, watcher leadership, file watcher, registry,
 Mimir Baleyg provider and artifact service shown here must be implemented. Existing Hands v1 does not
 accept arbitrary tools. This is the target architecture: artifact storage, embedded terminal
 streaming and ACP client sessions are separate slices. See the [local topology](../local-topology.md).
@@ -18,7 +18,7 @@ C4Container
     Container(mcp, "baleyg mcp", "stdio MCP, one per agent session", "Serves the checkout it was launched in; read-only tools")
     Container(core, "Browser daemon", "Rust", "Serves the workbench; stores artifacts")
     ContainerDb(registry, "Project registry", "Optional local durable store", "Lists checkouts for the browser picker; not needed by agents")
-    ContainerDb(stores, "Per-checkout index", "SQLite at .baleyg/index.db", "Disposable evidence; one lock-elected writer")
+    ContainerDb(stores, "Per-checkout index", "SQLite at .baleyg/index.db", "Disposable evidence; one watcher leader, CAS publication")
     ContainerDb(durable, "Durable state", "SQLite outside the checkout", "Views, notes, artifacts, tokens, ledgers")
     ContainerDb(facts, "Shared fact cache", "Git common dir or user cache", "Per-file extraction by content hash")
   }

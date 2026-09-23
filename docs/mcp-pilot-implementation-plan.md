@@ -5,9 +5,11 @@
 > design is the [local topology](local-topology.md) and [stdio MCP contract](mcp-readonly-pilot-contract.md),
 > sequenced by [#8](https://github.com/jasoncarreira/baleyg/issues/8). Kept as history; do not implement from it.
 
-Status: **PLAN — no implementation authorized beyond slice 0**. This sequences the work specified
-by the [read-only pilot contract](mcp-readonly-pilot-contract.md), which remains the normative
-specification and acceptance gate. Where this plan and that contract disagree, the contract wins.
+Status (historical): **PLAN — no implementation authorized beyond slice 0**. This sequenced the work
+specified by the grant-based pilot contract as it stood before 2026-09-23, which was then the
+normative specification. That contract text has since been replaced; the file now at
+`mcp-readonly-pilot-contract.md` is the new stdio contract and is **not** what this plan implements.
+The superseded contract is recoverable from Git history (commit `7122ed4`).
 Nothing here authorizes indexing, provider calls, changes to a running daemon, credential access,
 or execution of an inspected repository.
 

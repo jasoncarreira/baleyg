@@ -1,8 +1,9 @@
 # SCIP beyond JavaScript: staged import and generation plan
 
 > **Update (2026-09-23).** Semantic evidence must now also survive real-time native refresh: per-document
-> basis, stale labelling of documents that reference changed symbols, and whole-basis invalidation on
-> build/config changes. See the [local topology](local-topology.md#real-time-native-refresh).
+> basis and dependencies, conservative possibly-stale labelling (referencing, importing and newly
+> resolvable documents, transitively on export-surface changes), and whole-basis invalidation on
+> build/config changes. See the [local topology](local-topology.md#semantic-freshness-under-native-refresh).
 
 ## Decision and scope
 

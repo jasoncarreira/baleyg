@@ -207,7 +207,7 @@ a mutable global “current project.” Future registry enumeration must itself 
 | `baleyg_read_source` | Bounded cached source range, with hash and exact range |
 
 All reads **except describe** carry `indexGeneration` and `expectedRevision`, validated in one
-transaction-pinned snapshot under the revision churn rule. See the
+transaction-pinned snapshot under the per-operation compatibility rule. See the
 [MCP contract](mcp-readonly-pilot-contract.md) for exact limits and schemas. No hidden navigation,
 diagram, text-search, artifact, live-file, provider or runtime-control tools belong to this slice.
 Tool allowlists and MCP read-only annotations are not a security boundary; the server simply has no
@@ -321,7 +321,7 @@ manifest/hash validation also guards accidental revision reuse.
 ### Phase 1 — per-checkout read-only MCP
 
 Deliver the [local topology](local-topology.md): per-checkout `.baleyg/index.db`, the shared fact
-cache, per-path delta publication, lock-elected writer with real-time native refresh, and
+cache, per-path delta publication, watcher leadership with real-time native refresh, and
 `baleyg mcp` over stdio exposing describe -> find_symbols -> inspect -> read_source. Test with a
 synthetic MCP client across several concurrent worktrees, without Herdr, Mimir, a model or a
 provider. The [MCP contract](mcp-readonly-pilot-contract.md) is the implementation/acceptance gate.

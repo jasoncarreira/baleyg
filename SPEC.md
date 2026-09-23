@@ -1,6 +1,6 @@
 # Baleyg — Architecture Spec
 
-**Status:** implemented Rust daemon and embedded browser with JavaScript/Rust/Java/Python syntax extraction, static sequences and Java/Python class diagrams. JavaScript SCIP import is implemented. Multi-language semantic import, the stdio MCP server, per-checkout indexes with real-time native refresh, coding-agent ACP sessions and diagram artifacts below are accepted design work, not shipped features. The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-23.
+**Status:** implemented Rust daemon and embedded browser with JavaScript/Rust/Java/Python syntax extraction, static sequences and Java/Python class diagrams. JavaScript SCIP import is implemented. Multi-language semantic import, the stdio MCP server, per-checkout indexes with real-time native refresh, coding-agent ACP sessions and diagram artifacts below are accepted direction, not shipped features; mechanics of the index/MCP topology remain proposed until Stage 1 of the semantic-index program ratifies them. The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-23.
 
 **Validation:** The first extraction/storage spike is recorded in
 [docs/research/EXTRACTION-RESULTS.md](docs/research/EXTRACTION-RESULTS.md). It validates a bounded JavaScript
@@ -43,9 +43,10 @@ Sections 4, 6, 8 and 12 are the current agent/semantic integration direction:
   at `<root>/.baleyg/index.db`; a shared per-file fact cache makes new checkouts cheap to index.
   The first catalog is four read-only tools. There are no grants and no agent network listener;
   the boundary is the OS user. See the [local topology](docs/local-topology.md).
-- One process per index is the writer, chosen by an exclusive lock. It keeps syntax evidence
-  current with a file watcher. Native extraction is the only automatic work; it executes no
-  repository code. Snapshot text search, artifact writes and broad agent orchestration are later
+- One process per index leads the file watcher, chosen by a lifetime lock that blocks nothing
+  else. Any Baleyg process publishes through short compare-and-swap transactions, so explicit
+  index requests never wait on an agent session. Native extraction is the only automatic work; it
+  executes no repository code. Snapshot text search, artifact writes and broad agent orchestration are later
   independently tested slices.
 - SCIP is the preferred batch semantic-artifact route, generalized one language at a time.
   LSP/compiler adapters remain possible complementary read/refactoring providers, not a
@@ -175,14 +176,16 @@ The store is split in two, physically:
 
 - **The index** — derived source snapshots, graph and class projections. Deletable,
   rebuilt deterministically, never authoritative. FTS and broader edge kinds are not implemented.
-  Today this is `cache.db` in an out-of-tree state directory. The accepted design moves it to
-  `<root>/.baleyg/index.db` inside each checkout, with a self-ignoring `.gitignore`, because it is
-  disposable and per-checkout (see [local topology](docs/local-topology.md)).
+  Today this is `cache.db` in an out-of-tree state directory. The accepted direction moves it to
+  `<root>/.baleyg/index.db` inside each checkout, with a self-ignoring `.gitignore`, strict
+  safe-open rules and an out-of-tree fallback recorded in a per-user locator, because it is
+  disposable and per-checkout (see [local topology](docs/local-topology.md#storage-layout)).
 - **`workspace.db`** — durable views and annotations today; versioned artifacts, agent
   associations and other proposed records need explicit migrations. References to missing
   symbol IDs become orphans; a cache rebuild does not guarantee automatic reattachment.
   Durable data, tokens and provider ledgers stay out of tree: anything under `.baleyg/` may be
-  removed by `git clean` or copied into a container build context.
+  removed by `git clean` or copied into a container build context. Existing in-tree
+  `--state-dir` setups migrate through an explicit command.
 
 With identical source bytes, pinned extraction tools, semantic-index artifacts and
 database snapshots, deleting the index must reproduce the same normalized semantic
@@ -224,7 +227,8 @@ The core owns Baleyg's stores, query services and UI events. It supervises only 
 that Baleyg explicitly launches, such as a future ACP adapter. It does **not** own every
 agent, shell or Herdr pane associated with a project. `baleyg mcp` processes are owned by the
 agent clients that launch them and exit with those clients; they need no supervisor. The browser
-daemon and any `baleyg mcp` process share each index through SQLite, with one lock-elected writer.
+daemon and any `baleyg mcp` process share each index through SQLite: one watcher leader, and
+short compare-and-swap publish transactions from any of them.
 
 ```mermaid
 flowchart LR
@@ -239,7 +243,7 @@ flowchart LR
   ACP -->|negotiated ACP| HARNESS[Existing harness or Mimir proxy]
   HARNESS -->|same tools via admitted local bridge| MCP
   MCP -->|read-only SQLite snapshots| M
-  MCP -. lock-elected writer: native refresh .-> M
+  MCP -. watcher leader: native refresh .-> M
   CORE -. optional metadata association .-> HM[Herdr adapter]
 ```
 
@@ -432,10 +436,12 @@ malformed, oversized or unsupported artifacts before publication. Do not downloa
 Baleyg or silently retry a build to resolve missing evidence.
 
 Stale semantic evidence must be rejected or downgraded visibly, preserving syntax-only browsing.
-The current system uses explicit full refresh. The accepted design adds a file watcher that refreshes
+The current system uses explicit full refresh. The accepted direction adds a file watcher that refreshes
 **native** evidence per changed file (§7.2). When a file changes, its semantic evidence falls back to
-syntax-only, and semantic facts in files that reference its symbols are labelled stale with their
-basis. A build or configuration change invalidates the whole semantic basis of its source set. The
+syntax-only. Files that reference its symbols, reach it through imports or wildcards, or could now
+resolve to a declaration it added are labelled possibly stale with their basis; an export-surface
+change stales importers transitively. A build or configuration change invalidates the whole semantic
+basis of its source set. Labels are conservative: over-labelling is acceptable. The
 watcher never runs a producer. None of this is implemented yet.
 
 ### 6.3 LSP and compiler APIs remain complementary
@@ -464,7 +470,7 @@ it” is a valid guarantee. Preserve the distinction between evidence, candidate
 
 ### 7.1 Construction
 
-Accepted incremental design below; current publication is explicit full-index rebuild.
+Accepted incremental direction below; current publication is explicit full-index rebuild.
 Three conceptual passes, keyed on source and relevant extraction/configuration hashes.
 
 1. **Discover and hash.** Walk respecting `.gitignore`, or in a Git checkout use `git ls-files -s`
@@ -472,30 +478,34 @@ Three conceptual passes, keyed on source and relevant extraction/configuration h
    table *is* the incrementality story.
 2. **Parse.** tree-sitter per file, in parallel, a pure function of file bytes and
    therefore cacheable by hash. Emits local nodes, unresolved references, call
-   ordinals, control context. Results live in a **shared fact cache** keyed by language,
-   extractor version and content hash, stored in the Git common directory so every worktree of a
-   repository reuses it. A new worktree parses only the files its branch changed.
+   ordinals, control context. Results live in a **shared fact cache** as a path-neutral record
+   keyed by language, extractor version, extraction-context digest and content hash, stored in the
+   Git common directory so every worktree of a repository reuses it. Assembly binds records to paths
+   and derives the existing path-bearing IDs. A new worktree parses only the files its branch changed.
 3. **Enrich.** Ingest admitted semantic artifacts through the appropriate language adapter.
    Syntax-only import/name matching may provide explicitly scoped navigation candidates, not
    resolved dispatch. It must never silently replace missing compiler evidence with a guessed call.
 
 ### 7.2 Maintenance
 
-Watcher, incremental dependency invalidation and indexer scheduling below are accepted design,
+Watcher, incremental dependency invalidation and indexer scheduling below are accepted direction
+with proposed mechanics ([local topology](docs/local-topology.md#watcher-leadership-and-publication)),
 not current behavior or permission to execute producer tools. Production generation requires
 explicit trusted execution policy; automatic producer scheduling stays off.
 
-- **Single writer.** Every process that may publish (browser daemon, `baleyg mcp`) competes for an
-  exclusive lock on the index directory. The holder runs the watcher and publishes; the others
-  read. The kernel releases the lock on exit or crash; the next holder does a catch-up rescan.
+- **Leadership and publication.** A lifetime lock decides which process runs the watcher and
+  blocks nothing else. Every job takes a monotonic epoch, extracts outside any transaction, and
+  publishes in one short transaction that replaces a path only with a newer observation. Explicit
+  index requests and artifact imports publish the same way, never waiting on the leader.
 - **Watcher.** Native FSEvents / inotify through the `notify` crate, about 100–300ms debounce,
   re-hash changed files, re-run pass 2 for those files only, publish a per-path delta. Always
-  exclude `.baleyg/` and `.git/`. Overflow, lost events, watch-limit exhaustion and bulk changes
-  fall back to a full rescan.
-- **Reverse dependencies.** `edge_deps` records which files each resolved edge depended
-  on. When file `F` changes, re-resolve edges whose dependency set includes `F`, plus
-  every unresolved reference inside `F`. Above a threshold of changed files, full
-  re-resolve — branch switches are not worth being clever about.
+  exclude `.baleyg/` and `.git/`. A new leader watches first, scans, then applies buffered events.
+  Overflow, lost events, watch-limit exhaustion and bulk changes fall back to a full rescan;
+  periodic reconciliation catches silently lost events.
+- **Resolution dependencies.** Record the scope/name keys each binding looked up, including
+  lookups that found nothing or several candidates. When a delta adds, removes or renames
+  declarations, re-resolve every binding that depends on an affected key, resolved or not. Above a
+  threshold of changed files, full re-resolve — branch switches are not worth being clever about.
 - **Git awareness.** Store the indexed HEAD sha. On branch switch use
   `git diff --name-status` rather than riding out the watcher storm.
 - **Cancellation over speed.** Every pass must abort cleanly mid-flight; the user will
@@ -506,13 +516,18 @@ explicit trusted execution policy; automatic producer scheduling stays off.
   transaction. Readers pin a WAL read transaction while reading revision metadata and
   graph rows. An `index_rev` column alone does not retain old snapshots. Keep durable
   annotations separately; cross-database atomicity requires its own contract.
-- **Revision churn.** Each revision records the paths it changed. A pinned evidence request is
-  answered from the current revision when none of the paths it read changed since the pin;
-  otherwise it conflicts. Only the current graph is retained.
+- **Revision compatibility.** Each revision records the paths it changed. An older pin is honoured
+  only per operation and conservatively: a cached source read or a single declaration whose path is
+  unchanged. Outgoing calls, symbol search, ranked or global queries and negative results always
+  conflict when stale. Only the current graph is retained.
 - **SCIP scheduling.** Producers run only through the explicit owner workflow, never from the
   watcher or an agent. Surface the age and basis of semantic evidence in the UI and MCP results.
-- **Cleanup.** A removed checkout takes its index with it. The shared fact cache is
-  garbage-collected against surviving workspaces. A machine-wide limit bounds concurrent index jobs.
+- **Identity.** The index generation is bound to the database file's device and inode and rotates
+  after a copy, restore or replacement. Every transaction checks that its open file is still the one
+  the locator names, so a live `git clean` cannot leave a process serving a deleted index.
+- **Cleanup.** A removed checkout takes its index with it. Automatic garbage collection covers derived
+  caches only; durable views, notes, tokens and ledgers are deleted only by an explicit command. A
+  machine-wide limit bounds concurrent index jobs.
 
 ### 7.3 Storage
 
@@ -595,7 +610,7 @@ fake tool calls. `_meta` correlation is not a replacement for a versioned tool s
 The first catalog is `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect` and
 `baleyg_read_source`, served by `baleyg mcp` over stdio. Describe reports the current basis
 `{indexGeneration, indexRevision}`; every evidence read carries a pin, validated under the
-revision churn rule (§7.2). No registry, grep scan, artifact write, shell or on-request index
+per-operation compatibility rule (§7.2). Results report semantic basis and freshness per item. No registry, grep scan, artifact write, shell or on-request index
 operation is part of this path. Snapshot text search gets its own bounded literal-scan design;
 FTS does not exist today.
 
@@ -742,7 +757,7 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 
 | Slice | Runnable acceptance |
 | --- | --- |
-| A. Per-checkout read-only MCP | `baleyg mcp` over stdio in any checkout or worktree; describe/find/inspect/read with revision pins; real-time native refresh by the lock-elected writer; no ACP, Herdr, registry or grants required |
+| A. Per-checkout read-only MCP | `baleyg mcp` over stdio in any checkout or worktree; describe/find/inspect/read with revision pins; real-time native refresh by the watcher leader; no ACP, Herdr, registry or grants required |
 | B. Bounded snapshot text search | Literal scan over cached payloads with separate byte/time/result budgets, cancellation and explicit partial results; no FTS assumption |
 | C. Versioned diagram artifacts | Evidence view or clearly authored draft -> CAS update -> local publish -> user opens deep link; stale source stays honest |
 | D. Unified workbench terminals | Real PTY tab for a user-launched direct agent, the same MCP tools, bounded terminal stream and explicit lifecycle/input permissions |
