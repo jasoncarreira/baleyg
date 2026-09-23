@@ -61,8 +61,9 @@ and moving the directory disconnects it (it is reported, never deleted).
   and recreate the tables in one transaction), so readers holding it open keep a consistent snapshot
   and SQLite's WAL files are never shared between two databases. Only a file SQLite cannot open at all
   is deleted and recreated.
-- `indexGeneration` is a random value created with each index file. Evidence basis is
-  `{indexGeneration, indexRevision}`, so revisions from a rebuilt index never match old ones.
+- `indexGeneration` is a random value set when the index is created and replaced on every rebuild.
+  Evidence basis is `{indexGeneration, indexRevision}`, so revisions from a rebuilt index never match
+  old ones.
 - Change detection is a stat scan (size, mtime, inode) against the index's file table, hashing only
   files whose stat changed, with Git's racy-timestamp rule (re-hash when mtime is not older than the
   previous scan). It uses the existing `ignore`-crate walker and its exclusions.
