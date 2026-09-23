@@ -46,7 +46,8 @@ lives inside a checkout. Token and ledger paths must be outside every workspace 
 state migrations: existing saved views and notes are not carried over, and the owner moves any
 existing in-tree ledger directory by hand, once, with Baleyg stopped.
 
-**Workspace UUID.** Stored at `<git-dir>/baleyg/workspace-id`, where `<git-dir>` is `.git` for a main
+**Workspace UUID.** Created exclusively (the first process to create it wins; others read it) at
+`<git-dir>/baleyg/workspace-id`, where `<git-dir>` is `.git` for a main
 checkout, or the directory a `.git` file points to (linked worktree, submodule, `--separate-git-dir`).
 Moving a checkout keeps its UUID, so its views and notes stay connected; its index is rebuilt at the
 new path, cheaply, from the fact cache. A copy of a checkout keeps the same UUID and shares its views
@@ -56,7 +57,10 @@ and moving the directory disconnects it (it is reported, never deleted).
 ## Index as a cache
 
 - The index records its schema version and extractor version. Any mismatch, or an integrity failure,
-  means delete and rebuild. There is no index migration.
+  means rebuild. There is no index migration. The leader rebuilds **inside the existing file** (drop
+  and recreate the tables in one transaction), so readers holding it open keep a consistent snapshot
+  and SQLite's WAL files are never shared between two databases. Only a file SQLite cannot open at all
+  is deleted and recreated.
 - `indexGeneration` is a random value created with each index file. Evidence basis is
   `{indexGeneration, indexRevision}`, so revisions from a rebuilt index never match old ones.
 - Change detection is a stat scan (size, mtime, inode) against the index's file table, hashing only
