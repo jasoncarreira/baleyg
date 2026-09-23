@@ -304,7 +304,8 @@ Backward compatibility is not required for this change.
 Identity and location are separate fields. Renames and moves of a declaration change its ID;
 annotations on a removed declaration remain visible orphans. Durable anchors also store a hash of the
 declaration's header, so an ordinal that shifts onto a different same-named sibling orphans the
-anchor instead of silently moving it.
+anchor instead of silently moving it; an anchor on a declaration with identical-header siblings
+orphans whenever that sibling group changes.
 
 Illustrative only: node IDs are stable syntax IDs; the SCIP symbol is a separate binding; a measured
 call site keeps its own identity, separate from its declared target and dispatch kind.
@@ -531,8 +532,9 @@ producer tools. Automatic producer scheduling stays off.
   does not match the current source set at import is possibly stale from the start; afterwards,
   freshness is computed at read time against the last surface or configuration change in its source
   set or any source set it depends on.
-- **Cache discipline.** Any schema, extractor or integrity mismatch means delete and rebuild; nothing
-  in the index is migrated or repaired.
+- **Cache discipline.** Any schema, extractor or integrity mismatch means rebuild, inside the existing
+  file with a new generation; the file is deleted and recreated only when SQLite can no longer open or
+  rebuild it, and only while no process holds it open. Nothing in the index is migrated or repaired.
 - **Cleanup.** Automatic for derived state: indexes for vanished or long-unused paths (only when no
   process has them open) and fact-cache entries beyond a size cap are deleted by the leader at most
   daily. Durable records are created only on first write and never deleted automatically; orphaned

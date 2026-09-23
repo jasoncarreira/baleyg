@@ -35,10 +35,12 @@ Baleyg runs no `git` subprocess for discovery or indexing.
 | State | Location | Keyed by | Lifetime |
 | --- | --- | --- | --- |
 | Index (graph, cached source) | `<cache>/indexes/<root-key>/index.db` | Canonical root path | Cache; rebuilt freely |
-| Leader lock and use lock | `<cache>/indexes/<root-key>/leader.lock`, `use.lock` | Canonical root path | Removed with its index |
+| Leader lock | `<cache>/indexes/<root-key>/leader.lock` | Canonical root path | Removed with its index |
+| Index use lock | `<cache>/indexes/<root-key>.lock`, beside the index directory | Canonical root path | Removed last, by the deleter holding it |
 | Explicit index requests | `<cache>/indexes/<root-key>/requests.db` | Canonical root path | Survives index rebuilds |
 | Fact cache | `<cache>/facts.db` | File content | Cache; size-bounded |
 | Durable data (views, notes, future artifacts) | `<data>/workspaces/<record-id>/workspace.db` | Workspace UUID, or `path-<root-key>` outside Git | Durable; created on first write |
+| Durable use lock | `<data>/workspaces/<record-id>.lock`, beside the record directory | Record id | Removed last, by `forget` holding it |
 | Tokens and Jev/ACP ledgers | Explicitly configured paths | — | Durable |
 
 `<cache>` and `<data>` are the fixed per-user cache and data directories from `ProjectDirs` for
@@ -59,8 +61,8 @@ views and notes, which is harmless. Outside Git there is no UUID: the durable re
 
 A durable record directory and `workspace.db` are created only when the first view or note is written,
 so checkouts that never save anything, such as most Feature Factory sandboxes, leave nothing durable
-behind. Every process that writes or deletes durable data holds a lock on the record's `use.lock`:
-shared for writes, exclusive for `baleyg forget`.
+behind. Every process that opens a durable record, to read or write, holds a shared `flock` on the
+record's use lock for as long as it has `workspace.db` open; `baleyg forget` needs it exclusively.
 
 ## Index as a cache
 
@@ -68,7 +70,13 @@ shared for writes, exclusive for `baleyg forget`.
   means rebuild. There is no index migration. The leader rebuilds **inside the existing file** (drop
   and recreate the index tables in one transaction), so readers holding it open keep a consistent
   snapshot. Explicit requests live in `requests.db`, which a rebuild does not touch.
-- **Use lock.** Every process that has the index open holds a shared `flock` on `use.lock`. Deleting
+- **Use locks.** Use locks live *beside* the directory they protect, never inside it, so deleting the
+  directory cannot remove or recreate the lock mid-operation. A deleter holds the lock exclusively for
+  the whole operation, removes the directory, unlinks the lock file last, then releases. Every locker
+  verifies after locking that the path still names the file it locked and retries if not, so a process
+  racing a deletion starts over against fresh state.
+- **Index use lock.** Every process that has the index open holds a shared `flock` on its use lock.
+  Deleting
   or recreating `index.db` (a file SQLite can no longer open or rebuild, or garbage collection)
   requires the exclusive lock, taken non-blocking; a reader that gets `SQLITE_CORRUPT` closes its
   connection, releases its shared lock, and retries after the leader has recreated the file. So no two
@@ -97,9 +105,11 @@ shared for writes, exclusive for `baleyg forget`.
 - **Leader incarnation.** Immediately after locking, the leader writes a fresh random incarnation id
   into `leader.lock`. The index's `reconciled` marker records the incarnation that reconciled it.
   Evidence is served only while the lock is held and the marker's incarnation equals the one in
-  `leader.lock`; a marker left behind by a crashed leader never matches its successor. The remaining
-  window, between a successor taking the lock and writing its id, is bounded like ordinary watcher
-  latency, and the previous leader's evidence was reconciled when it was published.
+  `leader.lock`, so once a successor has written its id, a crashed leader's marker no longer matches.
+  **Accepted window:** between a successor taking the lock and writing its id (a few system calls), a
+  reader may still serve the previous leader's last reconciled revision. That evidence is labelled
+  with its basis and lags the files by no more than ordinary watcher latency does; it is the same
+  guarantee readers have at all times, not an exception to it.
 - **Root identity.** The leader records the root directory's device and inode when it starts, and
   re-checks them before every reconcile and publish; readers re-check before serving. If the path no
   longer names that directory (the checkout moved, or something else now occupies the path), the
@@ -129,8 +139,10 @@ within one revision. SCIP symbols are separate semantic bindings, never node IDs
 Saved views and notes anchor to a declaration ID plus a hash of the declaration's header text (name,
 signature, modifiers). If an ID now names a declaration whose header hash differs, which can happen
 when an earlier same-named sibling is inserted or removed, the anchor orphans rather than silently
-moving to another declaration. Anchors survive body edits and orphan when the declaration is removed,
-renamed, or its header changes.
+moving to another declaration. When same-named siblings have identical headers, the hash cannot tell
+them apart, so an anchor also records how many identical-header siblings existed; if that count
+changes, the anchor orphans. Anchors survive body edits and orphan when the declaration is removed,
+renamed, its header changes, or its identical-header sibling group changes.
 
 ## Re-resolution
 
@@ -172,14 +184,13 @@ differs. There is no change log and no compatibility exception.
 The leader runs garbage collection at most once a day:
 
 - Delete the index directory of any root path that no longer exists, or that has not been opened for
-  30 days, but only after taking that directory's `use.lock` exclusively, non-blocking; if anyone has
-  it open, skip it. Lockers verify after locking that the path still names the locked file, so a
-  process racing the deletion retries against a fresh directory instead of using a deleted one.
+  30 days, but only after taking its index use lock exclusively, non-blocking; if anyone has it open,
+  skip it.
 - Evict fact-cache entries least recently used beyond a size cap.
 - Durable records are never deleted automatically. Empty ones never exist (records are created on
   first write). Records whose checkout can no longer be found are reported by `baleyg gc --report`;
   `baleyg forget <record-id>` deletes one explicitly, after showing what it holds, while holding the
-  record's `use.lock` exclusively. Ledgers are never touched.
+  record's use lock exclusively. Ledgers are never touched.
 
 ## Threat and resource boundary
 
