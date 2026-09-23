@@ -1,7 +1,8 @@
 # Proposed agent integration — containers
 
-Direction accepted by the owner (2026-09-23); mechanics proposed until Stage 1 ratifies them. Not
-implemented. The stdio MCP server, per-checkout indexes, watcher leadership, file watcher, registry,
+Not implemented. The per-checkout index and stdio MCP parts follow the owner-accepted
+[local topology](../local-topology.md), whose mechanics Stage 1 ratifies; the registry, Mimir, Herdr,
+terminal and artifact parts remain proposals with their own later slices. The stdio MCP server, per-checkout indexes, watcher leadership, file watcher, registry,
 Mimir Baleyg provider and artifact service shown here must be implemented. Existing Hands v1 does not
 accept arbitrary tools. This is the target architecture: artifact storage, embedded terminal
 streaming and ACP client sessions are separate slices. See the [local topology](../local-topology.md).
@@ -30,12 +31,12 @@ C4Container
   Rel(agent, mcp, "Launches and calls tools", "MCP stdio")
   Rel(mimirRuntime, proxy, "Requests local tools through existing channel", "ACP tool bridge")
   Rel(proxy, mcp, "Invokes versioned Baleyg capability", "Proposed provider adapter")
-  Rel(mcp, stores, "Reads snapshots; refreshes natively when elected writer", "SQLite")
+  Rel(mcp, stores, "Reads snapshots; publishes native refresh; may lead the watcher", "SQLite")
   Rel(mcp, facts, "Reuses unchanged-file extraction", "Content hash")
   Rel(ui, core, "Queries projects and artifacts", "Authenticated local API")
   Rel(core, ui, "Notifies of available artifact versions", "Proposed metadata event stream")
   Rel(core, registry, "Looks up authorized project bindings", "Local storage")
-  Rel(core, stores, "Reads snapshots; refreshes natively when elected writer", "SQLite")
+  Rel(core, stores, "Reads snapshots; publishes native refresh; may lead the watcher", "SQLite")
   Rel(core, durable, "Persists views, notes and artifacts", "SQLite")
   Rel(core, herdr, "Optionally discovers and reconciles metadata", "Versioned local socket adapter")
 ```

@@ -14,7 +14,7 @@ grant handoff files and HTTP tool routes are removed.
   home and filesystem root refused unless explicit), for its whole lifetime. It opens no network
   listener.
 - It reads committed snapshots of the workspace's index, found through the workspace record
-  ([local topology](local-topology.md#placement-and-overrides)). It may also be the watcher leader and
+  ([local topology](local-topology.md#placement)). It may also be the watcher leader and
   may publish native refresh; neither role changes what tools can do.
 - Tools read only cached source and indexed evidence. No tool triggers indexing, runs a semantic
   producer, builds, downloads, writes durable data, calls a provider, executes repository code, opens
@@ -24,6 +24,8 @@ grant handoff files and HTTP tool routes are removed.
   `outgoing_calls` below, plus `incoming_calls`, `call_paths`, `usages`, `type_hierarchy`,
   `implementations` and `coverage`, whose input and output schemas Stage 1 ratifies from the semantic
   evidence contract. Every view follows the bounds, freshness, error and pin rules in this document.
+  The server first ships with syntax-tier evidence (`evidenceTier: syntax`, `semanticBasis: null`);
+  the semantic stages add semantic evidence to the same views without changing their schemas.
 
 Direct terminal agents, agents in Herdr panes, and agents reached through ACP all use the same
 server and catalog. Illustrative client configuration:
@@ -203,11 +205,14 @@ builds of inspected projects, no repository commands.
    is unchanged; an older pin on every other tool and view conflicts with `currentBasis`, including
    deleted and renamed results, `not_found`, displaced ranked results, and targets changed by another
    file's declaration. Evidence is never mixed across revisions.
-6. **Identity:** a copied, restored or replaced index file is quarantined until a full native
-   reconciliation rotates its generation; a semantic import cannot end quarantine; old pins conflict. A
-   live `git clean -fdx` while servers run is detected at the next check and servers reopen through the
-   workspace record, within the documented detection boundary. Moving the checkout keeps its UUID,
-   durable state and generation; copying it produces a new workspace.
+6. **Identity:** a copied, restored or replaced index file found when a server opens it is
+   quarantined until a fresh native rebuild replaces it; a semantic import cannot end quarantine; old
+   pins conflict. A live `git clean -fdx` or placement change while servers run is detected at the next
+   check and servers reopen through the workspace record. Replacing or restoring an index while servers
+   run is unsupported; tests assert only the documented detection boundary. Moving a checkout within
+   one filesystem keeps its UUID, durable state and generation; a cross-filesystem move keeps the UUID
+   and rebuilds the index; copying a checkout while the original still exists produces a new workspace;
+   a moved or copied linked worktree with a broken Git backlink is reported, not re-identified.
 7. **Safe open and discovery:** a `.baleyg` that is a symlink, contains symlinks, is hard-linked, is
    owned by another user, has permissive modes, or is tracked by Git is refused (fallback at first
    placement, `store_unavailable` afterwards); no write follows a link. Launching in the home directory

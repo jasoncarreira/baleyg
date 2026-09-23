@@ -1,7 +1,8 @@
 # Proposed agent integration — system context
 
-Direction accepted by the owner (2026-09-23); mechanics proposed until Stage 1 ratifies them. Not
-implemented. Direct terminal agents and optional ACP agents use the same MCP contract.
+Not implemented. The per-checkout index and stdio MCP parts follow the owner-accepted
+[local topology](../local-topology.md), whose mechanics Stage 1 ratifies; the registry, Mimir, Herdr,
+terminal and artifact parts remain proposals with their own later slices. Direct terminal agents and optional ACP agents use the same MCP contract.
 Herdr and Mimir are independent optional integrations. Terminal and ACP tabs in Baleyg are an
 accepted target UI, not implemented functionality.
 

@@ -1,6 +1,9 @@
 # Coding-agent integration plan
 
-Status: **direction accepted by the owner (2026-09-23); mechanics proposed until Stage 1 ratifies them. Not implemented.**
+Status: **not implemented.** The per-checkout index and stdio MCP direction is accepted by the owner
+(2026-09-23), with its mechanics proposed until Stage 1 of the semantic-index program ratifies them.
+The registry, artifact, Herdr, terminal and ACP parts below remain proposals with their own later
+slices; Stage 1 does not ratify them.
 Revised 2026-09-23 for the [local topology](local-topology.md): agents use a per-checkout stdio MCP
 server with no grants.
 This work inspected Baleyg, the local Mimir checkout,
@@ -206,11 +209,12 @@ a mutable global “current project.” Future registry enumeration must itself 
 | --- | --- |
 | `baleyg_workspace_describe` | Describe the launch checkout, current basis, index state, coverage and limits; no indexing on request |
 | `baleyg_find_symbols` | Bounded literal name/ID lookup in the current cached snapshot |
-| `baleyg_inspect` | One declaration or its bounded depth-one outgoing calls; no arbitrary graph query |
+| `baleyg_inspect` | Bounded views of one symbol: `declaration`, `outgoing_calls`, `incoming_calls`, `call_paths`, `usages`, `type_hierarchy`, `implementations`, `coverage`; no arbitrary graph query |
 | `baleyg_read_source` | Bounded cached source range, with hash and exact range |
 
 All reads **except describe** carry `indexGeneration` and `expectedRevision`, validated in one
-transaction-pinned snapshot under the per-operation compatibility rule. See the
+transaction-pinned snapshot; only a cached-source read of an unchanged path honours an older pin. The
+views first serve syntax-tier evidence and gain semantic evidence as the language stages land. See the
 [MCP contract](mcp-readonly-pilot-contract.md) for exact limits and schemas. No hidden navigation,
 diagram, text-search, artifact, live-file, provider or runtime-control tools belong to this slice.
 Tool allowlists and MCP read-only annotations are not a security boundary; the server simply has no
@@ -329,9 +333,9 @@ cache, per-path delta publication, watcher leadership with real-time native refr
 synthetic MCP client across several concurrent worktrees, without Herdr, Mimir, a model or a
 provider. The [MCP contract](mcp-readonly-pilot-contract.md) is the implementation/acceptance gate.
 In the semantic-index program this is sequenced by
-[#8](https://github.com/jasoncarreira/baleyg/issues/8): storage and delta publication in Stage 2,
-native scheduler, watcher leadership and native refresh in Stage 8, the MCP server and its
-startup wiring in Stage 9.
+[#8](https://github.com/jasoncarreira/baleyg/issues/8), early: storage and delta publication in Stage 2,
+native scheduler, watcher leadership and native refresh in Stage 3, and the syntax-tier MCP server
+and its startup wiring in Stage 4. The semantic stages then add evidence to the same tools.
 
 No registry, text scan, deterministic preview, artifacts, producer execution, live reads, ACP
 provider extension or new semantic-resolution claims are in Phase 1.

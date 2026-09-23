@@ -31,9 +31,10 @@ State defaults to a per-workspace OS application-data directory **outside the re
 Use `--state-dir /path/to/state` to override it. A state directory belongs to one canonical
 workspace. Indexing never runs package scripts, installs source dependencies, or edits source.
 The accepted direction moves the disposable index into each checkout at `.baleyg/index.db` while
-tokens, ledgers and durable notes stay outside it. `--state-dir` will then name durable and secret
-state only and must be outside the workspace; existing in-tree state directories migrate through an
-explicit command. See [local topology](docs/local-topology.md#storage-layout).
+tokens, ledgers and durable notes stay outside it, keyed by a per-checkout UUID so a moved checkout
+keeps them. The `--state-dir` flag is then replaced by `$BALEYG_STATE_HOME`, and existing in-tree
+state directories migrate through an explicit command. See
+[local topology](docs/local-topology.md#storage-layout).
 
 ## What works
 

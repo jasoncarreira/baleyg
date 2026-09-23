@@ -180,13 +180,15 @@ The store is split in two, physically:
   `<root>/.baleyg/index.db` inside each checkout, with a self-ignoring `.gitignore`, strict
   safe-open rules and an out-of-tree fallback recorded in the workspace record, because it is
   disposable and per-checkout (see [local topology](docs/local-topology.md#storage-layout)).
-  Each checkout has a workspace UUID, kept in its Git directory, so moving it keeps its state.
+  Each checkout has a workspace UUID, kept in its Git directory (validated against Git's worktree
+  backlink), so moving it keeps its state.
 - **`workspace.db`** — durable views and annotations today; versioned artifacts, agent
   associations and other proposed records need explicit migrations. References to missing
   symbol IDs become orphans; a cache rebuild does not guarantee automatic reattachment.
   Durable data, tokens and provider ledgers stay out of tree: anything under `.baleyg/` may be
-  removed by `git clean` or copied into a container build context. Existing in-tree
-  `--state-dir` setups migrate through an explicit command.
+  removed by `git clean` or copied into a container build context. Per-user state is keyed by a
+  workspace UUID and located by `$BALEYG_STATE_HOME` or the default; the `--state-dir` flag is removed
+  and existing in-tree state migrates through an explicit command.
 
 With identical source bytes, pinned extraction tools, semantic-index artifacts and
 database snapshots, deleting the index must reproduce the same normalized semantic
@@ -307,7 +309,8 @@ but renames, moves and package-version changes can change them. Preserve annotat
 with missing targets as visible orphans until reconciliation is supported. Database
 identity and provisional-to-resolved migration remain design work. The anchor is cache.
 
-Illustrative only: node IDs are range/hash evidence IDs; the SCIP symbol is a separate binding.
+Illustrative only: node IDs are range/hash evidence IDs; the SCIP symbol is a separate binding; a
+measured call site keeps its own identity, separate from its declared target and dispatch kind.
 
 ```json
 {
@@ -326,13 +329,20 @@ Illustrative only: node IDs are range/hash evidence IDs; the SCIP symbol is a se
     "symbol": "scip-java maven acme/billing 1.4 com/acme/billing/Invoice#",
     "provenance": { "source": "scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
   }],
-  "edges": [{
-    "kind": "calls",
-    "from": "syntax:...Invoice.java:9c1f8a2e:1180:method_declaration",
-    "to": "syntax:...TaxTable.java:51d0b7c4:640:method_declaration",
+  "callSites": [{
+    "id": "call:src/main/java/com/acme/billing/Invoice.java:9c1f8a2e:1312:1340",
+    "caller": "syntax:...Invoice.java:9c1f8a2e:1180:method_declaration",
+    "range": [1312, 1340],
     "ordinal": 3,
-    "control": { "in": "if", "depth": 1 },
-    "provenance": { "source": "treesitter+scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
+    "regions": ["region:...Invoice.java:9c1f8a2e:1290:if"],
+    "provenance": { "source": "treesitter", "evidenceKind": "measuredSyntax", "indexRev": 148 }
+  }],
+  "callBindings": [{
+    "callSite": "call:src/main/java/com/acme/billing/Invoice.java:9c1f8a2e:1312:1340",
+    "declaredTarget": "syntax:...TaxTable.java:51d0b7c4:640:method_declaration",
+    "dispatch": "virtual",
+    "disposition": "resolved",
+    "provenance": { "source": "scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
   }]
 }
 ```
@@ -363,7 +373,9 @@ sequence schema.
 
 A live view is a query plus overrides: seed, bounded traversal, pins, hidden IDs and notes.
 On reindex, reevaluate only against an explicit new basis and expose orphaned IDs. Current
-saved views implement a subset of that model.
+saved views implement a subset of that model. The IDs in the example are evidence IDs, which change
+whenever their file changes; durable views and notes anchor through the stable join key that Stage 1
+defines.
 
 A proposed **published artifact** is an immutable version: preserve its query/options, frozen
 server-produced DTO or explicitly agent-authored graph, provenance and evidence basis. It must
@@ -375,11 +387,11 @@ remain distinct from evidence views even when they cite valid source ranges.
 {
   "viewId": "v_8f21",
   "kind": "sequence",
-  "query": { "seed": "...Invoice#settle().", "depth": 3,
+  "query": { "seed": "syntax:...Invoice.java:9c1f8a2e:2210:method_declaration", "depth": 3,
              "edgeKinds": ["calls"], "excludePackages": ["java.util"] },
-  "pins": { "...TaxTable#": { "x": 420, "y": 80 } },
-  "hidden": ["...Logger#"],
-  "notes": [{ "anchor": "edge:...#authorize().", "body": "retries twice" }]
+  "pins": { "syntax:...TaxTable.java:51d0b7c4:120:class_declaration": { "x": 420, "y": 80 } },
+  "hidden": ["syntax:...Logger.java:0a4e19d2:88:class_declaration"],
+  "notes": [{ "anchor": "call:...Invoice.java:9c1f8a2e:2388:2415", "body": "retries twice" }]
 }
 ```
 
@@ -779,7 +791,8 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 | G. Multi-language semantic import | Java then independently gated Rust/Python artifacts; exact snapshot/range joins, provenance and dispatch-safe traversal |
 
 Some slices can proceed in parallel once their contracts settle. The semantic-index program
-([#8](https://github.com/jasoncarreira/baleyg/issues/8)) sequences slices A and G. SCIP does not
+([#8](https://github.com/jasoncarreira/baleyg/issues/8)) sequences slices A and G: slice A ships
+with syntax-tier evidence right after the graph core, and slice G then enriches the same tools. SCIP does not
 require an MCP/ACP agent, and the read-only MCP surface does not require semantic resolution,
 embedded terminals, a project registry, snapshot search or paid inference. Embedded terminals
 are an accepted target UX, not a reason to expand the security-critical pilot.
