@@ -30,11 +30,10 @@ For the existing feature-factory snapshot with semantic resolution, see
 State defaults to a per-workspace OS application-data directory **outside the repository**.
 Use `--state-dir /path/to/state` to override it. A state directory belongs to one canonical
 workspace. Indexing never runs package scripts, installs source dependencies, or edits source.
-The accepted direction moves the disposable index into each checkout at `.baleyg/index.db` while
-tokens, ledgers and durable notes stay outside it, keyed by a per-checkout UUID so a moved checkout
-keeps them. The `--state-dir` flag is then replaced by `$BALEYG_STATE_HOME`, and existing in-tree
-state directories migrate through an explicit command. See
-[local topology](docs/local-topology.md#storage-layout).
+The accepted direction keeps each checkout's index as a pure cache in the per-user cache directory,
+keyed by the checkout's path, and keys saved views and notes by a UUID in the checkout's Git
+directory so they follow a moved checkout. The `--state-dir` flag goes away, and there are no state
+migrations. See [local topology](docs/local-topology.md#storage).
 
 ## What works
 

@@ -49,13 +49,12 @@ Herdr discovery must not silently edit any agent's MCP configuration.
 ### Portable server configuration
 
 The agent client launches `baleyg mcp` in the checkout it works in. The server discovers that
-workspace (explicit `--workspace`, Git top level, nearest ancestor with a workspace UUID, working
-directory) and serves only its index, normally `<root>/.baleyg/index.db` or the out-of-tree fallback
-recorded for the workspace. It needs no daemon, port, descriptor, token or grant, and it exits with
+workspace (explicit `--workspace`, Git top level, working directory) and serves only that checkout's
+index, a pure cache in the per-user cache directory. It needs no daemon, port, descriptor, token or grant, and it exits with
 its client. There is no project registry or `--project PROJECT_ID` prerequisite. See the
 [MCP contract](mcp-readonly-pilot-contract.md) for tool schemas, pins, errors and tests, and the
-[local topology](local-topology.md) for workspace identity, index placement, the shared fact cache,
-watcher leadership and publication, real-time native refresh and cleanup.
+[local topology](local-topology.md) for storage, workspace identity, the fact cache, the leader,
+real-time native refresh and cleanup.
 
 Illustrative configuration, **not a current working command**:
 
@@ -182,16 +181,16 @@ No terminal implementation or agent launch is part of this documentation change 
 
 ## Project and run identity
 
-Each checkout is its own workspace, identified by a workspace UUID kept in its Git directory (or in
-`.baleyg/` outside Git). `evidenceBasis` is `{indexGeneration, indexRevision}`; the generation is bound
-to the index file's identity and rotates after a rebuild, copy, restore or replacement. These are
-proposed fields, not current store columns. Separate worktrees are
+Each checkout's index is keyed by its path; its durable views and notes are keyed by a workspace UUID
+kept in its Git directory. `evidenceBasis` is `{indexGeneration, indexRevision}`; the generation is
+new whenever the index is rebuilt. These are proposed fields, not current store columns. Separate worktrees are
 separate workspaces with separate indexes; they share only content-addressed extraction results. No
 global registry, stable project catalog or workspace picker is needed for agents.
 
 A future browser project picker can list known checkouts without merging databases. See
-[multi-project viability](multi-project-viability.md). A moved checkout keeps its UUID, so its index,
-saved views and notes stay connected; a copied checkout becomes a new workspace.
+[multi-project viability](multi-project-viability.md). A moved checkout keeps its UUID, so its saved
+views and notes stay connected, and its index is rebuilt cheaply from the fact cache. A copy shares
+the original's views and notes.
 
 Keep runtime session/run IDs, optional Herdr connection/pane associations, and future artifact IDs
 and artifact revisions separate from source revision. Client-supplied labels do not authenticate
@@ -209,7 +208,7 @@ a mutable global “current project.” Future registry enumeration must itself 
 | --- | --- |
 | `baleyg_workspace_describe` | Describe the launch checkout, current basis, index state, coverage and limits; no indexing on request |
 | `baleyg_find_symbols` | Bounded literal name/ID lookup in the current cached snapshot |
-| `baleyg_inspect` | Bounded views of one symbol: `declaration`, `outgoing_calls`, `incoming_calls`, `call_paths`, `usages`, `type_hierarchy`, `implementations`, `coverage`; no arbitrary graph query |
+| `baleyg_inspect` | Bounded views of one symbol: first `declaration`, `outgoing_calls` and `incoming_calls`; later `call_paths`, `usages`, `type_hierarchy`, `implementations` and `coverage`; no arbitrary graph query |
 | `baleyg_read_source` | Bounded cached source range, with hash and exact range |
 
 All reads **except describe** carry `indexGeneration` and `expectedRevision`, validated in one
@@ -309,7 +308,7 @@ manifest/hash validation also guards accidental revision reuse.
   server authorizes disclosure to that client; enforce known provider policy inside Mimir, and do
   not imply equal enforcement for every third-party client.
 - Do not give agents the browser owner's daemon token. Keep tokens and ledgers outside every
-  checkout, including `.baleyg/`; do not expose owner-authenticated HTTP or Herdr socket forwarding.
+  checkout; do not expose owner-authenticated HTTP or Herdr socket forwarding.
 - A read-only MCP catalog does not sandbox an agent that also has shell/Python authority. The
   boundary is the OS user; a hostile-agent model needs a separate account or sandbox.
 - Repository text, search matches, terminal output and diagram labels are untrusted data, not tool
@@ -327,14 +326,14 @@ manifest/hash validation also guards accidental revision reuse.
 
 ### Phase 1 — per-checkout read-only MCP
 
-Deliver the [local topology](local-topology.md): per-checkout `.baleyg/index.db`, the shared fact
-cache, per-path delta publication, watcher leadership with real-time native refresh, and
-`baleyg mcp` over stdio exposing describe -> find_symbols -> inspect -> read_source. Test with a
+Deliver the [local topology](local-topology.md): per-checkout index caches, the shared fact cache,
+delta publication by the leader with real-time native refresh, and `baleyg mcp` over stdio exposing
+describe -> find_symbols -> inspect (declaration, outgoing and incoming calls) -> read_source. Test with a
 synthetic MCP client across several concurrent worktrees, without Herdr, Mimir, a model or a
 provider. The [MCP contract](mcp-readonly-pilot-contract.md) is the implementation/acceptance gate.
 In the semantic-index program this is sequenced by
 [#8](https://github.com/jasoncarreira/baleyg/issues/8), early: storage and delta publication in Stage 2,
-native scheduler, watcher leadership and native refresh in Stage 3, and the syntax-tier MCP server
+the leader and native refresh in Stage 3, and the syntax-tier MCP server
 and its startup wiring in Stage 4. The semantic stages then add evidence to the same tools.
 
 No registry, text scan, deterministic preview, artifacts, producer execution, live reads, ACP

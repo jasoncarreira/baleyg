@@ -46,7 +46,7 @@ launch configuration and read/input permissions are independent from MCP access 
   not preserve a PTY process. Do not claim kill/revoke always stops detached descendants.
 - Show index freshness per checkout. Agent source edits reach the cached index only through
   published revisions; the accepted watcher design refreshes native evidence automatically
-  ([local topology](local-topology.md#watcher-leadership-and-publication)), and until it is
+  ([local topology](local-topology.md#leader)), and until it is
   implemented the explicit reindex operation remains the only refresh.
 
 ## Optional Herdr attachment
