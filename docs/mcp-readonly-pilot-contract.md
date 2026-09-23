@@ -46,8 +46,8 @@ A remote agent cannot reach a local stdio server; that needs a separately secure
 Every evidence result comes from one SQLite read transaction and reports
 `evidenceBasis: {indexGeneration, indexRevision}`. Pins are optional:
 
-- `expectedRevision` (with `indexGeneration`), when supplied and not current, returns
-  `revision_conflict` with `currentBasis`.
+- `expectedBasis` (`indexGeneration` and `indexRevision` together; a revision alone is rejected as
+  `invalid_request`), when supplied and not current, returns `revision_conflict` with `currentBasis`.
 - `baleyg_read_source` may take `expectedContentHash`; if the cached file's hash differs it returns
   `revision_conflict` with the current hash.
 
@@ -108,7 +108,7 @@ absolute paths outside the workspace, or source.
 | `not_found` | Missing symbol or cached path at the current basis |
 | `too_many_requests` | Concurrency cap reached; retryable |
 | `deadline_exceeded` | Bounded work cancelled; no partial evidence |
-| `store_unavailable` | Index unreadable; the leader rebuilds it; no repair from a tool call |
+| `store_unavailable` | Index unreadable and being rebuilt, or the workspace root no longer names the directory this server started in; no repair from a tool call |
 
 On cancellation, interrupt the read where supported and emit nothing further for that request.
 
@@ -133,11 +133,13 @@ Fixtures and a synthetic MCP client; no model, provider, repository commands or 
    indexing runs; evidence tools return `index_not_ready`, then succeed.
 5. **Leader:** with several servers on one checkout, exactly one watches and writes; killing it makes
    another take over, reconcile, and serve again; edits made while no leader ran are picked up before
-   any evidence is served.
+   any evidence is served; a `reconciled` marker left by a crashed leader is never accepted. Moving the
+   checkout, or putting a different directory at its path, stops the old server from serving it.
 6. **Live edits:** an edit is reflected within the ratified incremental budget; a body-only edit keeps
    every declaration ID; an added declaration resolves a previously unresolved call elsewhere.
-7. **Pins:** a stale `expectedRevision` or `expectedContentHash` conflicts with the current basis;
-   omitted pins answer from the current revision; no answer mixes revisions.
+7. **Pins:** a stale `expectedBasis` or `expectedContentHash` conflicts with the current basis; a
+   revision without its generation is rejected; omitted pins answer from the current revision; no
+   answer mixes revisions.
 8. **No side effects:** tool calls start no indexing, producer, build, download, provider call or
    durable write, and never read the live working tree.
 9. **Bounds and cancellation:** malformed or oversized inputs fail or report exact truncation; a

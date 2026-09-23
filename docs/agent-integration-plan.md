@@ -211,9 +211,9 @@ a mutable global “current project.” Future registry enumeration must itself 
 | `baleyg_inspect` | Bounded views of one symbol: first `declaration`, `outgoing_calls` and `incoming_calls`; later `call_paths`, `usages`, `type_hierarchy`, `implementations` and `coverage`; no arbitrary graph query |
 | `baleyg_read_source` | Bounded cached source range, with hash and exact range |
 
-All reads **except describe** carry `indexGeneration` and `expectedRevision`, validated in one
-transaction-pinned snapshot; only a cached-source read of an unchanged path honours an older pin. The
-views first serve syntax-tier evidence and gain semantic evidence as the language stages land. See the
+Every read comes from one snapshot and reports its basis. Pins are optional: a client may send a
+complete `expectedBasis`, or `expectedContentHash` for a source read, and a stale one always conflicts.
+The views first serve syntax-tier evidence and gain semantic evidence as the language stages land. See the
 [MCP contract](mcp-readonly-pilot-contract.md) for exact limits and schemas. No hidden navigation,
 diagram, text-search, artifact, live-file, provider or runtime-control tools belong to this slice.
 Tool allowlists and MCP read-only annotations are not a security boundary; the server simply has no

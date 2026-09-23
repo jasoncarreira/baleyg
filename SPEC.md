@@ -302,7 +302,9 @@ IDs. Call sites and control regions are occurrence IDs within a revision (caller
 Backward compatibility is not required for this change.
 
 Identity and location are separate fields. Renames and moves of a declaration change its ID;
-annotations on a removed declaration remain visible orphans.
+annotations on a removed declaration remain visible orphans. Durable anchors also store a hash of the
+declaration's header, so an ordinal that shifts onto a different same-named sibling orphans the
+anchor instead of silently moving it.
 
 Illustrative only: node IDs are stable syntax IDs; the SCIP symbol is a separate binding; a measured
 call site keeps its own identity, separate from its declared target and dispatch kind.
@@ -487,8 +489,8 @@ Accepted incremental direction below; current publication is explicit full-index
 Three conceptual passes, keyed on source and relevant extraction/configuration hashes.
 
 1. **Discover and hash.** Walk respecting `.gitignore` with the existing walker. Record
-   `(path, size, mtime, inode, hash)`, hashing only files whose stat changed (Git's racy-timestamp
-   rule applies). This table *is* the incrementality story. No `git` subprocess runs.
+   `(path, size, mtime, ctime, inode, hash)`, hashing only files whose stat changed (Git's
+   racy-timestamp rule applies). This table *is* the incrementality story. No `git` subprocess runs.
 2. **Parse.** tree-sitter per file, in parallel, a pure function of file bytes and
    therefore cacheable by hash. Emits local nodes, unresolved references, call
    ordinals, control context. Results live in a per-user **fact cache** as a path-neutral record
@@ -505,30 +507,36 @@ Watcher, incremental invalidation and scheduling below are accepted direction wi
 ([local topology](docs/local-topology.md#leader)), not current behavior or permission to execute
 producer tools. Automatic producer scheduling stays off.
 
-- **Leader.** An OS file lock picks one process per checkout. It alone writes native rows: on taking
-  the lock it reconciles against the files before evidence is served, then watches. Other processes
-  queue explicit index requests to it through a table in the index; if there is no leader, the
-  requester becomes one.
+- **Leader.** An OS file lock picks one process per checkout. It alone writes native rows, running
+  watcher batches, reconciles and explicit requests one at a time from a single ordered queue. On
+  taking the lock it reconciles against the files, and evidence is served only once the current
+  leader has done so. It re-checks that the root path still names the same directory before every
+  reconcile and publish. Other processes queue explicit requests in a small database that survives
+  index rebuilds; if there is no leader, the requester becomes one.
 - **Watcher.** FSEvents / inotify through the `notify` crate, debounced, re-extracting changed files
   (or taking them from the fact cache) and publishing one short transaction per batch. Overflow, lost
   events, watch-limit exhaustion, bulk changes and system wake trigger a full stat reconcile; a slow
   periodic reconcile catches silently lost events. A branch switch is just a bulk change.
-- **Re-resolution.** Bindings record the names they looked up, including lookups that found nothing.
-  A publish diffs each changed file's old and new declarations and re-resolves bindings that looked up
-  a name whose declarations were added, removed or changed in anything a lookup can see. Stable IDs
+- **Re-resolution.** Bindings record the names they looked up, including lookups that found nothing,
+  and the scopes they traversed (enclosing classes and modules, supertypes, imports, re-export
+  sources). A publish diffs each changed file's old and new declarations and re-resolves bindings that
+  recorded any name whose declaration was added, removed or changed in anything a lookup can see. Stable IDs
   mean a body-only edit re-resolves nothing. Above a threshold, re-resolve everything.
 - **Cancellation over speed.** Every pass must abort cleanly mid-flight; the user will
   switch branches while indexing.
 - **Atomic revisions, not timestamps.** Each publish is one SQLite transaction and advances the
   revision. Readers pin a WAL read transaction. Only the current graph is retained.
 - **Semantic evidence.** Producers run only through the explicit owner workflow. Imported facts are
-  overlays that apply only while their document's content hash matches; freshness is computed at read
-  time against the source set's last surface or configuration change.
+  overlays that apply only while their document's content hash matches. An artifact whose manifest
+  does not match the current source set at import is possibly stale from the start; afterwards,
+  freshness is computed at read time against the last surface or configuration change in its source
+  set or any source set it depends on.
 - **Cache discipline.** Any schema, extractor or integrity mismatch means delete and rebuild; nothing
   in the index is migrated or repaired.
-- **Cleanup.** Automatic: indexes for vanished or long-unused paths, fact-cache entries beyond a size
-  cap, and empty durable records are deleted by the leader at most daily. Durable records with content
-  are only reported; `baleyg forget` deletes one explicitly. Ledgers are never touched.
+- **Cleanup.** Automatic for derived state: indexes for vanished or long-unused paths (only when no
+  process has them open) and fact-cache entries beyond a size cap are deleted by the leader at most
+  daily. Durable records are created only on first write and never deleted automatically; orphaned
+  ones are reported, and `baleyg forget` deletes one explicitly. Ledgers are never touched.
 
 ### 7.3 Storage
 
@@ -612,8 +620,8 @@ The first catalog is `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg
 `baleyg_read_source`, served by `baleyg mcp` over stdio (MCP `2026-07-28`). The first release of
 `baleyg_inspect` offers `declaration`, `outgoing_calls` and `incoming_calls` over syntax-tier evidence;
 later stages add views and semantic evidence. Every result reports its basis
-`{indexGeneration, indexRevision}` and per-item tier and freshness; pins are optional and a stale pin
-always conflicts. No registry, grep scan, artifact write, shell or on-request index operation is part
+`{indexGeneration, indexRevision}` and per-item tier and freshness; pins are optional, carry the
+complete basis, and always conflict when stale. No registry, grep scan, artifact write, shell or on-request index operation is part
 of this path. Snapshot text search gets its own bounded literal-scan design; FTS does not exist today.
 
 There are no agent grants, principals or budgets. stdio has no network surface, so there is no
