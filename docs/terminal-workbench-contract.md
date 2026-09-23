@@ -61,8 +61,9 @@ Until a supported attachment works, provide honest association/focus links rathe
 
 ## ACP and MCP boundaries
 
-Both terminal and ACP agents get the same portable Baleyg MCP tool schemas and scoped grants.
-A terminal input grant is not an MCP artifact-write grant, and neither grants arbitrary ACP
+Both terminal and ACP agents get the same portable Baleyg MCP tool schemas, served by a stdio
+`baleyg mcp` launched in the agent's checkout ([local topology](local-topology.md)). Terminal input
+authority is not MCP artifact-write authority, and neither grants arbitrary ACP
 filesystem/terminal capabilities. Negotiate implemented capabilities; preserve Mimir's provider
 admission, local/remote host distinction, permission gates and one-client constraint. Baleyg may be
 the chosen ACP client; it must not connect as a second observer beside an occupied editor session.

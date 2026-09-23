@@ -1,5 +1,10 @@
 # MCP read-only pilot — implementation plan
 
+> **Superseded (2026-09-23).** This plan implemented the grant-based pilot (enrollment, owner-issued
+> grants, limited principals, budgets, HTTP tool routes). Its PRs were closed unmerged. The accepted
+> design is the [local topology](local-topology.md) and [stdio MCP contract](mcp-readonly-pilot-contract.md),
+> sequenced by [#8](https://github.com/jasoncarreira/baleyg/issues/8). Kept as history; do not implement from it.
+
 Status: **PLAN — no implementation authorized beyond slice 0**. This sequences the work specified
 by the [read-only pilot contract](mcp-readonly-pilot-contract.md), which remains the normative
 specification and acceptance gate. Where this plan and that contract disagree, the contract wins.

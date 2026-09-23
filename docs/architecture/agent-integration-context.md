@@ -15,7 +15,7 @@ C4Context
   Rel(user, baleyg, "Inspects artifacts and source", "Local browser")
   Rel(user, agent, "Assigns coding or inspection tasks", "Workbench terminal or existing agent UI")
   Rel(baleyg, mimir, "Optionally acts as the chosen ACP client", "Negotiated ACP adapter")
-  Rel(agent, baleyg, "Queries evidence and publishes artifacts", "Scoped MCP tools")
+  Rel(agent, baleyg, "Queries evidence for its checkout", "stdio MCP it launches")
   Rel(user, mimir, "Configures managed sessions and permissions", "Existing Mimir UI")
   Rel(mimir, baleyg, "Routes approved local tools", "Proposed provider bridge")
   Rel(user, herdr, "Organizes workspaces and panes", "Herdr TUI")

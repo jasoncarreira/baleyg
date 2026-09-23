@@ -30,6 +30,8 @@ For the existing feature-factory snapshot with semantic resolution, see
 State defaults to a per-workspace OS application-data directory **outside the repository**.
 Use `--state-dir /path/to/state` to override it. A state directory belongs to one canonical
 workspace. Indexing never runs package scripts, installs source dependencies, or edits source.
+The accepted design moves the disposable index into each checkout at `.baleyg/index.db` while
+tokens, ledgers and durable notes stay outside it; see [local topology](docs/local-topology.md).
 
 ## What works
 
@@ -61,12 +63,13 @@ Baleyg or optional Herdr panes), and agents connected through ACP, primarily Mim
 same portable MCP tools. MCP, general coding-agent ACP sessions and embedded terminals are
 **not implemented yet**; the existing one-shot ACP answer feature is separate.
 
-Start with a four-tool read-only MCP pilot against one existing workspace and server-enforced scoped
-grants. Add snapshot text search, versioned diagram artifacts, the unified terminal workbench and
-multi-project routing as separate slices. Extend SCIP import beyond JavaScript through tested
+Agents reach Baleyg through `baleyg mcp`, a stdio server the agent client launches in the checkout
+it works in, with four read-only tools, no grants and real-time native refresh. Add snapshot text
+search, versioned diagram artifacts, the unified terminal workbench and a browser project picker as
+separate slices. Extend SCIP import beyond JavaScript through tested
 language adapters, initially Java; producing semantic artifacts remains explicitly authorized work.
 
-See the [integration plan](docs/agent-integration-plan.md), [pilot contract](docs/mcp-readonly-pilot-contract.md),
+See the [local topology](docs/local-topology.md), [integration plan](docs/agent-integration-plan.md), [MCP contract](docs/mcp-readonly-pilot-contract.md),
 [terminal workbench](docs/terminal-workbench-contract.md), [SCIP roadmap](docs/scip-multilanguage-plan.md),
 and [optional LSP assessment](docs/lsp-integration-plan.md).
 
@@ -111,9 +114,10 @@ the Feature Factory fixtures under `tests/fixtures/` carry their original projec
 
 - [Architecture and accepted direction](SPEC.md)
 - [MCP-first direct/ACP agent integration plan](docs/agent-integration-plan.md)
-- [Single-workspace read-only MCP pilot and scoped grants](docs/mcp-readonly-pilot-contract.md)
-- [Pilot implementation slices and authorization boundary](docs/mcp-pilot-implementation-plan.md)
-- [Slice 0 storage and cancellation findings](docs/mcp-pilot-slice0-findings.md)
+- [Per-checkout index, stdio MCP and native refresh topology](docs/local-topology.md)
+- [Read-only stdio MCP contract](docs/mcp-readonly-pilot-contract.md)
+- [Superseded: grant-based pilot implementation slices](docs/mcp-pilot-implementation-plan.md)
+- [Superseded: grant-pilot slice 0 storage and cancellation findings](docs/mcp-pilot-slice0-findings.md)
 - [Unified terminal and ACP workbench design](docs/terminal-workbench-contract.md)
 - [Multi-language SCIP semantic import roadmap](docs/scip-multilanguage-plan.md)
 - [Optional LSP bridge: Java-first assessment](docs/lsp-integration-plan.md)
@@ -135,9 +139,10 @@ the Feature Factory fixtures under `tests/fixtures/` carry their original projec
 - [Extraction spike](docs/research/EXTRACTION-RESULTS.md)
 - [Jev/Opus exploratory comparison](docs/research/selection/HARD-RESULTS.md)
 
-Next: the scoped read-only MCP pilot, multi-language SCIP import, and separately gated snapshot
+Next: the semantic-index program ([#8](https://github.com/jasoncarreira/baleyg/issues/8)), including
+per-checkout stdio MCP and multi-language SCIP import, and separately gated snapshot
 search, diagram artifacts and embedded terminal/ACP integration. Continue static sequence coverage
 and library adapters beyond Rust/Cargo; source-backed provider validation still requires authorization
 and working authentication.
-The local literal preview does not understand questions. TypeScript parsing, file watching,
+The local literal preview does not understand questions. TypeScript parsing, file watching (accepted design, not built),
 terminals, React/Tauri and database diagrams remain outside the current implementation.

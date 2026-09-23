@@ -1,5 +1,10 @@
 # MCP pilot slice 0 — storage and cancellation findings
 
+> **Superseded context (2026-09-23).** These findings were gathered for the grant-based pilot. The SQLite
+> observations (a cold read-only open creates `-wal`/`-shm` sidecars; cancellation behaviour) remain
+> useful facts for any reader of the index. The enrollment identity design they supported is
+> replaced by the `indexGeneration` basis in the [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
 Status: **slice 0 complete. Verdict: GO — the [pilot contract](mcp-readonly-pilot-contract.md) is
 implementable as written.** No design amendment is required. Two small additions to its acceptance
 tests are recommended below.

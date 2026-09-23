@@ -1,5 +1,9 @@
 # SCIP beyond JavaScript: staged import and generation plan
 
+> **Update (2026-09-23).** Semantic evidence must now also survive real-time native refresh: per-document
+> basis, stale labelling of documents that reference changed symbols, and whole-basis invalidation on
+> build/config changes. See the [local topology](local-topology.md#real-time-native-refresh).
+
 ## Decision and scope
 
 **Yes. Implement a shared SCIP importer with language-specific syntax joins. Roll out Java first, then Rust, then Python.** Keep generation of SCIP artifacts a separate, opt-in capability. The first implementation should import supplied artifacts and run only synthetic importer tests. It does not need a compiler, language server, build tool, provider, or network.

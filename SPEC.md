@@ -1,6 +1,6 @@
 # Baleyg — Architecture Spec
 
-**Status:** implemented Rust daemon and embedded browser with JavaScript/Rust/Java/Python syntax extraction, static sequences and Java/Python class diagrams. JavaScript SCIP import is implemented. Multi-language semantic import, MCP tools, scoped tool grants, coding-agent ACP sessions and diagram artifacts below are accepted design work, not shipped features. The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-20.
+**Status:** implemented Rust daemon and embedded browser with JavaScript/Rust/Java/Python syntax extraction, static sequences and Java/Python class diagrams. JavaScript SCIP import is implemented. Multi-language semantic import, the stdio MCP server, per-checkout indexes with real-time native refresh, coding-agent ACP sessions and diagram artifacts below are accepted design work, not shipped features. The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-23.
 
 **Validation:** The first extraction/storage spike is recorded in
 [docs/research/EXTRACTION-RESULTS.md](docs/research/EXTRACTION-RESULTS.md). It validates a bounded JavaScript
@@ -38,15 +38,21 @@ Sections 4, 6, 8 and 12 are the current agent/semantic integration direction:
 - Baleyg may implement an ACP client UI and supervise an adapter it explicitly starts.
   That is not a new agent reasoning harness. External agents and Herdr panes keep their
   existing lifecycle owner. Mimir's single-client/provider-profile constraints still apply.
-- The first MCP pilot is four read-only tools against one existing workspace daemon.
-  Scoped server-enforced grants are part of that pilot. A project registry, snapshot text
-  search, artifact writes and broad agent orchestration are later independently tested slices.
+- Agents reach Baleyg through `baleyg mcp`, a stdio MCP server the agent client launches in the
+  checkout it works in. Each checkout, including every Git worktree, has its own disposable index
+  at `<root>/.baleyg/index.db`; a shared per-file fact cache makes new checkouts cheap to index.
+  The first catalog is four read-only tools. There are no grants and no agent network listener;
+  the boundary is the OS user. See the [local topology](docs/local-topology.md).
+- One process per index is the writer, chosen by an exclusive lock. It keeps syntax evidence
+  current with a file watcher. Native extraction is the only automatic work; it executes no
+  repository code. Snapshot text search, artifact writes and broad agent orchestration are later
+  independently tested slices.
 - SCIP is the preferred batch semantic-artifact route, generalized one language at a time.
   LSP/compiler adapters remain possible complementary read/refactoring providers, not a
   requirement for the MCP pilot. No indexer build, download or repository code runs implicitly.
 
-The [agent integration plan](docs/agent-integration-plan.md),
-[read-only MCP pilot contract](docs/mcp-readonly-pilot-contract.md), and
+The [local topology](docs/local-topology.md), [agent integration plan](docs/agent-integration-plan.md),
+[read-only MCP contract](docs/mcp-readonly-pilot-contract.md), and
 [multi-language SCIP plan](docs/scip-multilanguage-plan.md) elaborate these decisions.
 If implementation status is unclear, [README](README.md) describes what currently works.
 The experiment/first-daemon subsections below are **historical implementation checkpoints**,
@@ -138,7 +144,7 @@ API and inspector checks passed. The product-level diagram and provider gates re
 
 | Phase | What ships | Gated on |
 | --- | --- | --- |
-| 1. Read | File/method browsing, static sequences, class diagrams; portable MCP tools for direct terminal/optional Herdr agents or optional ACP sessions | Measured extraction + scoped read access; neither terminal embedding nor ACP is required for MCP |
+| 1. Read | File/method browsing, static sequences, class diagrams; portable MCP tools for direct terminal/optional Herdr agents or optional ACP sessions | Measured extraction + per-checkout stdio MCP; neither terminal embedding nor ACP is required for MCP |
 | 2. Data | DB connection, ERD, `mapsTo` links from entity types to tables | Phase 1 model, driver sandboxing |
 | 3. Author | Edit on canvas, diff revisions, agent writes the code | Phases 1–2 plus a real identity story |
 
@@ -167,14 +173,19 @@ Baleyg asks:
 
 The store is split in two, physically:
 
-- **`cache.db`** — derived source snapshots, graph and class projections. Deletable,
+- **The index** — derived source snapshots, graph and class projections. Deletable,
   rebuilt deterministically, never authoritative. FTS and broader edge kinds are not implemented.
+  Today this is `cache.db` in an out-of-tree state directory. The accepted design moves it to
+  `<root>/.baleyg/index.db` inside each checkout, with a self-ignoring `.gitignore`, because it is
+  disposable and per-checkout (see [local topology](docs/local-topology.md)).
 - **`workspace.db`** — durable views and annotations today; versioned artifacts, agent
   associations and other proposed records need explicit migrations. References to missing
   symbol IDs become orphans; a cache rebuild does not guarantee automatic reattachment.
+  Durable data, tokens and provider ledgers stay out of tree: anything under `.baleyg/` may be
+  removed by `git clean` or copied into a container build context.
 
 With identical source bytes, pinned extraction tools, semantic-index artifacts and
-database snapshots, deleting `cache.db` must reproduce the same normalized semantic
+database snapshots, deleting the index must reproduce the same normalized semantic
 graph. Preserve accepted agent output and layout decisions in the durable store.
 SQLite file bytes and renderer pixels are not the determinism contract.
 
@@ -210,22 +221,25 @@ reconsider.
 ## 4. Processes and connection modes
 
 The core owns Baleyg's stores, query services and UI events. It supervises only processes
-that Baleyg explicitly launches, such as a future MCP/ACP adapter. It does **not** own every
-agent, shell or Herdr pane associated with a project.
+that Baleyg explicitly launches, such as a future ACP adapter. It does **not** own every
+agent, shell or Herdr pane associated with a project. `baleyg mcp` processes are owned by the
+agent clients that launch them and exit with those clients; they need no supervisor. The browser
+daemon and any `baleyg mcp` process share each index through SQLite, with one lock-elected writer.
 
 ```mermaid
 flowchart LR
   UI[Baleyg browser] -->|explicit requests| CORE[Baleyg core]
   CORE -->|evidence and artifact events| UI
-  CORE --> M[(Per-workspace cache and durable data)]
-  DIRECT[Direct agent: embedded or external terminal] -->|MCP| MCP[Baleyg MCP tools]
+  CORE --> M[(Per-checkout index and out-of-tree durable data)]
+  DIRECT[Direct agent: embedded or external terminal] -->|launches, stdio MCP| MCP[baleyg mcp, one per agent session]
   UI <-->|authenticated terminal stream| PTY[Owned PTY service]
   PTY -->|explicit launch only| DIRECT
   HERDR[Agent in optional Herdr pane] -->|same MCP contract| MCP
   UI -->|optional ACP session controls| ACP[Baleyg ACP client adapter]
   ACP -->|negotiated ACP| HARNESS[Existing harness or Mimir proxy]
   HARNESS -->|same tools via admitted local bridge| MCP
-  MCP -->|scoped read or artifact grant| CORE
+  MCP -->|read-only SQLite snapshots| M
+  MCP -. lock-elected writer: native refresh .-> M
   CORE -. optional metadata association .-> HM[Herdr adapter]
 ```
 
@@ -418,8 +432,11 @@ malformed, oversized or unsupported artifacts before publication. Do not downloa
 Baleyg or silently retry a build to resolve missing evidence.
 
 Stale semantic evidence must be rejected or downgraded visibly, preserving syntax-only browsing.
-The current system uses explicit full refresh; watching and dependency-aware incremental invalidation
-are future work. Do not describe a background re-indexer or per-file semantic fallback as already live.
+The current system uses explicit full refresh. The accepted design adds a file watcher that refreshes
+**native** evidence per changed file (§7.2). When a file changes, its semantic evidence falls back to
+syntax-only, and semantic facts in files that reference its symbols are labelled stale with their
+basis. A build or configuration change invalidates the whole semantic basis of its source set. The
+watcher never runs a producer. None of this is implemented yet.
 
 ### 6.3 LSP and compiler APIs remain complementary
 
@@ -447,26 +464,34 @@ it” is a valid guarantee. Preserve the distinction between evidence, candidate
 
 ### 7.1 Construction
 
-Target incremental design below; current publication is explicit full-index rebuild.
+Accepted incremental design below; current publication is explicit full-index rebuild.
 Three conceptual passes, keyed on source and relevant extraction/configuration hashes.
 
-1. **Discover and hash.** Walk respecting `.gitignore`. Record
-   `(path, size, mtime_ms, blake3)`. This table *is* the incrementality story.
+1. **Discover and hash.** Walk respecting `.gitignore`, or in a Git checkout use `git ls-files -s`
+   plus `git status` for dirty and untracked files. Record `(path, size, mtime_ms, hash)`. This
+   table *is* the incrementality story.
 2. **Parse.** tree-sitter per file, in parallel, a pure function of file bytes and
    therefore cacheable by hash. Emits local nodes, unresolved references, call
-   ordinals, control context.
+   ordinals, control context. Results live in a **shared fact cache** keyed by language,
+   extractor version and content hash, stored in the Git common directory so every worktree of a
+   repository reuses it. A new worktree parses only the files its branch changed.
 3. **Enrich.** Ingest admitted semantic artifacts through the appropriate language adapter.
    Syntax-only import/name matching may provide explicitly scoped navigation candidates, not
    resolved dispatch. It must never silently replace missing compiler evidence with a guessed call.
 
 ### 7.2 Maintenance
 
-Watcher, incremental dependency invalidation and indexer scheduling below are future work,
+Watcher, incremental dependency invalidation and indexer scheduling below are accepted design,
 not current behavior or permission to execute producer tools. Production generation requires
-explicit trusted execution policy; automatic scheduling is off until separately implemented.
+explicit trusted execution policy; automatic producer scheduling stays off.
 
-- **Watcher.** Native FSEvents / inotify / ReadDirectoryChangesW, 300ms debounce,
-  re-hash changed files, re-run pass 2 for those files only.
+- **Single writer.** Every process that may publish (browser daemon, `baleyg mcp`) competes for an
+  exclusive lock on the index directory. The holder runs the watcher and publishes; the others
+  read. The kernel releases the lock on exit or crash; the next holder does a catch-up rescan.
+- **Watcher.** Native FSEvents / inotify through the `notify` crate, about 100–300ms debounce,
+  re-hash changed files, re-run pass 2 for those files only, publish a per-path delta. Always
+  exclude `.baleyg/` and `.git/`. Overflow, lost events, watch-limit exhaustion and bulk changes
+  fall back to a full rescan.
 - **Reverse dependencies.** `edge_deps` records which files each resolved edge depended
   on. When file `F` changes, re-resolve edges whose dependency set includes `F`, plus
   every unresolved reference inside `F`. Above a threshold of changed files, full
@@ -481,12 +506,18 @@ explicit trusted execution policy; automatic scheduling is off until separately 
   transaction. Readers pin a WAL read transaction while reading revision metadata and
   graph rows. An `index_rev` column alone does not retain old snapshots. Keep durable
   annotations separately; cross-database atomicity requires its own contract.
-- **SCIP scheduling.** Re-run indexers on a long debounce in the background, never on
-  the save path. Surface the age of the index in the UI.
+- **Revision churn.** Each revision records the paths it changed. A pinned evidence request is
+  answered from the current revision when none of the paths it read changed since the pin;
+  otherwise it conflicts. Only the current graph is retained.
+- **SCIP scheduling.** Producers run only through the explicit owner workflow, never from the
+  watcher or an agent. Surface the age and basis of semantic evidence in the UI and MCP results.
+- **Cleanup.** A removed checkout takes its index with it. The shared fact cache is
+  garbage-collected against surviving workspaces. A machine-wide limit bounds concurrent index jobs.
 
 ### 7.3 Storage
 
-SQLite, WAL, two files per workspace as described in §2. Traversals are recursive CTEs
+SQLite, WAL: a per-checkout index plus out-of-tree durable data, as described in §2, and a shared
+per-repository fact cache (§7.1). Traversals are recursive CTEs
 and must be benchmarked on representative views. Illustrative DDL is in Appendix A;
 revision publication and sequence-region tables are not yet a production schema.
 
@@ -517,15 +548,17 @@ building on it. LSIF is superseded by SCIP.
 
 **The same MCP tools must be available in both connection modes.** This section supersedes
 the original ACP-only launcher/registry topology and its prototype `query_graph`, `get_symbol`,
-`emit_diagram` names. The [integration plan](docs/agent-integration-plan.md) and
-[pilot contract](docs/mcp-readonly-pilot-contract.md) define the portable `baleyg_*` names.
-These tools, their scoped grants and the general coding-agent client are not implemented yet.
+`emit_diagram` names, and the later owner-grant pilot. The [local topology](docs/local-topology.md),
+[integration plan](docs/agent-integration-plan.md) and [MCP contract](docs/mcp-readonly-pilot-contract.md)
+define the portable `baleyg_*` names. These tools and the general coding-agent client are not
+implemented yet.
 
 ### 8.1 Direct agents, including embedded terminals
 
 An agent can run in an ordinary terminal, in a Baleyg-owned terminal tab, or in an optional
 Herdr pane. Configure the proposed `baleyg mcp` stdio server through that agent's supported
-MCP settings. Baleyg need not become its ACP client or its reasoning harness. A user may
+MCP settings; the agent client launches it in the checkout it works in, and the server serves that
+checkout only. Baleyg need not become its ACP client or its reasoning harness. A user may
 continue to launch agents outside Baleyg; tools and published diagrams work the same way.
 
 The target workbench includes terminal tabs alongside diagrams and source (§4). MCP and PTY
@@ -559,24 +592,24 @@ fake tool calls. `_meta` correlation is not a replacement for a versioned tool s
 
 ### 8.3 Tool authority and first pilot
 
-The first pilot is one existing single-workspace daemon with only:
-`baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect`, `baleyg_read_source`.
-Describe bootstraps current basis; all evidence reads require/check the admitted revision.
-No registry, grep scan, artifact write, shell or index operation is needed to prove this path.
-Snapshot text search gets its own bounded literal-scan design; FTS does not exist today.
+The first catalog is `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect` and
+`baleyg_read_source`, served by `baleyg mcp` over stdio. Describe reports the current basis
+`{indexGeneration, indexRevision}`; every evidence read carries a pin, validated under the
+revision churn rule (§7.2). No registry, grep scan, artifact write, shell or on-request index
+operation is part of this path. Snapshot text search gets its own bounded literal-scan design;
+FTS does not exist today.
 
-Current bearer authentication grants broad owner access and cannot be handed to an agent.
-Add owner-issued, short-lived, revocable **server-enforced read grants**, limited to the exact
-workspace/store and read operation allowlist. A local adapter receives the grant through a
-private mechanism outside the agent-readable worktree, never a bearer token in command arguments
-or model-visible output. The agent cannot mint its own grant. Existing browser/owner credentials
-are neither inherited nor substituted as a fallback. See the pilot contract for bootstrap,
-expiry, revocation, routes and negative tests. A tool's `readOnlyHint` is not access control.
+There are no agent grants, principals or budgets. stdio has no network surface, so there is no
+Host/Origin exposure and other OS users cannot connect. The boundary is the OS user: any
+same-user process can launch the server or read the index file, just as it can read the source.
+Configuring the server for an agent approves disclosure of the whole indexed checkout to that agent
+and its provider. The browser's bearer token remains the browser's credential and is never given
+to agents. A tool's `readOnlyHint` is not access control.
 
-The same grant rules apply whether the caller came from a direct terminal, Herdr, or ACP.
+The same rules apply whether the caller came from a direct terminal, Herdr, or ACP.
 Remote disclosure needs a runtime/destination policy; MCP alone cannot attest the downstream
-model provider. Read-only does not mean non-sensitive. An agent with separately granted shell
-or broad same-user filesystem access is not sandboxed by a narrow MCP capability.
+model provider. Read-only does not mean non-sensitive. A hostile-agent threat model needs a
+separate OS account or sandbox, not a narrower MCP catalog.
 
 ### 8.4 Permissions, launch configuration and ownership
 
@@ -709,7 +742,7 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 
 | Slice | Runnable acceptance |
 | --- | --- |
-| A. Single-workspace read-only MCP | Describe/find/inspect/read through an owner-issued scoped grant; denied writes/index/provider routes; no ACP, Herdr or registry required |
+| A. Per-checkout read-only MCP | `baleyg mcp` over stdio in any checkout or worktree; describe/find/inspect/read with revision pins; real-time native refresh by the lock-elected writer; no ACP, Herdr, registry or grants required |
 | B. Bounded snapshot text search | Literal scan over cached payloads with separate byte/time/result budgets, cancellation and explicit partial results; no FTS assumption |
 | C. Versioned diagram artifacts | Evidence view or clearly authored draft -> CAS update -> local publish -> user opens deep link; stale source stays honest |
 | D. Unified workbench terminals | Real PTY tab for a user-launched direct agent, the same MCP tools, bounded terminal stream and explicit lifecycle/input permissions |
@@ -717,8 +750,9 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 | F. Optional Herdr integration and multi-project UI | Read-only association first; independently verified terminal attach later; per-project routing without merging stores |
 | G. Multi-language semantic import | Java then independently gated Rust/Python artifacts; exact snapshot/range joins, provenance and dispatch-safe traversal |
 
-Some slices can proceed in parallel once their contracts settle. In particular, SCIP does not
-require an MCP/ACP agent, and the read-only MCP pilot does not require semantic resolution,
+Some slices can proceed in parallel once their contracts settle. The semantic-index program
+([#8](https://github.com/jasoncarreira/baleyg/issues/8)) sequences slices A and G. SCIP does not
+require an MCP/ACP agent, and the read-only MCP surface does not require semantic resolution,
 embedded terminals, a project registry, snapshot search or paid inference. Embedded terminals
 are an accepted target UX, not a reason to expand the security-critical pilot.
 
@@ -731,7 +765,12 @@ could extract a class diagram; they died because the diagram was unreadable. The
 differentiator is the agent deciding what to leave out. Budget real effort there.
 
 **Degraded mode will be silent unless made loud.** Show the active extraction tier per
-workspace, always, and the age of the SCIP index.
+workspace, always, and the age and basis of semantic evidence. With real-time native refresh,
+semantic evidence lags edits by design; every result must say so.
+
+**Many live checkouts.** Agents work in several worktrees at once. Index cost must scale with what
+each checkout changed, not its size; processes must end with their clients; and storage must be
+reclaimed when checkouts disappear. See the [local topology](docs/local-topology.md).
 
 **Indexer coverage varies.** Validate a pinned producer against the exact language/toolchain,
 position encoding, ranges, roles and relationships needed by each adapter. Do not infer maturity
@@ -758,7 +797,7 @@ and any one is a project.
 
 ## Appendix A — illustrative schema (not finalized)
 
-### `cache.db` — derived, deletable
+### Index (`cache.db` today, `.baleyg/index.db` proposed) — derived, deletable
 
 ```sql
 CREATE TABLE files (
