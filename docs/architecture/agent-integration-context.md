@@ -1,6 +1,7 @@
 # Proposed agent integration — system context
 
-Proposal only. Direct terminal agents and optional ACP agents use the same MCP contract.
+Direction accepted by the owner (2026-09-23); mechanics proposed until Stage 1 ratifies them. Not
+implemented. Direct terminal agents and optional ACP agents use the same MCP contract.
 Herdr and Mimir are independent optional integrations. Terminal and ACP tabs in Baleyg are an
 accepted target UI, not implemented functionality.
 

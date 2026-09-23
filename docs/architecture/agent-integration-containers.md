@@ -1,6 +1,7 @@
 # Proposed agent integration — containers
 
-Proposal only. The stdio MCP server, per-checkout indexes, watcher leadership, file watcher, registry,
+Direction accepted by the owner (2026-09-23); mechanics proposed until Stage 1 ratifies them. Not
+implemented. The stdio MCP server, per-checkout indexes, watcher leadership, file watcher, registry,
 Mimir Baleyg provider and artifact service shown here must be implemented. Existing Hands v1 does not
 accept arbitrary tools. This is the target architecture: artifact storage, embedded terminal
 streaming and ACP client sessions are separate slices. See the [local topology](../local-topology.md).

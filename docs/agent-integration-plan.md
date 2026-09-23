@@ -1,7 +1,8 @@
 # Coding-agent integration plan
 
-Status: **proposal, not implemented**. Revised 2026-09-23 for the
-[local topology](local-topology.md): agents use a per-checkout stdio MCP server with no grants.
+Status: **direction accepted by the owner (2026-09-23); mechanics proposed until Stage 1 ratifies them. Not implemented.**
+Revised 2026-09-23 for the [local topology](local-topology.md): agents use a per-checkout stdio MCP
+server with no grants.
 This work inspected Baleyg, the local Mimir checkout,
 and the installed Herdr CLI/schema. It did not start or prompt Herdr/Mimir coding agents,
 call project-configured providers, change either runtime, index projects, or change the
@@ -44,13 +45,14 @@ Herdr discovery must not silently edit any agent's MCP configuration.
 
 ### Portable server configuration
 
-The agent client launches `baleyg mcp` in the checkout it works in. The server resolves its
-workspace from its working directory and serves only that checkout's index at
-`<root>/.baleyg/index.db`. It needs no daemon, port, descriptor, token or grant, and it exits with
+The agent client launches `baleyg mcp` in the checkout it works in. The server discovers that
+workspace (explicit `--workspace`, Git top level, nearest ancestor with a workspace UUID, working
+directory) and serves only its index, normally `<root>/.baleyg/index.db` or the out-of-tree fallback
+recorded for the workspace. It needs no daemon, port, descriptor, token or grant, and it exits with
 its client. There is no project registry or `--project PROJECT_ID` prerequisite. See the
 [MCP contract](mcp-readonly-pilot-contract.md) for tool schemas, pins, errors and tests, and the
-[local topology](local-topology.md) for index placement, the shared fact cache, writer election,
-real-time native refresh and cleanup.
+[local topology](local-topology.md) for workspace identity, index placement, the shared fact cache,
+watcher leadership and publication, real-time native refresh and cleanup.
 
 Illustrative configuration, **not a current working command**:
 
@@ -177,15 +179,16 @@ No terminal implementation or agent launch is part of this documentation change 
 
 ## Project and run identity
 
-Each checkout is its own workspace, identified by its index. `evidenceBasis` is
-`{indexGeneration, indexRevision}`; the generation is created with the index and changes when it is
-rebuilt from nothing. These are proposed fields, not current store columns. Separate worktrees are
+Each checkout is its own workspace, identified by a workspace UUID kept in its Git directory (or in
+`.baleyg/` outside Git). `evidenceBasis` is `{indexGeneration, indexRevision}`; the generation is bound
+to the index file's identity and rotates after a rebuild, copy, restore or replacement. These are
+proposed fields, not current store columns. Separate worktrees are
 separate workspaces with separate indexes; they share only content-addressed extraction results. No
 global registry, stable project catalog or workspace picker is needed for agents.
 
 A future browser project picker can list known checkouts without merging databases. See
-[multi-project viability](multi-project-viability.md). A moved checkout carries its index with it;
-the store verifies relocation instead of refusing it.
+[multi-project viability](multi-project-viability.md). A moved checkout keeps its UUID, so its index,
+saved views and notes stay connected; a copied checkout becomes a new workspace.
 
 Keep runtime session/run IDs, optional Herdr connection/pane associations, and future artifact IDs
 and artifact revisions separate from source revision. Client-supplied labels do not authenticate
@@ -327,7 +330,8 @@ synthetic MCP client across several concurrent worktrees, without Herdr, Mimir, 
 provider. The [MCP contract](mcp-readonly-pilot-contract.md) is the implementation/acceptance gate.
 In the semantic-index program this is sequenced by
 [#8](https://github.com/jasoncarreira/baleyg/issues/8): storage and delta publication in Stage 2,
-watcher and writer election in Stage 8, the MCP server in Stage 9.
+native scheduler, watcher leadership and native refresh in Stage 8, the MCP server and its
+startup wiring in Stage 9.
 
 No registry, text scan, deterministic preview, artifacts, producer execution, live reads, ACP
 provider extension or new semantic-resolution claims are in Phase 1.

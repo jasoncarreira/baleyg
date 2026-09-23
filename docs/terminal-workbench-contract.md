@@ -1,8 +1,9 @@
 # Unified terminal and agent workbench — design contract
 
-Status: accepted target UX, **not implemented**. This document does not authorize launching
-agents, attaching to existing Herdr panes, installing terminal libraries or running repository
-commands. The four-tool [MCP pilot](mcp-readonly-pilot-contract.md) remains a smaller first slice.
+Status: **direction accepted by the owner; not implemented.** This document does not authorize
+launching agents, attaching to existing Herdr panes, installing terminal libraries or running
+repository commands. The stdio [MCP contract](mcp-readonly-pilot-contract.md) is a separate, smaller
+slice.
 
 ## User outcome
 

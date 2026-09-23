@@ -178,8 +178,9 @@ The store is split in two, physically:
   rebuilt deterministically, never authoritative. FTS and broader edge kinds are not implemented.
   Today this is `cache.db` in an out-of-tree state directory. The accepted direction moves it to
   `<root>/.baleyg/index.db` inside each checkout, with a self-ignoring `.gitignore`, strict
-  safe-open rules and an out-of-tree fallback recorded in a per-user locator, because it is
+  safe-open rules and an out-of-tree fallback recorded in the workspace record, because it is
   disposable and per-checkout (see [local topology](docs/local-topology.md#storage-layout)).
+  Each checkout has a workspace UUID, kept in its Git directory, so moving it keeps its state.
 - **`workspace.db`** — durable views and annotations today; versioned artifacts, agent
   associations and other proposed records need explicit migrations. References to missing
   symbol IDs become orphans; a cache rebuild does not guarantee automatic reattachment.
@@ -306,25 +307,32 @@ but renames, moves and package-version changes can change them. Preserve annotat
 with missing targets as visible orphans until reconciliation is supported. Database
 identity and provisional-to-resolved migration remain design work. The anchor is cache.
 
+Illustrative only: node IDs are range/hash evidence IDs; the SCIP symbol is a separate binding.
+
 ```json
 {
   "schemaVersion": 1,
   "nodes": [{
-    "id": "scip-java maven acme/billing 1.4 com/acme/billing/Invoice#",
+    "id": "syntax:src/main/java/com/acme/billing/Invoice.java:9c1f8a2e:420:class_declaration",
     "kind": "class",
     "name": "Invoice",
     "container": "com.acme.billing",
     "anchor": { "path": "src/main/java/com/acme/billing/Invoice.java",
                 "range": [420, 2310], "blob": "9c1f8a2e" },
+    "provenance": { "source": "treesitter", "evidenceKind": "measuredSyntax", "indexRev": 148 }
+  }],
+  "semanticBindings": [{
+    "node": "syntax:src/main/java/com/acme/billing/Invoice.java:9c1f8a2e:420:class_declaration",
+    "symbol": "scip-java maven acme/billing 1.4 com/acme/billing/Invoice#",
     "provenance": { "source": "scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
   }],
   "edges": [{
     "kind": "calls",
-    "from": "...Invoice#total().",
-    "to": "...TaxTable#rateFor().",
+    "from": "syntax:...Invoice.java:9c1f8a2e:1180:method_declaration",
+    "to": "syntax:...TaxTable.java:51d0b7c4:640:method_declaration",
     "ordinal": 3,
     "control": { "in": "if", "depth": 1 },
-    "provenance": { "source": "treesitter", "evidenceKind": "measuredSyntax", "indexRev": 148 }
+    "provenance": { "source": "treesitter+scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
   }]
 }
 ```
@@ -494,18 +502,21 @@ with proposed mechanics ([local topology](docs/local-topology.md#watcher-leaders
 not current behavior or permission to execute producer tools. Production generation requires
 explicit trusted execution policy; automatic producer scheduling stays off.
 
-- **Leadership and publication.** A lifetime lock decides which process runs the watcher and
-  blocks nothing else. Every job takes a monotonic epoch, extracts outside any transaction, and
-  publishes in one short transaction that replaces a path only with a newer observation. Explicit
-  index requests and artifact imports publish the same way, never waiting on the leader.
+- **Leadership and publication.** A lifetime lock in per-user state decides which process runs the
+  watcher and blocks nothing else. Native jobs publish optimistically per path: a path is replaced
+  only if its published version is unchanged since the job recorded it; otherwise the job re-reads
+  the file and retries. Resolution runs inside the committing transaction. Semantic facts are
+  separate overlays that never block a native update. Explicit index requests (CLI or browser) are
+  accepted or queued, never rejected as busy.
 - **Watcher.** Native FSEvents / inotify through the `notify` crate, about 100–300ms debounce,
   re-hash changed files, re-run pass 2 for those files only, publish a per-path delta. Always
   exclude `.baleyg/` and `.git/`. A new leader watches first, scans, then applies buffered events.
   Overflow, lost events, watch-limit exhaustion and bulk changes fall back to a full rescan;
   periodic reconciliation catches silently lost events.
-- **Resolution dependencies.** Record the scope/name keys each binding looked up, including
-  lookups that found nothing or several candidates. When a delta adds, removes or renames
-  declarations, re-resolve every binding that depends on an affected key, resolved or not. Above a
+- **Resolution dependencies.** Every binding records the keys it looked up, including lookups that
+  found nothing or several candidates. Each file publishes a declaration-surface digest per key
+  (existence, visibility, export, signature, owner, supertypes, re-export membership). When a
+  delta changes a digest, re-resolve every binding that recorded that key, resolved or not. Above a
   threshold of changed files, full re-resolve — branch switches are not worth being clever about.
 - **Git awareness.** Store the indexed HEAD sha. On branch switch use
   `git diff --name-status` rather than riding out the watcher storm.
@@ -518,14 +529,14 @@ explicit trusted execution policy; automatic producer scheduling stays off.
   graph rows. An `index_rev` column alone does not retain old snapshots. Keep durable
   annotations separately; cross-database atomicity requires its own contract.
 - **Revision compatibility.** Each revision records the paths it changed. An older pin is honoured
-  only per operation and conservatively: a cached source read or a single declaration whose path is
-  unchanged. Outgoing calls, symbol search, ranked or global queries and negative results always
-  conflict when stale. Only the current graph is retained.
+  only for a cached source read whose path is unchanged; every other operation conflicts when stale.
+  Only the current graph is retained.
 - **SCIP scheduling.** Producers run only through the explicit owner workflow, never from the
   watcher or an agent. Surface the age and basis of semantic evidence in the UI and MCP results.
-- **Identity.** The index generation is bound to the database file's device and inode and rotates
-  after a copy, restore or replacement. Every transaction checks that its open file is still the one
-  the locator names, so a live `git clean` cannot leave a process serving a deleted index.
+- **Identity.** The index generation is bound to the database file's device and inode. A copied,
+  restored or replaced index is quarantined until a full native reconciliation rotates it. Processes
+  check their open file against the workspace record at transaction start, before commit and before
+  responding, so a live `git clean` is caught at the next check.
 - **Cleanup.** A removed checkout takes its index with it. Automatic garbage collection covers derived
   caches only; durable views, notes, tokens and ledgers are deleted only by an explicit command. A
   machine-wide limit bounds concurrent index jobs.
@@ -611,7 +622,8 @@ fake tool calls. `_meta` correlation is not a replacement for a versioned tool s
 The first catalog is `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect` and
 `baleyg_read_source`, served by `baleyg mcp` over stdio. Describe reports the current basis
 `{indexGeneration, indexRevision}`; every evidence read carries a pin, validated under the
-per-operation compatibility rule (§7.2). Results report semantic basis and freshness per item. No registry, grep scan, artifact write, shell or on-request index
+compatibility rule (§7.2). Results report semantic basis and freshness per item, and bindings to a
+removed target are `staleTarget`, never resolved. The server speaks MCP `2026-07-28` over stdio. No registry, grep scan, artifact write, shell or on-request index
 operation is part of this path. Snapshot text search gets its own bounded literal-scan design;
 FTS does not exist today.
 
@@ -826,7 +838,7 @@ CREATE TABLE files (
 ) WITHOUT ROWID;
 
 CREATE TABLE nodes (
-  id          TEXT PRIMARY KEY,          -- SCIP symbol string
+  id          TEXT PRIMARY KEY,          -- range/hash evidence ID; SCIP symbols live in a binding table
   kind        TEXT NOT NULL,             -- class|interface|method|field|table|column
   name        TEXT NOT NULL,
   container   TEXT,                      -- parent node id
