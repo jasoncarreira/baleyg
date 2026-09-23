@@ -3,7 +3,9 @@
 > **Update (2026-09-23).** Semantic evidence must now also survive real-time native refresh: per-document
 > basis and dependencies, conservative possibly-stale labelling (referencing, importing and newly
 > resolvable documents, transitively on export-surface changes), and whole-basis invalidation on
-> build/config changes. See the [local topology](local-topology.md#semantic-freshness-under-native-refresh).
+> build/config changes. The recommendation below to keep current JavaScript identity behaviour is
+> overridden by an owner decision: JavaScript moves to range/hash node IDs with SCIP symbols as
+> separate bindings, without backward compatibility (see SPEC §5). See the [local topology](local-topology.md#semantic-freshness-under-native-refresh).
 
 ## Decision and scope
 

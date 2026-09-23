@@ -294,11 +294,12 @@ a subgraph whose nodes happen to be tables.
 ### Identity
 
 SCIP supplies semantic symbol strings; local SCIP IDs require document/artifact scoping.
-The existing JavaScript importer can replace syntax IDs with imported identities. Generalizing
-that behavior is not automatic: new language adapters must join exact measured declarations and
-keep semantic identity, snapshot identity and source location distinct. Prefer an explicit binding
-or alias layer that preserves existing measured IDs and orphan behavior until a tested identity
-migration exists. Parser-only identities remain provisional and must not masquerade as SCIP IDs.
+The existing JavaScript importer replaces syntax IDs with imported identities. **Owner decision
+(2026-09-23): that behavior is removed.** Every language, JavaScript included, uses range/hash
+evidence IDs for nodes, and SCIP symbols are recorded in a separate binding layer, keeping semantic
+identity, snapshot identity and source location distinct. Backward compatibility is not required for
+this change: saved views and annotations whose JavaScript IDs change may become orphans, with no
+migration. Parser-only identities remain provisional and must not masquerade as SCIP IDs.
 
 Identity and location are separate fields. Exported symbol ids can survive body edits,
 but renames, moves and package-version changes can change them. Preserve annotations
