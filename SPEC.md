@@ -510,8 +510,9 @@ producer tools. Automatic producer scheduling stays off.
 
 - **Leader.** An OS file lock picks one process per checkout. It alone writes native rows, running
   watcher batches, reconciles and explicit requests one at a time from a single ordered queue. On
-  taking the lock it reconciles against the files, and evidence is served only once the current
-  leader has done so. It re-checks that the root path still names the same directory before every
+  taking the lock it reconciles against the files; apart from a brief documented takeover window,
+  which serves only the previous leader's last reconciled revision, evidence is served only once the
+  current leader has done so. It re-checks that the root path still names the same directory before every
   reconcile and publish. Other processes queue explicit requests in a small database that survives
   index rebuilds; if there is no leader, the requester becomes one.
 - **Watcher.** FSEvents / inotify through the `notify` crate, debounced, re-extracting changed files

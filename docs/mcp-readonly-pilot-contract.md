@@ -132,10 +132,11 @@ Fixtures and a synthetic MCP client; no model, provider, repository commands or 
 4. **Startup:** with no index, `server/discover` and `tools/list` answer within their deadlines while
    indexing runs; evidence tools return `index_not_ready`, then succeed.
 5. **Leader:** with several servers on one checkout, exactly one watches and writes; killing it makes
-   another take over, reconcile, and serve again; edits made while no leader ran are picked up before
-   any evidence is served; a crashed leader's `reconciled` marker is never accepted once the successor
-   has recorded its incarnation (the documented takeover window serves only already-reconciled,
-   basis-labelled evidence). Moving the
+   another take over, reconcile, and serve again; edits made while no leader ran are published by the
+   successor's catch-up reconcile. Apart from the documented takeover window, no evidence is served
+   until that reconcile completes; during the window, a reader may serve the previous leader's last
+   reconciled, basis-labelled revision, which does not yet include those edits. A crashed leader's
+   `reconciled` marker is never accepted once the successor has recorded its incarnation. Moving the
    checkout, or putting a different directory at its path, stops the old server from serving it.
 6. **Live edits:** an edit is reflected within the ratified incremental budget; a body-only edit keeps
    every declaration ID; an added declaration resolves a previously unresolved call elsewhere.
