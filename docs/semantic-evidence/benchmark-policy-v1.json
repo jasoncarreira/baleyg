@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "status": "ratifiedPolicyNotBenchmarkEvidence",
+  "approval": {
+    "approvedOn": "2026-09-22",
+    "amendmentsApprovedOn": "2026-09-23",
+    "amendments": ["A1", "A2"],
+    "contractReviewer": "@jasoncarreira",
+    "finalApprover": "@jasoncarreira",
+    "benchmarkDecisionOwner": "@jasoncarreira",
+    "independentTechnicalCheck": "Feature Factory work-reviewer",
+    "boundArtifactHashes": ["contract", "corpus", "policy", "baseline"],
+    "hashRecordLocations": ["stage1PullRequest", "decisionRegister"]
+  },
+  "quality": {
+    "languages": ["java", "rust", "python", "javascript"],
+    "conformancePassPct": 100,
+    "preservationPct": 100,
+    "preservedProperties": ["ranges", "hashes", "IDs", "owners", "ordinals", "controlRegions", "callbackBoundaries", "expectedCoverageRows"],
+    "identicalImports": 3,
+    "normalizedOutput": "deterministic",
+    "acceptedStaleFactsMax": 0,
+    "acceptedMismatchedFactsMax": 0,
+    "staticRuntimeObservedClaimsMax": 0,
+    "falseDirectExecutionPromotionsMax": 0,
+    "nonExecutableEvidence": ["ambiguous", "unresolved", "dynamic", "external", "declarationOnly"],
+    "directDispatchPrecisionPct": 100,
+    "directDispatchGate": "empiricalPrecisionAndZeroFalsePromotions",
+    "insufficientRequiredPopulationResult": {"status": "notMeasured", "value": null, "passes": false},
+    "realProducerQualification": {
+      "interval": "wilsonScoreTwoSidedLowerBound",
+      "confidencePct": 95,
+      "z": 1.959963984540054,
+      "lowerBoundFormula": "(p+z*z/(2*n)-z*sqrt(p*(1-p)/n+z*z/(4*n*n)))/(1+z*z/n)",
+      "pDefinition": "successes/denominator",
+      "minimumPositiveOracleCases": 1000,
+      "minimumHardNegativeOracleCases": 1000,
+      "minimumMetricDenominator": 1000,
+      "minimumScope": "perLanguagePerMeasuredCapability",
+      "undersizedResult": "notMeasured",
+      "notMeasuredValue": null,
+      "notMeasuredPasses": false,
+      "comparison": "unroundedLowerBoundTimes100GteFloor",
+      "floorsPct": {
+        "java": {"exactBindingReferencePrecision": 99, "supportedFactRecall": 95, "typePossibleDispatchRecall": 95},
+        "rust": {"exactBindingReferencePrecision": 99, "supportedFactRecall": 90, "typePossibleDispatchRecall": 90},
+        "python": {"exactBindingReferencePrecision": 99, "supportedFactRecall": 85, "typePossibleDispatchRecall": 80},
+        "javascript": {"exactBindingReferencePrecision": 99, "supportedFactRecall": 95, "typePossibleDispatchRecall": 90}
+      }
+    },
+    "recallPopulation": "oracleFactsDeclaredSupportedByPinnedProfile",
+    "dispositionReportPopulation": "fullOracleDenominator",
+    "separateDispositions": ["unsupported", "ambiguous", "unresolved", "dynamic"],
+    "relabelAfterProducerOutputAllowed": false
+  },
+  "performance": {
+    "limitComparison": "lte",
+    "defaultBoundedQuery": {"depth": 2, "maxNodes": 150, "maxCalls": 500, "p95Ms": 100},
+    "maximumBoundedQuery": {"depth": 5, "maxNodes": 150, "maxCalls": 500, "p95Ms": 250, "p99Ms": 750},
+    "symbolSubstringSearch": {"p95Ms": 250},
+    "status": {"p95Ms": 25},
+    "sourceByKey": {"p95Ms": 25},
+    "fullIndex": {
+      "includedStages": ["nativeIndex", "semanticImport", "sqlitePublication"],
+      "producerGenerationIncluded": false,
+      "small": {"medianSeconds": 2, "rssMiB": 512},
+      "medium": {"medianSeconds": 30, "rssGiB": 2},
+      "large": {"medianSeconds": 180, "rssGiB": 8}
+    },
+    "incrementalUpdate": {"scope": "trueSingleFile", "mediumP95Seconds": 2, "largeP95Seconds": 5},
+    "storage": {
+      "steadyToCanonicalSerializedEvidenceMaxMultiplier": 3,
+      "steadyMaxGiB": 4,
+      "steadyLimitsCombinedBy": "and",
+      "publicationPeakToSteadyMaxMultiplier": 2,
+      "publicationPeakIncludes": ["database", "WAL", "SHM"]
+    },
+    "mixedLoad": {
+      "concurrentMcpReaderProcesses": 8,
+      "concurrentPublishers": ["nativeRefresh", "explicitIndex"],
+      "mixedRevisionsMax": 0,
+      "partialPublishesMax": 0,
+      "unexpectedToolErrorsMax": 0,
+      "unexpectedProtocolErrorsMax": 0,
+      "lostUpdatesMax": 0,
+      "queryP95Ms": 500,
+      "queryP99Seconds": 1,
+      "publisherWallToSoloMedianMaxMultiplier": 1.25,
+      "explicitRequestWhileJobRunning": {
+        "responses": ["accepted", "queued"],
+        "responseMaxMs": 100,
+        "watcherLeadershipMayBlock": false,
+        "browserDaemonIndexRoute": "queue",
+        "browserBusyStatusForbidden": 409
+      }
+    }
+  },
+  "regressions": {
+    "absoluteLimitsAlwaysGate": true,
+    "relativeFailureComparison": "gt",
+    "queryTimeIncreasePct": 15,
+    "indexTimeIncreasePct": 15,
+    "rssIncreasePct": 10,
+    "storageIncreasePct": 10,
+    "concurrencyThroughputDecreasePct": 10,
+    "qualityDecreasePercentagePoints": 1,
+    "zeroBaselineCounts": {"correctness": 0, "privacy": 0, "falsePromotion": 0},
+    "zeroToPositiveAlwaysFails": true,
+    "nonCountZeroBaselinePolicy": "zeroUnchangedIsNoRegressionAdverseChangeFailsBeneficialChangeDoesNotFail",
+    "comparisonBasis": "sameMetricCohortAndCompleteHardwareProfile"
+  },
+  "baseline": {
+    "name": "semantic-v1",
+    "establishment": "firstFullyPassingBenchmark",
+    "immutableAfterEstablishment": true,
+    "failedRunMayEstablish": false,
+    "failedRunMayRefresh": false,
+    "laterPassingRunMayRefresh": false,
+    "requiredMeasurementMayBeNotMeasured": false,
+    "completeObservedHardwareRequired": true,
+    "allSemanticProducerVersionsRequired": true,
+    "frozenCohortManifestRequired": true,
+    "bindToCompleteHardwareProfile": true,
+    "bindToApprovalArtifactHashes": true
+  },
+  "referenceHost": {
+    "profileId": "mac-mini-m5-pro-v1",
+    "location": "ownerLocal",
+    "paidCloudAuthorized": false,
+    "githubActionsRole": "correctnessOnly",
+    "githubActionsAuthoritativePerformanceHost": false,
+    "missingInventoryBlocksImplementation": false,
+    "completeInventoryRequiredBefore": ["performanceBaselineAcceptance", "performanceThresholdAcceptance", "authoritativeBenchmarkAcceptance", "releaseBaselineAcceptance"]
+  }
+}
