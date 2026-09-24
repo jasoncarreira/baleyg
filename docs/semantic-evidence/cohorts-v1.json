@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "status": "requirementsNotMeasuredCorpus",
+  "languages": ["java", "rust", "python", "javascript"],
+  "conformance": {
+    "minimumScenariosPerLanguage": 32,
+    "minimumScenariosPerCategoryPerLanguage": 4,
+    "categories": ["sameNameOverload", "importsAliases", "callableValues", "recursion", "relationshipsDispatch", "unicodeCoordinates", "coverageFreshness", "compatibilityControl"],
+    "minimumMeasuredCallAnchorsPerLanguage": 120,
+    "minimumReferenceRoleFactsPerLanguage": 40,
+    "referenceCountingUnit": "distinctReferenceRecordNotRole",
+    "allApplicableReferenceRolesRequired": true,
+    "nonApplicableReferenceRoles": {"java": ["alias"], "rust": [], "python": [], "javascript": []},
+    "minimumCallableValueNegativesPerLanguage": 20,
+    "minimumApplicableTypeRelationshipsPerLanguage": 20,
+    "minimumOutcomesPerLanguage": {"resolved": 20, "external": 20, "ambiguous": 20, "unresolved": 20, "unsupported": 20},
+    "externalOutcomeRequires": "provenExternal",
+    "anchorsIndependentlyAuthored": true,
+    "expectedAnswers": "handAuthoredIndependentlyOfEvaluator"
+  },
+  "realProjects": {
+    "selection": "allTrackedFilesOfRelevantLanguage",
+    "exclusionKinds": ["generated", "vendor"],
+    "exclusionsRecordedIn": "cohortManifest",
+    "manifestFrozenBeforeProducerOutput": true,
+    "projects": [
+      {"language": "java", "repository": "junit-team/junit4", "revision": "890f3c972647de378f25e7271d8fbbd9d3456b79", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "java", "repository": "google/gson", "revision": "854c8255b625cf1e13c701a83ea9ccb4caaa576a", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "java", "repository": "google/guava", "revision": "2a11c2a311cfa400ceda7b847b20f0742bf6748f", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "javascript", "repository": "sindresorhus/p-limit", "revision": "a8a6fbec4e0e866d6d779b10889bb4f5567e70eb", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "javascript", "repository": "expressjs/express", "revision": "9a34acf03cb818ff3f8bc40e44176e277a25cbb9", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "javascript", "repository": "eslint/eslint", "revision": "3d2e7cedb7409d8a2c5f2c2fafb14fa22790e40e", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "rust", "repository": "dtolnay/anyhow", "revision": "c63b279f3f4af2b02ca6267d9eb47d6d10497f69", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "rust", "repository": "BurntSushi/ripgrep", "revision": "3fce3b5bb0236da2df6d99672afb8a719642eca7", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "rust", "repository": "tokio-rs/tokio", "revision": "5d5ca1181e3f17d56e03eac9756fa78dba399a39", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "python", "repository": "psf/requests", "revision": "611c6162cbc4ac2020a2f91c7cfa4f3abf9bbb60", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "python", "repository": "pallets/flask", "revision": "d73fa1cdcbd8b1465c151db8924ba58b1dd14e35", "exclusionInventoryStatus": "notRecorded", "exclusions": null},
+      {"language": "python", "repository": "django/django", "revision": "dd6f6b1531984823e3dc56740dfa93f3ceb09357", "exclusionInventoryStatus": "notRecorded", "exclusions": null}
+    ]
+  },
+  "synthetic": {
+    "small": {"dimensionStatus": "notSpecifiedByRatification", "files": null, "sourceMiB": null, "minimumNormalizedFacts": null, "factsScope": null},
+    "medium": {"files": 1000, "sourceMiB": 16, "minimumNormalizedFacts": 50000, "factsScope": "perLanguage"},
+    "large": {"files": 10000, "sourceMiB": 128, "minimumNormalizedFacts": 500000, "factsScope": "overall"},
+    "atCap": {"files": 100000, "sourceMiB": 256, "purpose": "boundedFailureSafetyLimits", "sloApplies": false}
+  }
+}
