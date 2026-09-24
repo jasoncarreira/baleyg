@@ -1,231 +1,91 @@
 # Local index and agent topology
 
-Status: **direction accepted by the owner (2026-09-23); the mechanics in this document are proposed
-until Stage 1 ratifies them.** Stage 1 of the semantic-index program ([#8](https://github.com/jasoncarreira/baleyg/issues/8))
-turns this document into contract text. Paths, commands and fields below are proposals, not claims
-about the current CLI or store. This document supersedes the one-daemon, owner-grant topology of the
-earlier MCP pilot.
+**Status: normative for future Stages 2–4, not shipped behavior.** This #23 contract guides [#10](https://github.com/jasoncarreira/baleyg/issues/10), [#16](https://github.com/jasoncarreira/baleyg/issues/16), and [#17](https://github.com/jasoncarreira/baleyg/issues/17). The owner accepted the direction on 2026-09-23. [#22](semantic-evidence/contract-v1.md) owns semantic identity and evidence meaning; [#24](https://github.com/jasoncarreira/baleyg/issues/24) owns MCP wire form. These are behavior requirements, not prescribed SQL schemas or internal tuning values. The error names below describe refusal outcomes, not an existing error API.
 
-## Problem
+Each selected checkout has a disposable, path-keyed index outside the checkout. Its Git directory holds a workspace UUID that keys durable saved views and notes across moves; a non-Git root uses path identity. Future `baleyg mcp` is a local stdio entry point. Exactly one local lock-elected leader watches and writes native index data. Other processes read verified snapshots and submit persistent reconciliation requests. The UUID marker is the sole permitted topology write into Git metadata, which can itself be inside the checkout.
 
-Coding agents work in many checkouts at once: the main checkout, several Git worktrees, and
-Feature Factory sandboxes that are created and deleted routinely. Each needs evidence about the
-source it is actually editing, not about `main`. Indexing a large codebase is hard enough, so the
-topology around it must stay simple.
+<a id="workspace-discovery"></a>
+## T01 — Discovery and identity
 
-## Design in one paragraph
+An explicit `--workspace` selects exactly that directory, never an ancestor. Otherwise walk upward from cwd to the nearest `.git` entry; if none exists, select cwd. A malformed or inaccessible encountered marker is an error, not permission to search farther upward. Refuse implicit home or filesystem root; an explicit choice still must pass the security and storage-overlap checks. Run no Git subprocess. Require an existing readable directory, refuse a final-component symlink, canonicalize ancestors once, and require a valid UTF-8 absolute root. Capture the opened root's `(device,inode)`; check this identity throughout its lifetime.
 
-Each checkout has an index that is a **pure cache**, stored outside the checkout and keyed by the
-checkout's path. Durable data (saved views, notes) is keyed by a **workspace UUID** kept in the
-checkout's Git directory, so it follows the checkout when it moves. Agents reach the index through
-**`baleyg mcp`**, a stdio MCP server the agent client launches in the checkout. One process per
-checkout is the **leader**, chosen by an OS file lock: it alone watches the files and writes native
-index rows. Node IDs are **stable across edits**, so an edit changes only what it actually changes.
-Anything derived is rebuilt rather than repaired, and cleanup is automatic.
+`root-key` is the 64-digit lowercase hexadecimal SHA-256 of the canonical absolute root's UTF-8 bytes (no trailing slash except `/`, no case or Unicode normalization). Record and verify the full spelling, not only its hash: a different spelling at that key refuses `root_key_collision`. The key determines cache placement, not semantic evidence identity.
 
-## Workspace discovery
+A `.git` marker is either a current-user-owned non-symlink directory or a current-user-owned, regular no-follow UTF-8 file of at most 4096 bytes. A file contains exactly `gitdir: ` followed by a nonempty path, with at most one final LF or CRLF; reject NUL, extra lines or whitespace. Resolve relative targets against the file's parent, normalize `.`/`..`, traverse without symlinks, and require an existing, readable current-user-owned directory. Main checkouts, linked worktrees, submodules and separate-git-dir checkouts use their *selected* Git directory, not `commondir`; separate worktrees have separate UUID markers.
 
-A process chooses its workspace root in this order: an explicit `--workspace PATH`; the Git top level
-of the working directory, found in-process by walking up to a `.git` directory or file; otherwise the
-working directory. The home directory and filesystem root are refused unless named explicitly.
-Baleyg runs no `git` subprocess for discovery or indexing.
+The marker `<git-dir>/baleyg/workspace-id` contains exactly 36 ASCII bytes of a lowercase hyphenated, non-nil UUID; new markers use UUIDv4. Its parent is private, and the marker is a private, current-user-owned, single-link regular file opened no-follow. Invalid ownership, permissions, type or bytes refuse `invalid_workspace_id` without replacement. Create only the missing `baleyg` child under a verified existing Git directory; never manufacture Git ancestors. An exclusive file creation picks one UUID, and losing creators adopt that value. A transient short write by a competing creator can be retried briefly; a crash-left partial marker needs owner intervention, not regeneration. Before *any* creator or adopter acknowledges a valid UUID or attaches a record, it fsyncs the verified marker, its `baleyg` directory and Git parent, in that order; failure refuses `workspace_id_not_durable`. This also lets an opener finish a prior creator's interrupted durability sequence.
 
-## Storage
+The durable `record-id` is that UUID, or `path-<root-key>` without Git. A Git checkout move changes its index key but retains its record; copying the marker deliberately shares that record. A non-Git move disconnects its old, still-reportable record. A marker change during an open requires close/reopen, never silent redirection. Reject roots overlapping either fixed topology location or configured token/ledger paths, including aliases and ancestors.
 
-| State | Location | Keyed by | Lifetime |
-| --- | --- | --- | --- |
-| Index (graph, cached source) | `<cache>/indexes/<root-key>/index.db` | Canonical root path | Cache; rebuilt freely |
-| Leader lock | `<cache>/indexes/<root-key>/leader.lock` | Canonical root path | Removed with its index |
-| Index use lock | `<cache>/indexes/<root-key>.lock`, beside the index directory | Canonical root path | Removed last, by the deleter holding it |
-| Explicit index requests | `<cache>/indexes/<root-key>/requests.db` | Canonical root path | Survives index rebuilds |
-| Fact cache | `<cache>/facts.db` | File content | Cache; size-bounded |
-| Durable data (views, notes, future artifacts) | `<data>/workspaces/<record-id>/workspace.db` | Workspace UUID, or `path-<root-key>` outside Git | Durable; created on first write |
-| Durable use lock | `<data>/workspaces/<record-id>.lock`, beside the record directory | Record id | Removed last, by `forget` holding it |
-| Tokens and Jev/ACP ledgers | Explicitly configured paths | — | Durable |
+## T02 — Locations and store responsibilities
 
-`<cache>` and `<data>` are the fixed per-user cache and data directories from `ProjectDirs` for
-`dev.odin.baleyg`. There is no environment override and no `--state-dir` flag. Nothing Baleyg writes
-lives inside a checkout. Token and ledger paths must be outside every workspace root. There are no
-state migrations: existing saved views and notes are not carried over, and the owner moves any
-existing in-tree ledger directory by hand, once, with Baleyg stopped.
+`<cache>` and `<data>` are fixed per-user `ProjectDirs::from("dev", "odin", "baleyg").cache_dir()` and `.data_local_dir()`. If unavailable, refuse; there is no placement override or state migration. State directories are private and outside selected workspaces. Reject unsafe ownership, symlinks or unexpected file types rather than repairing them. Local OS filesystem locking, safe descriptor opens and durable writes are required; do not claim protection against hostile concurrent ancestor replacement by the same user.
 
-**Workspace UUID.** Stored at `<git-dir>/baleyg/workspace-id`, where `<git-dir>` is `.git` for a main
-checkout, or the directory a `.git` file points to (linked worktree, submodule, `--separate-git-dir`).
-Baleyg parses the `gitdir:` line itself, requires the target to be an existing directory owned by the
-current user, opens the UUID file with no-follow, and accepts only a canonical lowercase UUID; anything
-else is refused, never used as a path. The file is created exclusively, so concurrent first openers
-agree on one UUID. Moving a checkout keeps its UUID, so its views and notes stay connected; its index
-is rebuilt at the new path, cheaply, from the fact cache. A copy keeps the same UUID and shares its
-views and notes, which is harmless. Outside Git there is no UUID: the durable record id is
-`path-<root-key>`, and moving the directory disconnects it (it is reported, never deleted).
+| State | Fixed location | Required content/lifetime |
+| --- | --- | --- |
+| Derived index | `<cache>/indexes/<root-key>/index.db` | Root spelling/identity, schema and extractor compatibility, fresh generation, revision and reconciled leader incarnation; captured source, graph and dependency evidence. Rebuildable. |
+| Leader and index use locks | `<cache>/indexes/<root-key>/leader.lock` and `<cache>/indexes/<root-key>.lock` | Path-keyed; use lock beside protected directory. |
+| Explicit requests | `<cache>/indexes/<root-key>/requests.db` | Root identity and accepted ordered reconciliation requests; survives index rebuild, but is discarded with an obsolete index directory. |
+| Optional facts | `<cache>/facts.db` | Path-neutral extracted facts keyed by language, extractor version, extraction context and content hash; misses/eviction must not change evidence. |
+| Durable record and use lock | `<data>/workspaces/<record-id>/workspace.db` and `<data>/workspaces/<record-id>.lock` | Views, notes, their captured #22 `DurableAnchor` values and last-saved known roots. Created on first save, never automatically deleted. |
+| Tokens and Jev/ACP ledgers | Explicitly configured external paths | Durable, outside topology ownership. |
 
-A durable record directory and `workspace.db` are created only when the first view or note is written,
-so checkouts that never save anything, such as most Feature Factory sandboxes, leave nothing durable
-behind. Every process that opens a durable record, to read or write, holds a shared `flock` on the
-record's use lock for as long as it has `workspace.db` open; `baleyg forget` needs it exclusively.
+An index publication changes generation only on creation/rebuild, advances revision on successful publication, and exposes one coherent graph/source snapshot with its reconciled incarnation. A failure leaves the prior committed snapshot intact, but cannot make an incompatible or unreconciled snapshot servable. The fact cache cannot be authoritative: a missing, corrupt, conflicting or unavailable entry falls back to extraction or reports extraction failure, never substitutes fabricated evidence. #10 chooses its tables and indexes to meet [#22](semantic-evidence/contract-v1.md) and its query budgets; no generic record-envelope table or future artifact placeholder is reserved here.
 
-## Index as a cache
+A durable item survives index rebuild, checkout moves with the same UUID, and future index cleanup. Preserve each captured anchor exactly as #22 defines it, including its document, revision, header and sibling evidence; attachment is computed against a requested snapshot, not written back as a guessed new anchor. An unreadable/incompatible durable record fails closed without rebuild, migration or deletion. First-save creation is serialized under exclusive use: persist newly made parent entries and the committed initial item/anchors before success. Reads never create a durable database; deleting the last item does not delete a valid empty record. A crash-left incomplete first creation is not a successful save and must not be silently treated as one. Future artifact storage belongs to its feature owner.
 
-- The index records its schema version and extractor version. Any mismatch, or an integrity failure,
-  means rebuild. There is no index migration. The leader rebuilds **inside the existing file** (drop
-  and recreate the index tables in one transaction), so readers holding it open keep a consistent
-  snapshot. Explicit requests live in `requests.db`, which a rebuild does not touch.
-- **Use locks.** Use locks live *beside* the directory they protect, never inside it, so deleting the
-  directory cannot remove or recreate the lock mid-operation. A deleter holds the lock exclusively for
-  the whole operation, removes the directory, unlinks the lock file last, then releases. Every locker
-  verifies after locking that the path still names the file it locked and retries if not, so a process
-  racing a deletion starts over against fresh state.
-- **Index use lock.** Every process that has the index open holds a shared `flock` on its use lock.
-  Deleting
-  or recreating `index.db` (a file SQLite can no longer open or rebuild, or garbage collection)
-  requires the exclusive lock, taken non-blocking; a reader that gets `SQLITE_CORRUPT` closes its
-  connection, releases its shared lock, and retries after the leader has recreated the file. So no two
-  database incarnations ever share one pathname while anyone has the old one open.
-- `indexGeneration` is a random value set when the index is created and replaced on every rebuild.
-  Evidence basis is `{indexGeneration, indexRevision}`, so revisions from a rebuilt index never match
-  old ones.
-- Change detection is a stat scan (size, mtime, ctime, inode) against the index's file table,
-  hashing only files whose stat changed, with Git's racy-timestamp rule (re-hash when mtime or ctime
-  is not older than the previous scan). ctime changes on every write and cannot be set by tools that
-  preserve mtime, which closes the same-size, preserved-mtime case. It uses the existing `ignore`-crate walker and its exclusions.
-- The **fact cache** holds a path-neutral extraction record per
-  `(language, extractorVersion, extractionContextDigest, contentHash)`, written with
-  `INSERT OR IGNORE`. A missing or evicted entry is just a cache miss. Assembly binds a record to a
-  path and derives the node IDs. A new worktree, or a moved checkout, parses only files the cache has
-  never seen.
+<a id="leader"></a>
+## T03 — Use locks, leader and reads
 
-## Leader
+Every opener of `index.db`, `requests.db` or `leader.lock` holds shared flock on the index use lock while protected handles are open; every opener of a durable DB similarly holds shared durable use. For deletion or exceptional recreation, take the corresponding use lock exclusively and nonblocking, after closing protected handles. Locks are *beside* directories; delete the use-lock path last. After acquiring any lock, compare the held file's identity with the no-follow pathname identity. If they differ, release and reopen against the new pathname. Busy locks never authorize deletion, forceful process eviction or a blocking lock upgrade. Close protected DB handles before releasing use.
 
-- Every Baleyg process for a checkout (each `baleyg mcp`, the browser daemon, an explicit CLI job)
-  tries a non-blocking `flock` on `leader.lock` (a non-blocking variant of the `initialization_lock`
-  helper the Jev/ACP ledgers already use), and after locking verifies that the path still names the
-  locked file. The holder is the leader. The kernel releases the lock when the leader exits or
-  crashes; non-leaders retry the lock periodically and at their next request, and the first to succeed
-  takes over. This is a local OS lock, not a distributed protocol.
-- **Leader incarnation.** Immediately after locking, the leader writes a fresh random incarnation id
-  into `leader.lock`. The index's `reconciled` marker records the incarnation that reconciled it.
-  Evidence is served only while the lock is held and the marker's incarnation equals the one in
-  `leader.lock`, so once a successor has written its id, a crashed leader's marker no longer matches.
-  **Accepted window:** between a successor taking the lock and writing its id (a few system calls), a
-  reader may still serve the previous leader's last reconciled revision. That evidence is labelled
-  with its basis and lags the files by no more than ordinary watcher latency does; it is the same
-  guarantee readers have at all times, not an exception to it.
-- **Root identity.** The leader records the root directory's device and inode when it starts, and
-  re-checks them before every reconcile and publish; readers re-check before serving. If the path no
-  longer names that directory (the checkout moved, or something else now occupies the path), the
-  process stops serving and leading for it; it never scans or publishes a different directory.
-- **One ordered queue.** The leader runs all native work, meaning watcher batches, reconciles and
-  explicit requests, one job at a time from a single queue, so a slow job can never commit an older
-  observation over a newer one. A long job checks the watcher's pending events before committing and
-  re-reads any path that changed while it ran.
-- **Requests from others.** An explicit index request (CLI or browser) is appended to `requests.db`;
-  the leader claims it, runs it, and marks it done; a request claimed by a leader that then died is
-  reclaimed by the next one. Requests are queued, never rejected. If there is no leader, the requester
-  takes the lock and leads for the job.
-- **Watcher.** The leader watches the checkout with the `notify` crate, debounces and coalesces events,
-  re-extracts changed files (or takes them from the fact cache), and publishes one short transaction
-  per batch. Watcher overflow, lost-event notifications, watch-limit exhaustion, bulk changes such as
-  a checkout or rebase, and system wake trigger a full stat reconcile; a slow periodic reconcile
-  catches silently lost events.
-- Readers use SQLite WAL snapshots and never block the leader. Each publish advances `indexRevision`.
+Any MCP process, browser daemon or CLI process can acquire the path's exclusive leader lock nonblocking. The holder alone watches, claims/completes requests and writes native index evidence. It verifies leader-lock identity, then writes and syncs a fresh random incarnation to that lock immediately, before scans or other jobs. No PID, timeout or clock lease elects a leader. On takeover, it invalidates old reconciliation, validates the captured root, and full-reconciles before serving new evidence. A failed initial reconcile leaves evidence unavailable. Nonleaders try again on later work/periodically; an explicit requester can become leader. A suspended live holder remains leader until it releases the OS lock.
 
-## Stable node IDs
+A reader checks that the root pathname still matches its opened `(device,inode)`, a leader actually holds the exclusive lock, the lock's incarnation agrees with the reconciled marker in one coherent index snapshot, and the same conditions still hold after materializing its response. The leader checks its held lock rather than trying to probe itself. If checks fail, discard the response and return not-ready or root-changed instead of serving stale evidence. Readers use consistent SQLite snapshots; a response never mixes revisions. A leader checks root identity before scans and publication, and both leaders and followers check before/after serving. On missing/moved/replaced root, stop native work and serving at the old pathname; never follow the moved object or scan a replacement using old captured identity.
 
-A declaration ID is `sid:v1:` plus the first 128 bits (32 lowercase hex digits) of the
-[contract-v1](semantic-evidence/contract-v1.md) domain-separated SHA-256 digest over its canonical
-logical source set, normalized relative path, language and declaration key (enclosing keys, kind,
-exact measured name, Java overload signature or same-key sibling ordinal). Range and content hash
-are separate fields, so a body-only edit changes no ID. Call sites and control regions use
-revision-local `occ:v1:` IDs: the same-length digest prefix over revision ID, owner syntax ID, kind,
-and ordinal. SCIP symbols are separate semantic bindings, never node IDs, for every language.
-Readable path/key labels are **separate presentation-only fields**, never identity or request input.
+**Accepted takeover limit:** between a successor's successful flock acquisition and its new incarnation write, a follower can observe the contended lock plus the predecessor's still-matching marker and serve the predecessor's last reconciled snapshot. There is **no finite wall-clock bound under process suspension**. Do not insert deliberate work between verification and the marker write; once it is visible, old-incarnation reads fail until reconciliation commits. Neither watcher latency nor the final-check/response race is a linearizable filesystem-freshness guarantee.
 
-For example, these illustrative result fields use logical source set `core` and Java, with
-revision `rev-148` for the call occurrence. Display keys are not hashed or used as selectors:
+## T04 — One native queue and explicit requests
 
-```json
-[
-  {
-    "id": "sid:v1:b70d3246cbc86a736696fb558d1e2348",
-    "displayKey": "src/main/java/com/acme/billing/Invoice.java#class:Invoice"
-  },
-  {
-    "id": "occ:v1:c5fb440e061729989aca50c29a8f0b5c",
-    "displayKey": "...Invoice.java#class:Invoice/method:total()@call:3"
-  }
-]
-```
+The leader serializes watcher batches, full reconciles and explicit requests in one ordered native work stream, so an older job cannot publish after a newer job. Explicit browser and CLI indexing always enqueue a reconcile in `requests.db`, even inside the leader process; MCP read tools do not directly mutate native rows. An accepted request has `queued → running → done | failed`. Claim requests in submission order, with one active native writer. Requests stay queued rather than rejected for mere leadership contention; invalid input or unavailable/unsafe storage must fail explicitly rather than claim acceptance. A waiting client may stop waiting without cancelling accepted work.
 
-Saved views and notes anchor to a declaration ID plus a hash of its projected header metadata.
-If an ID now names a declaration whose header hash differs, the anchor orphans instead of silently
-moving to another declaration. Identical-header siblings also require independently established
-group continuity; changed or unknown continuity orphans their anchors. Anchors survive body edits
-but orphan on removal, rename, changed header or unsafe sibling-group change.
+Acceptance is durable before it is acknowledged. Only the locked leader claims, executes and completes requests. If it dies, the next verified leader reclaims its running requests and may repeat work. A crash after publication but before completion can cause another reconciliation and revision advance; it cannot roll source state back. Index publication and request completion need not be one cross-database transaction. Keep requests when rebuilding or exceptionally recreating *index.db*. They are not user-owned durable data: removing an obsolete index directory discards its requests.
 
-## Re-resolution
+Every request records the `(device,inode)` of the root for which it was submitted. An old-path leader that detects a missing or replaced root fails its queued/running requests with `root_changed`, stops work and closes. A replacement opener checks the old request identity and fails any remaining old-root requests before admitting new-root work or publishing a freshly reconciled index. After a move with no old-path opener, no process is required to update abandoned rows: a waiting client checks its captured root identity and reports `root_changed`, and GC may discard the old index and requests when the root is gone. No long-term failure quarantine, retirement state or special administrator leader is required. Never execute an old-root request on a new occupant. If a replacement opener cannot record old-root failure, it leaves requests untouched and cannot proceed until a leader retries; no client may report success for an old-root request. #16 chooses cancellation, deduplication, retry accounting and ordinary history policy; this contract requires no numeric queue cap or attempt limit.
 
-Each binding records the simple names it looked up, including lookups that found nothing or several
-candidates, **and the names of the scopes it traversed**: enclosing classes and modules, supertypes,
-imported modules, and re-export sources. When the leader publishes a changed file, it diffs the
-file's old and new declaration records and collects every name whose declaration was added, removed,
-or changed in anything a lookup can see (visibility, export, signature, owner, supertypes, imports,
-re-exports). It re-resolves every binding that recorded one of those names, as a looked-up name or as
-a traversed scope, in the same transaction. Name keys over-approximate, which is safe. Above a
-threshold of changed files, it re-resolves the whole workspace.
+## T05 — Watch, capture, reassembly and publication
 
-## Semantic evidence (after the syntax-tier release)
+The native source walker uses the established `ignore`-crate exclusions: no symlink traversal, hidden and common build/vendor directory exclusions, and supported `js,mjs,cjs,rs,java,py` extensions, subject to #22 source-set admission. In-root `.gitignore`/`.ignore` matter; ambient ancestor/global ignore rules and Git `info/exclude` must not silently influence a captured root. Record captured source bytes/hash and relevant admission, ignore, project config/manifest, toolchain and dependency inputs needed for an honest #22 basis. A source-set descriptor change requires reopening to capture a new admission. A native extractor must refuse or recapture if an undeclared external input would affect output; a path-neutral cached fact cannot carry path IDs or masquerade as a new revision.
 
-- Semantic facts are overlay rows keyed by `(path, contentHash, artifact)`, imported by an explicit
-  owner command in a short transaction. An overlay applies only while its document's content hash
-  equals the current one, so an edit withdraws it without any write.
-- **Freshness is computed at read time.** At import, an artifact is *basis-current* only if its
-  manifest (every document's content hash plus the build, configuration and dependency inputs)
-  matches the current source set exactly; otherwise all of its overlays are `possiblyStale` from the
-  start. Each source set carries a `lastSurfaceChangeRevision`, advanced whenever a declaration
-  surface or a build/config/dependency input in it, **or in any source set it depends on**, changes.
-  A basis-current overlay becomes `possiblyStale` once that revision is newer than its import
-  revision. This is conservative and costs nothing on edit.
-- A semantic binding whose target declaration ID no longer exists is `staleTarget`, never resolved,
-  and is never rebound by name or position.
-- Semantic basis names the producer, profile, artifact hash, document content hash, and a digest of the
-  source-set manifest.
+A leader watches creates, edits, removals and renames (both ends), debounces/coalesces events, and performs periodic full stat reconciliation. Overflow, watch failure, wake, bulk change and relevant config/ignore change require full reconciliation. If watching cannot work, expose degraded status and continue periodic full scans. Every full scan must re-enumerate sources and visited ignore rules and check even previously absent or unchanged-stat tracked config/manifest inputs; silently missed events must eventually be detectable. Watcher events are hints, not proof of a complete filesystem snapshot. Stat comparisons can avoid hashing unchanged sources, but racy timestamps, uncertain precision or clock behavior require conservative hashing. A preserved-mtime edit should be noticed by ctime where the platform supplies it. Unreadable or unstable required inputs cause failure, not a falsely complete publish.
 
-## Revision pins
+Build evidence from captured bytes and recheck pending changes and root identity before publication. If a watched path changes mid-job, reread or promote to full reconciliation before committing; events after the final cutoff stay pending. Publish graph, source bytes, input inventory, dependency observations, generation/revision and current reconciliation marker atomically. Failed extraction, unstable inputs, cancellation or a failed commit leaves the prior publication intact; on takeover the old publication stays unavailable until the new leader reconciles. Internal work/resource limits may yield explicit failure, never a silently truncated successful snapshot. No instantaneous freshness or guaranteed timer-to-publication deadline is promised.
 
-Every result reports its `evidenceBasis` and comes from one read transaction. Pins are optional: a
-client may send a complete `expectedBasis` (`indexGeneration` and `indexRevision` together, never a
-revision alone), and a stale one always returns `revision_conflict` with the current basis. `baleyg_read_source` may instead take `expectedContentHash`, and conflicts if the cached file
-differs. There is no change log and no compatibility exception.
+<a id="semantic-evidence-after-the-syntax-tier-release"></a>
+For native reassembly, retain dependencies for *measured* lookups, including unsuccessful and ambiguous lookups and traversed enclosing scopes, supertypes, imported modules and re-export sources. Diff old/new declaration surfaces, including headers, visibility, signatures, owners, imports, exports, supertypes and re-exports. Reassemble affected native call/declaration owners and reverse dependent admitted source sets in the same publication; unknown dependencies require wider, potentially whole-workspace reassembly. A body-only edit need not trigger unrelated surface dependents. No fixed fanout threshold is a topology contract. This work does **not** manufacture semantic target bindings: #22's producer owns `Reference`, `CallBinding`, `DeclarationBinding`, `Symbol` and `TypeRelationship` evidence. A newly added declaration cannot turn a historical unresolved semantic binding into a resolved one. Captured semantic artifacts remain historical; #22 decides their basis freshness and target checks. This document adds no semantic-import command or storage format.
 
-## Cleanup (automatic)
+## T06 — Rebuild and cleanup
 
-The leader runs garbage collection at most once a day:
+A mismatched extractor/schema or invalid derived index must not be served or migrated. The leader normally rebuilds index-owned content transactionally **in the existing index file**, with a new random generation and a reconciled full snapshot; requests, facts and durable records survive. A failed rebuild does not serve invalid old state as a fallback. An already-open compatible reader can finish a coherent snapshot only if leader/incarnation/root read checks still pass.
 
-- Delete the index directory of any root path that no longer exists, or that has not been opened for
-  30 days, but only after taking its index use lock exclusively, non-blocking; if anyone has it open,
-  skip it.
-- Evict fact-cache entries least recently used beyond a size cap.
-- Durable records are never deleted automatically. Empty ones never exist (records are created on
-  first write). Records whose checkout can no longer be found are reported by `baleyg gc --report`;
-  `baleyg forget <record-id>` deletes one explicitly, after showing what it holds, while holding the
-  record's use lock exclusively. Ledgers are never touched.
+Only actual corruption or an index-file format failure preventing in-place replacement permits exceptional recreation. Ordinary busy, full-disk, permissions and I/O failures do not authorize deleting an index. Close old connections, take verified exclusive index use nonblocking, then recreate only index.db and its sidecars while retaining `requests.db` and leader lock. If a reader holds shared use, defer recovery. No old and new file incarnations can coexist at the same pathname under live openers; partial recovery never signals success.
 
-## Threat and resource boundary
+A leader records last-opened time when it takes leadership, and may refresh it periodically while leading. Followers never write open-age metadata or index/request state to read. Automatic GC deletes a derived index directory when its recorded root is **missing or replaced**, or it has **not been opened for 30 days**. It must hold verified exclusive use nonblocking and recheck eligibility; skip busy or unknown/unreadable entries. This is not a timer guarantee, and followers opening without leadership do not refresh recorded age. Requests die with a deleted root's index directory. A root which returns or is replaced starts fresh under its new captured identity; it does not revive prior requests. Optional facts may be evicted without changing evidence. Never automatically delete durable records, UUID markers, configured token/ledger trees or legacy state.
 
-- stdio has no network surface: no port, no Host/Origin handling, no DNS-rebinding exposure, and other
-  OS users cannot connect.
-- The boundary is the OS user. Any same-user process can launch `baleyg mcp` or read the index
-  directly, just as it can read the source. MCP tools add bounded, typed access, not isolation. A
-  hostile-agent threat model needs a separate OS account or sandbox.
-- Configuring `baleyg mcp` for an agent approves disclosure of the whole indexed checkout to that agent
-  and its provider. There is no per-path scope and no grant.
-- Per-call limits bound each request, not aggregate use across many MCP processes of one user.
-- Repository text is untrusted data, never an instruction or permission.
+`baleyg gc --report` is read-only: show eligible, busy and unknown derived entries, and durable IDs with item counts and last-saved known paths that are missing, without claiming to find every copy of a UUID. Do not initialize missing records or update open age in report mode. `baleyg forget <record-id>` accepts only a canonical UUID or `path-` plus its canonical root key, not a supplied filesystem path. Under verified exclusive durable use, show the record inventory and warn that every checkout sharing its UUID loses these items. Require explicit confirmation (exact ID interactively, or `--yes` noninteractively); unsafe/unknown contents require warning, not silent deletion. Delete only that record and recognized sidecars, unlink use lock last; never touch UUID, index, facts, requests or ledgers. Report success only after completed removal. Later explicit saving can create a new record for the unchanged identity.
 
-## Superseded
+## T07 — Ownership and limits
 
-This topology replaces owner-issued grants, limited principals, budgets, enrollment identity
-latching, grant handoff files and the HTTP tool routes of the earlier pilot documents, and the
-in-checkout index, placement, quarantine and per-path versioning of earlier drafts of this document.
-The [multi-project viability review](multi-project-viability.md) is still accurate about the current
-code, but its one-daemon registry recommendation is not the chosen agent topology.
+[#22's stable identifiers](semantic-evidence/contract-v1.md#stable-identifiers), [durable anchors](semantic-evidence/contract-v1.md#durable-anchors), and [basis/freshness](semantic-evidence/contract-v1.md#basis-and-freshness) govern IDs, attachment, pins and evidence interpretation. This topology's root key, UUID, index generation/revision and incarnation serve placement/coordination, not competing semantic algorithms. #24 defines wire requests, result basis and pin shape. Current `--state-dir`, old path-bound DBs, Store migrations, one-shot indexing and HTTP jobs are historical code, not compatibility promises. No legacy state or saved view/note migration is implied. Move existing in-tree ledgers manually with Baleyg stopped.
+
+The boundary is the OS user, not an agent principal. stdio opens no network listener and grants its configured agent access to the selected checkout, without per-path grants; source text is data, never instructions. Per-call limits do not cap many same-user processes in aggregate. Unsupported local locking refuses topology use; network/distributed filesystems and hostile same-user mutation fall outside this safety claim.
+
+## T08 — Worked checks for Stages 2–4
+
+The labels here are fixture placeholders, **not #22 identity vectors**. For each case, verify the reported result and the unchanged or changed protected state; the document itself adds no tests or production code.
+
+1. **Selection and persistence (AC1).** Implicit `/repo/sub` finds `/repo/.git`; explicit `/repo/sub` without its own marker uses path identity. A valid `.git` pointer to a private linked-worktree Git directory gets that directory's UUID. Malformed pointers, symlink targets and invalid UUIDs refuse without searching upward or replacing bytes. Two creators converge on one marker; if either crashes before fsync, a valid-marker adopter completes marker/directory/parent fsync before saving. Save note N under UUID U; moving `/repo` changes its path-keyed index and keeps N. Copying U shares N. Moving a non-Git root instead leaves its old path record reportable. A read-only open creates no durable DB.
+2. **Locks and takeover (AC2).** Reader holds shared index use; GC/recreation cannot get exclusive use and leaves files untouched. After deletion, a waiter on the old lock inode detects the changed pathname and retries. A leader at generation G1/incarnation A crashes; no-holder evidence refuses. Successor takes flock and pauses before writing B: a follower may still serve A's last coherent snapshot for an unbounded wall time under suspension. Once B is written, A's marker cannot serve; only B's successful full root-checked reconciliation enables evidence. A live suspended leader cannot be stolen by timeouts.
+3. **Ordered updates and root identity (AC3).** Browser request Q1 and CLI request Q2 queue while a watcher edit is pending; one leader publishes serially, and every result uses one coherent revision. A crash after Q1's index publish but before its completion permits repeat work without regression; Q2 remains accepted across index rebuild. Move the root or replace its inode: old openers refuse evidence and waiting clients report `root_changed`. An old-path leader or replacement opener fails old-root queued/running rows before any replacement work; without either opener, GC may discard the abandoned requests. Replacement enters through fresh reconciliation, never through old requests; failed recording cannot be reported as success. Overflow or a lost watcher event forces full scan; a silently changed tracked config is found by the next successful full scan.
+4. **Reassembly and recovery (AC4).** Add a declaration named by an unresolved native lookup: reassemble affected native owners and dependents atomically, including previously unsuccessful lookups, but leave historical semantic `CallBinding` unresolved. Remove a supertype/import and reassemble its dependents. A failed publish leaves earlier graph, dependencies and source bytes together. An incompatible index rebuilds in place with new generation G2 while accepted requests and saved note N survive. Corruption requiring recreation waits for all shared-use readers and preserves requests; busy/full-disk alone never triggers recreation.
+5. **Durable and cleanup boundary (AC5).** Save a view and captured #22 anchor, change its header, then read: #22 orphans attachment without overwriting the saved anchor. A valid empty record after deleting its last item remains. GC skips an open index and may remove a missing/replaced root or a 30-day unopened derived index under exclusive use; it cannot remove the saved view. A follower read writes no last-opened metadata. `gc --report` changes no files. `forget U` refuses without exclusive use/confirmation, then removes only U's record; UUIDs, requests belonging to other indexes, facts and ledgers remain.
