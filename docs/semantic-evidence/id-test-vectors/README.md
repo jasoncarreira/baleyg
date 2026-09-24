@@ -54,7 +54,7 @@ Each language uses the same 16 slots, for exactly 64 cases and 16 cases per lang
 | 11 | Third identical-header member changes slot 9's group count |
 | 12 | Nested declaration with an outermost-to-parent ancestor chain |
 | 13 | Anonymous declaration with a null name |
-| 14 | Another non-ASCII measured name |
+| 14 | Another non-ASCII measured name; Java also exercises quote, backslash and LF in the logical `sourceSet` ID |
 | 15 | NFC name containing U+00E9 |
 | 16 | NFD name containing U+0065 U+0301, linked to slot 15 |
 
@@ -65,17 +65,17 @@ Java slots 5 and 6 use distinct measured parameter-type signatures, so each over
 Expected values were derived from the ratified text, separately from `check.mjs`:
 
 1. Copy only `{sourceSet,path,language,ancestors,declaration}` from the descriptor. Serialize with the contract's canonical JSON rules: ASCII-sorted object keys, specified array order, required nulls, UTF-8 without normalization, and no whitespace or newline.
-2. Record those literal bytes as `inputHex`. Prepend the literal syntax `domainHex`, calculate SHA-256, record its lowercase hex, and spell the stable ID as `sid:v1:<digest>`.
+2. Record those literal bytes as `inputHex`. Prepend the literal syntax `domainHex`, calculate SHA-256, record the **full 64-hex** digest, and spell the stable ID as `sid:v1:` plus exactly its **first 32 hex characters** (first 16 digest bytes). The full digest remains the integrity witness; the ID is a shorter handle.
 3. Canonically serialize every distinct projected `Header` without adding source text or omitted syntax. Hash each with the header domain.
 4. Put the resulting header hashes in the descriptor's sibling order in canonical `{"headers":[...]}`. Hash that input with the sibling-group domain. Count all members and occurrences of the focused header hash.
 5. Copy the literal stable ID and header/group values into the durable anchor. The revision is captured by the anchor but is excluded from stable-ID, header, and group inputs.
 6. For linked cases, audit the prior anchor in contract order: old ID presence, header equality, then duplicate-group hash/counts and independent continuity when required. Record the literal result; never search by name or header for a replacement.
 
-The byte review must decode every `inputHex` and compare it with its stated descriptor. In particular, slots 15 and 16 retain different UTF-8 byte sequences; lookup normalization never enters these bytes. Body-only slots 2 and 10 change revision IDs but keep their identity/header inputs. Slot 7 deliberately leaves the prior ordinal-zero ID on the inserted member, whose different header causes `headerMismatch`. Slot 8 keeps the old ordinal-zero ID and header. Slot 10 assumes independently proven unchanged membership/order. Slot 11 states changed continuity and has unequal group hash/counts, so it yields `groupChanged`. Slot 16 cannot find the prior NFC ID and yields `missing`.
+The byte review must decode every `inputHex` and compare it with its stated descriptor. Java slot 14 uses a synthetic but valid logical `sourceSet` containing U+0022, U+005C, and U+000A: the **canonical input bytes** must contain `\"`, `\\`, and `\u000a` respectively, not a short control escape. Source-set IDs are `Text`; source paths prohibit backslash, and measured declaration names cannot carry these characters. In particular, slots 15 and 16 retain different UTF-8 byte sequences; lookup normalization never enters these bytes. Body-only slots 2 and 10 change revision IDs but keep their identity/header inputs. Slot 7 deliberately leaves the prior ordinal-zero ID on the inserted member, whose different header causes `headerMismatch`. Slot 8 keeps the old ordinal-zero ID and header. Slot 10 assumes independently proven unchanged membership/order. Slot 11 states changed continuity and has unequal group hash/counts, so it yields `groupChanged`. Slot 16 cannot find the prior NFC ID and yields `missing`.
 
 ## Deliberately limited checker
 
-`check.mjs` checks JSON parsing, exact required/unknown fields, documented primitive and enum shapes, version 1, total and per-language counts, unique case IDs, unique per-case digest labels, lowercase byte hex, allowed domains, and raw SHA-256 of `domainBytes || inputBytes`.
+`check.mjs` strictly rejects invalid UTF-8 bytes before JSON parsing **and rejects duplicate object keys in the raw vector file**, including escaped-equivalent spellings; exact required/unknown fields; documented primitive and enum shapes; version 1; total and per-language counts; unique case IDs and per-case digest labels; lowercase byte hex; allowed domains; and raw SHA-256 of `domainBytes || inputBytes`. Its lexical duplicate-key pass decodes JSON key spellings, leaves full syntax checking to `JSON.parse`, and bounds input to 8 MiB and nesting to 128 levels. Run `node docs/semantic-evidence/id-test-vectors/check.mjs --self-test` for literal, escaped-equivalent, nested, and distinct-scope duplicate-key controls and invalid UTF-8 rejection.
 
 It does **not** canonicalize descriptors; compute or compare stable IDs; derive ordinals, headers, groups, or counts; normalize names; evaluate continuity or anchor results; or model semantic records, joins, coverage, freshness, dispatch, traversal, cursors, or frontiers. A well-shaped but incorrect `expected.stableId` can therefore pass. A matching raw digest also proves only that the declared bytes hash as stated, not that those bytes encode the specified descriptor. This boundary is intentional so that a second implementation cannot bless the author's semantic error.
 
@@ -84,7 +84,7 @@ These vectors document prospective measured syntax identity and conservative anc
 ## Final review procedure
 
 1. Run the exact command above from the repository root and observe 64 cases and the reported digest count.
-2. On disposable copies only, confirm failures for malformed JSON, an unknown field, a duplicate case ID, invalid hex, an unknown domain, and a changed digest. Do not commit those copies or add fixtures.
+2. Run `node docs/semantic-evidence/id-test-vectors/check.mjs --self-test`. On disposable copies only, also confirm failures for duplicate raw object keys (including escaped-equivalent spellings), malformed JSON, an unknown field, a duplicate case ID, invalid hex, an unknown domain, and a changed digest. Do not commit those copies or add fixtures.
 3. Independently inspect all 64 descriptors, canonical byte strings, literal digests and IDs, anchor fields, links, continuity assumptions, and prior results against the final contract. Green raw-digest output is insufficient.
 4. Confirm the 16-slot allocation for each language, Java-only signature rule, sibling membership/order, NFC/NFD code points, and the absence of occurrence, reference, graph, source, or token suites.
 5. Have the orchestrator-assigned independent test verifier perform the integrated contract/decision/README/vector/checker cross-check and record findings in run artifacts, not another repository file.

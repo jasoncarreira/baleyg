@@ -29,6 +29,7 @@ Subject to independent review, we ratify `contract-v1.md` as the complete prospe
 
 - All logical records are closed. Every field is required; nullable fields carry explicit nulls. Unknown fields are rejected by a future v1 consumer.
 - Canonical bytes and all identity inputs are fixed by the contract. Lookup normalization cannot enter ID bytes. Header hashes cover only the declared projection, not raw source headers.
+- The PR review chose opaque 128-bit syntax and occurrence handles (the first 16 bytes of their full domain-separated SHA-256 digests) to reduce repeated result size. Full 256-bit digests remain in integrity fields and vector digest rows. Distinct canonical inputs that collide on an emitted handle invalidate the affected artifact; presentation-only display keys are never identity or identity-hash inputs.
 - Durable attachment never searches by name or header for a replacement. Duplicate-header survival needs independently proven group continuity; equal hashes and counts alone do not prove it.
 - Per-producer coverage may be validly partial. Malformed artifacts are rejected atomically. Old evidence survives only as labelled history.
 - Graph answers select one producer or syntax-only evidence. They expose every measured call as one ordered edge when within call budget, retain static semantic boundaries, and use ordered frontiers only for depth/node/call limits.
@@ -69,7 +70,7 @@ Existing Java/Rust/Python IDs that include path/content/ranges and JavaScript im
 | Record validation, joins, freshness, dispatch, BFS/frontiers | #10 and later implementation stages | Runtime code and executable behavioral tests. |
 | Trustworthy sibling-group edit classification | #10 and #27–#30 corpora | Evidence that membership/order is unchanged; vectors only state assumptions. |
 | Topology and persistence | #23 | Storage model, migrations, grants, read projections. |
-| MCP wire format | #24 | DTO/schema/error transport and compatibility. |
+| MCP wire format and presentation-only `displayKey` result field | #24 (implemented by #17 after ratification) | DTO/schema/error transport, field nullability, ordering, and compatibility; no display key in identity-typed requests. |
 | Corpus consistency checker | #26 | Cross-record semantic validation. |
 | Source/token witnesses and language/compiler semantics | #27–#30 | Parser witnesses, binding quality, role-floor proof, and edit evidence. |
 | Traceability | #9 | Requirement-to-evidence links only. |
