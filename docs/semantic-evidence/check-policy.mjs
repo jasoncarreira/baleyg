@@ -350,7 +350,8 @@ function crossFileTests(documents) {
     if (JSON.stringify(left) !== JSON.stringify(right)) fail(path, "cross-file mismatch");
   };
   identical(policy.quality.languages, cohort.languages, "cohorts-v1.json:$.languages");
-  identical(policy.quality.languages, Object.keys(policy.quality.realProducerQualification.floorsPct),
+  identical([...policy.quality.languages].sort(),
+    Object.keys(policy.quality.realProducerQualification.floorsPct).sort(),
     "benchmark-policy-v1.json:$.quality.realProducerQualification.floorsPct");
   identical(policy.referenceHost.profileId, hardware.profileId, "hardware/mac-mini-m5-pro-v1.json:$.profileId");
   identical(hardware.observed.cpuCoreGroups.reduce((sum, count) => sum + count, 0),
@@ -481,6 +482,12 @@ function selfTest() {
     assert.doesNotThrow(() => checkDocument(Buffer.from(" \n" + JSON.stringify(reordered) + "\n"), file));
   }
   strictInputTests();
+  const reorderedFloors = structuredClone(snapshots);
+  const floors = reorderedFloors[names[0]].quality.realProducerQualification;
+  floors.floorsPct = Object.fromEntries(Object.entries(floors.floorsPct).reverse());
+  const checkedReorder = Object.fromEntries(names.map((name) =>
+    [name, checkDocument(buffer(reorderedFloors[name]), name)]));
+  assert.doesNotThrow(() => crossFileTests(checkedReorder));
   const copies = structuredClone(snapshots);
   copies[names[2]].profileId = "other";
   assert.throws(() => crossFileTests(copies), /profileId: cross-file mismatch/); cases++;
