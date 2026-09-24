@@ -131,18 +131,36 @@ record's use lock for as long as it has `workspace.db` open; `baleyg forget` nee
 
 ## Stable node IDs
 
-A declaration's ID is its path plus a declaration key: the chain of enclosing declarations, its kind,
-its name, and an overload signature or ordinal among same-named siblings. Its range and the file's
-content hash are separate fields. A body-only edit changes no IDs. A call site is identified by its
-caller's ID and its ordinal within the caller, and a control region likewise; these are occurrence IDs
-within one revision. SCIP symbols are separate semantic bindings, never node IDs, for every language.
-Saved views and notes anchor to a declaration ID plus a hash of the declaration's header text (name,
-signature, modifiers). If an ID now names a declaration whose header hash differs, which can happen
-when an earlier same-named sibling is inserted or removed, the anchor orphans rather than silently
-moving to another declaration. When same-named siblings have identical headers, the hash cannot tell
-them apart, so an anchor also records how many identical-header siblings existed; if that count
-changes, the anchor orphans. Anchors survive body edits and orphan when the declaration is removed,
-renamed, its header changes, or its identical-header sibling group changes.
+A declaration ID is `sid:v1:` plus the first 128 bits (32 lowercase hex digits) of the
+[contract-v1](semantic-evidence/contract-v1.md) domain-separated SHA-256 digest over its canonical
+logical source set, normalized relative path, language and declaration key (enclosing keys, kind,
+exact measured name, Java overload signature or same-key sibling ordinal). Range and content hash
+are separate fields, so a body-only edit changes no ID. Call sites and control regions use
+revision-local `occ:v1:` IDs: the same-length digest prefix over revision ID, owner syntax ID, kind,
+and ordinal. SCIP symbols are separate semantic bindings, never node IDs, for every language.
+Readable path/key labels are **separate presentation-only fields**, never identity or request input.
+
+For example, these illustrative result fields use logical source set `core` and Java, with
+revision `rev-148` for the call occurrence. Display keys are not hashed or used as selectors:
+
+```json
+[
+  {
+    "id": "sid:v1:b70d3246cbc86a736696fb558d1e2348",
+    "displayKey": "src/main/java/com/acme/billing/Invoice.java#class:Invoice"
+  },
+  {
+    "id": "occ:v1:c5fb440e061729989aca50c29a8f0b5c",
+    "displayKey": "...Invoice.java#class:Invoice/method:total()@call:3"
+  }
+]
+```
+
+Saved views and notes anchor to a declaration ID plus a hash of its projected header metadata.
+If an ID now names a declaration whose header hash differs, the anchor orphans instead of silently
+moving to another declaration. Identical-header siblings also require independently established
+group continuity; changed or unknown continuity orphans their anchors. Anchors survive body edits
+but orphan on removal, rename, changed header or unsafe sibling-group change.
 
 ## Re-resolution
 

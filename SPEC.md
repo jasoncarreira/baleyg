@@ -295,27 +295,35 @@ a subgraph whose nodes happen to be tables.
 SCIP supplies semantic symbol strings; local SCIP IDs require document/artifact scoping.
 The existing JavaScript importer replaces syntax IDs with imported identities. **Owner decision
 (2026-09-23): that behavior is removed.** Every language uses **stable syntax IDs** for declarations:
-the path plus a declaration key (enclosing declarations, kind, name, and an overload signature or
-ordinal among same-named siblings). Range and the file's content hash are separate fields, so a
-body-only edit changes no IDs. SCIP symbols are recorded in a separate binding layer, never as node
-IDs. Call sites and control regions are occurrence IDs within a revision (caller ID plus ordinal).
-Backward compatibility is not required for this change.
+`sid:v1:` plus the first 128 bits (32 lowercase hex digits) of the domain-separated SHA-256 digest
+of the canonical source-set, path, language, and declaration key (enclosing declarations, kind,
+exact measured name, Java overload signature or same-key sibling ordinal). Range and file content
+hash remain separate fields, so a body-only edit changes no IDs. Readable path/key strings are
+separate presentation-only `displayKey` values, never identity, accepted input, or hashed. SCIP
+symbols remain in a separate binding layer, never as node IDs. Call sites and control regions use
+revision-local `occ:v1:` IDs: the first 128 bits of the digest over revision, shortened owner syntax
+ID, occurrence kind and ordinal. Backward compatibility is not required for this change.
 
 Identity and location are separate fields. Renames and moves of a declaration change its ID;
 annotations on a removed declaration remain visible orphans. Durable anchors also store a hash of the
-declaration's header, so an ordinal that shifts onto a different same-named sibling orphans the
-anchor instead of silently moving it; an anchor on a declaration with identical-header siblings
-orphans whenever that sibling group changes.
+declaration's projected header metadata, so an ordinal that shifts onto a different same-named
+sibling orphans the anchor instead of silently moving it. Identical-header sibling anchors also
+require independently established group continuity; changed or unknown continuity orphans them.
 
 Illustrative only: node IDs are stable syntax IDs; the SCIP symbol is a separate binding; a measured
-call site keeps its own identity, separate from its declared target and dispatch kind.
+call site keeps its own identity, separate from its declared target and dispatch kind. These example
+hashes assume logical source set `core`, Java, the displayed paths, `type` declaration keys for
+classes, zero-based declaration ordinals, ordinary Java method signatures (empty except
+`rateFor(Region)`), and revision `rev-148` for occurrence IDs. `displayKey` is a readable result
+label, never an identity or request selector; this is not a complete v1 DTO schema.
 
 ```json
 {
   "schemaVersion": 1,
   "nodes": [{
-    "id": "src/main/java/com/acme/billing/Invoice.java#class:Invoice",
-    "kind": "class",
+    "id": "sid:v1:b70d3246cbc86a736696fb558d1e2348",
+    "displayKey": "src/main/java/com/acme/billing/Invoice.java#class:Invoice",
+    "kind": "type",
     "name": "Invoice",
     "container": "com.acme.billing",
     "anchor": { "path": "src/main/java/com/acme/billing/Invoice.java",
@@ -323,21 +331,22 @@ call site keeps its own identity, separate from its declared target and dispatch
     "provenance": { "source": "treesitter", "evidenceKind": "measuredSyntax", "indexRev": 148 }
   }],
   "semanticBindings": [{
-    "node": "src/main/java/com/acme/billing/Invoice.java#class:Invoice",
+    "node": "sid:v1:b70d3246cbc86a736696fb558d1e2348",
     "symbol": "scip-java maven acme/billing 1.4 com/acme/billing/Invoice#",
     "provenance": { "source": "scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
   }],
   "callSites": [{
-    "id": "...Invoice.java#class:Invoice/method:total()@call:3",
-    "caller": "...Invoice.java#class:Invoice/method:total()",
+    "id": "occ:v1:c5fb440e061729989aca50c29a8f0b5c",
+    "displayKey": "...Invoice.java#class:Invoice/method:total()@call:3",
+    "caller": "sid:v1:f2ff8bd933db88969122e5d61d873746",
     "range": [1312, 1340],
     "ordinal": 3,
-    "regions": ["...Invoice.java#class:Invoice/method:total()@if:1"],
+    "regions": ["occ:v1:e7bdfb1616a2481d2ea152a56d2c5698"],
     "provenance": { "source": "treesitter", "evidenceKind": "measuredSyntax", "indexRev": 148 }
   }],
   "callBindings": [{
-    "callSite": "...Invoice.java#class:Invoice/method:total()@call:3",
-    "declaredTarget": "...TaxTable.java#class:TaxTable/method:rateFor(Region)",
+    "callSite": "occ:v1:c5fb440e061729989aca50c29a8f0b5c",
+    "declaredTarget": "sid:v1:7bfe74998e06c7d1c080fe6f60acf8f3",
     "dispatch": "virtual",
     "disposition": "resolved",
     "provenance": { "source": "scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
@@ -371,8 +380,10 @@ sequence schema.
 
 A live view is a query plus overrides: seed, bounded traversal, pins, hidden IDs and notes.
 On reindex, reevaluate only against an explicit new basis and expose orphaned IDs. Current
-saved views implement a subset of that model. The IDs in the example are stable declaration IDs,
-so views and notes survive edits and orphan only when a declaration is removed or renamed.
+saved views implement a subset of that model. The IDs in the example are stable declaration IDs;
+readable display keys appear only in presentation results, not saved-view selectors. Anchors survive
+body edits under the contract's continuity rules and orphan on removal, rename, changed header, or
+unsafe sibling-group change.
 
 A proposed **published artifact** is an immutable version: preserve its query/options, frozen
 server-produced DTO or explicitly agent-authored graph, provenance and evidence basis. It must
@@ -384,11 +395,11 @@ remain distinct from evidence views even when they cite valid source ranges.
 {
   "viewId": "v_8f21",
   "kind": "sequence",
-  "query": { "seed": "...Invoice.java#class:Invoice/method:settle()", "depth": 3,
+  "query": { "seed": "sid:v1:a10398f88e7a816d9be9dc7a223dbaf8", "depth": 3,
              "edgeKinds": ["calls"], "excludePackages": ["java.util"] },
-  "pins": { "...TaxTable.java#class:TaxTable": { "x": 420, "y": 80 } },
-  "hidden": ["...Logger.java#class:Logger"],
-  "notes": [{ "anchor": "...Invoice.java#class:Invoice/method:settle()", "body": "retries twice" }]
+  "pins": { "sid:v1:73cb719e7a1458a1ad243bc28da2e229": { "x": 420, "y": 80 } },
+  "hidden": ["sid:v1:16cd2ced398a21036bd15efffdec0434"],
+  "notes": [{ "anchor": "sid:v1:a10398f88e7a816d9be9dc7a223dbaf8", "body": "retries twice" }]
 }
 ```
 
