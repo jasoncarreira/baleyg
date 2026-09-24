@@ -14,6 +14,7 @@ const ALLOWED = new Set([
   "verify_timeout_ms",
   "bootstrap",
   "bootstrap_timeout_ms",
+  "max_retries",
 ]);
 
 function loadConfig() {
@@ -67,6 +68,7 @@ test("factory config uses the closed supported schema", () => {
   assert.equal(typeof config.bootstrap, "string");
   assert.notEqual(config.bootstrap.trim(), "");
   assert.equal(Number.isSafeInteger(config.bootstrap_timeout_ms) && config.bootstrap_timeout_ms > 0, true);
+  assert.equal(config.max_retries, 5);
 });
 
 test("resolver accepts only canonical Baleyg issue references", () => {
