@@ -383,9 +383,9 @@ A body-only or unrelated edit therefore preserves duplicate anchors only with in
 | `.targetId` | `SyntaxId?` | NodeLimit uses refused target; otherwise null. | Wrong combination invalid. |
 | `.nextOrdinal` | `UInt?` | Depth=0; callLimit=next local call ordinal; nodeLimit=null. | Wrong combination invalid. |
 | `.omittedCalls` | `UInt` | Depth/callLimit exact remaining count; nodeLimit 0. | Wrong arithmetic invalid. |
-| `Warning.code` | `coverageIncomplete \| staleEvidence \| staleTarget \| bindingAmbiguous \| syntaxOnly` | Describes returned limitation. | Unknown code invalid. |
+| `Warning.code` | `coverageIncomplete \| staleEvidence \| staleTarget \| bindingAmbiguous \| syntaxOnly` | Required exactly as in Warning completeness (warnings-v1). | Unknown code invalid. |
 | `.message` | `Text` | Concrete warning. | Empty invalid. |
-| `.provenanceId` | `Text?` | Relevant provenance or null for aggregate absence. | Dangling invalid. |
+| `.provenanceId` | `Text?` | Relevant returned provenance, or null for an aggregate warning (including `possiblyStale`). | Dangling invalid. |
 | `GraphResult.request` | `GraphRequest` | Exact effective request, with defaults materialized. | Mismatch invalid. |
 | `.resolvedRevisionId` | `Text` | Equals pinned revision. | Fallback/mismatch invalid. |
 | `.nodes` | `GraphNode[]` | Admission order. | Wrong order/duplicate invalid. |
@@ -395,7 +395,7 @@ A body-only or unrelated edit therefore preserves duplicate anchors only with in
 | `.provenance` | `Provenance[]` | Relevant evidence and freshness. | Dangling/omitted selected evidence invalid. |
 | `.partial` | `boolean` | True iff truncated, selected coverage not complete, or any boundary edge. | False never asserts runtime completeness. |
 | `.truncated` | `boolean` | True iff any depth/node/call frontier exists. | Exact cap alone does not set it. |
-| `.warnings` | `Warning[]` | Unique by `(code,provenanceId,message)`, sorted by that tuple. | Duplicate/unsorted invalid. |
+| `.warnings` | `Warning[]` | Exactly the warnings-v1 set; unique by `(code,provenanceId)`; sorted by `(code,provenanceId,message)`. | Missing, extra, duplicate-key, or unsorted warning invalid. |
 | `Error.code` | `invalidRequest \| invalidRecord \| invalidRange \| invalidDigest \| unsupportedEncoding \| sourceSetDenied \| revisionUnavailable \| rootMissing \| producerUnavailable` | Exact failure category. | Unknown code invalid. |
 | `.message` | `Text` | Concrete failure. | Empty invalid. |
 | `.field` | `Text?` | Offending logical field when applicable. | No fabricated field. |
@@ -405,6 +405,35 @@ A body-only or unrelated edit therefore preserves duplicate anchors only with in
 | failure `.error` | `Error` | Present only on failure. | Missing error or any result field invalid. |
 
 Success is `{ok:true,result:GraphResult}` and failure is `{ok:false,error:Error}`. They are exclusive. Corrupt snapshots yield no best-effort result.
+
+### Warning completeness (warnings-v1)
+
+A `GraphResult` carries **exactly** one warning for each key `(code, provenanceId)` whose condition below holds, and no other warnings. A warning's `message` is free nonempty text, not part of its key or trigger. Evaluate only the returned request, coverage, provenance, and bindings on returned edges; evidence outside the result cannot add a warning.
+
+| Code | Required if and only if | `provenanceId` |
+|---|---|---|
+| `syntaxOnly` | `request.semanticProducerId` is null. | null |
+| `coverageIncomplete` | At least one returned *selected* coverage row is not complete. This is exactly the selected-coverage-incomplete operand of `partial`, not `partial` as a whole: a selected row has `state=failed` or `state=partial`. | null |
+| `staleEvidence` | A returned `Provenance` has `freshness=stale`. | That provenance's `id`; one warning for each stale provenance. |
+| `staleEvidence` | At least one returned `Provenance` has `freshness=possiblyStale`. | null; one aggregate warning, however many provenances are possibly stale. |
+| `staleTarget` | A binding on a returned edge has `staleTarget=true`. | That binding's `provenanceId`; one warning per distinct provenance. |
+| `bindingAmbiguous` | A binding on a returned edge has `resolution=ambiguous`. | That binding's `provenanceId`; one warning per distinct provenance. |
+
+The aggregate `possiblyStale` key avoids repeating one warning for every affected document during ordinary manifest changes; each returned provenance still exposes its own freshness.
+
+The coverage row rule requires all relevant rows to exist as specified above. A missing required row makes the result invalid; it is not a warning substitute. An unselected `omitted` or `unsupported` row alone does not trigger `coverageIncomplete`; an unsupported *requested role* represented by a selected `partial` row does. A frontier, boundary edge, or `partial=true` alone does not trigger that code. Conversely, independent coverage or freshness conditions still trigger their own warnings even when a boundary or frontier exists.
+
+Deduplicate by `(code, provenanceId)` even when multiple edges share one binding provenance; two messages for the same key are invalid. Sort warnings by `(code, provenanceId, message)` using the declared **code enum order** and null-before-text tuple ordering in the conventions above, not lexical code order. A missing required warning, an extra warning without its condition, or an invalid/duplicate key invalidates the result. Unresolved and external bindings, dispatch boundaries, node limits, and truncation have no *dedicated* warning code; their `boundaryReason`, frontier, `partial`, and `truncated` fields retain their existing meanings. No new warning codes are introduced.
+
+#### Worked warning checks
+
+The following are hand-evaluated warning-key arrays; each assumes an otherwise valid result, a nonempty message for every listed warning, no unmentioned trigger, and the required coverage/provenance/edge fields. The arrays state `(code, provenanceId)` only because message text does not affect the required set.
+
+1. **Syntax only.** The request has `semanticProducerId=null`, all returned selected coverage is complete, the root has no calls, and no returned provenance is non-fresh. `partial=false`; warning keys are `[(syntaxOnly,null)]`. No `coverageIncomplete` follows from syntax-only selection itself.
+2. **Two ambiguous bindings, one provenance.** The request names a semantic producer; two returned edges have ambiguous bindings with `provenanceId=pA`, and all selected coverage is complete and returned provenance fresh. Both edges are boundaries, so `partial=true`, but warning keys are only `[(bindingAmbiguous,pA)]`—not two warnings and not `coverageIncomplete`.
+3. **Three possibly-stale provenances.** Returned provenances `p1,p2,p3` each have `freshness=possiblyStale`; the request names a semantic producer, selected coverage is complete, and no returned edge binding is ambiguous or has a stale target. Warning keys are `[(staleEvidence,null)]`, not three per-provenance warnings. Each provenance still exposes its own freshness.
+4. **Mixed freshness and target.** Returned `p1` and `p3` are `possiblyStale`, `p2` is `stale`, and a returned edge binding has `provenanceId=p3` and `staleTarget=true` because its internal target bytes changed. The request names a semantic producer and selected coverage is complete. Warning keys, in code-enum and null-before-text order, are `[(staleEvidence,null),(staleEvidence,p2),(staleTarget,p3)]`; the stale boundary sets `partial=true` without adding `coverageIncomplete`.
+5. **Coverage versus other partial causes.** With a selected `partial` coverage row and an unselected `unsupported` row for a distinct relevant tuple, no other triggers, `partial=true` and warning keys are `[(coverageIncomplete,null)]`. If the selected row becomes `complete` while only the unselected `unsupported` row remains, no boundary or frontier exists, and all else stays fresh, then `partial=false` and `warnings=[]`. A depth frontier alone instead makes `partial=true` and `truncated=true` with `warnings=[]`.
 
 ### Pinned FIFO breadth-first algorithm
 
