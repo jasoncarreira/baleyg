@@ -7,9 +7,10 @@ const test = require("node:test");
 
 const ROOT = join(__dirname, "..");
 const CONFIG_PATH = join(ROOT, ".factory.json");
-const REQUIRED = ["publish", "resolve", "verify"];
+const REQUIRED = ["resolve", "verify"];
 const ALLOWED = new Set([
   ...REQUIRED,
+  "publish",
   "pr_draft",
   "verify_timeout_ms",
   "bootstrap",
@@ -63,6 +64,7 @@ test("factory config uses the closed supported schema", () => {
     assert.equal(typeof config[key], "string");
     assert.notEqual(config[key].trim(), "");
   }
+  assert.equal(Object.hasOwn(config, "publish"), false, "use the default PR publisher, not a push-only override");
   assert.equal(typeof config.pr_draft, "boolean");
   assert.equal(Number.isSafeInteger(config.verify_timeout_ms) && config.verify_timeout_ms > 0, true);
   assert.equal(typeof config.bootstrap, "string");
