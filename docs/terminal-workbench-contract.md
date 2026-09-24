@@ -1,8 +1,9 @@
 # Unified terminal and agent workbench — design contract
 
-Status: accepted target UX, **not implemented**. This document does not authorize launching
-agents, attaching to existing Herdr panes, installing terminal libraries or running repository
-commands. The four-tool [MCP pilot](mcp-readonly-pilot-contract.md) remains a smaller first slice.
+Status: **direction accepted by the owner; not implemented.** This document does not authorize
+launching agents, attaching to existing Herdr panes, installing terminal libraries or running
+repository commands. The stdio [MCP contract](mcp-readonly-pilot-contract.md) is a separate, smaller
+slice.
 
 ## User outcome
 
@@ -26,7 +27,7 @@ chosen interaction mode; do not duplicate a runtime just to make an ACP transcri
 
 Use a real PTY backend and local terminal renderer (candidate: Rust `portable-pty` and xterm.js).
 Choose/pin dependencies during implementation. A terminal ID, project/worktree binding, ownership,
-launch configuration and read/input permissions are independent from an MCP grant or index revision.
+launch configuration and read/input permissions are independent from MCP access and index revision.
 
 - Launch only from explicit user action and a trusted command/profile. No model-supplied automatic
   launch string, source-selection side effect, auto-start on deep link, or provider retry.
@@ -43,8 +44,10 @@ launch configuration and read/input permissions are independent from an MCP gran
 - Closing a tab/disconnecting the browser detaches by default; terminating an owned process requires
   a separate action. Define daemon restart semantics honestly—durable transcript metadata alone does
   not preserve a PTY process. Do not claim kill/revoke always stops detached descendants.
-- Source edits made by an agent do not silently replace the cached index. Show index freshness and
-  require the existing explicit reindex operation until a separate watcher policy is implemented.
+- Show index freshness per checkout. Agent source edits reach the cached index only through
+  published revisions; the accepted watcher design refreshes native evidence automatically
+  ([local topology](local-topology.md#leader)), and until it is
+  implemented the explicit reindex operation remains the only refresh.
 
 ## Optional Herdr attachment
 
@@ -61,8 +64,9 @@ Until a supported attachment works, provide honest association/focus links rathe
 
 ## ACP and MCP boundaries
 
-Both terminal and ACP agents get the same portable Baleyg MCP tool schemas and scoped grants.
-A terminal input grant is not an MCP artifact-write grant, and neither grants arbitrary ACP
+Both terminal and ACP agents get the same portable Baleyg MCP tool schemas, served by a stdio
+`baleyg mcp` launched in the agent's checkout ([local topology](local-topology.md)). Terminal input
+authority is not MCP artifact-write authority, and neither grants arbitrary ACP
 filesystem/terminal capabilities. Negotiate implemented capabilities; preserve Mimir's provider
 admission, local/remote host distinction, permission gates and one-client constraint. Baleyg may be
 the chosen ACP client; it must not connect as a second observer beside an occupied editor session.

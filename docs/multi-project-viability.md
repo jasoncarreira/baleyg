@@ -1,5 +1,10 @@
 # Multi-project viability
 
+> **Topology decision (2026-09-23).** The facts below about the current code still hold. For agents, the
+> chosen topology is not the one-daemon registry recommended here but one index per checkout reached through
+> a stdio `baleyg mcp` server; see the [local topology](local-topology.md). A registry may still back a
+> future browser project picker.
+
 ## Decision summary
 
 **Yes, one multi-project SQLite database is viable. It is not needed to get one Baleyg window with a project/space selector.** The smallest safe approach is one daemon with a small project registry, routing to the existing per-workspace stores. Keep independent project context, index state, notes and provider allowances. Add cross-project search or links only when needed.

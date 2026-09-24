@@ -1,8 +1,14 @@
 # MCP pilot slice 0 — storage and cancellation findings
 
-Status: **slice 0 complete. Verdict: GO — the [pilot contract](mcp-readonly-pilot-contract.md) is
-implementable as written.** No design amendment is required. Two small additions to its acceptance
-tests are recommended below.
+> **Superseded context (2026-09-23).** These findings were gathered for the grant-based pilot. The SQLite
+> observations (a cold read-only open creates `-wal`/`-shm` sidecars; cancellation behaviour) remain
+> useful facts for any reader of the index. The enrollment identity design they supported is
+> replaced by the `indexGeneration` basis in the [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
+Status (historical): **slice 0 complete. Verdict at the time: GO — the grant-based pilot contract as
+it stood before 2026-09-23 was implementable as written.** That verdict applies only to the
+superseded contract (recoverable from Git history, commit `7122ed4`), not to the stdio contract now
+at `mcp-readonly-pilot-contract.md`.
 
 These are measured results from a throwaway spike, not shipped code. The spike used disposable
 fixture databases in a scratch directory. No inspected repository, provider, credential, running
@@ -75,9 +81,10 @@ The documented detection boundary is confirmed exactly: persistent replacement, 
 are detected; an inode-preserving overwrite is not. The contract's "Detection boundary" paragraph
 needs no change.
 
-## Recommended additions to the contract
+## Recommended additions to the (superseded) contract
 
-Both are test additions, not design changes.
+Both were test additions to the grant-based contract. The first still applies to any test that checks
+a non-writable directory; the second applies to any cancellation test of a SQLite read.
 
 1. **Acceptance test 7** should require the non-writable-directory case to run as a **non-root**
    user. Run as root, the same case silently succeeds, because root bypasses the directory

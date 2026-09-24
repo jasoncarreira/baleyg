@@ -1,6 +1,12 @@
 # Coding-agent integration plan
 
-Status: **proposal, not implemented**. This work inspected Baleyg, the local Mimir checkout,
+Status: **not implemented.** The per-checkout index and stdio MCP direction is accepted by the owner
+(2026-09-23), with its mechanics proposed until Stage 1 of the semantic-index program ratifies them.
+The registry, artifact, Herdr, terminal and ACP parts below remain proposals with their own later
+slices; Stage 1 does not ratify them.
+Revised 2026-09-23 for the [local topology](local-topology.md): agents use a per-checkout stdio MCP
+server with no grants.
+This work inspected Baleyg, the local Mimir checkout,
 and the installed Herdr CLI/schema. It did not start or prompt Herdr/Mimir coding agents,
 call project-configured providers, change either runtime, index projects, or change the
 running Baleyg deployment.
@@ -42,34 +48,26 @@ Herdr discovery must not silently edit any agent's MCP configuration.
 
 ### Portable server configuration
 
-Phase 1 binds a local stdio adapter directly to **one existing daemon and its current store**.
-There is no project registry or `--project PROJECT_ID` prerequisite. See the
-[read-only pilot contract](mcp-readonly-pilot-contract.md) for the proposed descriptor,
-owner-only grant bootstrap, four tool schemas, errors and tests.
+The agent client launches `baleyg mcp` in the checkout it works in. The server discovers that
+workspace (explicit `--workspace`, Git top level, working directory) and serves only that checkout's
+index, a pure cache in the per-user cache directory. It needs no daemon, port, descriptor, token or grant, and it exits with
+its client. There is no project registry or `--project PROJECT_ID` prerequisite. See the
+[MCP contract](mcp-readonly-pilot-contract.md) for tool schemas, pins, errors and tests, and the
+[local topology](local-topology.md) for storage, workspace identity, the fact cache, the leader,
+real-time native refresh and cleanup.
 
 Illustrative configuration, **not a current working command**:
 
 ```json
-{
-  "mcpServers": {
-    "baleyg": {
-      "command": "baleyg",
-      "args": ["mcp", "--binding-file", "/private/operator/baleyg/pilot.json"]
-    }
-  }
-}
+{ "mcpServers": { "baleyg": { "command": "baleyg", "args": ["mcp"] } } }
 ```
 
-The descriptor points to a private, short-lived grant file outside agent-readable roots.
-Token values never enter argv, model context or logs. A trusted owner helper issues the grant;
-the adapter cannot mint it and never receives the long-lived owner bearer. Stdout is MCP-only.
-The file approach works with ordinary command/args MCP launchers; a trusted launcher can instead
-pass an inherited private FD. Neither is isolation from unrestricted same-user shell access.
+Stdout is MCP-only. The same configuration works in every checkout and worktree because the
+workspace comes from the launch directory, not from configuration.
 
 A remote MCP client cannot reach local stdio automatically. Mimir's proposed local proxy extension
-is one bridge. Authenticated MCP Streamable HTTP is a later option, not part of this pilot.
-MCP standardizes tool transport; it does not replace backend authorization, runtime sandboxing,
-or disclosure approval. No new network listener or model/provider call is needed for pilot tests.
+is one bridge. MCP standardizes tool transport; it does not replace runtime sandboxing or disclosure
+approval. No network listener or model/provider call is needed for tests.
 
 ## Ownership
 
@@ -79,10 +77,11 @@ or disclosure approval. No new network listener or model/provider call is needed
 | Real PTY and embedded terminal tabs for direct agents explicitly launched by Baleyg | Baleyg owns only these launched sessions; existing runtime owns its agent loop |
 | Mimir agent loop, model/provider choice, ACP session, Hands execution and permission policy | Mimir |
 | Other coding-agent runtimes | Their existing harness |
-| Single daemon/store binding and indexed evidence; registered projects later | Baleyg |
+| Per-checkout indexes, native refresh and indexed evidence | Baleyg |
+| Lifetime of each `baleyg mcp` process | The agent client that launched it |
 | Structural queries, static sequence/class projections, bounded snapshot text search | Baleyg |
 | Diagram validation, durable versions, evidence references, browser display | Baleyg |
-| Permission to disclose local information to a remote agent | Explicit operator grant enforced at the local bridge and runtime policy |
+| Permission to disclose local information to an agent | Configuring `baleyg mcp` for that agent (whole checkout); remote bridges add runtime/destination policy |
 
 Do not duplicate credentials, permission caches, run retries, or pane ownership across systems.
 An external-agent integration must not reset or bypass existing Baleyg Jev/ACP accounting.
@@ -99,8 +98,8 @@ sequences, Java/Python class diagrams including hierarchy, and source/member nav
 Method candidates retain their original IDs/ranges and uncertainty. Same-class Java candidates
 are **not** compiler bindings. Unresolved graph edges remain unresolved.
 
-Missing: a portable tool server, bounded snapshot grep, uniform project/revision guards,
-agent principals/scoped grants, multi-project routing, versioned diagram artifacts, artifact
+Missing: a portable tool server, bounded snapshot grep, uniform revision guards, per-checkout
+indexes, a file watcher and delta publication, versioned diagram artifacts, artifact
 notifications, and deep links. Existing saved views are raw graph queries, not a general
 sequence/class/authored-diagram artifact system. Their writes have no artifact CAS/ownership.
 Incoming **call** hierarchy is not implemented; class relations/hierarchy are a different capability.
@@ -176,22 +175,22 @@ own conversation/tool/approval tabs. Show a terminal only when an actual PTY is 
 Do not launch a redundant Mimir ACP client to fill a tab already owned by an editor. A user-requested
 Baleyg-owned adapter/session is allowed where the runtime supports it.
 
-Embedded terminals can execute/edit far beyond a read-only MCP grant. Their launch/input authority,
+Embedded terminals can execute/edit far beyond the read-only MCP catalog. Their launch/input authority,
 transport security and effective runtime permissions require a separate slice and explicit approval.
 No terminal implementation or agent launch is part of this documentation change or MCP Phase 1.
 
 ## Project and run identity
 
-The first pilot binds directly to one existing daemon's canonical workspace and state directory.
-A non-secret descriptor carries `daemonInstanceId` and `storeGeneration`; the server retains the
-canonical binding. `evidenceBasis` adds `indexRevision`. These are proposed fields, not current
-store columns. A fresh daemon incarnation or replaced cache rotates the binding generation and
-requires a new owner grant. No global registry, stable project catalog or workspace picker is needed.
+Each checkout's index is keyed by its path; its durable views and notes are keyed by a workspace UUID
+kept in its Git directory. `evidenceBasis` is `{indexGeneration, indexRevision}`; the generation is
+new whenever the index is rebuilt. These are proposed fields, not current store columns. Separate worktrees are
+separate workspaces with separate indexes; they share only content-addressed extraction results. No
+global registry, stable project catalog or workspace picker is needed for agents.
 
-Later, an explicit registry can name multiple per-workspace `cache.db` / `workspace.db` pairs.
-Do not merge databases to get a picker. See [multi-project viability](multi-project-viability.md).
-A future opaque `projectId` identifies an explicitly registered checkout/worktree without relying
-on Git. Relocation is an explicit rebind; separate worktrees remain separate registrations.
+A future browser project picker can list known checkouts without merging databases. See
+[multi-project viability](multi-project-viability.md). A moved checkout keeps its UUID, so its saved
+views and notes stay connected, and its index is rebuilt cheaply from the fact cache. A copy shares
+the original's views and notes.
 
 Keep runtime session/run IDs, optional Herdr connection/pane associations, and future artifact IDs
 and artifact revisions separate from source revision. Client-supplied labels do not authenticate
@@ -207,27 +206,27 @@ a mutable global “current project.” Future registry enumeration must itself 
 
 | Tool | Phase 1 purpose |
 | --- | --- |
-| `baleyg_workspace_describe` | Describe the single authorized binding, current revision, capabilities and limits; no indexing |
+| `baleyg_workspace_describe` | Describe the launch checkout, current basis, index state, coverage and limits; no indexing on request |
 | `baleyg_find_symbols` | Bounded literal name/ID lookup in the current cached snapshot |
-| `baleyg_inspect` | One declaration or its bounded depth-one outgoing calls; no arbitrary graph query |
+| `baleyg_inspect` | Bounded views of one symbol: first `declaration`, `outgoing_calls` and `incoming_calls`; later `call_paths`, `usages`, `type_hierarchy`, `implementations` and `coverage`; no arbitrary graph query |
 | `baleyg_read_source` | Bounded cached source range, with hash and exact range |
 
-All reads **except describe** require the full binding and `expectedRevision`, matching both the
-grant's admitted revision and a transaction-pinned snapshot. See the
-[pilot contract](mcp-readonly-pilot-contract.md) for exact limits and schemas. No hidden navigation,
+Every read comes from one snapshot and reports its basis. Pins are optional: a client may send a
+complete `expectedBasis`, or `expectedContentHash` for a source read, and a stale one always conflicts.
+The views first serve syntax-tier evidence and gain semantic evidence as the language stages land. See the
+[MCP contract](mcp-readonly-pilot-contract.md) for exact limits and schemas. No hidden navigation,
 diagram, text-search, artifact, live-file, provider or runtime-control tools belong to this slice.
-Tool allowlists and MCP read-only annotations are not a security boundary: the daemon must enforce
-the limited credential on dedicated tool-service routes and deny all other routes.
+Tool allowlists and MCP read-only annotations are not a security boundary; the server simply has no
+code path to those operations.
 
 Later tools may add `baleyg_search_text`, `baleyg_navigate`, `baleyg_diagram_preview` and
 `baleyg_artifact_create`, `baleyg_artifact_update`, `baleyg_artifact_publish`,
 `baleyg_artifact_get`, `baleyg_artifact_list`. They are roadmap names, not Phase 1 capabilities.
 Artifact reads and conceptual drafts will need their own version/authorization contract.
 
-Return original IDs/ranges, evidence basis, certainty, warnings and explicit truncation. An exhausted
-budget is not “no results.” Uniform guards require implementation: `/api/symbols` and `/api/query`
-do not currently require an expected revision. Do not forward these broad owner routes to an agent
-and claim that the adapter's allowlist makes them scoped.
+Return original IDs/ranges, evidence basis, certainty, warnings and explicit truncation. A capped
+result is not “no results.” Uniform guards require implementation: `/api/symbols` and `/api/query`
+do not currently require an expected revision. Agents never use the browser's owner HTTP routes.
 
 ### Structured tools complement grep
 
@@ -242,8 +241,9 @@ working-tree grep. A future typed `baleyg_search_live` can extend coverage with 
 fixed safe execution/library interface, no shell command string, and time/byte/result caps.
 
 Live hits must say `workingTree`, capture time and per-file hash; they are not an atomic indexed
-snapshot. Do not attach live line numbers to cached symbols unless hashes match. A changed file
-requires an explicit new index or an explicitly different evidence basis, never silent rebinding.
+snapshot. Do not attach live line numbers to cached symbols unless hashes match. Real-time native
+refresh narrows the gap between cached and live text, but a changed file still needs a new
+published revision before its cached evidence changes; never rebind silently.
 Compiler/LSP resolution can later enrich these tools. It is not required to ship their first version.
 
 ## Diagrams: two deliberately different products
@@ -299,22 +299,22 @@ manifest/hash validation also guards accidental revision reuse.
 
 ## Security and lifecycle rules
 
-- Separate grants for navigation, source reads, live search, artifact writes, publication, indexing,
-  shell/edit execution and runtime control. A read-only tool may still disclose sensitive data.
+- Navigation, source reads, live search, artifact writes, publication, producer execution,
+  shell/edit execution and runtime control remain separate capabilities. The read-only catalog has
+  only the first two. A read-only tool may still disclose sensitive data.
 - Remote access requires explicit provider/destination + project/source scope + output/budget policy.
   Keep local read-only operation available without any provider. Cancellation cannot unsend content.
-  MCP itself cannot attest which downstream provider an arbitrary client uses. Grants authorize
-  disclosure to the connected runtime under an explicit destination/trust policy; enforce known
-  provider policy inside Mimir, and do not imply equal enforcement for every third-party client.
-- Do not give agents the browser owner's broad daemon token. Add scoped, revocable tool credentials
-  or bridge-bound grants. Keep credentials outside agent-readable worktrees; do not expose generic
-  owner-authenticated HTTP or Herdr socket forwarding.
-- A narrow Baleyg grant does not sandbox an agent that also has broader Hands shell/Python authority.
-  Show and enforce the effective permissions across both systems; do not imply otherwise.
+  MCP itself cannot attest which downstream provider an arbitrary client uses. Configuring the
+  server authorizes disclosure to that client; enforce known provider policy inside Mimir, and do
+  not imply equal enforcement for every third-party client.
+- Do not give agents the browser owner's daemon token. Keep tokens and ledgers outside every
+  checkout; do not expose owner-authenticated HTTP or Herdr socket forwarding.
+- A read-only MCP catalog does not sandbox an agent that also has shell/Python authority. The
+  boundary is the OS user; a hostile-agent model needs a separate account or sandbox.
 - Repository text, search matches, terminal output and diagram labels are untrusted data, not tool
   grants or instructions. Mimir's existing taint/approval gates must survive the provider extension.
-- Pilot request cancellation drops that response; session disconnect/replacement ends the adapter
-  and triggers owner-side revocation (expiry is the fallback). See the pilot contract for limits.
+- Request cancellation drops that response; session end closes stdin and ends the server. See the
+  MCP contract for limits.
   Future writes must revoke pending capabilities at session cancellation. Do not retry ambiguous writes;
   use operation IDs and check recorded result. Cancellation does not roll back completed effects.
 - Deduplicate Mimir replay by session plus journal sequence; journal replay is not effect replay.
@@ -324,31 +324,20 @@ manifest/hash validation also guards accidental revision reuse.
 
 ## Delivery plan
 
-### Phase 1 — single-workspace read-only pilot
+### Phase 1 — per-checkout read-only MCP
 
-Use one **already running daemon and already indexed store**, directly bound by a local descriptor.
-Implement owner-only issue/revoke and backend-enforced short-lived read grants, guarded reads and
-one stdio MCP adapter. Expose only describe -> find_symbols -> inspect -> read_source. Test with a
-synthetic MCP client, without Herdr, Mimir, a model or a provider. This is the full Phase 1 boundary.
-The [pilot contract](mcp-readonly-pilot-contract.md) is the implementation/acceptance gate.
-Its in-memory generation is backed by enrolled persistent read-only SQLite connection checks and
-retained Unix directory/database identities, not a startup UUID alone. Observed replacement disables
-MCP until restart/reissue; unmanaged in-place restores and unobserved ABA are outside that guard.
-Both inspect and read_source require explicit source approval because call/condition text is source,
-not merely structural metadata (condition labels are excluded from the pilot projection). Issuance
-against a valid unindexed store returns 409 `no_published_index`; no automatic indexing occurs.
-Owner binding/issuance and final revision checks must also use the enrolled read-only connection,
-not `Store::status()` (whose ordinary open can recreate a deleted cache). Qualify cold WAL/shared-memory
-setup. The MCP latch does not currently cover browser reads; browser warning/blocking behavior is an
-explicitly open product decision, not an implied daemon-wide guarantee.
-One-shot credential handoff also means a crashed stdio adapter needs owner reissue; supported launchers
-must cap/disable restart loops rather than silently reacquire credentials.
-Its grant issuance requires a published index even for describe-only use. Owner-only binding discovery
-handles an unindexed daemon. Broader pre-index describe/conceptual-draft workflows belong to later
-contracts; describe's missing request revision guard does not remove this pilot prerequisite.
+Deliver the [local topology](local-topology.md): per-checkout index caches, the shared fact cache,
+delta publication by the leader with real-time native refresh, and `baleyg mcp` over stdio exposing
+describe -> find_symbols -> inspect (declaration, outgoing and incoming calls) -> read_source. Test with a
+synthetic MCP client across several concurrent worktrees, without Herdr, Mimir, a model or a
+provider. The [MCP contract](mcp-readonly-pilot-contract.md) is the implementation/acceptance gate.
+In the semantic-index program this is sequenced by
+[#8](https://github.com/jasoncarreira/baleyg/issues/8), early: storage and delta publication in Stage 2,
+the leader and native refresh in Stage 3, and the syntax-tier MCP server
+and its startup wiring in Stage 4. The semantic stages then add evidence to the same tools.
 
-No registry, multi-project routing, text scan, deterministic preview, artifacts, auto-indexing,
-live reads, ACP provider extension or new semantic-resolution claims are in Phase 1.
+No registry, text scan, deterministic preview, artifacts, producer execution, live reads, ACP
+provider extension or new semantic-resolution claims are in Phase 1.
 
 ### Next slice — bounded snapshot literal text scan
 
@@ -374,7 +363,7 @@ bounded provider allowance. Do not repurpose/reset the old Baleyg ACP allowance.
 A read-only discovery prototype can run in parallel after identity contracts settle. Deliver explicit
 workspace/worktree associations, agent/pane links and status. Add an explicit registry and project picker
 while retaining per-project stores; neither was required for the single-workspace pilot. Later add
-explicit focus/prompt actions for supported agents; no generic terminal control or automatic topology changes. Core tools/artifacts remain usable when
+explicit focus/prompt actions for supported agents; no generic terminal control or automatic topology changes. Agent access never depends on the registry: each checkout's `baleyg mcp` works without it. Core tools/artifacts remain usable when
 Herdr disconnects, restarts, or is not installed.
 
 ### Separate accepted UI slice — embedded terminals and ACP tabs
@@ -383,7 +372,7 @@ Implement real PTY-backed tabs for explicitly requested Baleyg-launched direct a
 streaming, input/resize authorization and owned-session lifecycle. Add ACP conversation/tool/approval
 tabs without treating ACP as a terminal transport. Gate Herdr terminal embedding on a verified native
 attach/stream API; association/focus is not an embedded terminal. Keep the four-tool MCP pilot small
-and independently shippable. Terminal launch/input is never added to its limited grant.
+and independently shippable. Terminal launch/input is never added to the read-only catalog.
 
 ### Later, only if needed
 
@@ -393,9 +382,10 @@ Do not begin with a shared-database migration, a Baleyg agent manager, or automa
 
 ## First useful user journey
 
-**Phase 1:** From a direct terminal agent or an already supported MCP client, describe the admitted
-workspace, find a method, inspect its outgoing calls and read its cached source. Cite its revision
-and uncertainty. Do not run commands, change the index or publish anything. Mimir uses this same
+**Phase 1:** From a direct terminal agent or an already supported MCP client, in any checkout or
+worktree, describe the workspace, find a method, inspect its outgoing calls and read its cached
+source. Edit the file and see the next revision reflect it within the refresh budget. Cite revision
+and uncertainty. Do not run commands or publish anything. Mimir uses this same
 catalog once its separately gated local provider extension is available.
 
 **Later, after artifact and Mimir bridge slices:** From an existing Mimir or other coding-agent session:
@@ -411,11 +401,12 @@ without Herdr, the same workflow works normally.
 
 ## Acceptance gates
 
-Phase 1 must pass the concrete [pilot acceptance tests](mcp-readonly-pilot-contract.md#acceptance-tests).
+Phase 1 must pass the concrete [MCP acceptance tests](mcp-readonly-pilot-contract.md#acceptance-tests).
 The following additional gates apply as the later capabilities are delivered, not to enlarge Phase 1:
 
 - Same file names, symbol IDs and revisions in two projects/worktrees cannot cross-contaminate.
-- Project switching, logout, reconnect, stale revisions and cache replacement reject late results.
+- Project switching, logout, reconnect, stale revisions and index rebuilds reject late results.
+- Many concurrent worktrees leave no orphaned processes and no unbounded storage growth.
 - Live text is never presented as cached evidence without an exact hash match.
 - Overloads/candidates remain labelled; diagrams do not promote them into runtime facts.
 - Extra/changed Mimir tool schemas fail closed; existing Hands v1 sessions keep working.

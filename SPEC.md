@@ -1,6 +1,6 @@
 # Baleyg — Architecture Spec
 
-**Status:** implemented Rust daemon and embedded browser with JavaScript/Rust/Java/Python syntax extraction, static sequences and Java/Python class diagrams. JavaScript SCIP import is implemented. Multi-language semantic import, MCP tools, scoped tool grants, coding-agent ACP sessions and diagram artifacts below are accepted design work, not shipped features. The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-20.
+**Status:** implemented Rust daemon and embedded browser with JavaScript/Rust/Java/Python syntax extraction, static sequences and Java/Python class diagrams. JavaScript SCIP import is implemented. Multi-language semantic import, the stdio MCP server, per-checkout indexes with real-time native refresh, coding-agent ACP sessions and diagram artifacts below are accepted direction, not shipped features; mechanics of the index/MCP topology remain proposed until Stage 1 of the semantic-index program ratifies them. The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-23.
 
 **Validation:** The first extraction/storage spike is recorded in
 [docs/research/EXTRACTION-RESULTS.md](docs/research/EXTRACTION-RESULTS.md). It validates a bounded JavaScript
@@ -38,15 +38,22 @@ Sections 4, 6, 8 and 12 are the current agent/semantic integration direction:
 - Baleyg may implement an ACP client UI and supervise an adapter it explicitly starts.
   That is not a new agent reasoning harness. External agents and Herdr panes keep their
   existing lifecycle owner. Mimir's single-client/provider-profile constraints still apply.
-- The first MCP pilot is four read-only tools against one existing workspace daemon.
-  Scoped server-enforced grants are part of that pilot. A project registry, snapshot text
-  search, artifact writes and broad agent orchestration are later independently tested slices.
+- Agents reach Baleyg through `baleyg mcp`, a stdio MCP server the agent client launches in the
+  checkout it works in. Each checkout, including every Git worktree, has its own index: a pure cache
+  outside the checkout, keyed by the checkout's path. A shared per-file fact cache makes new and moved
+  checkouts cheap to index. The first catalog is four read-only tools over syntax-tier evidence. There
+  are no grants and no agent network listener; the boundary is the OS user. See the
+  [local topology](docs/local-topology.md).
+- One process per checkout is the leader, chosen by an OS file lock. It alone watches the files and
+  writes native index rows; explicit index requests are queued to it. Native extraction is the only
+  automatic work; it executes no repository code. Snapshot text search, artifact writes and broad
+  agent orchestration are later independently tested slices.
 - SCIP is the preferred batch semantic-artifact route, generalized one language at a time.
   LSP/compiler adapters remain possible complementary read/refactoring providers, not a
   requirement for the MCP pilot. No indexer build, download or repository code runs implicitly.
 
-The [agent integration plan](docs/agent-integration-plan.md),
-[read-only MCP pilot contract](docs/mcp-readonly-pilot-contract.md), and
+The [local topology](docs/local-topology.md), [agent integration plan](docs/agent-integration-plan.md),
+[read-only MCP contract](docs/mcp-readonly-pilot-contract.md), and
 [multi-language SCIP plan](docs/scip-multilanguage-plan.md) elaborate these decisions.
 If implementation status is unclear, [README](README.md) describes what currently works.
 The experiment/first-daemon subsections below are **historical implementation checkpoints**,
@@ -138,7 +145,7 @@ API and inspector checks passed. The product-level diagram and provider gates re
 
 | Phase | What ships | Gated on |
 | --- | --- | --- |
-| 1. Read | File/method browsing, static sequences, class diagrams; portable MCP tools for direct terminal/optional Herdr agents or optional ACP sessions | Measured extraction + scoped read access; neither terminal embedding nor ACP is required for MCP |
+| 1. Read | File/method browsing, static sequences, class diagrams; portable MCP tools for direct terminal/optional Herdr agents or optional ACP sessions | Measured extraction + per-checkout stdio MCP; neither terminal embedding nor ACP is required for MCP |
 | 2. Data | DB connection, ERD, `mapsTo` links from entity types to tables | Phase 1 model, driver sandboxing |
 | 3. Author | Edit on canvas, diff revisions, agent writes the code | Phases 1–2 plus a real identity story |
 
@@ -167,14 +174,20 @@ Baleyg asks:
 
 The store is split in two, physically:
 
-- **`cache.db`** — derived source snapshots, graph and class projections. Deletable,
-  rebuilt deterministically, never authoritative. FTS and broader edge kinds are not implemented.
-- **`workspace.db`** — durable views and annotations today; versioned artifacts, agent
-  associations and other proposed records need explicit migrations. References to missing
-  symbol IDs become orphans; a cache rebuild does not guarantee automatic reattachment.
+- **The index** — derived source snapshots, graph and class projections. A pure cache: deletable,
+  rebuilt deterministically, never authoritative, never migrated. FTS and broader edge kinds are not
+  implemented. Today this is `cache.db` in an out-of-tree state directory. The accepted direction
+  keeps it out of tree in the per-user cache directory, keyed by the checkout's canonical path
+  (see [local topology](docs/local-topology.md#storage)).
+- **`workspace.db`** — durable views and annotations today; versioned artifacts and other proposed
+  records later. References to missing symbol IDs become orphans; a cache rebuild does not guarantee
+  automatic reattachment. The accepted direction keys it by a workspace UUID kept in the checkout's
+  Git directory, so views and notes follow a moved checkout. Tokens and ledgers stay at explicitly
+  configured paths outside every checkout. There is no `--state-dir` flag and there are no state
+  migrations; existing views and notes are not carried over.
 
 With identical source bytes, pinned extraction tools, semantic-index artifacts and
-database snapshots, deleting `cache.db` must reproduce the same normalized semantic
+database snapshots, deleting the index must reproduce the same normalized semantic
 graph. Preserve accepted agent output and layout decisions in the durable store.
 SQLite file bytes and renderer pixels are not the determinism contract.
 
@@ -210,22 +223,26 @@ reconsider.
 ## 4. Processes and connection modes
 
 The core owns Baleyg's stores, query services and UI events. It supervises only processes
-that Baleyg explicitly launches, such as a future MCP/ACP adapter. It does **not** own every
-agent, shell or Herdr pane associated with a project.
+that Baleyg explicitly launches, such as a future ACP adapter. It does **not** own every
+agent, shell or Herdr pane associated with a project. `baleyg mcp` processes are owned by the
+agent clients that launch them and exit with those clients; they need no supervisor. The browser
+daemon and any `baleyg mcp` process share each index through SQLite: whichever holds the leader lock
+watches and writes; the others read and queue explicit index requests to it.
 
 ```mermaid
 flowchart LR
   UI[Baleyg browser] -->|explicit requests| CORE[Baleyg core]
   CORE -->|evidence and artifact events| UI
-  CORE --> M[(Per-workspace cache and durable data)]
-  DIRECT[Direct agent: embedded or external terminal] -->|MCP| MCP[Baleyg MCP tools]
+  CORE --> M[(Per-checkout index and out-of-tree durable data)]
+  DIRECT[Direct agent: embedded or external terminal] -->|launches, stdio MCP| MCP[baleyg mcp, one per agent session]
   UI <-->|authenticated terminal stream| PTY[Owned PTY service]
   PTY -->|explicit launch only| DIRECT
   HERDR[Agent in optional Herdr pane] -->|same MCP contract| MCP
   UI -->|optional ACP session controls| ACP[Baleyg ACP client adapter]
   ACP -->|negotiated ACP| HARNESS[Existing harness or Mimir proxy]
   HARNESS -->|same tools via admitted local bridge| MCP
-  MCP -->|scoped read or artifact grant| CORE
+  MCP -->|read-only SQLite snapshots| M
+  MCP -. when leader: watches and writes .-> M
   CORE -. optional metadata association .-> HM[Herdr adapter]
 ```
 
@@ -276,36 +293,54 @@ a subgraph whose nodes happen to be tables.
 ### Identity
 
 SCIP supplies semantic symbol strings; local SCIP IDs require document/artifact scoping.
-The existing JavaScript importer can replace syntax IDs with imported identities. Generalizing
-that behavior is not automatic: new language adapters must join exact measured declarations and
-keep semantic identity, snapshot identity and source location distinct. Prefer an explicit binding
-or alias layer that preserves existing measured IDs and orphan behavior until a tested identity
-migration exists. Parser-only identities remain provisional and must not masquerade as SCIP IDs.
+The existing JavaScript importer replaces syntax IDs with imported identities. **Owner decision
+(2026-09-23): that behavior is removed.** Every language uses **stable syntax IDs** for declarations:
+the path plus a declaration key (enclosing declarations, kind, name, and an overload signature or
+ordinal among same-named siblings). Range and the file's content hash are separate fields, so a
+body-only edit changes no IDs. SCIP symbols are recorded in a separate binding layer, never as node
+IDs. Call sites and control regions are occurrence IDs within a revision (caller ID plus ordinal).
+Backward compatibility is not required for this change.
 
-Identity and location are separate fields. Exported symbol ids can survive body edits,
-but renames, moves and package-version changes can change them. Preserve annotations
-with missing targets as visible orphans until reconciliation is supported. Database
-identity and provisional-to-resolved migration remain design work. The anchor is cache.
+Identity and location are separate fields. Renames and moves of a declaration change its ID;
+annotations on a removed declaration remain visible orphans. Durable anchors also store a hash of the
+declaration's header, so an ordinal that shifts onto a different same-named sibling orphans the
+anchor instead of silently moving it; an anchor on a declaration with identical-header siblings
+orphans whenever that sibling group changes.
+
+Illustrative only: node IDs are stable syntax IDs; the SCIP symbol is a separate binding; a measured
+call site keeps its own identity, separate from its declared target and dispatch kind.
 
 ```json
 {
   "schemaVersion": 1,
   "nodes": [{
-    "id": "scip-java maven acme/billing 1.4 com/acme/billing/Invoice#",
+    "id": "src/main/java/com/acme/billing/Invoice.java#class:Invoice",
     "kind": "class",
     "name": "Invoice",
     "container": "com.acme.billing",
     "anchor": { "path": "src/main/java/com/acme/billing/Invoice.java",
                 "range": [420, 2310], "blob": "9c1f8a2e" },
+    "provenance": { "source": "treesitter", "evidenceKind": "measuredSyntax", "indexRev": 148 }
+  }],
+  "semanticBindings": [{
+    "node": "src/main/java/com/acme/billing/Invoice.java#class:Invoice",
+    "symbol": "scip-java maven acme/billing 1.4 com/acme/billing/Invoice#",
     "provenance": { "source": "scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
   }],
-  "edges": [{
-    "kind": "calls",
-    "from": "...Invoice#total().",
-    "to": "...TaxTable#rateFor().",
+  "callSites": [{
+    "id": "...Invoice.java#class:Invoice/method:total()@call:3",
+    "caller": "...Invoice.java#class:Invoice/method:total()",
+    "range": [1312, 1340],
     "ordinal": 3,
-    "control": { "in": "if", "depth": 1 },
+    "regions": ["...Invoice.java#class:Invoice/method:total()@if:1"],
     "provenance": { "source": "treesitter", "evidenceKind": "measuredSyntax", "indexRev": 148 }
+  }],
+  "callBindings": [{
+    "callSite": "...Invoice.java#class:Invoice/method:total()@call:3",
+    "declaredTarget": "...TaxTable.java#class:TaxTable/method:rateFor(Region)",
+    "dispatch": "virtual",
+    "disposition": "resolved",
+    "provenance": { "source": "scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
   }]
 }
 ```
@@ -336,7 +371,8 @@ sequence schema.
 
 A live view is a query plus overrides: seed, bounded traversal, pins, hidden IDs and notes.
 On reindex, reevaluate only against an explicit new basis and expose orphaned IDs. Current
-saved views implement a subset of that model.
+saved views implement a subset of that model. The IDs in the example are stable declaration IDs,
+so views and notes survive edits and orphan only when a declaration is removed or renamed.
 
 A proposed **published artifact** is an immutable version: preserve its query/options, frozen
 server-produced DTO or explicitly agent-authored graph, provenance and evidence basis. It must
@@ -348,11 +384,11 @@ remain distinct from evidence views even when they cite valid source ranges.
 {
   "viewId": "v_8f21",
   "kind": "sequence",
-  "query": { "seed": "...Invoice#settle().", "depth": 3,
+  "query": { "seed": "...Invoice.java#class:Invoice/method:settle()", "depth": 3,
              "edgeKinds": ["calls"], "excludePackages": ["java.util"] },
-  "pins": { "...TaxTable#": { "x": 420, "y": 80 } },
-  "hidden": ["...Logger#"],
-  "notes": [{ "anchor": "edge:...#authorize().", "body": "retries twice" }]
+  "pins": { "...TaxTable.java#class:TaxTable": { "x": 420, "y": 80 } },
+  "hidden": ["...Logger.java#class:Logger"],
+  "notes": [{ "anchor": "...Invoice.java#class:Invoice/method:settle()", "body": "retries twice" }]
 }
 ```
 
@@ -418,8 +454,11 @@ malformed, oversized or unsupported artifacts before publication. Do not downloa
 Baleyg or silently retry a build to resolve missing evidence.
 
 Stale semantic evidence must be rejected or downgraded visibly, preserving syntax-only browsing.
-The current system uses explicit full refresh; watching and dependency-aware incremental invalidation
-are future work. Do not describe a background re-indexer or per-file semantic fallback as already live.
+The current system uses explicit full refresh. The accepted direction adds a file watcher that refreshes
+**native** evidence per changed file (§7.2). A changed file's semantic overlays stop applying, because
+they are keyed by its old content hash. Other semantic facts are reported possibly stale, computed at
+read time, whenever any declaration surface or build/configuration input in their source set changed
+after they were imported. This is conservative by design. The watcher never runs a producer. None of this is implemented yet.
 
 ### 6.3 LSP and compiler APIs remain complementary
 
@@ -447,46 +486,65 @@ it” is a valid guarantee. Preserve the distinction between evidence, candidate
 
 ### 7.1 Construction
 
-Target incremental design below; current publication is explicit full-index rebuild.
+Accepted incremental direction below; current publication is explicit full-index rebuild.
 Three conceptual passes, keyed on source and relevant extraction/configuration hashes.
 
-1. **Discover and hash.** Walk respecting `.gitignore`. Record
-   `(path, size, mtime_ms, blake3)`. This table *is* the incrementality story.
+1. **Discover and hash.** Walk respecting `.gitignore` with the existing walker. Record
+   `(path, size, mtime, ctime, inode, hash)`, hashing only files whose stat changed (Git's
+   racy-timestamp rule applies). This table *is* the incrementality story. No `git` subprocess runs.
 2. **Parse.** tree-sitter per file, in parallel, a pure function of file bytes and
    therefore cacheable by hash. Emits local nodes, unresolved references, call
-   ordinals, control context.
+   ordinals, control context. Results live in a per-user **fact cache** as a path-neutral record
+   keyed by language, extractor version, extraction-context digest and content hash, shared by every
+   checkout on the machine. Assembly binds records to paths and derives the node IDs. A new or moved
+   checkout parses only files the cache has never seen.
 3. **Enrich.** Ingest admitted semantic artifacts through the appropriate language adapter.
    Syntax-only import/name matching may provide explicitly scoped navigation candidates, not
    resolved dispatch. It must never silently replace missing compiler evidence with a guessed call.
 
 ### 7.2 Maintenance
 
-Watcher, incremental dependency invalidation and indexer scheduling below are future work,
-not current behavior or permission to execute producer tools. Production generation requires
-explicit trusted execution policy; automatic scheduling is off until separately implemented.
+Watcher, incremental invalidation and scheduling below are accepted direction with proposed mechanics
+([local topology](docs/local-topology.md#leader)), not current behavior or permission to execute
+producer tools. Automatic producer scheduling stays off.
 
-- **Watcher.** Native FSEvents / inotify / ReadDirectoryChangesW, 300ms debounce,
-  re-hash changed files, re-run pass 2 for those files only.
-- **Reverse dependencies.** `edge_deps` records which files each resolved edge depended
-  on. When file `F` changes, re-resolve edges whose dependency set includes `F`, plus
-  every unresolved reference inside `F`. Above a threshold of changed files, full
-  re-resolve — branch switches are not worth being clever about.
-- **Git awareness.** Store the indexed HEAD sha. On branch switch use
-  `git diff --name-status` rather than riding out the watcher storm.
+- **Leader.** An OS file lock picks one process per checkout. It alone writes native rows, running
+  watcher batches, reconciles and explicit requests one at a time from a single ordered queue. On
+  taking the lock it reconciles against the files; apart from a brief documented takeover window,
+  which serves only the previous leader's last reconciled revision, evidence is served only once the
+  current leader has done so. It re-checks that the root path still names the same directory before every
+  reconcile and publish. Other processes queue explicit requests in a small database that survives
+  index rebuilds; if there is no leader, the requester becomes one.
+- **Watcher.** FSEvents / inotify through the `notify` crate, debounced, re-extracting changed files
+  (or taking them from the fact cache) and publishing one short transaction per batch. Overflow, lost
+  events, watch-limit exhaustion, bulk changes and system wake trigger a full stat reconcile; a slow
+  periodic reconcile catches silently lost events. A branch switch is just a bulk change.
+- **Re-resolution.** Bindings record the names they looked up, including lookups that found nothing,
+  and the scopes they traversed (enclosing classes and modules, supertypes, imports, re-export
+  sources). A publish diffs each changed file's old and new declarations and re-resolves bindings that
+  recorded any name whose declaration was added, removed or changed in anything a lookup can see. Stable IDs
+  mean a body-only edit re-resolves nothing. Above a threshold, re-resolve everything.
 - **Cancellation over speed.** Every pass must abort cleanly mid-flight; the user will
-  switch branches while indexing. Consider `salsa` (the memoized-query framework
-  underneath rust-analyzer) rather than hand-rolling dependency tracking,
-  invalidation and cancellation.
-- **Atomic revisions, not timestamps.** Publish a complete revision inside one SQLite
-  transaction. Readers pin a WAL read transaction while reading revision metadata and
-  graph rows. An `index_rev` column alone does not retain old snapshots. Keep durable
-  annotations separately; cross-database atomicity requires its own contract.
-- **SCIP scheduling.** Re-run indexers on a long debounce in the background, never on
-  the save path. Surface the age of the index in the UI.
+  switch branches while indexing.
+- **Atomic revisions, not timestamps.** Each publish is one SQLite transaction and advances the
+  revision. Readers pin a WAL read transaction. Only the current graph is retained.
+- **Semantic evidence.** Producers run only through the explicit owner workflow. Imported facts are
+  overlays that apply only while their document's content hash matches. An artifact whose manifest
+  does not match the current source set at import is possibly stale from the start; afterwards,
+  freshness is computed at read time against the last surface or configuration change in its source
+  set or any source set it depends on.
+- **Cache discipline.** Any schema, extractor or integrity mismatch means rebuild, inside the existing
+  file with a new generation; the file is deleted and recreated only when SQLite can no longer open or
+  rebuild it, and only while no process holds it open. Nothing in the index is migrated or repaired.
+- **Cleanup.** Automatic for derived state: indexes for vanished or long-unused paths (only when no
+  process has them open) and fact-cache entries beyond a size cap are deleted by the leader at most
+  daily. Durable records are created only on first write and never deleted automatically; orphaned
+  ones are reported, and `baleyg forget` deletes one explicitly. Ledgers are never touched.
 
 ### 7.3 Storage
 
-SQLite, WAL, two files per workspace as described in §2. Traversals are recursive CTEs
+SQLite, WAL: a per-checkout index cache, durable data keyed by workspace UUID, and a per-user fact
+cache, all outside the checkout (§2, §7.1). Traversals are recursive CTEs
 and must be benchmarked on representative views. Illustrative DDL is in Appendix A;
 revision publication and sequence-region tables are not yet a production schema.
 
@@ -517,15 +575,17 @@ building on it. LSIF is superseded by SCIP.
 
 **The same MCP tools must be available in both connection modes.** This section supersedes
 the original ACP-only launcher/registry topology and its prototype `query_graph`, `get_symbol`,
-`emit_diagram` names. The [integration plan](docs/agent-integration-plan.md) and
-[pilot contract](docs/mcp-readonly-pilot-contract.md) define the portable `baleyg_*` names.
-These tools, their scoped grants and the general coding-agent client are not implemented yet.
+`emit_diagram` names, and the later owner-grant pilot. The [local topology](docs/local-topology.md),
+[integration plan](docs/agent-integration-plan.md) and [MCP contract](docs/mcp-readonly-pilot-contract.md)
+define the portable `baleyg_*` names. These tools and the general coding-agent client are not
+implemented yet.
 
 ### 8.1 Direct agents, including embedded terminals
 
 An agent can run in an ordinary terminal, in a Baleyg-owned terminal tab, or in an optional
 Herdr pane. Configure the proposed `baleyg mcp` stdio server through that agent's supported
-MCP settings. Baleyg need not become its ACP client or its reasoning harness. A user may
+MCP settings; the agent client launches it in the checkout it works in, and the server serves that
+checkout only. Baleyg need not become its ACP client or its reasoning harness. A user may
 continue to launch agents outside Baleyg; tools and published diagrams work the same way.
 
 The target workbench includes terminal tabs alongside diagrams and source (§4). MCP and PTY
@@ -559,24 +619,25 @@ fake tool calls. `_meta` correlation is not a replacement for a versioned tool s
 
 ### 8.3 Tool authority and first pilot
 
-The first pilot is one existing single-workspace daemon with only:
-`baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect`, `baleyg_read_source`.
-Describe bootstraps current basis; all evidence reads require/check the admitted revision.
-No registry, grep scan, artifact write, shell or index operation is needed to prove this path.
-Snapshot text search gets its own bounded literal-scan design; FTS does not exist today.
+The first catalog is `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect` and
+`baleyg_read_source`, served by `baleyg mcp` over stdio (MCP `2026-07-28`). The first release of
+`baleyg_inspect` offers `declaration`, `outgoing_calls` and `incoming_calls` over syntax-tier evidence;
+later stages add views and semantic evidence. Every result reports its basis
+`{indexGeneration, indexRevision}` and per-item tier and freshness; pins are optional, carry the
+complete basis, and always conflict when stale. No registry, grep scan, artifact write, shell or on-request index operation is part
+of this path. Snapshot text search gets its own bounded literal-scan design; FTS does not exist today.
 
-Current bearer authentication grants broad owner access and cannot be handed to an agent.
-Add owner-issued, short-lived, revocable **server-enforced read grants**, limited to the exact
-workspace/store and read operation allowlist. A local adapter receives the grant through a
-private mechanism outside the agent-readable worktree, never a bearer token in command arguments
-or model-visible output. The agent cannot mint its own grant. Existing browser/owner credentials
-are neither inherited nor substituted as a fallback. See the pilot contract for bootstrap,
-expiry, revocation, routes and negative tests. A tool's `readOnlyHint` is not access control.
+There are no agent grants, principals or budgets. stdio has no network surface, so there is no
+Host/Origin exposure and other OS users cannot connect. The boundary is the OS user: any
+same-user process can launch the server or read the index file, just as it can read the source.
+Configuring the server for an agent approves disclosure of the whole indexed checkout to that agent
+and its provider. The browser's bearer token remains the browser's credential and is never given
+to agents. A tool's `readOnlyHint` is not access control.
 
-The same grant rules apply whether the caller came from a direct terminal, Herdr, or ACP.
+The same rules apply whether the caller came from a direct terminal, Herdr, or ACP.
 Remote disclosure needs a runtime/destination policy; MCP alone cannot attest the downstream
-model provider. Read-only does not mean non-sensitive. An agent with separately granted shell
-or broad same-user filesystem access is not sandboxed by a narrow MCP capability.
+model provider. Read-only does not mean non-sensitive. A hostile-agent threat model needs a
+separate OS account or sandbox, not a narrower MCP catalog.
 
 ### 8.4 Permissions, launch configuration and ownership
 
@@ -709,7 +770,7 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 
 | Slice | Runnable acceptance |
 | --- | --- |
-| A. Single-workspace read-only MCP | Describe/find/inspect/read through an owner-issued scoped grant; denied writes/index/provider routes; no ACP, Herdr or registry required |
+| A. Per-checkout read-only MCP | `baleyg mcp` over stdio in any checkout or worktree; describe/find/inspect/read with revision pins; real-time native refresh by the leader; no ACP, Herdr, registry or grants required |
 | B. Bounded snapshot text search | Literal scan over cached payloads with separate byte/time/result budgets, cancellation and explicit partial results; no FTS assumption |
 | C. Versioned diagram artifacts | Evidence view or clearly authored draft -> CAS update -> local publish -> user opens deep link; stale source stays honest |
 | D. Unified workbench terminals | Real PTY tab for a user-launched direct agent, the same MCP tools, bounded terminal stream and explicit lifecycle/input permissions |
@@ -717,8 +778,10 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 | F. Optional Herdr integration and multi-project UI | Read-only association first; independently verified terminal attach later; per-project routing without merging stores |
 | G. Multi-language semantic import | Java then independently gated Rust/Python artifacts; exact snapshot/range joins, provenance and dispatch-safe traversal |
 
-Some slices can proceed in parallel once their contracts settle. In particular, SCIP does not
-require an MCP/ACP agent, and the read-only MCP pilot does not require semantic resolution,
+Some slices can proceed in parallel once their contracts settle. The semantic-index program
+([#8](https://github.com/jasoncarreira/baleyg/issues/8)) sequences slices A and G: slice A ships
+with syntax-tier evidence right after the graph core, and slice G then enriches the same tools. SCIP does not
+require an MCP/ACP agent, and the read-only MCP surface does not require semantic resolution,
 embedded terminals, a project registry, snapshot search or paid inference. Embedded terminals
 are an accepted target UX, not a reason to expand the security-critical pilot.
 
@@ -731,7 +794,12 @@ could extract a class diagram; they died because the diagram was unreadable. The
 differentiator is the agent deciding what to leave out. Budget real effort there.
 
 **Degraded mode will be silent unless made loud.** Show the active extraction tier per
-workspace, always, and the age of the SCIP index.
+workspace, always, and the age and basis of semantic evidence. With real-time native refresh,
+semantic evidence lags edits by design; every result must say so.
+
+**Many live checkouts.** Agents work in several worktrees at once. Index cost must scale with what
+each checkout changed, not its size; processes must end with their clients; and storage must be
+reclaimed when checkouts disappear. See the [local topology](docs/local-topology.md).
 
 **Indexer coverage varies.** Validate a pinned producer against the exact language/toolchain,
 position encoding, ranges, roles and relationships needed by each adapter. Do not infer maturity
@@ -758,7 +826,7 @@ and any one is a project.
 
 ## Appendix A — illustrative schema (not finalized)
 
-### `cache.db` — derived, deletable
+### Index (`cache.db` today; per-user cache keyed by checkout path, proposed) — derived, deletable
 
 ```sql
 CREATE TABLE files (
@@ -771,7 +839,7 @@ CREATE TABLE files (
 ) WITHOUT ROWID;
 
 CREATE TABLE nodes (
-  id          TEXT PRIMARY KEY,          -- SCIP symbol string
+  id          TEXT PRIMARY KEY,          -- stable syntax ID; SCIP symbols live in a binding table
   kind        TEXT NOT NULL,             -- class|interface|method|field|table|column
   name        TEXT NOT NULL,
   container   TEXT,                      -- parent node id

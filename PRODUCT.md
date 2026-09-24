@@ -47,5 +47,7 @@ bound to the indexed workspace revision. See [class diagrams](docs/class-diagram
 Keep agent terminals, source and diagrams in one workbench. Direct terminal agents and optional
 ACP agents use the same portable MCP tools; neither Mimir nor Herdr is mandatory. Real PTY tabs
 and ACP conversation/tool/approval tabs are separate surfaces. These integrations are not shipped.
+Every checkout and worktree gets its own index, kept current as agents edit, and agents reach it
+through a stdio MCP server launched in that checkout.
 See the [integration plan](docs/agent-integration-plan.md) and
 [terminal contract](docs/terminal-workbench-contract.md).

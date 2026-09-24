@@ -1,9 +1,11 @@
 # Proposed agent integration — containers
 
-Proposal only. The Mimir Baleyg provider, scoped grants, MCP adapter, registry and artifact
-service shown here must be implemented. Existing Hands v1 does not accept arbitrary tools.
-This is the target architecture, not the four-tool pilot: registry, artifact storage, embedded
-terminal streaming and ACP client sessions are separate slices. The pilot binds one existing daemon.
+Not implemented. The per-checkout index and stdio MCP parts follow the owner-accepted
+[local topology](../local-topology.md), whose mechanics Stage 1 ratifies; the registry, Mimir, Herdr,
+terminal and artifact parts remain proposals with their own later slices. The stdio MCP server, per-checkout indexes, watcher leadership, file watcher, registry,
+Mimir Baleyg provider and artifact service shown here must be implemented. Existing Hands v1 does not
+accept arbitrary tools. This is the target architecture: artifact storage, embedded terminal
+streaming and ACP client sessions are separate slices. See the [local topology](../local-topology.md).
 
 ```mermaid
 C4Container
@@ -15,23 +17,27 @@ C4Container
   Container_Ext(herdr, "Herdr server", "Optional local terminal service", "Owns panes and lifecycle metadata")
   System_Boundary(baleyg, "Baleyg") {
     Container(ui, "Workbench", "Local browser UI", "Source, diagrams, terminal and ACP tabs")
-    Container(mcp, "Tool adapter", "Local stdio MCP", "Exposes bounded project-scoped tools")
-    Container(core, "Daemon", "Rust", "Validates grants and evidence; stores artifacts")
-    ContainerDb(registry, "Project registry", "Local durable store", "Maps independent projects and integrations")
-    ContainerDb(stores, "Per-project stores", "SQLite cache and durable data", "Keep evidence separate from artifacts")
+    Container(mcp, "baleyg mcp", "stdio MCP, one per agent session", "Serves the checkout it was launched in; read-only tools")
+    Container(core, "Browser daemon", "Rust", "Serves the workbench; stores artifacts")
+    ContainerDb(registry, "Project registry", "Optional local durable store", "Lists checkouts for the browser picker; not needed by agents")
+    ContainerDb(stores, "Per-checkout index", "SQLite cache, per-user, keyed by path", "Disposable evidence; written only by the leader")
+    ContainerDb(durable, "Durable state", "SQLite outside the checkout", "Views, notes, artifacts, tokens, ledgers")
+    ContainerDb(facts, "Shared fact cache", "SQLite, per-user cache", "Per-file extraction by content hash")
   }
   Rel(user, ui, "Inspects code and operates agent tabs", "Local HTTP")
   Rel(core, agent, "Optionally launches an explicitly owned child", "Real PTY; existing harness")
   Rel(core, ui, "Streams owned or validated attached terminals", "Authenticated bounded channel")
   Rel(core, proxy, "Optionally acts as the chosen ACP client", "Negotiated ACP")
-  Rel(agent, mcp, "Calls approved tools", "MCP stdio")
+  Rel(agent, mcp, "Launches and calls tools", "MCP stdio")
   Rel(mimirRuntime, proxy, "Requests local tools through existing channel", "ACP tool bridge")
   Rel(proxy, mcp, "Invokes versioned Baleyg capability", "Proposed provider adapter")
-  Rel(mcp, core, "Requests evidence or artifact operations", "Scoped local API")
+  Rel(mcp, stores, "Reads snapshots; watches and writes when leader", "SQLite")
+  Rel(mcp, facts, "Reuses unchanged-file extraction", "Content hash")
   Rel(ui, core, "Queries projects and artifacts", "Authenticated local API")
   Rel(core, ui, "Notifies of available artifact versions", "Proposed metadata event stream")
   Rel(core, registry, "Looks up authorized project bindings", "Local storage")
-  Rel(core, stores, "Reads snapshots and persists artifacts", "SQLite")
+  Rel(core, stores, "Reads snapshots; watches and writes when leader", "SQLite")
+  Rel(core, durable, "Persists views, notes and artifacts", "SQLite")
   Rel(core, herdr, "Optionally discovers and reconciles metadata", "Versioned local socket adapter")
 ```
 

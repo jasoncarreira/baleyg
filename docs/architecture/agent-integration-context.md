@@ -1,6 +1,8 @@
 # Proposed agent integration — system context
 
-Proposal only. Direct terminal agents and optional ACP agents use the same MCP contract.
+Not implemented. The per-checkout index and stdio MCP parts follow the owner-accepted
+[local topology](../local-topology.md), whose mechanics Stage 1 ratifies; the registry, Mimir, Herdr,
+terminal and artifact parts remain proposals with their own later slices. Direct terminal agents and optional ACP agents use the same MCP contract.
 Herdr and Mimir are independent optional integrations. Terminal and ACP tabs in Baleyg are an
 accepted target UI, not implemented functionality.
 
@@ -15,7 +17,7 @@ C4Context
   Rel(user, baleyg, "Inspects artifacts and source", "Local browser")
   Rel(user, agent, "Assigns coding or inspection tasks", "Workbench terminal or existing agent UI")
   Rel(baleyg, mimir, "Optionally acts as the chosen ACP client", "Negotiated ACP adapter")
-  Rel(agent, baleyg, "Queries evidence and publishes artifacts", "Scoped MCP tools")
+  Rel(agent, baleyg, "Queries evidence for its checkout", "stdio MCP it launches")
   Rel(user, mimir, "Configures managed sessions and permissions", "Existing Mimir UI")
   Rel(mimir, baleyg, "Routes approved local tools", "Proposed provider bridge")
   Rel(user, herdr, "Organizes workspaces and panes", "Herdr TUI")
