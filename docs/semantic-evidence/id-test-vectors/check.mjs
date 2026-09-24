@@ -78,7 +78,7 @@ function check(value, type, path) {
   if (!fields) return scalar(value, type, path);
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail(path, "must be an object");
   const actual = Object.keys(value);
-  for (const key of actual) if (!(key in fields)) fail(`${path}.${key}`, "unknown field");
+  for (const key of actual) if (!Object.hasOwn(fields, key)) fail(`${path}.${key}`, "unknown field");
   for (const key of Object.keys(fields)) if (!(key in value)) fail(`${path}.${key}`, "missing field");
   for (const [key, childType] of Object.entries(fields)) check(value[key], childType, `${path}.${key}`);
 }
