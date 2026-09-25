@@ -59,7 +59,12 @@ fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
         if suffix == "-journal" && !writable {
             continue;
         }
-        let sidecar = path.with_file_name(format!("index.db{suffix}"));
+        let sidecar = path.with_file_name(format!(
+            "{}{suffix}",
+            path.file_name()
+                .context("index filename missing")?
+                .to_string_lossy()
+        ));
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => anyhow::bail!("recovery_required: {}", sidecar.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -100,6 +105,36 @@ fn verify_index_file(path: &Path) -> Result<()> {
     );
     let _ = file.as_raw_fd();
     Ok(())
+}
+// Treat dangling symlinks as existing, so a first open never replaces an unsafe path.
+fn index_path_present(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// The staged file is private to this attempt. On failure, only unlink our own inode.
+struct StagedIndex {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    published: bool,
+}
+impl Drop for StagedIndex {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if self.published {
+            return;
+        }
+        if let (Ok(owned), Ok(named)) =
+            (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+        {
+            if owned.dev() == named.dev() && owned.ino() == named.ino() {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
 }
 fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     use rusqlite::OpenFlags;
@@ -804,6 +839,13 @@ impl Store {
         roots: topology::TopologyRoots,
         identity: topology::WorkspaceIdentity,
     ) -> Result<Self> {
+        Self::open_with_stage_hook(roots, identity, |_| Ok(()))
+    }
+    fn open_with_stage_hook(
+        roots: topology::TopologyRoots,
+        identity: topology::WorkspaceIdentity,
+        before_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Self> {
         identity.verify()?;
         roots.prepare_index(&identity)?;
         let store = Self {
@@ -815,9 +857,9 @@ impl Store {
             roots,
             identity: Arc::new(identity),
         };
-        if !store.roots.index_db(&store.identity).exists() {
+        if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.leader(&store.identity)?;
-            store.initialize(&leader)?;
+            store.initialize(&leader, before_publish)?;
         }
         store.status()?;
         Ok(store)
@@ -829,24 +871,46 @@ impl Store {
             topology::TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
         Self::open(roots, identity)
     }
-    fn initialize(&self, leader: &topology::LeaderGuard) -> Result<()> {
+    /// Fixture barrier after building a staged index, before its validation and publication.
+    pub fn open_for_tests_with_index_stage_hook(
+        state: &Path,
+        workspace: &Path,
+        before_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Self> {
+        let identity = topology::WorkspaceIdentity::discover(Some(workspace), workspace)?;
+        let roots =
+            topology::TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
+        Self::open_with_stage_hook(roots, identity, before_publish)
+    }
+    fn initialize(
+        &self,
+        leader: &topology::LeaderGuard,
+        before_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         use rusqlite::OpenFlags;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
         let path = self.roots.index_db(&self.identity);
         reject_sidecars(&path, true)?;
-        if path.exists() {
+        if index_path_present(&path)? {
             return Ok(());
         }
-        let _use_guard = self.roots.index_use(&self.identity)?;
+        let use_guard = self.roots.index_use(&self.identity)?;
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
+        let staged_path = path.with_file_name(format!("index.db.tmp-{}", uuid::Uuid::new_v4()));
+        let staged = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&path)?;
+            .open(&staged_path)?;
+        let mut staged = StagedIndex {
+            path: staged_path,
+            file: staged,
+            published: false,
+        };
         let db = Connection::open_with_flags(
-            &path,
+            &staged.path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -882,10 +946,36 @@ impl Store {
         }
         result?;
         drop(db);
-        verify_index_file(&path)?;
-        std::fs::File::open(&path)?.sync_all()?;
-        std::fs::File::open(self.roots.index_dir(&self.identity))?.sync_all()?;
+        before_publish(&staged.path)?;
+        verify_index_file(&staged.path)?;
+        let checked = open_index(&staged.path, true)?;
+        self.read_status(&checked)?;
+        let integrity: String =
+            storage_result(checked.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
+        ensure!(
+            integrity == "ok",
+            "incompatible_index: staged integrity check failed"
+        );
+        drop(checked);
+        staged.file.sync_all()?;
+        // The verified pathname must still refer to the inode we created.
+        use std::os::unix::fs::MetadataExt;
+        let named = std::fs::symlink_metadata(&staged.path)?;
+        let opened = staged.file.metadata()?;
+        ensure!(
+            named.is_file() && named.dev() == opened.dev() && named.ino() == opened.ino(),
+            "unsafe_index: staged pathname changed"
+        );
+        leader.verify()?;
+        use_guard.verify()?;
         self.identity.verify()?;
+        ensure!(
+            !index_path_present(&path)?,
+            "incompatible_index: index appeared during initialization"
+        );
+        std::fs::rename(&staged.path, &path)?;
+        staged.published = true;
+        std::fs::File::open(self.roots.index_dir(&self.identity))?.sync_all()?;
         Ok(())
     }
     pub fn leader(&self) -> Result<topology::LeaderGuard> {
