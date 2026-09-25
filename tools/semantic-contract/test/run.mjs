@@ -11,7 +11,7 @@ const here=fileURLToPath(new URL('.',import.meta.url));
 const project=resolve(here,'../../..');
 const defaultRoot=join(project,'tests/fixtures/semantic-evidence/v1');
 const shared=[
- 'anchors','answers','coordinates','counts','example-fixture','formats','freshness',
+ 'author-helper','anchors','answers','coordinates','counts','example-fixture','formats','freshness',
  'graph-evidence','graph','identity','load','lookup','normalization',
  'publication','record-bindings','record-coverage','record-joins','record-measurement',
  'record-relationships','warnings','fixture'
