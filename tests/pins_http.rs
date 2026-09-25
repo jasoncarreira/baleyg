@@ -121,7 +121,7 @@ async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
     let old_source = format!("/api/source?path=Types.java&{}", query(old));
     assert_eq!(call(&app, "GET", &old_source, Value::Null).await.0, 200);
 
-    // Simulate deleting a disposable index while the workspace and its marker remain.
+    // Simulate deleting a disposable index while the non-Git workspace remains unchanged.
     // This is not an in-place rebuild or a #39 full rebuild publication path.
     drop(app);
     drop(store);
@@ -165,6 +165,7 @@ async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
         code, 409,
         "old pair must conflict despite the reused number: {body}"
     );
+    assert_eq!(body["error"]["code"], "revision_conflict");
     let current_source = format!("/api/source?path=Types.java&{}", query(current));
     let (code, body) = call(&app, "GET", &current_source, Value::Null).await;
     assert_eq!(code, 200, "current pair must work: {body}");
@@ -173,6 +174,7 @@ async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
     let old_sequence = json!({"seed":id,"expectedRevision":old});
     let (code, body) = call(&app, "POST", "/api/sequence", old_sequence).await;
     assert_eq!(code, 409, "old required pair must conflict: {body}");
+    assert_eq!(body["error"]["code"], "revision_conflict");
     let current_sequence = json!({"seed":id,"expectedRevision":current});
     let (code, body) = call(&app, "POST", "/api/sequence", current_sequence).await;
     assert_eq!(code, 200, "current required pair must work: {body}");
