@@ -181,8 +181,12 @@ test('unsupported source capability rejects an authored label',async t=>{
  for(const row of rows)await runControl(row);
 });
 test('corpus profile enforces all floors, not only totals',async t=>{
- const s=await specimen(t);s.loaded.fixture.profile='corpus';
- assert.throws(()=>result(s.loaded,s.records),e=>e.assertion==='COUNT.FLOOR'&&e.code==='invalidRecord'&&e.field==='counts');
+ const s=await specimen(t);
+ const controls=registerControls([{id:'COUNT.profile.example-to-corpus',baseline:()=>s.loaded.fixture,
+  mutate:fixture=>{fixture.profile='corpus';return fixture;},
+  check:fixture=>checkCounts({...s.loaded,fixture},s.records),
+  expectedAssertion:'COUNT.FLOOR',expectedCode:'invalidRecord',expectedField:'counts'}]);
+ for(const control of controls)await runControl(control);
 });
 
 test('exact mutation controls on source-backed native membership and captured dispositions',async t=>{
@@ -450,7 +454,7 @@ test('unsupported copies in UTF-16 and scalar encodings share one source-byte sp
 });
 
 // The floor specimen is a captured source/candidate inventory, not an authored CountsV1.
-async function generatedCorpus(t,{duplicateProducer=false}={}) {
+async function generatedCorpus(t,{duplicateProducer=false,omitRole=null}={}) {
  const doc={sourceSetId:'main',language:'java',path:'src/Corpus.java'};
  let text='// é\n',decls=[],calls=[],refs=[],facts=[],scenarios=[];
  const add=part=>{const start=Buffer.byteLength(text);text+=part;return start;};
@@ -535,7 +539,8 @@ async function generatedCorpus(t,{duplicateProducer=false}={}) {
  for(let i=0;i<39;i++){
   const selector=i<19?{...callSelectors[i+4],kind:'reference'}:refSelectors[i-19];
   const roles=i<4?['read','call','import']:i<19?['read','call']:i===19?['read','write']:i===20?['read','type']:['read'];
-  const record={site:'use',roles,resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''};
+  const removed=omitRole==='read'&&i!==19?null:omitRole;
+  const record={site:'use',roles:roles.filter(role=>role!==removed),resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''};
   const fact=addFact('reference',selector,record);refFacts.push(fact);
   if(i>=19)assertions.push({kind:'resolution',factRef:fact,disposition:'resolved'});
  }
@@ -545,9 +550,17 @@ async function generatedCorpus(t,{duplicateProducer=false}={}) {
    candidates:resolution==='ambiguous'?[targetRef,external]:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
   assertions.push({kind:'resolution',factRef:fact,disposition:resolution==='external'?'provenExternal':resolution});
  }
- makeRef('target',targetStart+6,'host');
- addFact('reference',anchor('reference',targetStart+6,targetStart+12,'host'),
-  {site:'declaration',roles:['definition'],resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''});
+ if(omitRole==='definition'){
+  // Keep forty measured uses: replace the declaration-site proof with a real unused use span.
+  const start=unsupportedSelectors[0].range.start;
+  makeRef('target',start);
+  addFact('reference',anchor('reference',start,start+6,'drive'),
+   {site:'use',roles:['read'],resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''});
+ }else{
+  makeRef('target',targetStart+6,'host');
+  addFact('reference',anchor('reference',targetStart+6,targetStart+12,'host'),
+   {site:'declaration',roles:['definition'],resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''});
+ }
  const callFacts=[];
  for(let i=0;i<4;i++){
   const fact=addFact('callBinding',callSelectors[i],{resolution:'resolved',declaredTarget:driveRef,candidates:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
@@ -599,6 +612,34 @@ test('temporary captured Java corpus reaches each exact floor through checkCount
  assert.equal(count.callableValueNegatives,20);assert.equal(count.typeRelationships,20);
  assert.deepEqual(count.outcomes.map(x=>x.count),Array(5).fill(20));
  assert.deepEqual(count.observedRoles,['definition','read','write','call','type','import']);
+});
+
+test('captured Java corpus checks independently removable role floors',async t=>{
+ const baseline=await generatedCorpus(t);
+ const roles=['definition','write','call','type'];
+ const variants=await Promise.all(roles.map(role=>generatedCorpus(t,{omitRole:role})));
+ const controls=registerControls(roles.map((role,i)=>({id:`COUNT.corpus.role-${role}`,
+  baseline:()=>0,
+  // Switch the complete admitted capture and normalized snapshot, not an output role list.
+  mutate:()=>1,
+  check:value=>{const snapshot=value===0?baseline:variants[i];return checkCounts(snapshot.loaded,snapshot.records);},
+  expectedAssertion:'COUNT.FLOOR',expectedCode:'invalidRecord',expectedField:'counts'})));
+ for(const control of controls)await runControl(control);
+});
+
+test('captured Java role dependencies fail before the floor for read and import',async t=>{
+ const baseline=await generatedCorpus(t);
+ const roles=['read','import'];
+ const variants=await Promise.all(roles.map(role=>generatedCorpus(t,{omitRole:role})));
+ // Remove read from one witnessed callable-value negative: the other four reads keep
+ // its scenario valid, but that negative must fail. Four Java importsAliases scenarios
+ // require import, because alias is not an applicable Java role.
+ const controls=registerControls(roles.map((role,i)=>({id:`COUNT.corpus.role-dependency-${role}`,
+  baseline:()=>0,mutate:()=>1,
+  check:value=>{const snapshot=value===0?baseline:variants[i];return checkCounts(snapshot.loaded,snapshot.records);},
+  expectedAssertion:role==='read'?'COUNT.NEGATIVE':'COUNT.SCENARIO',
+  expectedCode:'invalidRecord',expectedField:role==='read'?'callableValueNegatives':'category'})));
+ for(const control of controls)await runControl(control);
 });
 
 test('integrated captured corpus rejects each count below its exact floor',async t=>{
