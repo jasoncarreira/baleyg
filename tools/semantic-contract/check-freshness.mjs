@@ -34,10 +34,18 @@ function capturedDocument(provenance, loaded) {
     document.contentHash === provenance.contentHash,
     "BASIS.CONTENT_HASH",
     "contentHash",
-    "captured content differs",
+    `captured content differs: expected ${document.contentHash}, actual ${provenance.contentHash}`,
   );
   return { revision, document };
 }
+// Actual digests of the captured bytes of one kind, for mismatch diagnostics.
+function capturedHashes(loaded, kind) {
+  return loaded.fixture.captures
+    .filter((x) => x.kind === kind && loaded.captureBytes.has(x.ref))
+    .map((x) => contentHash(loaded.captureBytes.get(x.ref)));
+}
+const oneOf = (hashes, actual) =>
+  `expected one of [${hashes.join(", ")}], actual ${actual}`;
 function captureExists(loaded, kind, hash) {
   return loaded.fixture.captures.some(
     (x) =>
@@ -64,7 +72,7 @@ export function checkCapturedBasis(provenance, loaded) {
     captureExists(loaded, "executable", producer.executableHash),
     "BASIS.EXECUTABLE",
     "producerHash",
-    "missing or changed executable bytes",
+    `missing or changed executable bytes: ${oneOf(capturedHashes(loaded, "executable"), producer.executableHash)}`,
   );
   if (producer.kind === "native") {
     assert(
@@ -99,7 +107,7 @@ export function checkCapturedBasis(provenance, loaded) {
       basis[field] === expected,
       `BASIS.${field.toUpperCase()}`,
       field,
-      "captured claim differs",
+      `captured claim differs: expected ${expected}, actual ${basis[field]}`,
     );
   assert(
     producer.languages.includes(basis.language),
@@ -116,7 +124,7 @@ export function checkCapturedBasis(provenance, loaded) {
       captureExists(loaded, kind, basis[field]),
       `BASIS.${field.toUpperCase()}`,
       field,
-      "captured bytes unavailable",
+      `captured bytes unavailable: ${oneOf(capturedHashes(loaded, kind), basis[field])}`,
     );
   assert(
     loaded.semanticBytes.some(
@@ -126,7 +134,12 @@ export function checkCapturedBasis(provenance, loaded) {
     ),
     "BASIS.ARTIFACTHASH",
     "artifactHash",
-    "semantic artifact bytes differ",
+    `semantic artifact bytes differ: ${oneOf(
+      loaded.semanticBytes
+        .filter(({ value }) => value.producerId === producer.id)
+        .map(({ bytes }) => contentHash(bytes)),
+      basis.artifactHash,
+    )}`,
   );
   const deps = basis.lookupDependencies;
   assert(
@@ -156,24 +169,41 @@ export function checkCapturedBasis(provenance, loaded) {
   return { producer, revision };
 }
 
-export function expectedFreshness(provenance, loaded) {
+// The requested snapshot defaults to the fixture comparison. A graph request may
+// pin another admitted revision; it then compares against captured producers.
+function requestedSnapshot(loaded, request) {
+  const comparison = loaded.comparison;
+  const at = request ?? comparison;
+  const matches =
+    at.sourceSetId === comparison.sourceSetId &&
+    at.revisionId === comparison.revisionId;
+  return {
+    sourceSetId: at.sourceSetId,
+    revision: matches
+      ? loaded.selected
+      : loaded.revisions.get(tuple(at.sourceSetId, at.revisionId)),
+    producers: matches ? comparison.producers : loaded.fixture.producers,
+  };
+}
+export function expectedFreshness(provenance, loaded, request) {
   const { producer } = checkCapturedBasis(provenance, loaded);
-  const selected = loaded.selected;
-  const wanted = selected.documents.find(
+  const { sourceSetId, revision, producers } = requestedSnapshot(
+    loaded,
+    request,
+  );
+  const wanted = revision?.documents.find(
     (x) =>
       x.key.path === provenance.document.path &&
       x.key.language === provenance.document.language,
   );
   if (!wanted || wanted.contentHash !== provenance.contentHash) return "stale";
   if (producer.kind === "native")
-    return selected.id === provenance.revisionId &&
-      loaded.comparison.sourceSetId === provenance.document.sourceSetId
+    return revision.id === provenance.revisionId &&
+      sourceSetId === provenance.document.sourceSetId
       ? "fresh"
       : "possiblyStale";
   const basis = provenance.basis;
-  const requested = loaded.comparison.producers.find(
-    (x) => x.id === basis.producerId,
-  );
+  const requested = producers.find((x) => x.id === basis.producerId);
   if (
     !requested ||
     requested.kind !== "semantic" ||
@@ -184,12 +214,12 @@ export function expectedFreshness(provenance, loaded) {
     JSON.stringify(requested.languages) !==
       JSON.stringify(producer.languages) ||
     !captureExists(loaded, "executable", requested.executableHash) ||
-    loaded.comparison.sourceSetId !== basis.sourceSetId ||
-    loaded.comparison.revisionId !== basis.revisionId ||
-    loaded.sourceManifestHash(selected) !== basis.sourceManifestHash ||
-    selected.toolchainHash !== basis.toolchainHash ||
-    selected.configHash !== basis.configHash ||
-    selected.dependencyHash !== basis.dependencyHash
+    sourceSetId !== basis.sourceSetId ||
+    revision.id !== basis.revisionId ||
+    loaded.sourceManifestHash(revision) !== basis.sourceManifestHash ||
+    revision.toolchainHash !== basis.toolchainHash ||
+    revision.configHash !== basis.configHash ||
+    revision.dependencyHash !== basis.dependencyHash
   )
     return "possiblyStale";
   return "fresh";
@@ -207,7 +237,13 @@ export function checkFreshness(provenance, loaded) {
 
 // Declaration presence is supplied by the verified normalization layer. Keys are
 // logical tuples, not serialized DocumentKey objects or object insertion order.
-export function expectedStaleTarget(binding, provenance, loaded, declarations) {
+export function expectedStaleTarget(
+  binding,
+  provenance,
+  loaded,
+  declarations,
+  request,
+) {
   validate("CallBinding", binding);
   checkCapturedBasis(provenance, loaded);
   assert(
@@ -238,13 +274,14 @@ export function expectedStaleTarget(binding, provenance, loaded, declarations) {
     "declaredTarget",
     "target declaration not present in captured snapshot",
   );
-  const requested = loaded.selected.documents.find(
+  const { sourceSetId, revision } = requestedSnapshot(loaded, request);
+  const requested = revision?.documents.find(
     (x) =>
       x.key.path === target.document.path &&
       x.key.language === target.document.language,
   );
   const requestedDeclaration = declarations
-    .get(tuple(loaded.comparison.sourceSetId, loaded.comparison.revisionId))
+    .get(tuple(sourceSetId, revision?.id))
     ?.get(target.syntaxId);
   return (
     !requested ||

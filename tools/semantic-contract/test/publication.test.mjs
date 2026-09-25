@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmod,
   cp,
   mkdtemp,
   readdir,
@@ -156,56 +157,69 @@ test("publication: changed admitted answer bytes invalidate manifest with zero w
   }
 });
 
-test("publication: staged and installed faults preserve prior valid manifest and bundle", async () => {
-  for (const boundary of [
-    "stage:records",
-    "stage:answers",
-    "stage:counts",
-    "stage:verified",
-    "install:bundle",
-    "install:records",
-    "install:answers",
-    "install:counts",
-    "install:verified",
-    "install:manifest",
-  ]) {
+test("publication: failed compile or bundle write preserves prior valid manifest and bundle", async () => {
+  for (const failure of ["compile", "write"]) {
     const { root, cleanup } = await copyFixture();
     try {
       const previous = await generateFixture(root),
         bytes = await publicationBytes(root, previous);
-      const before = await tree(root);
       const expected = join(root, "expected/answers.json"),
         original = await readFile(expected);
+      const bundles = join(root, "generated/bundles");
       try {
-        await addWhitespace(root);
+        if (failure === "compile") await writeFile(expected, "{");
+        else {
+          await addWhitespace(root);
+          await chmod(bundles, 0o555);
+        }
+        const before = await tree(root);
         await assert.rejects(
-          () =>
-            generateFixture(root, {
-              fault: (at) => {
-                if (at === boundary) throw Error(`fault:${at}`);
-              },
-            }),
-          new RegExp(`fault:${boundary}`),
+          () => generateFixture(root),
+          failure === "compile" ? /JSON\.INTAKE / : { code: "EACCES" },
         );
+        await chmod(bundles, 0o755);
+        assert.deepEqual(await tree(root), before, failure);
       } finally {
+        await chmod(bundles, 0o755);
         await writeFile(expected, original);
       }
-      assert.deepEqual(await checkPublication(root), previous, boundary);
-      assert.deepEqual(await publicationBytes(root, previous), bytes, boundary);
+      assert.deepEqual(await checkPublication(root), previous, failure);
+      assert.deepEqual(await publicationBytes(root, previous), bytes, failure);
       assert.deepEqual(
         (await readdir(join(root, "generated"))).sort(),
         ["bundles", "manifest.json"],
-        boundary,
+        failure,
       );
-      assert.deepEqual(
-        await readdir(join(root, "generated/bundles")),
-        [previous.bundleHash],
-        boundary,
-      );
-      assert.deepEqual(await tree(root), before, boundary);
+      assert.deepEqual(await readdir(bundles), [previous.bundleHash], failure);
     } finally {
       await cleanup();
     }
+  }
+});
+
+test("publication: concurrent identical generations both succeed on one immutable bundle", async () => {
+  const { root, cleanup } = await copyFixture();
+  try {
+    await generateFixture(root);
+    await addWhitespace(root);
+    const results = await Promise.allSettled([
+      generateFixture(root),
+      generateFixture(root),
+    ]);
+    assert.deepEqual(
+      results.map((x) => x.status),
+      ["fulfilled", "fulfilled"],
+      results.map((x) => x.reason?.message).join("; "),
+    );
+    const manifest = results[0].value;
+    assert.deepEqual(results[1].value, manifest);
+    assert.deepEqual(await checkPublication(root), manifest);
+    assert.deepEqual((await readdir(join(root, "generated"))).sort(), [
+      "bundles",
+      "manifest.json",
+    ]);
+  } finally {
+    await cleanup();
   }
 });
 

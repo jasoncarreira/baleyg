@@ -50,7 +50,7 @@ export function selectGraphEvidence(loaded, records, checked, result) {
     ]),
   );
   const proofById = new Map(records.provenance.map((row) => [row.id, row]));
-  const projection = graphProjection(records, result.request);
+  const projection = graphProjection(loaded, records, result.request);
   const coverage = new Map(),
     provenance = new Map(),
     documents = new Map(),
@@ -130,12 +130,21 @@ export function selectGraphEvidence(loaded, records, checked, result) {
           "edges.binding",
           "old or foreign binding on current occurrence",
         );
-      addProof(
-        edge.binding.provenanceId,
-        producerId,
-        edge.call.document,
-        revisionId,
+      // A contradictory group is ambiguous on every member; each member's proof
+      // remains relevant evidence even though the edge carries one of them.
+      const group = records.callBindings.filter(
+        (b) =>
+          b.callId === edge.binding.callId &&
+          b.resolution === "ambiguous" &&
+          edge.binding.resolution === "ambiguous" &&
+          proofById.get(b.provenanceId)?.producerId === producerId &&
+          b.join.anchor.revisionId === revisionId,
       );
+      for (const id of new Set([
+        edge.binding.provenanceId,
+        ...group.map((b) => b.provenanceId),
+      ]))
+        addProof(id, producerId, edge.call.document, revisionId);
     }
   }
   if (producerId !== null) {
@@ -240,7 +249,7 @@ export function selectGraphEvidence(loaded, records, checked, result) {
               fail(
                 "GRAPH.HISTORY",
                 "provenance",
-                "historical proof bytes or requested freshness differ",
+                `historical proof bytes or requested freshness differ${capturedDocument?.contentHash !== proof.contentHash ? `: expected contentHash ${capturedDocument?.contentHash}, actual ${proof.contentHash}` : ""}`,
               );
           }
           addProof(proofId, producerId, document, selectedRevision);

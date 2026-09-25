@@ -356,11 +356,18 @@ test("IDENTITY.CANONICAL every control and closed nested input", () => {
     ancestors: [],
     declaration: { kind: "function", name: "a", signature: null, ordinal: 0 },
   };
-  assert.throws(() =>
-    syntaxId({ ...syntax, declaration: { ...syntax.declaration, extra: 1 } }),
+  assert.throws(
+    () =>
+      syntaxId({ ...syntax, declaration: { ...syntax.declaration, extra: 1 } }),
+    { assertion: "FORMAT.SHAPE", message: /declaration\.extra: unknown field/ },
   );
-  assert.throws(() =>
-    syntaxId({ ...syntax, ancestors: [{ ...syntax.declaration, extra: 1 }] }),
+  assert.throws(
+    () =>
+      syntaxId({ ...syntax, ancestors: [{ ...syntax.declaration, extra: 1 }] }),
+    {
+      assertion: "FORMAT.SHAPE",
+      message: /ancestors\[0\]\.extra: unknown field/,
+    },
   );
   assert.equal(canonicalBytes([]).toString("hex"), "5b5d");
 });

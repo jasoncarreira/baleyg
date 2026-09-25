@@ -108,7 +108,9 @@ test("WITNESS.SPELLING validates separate spelling when calleeRange is null", ()
   );
 });
 test("COORD.INVALID_UTF8 rejects malformed exact source bytes", () => {
-  assert.throws(() =>
-    toByteRange(Buffer.from([0xff]), { encoding: "utf8", start: 0, end: 1 }),
+  assert.throws(
+    () =>
+      toByteRange(Buffer.from([0xff]), { encoding: "utf8", start: 0, end: 1 }),
+    /not valid for encoding utf-8/,
   );
 });

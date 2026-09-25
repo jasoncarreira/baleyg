@@ -277,7 +277,7 @@ export function checkJoins(loaded, records, coverage, measurement) {
       reject(
         "JOIN.TUPLE",
         "anchor",
-        "semantic anchor disagrees with captured proof",
+        `semantic anchor disagrees with captured proof${proof.contentHash !== selector.contentHash ? `: expected contentHash ${proof.contentHash}, actual ${selector.contentHash}` : ""}`,
       );
     // Coverage selection belongs to the semantic producer, not the native measurement.
     // Verify every fact, including those that will remain unmatched or unsupported.
@@ -307,7 +307,7 @@ export function checkJoins(loaded, records, coverage, measurement) {
       reject(
         "JOIN.TUPLE",
         "anchor",
-        "source set, document, revision or hash differs",
+        `source set, document, revision or hash differs: expected ${document?.contentHash ?? "a captured document"}, actual ${selector.contentHash}`,
       );
     const owner = declarations.get(selector.ownerRef);
     if (

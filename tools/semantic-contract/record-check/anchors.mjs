@@ -57,7 +57,7 @@ function groupFor(measurement, ref) {
     reject(
       "ANCHOR.GROUP",
       "groupsByDeclarationRef",
-      "sibling hashes differ from measured headers",
+      `sibling hashes differ from measured headers: expected ${JSON.stringify(headers)}, actual ${JSON.stringify(group.headers)}`,
     );
   return headers;
 }

@@ -56,6 +56,14 @@ function sortedRoles(roles, language, field) {
     previous = index;
   }
 }
+// Actual digests of the captured bytes of one kind, for mismatch diagnostics.
+function capturedHashes(loaded, kind) {
+  return loaded.fixture.captures
+    .filter((x) => x.kind === kind && loaded.captureBytes.has(x.ref))
+    .map((x) => contentHash(loaded.captureBytes.get(x.ref)));
+}
+const oneOf = (hashes, actual) =>
+  `expected one of [${hashes.join(", ")}], actual ${actual}`;
 function capture(loaded, kind, hash) {
   return loaded.fixture.captures.some(
     (x) =>
@@ -74,7 +82,11 @@ function capturedBasis(proof, loaded, proofRow) {
   validate("Provenance", proof);
   const document = documentAt(loaded, proof.document, proof.revisionId);
   if (!document || document.contentHash !== proof.contentHash)
-    fail("FRESHNESS.BASIS", "contentHash", "captured document bytes disagree");
+    fail(
+      "FRESHNESS.BASIS",
+      "contentHash",
+      `captured document bytes disagree: expected ${document?.contentHash ?? "a captured document"}, actual ${proof.contentHash}`,
+    );
   const producer = loaded.fixture.producers.find(
     (x) => x.id === proof.producerId,
   );
@@ -86,7 +98,7 @@ function capturedBasis(proof, loaded, proofRow) {
     fail(
       "FRESHNESS.BASIS",
       "producerId",
-      "captured executable or producer missing",
+      `captured executable or producer missing${producer ? `: ${oneOf(capturedHashes(loaded, "executable"), producer.executableHash)}` : ""}`,
     );
   if (producer.kind === "native") {
     if (proof.evidenceKind !== "measuredSyntax" || proof.basis !== null)
@@ -132,7 +144,7 @@ function capturedBasis(proof, loaded, proofRow) {
       fail(
         "FRESHNESS.BASIS",
         `basis.${field}`,
-        "captured bytes missing or changed",
+        `captured bytes missing or changed: ${oneOf(capturedHashes(loaded, kind), basis[field])}`,
       );
   if (
     !capture(loaded, "semanticArtifact", basis.artifactHash) ||
@@ -145,7 +157,12 @@ function capturedBasis(proof, loaded, proofRow) {
     fail(
       "FRESHNESS.BASIS",
       "basis.artifactHash",
-      "artifact capture missing or changed",
+      `artifact capture missing or changed: ${oneOf(
+        loaded.semanticBytes
+          .filter((x) => x.value.producerId === producer.id)
+          .map((x) => contentHash(x.bytes)),
+        basis.artifactHash,
+      )}`,
     );
   if (
     basis.lookupDependencies.some((x) =>
@@ -171,7 +188,7 @@ function capturedBasis(proof, loaded, proofRow) {
     fail(
       "FRESHNESS.BASIS",
       "provenance",
-      "proof does not match captured fact and wrapper",
+      `proof does not match captured fact and wrapper${proofRow?.hash !== basis.artifactHash ? `: expected artifactHash ${proofRow?.hash}, actual ${basis.artifactHash}` : ""}`,
     );
   return producer;
 }

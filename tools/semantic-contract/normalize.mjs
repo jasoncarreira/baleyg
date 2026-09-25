@@ -233,7 +233,11 @@ export function joinAnchor(
     (x) => encode(x.key) === encode(selector.document),
   );
   if (!document || document.contentHash !== selector.contentHash)
-    fail("JOIN.DOCUMENT", "contentHash", "anchor source tuple differs");
+    fail(
+      "JOIN.DOCUMENT",
+      "contentHash",
+      `anchor source tuple differs: expected ${document?.contentHash ?? "a captured document"}, actual ${selector.contentHash}`,
+    );
   const range = toByteRange(source, selector.range);
   const anchor = {
     document: selector.document,
@@ -976,7 +980,11 @@ export function normalizeFixture(loaded) {
         fact.anchor.revisionId !== proof.revisionId ||
         fact.anchor.contentHash !== proof.contentHash)
     )
-      fail("NORMALIZE.FACT_TUPLE", "anchor", "anchor/proof tuple mismatch");
+      fail(
+        "NORMALIZE.FACT_TUPLE",
+        "anchor",
+        `anchor/proof tuple mismatch${proof.contentHash !== fact.anchor.contentHash ? `: expected contentHash ${proof.contentHash}, actual ${fact.anchor.contentHash}` : ""}`,
+      );
     if (fact.kind === "symbol") {
       symbolKey(fact.record.key);
       const value = {

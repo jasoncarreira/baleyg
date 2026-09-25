@@ -281,13 +281,14 @@ test("graph projection rejects incomplete records rather than silently reusing c
     ],
     ["declarations", { ...s.records, declarations: undefined }],
     ["producers", { ...s.records, producers: undefined }],
+    ["provenance", { ...s.records, provenance: undefined }],
     ["revisionId", s.records],
   ];
   for (const [field, records] of invalid) {
     const attempted =
       field === "revisionId" ? { ...request, revisionId: "absent" } : request;
     assert.throws(
-      () => graphProjection(records, attempted),
+      () => graphProjection(s.loaded, records, attempted),
       (error) =>
         error.assertion === "GRAPH.PROJECTION" &&
         error.code === "invalidRecord" &&
@@ -1222,4 +1223,64 @@ test("an admitted r1 graph projects captured r1 proof and target against r1, not
       false,
     );
   }
+});
+
+test("a contradictory ambiguous binding group returns every member's proof on its edge", () => {
+  const s = specimen({ currentState: "complete" }),
+    D = s.D,
+    call = s.result.edges[0].call;
+  const member = (id) => ({
+    callId: call.id,
+    join: {
+      status: "exact",
+      anchor: { document: D, revisionId: "r2" },
+      candidateIds: [call.id],
+    },
+    resolution: "ambiguous",
+    provenanceId: id,
+  });
+  for (const id of ["proof:call-a", "proof:call-b"])
+    s.records.provenance.push(proof(id, "P", D, "r2", "fresh", "same"));
+  s.records.callBindings = [member("proof:call-b"), member("proof:call-a")];
+  s.result.edges[0] = {
+    ...s.result.edges[0],
+    binding: member("proof:call-a"),
+    boundaryReason: "ambiguous",
+  };
+  const ids = select(s).provenance.map((x) => x.id);
+  assert.ok(ids.includes("proof:call-a"), "edge member proof");
+  assert.ok(ids.includes("proof:call-b"), "other contradictory member proof");
+});
+
+test("real fixture projection at a non-comparison revision fails closed on incomplete records", async () => {
+  const loaded = await loadFixture(
+    new URL(
+      "../../../tests/fixtures/semantic-evidence/v1/example/",
+      import.meta.url,
+    ).pathname,
+  );
+  const { records } = normalizeFixture(loaded);
+  const request = {
+    sourceSetId: records.comparison.sourceSetId,
+    revisionId: "r1",
+  };
+  assert.notEqual(records.comparison.revisionId, request.revisionId);
+  graphProjection(loaded, records, request);
+  const cases = [
+    ["revisions.documents", { ...records, revisions: undefined }],
+    ["producers", { ...records, producers: undefined }],
+    [
+      "revisionId",
+      {
+        ...records,
+        revisions: records.revisions.filter((r) => r.id !== request.revisionId),
+      },
+    ],
+  ];
+  for (const [field, broken] of cases)
+    assert.throws(() => graphProjection(loaded, broken, request), {
+      assertion: "GRAPH.PROJECTION",
+      code: "invalidRecord",
+      field,
+    });
 });

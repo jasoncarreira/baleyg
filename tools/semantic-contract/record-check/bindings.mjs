@@ -163,7 +163,7 @@ export function checkBindings(loaded, records, C, M, J) {
         reject(
           "BINDING.JOIN",
           "join",
-          "fact lacks producer-specific measured call join",
+          `fact lacks producer-specific measured call join${proof.contentHash !== joined?.join.anchor.contentHash ? `: expected contentHash ${proof.contentHash}, actual ${joined?.join.anchor.contentHash}` : ""}`,
         );
       C.checkUse({
         producerId: proof.producerId,

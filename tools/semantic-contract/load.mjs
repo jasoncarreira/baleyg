@@ -445,21 +445,21 @@ export async function loadFixture(root) {
         callBinding: "semanticReference",
         typeRelationship: "typeRelationship",
       }[fact.kind];
+      const documentHash = revisions
+        .get(key([annotation.document.sourceSetId, annotation.revisionId]))
+        ?.documents.find(
+          (x) => documentKey(x.key) === documentKey(annotation.document),
+        )?.contentHash;
       if (
         !provenance ||
         provenance.evidenceKind !== evidenceKind ||
         provenance.producerId !== provenance.basis?.producerId ||
-        provenance.contentHash !==
-          revisions
-            .get(key([annotation.document.sourceSetId, annotation.revisionId]))
-            ?.documents.find(
-              (x) => documentKey(x.key) === documentKey(annotation.document),
-            )?.contentHash
+        provenance.contentHash !== documentHash
       )
         reject(
           "IDENTITY.SEMANTIC",
           fact.ref,
-          "missing, wrong-kind, or mismatched semantic provenance",
+          `missing, wrong-kind, or mismatched semantic provenance${provenance && provenance.contentHash !== documentHash ? `: expected contentHash ${documentHash}, actual ${provenance.contentHash}` : ""}`,
         );
       if (fact.kind === "typeRelationship" && fact.source.kind === "internal") {
         const declaration = native.declarations.find(
@@ -546,7 +546,7 @@ export async function loadFixture(root) {
         reject(
           "IDENTITY.SEMANTIC",
           fact.ref,
-          "capture basis/document mismatch",
+          `capture basis/document mismatch${provenance.basis?.artifactHash !== raw.hash ? `: expected artifactHash ${raw.hash}, actual ${provenance.basis?.artifactHash}` : ""}`,
         );
       const existing = semanticProofs.get(provenance.id);
       if (

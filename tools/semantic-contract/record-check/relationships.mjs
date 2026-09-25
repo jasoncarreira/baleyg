@@ -204,7 +204,7 @@ export function checkRelationships(loaded, records, C, M, J) {
           reject(
             "DECLARATION_BINDING.JOIN",
             "join",
-            "measured declaration-name join or source tuple differs",
+            `measured declaration-name join or source tuple differs${proof.contentHash !== joined?.join.anchor.contentHash ? `: expected contentHash ${proof.contentHash}, actual ${joined?.join.anchor.contentHash}` : ""}`,
           );
         const exact = joined.join.status === "exact";
         if (
