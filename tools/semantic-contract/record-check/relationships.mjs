@@ -101,23 +101,49 @@ export function checkRelationships(loaded,records,C,M,J) {
    if(fact.relationshipKind==='overrides'?!['method','function'].includes(native.kind):!typeSource)
     reject('RELATIONSHIP.SOURCE','source','source declaration kind contradicts directed relationship');
    const capturedSource=row=>loaded.sources.get(JSON.stringify([row.document.sourceSetId,row.revisionId,row.document.path]));
-   function directedBase(row,baseName,kind) {
+   function directedBases(row,baseName,kind) {
     const bytes=capturedSource(row);
-    const index=row.header.bases.indexOf(baseName);
-    const witness=row.witnesses.find(x=>x.field===`header.bases[${index}]`)?.witness;
-    if(!bytes || index<0 || !witness)
-     reject('RELATIONSHIP.SOURCE','source','directed base lacks a measured source witness');
-    const name=toByteRange(bytes,row.nameRange),base=toByteRange(bytes,witness.range);
-    const between=(a,b)=>Buffer.from(bytes).subarray(a,b).toString('utf8');
-    let supported=false;
-    if(row.document.language==='rust') {
-     if(kind==='extends') supported=base.start>name.end && /^\s*:\s*$/.test(between(name.end,base.start)) && /\btrait\s*$/.test(between(toByteRange(bytes,row.range).start,name.start));
-     if(kind==='implements') supported=row.kind==='implementation' && base.end<name.start && /\bimpl\s*$/.test(between(toByteRange(bytes,row.range).start,base.start)) && /^\s+for\s+$/.test(between(base.end,name.start));
-    } else {
+    if(!bytes)reject('RELATIONSHIP.SOURCE','source','relationship source snapshot is absent');
+    const name=toByteRange(bytes,row.nameRange),declaration=toByteRange(bytes,row.range);
+    const between=(start,end)=>Buffer.from(bytes).subarray(start,end).toString('utf8');
+    const candidates=row.header.bases.flatMap((text,index)=>{
+     if(baseName!==null && text!==baseName)return [];
+     const witness=row.witnesses.find(x=>x.field===`header.bases[${index}]`)?.witness;
+     return witness?[{range:toByteRange(bytes,witness.range)}]:[];
+    });
+    if(!candidates.length)reject('RELATIONSHIP.SOURCE','source','directed base lacks a measured source witness');
+    const supported=candidates.filter(({range:base})=>{
+     if(row.document.language==='rust') {
+      if(kind==='extends')return base.start>name.end && /^\s*:\s*$/.test(between(name.end,base.start)) && /\btrait\s*$/.test(between(declaration.start,name.start));
+      if(kind==='implements')return row.kind==='implementation' && base.end<name.start && /\bimpl\s*$/.test(between(declaration.start,base.start)) && /^\s+for\s+$/.test(between(base.end,name.start));
+      return false;
+     }
+     if(base.start<=name.end)return false;
      const syntax=between(name.end,base.start).replace(/\/\*[\s\S]*?\*\//g,' ').replace(/\/\/[^\n]*/g,' ');
-     supported=base.start>name.end && new RegExp(`\\b${kind}\\b`).test(syntax);
+     if(row.document.language==='python')return kind==='extends' && /^\s*\([\s\S]*$/.test(syntax) && /(?:\(|,)\s*$/.test(syntax);
+     const keywords=[...syntax.matchAll(/\b(extends|implements)\b/g)];
+     return keywords.at(-1)?.[1]===kind;
+    });
+    if(!supported.length)reject('RELATIONSHIP.KIND','kind','source syntax does not support the directed relationship kind');
+    return supported;
+   }
+   function checkExternalReference(base,relationshipTarget) {
+    const references=loaded.annotations.flatMap(annotation=>annotation.facts.filter(fact=>
+     fact.kind==='reference' && same(annotation.document,native.document) && annotation.revisionId===native.revisionId));
+    for(const reference of references) {
+     const joined=J.joined.get(reference.ref),resolved=J.recordByFactRef?.get(reference.ref);
+     if(joined?.join.status!=='exact' || joined.producerId!==proof.producerId ||
+        !['external','resolved'].includes(resolved?.resolution) ||
+        resolved.provenanceId!==reference.record.provenanceId ||
+        proofById.get(resolved.provenanceId)?.producerId!==proof.producerId ||
+        !joined.nativeRefs.some(ref=>{
+         const measured=M.nativeReferenceDescriptors?.find(row=>row.ref===ref);
+         return measured?.ownerRef===native.ref && same(measured.document,native.document) &&
+          measured.revisionId===native.revisionId && same(measured.range,base.range);
+        }))continue;
+     if(!same(resolved.declaredTarget,relationshipTarget))
+      reject('RELATIONSHIP.TARGET','target','exact same-producer base reference contradicts the external target');
     }
-    if(!supported)reject('RELATIONSHIP.KIND','kind','source syntax does not support the directed relationship kind');
    }
    if(fact.relationshipKind==='overrides') {
     if(target.kind!=='internal')reject('RELATIONSHIP.TARGET','target','override requires a measured base member');
@@ -143,17 +169,18 @@ export function checkRelationships(loaded,records,C,M,J) {
     };
     if(sourceParameters(native)===null || sourceParameters(native)!==sourceParameters(base))
      reject('RELATIONSHIP.SOURCE','source','source parameter lists do not support a matching override');
-    directedBase(owner,baseOwner.name,'extends');
+    directedBases(owner,baseOwner.name,'extends');
    } else {
     if(target.kind==='internal') {
      const base=nativeDeclarations.get(fact.target.declarationRef);
      if(!base || !['type','implementation'].includes(base.kind))
       reject('RELATIONSHIP.TARGET','target','target declaration kind contradicts relationship');
     }
-    const baseName=target.kind==='internal'?nativeDeclarations.get(fact.target.declarationRef).name:
-     /(?:^|[ /.:#])([\p{L}_$][\p{L}\p{N}_$]*)[#.]?$/u.exec(target.symbol.symbol)?.[1];
-    if(!baseName)reject('RELATIONSHIP.SOURCE','source','external key lacks a source-matchable base spelling');
-    directedBase(native,baseName,fact.relationshipKind);
+    const baseName=target.kind==='internal'?nativeDeclarations.get(fact.target.declarationRef).name:null;
+    const bases=directedBases(native,baseName,fact.relationshipKind);
+    // A sole witnessed base with an independent exact reference can disprove its target.
+    // Without that reference, an opaque SymbolKey supplies no source spelling to compare.
+    if(target.kind==='external' && bases.length===1)checkExternalReference(bases[0],target);
    }
    if(target.kind==='internal' && same(source,target))reject('RELATIONSHIP.TARGET','target','relationship cannot target itself');
    const value={kind:fact.relationshipKind,source,target,provenanceId:proof.id};
