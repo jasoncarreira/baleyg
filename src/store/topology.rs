@@ -552,7 +552,9 @@ enum MarkerRead {
     Short(File),
 }
 fn read_marker_file(path: &Path) -> Result<MarkerRead> {
-    let f = open_file(path, false)?;
+    classify_marker_file(path, open_file(path, false)?)
+}
+fn classify_marker_file(path: &Path, f: File) -> Result<MarkerRead> {
     let mut data = Vec::new();
     (&f).take(37).read_to_end(&mut data)?;
     private_file(path, &f)?;
@@ -576,10 +578,12 @@ fn read_marker(path: &Path) -> Result<Uuid> {
 }
 fn read_marker_during_creation(
     path: &Path,
+    first: MarkerRead,
     hook: &mut impl FnMut(MarkerStage) -> Result<()>,
 ) -> Result<(Uuid, File)> {
+    let mut current = first;
     for attempt in 0..20 {
-        match read_marker_file(path)? {
+        match current {
             MarkerRead::Valid(id, file) => return Ok((id, file)),
             MarkerRead::Short(file) => {
                 hook(MarkerStage::ShortRead)?;
@@ -588,6 +592,7 @@ fn read_marker_during_creation(
                     bail!("invalid workspace-id marker: persistently short");
                 }
                 std::thread::sleep(Duration::from_millis(5));
+                current = read_marker_file(path)?;
             }
         }
     }
@@ -619,15 +624,21 @@ fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Re
     let baleyg = git.join("baleyg");
     make_private(&baleyg)?;
     let path = baleyg.join("workspace-id");
-    match read_marker_during_creation(&path, hook) {
-        Ok((id, file)) => {
+    // Only an absent initial pathname may start a new UUID. Once opened,
+    // descriptor/path failures (including NotFound) must not regenerate it.
+    let initial = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path);
+    match initial {
+        Ok(file) => {
+            let first = classify_marker_file(&path, file)?;
+            let (id, file) = read_marker_during_creation(&path, first, hook)?;
             durable_marker(&path, &baleyg, git, &file, hook)?;
             Ok(id)
         }
-        Err(e)
-            if e.downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let id = Uuid::new_v4();
             let created = OpenOptions::new()
                 .write(true)
@@ -644,14 +655,15 @@ fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Re
                     Ok(id)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let (id, file) = read_marker_during_creation(&path, hook)?;
+                    let first = read_marker_file(&path)?;
+                    let (id, file) = read_marker_during_creation(&path, first, hook)?;
                     durable_marker(&path, &baleyg, git, &file, hook)?;
                     Ok(id)
                 }
                 Err(e) => Err(e.into()),
             }
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }
 #[derive(Debug)]

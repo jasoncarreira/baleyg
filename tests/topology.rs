@@ -199,6 +199,40 @@ fn paused_creator_and_adopter_share_the_single_marker() {
 }
 
 #[test]
+fn short_marker_disappearing_or_replaced_at_barrier_is_not_regenerated() {
+    use baleyg::store::topology::MarkerStage;
+    for replacement in [None, Some("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa")] {
+        let (temp, _) = common::fixture();
+        let work = root(temp.path());
+        common::private(&work.join(".git"));
+        let marker = work.join(".git/baleyg/workspace-id");
+        let original = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        fs::write(&marker, b"partial").unwrap();
+        let mut saw_short = false;
+        let error = WorkspaceIdentity::discover_with_marker_hook(Some(&work), &work, |stage| {
+            if stage == MarkerStage::ShortRead {
+                saw_short = true;
+                fs::remove_file(&marker)?;
+                if let Some(bytes) = replacement {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::write(&marker, bytes)?;
+                    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(saw_short);
+        assert!(!error.to_string().is_empty());
+        match replacement {
+            None => assert!(!marker.exists(), "a vanished short marker was regenerated"),
+            Some(bytes) => assert_eq!(fs::read(&marker).unwrap(), bytes.as_bytes()),
+        }
+        assert!(original.verify().is_err());
+    }
+}
+
+#[test]
 fn every_marker_sync_stage_is_required_for_creator_and_adopter() {
     use baleyg::store::topology::MarkerStage;
     for stage in [
