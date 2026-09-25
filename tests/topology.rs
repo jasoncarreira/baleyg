@@ -40,6 +40,85 @@ fn discovery_matrix() {
 }
 
 #[test]
+fn implicit_home_is_refused_in_isolated_child() {
+    let (temp, _) = common::fixture();
+    let home = fs::canonicalize(root(temp.path())).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("implicit_home_child")
+        .arg("--nocapture")
+        .env("HOME", &home)
+        .env("TOPOLOGY_IMPLICIT_HOME_CHILD", &home)
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated home check failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn implicit_home_child() {
+    let Some(home) = std::env::var_os("TOPOLOGY_IMPLICIT_HOME_CHILD") else {
+        return;
+    };
+    let home = Path::new(&home);
+    assert_eq!(
+        std::env::current_dir().unwrap(),
+        fs::canonicalize(home).unwrap()
+    );
+    assert_eq!(std::env::var_os("HOME").as_deref(), Some(home.as_os_str()));
+    let error = WorkspaceIdentity::discover(None, home).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("implicit home or filesystem root refused"),
+        "unexpected home refusal: {error}"
+    );
+    // The same location is accepted when the workspace is explicitly selected.
+    assert_eq!(
+        WorkspaceIdentity::discover(Some(home), home).unwrap().root,
+        home
+    );
+}
+
+#[test]
+fn implicit_filesystem_root_is_refused() {
+    let filesystem_root = Path::new("/");
+    let error = WorkspaceIdentity::discover(None, filesystem_root).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("implicit home or filesystem root refused"),
+        "unexpected filesystem-root refusal: {error}"
+    );
+}
+
+#[test]
+fn path_identity_is_sha256_of_canonical_absolute_root_bytes() {
+    use sha2::{Digest, Sha256};
+    let (temp, _) = common::fixture();
+    let work = root(temp.path());
+    let nested = work.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let selected = nested.join("..").join("nested");
+    let canonical = fs::canonicalize(&selected).unwrap();
+    let expected_key = hex::encode(Sha256::digest(canonical.to_str().unwrap().as_bytes()));
+    let identity = WorkspaceIdentity::discover(Some(&selected), &work).unwrap();
+    assert!(canonical.is_absolute());
+    assert_eq!(identity.root, canonical);
+    assert_eq!(identity.root_key, expected_key);
+    assert_eq!(identity.record_id, format!("path-{expected_key}"));
+    assert_ne!(
+        identity.root_key,
+        hex::encode(Sha256::digest(selected.to_str().unwrap().as_bytes()))
+    );
+}
+
+#[test]
 fn fixed_paths_and_unsafe_components() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
