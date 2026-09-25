@@ -1050,6 +1050,248 @@ impl<'a> DurableRecords<'a> {
     }
 }
 
+/// The report is a read-only snapshot; it never creates a use lock or a database.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcReport {
+    pub derived: Vec<DerivedReport>,
+    pub records: Vec<RecordReport>,
+}
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DerivedReport {
+    pub root_key: String,
+    pub status: &'static str,
+    pub reason: &'static str,
+}
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordReport {
+    pub id: String,
+    pub views: i64,
+    pub annotations: i64,
+    pub missing_known_paths: Vec<String>,
+}
+
+const GC_AGE_SECONDS: i64 = 30 * 24 * 60 * 60;
+const MAX_TRUSTED_SECONDS: i64 = 9_007_199_254_740_991;
+
+/// A persisted open age is trusted only when positive and no later than this report's clock.
+pub fn classify_index_age(now_secs: i64, opened_secs: Option<i64>) -> (&'static str, &'static str) {
+    match opened_secs {
+        Some(opened) if opened > 0 && opened <= MAX_TRUSTED_SECONDS && opened <= now_secs => {
+            if now_secs - opened >= GC_AGE_SECONDS {
+                ("eligible", "age_30_days")
+            } else {
+                ("unknown", "recent_open")
+            }
+        }
+        _ => ("unknown", "age_unknown"),
+    }
+}
+
+fn managed_existing(base: &Path, child: &str) -> Result<Option<PathBuf>> {
+    for path in [base.to_owned(), base.join(child)] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => private_dir(&path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Some(base.join(child)))
+}
+fn lower_hex(text: &str, length: usize) -> bool {
+    text.len() == length
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+/// Accept only an exact durable record ID, never a pathname or a nil UUID.
+pub fn valid_record_id(id: &str) -> bool {
+    id.strip_prefix("path-")
+        .is_some_and(|key| lower_hex(key, 64))
+        || Uuid::parse_str(id).is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == id)
+}
+fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
+    use rusqlite::{Connection, OpenFlags};
+    let file = open_file(path, false)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = path.with_file_name(format!(
+            "{}{suffix}",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        ensure!(!sidecar.try_exists()?, "recovery sidecar present");
+    }
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    private_file(path, &file)?;
+    db.busy_timeout(Duration::ZERO)?;
+    db.pragma_update(None, "query_only", "ON")?;
+    let journal: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+    ensure!(journal == "delete", "incompatible database journal mode");
+    Ok(db)
+}
+fn inspect_index(dir: &Path, key: &str, now_secs: i64) -> Result<(&'static str, &'static str)> {
+    private_dir(dir)?;
+    let db = readonly_db(&dir.join("index.db"))?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(version == 4, "incompatible index schema");
+    let (schema, spelling, dev, ino, age): (i64, String, String, String, rusqlite::types::Value) = db.query_row(
+        "SELECT schema_version,root_spelling,root_device,root_inode,last_opened_at FROM index_metadata WHERE singleton=1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+    ensure!(
+        schema == 4
+            && Path::new(&spelling).is_absolute()
+            && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
+        "incompatible index identity"
+    );
+    let device: u64 = dev.parse()?;
+    let inode: u64 = ino.parse()?;
+    ensure!(device > 0 && inode > 0, "invalid root identity");
+    let age = match age {
+        rusqlite::types::Value::Integer(n) => Some(n),
+        _ => None,
+    };
+    for ancestor in Path::new(&spelling)
+        .ancestors()
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+    {
+        match fs::symlink_metadata(ancestor) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+            Ok(m) if m.file_type().is_symlink() => return Ok(("unknown", "root_identity_unknown")),
+            Ok(_) if *ancestor == Path::new(&spelling) => break,
+            Ok(_) => return Ok(("unknown", "root_identity_unknown")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(("eligible", "root_missing"));
+            }
+            Err(_) => return Ok(("unknown", "root_identity_unknown")),
+        }
+    }
+    match fs::symlink_metadata(&spelling) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(("eligible", "root_missing")),
+        Ok(m)
+            if m.is_dir()
+                && !m.file_type().is_symlink()
+                && (m.dev(), m.ino()) == (device, inode) =>
+        {
+            Ok(classify_index_age(now_secs, age))
+        }
+        Ok(m) if !m.file_type().is_symlink() => Ok(("eligible", "root_replaced")),
+        _ => Ok(("unknown", "root_identity_unknown")),
+    }
+}
+
+impl TopologyRoots {
+    /// Resolve a durable record by validated ID without discovering a checkout marker.
+    pub fn record_by_id(&self, id: &str) -> Result<Option<RecordReport>> {
+        ensure!(valid_record_id(id), "invalid record ID");
+        let Some(parent) = managed_existing(&self.data, "workspaces")? else {
+            return Ok(None);
+        };
+        let dir = parent.join(id);
+        match fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+            Ok(_) => private_dir(&dir)?,
+        }
+        let guard = UseGuard::acquire_existing(&parent.join(format!("{id}.lock")), false, true)?;
+        let db = readonly_db(&dir.join("workspace.db"))?;
+        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        ensure!(version == 1, "incompatible_record: schema version");
+        let row: (i64, String, i64) = db.query_row(
+            "SELECT schema_version,record_id,initialized FROM record_metadata WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        ensure!(
+            row == (1, id.to_owned(), 1),
+            "incomplete_record: metadata mismatch"
+        );
+        let views = db.query_row("SELECT count(*) FROM views", [], |r| r.get(0))?;
+        let annotations = db.query_row("SELECT count(*) FROM annotations", [], |r| r.get(0))?;
+        let paths = db
+            .prepare("SELECT path FROM known_roots ORDER BY path")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let missing_known_paths = paths
+            .into_iter()
+            .filter(|p| {
+                fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            })
+            .collect();
+        guard.verify()?;
+        Ok(Some(RecordReport {
+            id: id.to_owned(),
+            views,
+            annotations,
+            missing_known_paths,
+        }))
+    }
+    pub fn gc_report(&self) -> Result<GcReport> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        self.gc_report_at(now_secs)
+    }
+    /// Fixed clock for report tests; production takes one snapshot per invocation.
+    pub fn gc_report_at(&self, now_secs: i64) -> Result<GcReport> {
+        let mut derived = Vec::new();
+        if let Some(parent) = managed_existing(&self.cache, "indexes")? {
+            for entry in fs::read_dir(&parent)? {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 index name"))?;
+                if !lower_hex(&name, 64) {
+                    continue;
+                }
+                let lock = parent.join(format!("{name}.lock"));
+                let (status, reason) = match UseGuard::acquire_existing(&lock, true, true) {
+                    Err(e) if e.to_string().contains("storage_busy") => ("busy", "use_lock_busy"),
+                    Err(_) => ("unknown", "unsafe_use_lock"),
+                    Ok(guard) => {
+                        let result = inspect_index(&entry.path(), &name, now_secs)
+                            .unwrap_or(("unknown", "metadata_unreadable"));
+                        if guard.verify().is_err() {
+                            ("unknown", "unsafe_use_lock")
+                        } else {
+                            result
+                        }
+                    }
+                };
+                derived.push(DerivedReport {
+                    root_key: name,
+                    status,
+                    reason,
+                });
+            }
+            derived.sort_by(|a, b| a.root_key.cmp(&b.root_key));
+        }
+        let mut records = Vec::new();
+        if let Some(parent) = managed_existing(&self.data, "workspaces")? {
+            for entry in fs::read_dir(parent)? {
+                let name = entry?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 record name"))?;
+                if valid_record_id(&name) {
+                    records.push(
+                        self.record_by_id(&name)?
+                            .context("incomplete_record: missing record")?,
+                    );
+                }
+            }
+            records.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        Ok(GcReport { derived, records })
+    }
+}
+
 #[cfg(test)]
 pub fn assert_topology_fixture(store: &crate::store::Store, state: &Path) {
     let status = store.status().unwrap();

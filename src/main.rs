@@ -43,6 +43,14 @@ enum Command {
     Query(QueryArgs),
     /// Export the normalized snapshot graph as JSON, including indexed source.
     Export(ExportArgs),
+    /// Inspect existing derived indexes and saved records without changing them.
+    Gc(GcArgs),
+}
+#[derive(Args)]
+struct GcArgs {
+    /// Print the read-only cleanup inventory.
+    #[arg(long, required = true)]
+    report: bool,
 }
 #[derive(Args, Clone)]
 struct WorkspaceArgs {
@@ -202,6 +210,7 @@ async fn main() -> Result<()> {
         )
         .init();
     match Cli::parse().command {
+        Command::Gc(_) => print_json(&TopologyRoots::production()?.gc_report()?)?,
         Command::Index(args) => {
             let (store, options, _) = args.resolve()?;
             let expected = store.status()?.revision;

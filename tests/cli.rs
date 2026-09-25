@@ -429,3 +429,49 @@ fn overlapping_git_workspace_refuses_before_marker_or_managed_entries() {
         }
     }
 }
+
+#[test]
+fn gc_report_without_workspace_does_not_create_state() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let output = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .args(["gc", "--report"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(inventory["derived"], serde_json::json!([]));
+    assert_eq!(inventory["records"], serde_json::json!([]));
+    assert!(!home.exists());
+    let denied = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("gc")
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(!home.exists());
+    let root = temp.path().join("work");
+    fs::create_dir(&root).unwrap();
+    assert!(
+        command(&root, &home, "status")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .args(["gc", "--report"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(inventory["derived"].as_array().unwrap().len(), 1);
+    assert_eq!(inventory["derived"][0]["status"], "unknown");
+    assert_eq!(inventory["derived"][0]["reason"], "recent_open");
+}
