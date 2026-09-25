@@ -187,6 +187,13 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                     | "lambda_expression"
                     | "lambda"
                     | "compact_constructor_declaration"
+                    | "impl_item"
+                    | "trait_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "union_item"
+                    | "mod_item"
+                    | "closure_expression"
             )
             || (node.kind == "class_body"
                 && node.parent_id.is_some_and(|parent| {
@@ -198,6 +205,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         let invocation = matches!(
             node.kind.as_str(),
             "call_expression"
+                | "method_call_expression"
                 | "new_expression"
                 | "method_invocation"
                 | "call"
@@ -279,6 +287,13 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                     | "arrow_function"
                     | "lambda_expression"
                     | "lambda"
+                    | "closure_expression"
+                    | "impl_item"
+                    | "trait_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "union_item"
+                    | "mod_item"
             )
         {
             owner = nodes[owner].parent_id.unwrap_or(0);
@@ -288,7 +303,12 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 .iter()
                 .find(|candidate| {
                     candidate.parent_id == Some(node.id)
-                        && matches!(candidate.field_name.as_deref(), Some("name" | "declarator"))
+                        && matches!(
+                            candidate.field_name.as_deref(),
+                            Some("name" | "declarator" | "type")
+                        )
+                        && (candidate.field_name.as_deref() != Some("type")
+                            || node.kind == "impl_item")
                 })
                 .and_then(|candidate| {
                     if candidate.field_name.as_deref() == Some("declarator") {
@@ -317,6 +337,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 | "arrow_function"
                 | "lambda_expression"
                 | "lambda"
+                | "closure_expression"
         ) || node.kind == "class_body"
             && node.parent_id.is_some_and(|parent| {
                 matches!(
@@ -1214,6 +1235,8 @@ pub fn capture_revision_with_hook(
             crate::indexer_java::identify_document(document, &revision_id)?;
         } else if document.key.language == Language::Python {
             crate::indexer_python::identify_document(document, &revision_id)?;
+        } else if document.key.language == Language::Rust {
+            crate::indexer_rust::identify_document(document, &revision_id)?;
         }
         for position in &mut document.semantic_positions {
             position.revision_id = revision_id.clone();
@@ -1629,11 +1652,12 @@ pub fn index_workspace(
             Err(e) => diag(&mut g, None, "scip-unavailable", e.to_string()),
         }
     }
-    let browser_capture = if g
-        .files
-        .iter()
-        .any(|f| matches!(f.language.as_str(), "javascript" | "java" | "python"))
-    {
+    let browser_capture = if g.files.iter().any(|f| {
+        matches!(
+            f.language.as_str(),
+            "javascript" | "java" | "python" | "rust"
+        )
+    }) {
         Some(capture_browser_revision(
             options,
             &workspace_root,
@@ -1652,7 +1676,21 @@ pub fn index_workspace(
         let file = g.files[i].clone();
         if file.language != "javascript" {
             match file.language.as_str() {
-                "rust" => crate::indexer_rust::extract(&mut g, &file, cancel)?,
+                "rust" => {
+                    let source_set =
+                        crate::store::topology::WorkspaceIdentity::discover_unattached(
+                            Some(&workspace_root),
+                            &workspace_root,
+                        )?
+                        .record_id;
+                    crate::indexer_rust::extract_with_identity(
+                        &mut g,
+                        &file,
+                        cancel,
+                        &browser_capture.as_ref().unwrap().revision_id,
+                        &source_set,
+                    )?
+                }
                 "java" => {
                     let source_set =
                         crate::store::topology::WorkspaceIdentity::discover_unattached(

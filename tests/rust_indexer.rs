@@ -201,3 +201,139 @@ fn chained_calls_have_unique_range_ids_and_publish() {
         )
         .unwrap();
 }
+
+fn captured(root: &std::path::Path) -> baleyg::indexer::CapturedRevision {
+    use baleyg::{
+        indexer::{CaptureAdmission, capture_revision},
+        model::v1::Language,
+    };
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(root), root).unwrap();
+    for name in ["toolchain.capture", "config.capture", "dependency.capture"] {
+        fs::write(root.join(name), b"fixture").unwrap();
+    }
+    capture_revision(
+        &IndexOptions::new(root.to_owned()),
+        &CaptureAdmission {
+            source_set_id: identity.record_id,
+            root_id: identity.root_key,
+            languages: vec![Language::Rust],
+            toolchain: root.join("toolchain.capture"),
+            config: root.join("config.capture"),
+            dependency: root.join("dependency.capture"),
+            dependency_source_sets: vec![],
+            producers: vec![],
+        },
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap()
+}
+#[test]
+fn rust_member_token_is_measured_not_inferred() {
+    use baleyg::indexer::NativeCandidateKind;
+    let d = tempfile::tempdir().unwrap();
+    let source = "struct Café; impl Café { fn r#type(&self) {} } fn run() { obj.r#type(); (obj.field)(1); factory().write(2); let f = || inner(); }";
+    fs::write(d.path().join("lib.rs"), source).unwrap();
+    let capture = captured(d.path());
+    let doc = &capture.documents[0];
+    assert!(doc.native_candidates.iter().any(|w| {
+        w.node_kind == "closure_expression"
+            && w.candidate_kind == NativeCandidateKind::Declaration
+            && w.stable_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("sid:v1:"))
+    }));
+    let methods: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| {
+            w.candidate_kind == NativeCandidateKind::Invocation
+                && w.node_kind == "call_expression"
+                && w.verified_member_token
+        })
+        .collect();
+    assert_eq!(methods.len(), 2);
+    for member in methods {
+        assert!(member.stable_id.as_deref().unwrap().starts_with("occ:v1:"));
+        assert!(member.verified_member_token);
+        assert_eq!(
+            &source[member.token_start_byte..member.token_end_byte],
+            member
+                .token_bytes
+                .as_slice()
+                .iter()
+                .map(|&b| b as char)
+                .collect::<String>()
+        );
+        assert_eq!(
+            member.spelling.as_deref(),
+            Some(if member.token_bytes == b"r#type" {
+                "type"
+            } else {
+                "write"
+            })
+        );
+    }
+    let compound = doc
+        .native_candidates
+        .iter()
+        .find(|w| {
+            w.candidate_kind == NativeCandidateKind::Invocation
+                && source[w.start_byte..w.end_byte].starts_with("(obj.field)(1)")
+        })
+        .unwrap();
+    assert!(!compound.verified_member_token);
+    assert!(compound.spelling.is_none());
+    let graph = run(&IndexOptions::new(d.path().to_owned()));
+    assert!(graph.calls.iter().all(|c| c.id.starts_with("occ:v1:")
+        && c.target.is_none()
+        && c.candidate_symbols.is_empty()));
+    assert!(graph.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
+}
+
+#[test]
+fn rust_declarations_keep_ids_across_body_edits_and_exact_names() {
+    use baleyg::indexer::NativeCandidateKind;
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("lib.rs");
+    let before = "fn café() { first(); } fn cafe\u{301}() { first(); } fn same() { first(); } fn same() { first(); }";
+    fs::write(&path, before).unwrap();
+    let first = captured(d.path());
+    let declarations = |capture: &baleyg::indexer::CapturedRevision| {
+        capture.documents[0]
+            .native_candidates
+            .iter()
+            .filter(|w| {
+                w.candidate_kind == NativeCandidateKind::Declaration
+                    && w.node_kind == "function_item"
+            })
+            .map(|w| (w.name_bytes.clone(), w.stable_id.clone().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let a = declarations(&first);
+    assert_eq!(a.len(), 4);
+    assert_ne!(a[0].1, a[1].1);
+    assert_ne!(a[2].1, a[3].1);
+    assert!(a.iter().all(|(_, id)| id.starts_with("sid:v1:")));
+    let altered = before.replace("first();", "second();");
+    fs::write(&path, altered).unwrap();
+    let second = captured(d.path());
+    assert_eq!(a, declarations(&second));
+    let calls = |capture: &baleyg::indexer::CapturedRevision| {
+        capture.documents[0]
+            .native_candidates
+            .iter()
+            .filter(|w| w.candidate_kind == NativeCandidateKind::Invocation)
+            .map(|w| w.stable_id.clone().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(calls(&first), calls(&second));
+    assert_eq!(
+        run(&IndexOptions::new(d.path().to_owned()))
+            .nodes
+            .iter()
+            .filter(|n| n.name == "same")
+            .count(),
+        2
+    );
+}

@@ -1,7 +1,10 @@
 //! Syntax-only Rust adapter. Never invokes workspace tools or expands macros.
 //! Names and containers are lexical hints, not type, trait, cfg or module resolution.
+use crate::model::v1::{self, Key, Kind, Language, Text, UInt};
 use crate::model::*;
+use crate::semantic_identity::{self as identity, OccurrenceKind};
 use anyhow::{Context, Result, ensure};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tree_sitter::Node;
 
@@ -21,8 +24,356 @@ fn range(n: Node<'_>) -> SourceRange {
         end_column: n.end_position().column + 1,
     }
 }
+struct RustIds {
+    module: String,
+    ids: HashMap<(usize, usize, &'static str), String>,
+    owners: HashMap<(usize, usize, &'static str), String>,
+    paths: HashMap<String, Vec<String>>,
+}
+
+fn declaration(n: Node<'_>, bytes: &[u8]) -> Result<Option<Key>> {
+    let kind = match n.kind() {
+        "function_item" => {
+            if n.parent().is_some_and(|p| {
+                p.kind() == "declaration_list"
+                    && p.parent()
+                        .is_some_and(|p| matches!(p.kind(), "impl_item" | "trait_item"))
+            }) {
+                Kind::Method
+            } else {
+                Kind::Function
+            }
+        }
+        "closure_expression" => Kind::AnonymousFunction,
+        "impl_item" | "trait_item" | "struct_item" | "enum_item" | "union_item" | "mod_item" => {
+            Kind::Type
+        }
+        _ => return Ok(None),
+    };
+    let name = if n.kind() == "impl_item" {
+        let ty = n.child_by_field_name("type").context("impl has no type")?;
+        let tr = n
+            .child_by_field_name("trait")
+            .map(|t| format!("{} for ", String::from_utf8_lossy(&bytes[t.byte_range()])))
+            .unwrap_or_default();
+        Some(
+            Text::new(format!(
+                "impl {tr}{}",
+                String::from_utf8_lossy(&bytes[ty.byte_range()])
+            ))
+            .context("invalid Rust impl name")?,
+        )
+    } else {
+        n.child_by_field_name("name")
+            .map(|v| {
+                Text::new(std::str::from_utf8(&bytes[v.byte_range()])?.to_owned())
+                    .context("invalid Rust name")
+            })
+            .transpose()?
+    };
+    Ok(Some(Key {
+        kind,
+        name,
+        signature: None,
+        ordinal: UInt::new(0).unwrap(),
+    }))
+}
+fn region(n: Node<'_>) -> bool {
+    matches!(
+        n.kind(),
+        "if_expression"
+            | "match_arm"
+            | "loop_expression"
+            | "while_expression"
+            | "for_expression"
+            | "async_block"
+            | "unsafe_block"
+    )
+}
+fn skipped(n: Node<'_>) -> bool {
+    matches!(
+        n.kind(),
+        "macro_invocation"
+            | "macro_definition"
+            | "token_tree"
+            | "attribute_item"
+            | "inner_attribute_item"
+    )
+}
+impl RustIds {
+    fn new(root: Node<'_>, file: &SourceFile, revision: &str, source_set: &str) -> Result<Self> {
+        let path = v1::Path::new(file.path.clone()).context("invalid Rust path")?;
+        let source_set = Text::new(source_set.to_owned()).context("invalid source set")?;
+        let module_key = Key {
+            kind: Kind::Module,
+            name: None,
+            signature: None,
+            ordinal: UInt::new(0).unwrap(),
+        };
+        let module = identity::syntax_id(&source_set, &path, Language::Rust, &[], &module_key)?
+            .as_str()
+            .to_owned();
+        let mut decl = Vec::<(usize, usize, Key, Vec<usize>)>::new();
+        fn collect(
+            n: Node<'_>,
+            bytes: &[u8],
+            parents: Vec<usize>,
+            out: &mut Vec<(usize, usize, Key, Vec<usize>)>,
+        ) -> Result<()> {
+            if skipped(n) {
+                return Ok(());
+            }
+            let mut parents = parents;
+            if let Some(key) = declaration(n, bytes)? {
+                out.push((n.start_byte(), n.end_byte(), key, parents.clone()));
+                parents.push(out.len() - 1);
+            }
+            let mut cursor = n.walk();
+            for child in n.named_children(&mut cursor) {
+                collect(child, bytes, parents.clone(), out)?;
+            }
+            Ok(())
+        }
+        collect(root, file.text.as_bytes(), vec![], &mut decl)?;
+        let mut ids = HashMap::new();
+        let mut keys = HashMap::<usize, Key>::new();
+        let mut resolved = HashMap::<usize, String>::new();
+        let mut paths = HashMap::from([(module.clone(), vec![module.clone()])]);
+        let mut collisions = identity::CollisionRegistry::default();
+        for depth in 0..=decl.iter().map(|d| d.3.len()).max().unwrap_or(0) {
+            let indexes: Vec<_> = (0..decl.len())
+                .filter(|&i| decl[i].3.len() == depth)
+                .collect();
+            let entries: Vec<_> = indexes
+                .iter()
+                .map(|&i| {
+                    let (start, end, key, parents) = &decl[i];
+                    let ancestors = std::iter::once(module_key.clone())
+                        .chain(parents.iter().map(|p| keys[p].clone()))
+                        .collect();
+                    (ancestors, key.clone(), *start as u64, *end as u64)
+                })
+                .collect();
+            for (&i, ordinal) in indexes.iter().zip(identity::sibling_ordinals(&entries)?) {
+                let (start, end, key, parents) = &decl[i];
+                let mut key = key.clone();
+                key.ordinal = ordinal;
+                let ancestors: Vec<_> = std::iter::once(module_key.clone())
+                    .chain(parents.iter().map(|p| keys[p].clone()))
+                    .collect();
+                let digest =
+                    identity::syntax_digest(&source_set, &path, Language::Rust, &ancestors, &key)?;
+                let id = identity::syntax_id(&source_set, &path, Language::Rust, &ancestors, &key)?;
+                collisions.syntax(&id, digest.input)?;
+                let id = id.as_str().to_owned();
+                ids.insert((*start, *end, "syntax"), id.clone());
+                paths.insert(
+                    id.clone(),
+                    std::iter::once(module.clone())
+                        .chain(parents.iter().map(|p| resolved[p].clone()))
+                        .chain(std::iter::once(id.clone()))
+                        .collect(),
+                );
+                resolved.insert(i, id);
+                keys.insert(i, key);
+            }
+        }
+        let mut occ = Vec::<(usize, usize, &'static str, String, OccurrenceKind)>::new();
+        fn visit(
+            n: Node<'_>,
+            decl: &[(usize, usize, Key, Vec<usize>)],
+            resolved: &HashMap<usize, String>,
+            owner: String,
+            out: &mut Vec<(usize, usize, &'static str, String, OccurrenceKind)>,
+        ) {
+            if skipped(n) {
+                return;
+            }
+            let owner = decl
+                .iter()
+                .enumerate()
+                .find(|(_, d)| d.0 == n.start_byte() && d.1 == n.end_byte())
+                .and_then(|(i, _)| resolved.get(&i))
+                .cloned()
+                .unwrap_or(owner);
+            if region(n) {
+                out.push((
+                    n.start_byte(),
+                    n.end_byte(),
+                    "region",
+                    owner.clone(),
+                    OccurrenceKind::Control,
+                ));
+            }
+            if matches!(n.kind(), "call_expression" | "method_call_expression") {
+                out.push((
+                    n.start_byte(),
+                    n.end_byte(),
+                    "call",
+                    owner.clone(),
+                    OccurrenceKind::Call,
+                ));
+            }
+            let mut cursor = n.walk();
+            for child in n.named_children(&mut cursor) {
+                visit(child, decl, resolved, owner.clone(), out);
+            }
+        }
+        visit(root, &decl, &resolved, module.clone(), &mut occ);
+        let entries: Vec<_> = occ
+            .iter()
+            .map(|(start, end, _, owner, kind)| {
+                (
+                    v1::SyntaxId::new(owner.clone()).unwrap(),
+                    *kind,
+                    *start as u64,
+                    *end as u64,
+                )
+            })
+            .collect();
+        let revision = Text::new(revision.to_owned()).context("invalid revision")?;
+        let mut owners = HashMap::new();
+        for ((start, end, prefix, owner, kind), ordinal) in occ
+            .into_iter()
+            .zip(identity::occurrence_ordinals(&entries)?)
+        {
+            owners.insert((start, end, prefix), owner.clone());
+            let owner = v1::SyntaxId::new(owner).context("invalid owner ID")?;
+            let digest = identity::occurrence_digest(&revision, &owner, kind, ordinal)?;
+            let id = identity::occurrence_id(&revision, &owner, kind, ordinal)?;
+            collisions.occurrence(&id, digest.input)?;
+            ids.insert((start, end, prefix), id.as_str().to_owned());
+        }
+        Ok(Self {
+            module,
+            ids,
+            owners,
+            paths,
+        })
+    }
+}
+
+pub(crate) fn identify_document(
+    document: &mut crate::indexer::CapturedDocument,
+    revision: &str,
+) -> Result<()> {
+    use crate::indexer::NativeCandidateKind;
+    let source = std::str::from_utf8(&document.bytes)?;
+    let file = SourceFile {
+        path: document.key.path.as_str().to_owned(),
+        hash: document.content_hash.clone(),
+        language: "rust".into(),
+        text: source.into(),
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
+    let tree = parser.parse(source, None).context("Rust parser failed")?;
+    let ids = RustIds::new(
+        tree.root_node(),
+        &file,
+        revision,
+        document.key.source_set_id.as_str(),
+    )?;
+    document.native_candidates.retain(|w| {
+        !matches!(
+            w.candidate_kind,
+            NativeCandidateKind::ControlRegion | NativeCandidateKind::Invocation
+        ) || ids.ids.contains_key(&(
+            w.start_byte,
+            w.end_byte,
+            if w.candidate_kind == NativeCandidateKind::Invocation {
+                "call"
+            } else {
+                "region"
+            },
+        ))
+    });
+    for witness in &mut document.native_candidates {
+        let prefix = match witness.candidate_kind {
+            NativeCandidateKind::Declaration => "syntax",
+            NativeCandidateKind::Invocation => "call",
+            NativeCandidateKind::ControlRegion => "region",
+            NativeCandidateKind::Occurrence => continue,
+        };
+        witness.stable_id = ids
+            .ids
+            .get(&(witness.start_byte, witness.end_byte, prefix))
+            .cloned();
+        witness.ancestor_ids = if prefix == "syntax" {
+            witness
+                .stable_id
+                .as_ref()
+                .and_then(|id| ids.paths.get(id))
+                .map(|p| p[..p.len() - 1].to_vec())
+                .unwrap_or_else(|| vec![ids.module.clone()])
+        } else {
+            ids.owners
+                .get(&(witness.start_byte, witness.end_byte, prefix))
+                .and_then(|owner| ids.paths.get(owner))
+                .cloned()
+                .unwrap_or_else(|| vec![ids.module.clone()])
+        };
+        if witness.candidate_kind == NativeCandidateKind::Invocation
+            && let Some(node) =
+                find_invocation(tree.root_node(), witness.start_byte, witness.end_byte)
+            && let Some((start, end, spelling)) = measured_member_name(node, &document.bytes)
+        {
+            witness.token_start_byte = start;
+            witness.token_end_byte = end;
+            witness.token_bytes = document.bytes[start..end].to_vec();
+            witness.name_bytes = witness.token_bytes.clone();
+            witness.spelling = Some(spelling);
+            witness.verified_member_token = true;
+        }
+    }
+    Ok(())
+}
+fn find_invocation(n: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
+    if matches!(n.kind(), "call_expression" | "method_call_expression")
+        && n.start_byte() == start
+        && n.end_byte() == end
+    {
+        return Some(n);
+    }
+    let mut cursor = n.walk();
+    for child in n.named_children(&mut cursor) {
+        if child.start_byte() <= start
+            && end <= child.end_byte()
+            && let Some(found) = find_invocation(child, start, end)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+fn measured_member_name(n: Node<'_>, bytes: &[u8]) -> Option<(usize, usize, String)> {
+    if n.kind() != "call_expression" {
+        return None;
+    }
+    let function = n.child_by_field_name("function")?;
+    if function.kind() != "field_expression" {
+        return None;
+    }
+    function.child_by_field_name("value")?;
+    let name = function.child_by_field_name("field")?;
+    if name.kind() != "field_identifier" || name.end_byte() > bytes.len() {
+        return None;
+    }
+    let raw = std::str::from_utf8(&bytes[name.byte_range()]).ok()?;
+    let spelling = raw.strip_prefix("r#").unwrap_or(raw).to_owned();
+    Some((name.start_byte(), name.end_byte(), spelling))
+}
+#[cfg(test)]
 pub(crate) fn extract(g: &mut Graph, file: &SourceFile, cancel: &CancelFlag) -> Result<()> {
-    extract_with_limits(g, file, cancel, usize::MAX, usize::MAX)
+    extract_with_limits(
+        g,
+        file,
+        cancel,
+        usize::MAX,
+        usize::MAX,
+        &file.hash,
+        "standalone",
+    )
 }
 /// External browsing bounds the extraction walk, not tree-sitter parsing time.
 /// Kept separate so workspace indexing retains its existing behavior.
@@ -31,7 +382,24 @@ pub(crate) fn extract_external(
     file: &SourceFile,
     cancel: &CancelFlag,
 ) -> Result<()> {
-    extract_with_limits(g, file, cancel, 50_000, 8_000)
+    extract_with_limits(g, file, cancel, 50_000, 8_000, &file.hash, "standalone")
+}
+pub(crate) fn extract_with_identity(
+    g: &mut Graph,
+    file: &SourceFile,
+    cancel: &CancelFlag,
+    revision: &str,
+    source_set: &str,
+) -> Result<()> {
+    extract_with_limits(
+        g,
+        file,
+        cancel,
+        usize::MAX,
+        usize::MAX,
+        revision,
+        source_set,
+    )
 }
 fn extract_with_limits(
     g: &mut Graph,
@@ -39,6 +407,8 @@ fn extract_with_limits(
     cancel: &CancelFlag,
     max_visits: usize,
     max_records: usize,
+    revision: &str,
+    source_set: &str,
 ) -> Result<()> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
@@ -60,7 +430,8 @@ fn extract_with_limits(
     }
     g.diagnostics.push(Diagnostic { path: Some(file.path.clone()), code: "rust-lexical-only".into(),
         message: "Rust syntax only: attributes/cfg are not evaluated, modules and names are not resolved, macros are opaque; async bodies describe possible execution when polled".into() });
-    let module = format!("module:{}", file.path);
+    let ids = RustIds::new(tree.root_node(), file, revision, source_set)?;
+    let module = ids.module.clone();
     g.nodes.push(Symbol {
         id: module.clone(),
         name: file.path.clone(),
@@ -78,6 +449,7 @@ fn extract_with_limits(
         visits: 0,
         max_visits,
         max_records,
+        ids: &ids,
     }
     .walk(tree.root_node(), &module, &[], 0)
 }
@@ -88,21 +460,18 @@ struct Extractor<'a> {
     visits: usize,
     max_visits: usize,
     max_records: usize,
+    ids: &'a RustIds,
 }
 impl Extractor<'_> {
     fn text(&self, n: Node<'_>) -> &str {
         &self.file.text[n.byte_range()]
     }
-    fn id(&self, n: Node<'_>, prefix: &str) -> String {
-        format!(
-            "{}:{}:{}:{}:{}:{}",
-            prefix,
-            self.file.path,
-            self.file.hash,
-            n.start_byte(),
-            n.end_byte(),
-            n.kind()
-        )
+    fn id(&self, n: Node<'_>, prefix: &'static str) -> String {
+        self.ids
+            .ids
+            .get(&(n.start_byte(), n.end_byte(), prefix))
+            .cloned()
+            .expect("measured Rust candidate identity")
     }
     fn walk(&mut self, n: Node<'_>, owner: &str, regions: &[String], depth: usize) -> Result<()> {
         ensure!(!self.cancel.load(Ordering::Relaxed), "indexing cancelled");
@@ -211,9 +580,13 @@ impl Extractor<'_> {
             });
             regions.push(id);
         }
-        if n.kind() == "call_expression" {
+        if matches!(n.kind(), "call_expression" | "method_call_expression") {
             let callee = n
-                .child_by_field_name("function")
+                .child_by_field_name(if n.kind() == "method_call_expression" {
+                    "method"
+                } else {
+                    "function"
+                })
                 .map(|v| self.text(v).to_owned())
                 .unwrap_or_default();
             let mut callbacks = Vec::new();
