@@ -115,6 +115,71 @@ async fn optional_endpoint_matrix() {
     }
 }
 #[tokio::test]
+async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
+    let (temp, store, graph, app, id) = fixture();
+    let old = store.status().unwrap().revision;
+    let old_source = format!("/api/source?path=Types.java&{}", query(old));
+    assert_eq!(call(&app, "GET", &old_source, Value::Null).await.0, 200);
+
+    // Simulate deleting a disposable index while the workspace and its marker remain.
+    // This is not an in-place rebuild or a #39 full rebuild publication path.
+    drop(app);
+    drop(store);
+    let indexes = temp.path().join("state/cache/indexes");
+    let index_dir = std::fs::read_dir(&indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let use_lock = indexes.join(format!(
+        "{}.lock",
+        index_dir.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::remove_dir_all(&index_dir).unwrap();
+    std::fs::remove_file(&use_lock).unwrap();
+
+    let root = temp.path().join("workspace");
+    let recreated = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
+    let baseline = recreated.status().unwrap().revision;
+    assert_eq!(baseline.index_revision, 0);
+    assert_ne!(baseline.index_generation, old.index_generation);
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    recreated
+        .publish(&graph, &recreated.leader().unwrap(), baseline, &cancel)
+        .unwrap();
+    let current = recreated.status().unwrap().revision;
+    assert_eq!(current.index_revision, old.index_revision);
+    assert_ne!(current.index_generation, old.index_generation);
+    let app = http::router(
+        http::new(
+            recreated,
+            IndexOptions::new(root),
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+
+    let (code, body) = call(&app, "GET", &old_source, Value::Null).await;
+    assert_eq!(
+        code, 409,
+        "old pair must conflict despite the reused number: {body}"
+    );
+    let current_source = format!("/api/source?path=Types.java&{}", query(current));
+    let (code, body) = call(&app, "GET", &current_source, Value::Null).await;
+    assert_eq!(code, 200, "current pair must work: {body}");
+    assert_eq!(body["revision"], json!(current));
+
+    let old_sequence = json!({"seed":id,"expectedRevision":old});
+    let (code, body) = call(&app, "POST", "/api/sequence", old_sequence).await;
+    assert_eq!(code, 409, "old required pair must conflict: {body}");
+    let current_sequence = json!({"seed":id,"expectedRevision":current});
+    let (code, body) = call(&app, "POST", "/api/sequence", current_sequence).await;
+    assert_eq!(code, 200, "current required pair must work: {body}");
+    assert_eq!(body["revision"], json!(current));
+}
+
+#[tokio::test]
 async fn producer_endpoint_matrix() {
     let (_temp, store, _graph, app, id) = fixture();
     let pin = store.status().unwrap().revision;
