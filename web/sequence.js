@@ -45,7 +45,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   // Keep a readable guard column even for deeply nested input. The canvas scrolls.
   const width = Math.max(720, participants.length * 210 + 80, visibleDepth * 10 + 400);
   const svg = make("svg", {viewBox:`0 0 ${width} 200`, width, role:"group", "aria-label":"Static possible paths sequence diagram"});
-  svg.append(make("title", {}, `${view.seed.name}: static possible paths, not a runtime trace`));
+  svg.append(make("title", {}, `${view.seed.name}: static possible paths, not a runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
   const positions = new Map(participants.map((p, i) => [p.id, 130 + i * 210]));
   const origin = positions.get(view.seed.id) || 130;
   const lines = make("g", {class:"sequence-lifelines"}); svg.append(lines);

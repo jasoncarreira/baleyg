@@ -6,18 +6,19 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/classes.js"), "utf8");
+const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.BaleygIndexPin = IndexPin;/)[0];
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => {resolve = yes; reject = no;}); return {promise, resolve, reject}; };
 const range = {startLine: 1, endLine: 8, startByte: 0, endByte: 120};
 function definition(id) { return {symbol: {id, name: id, path: `src/${id}.java`, range, provenance: {parser: "syntax"}}, qualifiedName: `sample.${id}`, language: "java", declarationKind: "class", fields: [{name:"other",typeHint:"B",path:`src/${id}.java`,range}], methods: [{name:"execute",symbolId:`${id}.execute`,typeHint:"void",path:`src/${id}.java`,range}], truncated:false}; }
 const node = id => ({id, label:id, kind:"class", expandable:true, class:definition(id)});
-function diagram(ids = ["A", "B"], revision = 1) { return {revision, seed: ids[0], nodes:ids.map(node), edges:ids.slice(1).map((id,i)=>({id:`e${i}`,owner:ids[0],target:id,typeName:id,kind:"field",matchKind:"syntaxCandidate",candidateIds:[id],path:"A.java",range})), warnings:[],truncated:false}; }
+function diagram(ids = ["A", "B"], revision = {indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}) { return {revision, seed: ids[0], nodes:ids.map(node), edges:ids.slice(1).map((id,i)=>({id:`e${i}`,owner:ids[0],target:id,typeName:id,kind:"field",matchKind:"syntaxCandidate",candidateIds:[id],path:"A.java",range})), warnings:[],truncated:false}; }
 function harness({navigation = false} = {}) {
-  const elements = new Map(), calls = [], reads = [], methods = [], changes = [], navigations = [];
+  const elements = new Map(), calls = [], reads = [], methods = [], changes = [], navigations = [], stale = [];
   let navigate = (event, selector, scope) => { navigations.push({event, selector, scope}); };
   const docListeners = {}, winListeners = {};
-  let revision = 1, session = "one";
+  let revision = {indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, session = "one";
   let request = async (url, options) => options ? diagram() : {revision,items:[definition("A")],nextOffset:null,warnings:[],truncated:false};
   const document = {activeElement:null, addEventListener(type, fn) { (docListeners[type] ||= []).push(fn); }};
   function element(tagName) {
@@ -49,9 +50,9 @@ function harness({navigation = false} = {}) {
   document.querySelector=selector=>document.body.querySelector(selector);
   document.getElementById=id=>{if(!elements.has(id)){const item=element(id);elements.set(id,item);document.body.append(item);}return elements.get(id);};
   const window = {innerWidth:390,innerHeight:600,addEventListener(type,fn){(winListeners[type] ||= []).push(fn);}};
-  vm.runInNewContext(source,{window,document,URLSearchParams,console});
-  window.BaleygClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true)});
-  return {controller:window.BaleygClasses,document,window,calls,reads,methods,changes,navigations,get:document.getElementById,
+  vm.runInNewContext(pinSource + "\n" + source,{window,document,URLSearchParams,console});
+  window.BaleygClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true),onStale:message=>stale.push(message)});
+  return {controller:window.BaleygClasses,document,window,calls,reads,methods,changes,navigations,stale,get:document.getElementById,
     setNavigate(fn){navigate=fn;},setRequest(fn){request=fn;},setRevision(value){revision=value;},setSession(value){session=value;},
     async event(type,target){for(const fn of docListeners[type]||[]) await fn({target});},
     menu(){return document.body.querySelector(".classes-context-menu");},
@@ -90,7 +91,7 @@ test("immutable definitions render compartments, dashed arrows and text-only hos
 test("source is explicit and method click passes a measured symbol ID",async()=>{
  const h=harness();await h.controller.open({seed:"A"});assert.equal(h.reads.length,0);
  await h.card("A").fire("contextmenu",{clientX:100,clientY:100});await h.button(h.menu(),"Read class source").fire("click");
- assert.equal(h.reads.length,1);assert.equal(h.reads[0].revision,1);assert.equal(h.reads[0].step.path,"src/A.java");
+ assert.equal(h.reads.length,1);assert.equal(h.reads[0].revision.indexRevision,1);assert.equal(h.reads[0].step.path,"src/A.java");
  await h.button(h.card("A"),"execute()").fire("click");assert.equal(h.methods[0].id,"A.execute");assert.equal(h.methods[0].parent,"A");assert.equal(h.calls.length,1);
 });
 test("related chooser adds only chosen neighbors and retains earlier roots and DOM slots",async()=>{
@@ -135,11 +136,11 @@ test("visible touch menu and ContextMenu key work; scroll dismisses",async()=>{
 test("stale open responses, revision responses and old actions do not affect new view",async()=>{
  const h=harness(), first=deferred();h.setRequest((_,options)=>options.body.seed==="A"?first.promise:Promise.resolve(diagram(["B"])));
  const old=h.controller.open({seed:"A"});await h.controller.open({seed:"B"});first.resolve(diagram());await old;assert.ok(h.card("B"));assert.equal(h.card("A"),undefined);
- await h.card("B").fire("contextmenu");const source=h.button(h.menu(),"Read class source");h.setRevision(2);await source.fire("click");assert.equal(h.reads.length,0);
+ await h.card("B").fire("contextmenu");const source=h.button(h.menu(),"Read class source");h.setRevision({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2});await source.fire("click");assert.equal(h.reads.length,0);
  h.setRequest(async()=>diagram(["C"],1));await h.controller.open({seed:"C"});assert.equal(h.get("classes-state").dataset.state,"stale");assert.equal(h.card("C"),undefined);
 });
 test("reset invalidates pending lookup and source callbacks; session guards reject late failures",async()=>{
- const h=harness(), pending=deferred();h.setRequest(()=>pending.promise);const work=h.controller.open({});h.controller.reset();pending.resolve({revision:1,items:[definition("A")],warnings:[]});await work;assert.equal(h.get("classes-results").children.length,0);
+ const h=harness(), pending=deferred();h.setRequest(()=>pending.promise);const work=h.controller.open({});h.controller.reset();pending.resolve({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[definition("A")],warnings:[]});await work;assert.equal(h.get("classes-results").children.length,0);
  const next=deferred();h.setRequest(()=>next.promise);const work2=h.controller.open({seed:"A"});h.setSession("two");next.reject(Error("old failure"));await work2;assert.doesNotMatch(text(h.get("classes-state")),/old failure/);
  assert.ok(h.changes.length>=4);
 });
@@ -150,8 +151,8 @@ test("loading a new view invalidates keyboard member/source callbacks in old dia
 });
 test("unsupported, unindexed, empty, partial and error states are explicit",async()=>{
  const h=harness();await h.controller.open({path:"src/lib.rs"});assert.equal(h.get("classes-state").dataset.state,"unsupported");assert.equal(h.calls.length,0);
- h.setRequest(async()=>({revision:1,items:[],warnings:["Index workspace to populate class declarations."],requireIndex:true}));await h.controller.open({});assert.equal(h.get("classes-state").dataset.state,"unindexed");
- h.setRequest(async()=>({revision:1,items:[],warnings:[]}));await h.controller.open({});assert.equal(h.get("classes-state").dataset.state,"empty");
+ h.setRequest(async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[],warnings:["Index workspace to populate class declarations."],requireIndex:true}));await h.controller.open({});assert.equal(h.get("classes-state").dataset.state,"unindexed");
+ h.setRequest(async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[],warnings:[]}));await h.controller.open({});assert.equal(h.get("classes-state").dataset.state,"empty");
  h.setRequest(async()=>({...diagram(),truncated:true,warnings:["Bound reached"]}));await h.controller.open({seed:"A"});assert.equal(h.get("classes-state").dataset.state,"partial");
  h.setRequest(async()=>{throw Error("Not a class or enclosing method");});await h.controller.open({seed:"bad"});assert.match(text(h.get("classes-state")),/Not a class/);assert.equal(h.get("classes-state").dataset.state,"error");
 });
@@ -302,12 +303,12 @@ test("late search pagination cannot replace a selected diagram status or notices
  const h=harness(),page=deferred();h.setRequest(async(url,options)=>{
   if(options)return {...diagram(),warnings:["CURRENT DIAGRAM NOTICE"]};
   const offset=new URL(url,"http://local").searchParams.get("offset");
-  return offset==="100"?page.promise:{revision:1,items:[definition("A")],nextOffset:100,warnings:[]};
+  return offset==="100"?page.promise:{revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[definition("A")],nextOffset:100,warnings:[]};
  });
  await h.controller.open({});const results=h.get("classes-results"),choose=results.children[0];
  const more=h.button(results,"More classes").fire("click");await choose.fire("click");
  const status=h.get("classes-state").textContent;
- page.resolve({revision:1,items:[definition("B")],warnings:["OLD SEARCH WARNING"],truncated:true});await more;
+ page.resolve({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[definition("B")],warnings:["OLD SEARCH WARNING"],truncated:true});await more;
  assert.equal(h.get("classes-state").textContent,status);assert.equal(results.children.length,1);assert.equal(results.hidden,true);
  const notices=h.document.body.querySelector(".classes-warnings");assert.match(text(notices),/CURRENT DIAGRAM NOTICE/);assert.doesNotMatch(text(notices),/OLD SEARCH WARNING/);
 });
@@ -538,7 +539,7 @@ for(const change of ["session","revision","reset","hidden","fold","rerender","ne
  const trigger=memberRows(h)[0].querySelector(".classes-member-type");await trigger.fire("click");const {isCurrent}=h.navigations[0].scope;assert.equal(isCurrent(),true);
  let work,pending;
  if(change==="session")h.setSession("two");
- if(change==="revision")h.setRevision(2);
+ if(change==="revision")h.setRevision({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2});
  if(change==="reset")h.controller.reset();
  if(change==="hidden")h.get("classes-panel").hidden=true;
  if(change==="fold")await revealMembers(h);
@@ -599,8 +600,8 @@ function integratedNavigation() {
  const h=harness({navigation:true}),navigationSource=fs.readFileSync(path.join(__dirname,"../web/navigation.js"),"utf8");
  vm.runInNewContext(navigationSource,{window:h.window,document:h.document,console});
  const nav=h.window.BaleygNavigation,selected=[];
- let request=async()=>({revision:1,targets:[{symbol:{id:"A.run",name:"run",path:"A.java",range},action:"sequence",reason:"declaration",matchKind:"measured"}],warnings:[]});
- nav.init({currentRevision:()=>1,currentSession:()=>"one",request:(...args)=>request(...args),
+ let request=async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},targets:[{symbol:{id:"A.run",name:"run",path:"A.java",range},action:"sequence",reason:"declaration",matchKind:"measured"}],warnings:[]});
+ nav.init({currentRevision:()=>({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}),currentSession:()=>"one",request:(...args)=>request(...args),
   showMenu:(event,actions,options)=>h.controller.showContextMenu(event,actions,options),
   selectMethod:symbol=>selected.push(symbol),openClass:symbol=>selected.push(symbol)});
  h.setNavigate((...args)=>nav.open(...args));
@@ -612,7 +613,7 @@ for(const replacement of [false,true])test(`actual shared navigation never reope
  const work=h.nav.open(menuEvent(anchor),{path:"A.java",line:1});assert.match(text(h.menu()),/Finding cached/);
  other.focus();assert.equal(h.menu(),null);
  if(replacement)h.controller.showContextMenu(menuEvent(other),[{label:"Other class menu",run(){}}]);
- pending.resolve({revision:1,targets:[],warnings:[]});await work;
+ pending.resolve({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},targets:[],warnings:[]});await work;
  if(replacement){assert.equal(h.menu().children[0].textContent,"Other class menu");assert.equal(h.document.activeElement,h.menu().children[0]);}
  else{assert.equal(h.menu(),null);assert.equal(h.document.activeElement,other);}
  assert.equal(h.selected.length,0);assert.equal(h.reads.length,0);
@@ -631,4 +632,35 @@ test("actual navigation reset closes its menu but cannot close a replacement cla
  await h.nav.open(menuEvent(anchor),{path:"A.java",line:1});
  h.controller.showContextMenu(menuEvent(h.get("other-class-anchor")),[{label:"Other class menu",run(){}}]);
  h.nav.reset();assert.equal(h.menu().children[0].textContent,"Other class menu");
+});
+
+test("class results cannot cross generation with the same revision",async()=>{
+  const h=harness(),gate=deferred();h.setRequest(()=>gate.promise);
+  const work=h.controller.open({seed:'A'});
+  h.setRevision({indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1});
+  gate.resolve(diagram());await work;
+  assert.equal(h.card('A'),undefined);
+});
+
+test("class search, page, diagram, and expansion reject a reused revision and ask for status refresh",async()=>{
+ const old={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ const next={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+ for(const action of ['search','page','diagram','expansion']) {
+   const h=harness();
+   if(action==='expansion') await h.controller.open({seed:'A'});
+   h.setRequest((url,options)=>options ? diagram(['A'],next) : {revision:next,items:[definition('A')],nextOffset:1});
+   if(action==='search') await h.controller.open({});
+   if(action==='page') { h.setRequest((url,options)=>options ? diagram() : {revision:old,items:[definition('A')],nextOffset:100}); await h.controller.open({}); h.setRequest(()=>({revision:next,items:[],nextOffset:null})); await h.button(h.get('classes-results'),'More classes').fire('click'); }
+   if(action==='diagram') await h.controller.open({seed:'A'});
+   if(action==='expansion') {h.get('classes-unmatched').checked=true;await h.get('classes-unmatched').fire('change');}
+   const call=h.calls.at(-1);
+   if(call.options) assert.deepEqual(JSON.parse(JSON.stringify(call.options.body.expectedRevision)),old,action);
+   else {const params=new URL(call.url,'http://local').searchParams;
+     assert.equal(params.get('indexGeneration'),old.indexGeneration,action);
+     assert.equal(params.get('indexRevision'),'1',action);
+   }
+   assert.equal(h.stale.length,1,action);
+   assert.equal(h.card('A'),undefined,action);
+   assert.match(h.get('classes-state').textContent,/revision changed/i,action);
+ }
 });

@@ -6,14 +6,15 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/navigation.js"), "utf8");
+const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.BaleygIndexPin = IndexPin;/)[0];
 const deferred = () => { let resolve, reject; const promise = new Promise((a,b) => {resolve=a;reject=b;}); return {promise,resolve,reject}; };
 const symbol = (id="A.run", name="run") => ({id,name,path:"src/A.java",range:{startLine:4,endLine:7,startByte:10,endByte:60},qualifiedName:`sample.${id}`});
 const target = (action="sequence", reason="declaration", id="A.run") => ({symbol:symbol(id),action,reason,matchKind:"syntaxCandidate"});
-const response = (targets=[target()], extras={}) => ({revision:1,targets,warnings:[],truncated:false,requireIndex:false,...extras});
+const response = (targets=[target()], extras={}) => ({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},targets,warnings:[],truncated:false,requireIndex:false,...extras});
 const descendants = node => [node,...node.children.flatMap(descendants)];
 function harness({openSource = false} = {}) {
-  let revision=1, session="one", request=async()=>response(), activeMenu=null;
-  const calls=[],menus=[],selected=[],classes=[],openedSources=[];
+  let revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, session="one", request=async()=>response(), activeMenu=null;
+  const calls=[],menus=[],selected=[],classes=[],openedSources=[],stale=[];
   const document={activeElement:null,listeners:{},addEventListener(type,fn){(this.listeners[type] ||= []).push(fn);}};
   function element(tagName) {
     const node={tagName,children:[],parentNode:null,attrs:{},className:"",textContent:"",listeners:{},scrollTop:27,scrollLeft:0,
@@ -45,7 +46,7 @@ function harness({openSource = false} = {}) {
   }
   document.body=element("body");document.createElement=element;
   document.querySelector=selector=>document.body.querySelector(selector);
-  const window={listeners:{},addEventListener(type,fn){(this.listeners[type] ||= []).push(fn);}}; vm.runInNewContext(source,{window,document,console});
+  const window={listeners:{},addEventListener(type,fn){(this.listeners[type] ||= []).push(fn);}}; vm.runInNewContext(pinSource + "\n" + source,{window,document,console});
   const nav=window.BaleygNavigation;
   function showMenu(event,actions,{onClose}={}) {
     activeMenu?.close("replace");
@@ -58,7 +59,7 @@ function harness({openSource = false} = {}) {
     return {close:()=>record.close()};
   }
   nav.init({request:(url,options)=>{calls.push({url,options});return request(url,options);},currentRevision:()=>revision,currentSession:()=>session,
-    selectMethod:s=>selected.push(s),openClass:s=>classes.push(s),showMenu,
+    selectMethod:s=>selected.push(s),openClass:s=>classes.push(s),showMenu,onStale:message=>stale.push(message),
     ...(openSource ? {openSource:(symbol,revision)=>openedSources.push({symbol,revision})} : {})});
   const anchor=element("button");document.body.append(anchor);anchor.focus();
   function event(details={}){return {type:"contextmenu",target:anchor,currentTarget:anchor,clientX:120,clientY:80,preventDefault(){this.prevented=true;},stopPropagation(){this.stopped=true;},...details};}
@@ -66,11 +67,11 @@ function harness({openSource = false} = {}) {
     const pre=element("pre");pre.setAttribute("tabindex","0");pre.setAttribute("aria-label","Original source");document.body.append(pre);
     const rows=numbers.map(n=>{const row=element("span");row.className="source-line";const num=element("span");num.className="line-number";num.textContent=String(n);const code=element("span");code.textContent="<script>λ café</script>";row.append(num,code);pre.append(row);return row;});
     if(rows[1]) rows[1].classList.add("highlight");
-    const binding=nav.attachSource(pre,{path:"src/A.java",revision:1,startLine:numbers[0],...options});
+    const binding=nav.attachSource(pre,{path:"src/A.java",revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},startLine:numbers[0],...options});
     const toolbar=pre.parentNode.children[pre.parentNode.children.indexOf(pre)-1];
     return {pre,rows,binding,toolbar,button:toolbar.children[0],status:toolbar.children[1]};
   }
-  return {nav,document,window,element,anchor,event,pane,calls,menus,selected,classes,openedSources,showMenu,
+  return {nav,document,window,element,anchor,event,pane,calls,menus,selected,classes,openedSources,stale,showMenu,
     set request(fn){request=fn;},set revision(n){revision=n;},set session(s){session=s;},get latest(){return menus.at(-1);}};
 }
 const selector={path:"src/A.java",line:1};
@@ -82,7 +83,7 @@ test("lookup captures anchor synchronously, fetches only navigation and exposes 
   assert.match(h.latest.actions[0].label,/Finding cached/);assert.ok(h.latest.actions.some(a=>!a.disabled));
   gate.resolve(response([target(),target("class","type","A"),target("sequence","call","B.run")]));await pending;
   assert.equal(h.calls.length,1);assert.equal(h.calls[0].url,"/api/navigation");assert.equal(h.calls[0].options.method,"POST");
-  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{expectedRevision:1,path:"src/A.java",line:1});
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{expectedRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"src/A.java",line:1});
   assert.equal(h.latest.event.currentTarget,h.anchor);assert.equal(h.latest.event.clientX,120);assert.equal(h.latest.event.clientY,80);
   assert.match(h.latest.actions[1].label,/Sequence · sample.A.run · declaration · syntax candidate · src\/A.java:4/);
   assert.match(h.latest.actions[2].label,/Class.*type/);assert.match(h.latest.actions[0].label,/call/);
@@ -95,7 +96,7 @@ test("only exact member selectors are submitted; invalid and mixed boundaries ne
     {classId:"A",memberName:"run",startByte:-1,endByte:5},{classId:"A",memberName:"run",startByte:4,endByte:3},{classId:"A",memberName:"run",startByte:1.2,endByte:5},{classId:"A",memberName:"",startByte:0,endByte:5}]) await h.nav.open(h.event(),bad);
   assert.equal(h.calls.length,0);
   await h.nav.open(h.event(),{classId:"A",memberName:"méthode",startByte:0,endByte:16});
-  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{expectedRevision:1,classId:"A",memberName:"méthode",startByte:0,endByte:16});
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{expectedRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},classId:"A",memberName:"méthode",startByte:0,endByte:16});
 });
 
 test("no-result, warnings, partial and requireIndex states are honest bounded text",async()=>{
@@ -110,8 +111,8 @@ test("errors have explicit retry; malformed and stale responses never navigate",
   const h=harness();h.request=async()=>{throw new Error("<script>offline</script>");};await h.nav.open(h.event(),selector);
   assert.match(h.latest.actions[0].label,/<script>offline<\/script>/);
   const retry=h.latest.actions.find(a=>a.label==="Try navigation again");h.request=async()=>response();await retry.run();assert.equal(h.calls.length,2);
-  h.request=async()=>response(undefined,{revision:2});await h.nav.open(h.event(),selector);assert.match(h.latest.actions[0].label,/stale/);
-  h.request=async()=>({revision:1});await h.nav.open(h.event(),selector);assert.match(h.latest.actions[0].label,/Invalid navigation response/);
+  h.request=async()=>response(undefined,{revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}});await h.nav.open(h.event(),selector);assert.match(h.latest.actions[0].label,/stale/);
+  h.request=async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}});await h.nav.open(h.event(),selector);assert.match(h.latest.actions[0].label,/Invalid navigation response/);
   assert.equal(h.selected.length,0);
 });
 
@@ -182,7 +183,7 @@ test("source selection, sourceSerial predicate, reset and disposal invalidate op
 test("empty/invalid line numbers disable navigation; reattachment does not duplicate listeners",async()=>{
   const h=harness(),empty=h.pane([]);assert.equal(empty.button.disabled,true);await empty.button.fire("click").done;assert.equal(h.calls.length,0);
   const p=h.pane(["01","-1","1.5","x"]);assert.equal(p.button.disabled,true);await p.rows[0].fire("contextmenu").done;assert.equal(h.calls.length,0);
-  const good=h.pane();const originalToolbar=good.toolbar;h.nav.attachSource(good.pre,{path:"src/B.java",revision:1,startLine:2});
+  const good=h.pane();const originalToolbar=good.toolbar;h.nav.attachSource(good.pre,{path:"src/B.java",revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},startLine:2});
   assert.equal(originalToolbar.parentNode,null);await good.pre.fire("keydown",{key:"ContextMenu"}).done;assert.equal(h.calls.length,1);assert.equal(h.calls[0].options.body.path,"src/B.java");assert.equal(h.calls[0].options.body.line,2);
 });
 
@@ -270,10 +271,10 @@ test("source toolbar remains sticky with line-reveal clearance at desktop and mo
 test("optional source callback adds explicit dual choices without auto reading or selecting",async()=>{
   const h=harness({openSource:true}),method=target("sequence","call");
   method.matchKind="sameClassCandidate";method.symbol.range.startColumn=9;
-  h.revision=7;h.request=async()=>response([method,target("class","type","A")],{revision:7});
+  h.revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:7};h.request=async()=>response([method,target("class","type","A")],{revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:7}});
   await h.nav.open(h.event(),selector);
   assert.equal(h.calls.length,1);assert.equal(h.calls[0].url,"/api/navigation");
-  assert.equal(h.calls[0].options.body.expectedRevision,7);
+  assert.equal(h.calls[0].options.body.expectedRevision.indexRevision,7);
   assert.equal(h.openedSources.length,0);assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);
   const [source,sequence,klass]=h.latest.actions;
   assert.match(source.label,/^Go to source · sample.A.run · call · same class candidate · src\/A.java:4:9$/);
@@ -281,7 +282,7 @@ test("optional source callback adds explicit dual choices without auto reading o
   assert.match(klass.label,/^Class ·/);
   h.latest.close("action");h.anchor.focus();source.run();
   assert.equal(h.openedSources.length,1);assert.equal(h.openedSources[0].symbol,method.symbol);
-  assert.equal(h.openedSources[0].symbol.range,method.symbol.range);assert.equal(h.openedSources[0].revision,7);
+  assert.equal(h.openedSources[0].symbol.range,method.symbol.range);assert.equal(h.openedSources[0].revision.indexRevision,7);
   assert.deepEqual(h.openedSources[0].symbol.range,{startLine:4,endLine:7,startByte:10,endByte:60,startColumn:9});
   assert.equal(h.selected.length,0);assert.equal(h.calls.length,1);
   source.run();sequence.run();klass.run();assert.equal(h.openedSources.length,1);assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);
@@ -343,7 +344,7 @@ test("both overload choices keep measured columns and byte/identity fallback lab
       assert.match(actions[index+2].label,columns ? /src\/A.java:4:40$/ : /bytes 40–60 · run#2$/);
     }
     actions[actionIndex+2].run();
-    if(actionIndex===0){assert.equal(h.openedSources[0].symbol,second.symbol);assert.equal(h.openedSources[0].revision,1);assert.equal(h.selected.length,0);}
+    if(actionIndex===0){assert.equal(h.openedSources[0].symbol,second.symbol);assert.equal(h.openedSources[0].revision.indexRevision,1);assert.equal(h.selected.length,0);}
     else {assert.equal(h.selected[0],second.symbol);assert.equal(h.openedSources.length,0);}
   }
 });
@@ -370,4 +371,26 @@ test("call choices come first with stable backend order, original symbols and bo
   await h.nav.open(h.event(),selector);
   assert.ok(h.latest.actions.every(a=>!a.label.includes("sample.Z.run")),"ordering does not expand the original 64-target bound");
   assert.equal(h.latest.actions.filter(a=>!a.disabled).length,128);
+});
+
+test("navigation discards late response when generation changes but revision repeats",async()=>{
+  const h=harness(),gate=deferred();h.request=()=>gate.promise;
+  const work=h.nav.open(h.event(),selector);
+  h.revision={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+  gate.resolve(response());await work;
+  assert.equal(h.menus.length,1);assert.match(h.latest.actions[0].label,/Finding cached/);
+});
+
+test("source and member navigation send a complete pair and refresh on reused revision",async()=>{
+ const old={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ const next={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+ for(const selector of [{path:'src/A.java',line:4},{classId:'A',memberName:'run',startByte:10,endByte:60}]) {
+   const h=harness();h.request=async()=>response([target()],{revision:next});
+   await h.nav.open(h.event(),selector);
+   assert.equal(h.calls[0].url,'/api/navigation');
+   assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body.expectedRevision)),old);
+   assert.equal(h.stale.length,1);
+   assert.match(h.latest.actions[0].label,/stale/i);
+   assert.equal(h.selected.length+h.classes.length,0);
+ }
 });
