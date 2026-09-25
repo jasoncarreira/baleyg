@@ -98,6 +98,24 @@ test('failed r2 refresh never attaches old r1 occurrence proof or reference to i
  const empty=specimen();assert.equal(traverseGraph({records:empty.records,request:empty.request,selectedCoverageIncomplete:true}).result.partial,true);
 });
 
+test('fresh exact r2 binding requires selected complete or partial coverage',()=>{
+ for(const [state,selected] of [['failed',true],['omitted',false],['unsupported',false],['notRequested',false],['complete',true],['partial',true]]){
+  const s=specimen();const call=s.add('A','B');const binding=s.records.callBindings[0];
+  s.records.coverage[0].state=state;s.records.coverage[0].selected=selected;
+  const r=s.run().result,edge=r.edges[0],eligible=state==='complete'||state==='partial';
+  assert.equal(r.edges.length,1,`${state}: measured r2 call remains`);
+  assert.equal(edge.call.id,call.id);assert.equal(binding.provenanceId,'proof-1');
+  assert.equal(edge.binding,eligible?binding:null,`${state}: effective binding`);
+  assert.equal(edge.boundaryReason,eligible?'none':'missingEvidence',`${state}: reason`);
+  assert.equal(edge.to,eligible?s.ids.B:null,`${state}: target`);
+  assert.equal(edge.visit,eligible?'new':'boundary',`${state}: visit`);
+  assert.deepEqual(r.nodes.map(n=>n.declaration.name),eligible?['A','B']:['A'],`${state}: expansion`);
+ }
+ const missing=specimen();missing.add('A','B');missing.records.coverage=[];
+ const edge=missing.run().result.edges[0];assert.equal(edge.binding,null);
+ assert.equal(edge.boundaryReason,'missingEvidence');assert.equal(edge.to,null);
+ assert.equal(edge.visit,'boundary');assert.equal(missing.run().result.nodes.length,1);
+});
 test('selected failed coverage alone sets partial; omitted coverage alone does not',()=>{
  const s=specimen();s.records.coverage[0].state='failed';assert.equal(s.run().result.partial,true);
  s.records.coverage[0].state='omitted';s.records.coverage[0].selected=false;assert.equal(s.run().result.partial,false);
@@ -156,9 +174,25 @@ const controls=registerControls([
   mutate:input=>{input.records.coverage[0].state='complete';return input;},
   check:input=>decisionCheck(input,{assertion:'GRAPH.R2_COVERAGE',field:'edges[0].boundaryReason',expected:'missingEvidence',callId:oid(2),select:r=>r.edges[0].boundaryReason}),
   expectedAssertion:'GRAPH.R2_COVERAGE',expectedCode:'invalidRecord',expectedField:'edges[0].boundaryReason'},
+ {id:'GRAPH.r2Coverage.binding',baseline:()=>{const s=specimen();const call=s.add('A','B');
+   assert.equal(s.records.callBindings[0].callId,call.id);
+   s.records.coverage[0].state='failed';
+   return {records:s.records,request:s.request,source:readFileSync(new URL('../graph-traversal.mjs',import.meta.url),'utf8')};},
+  mutate:input=>{const clause='to,binding,visit,boundaryReason:reason';
+   assert.equal(input.source.split(clause).length,2,'production edge emission must have one mutation site');
+   input.source=input.source.replace(clause,'to,binding:selected,visit,boundaryReason:reason');return input;},
+  check:async input=>{const module=await import(`data:text/javascript;base64,${Buffer.from(input.source).toString('base64')}`);
+   return decisionCheck({records:input.records,request:input.request},{assertion:'GRAPH.R2_BINDING',field:'edges[0].binding',expected:null,
+    callId:oid(1),traversal:module.traverseGraph,select:r=>{
+     assert.equal(r.edges[0].boundaryReason,'missingEvidence','mutation must retain the reason');
+     assert.equal(r.edges[0].to,null,'mutation must retain the boundary target');
+     assert.equal(r.edges[0].visit,'boundary','mutation must retain boundary visit');
+     return r.edges[0].binding;}});},
+  expectedAssertion:'GRAPH.R2_BINDING',expectedCode:'invalidRecord',expectedField:'edges[0].binding'},
  {id:'GRAPH.failedRefresh.oldBinding',baseline:()=>{const s=specimen();const old=s.add('A','B',{revision:'r1',callRevision:'r1'});
    const current={...old,id:oid(101),revisionId:'r2',ordinal:0};s.records.calls.push(current);
-   s.records.coverage[0].state='failed';
+   // Even finished coverage cannot promote the historical occurrence.
+   s.records.coverage[0].state='complete';
    assert.equal(s.records.callBindings.length,1);assert.equal(s.records.callBindings[0].callId,old.id);
    assert.equal(s.records.provenance[0].revisionId,'r1');assert.notEqual(old.id,current.id);
    return {records:s.records,request:s.request,source:readFileSync(new URL('../graph-traversal.mjs',import.meta.url),'utf8')};},
@@ -168,7 +202,6 @@ const controls=registerControls([
   check:async input=>{const module=await import(`data:text/javascript;base64,${Buffer.from(input.source).toString('base64')}`);
    return decisionCheck({records:input.records,request:input.request},{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].binding',expected:null,
     callId:oid(101),traversal:module.traverseGraph,select:r=>{const edge=r.edges[0];
-     assert.equal(edge.boundaryReason,'missingEvidence','failed r2 coverage remains withheld');
      if(edge.binding){assert.equal(edge.binding.callId,oid(1),'only the old r1 binding is present');
       assert.equal(edge.binding.provenanceId,'proof-1');}
      return edge.binding;}});},
