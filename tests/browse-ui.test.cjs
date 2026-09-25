@@ -52,6 +52,7 @@ function harness(windowOptions = {}) {
 
 const symbol = id => ({id, name:id, path:"src/a.js", range:{startLine:1,endLine:5}});
 const view = id => ({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},seed:symbol(id),participants:[{id,label:id,kind:"method"},{id:"unknown",label:"external?",kind:"boundary"}],steps:[],warnings:[],hiddenSteps:0,truncated:false});
+const pinQuery = pair => `indexGeneration=${encodeURIComponent(pair.indexGeneration)}&indexRevision=${pair.indexRevision}`;
 const response = data => ({ok:true,status:200,json:async()=>data});
 function descendants(node) { return [node, ...node.children.flatMap(descendants)]; }
 function text(node) { return descendants(node).map(n=>n.textContent).join(" "); }
@@ -846,8 +847,8 @@ test("same-workspace automatic Pair refresh retains list/save/delete payloads fo
    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
    if(url==='/api/views') return response(viewsData);
    if(url==='/api/annotations') return response(notesData);
-   if(url==='/api/views/item-1' && opts.method==='PUT') {viewsData=[{view:opts.body&&JSON.parse(opts.body)}];return response({});}
-   if(url==='/api/annotations/item-2' && opts.method==='PUT') {notesData=[{annotation:JSON.parse(opts.body)}];return response({});}
+   if(url===`/api/views/item-1?${pinQuery(newPair)}` && opts.method==='PUT') {viewsData=[{view:opts.body&&JSON.parse(opts.body)}];return response({});}
+   if(url===`/api/annotations/item-2?${pinQuery(newPair)}` && opts.method==='PUT') {notesData=[{annotation:JSON.parse(opts.body)}];return response({});}
    if(url==='/api/views/item-1' && opts.method==='DELETE') {viewsData=[];return response(null);}
    if(url==='/api/annotations/item-2' && opts.method==='DELETE') {notesData=[];return response(null);}
    return response({revision:newPair,items:[],nextOffset:null});
@@ -858,8 +859,9 @@ test("same-workspace automatic Pair refresh retains list/save/delete payloads fo
  h.run(`result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:1}}; seed='root'`);
  h.get('view-title').value='Keep';h.get('save-form').listeners.submit({preventDefault(){}}); await new Promise(setImmediate);
  h.get('note').value='Remember';h.get('annotation-form').listeners.submit({preventDefault(){}});await new Promise(setImmediate);
- assert.deepEqual(calls.find(c=>c.url==='/api/views/item-1'&&c.method==='PUT').body,{id:'item-1',title:'Keep',query:{seed:'root',depth:1},pins:{},hidden:[]});
- assert.deepEqual(calls.find(c=>c.url==='/api/annotations/item-2'&&c.method==='PUT').body,{id:'item-2',nodeId:'root',body:'Remember'});
+ assert.ok(calls.some(c=>c.url===`/api/views/item-1?${pinQuery(newPair)}`&&c.method==='PUT'), 'view PUT carries the current complete pair');
+ assert.deepEqual(calls.find(c=>c.url===`/api/views/item-1?${pinQuery(newPair)}`&&c.method==='PUT').body,{id:'item-1',title:'Keep',query:{seed:'root',depth:1},pins:{},hidden:[]});
+ assert.deepEqual(calls.find(c=>c.url===`/api/annotations/item-2?${pinQuery(newPair)}`&&c.method==='PUT').body,{id:'item-2',nodeId:'root',body:'Remember'});
  const viewDelete=descendants(h.get('views')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
  const noteDelete=descendants(h.get('annotations')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
  await viewDelete.listeners.click();await noteDelete.listeners.click();
@@ -868,6 +870,23 @@ test("same-workspace automatic Pair refresh retains list/save/delete payloads fo
  assert.equal(h.run('views.length + annotations.length'),0);
 });
 
+
+test("saved PUTs reject stale displayed selections and incomplete pairs before transport", async () => {
+  const h = harness(), sent = [];
+  h.context.fetch = async url => { sent.push(url); return response({}); };
+  h.context.crypto = {randomUUID: () => "unsent"};
+  h.run(`result={revision:{...status.revision,indexRevision:0},query:{seed:'root'}}`);
+  h.get("save-form").listeners.submit({preventDefault() {}});
+  h.get("annotation-form").listeners.submit({preventDefault() {}});
+  await new Promise(setImmediate);
+  assert.deepEqual(sent, []);
+  assert.match(h.get("error").textContent, /Index snapshot changed/);
+  h.run(`result={revision:{indexRevision:1},query:{seed:'root'}}`);
+  h.get("save-form").listeners.submit({preventDefault() {}});
+  await new Promise(setImmediate);
+  assert.deepEqual(sent, []);
+  assert.match(h.get("error").textContent, /Invalid index snapshot pair/);
+});
 
 test("request handlers reject bare numeric pins without sending a request", async () => {
  const h=harness(), requests=[];h.context.fetch=async url=>{requests.push(url);throw Error('invalid request was sent');};
