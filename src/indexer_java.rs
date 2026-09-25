@@ -162,9 +162,9 @@ fn declaration(n: Node<'_>, bytes: &[u8]) -> Result<Option<Key>> {
         None
     };
     Ok(Some(Key {
-        kind: if container {
+        kind: if container || anonymous {
             Kind::Type
-        } else if anonymous || lambda {
+        } else if lambda {
             Kind::AnonymousFunction
         } else if constructor {
             Kind::Constructor
@@ -411,6 +411,15 @@ pub(crate) fn identify_document(
         }
     }
     heritage(tree.root_node(), document);
+    // The shared syntax inventory includes controls for other languages and
+    // Java statement nodes that the graph does not model as regions.
+    // Keep only the measured Java region family used by both ID and graph walks.
+    document.native_candidates.retain(|witness| {
+        witness.candidate_kind != NativeCandidateKind::ControlRegion
+            || ids
+                .ids
+                .contains_key(&(witness.start_byte, witness.end_byte, "region"))
+    });
     for witness in &mut document.native_candidates {
         let prefix = match witness.candidate_kind {
             NativeCandidateKind::Declaration => "syntax",

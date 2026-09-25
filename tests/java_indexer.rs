@@ -45,7 +45,11 @@ class Café {
     assert_eq!(g, run(&opts));
     assert_eq!(g.stats.parse_error_files, 0, "{:?}", g.diagnostics);
     assert_eq!(g.files.len(), 3);
-    let class = g.nodes.iter().find(|n| n.name == "Café").unwrap();
+    let class = g
+        .nodes
+        .iter()
+        .find(|n| n.name == "Café" && n.kind == SymbolKind::Class)
+        .unwrap();
     assert_eq!(class.kind, SymbolKind::Class);
     let method = g.nodes.iter().find(|n| n.name == "run").unwrap();
     assert_eq!(method.parent.as_ref(), Some(&class.id));
