@@ -1,3 +1,9 @@
+fn test_pin(revision: u64) -> baleyg::model::IndexPin {
+    baleyg::model::IndexPin {
+        index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
+        index_revision: revision,
+    }
+}
 use baleyg::dependencies::{Catalog, CatalogOptions};
 use std::{fs, path::Path, sync::atomic::AtomicBool};
 use tempfile::TempDir;
@@ -40,7 +46,7 @@ fn cached(home: &Path, cache: &str, name: &str, version: &str) {
     );
 }
 fn build(root: &Path, options: &CatalogOptions) -> Catalog {
-    Catalog::build(root, 7, options, &AtomicBool::new(false)).unwrap()
+    Catalog::build(root, test_pin(7), options, &AtomicBool::new(false)).unwrap()
 }
 #[test]
 fn exact_locked_candidates_aliases_and_separate_sources() {
@@ -180,7 +186,7 @@ fn source_hash_and_catalog_identity_change_with_bytes_and_revision() {
     let c = build(ws.path(), &options);
     assert_ne!(a.id, c.id);
     assert_ne!(a.sources.keys().next(), c.sources.keys().next());
-    let d = Catalog::build(ws.path(), 8, &options, &AtomicBool::new(false)).unwrap();
+    let d = Catalog::build(ws.path(), test_pin(8), &options, &AtomicBool::new(false)).unwrap();
     assert_ne!(c.id, d.id);
 }
 #[test]
@@ -205,7 +211,7 @@ fn oversized_and_excluded_sources_are_honest() {
 fn cancellation_stops_build() {
     let (ws, _, options) = setup();
     assert!(
-        Catalog::build(ws.path(), 7, &options, &AtomicBool::new(true))
+        Catalog::build(ws.path(), test_pin(7), &options, &AtomicBool::new(true))
             .unwrap_err()
             .to_string()
             .contains("cancelled")

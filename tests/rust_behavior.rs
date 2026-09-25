@@ -1,3 +1,9 @@
+fn test_pin(revision: u64) -> baleyg::model::IndexPin {
+    baleyg::model::IndexPin {
+        index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
+        index_revision: revision,
+    }
+}
 use baleyg::{
     behavior::{SequenceStep, SequenceView, build_sequence},
     indexer::{IndexOptions, index_workspace},
@@ -20,7 +26,7 @@ fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
         .find(|n| n.name == name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", graph.nodes));
     let file = &graph.files[0];
-    let view = build_sequence(7, seed, file, &graph.calls, false).unwrap();
+    let view = build_sequence(test_pin(7), seed, file, &graph.calls, false).unwrap();
     (graph, view)
 }
 fn flatten(steps: &[SequenceStep]) -> Vec<&SequenceStep> {
@@ -189,7 +195,7 @@ fn if_let_evaluates_value_and_keeps_body_guarded() {
 fn cache_is_sufficient_and_missing_calls_are_not_invented() {
     let (graph, view) = fixture("fn run() { work(); }", "run");
     // fixture's temporary source directory has already been removed.
-    let cached = build_sequence(8, &view.seed, &graph.files[0], &[], true).unwrap();
+    let cached = build_sequence(test_pin(8), &view.seed, &graph.files[0], &[], true).unwrap();
     assert!(calls(&cached.steps).is_empty());
     assert!(
         cached
@@ -284,7 +290,14 @@ fn participant_limit_preserves_call_evidence() {
         c.resolution = Resolution::Internal;
         c.target = Some(format!("target:{i}"));
     }
-    let view = build_sequence(9, &view.seed, &graph.files[0], &graph.calls, false).unwrap();
+    let view = build_sequence(
+        test_pin(9),
+        &view.seed,
+        &graph.files[0],
+        &graph.calls,
+        false,
+    )
+    .unwrap();
     assert!(view.truncated);
     assert_eq!(view.participants.len(), 20);
     assert_eq!(
@@ -298,7 +311,7 @@ fn participant_limit_preserves_call_evidence() {
 #[test]
 fn show_all_does_not_filter_rust_calls() {
     let (graph, view) = fixture("fn run() { log(); debug(); }", "run");
-    let all = build_sequence(7, &view.seed, &graph.files[0], &graph.calls, true).unwrap();
+    let all = build_sequence(test_pin(7), &view.seed, &graph.files[0], &graph.calls, true).unwrap();
     assert_eq!(view, all);
 }
 
@@ -332,7 +345,7 @@ fn ungroup(steps: Vec<SequenceStep>) -> Vec<SequenceStep> {
         .collect()
 }
 fn assert_reversible(graph: &Graph, view: &SequenceView) {
-    let all = build_sequence(7, &view.seed, &graph.files[0], &graph.calls, true).unwrap();
+    let all = build_sequence(test_pin(7), &view.seed, &graph.files[0], &graph.calls, true).unwrap();
     let mut restored = view.clone();
     restored.steps = ungroup(restored.steps);
     assert_eq!(restored, all);
@@ -490,7 +503,7 @@ fn grouping_work_budget_is_independent_and_keeps_measured_steps() {
             .iter()
             .any(|w| w.contains("Chain grouping traversal truncated"))
     );
-    let all = build_sequence(7, &view.seed, &graph.files[0], &graph.calls, true).unwrap();
+    let all = build_sequence(test_pin(7), &view.seed, &graph.files[0], &graph.calls, true).unwrap();
     assert_eq!(ungroup(view.steps), all.steps);
 }
 
@@ -508,7 +521,7 @@ fn grouping_depth_budget_is_independent_and_keeps_measured_steps() {
             .iter()
             .any(|w| w.contains("Chain grouping traversal truncated"))
     );
-    let all = build_sequence(7, &view.seed, &graph.files[0], &graph.calls, true).unwrap();
+    let all = build_sequence(test_pin(7), &view.seed, &graph.files[0], &graph.calls, true).unwrap();
     assert_eq!(ungroup(view.steps), all.steps);
 }
 
@@ -619,7 +632,8 @@ fn receiver_names_are_stable_source_groups_not_object_identity() {
     let callee = target_for(&view, "file");
     assert_eq!(callee.kind, "unresolvedCallee");
     assert_ne!(callee.id, file.id);
-    let rebuilt = build_sequence(8, &view.seed, &graph.files[0], &graph.calls, true).unwrap();
+    let rebuilt =
+        build_sequence(test_pin(8), &view.seed, &graph.files[0], &graph.calls, true).unwrap();
     assert_eq!(target_for(&rebuilt, "read").id, file.id);
     let (_, shifted) = fixture(&format!("// shifted source\n{source}"), "run");
     assert_eq!(target_for(&shifted, "read").id, file.id);
@@ -721,7 +735,14 @@ fn confirmed_internal_targets_are_not_replaced_by_source_hints() {
     let (mut graph, view) = fixture("fn run() { file.read(); }", "run");
     graph.calls[0].resolution = Resolution::Internal;
     graph.calls[0].target = Some("measured:symbol".into());
-    let measured = build_sequence(7, &view.seed, &graph.files[0], &graph.calls, false).unwrap();
+    let measured = build_sequence(
+        test_pin(7),
+        &view.seed,
+        &graph.files[0],
+        &graph.calls,
+        false,
+    )
+    .unwrap();
     let target = target_for(&measured, "read");
     assert_eq!(target.id, "measured:symbol");
     assert_eq!(target.kind, "internal");

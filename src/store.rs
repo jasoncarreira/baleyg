@@ -1,21 +1,26 @@
 //! SQLite snapshots and durable user data. Connections are never shared between threads.
+pub mod topology;
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    path::{Path, PathBuf},
+    ops::{Deref, DerefMut},
+    path::Path,
+    sync::Arc,
     sync::atomic::Ordering,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug)]
 pub struct Store {
-    state_dir: PathBuf,
+    roots: topology::TopologyRoots,
+    identity: Arc<topology::WorkspaceIdentity>,
     workspace_root: String,
 }
-const DATABASE_SCHEMA_VERSION: u32 = 3;
+const DATABASE_SCHEMA_VERSION: u32 = 4;
+const EXTRACTOR_VERSION: &str = "native-v1";
 const CLASS_SCHEMA: &str = "
 CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
 CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
@@ -25,7 +30,7 @@ CREATE INDEX class_relations_owner ON class_relations(owner,id);
 CREATE INDEX class_relations_target ON class_relations(target,id);
 ";
 const CACHE_SCHEMA: &str = "
-CREATE TABLE revision(singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
 CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
 CREATE INDEX nodes_name ON nodes(name);
@@ -33,141 +38,171 @@ CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id
 CREATE INDEX calls_caller ON calls(caller);
 CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
 ";
-const WORKSPACE_SCHEMA: &str = "
-CREATE TABLE revision_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL CHECK(revision>=0));
-CREATE TABLE binding(singleton INTEGER PRIMARY KEY CHECK(singleton=1), workspace_root TEXT NOT NULL);
-CREATE TABLE views(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-CREATE TABLE annotations(id TEXT PRIMARY KEY, node_id TEXT NOT NULL, payload TEXT NOT NULL);
-";
-// Indexed source is as sensitive as the workspace. Do not make a public cache
-// beside a private bearer token. Never follow a database/state leaf symlink.
-fn secure_state_dir(path: &Path) -> Result<()> {
-    if !path.exists() {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(path)?;
+/// A normal connection keeps the verified index use lock until SQLite closes.
+struct IndexConnection {
+    db: Connection,
+    _use_guard: topology::UseGuard,
+}
+impl Deref for IndexConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.db
     }
-    let meta = std::fs::symlink_metadata(path)?;
-    ensure!(
-        meta.is_dir() && !meta.file_type().is_symlink(),
-        "state directory must be a real directory, not a symlink"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        ensure!(
-            meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
-            "state directory must be owned by the current user and private (chmod 700)"
-        );
+}
+impl DerefMut for IndexConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.db
+    }
+}
+fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        if suffix == "-journal" && !writable {
+            continue;
+        }
+        let sidecar = path.with_file_name(format!(
+            "{}{suffix}",
+            path.file_name()
+                .context("index filename missing")?
+                .to_string_lossy()
+        ));
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => anyhow::bail!("recovery_required: {}", sidecar.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }
-fn secure_database_file(path: &Path) -> Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(path).context("open private database file")?;
+fn verify_index_file(path: &Path) -> Result<()> {
+    use std::io::Read;
+    use std::os::unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawFd,
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .context("incompatible_index: missing or unreadable database")?;
     let meta = file.metadata()?;
-    ensure!(meta.is_file(), "database must be a regular file");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        ensure!(
-            meta.uid() == unsafe { libc::geteuid() } && meta.nlink() == 1,
-            "database must be owned by the current user and not hard-linked"
-        );
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
+    let named = std::fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_file()
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o777 == 0o600
+            && meta.nlink() == 1
+            && meta.dev() == named.dev()
+            && meta.ino() == named.ino(),
+        "unsafe_index: {}",
+        path.display()
+    );
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header)
+        .context("incompatible_index: invalid database header")?;
+    ensure!(
+        &header[..16] == b"SQLite format 3\0" && header[18] == 1 && header[19] == 1,
+        "incompatible_index: rollback header required"
+    );
+    let _ = file.as_raw_fd();
     Ok(())
+}
+// Treat dangling symlinks as existing, so a first open never replaces an unsafe path.
+fn index_path_present(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
-fn connect(path: &Path, schema: &str) -> Result<Connection> {
-    secure_database_file(path)?;
-    let mut db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-    db.busy_timeout(Duration::from_secs(5))?;
-    db.pragma_update(None, "foreign_keys", "ON")?;
-    let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(
-        version <= DATABASE_SCHEMA_VERSION,
-        "unsupported future database schema {version}"
-    );
-    db.pragma_update(None, "journal_mode", "WAL")?;
-    if version < DATABASE_SCHEMA_VERSION {
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // A competing opener may already have completed migration.
-        let version: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version == 0 {
-            let tables: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r| r.get(0))?;
-            ensure!(
-                tables == 0,
-                "unversioned nonempty database; refusing destructive migration"
-            );
-            tx.execute_batch(schema)?;
-        } else if version == 1 {
-            if schema == CACHE_SCHEMA {
-                tx.execute_batch("DROP INDEX IF EXISTS nodes_name; DROP INDEX IF EXISTS calls_caller;
-                    ALTER TABLE nodes RENAME TO old_nodes; ALTER TABLE calls RENAME TO old_calls; ALTER TABLE regions RENAME TO old_regions;
-                    CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-                    CREATE INDEX nodes_name ON nodes(name);
-                    CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-                    CREATE INDEX calls_caller ON calls(caller);
-                    CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-                    INSERT INTO nodes SELECT * FROM old_nodes; INSERT INTO calls SELECT * FROM old_calls; INSERT INTO regions SELECT * FROM old_regions;
-                    DROP TABLE old_calls; DROP TABLE old_regions; DROP TABLE old_nodes;")?;
-            } else {
-                tx.execute_batch("CREATE TABLE IF NOT EXISTS revision_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL CHECK(revision>=0))")?;
-            }
+// The staged file is private to this attempt. On failure, only unlink our own inode.
+struct StagedIndex {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    published: bool,
+}
+impl Drop for StagedIndex {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if self.published {
+            return;
         }
-        if version < 3 && schema == CACHE_SCHEMA {
-            // Additive projection migration: never rebuild or scan an old snapshot.
-            tx.execute_batch(CLASS_SCHEMA)?;
+        if let (Ok(owned), Ok(named)) =
+            (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+            && owned.dev() == named.dev()
+            && owned.ino() == named.ino()
+        {
+            let _ = std::fs::remove_file(&self.path);
         }
-        ensure!(
-            version <= DATABASE_SCHEMA_VERSION,
-            "unsupported future database schema {version}"
-        );
-        tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
-        tx.commit()?;
     }
-    // Prepare expected columns even on existing databases; malformed schemas fail early.
-    if schema == CACHE_SCHEMA {
-        db.prepare("SELECT revision,indexed_at,stats,diagnostics FROM revision")?;
-        db.prepare("SELECT path,hash,payload FROM files")?;
-        db.prepare("SELECT id,name,path,payload FROM nodes")?;
-        db.prepare("SELECT id,caller,target,path,payload FROM calls")?;
-        db.prepare("SELECT id,owner,path,payload FROM regions")?;
-        db.prepare("SELECT warnings,truncated FROM class_catalog")?;
-        db.prepare("SELECT id,name,qualified_name,path,payload FROM classes")?;
-        db.prepare("SELECT id,owner,target,payload FROM class_relations")?;
+}
+fn open_index(path: &Path, writable: bool) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    reject_sidecars(path, writable)?;
+    verify_index_file(path)?;
+    let flags = if writable {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
-        db.prepare("SELECT singleton,workspace_root FROM binding")?;
-        db.prepare("SELECT singleton,revision FROM revision_clock")?;
-        db.prepare("SELECT id,payload FROM views")?;
-        db.prepare("SELECT id,node_id,payload FROM annotations")?;
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let db = storage_result(Connection::open_with_flags(path, flags))?;
+    storage_result(db.busy_timeout(Duration::ZERO))?;
+    storage_result(db.pragma_update(None, "temp_store", "MEMORY"))?;
+    storage_result(db.pragma_update(None, "foreign_keys", "ON"))?;
+    if writable {
+        storage_result(db.pragma_update(None, "synchronous", "FULL"))?;
+    } else {
+        storage_result(db.pragma_update(None, "query_only", "ON"))?;
     }
+    let mode: String = storage_result(db.pragma_query_value(None, "journal_mode", |r| r.get(0)))?;
+    ensure!(mode == "delete", "incompatible_index: journal mode");
+    let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    ensure!(
+        version == DATABASE_SCHEMA_VERSION,
+        "incompatible_index: schema version {version}"
+    );
+    storage_result(db.prepare(
+        "SELECT index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata",
+    ))?;
+    storage_result(db.prepare("SELECT path,hash,payload FROM files"))?;
+    storage_result(db.prepare("SELECT id,name,path,payload FROM nodes"))?;
+    storage_result(db.prepare("SELECT id,caller,target,path,payload FROM calls"))?;
+    storage_result(db.prepare("SELECT id,owner,path,payload FROM regions"))?;
+    storage_result(db.prepare("SELECT warnings,truncated FROM class_catalog"))?;
+    storage_result(db.prepare("SELECT id,name,qualified_name,path,payload FROM classes"))?;
+    storage_result(db.prepare("SELECT id,owner,target,payload FROM class_relations"))?;
     Ok(db)
+}
+fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
+    match result {
+        Err(rusqlite::Error::SqliteFailure(info, _))
+            if info.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK =>
+        {
+            anyhow::bail!("recovery_required: hot index journal")
+        }
+        Err(rusqlite::Error::SqliteFailure(info, _))
+            if matches!(
+                info.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            anyhow::bail!("storage_busy: SQLite lock contention")
+        }
+        other => Ok(other?),
+    }
 }
 fn json<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 fn rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<Vec<T>> {
-    let mut stmt = db.prepare(sql)?;
-    let values = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    values.map(|v| Ok(serde_json::from_str(&v?)?)).collect()
+    let mut stmt = storage_result(db.prepare(sql))?;
+    let values = storage_result(stmt.query_map([], |r| r.get::<_, String>(0)))?;
+    values
+        .map(|v| Ok(serde_json::from_str(&storage_result(v)?)?))
+        .collect()
 }
 fn one<T: DeserializeOwned>(db: &Connection, sql: &str, id: &str) -> Result<Option<T>> {
-    let value: Option<String> = db.query_row(sql, [id], |r| r.get(0)).optional()?;
+    let value: Option<String> = storage_result(db.query_row(sql, [id], |r| r.get(0)).optional())?;
     value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
 }
 fn check_cancel(cancel: &CancelFlag) -> Result<()> {
@@ -522,7 +557,7 @@ fn class_paths(seed: &str, links: &[ClassLink]) -> BTreeMap<String, Option<(Stri
 #[allow(clippy::too_many_arguments)]
 fn hierarchy_diagram(
     db: &Connection,
-    revision: u64,
+    revision: IndexPin,
     request: &crate::class_diagram::ClassDiagramRequest,
     mut seeds: Vec<String>,
     mut classes: BTreeMap<String, crate::classes::ClassDefinition>,
@@ -800,80 +835,226 @@ fn hierarchy_diagram(
 }
 
 impl Store {
-    pub fn open(state_dir: &Path, workspace_root: &Path) -> Result<Self> {
-        let workspace_root = workspace_root
-            .canonicalize()?
-            .to_str()
-            .context("workspace path is not UTF-8")?
-            .to_owned();
-        secure_state_dir(state_dir)?;
+    pub fn open(
+        roots: topology::TopologyRoots,
+        identity: topology::WorkspaceIdentity,
+    ) -> Result<Self> {
+        Self::open_with_stage_hook(roots, identity, |_| Ok(()))
+    }
+    fn open_with_stage_hook(
+        roots: topology::TopologyRoots,
+        identity: topology::WorkspaceIdentity,
+        before_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Self> {
+        identity.verify()?;
+        roots.prepare_index(&identity)?;
         let store = Self {
-            state_dir: state_dir.canonicalize()?,
-            workspace_root,
+            workspace_root: identity
+                .root
+                .to_str()
+                .context("workspace path is not UTF-8")?
+                .to_owned(),
+            roots,
+            identity: Arc::new(identity),
         };
-        let mut db = store.workspace()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let bound: Option<String> = tx
-            .query_row(
-                "SELECT workspace_root FROM binding WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(bound) = bound {
-            ensure!(
-                bound == store.workspace_root,
-                "state directory belongs to a different workspace root"
-            );
-        } else {
-            tx.execute("INSERT INTO binding VALUES(1,?1)", [&store.workspace_root])?;
+        if !index_path_present(&store.roots.index_db(&store.identity))? {
+            let leader = store.roots.leader(&store.identity)?;
+            store.initialize(&leader, before_publish)?;
         }
-        tx.commit()?;
-        let cache_revision = store.status()?.revision;
-        // Seed the allocator when upgrading a previously published v1 database.
-        store.workspace()?.execute("INSERT INTO revision_clock VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET revision=max(revision,excluded.revision)",[cache_revision as i64])?;
+        store.status()?;
         Ok(store)
     }
-    fn cache(&self) -> Result<Connection> {
-        connect(&self.state_dir.join("cache.db"), CACHE_SCHEMA)
+    /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
+    pub fn open_for_tests(state: &Path, workspace: &Path) -> Result<Self> {
+        let identity = topology::WorkspaceIdentity::discover(Some(workspace), workspace)?;
+        let roots =
+            topology::TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
+        Self::open(roots, identity)
     }
-    fn workspace(&self) -> Result<Connection> {
-        connect(&self.state_dir.join("workspace.db"), WORKSPACE_SCHEMA)
+    /// Fixture barrier after building a staged index, before its validation and publication.
+    pub fn open_for_tests_with_index_stage_hook(
+        state: &Path,
+        workspace: &Path,
+        before_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Self> {
+        let identity = topology::WorkspaceIdentity::discover(Some(workspace), workspace)?;
+        let roots =
+            topology::TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
+        Self::open_with_stage_hook(roots, identity, before_publish)
     }
-    fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
-        let row: Option<(i64, String, String, String)> = db
-            .query_row(
-                "SELECT revision,indexed_at,stats,diagnostics FROM revision WHERE singleton=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let (revision, indexed_at, stats, diagnostics) = match row {
-            Some((rev, time, stats, diags)) => (
-                u64::try_from(rev).context("negative revision")?,
-                Some(time),
-                serde_json::from_str(&stats)?,
-                serde_json::from_str(&diags)?,
-            ),
-            None => (0, None, IndexStats::default(), vec![]),
+    fn initialize(
+        &self,
+        leader: &topology::LeaderGuard,
+        before_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        use rusqlite::OpenFlags;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        let path = self.roots.index_db(&self.identity);
+        reject_sidecars(&path, true)?;
+        if index_path_present(&path)? {
+            return Ok(());
+        }
+        let use_guard = self.roots.index_use(&self.identity)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let staged_path = path.with_file_name(format!("index.db.tmp-{}", uuid::Uuid::new_v4()));
+        let staged = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged_path)?;
+        let mut staged = StagedIndex {
+            path: staged_path,
+            file: staged,
+            published: false,
         };
-        Ok(IndexStatus {
-            workspace_root: self.workspace_root.clone(),
-            revision,
-            indexed_at,
-            stats,
-            diagnostics,
+        let db = Connection::open_with_flags(
+            &staged.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.busy_timeout(Duration::ZERO)?;
+        db.pragma_update(None, "journal_mode", "DELETE")?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            db.execute_batch(CACHE_SCHEMA)?;
+            db.execute_batch(CLASS_SCHEMA)?;
+            let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
+            db.execute(
+                "INSERT INTO index_metadata VALUES(1,4,?1,?2,?3,?4,?5,0,?6,'',?7,?8)",
+                params![
+                    EXTRACTOR_VERSION,
+                    self.workspace_root,
+                    self.identity.device.to_string(),
+                    self.identity.inode.to_string(),
+                    uuid::Uuid::new_v4().to_string(),
+                    age as i64,
+                    json(&IndexStats::default())?,
+                    json(&Vec::<Diagnostic>::new())?
+                ],
+            )?;
+            db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
+            db.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = db.execute_batch("ROLLBACK");
+        }
+        result?;
+        drop(db);
+        before_publish(&staged.path)?;
+        verify_index_file(&staged.path)?;
+        let checked = open_index(&staged.path, true)?;
+        self.read_status(&checked)?;
+        let integrity: String =
+            storage_result(checked.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
+        ensure!(
+            integrity == "ok",
+            "incompatible_index: staged integrity check failed"
+        );
+        drop(checked);
+        staged.file.sync_all()?;
+        // The verified pathname must still refer to the inode we created.
+        use std::os::unix::fs::MetadataExt;
+        let named = std::fs::symlink_metadata(&staged.path)?;
+        let opened = staged.file.metadata()?;
+        ensure!(
+            named.is_file() && named.dev() == opened.dev() && named.ino() == opened.ino(),
+            "unsafe_index: staged pathname changed"
+        );
+        leader.verify()?;
+        use_guard.verify()?;
+        self.identity.verify()?;
+        ensure!(
+            !index_path_present(&path)?,
+            "incompatible_index: index appeared during initialization"
+        );
+        std::fs::rename(&staged.path, &path)?;
+        staged.published = true;
+        std::fs::File::open(self.roots.index_dir(&self.identity))?.sync_all()?;
+        Ok(())
+    }
+    pub fn leader(&self) -> Result<topology::LeaderGuard> {
+        drop(self.cache()?);
+        let leader = self.roots.leader(&self.identity)?;
+        let mut db = self.cache_write()?;
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
+        storage_result(tx.execute(
+            "UPDATE index_metadata SET last_opened_at=?1 WHERE singleton=1",
+            [age as i64],
+        ))?;
+        storage_result(tx.commit())?;
+        leader.verify()?;
+        self.identity.verify()?;
+        Ok(leader)
+    }
+    fn cache(&self) -> Result<IndexConnection> {
+        self.connect_index(false)
+    }
+    fn cache_write(&self) -> Result<IndexConnection> {
+        self.connect_index(true)
+    }
+    fn connect_index(&self, writable: bool) -> Result<IndexConnection> {
+        self.identity.verify()?;
+        let use_guard = self.roots.index_use_existing(&self.identity)?;
+        let db = open_index(&self.roots.index_db(&self.identity), writable)?;
+        self.identity.verify()?;
+        use_guard.verify()?;
+        Ok(IndexConnection {
+            db,
+            _use_guard: use_guard,
         })
     }
+    fn records(&self) -> topology::DurableRecords<'_> {
+        topology::DurableRecords::new(&self.roots, &self.identity)
+    }
+    fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
+        let row: (i64,String,String,String,String,String,i64,String,String,String) = storage_result(db.query_row(
+            "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata WHERE singleton=1",
+            [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))))?;
+        ensure!(
+            row.0 == 4 && row.1 == EXTRACTOR_VERSION,
+            "incompatible_index: extractor or schema"
+        );
+        ensure!(
+            row.2 == self.workspace_root,
+            "root_key_collision: index belongs to a different spelling"
+        );
+        ensure!(
+            row.3 == self.identity.device.to_string() && row.4 == self.identity.inode.to_string(),
+            "root_changed: index root identity mismatch"
+        );
+        let pin: IndexPin = serde_json::from_value(
+            serde_json::json!({"indexGeneration":row.5,"indexRevision":row.6}),
+        )?;
+        Ok(IndexStatus {
+            workspace_root: self.workspace_root.clone(),
+            revision: pin,
+            indexed_at: if row.7.is_empty() { None } else { Some(row.7) },
+            stats: serde_json::from_str(&row.8)?,
+            diagnostics: serde_json::from_str(&row.9)?,
+        })
+    }
+    pub fn verify_root(&self) -> Result<()> {
+        self.identity.verify()
+    }
     pub fn status(&self) -> Result<IndexStatus> {
-        self.read_status(&self.cache()?)
+        let db = self.cache()?;
+        self.read_status(&db)
     }
     pub fn publish(
         &self,
         graph: &Graph,
-        expected_revision: Option<u64>,
+        leader: &topology::LeaderGuard,
+        expected_revision: IndexPin,
         cancel: &CancelFlag,
-    ) -> Result<u64> {
+    ) -> Result<IndexPin> {
         ensure!(
             graph.schema_version == SCHEMA_VERSION,
             "unsupported graph schema"
@@ -884,33 +1065,23 @@ impl Store {
         // still publish in one transaction with the same CAS/cancellation guard.
         let classes = crate::classes::Catalog::build(&graph.files, &graph.nodes, cancel)?;
         check_cancel(cancel)?;
-        let mut db = self.cache()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        let mut db = self.cache_write()?;
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let old = self.read_status(&tx)?.revision;
         ensure!(
-            expected_revision.is_none_or(|r| r == old),
-            "revision conflict: expected {expected_revision:?}, found {old}"
+            expected_revision == old,
+            "revision conflict: expected {expected_revision:?}, found {old:?}"
         );
-        // Allocate durably while holding the cache writer lock. Gaps after rollback are
-        // intentional: no revision token can be reused after cache loss or a failed commit.
-        let mut workspace = self.workspace()?;
-        let allocation = workspace.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let clock: i64 = allocation
-            .query_row(
-                "SELECT revision FROM revision_clock WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        let revision = u64::try_from(clock)
-            .context("negative revision clock")?
-            .max(old)
-            .checked_add(1)
-            .filter(|r| *r <= i64::MAX as u64)
-            .context("revision overflow")?;
-        allocation.execute("INSERT INTO revision_clock VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision",[revision as i64])?;
-        allocation.commit()?;
+        let revision = IndexPin {
+            index_generation: old.index_generation,
+            index_revision: old
+                .index_revision
+                .checked_add(1)
+                .filter(|n| *n <= 9_007_199_254_740_991)
+                .context("revision overflow")?,
+        };
         tx.execute_batch(
             "DELETE FROM class_relations; DELETE FROM classes; DELETE FROM class_catalog;
              DELETE FROM calls; DELETE FROM regions; DELETE FROM nodes; DELETE FROM files;",
@@ -976,17 +1147,12 @@ impl Store {
             .duration_since(UNIX_EPOCH)?
             .as_millis()
             .to_string();
-        tx.execute(
-            "INSERT OR REPLACE INTO revision VALUES(1,?1,?2,?3,?4)",
-            params![
-                revision as i64,
-                timestamp,
-                json(&stats)?,
-                json(&graph.diagnostics)?
-            ],
-        )?;
+        tx.execute("UPDATE index_metadata SET index_revision=?1,indexed_at=?2,stats=?3,diagnostics=?4 WHERE singleton=1",
+            params![revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?])?;
         check_cancel(cancel)?;
-        tx.commit()?;
+        leader.verify()?;
+        self.identity.verify()?;
+        storage_result(tx.commit())?;
         Ok(revision)
     }
     /// Search only the persisted projection. Wildcards are literal user text.
@@ -997,13 +1163,8 @@ impl Store {
     ) -> Result<crate::navigation::NavigationResult> {
         request.validate()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
-        let revision = tx
-            .query_row("SELECT revision FROM revision WHERE singleton=1", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .optional()?
-            .unwrap_or(0) as u64;
+        let tx = storage_result(db.transaction())?;
+        let revision = self.read_status(&tx)?.revision;
         ensure!(request.expected_revision() == revision, "revision conflict");
         crate::navigation::navigate(&tx, request, revision)
     }
@@ -1012,7 +1173,7 @@ impl Store {
         &self,
         path: Option<&str>,
         query: &str,
-        expected: Option<u64>,
+        expected: Option<IndexPin>,
         offset: usize,
         limit: usize,
     ) -> Result<crate::class_diagram::ClassPage> {
@@ -1037,7 +1198,7 @@ impl Store {
             );
         }
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         let Some((mut warnings, truncated)) = class_metadata(&tx)? else {
@@ -1116,7 +1277,7 @@ impl Store {
         use crate::class_diagram::{self, InvalidRequest, MAX_EDGES};
         request.validate()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(revision == request.expected_revision, "revision conflict");
         let Some((mut warnings, mut truncated)) = class_metadata(&tx)? else {
@@ -1263,10 +1424,10 @@ impl Store {
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
         Ok(self.symbols_at(query, limit)?.1)
     }
-    pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(u64, Vec<Symbol>)> {
+    pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         ensure!(query.len() <= 8192, "search query too long");
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE instr(lower(name),lower(?1)) > 0 OR instr(lower(id),lower(?1)) > 0 ORDER BY CASE WHEN lower(name)=lower(?1) THEN 0 WHEN instr(lower(name),lower(?1))=1 THEN 1 ELSE 2 END,name,id LIMIT ?2")?;
         let values = stmt.query_map(params![query, limit.min(150) as i64], |r| {
@@ -1287,22 +1448,22 @@ impl Store {
         &self,
         sql: &str,
         id: &str,
-        expected_revision: Option<u64>,
-    ) -> Result<Option<(u64, T)>> {
+        expected_revision: Option<IndexPin>,
+    ) -> Result<Option<(IndexPin, T)>> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(
             expected_revision.is_none_or(|r| r == revision),
-            "revision conflict: expected {expected_revision:?}, found {revision}"
+            "revision conflict: expected {expected_revision:?}, found {revision:?}"
         );
         Ok(one(&tx, sql, id)?.map(|value| (revision, value)))
     }
     pub fn symbol_at(
         &self,
         id: &str,
-        expected_revision: Option<u64>,
-    ) -> Result<Option<(u64, Symbol)>> {
+        expected_revision: Option<IndexPin>,
+    ) -> Result<Option<(IndexPin, Symbol)>> {
         self.entity_at(
             "SELECT payload FROM nodes WHERE id=?1",
             id,
@@ -1312,8 +1473,8 @@ impl Store {
     pub fn source_at(
         &self,
         path: &str,
-        expected_revision: Option<u64>,
-    ) -> Result<Option<(u64, SourceFile)>> {
+        expected_revision: Option<IndexPin>,
+    ) -> Result<Option<(IndexPin, SourceFile)>> {
         self.entity_at(
             "SELECT payload FROM files WHERE path=?1",
             path,
@@ -1326,9 +1487,9 @@ impl Store {
         &self,
         root: &Path,
         items: &mut [crate::file_tree::Entry],
-    ) -> Result<(u64, String)> {
+    ) -> Result<(IndexPin, String)> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         let workspace = Path::new(&self.workspace_root);
         let mut stmt = tx.prepare("SELECT (SELECT count(*) FROM nodes n WHERE n.path=f.path AND json_extract(n.payload,'$.kind') IN ('function','method')) FROM files f WHERE f.path=?1")?;
@@ -1350,7 +1511,7 @@ impl Store {
     }
     pub fn files_at(
         &self,
-        expected: Option<u64>,
+        expected: Option<IndexPin>,
         offset: usize,
         limit: usize,
     ) -> Result<serde_json::Value> {
@@ -1359,7 +1520,7 @@ impl Store {
             "invalid catalog pagination"
         );
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         let mut stmt = tx.prepare("SELECT f.path,json_extract(f.payload,'$.language'),(SELECT count(*) FROM nodes n WHERE n.path=f.path AND json_extract(n.payload,'$.kind') IN ('function','method')) FROM files f ORDER BY f.path LIMIT ?1 OFFSET ?2")?;
@@ -1373,10 +1534,10 @@ impl Store {
     pub fn methods_at(
         &self,
         path: &str,
-        expected: Option<u64>,
+        expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         if !tx.query_row(
@@ -1405,11 +1566,11 @@ impl Store {
     pub fn sequence_at(
         &self,
         seed: &str,
-        expected: u64,
+        expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(revision == expected, "revision conflict");
         let Some(symbol) = one::<Symbol>(&tx, "SELECT payload FROM nodes WHERE id=?1", seed)?
@@ -1446,15 +1607,15 @@ impl Store {
     }
     pub fn graph(&self) -> Result<Graph> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let graph = self.read_graph(&tx)?;
-        tx.commit()?;
+        storage_result(tx.commit())?;
         Ok(graph)
     }
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
         query.validate()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         let seed: Option<Symbol> = one(&tx, "SELECT payload FROM nodes WHERE id=?1", &query.seed)?;
         let Some(seed) = seed else { return Ok(None) };
@@ -1531,7 +1692,7 @@ impl Store {
                 regions.insert(id, region);
             }
         }
-        tx.commit()?;
+        storage_result(tx.commit())?;
         Ok(Some(ViewResult {
             revision,
             query: query.clone(),
@@ -1566,7 +1727,7 @@ impl Store {
     }
     pub fn put_view(&self, view: &SavedView) -> Result<()> {
         view.validate()?;
-        self.workspace()?.execute("INSERT INTO views VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![view.id,json(view)?])?;
+        self.records().put_view(view)?;
         Ok(())
     }
     fn resolve_view(db: &Connection, view: SavedView) -> Result<SavedViewState> {
@@ -1588,43 +1749,32 @@ impl Store {
         Ok(SavedViewState { view, orphaned_ids })
     }
     pub fn views(&self) -> Result<Vec<SavedViewState>> {
-        let views: Vec<SavedView> =
-            rows(&self.workspace()?, "SELECT payload FROM views ORDER BY id")?;
+        let views = self.records().views()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         views
             .into_iter()
             .map(|v| Self::resolve_view(&tx, v))
             .collect()
     }
     pub fn view(&self, id: &str) -> Result<Option<SavedViewState>> {
-        let view: Option<SavedView> = one(
-            &self.workspace()?,
-            "SELECT payload FROM views WHERE id=?1",
-            id,
-        )?;
+        let view = self.records().view(id)?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         view.map(|v| Self::resolve_view(&tx, v)).transpose()
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
-        Ok(self
-            .workspace()?
-            .execute("DELETE FROM views WHERE id=?1", [id])?
-            > 0)
+        self.records().delete_view(id)
     }
     pub fn put_annotation(&self, annotation: &Annotation) -> Result<()> {
         annotation.validate()?;
-        self.workspace()?.execute("INSERT INTO annotations VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET node_id=excluded.node_id,payload=excluded.payload",params![annotation.id,annotation.node_id,json(annotation)?])?;
+        self.records().put_annotation(annotation)?;
         Ok(())
     }
     pub fn annotations(&self) -> Result<Vec<AnnotationState>> {
-        let annotations: Vec<Annotation> = rows(
-            &self.workspace()?,
-            "SELECT payload FROM annotations ORDER BY id",
-        )?;
+        let annotations = self.records().annotations()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         annotations
             .into_iter()
             .map(|annotation| {
@@ -1641,9 +1791,6 @@ impl Store {
             .collect()
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
-        Ok(self
-            .workspace()?
-            .execute("DELETE FROM annotations WHERE id=?1", [id])?
-            > 0)
+        self.records().delete_annotation(id)
     }
 }

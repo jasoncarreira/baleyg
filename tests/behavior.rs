@@ -1,3 +1,9 @@
+fn test_pin(revision: u64) -> baleyg::model::IndexPin {
+    baleyg::model::IndexPin {
+        index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
+        index_revision: revision,
+    }
+}
 use baleyg::{
     behavior::{SequenceStep, SequenceView, build_sequence},
     indexer::{IndexOptions, index_workspace},
@@ -20,7 +26,7 @@ fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
         .find(|n| n.name == name)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", graph.nodes));
     let file = &graph.files[0];
-    let view = build_sequence(7, seed, file, &graph.calls, false).unwrap();
+    let view = build_sequence(test_pin(7), seed, file, &graph.calls, false).unwrap();
     (graph, view)
 }
 fn flatten(steps: &[SequenceStep]) -> Vec<&SequenceStep> {
@@ -83,7 +89,7 @@ async function atomicWrite(path, value) {
         assert!(!source.is_empty());
     }
     let wire = serde_json::to_value(&view).unwrap();
-    assert_eq!(wire["revision"], 7);
+    assert_eq!(wire["revision"], serde_json::json!(test_pin(7)));
     assert!(wire.get("hiddenSteps").is_some());
 }
 #[test]
@@ -187,7 +193,7 @@ fn effects_and_unresolved_argument_effects_are_never_hidden() {
             .filter(|s| s.hidden)
             .all(|s| s.label == "console.log")
     );
-    let all = build_sequence(7, &view.seed, &g.files[0], &g.calls, true).unwrap();
+    let all = build_sequence(test_pin(7), &view.seed, &g.files[0], &g.calls, true).unwrap();
     assert_eq!(all.hidden_steps, 0);
     assert!(flatten(&all.steps).iter().all(|s| !s.hidden));
     assert_eq!(calls(&view.steps), calls(&all.steps));
@@ -217,11 +223,11 @@ fn malformed_source_and_unsupported_language_fail_soft() {
     f.text = "function run() { broken( }".into();
     let mut seed = view.seed.clone();
     seed.range.end_byte = f.text.len();
-    let bad = build_sequence(1, &seed, &f, &[], false).unwrap();
+    let bad = build_sequence(test_pin(1), &seed, &f, &[], false).unwrap();
     assert!(calls(&bad.steps).is_empty());
     assert!(bad.steps.iter().any(|s| s.kind == "boundary"));
     f.language = "unsupported-language".into();
-    assert!(build_sequence(1, &seed, &f, &[], false).is_err());
+    assert!(build_sequence(test_pin(1), &seed, &f, &[], false).is_err());
 }
 #[test]
 fn bounded_output_and_honest_visual_grouping() {
@@ -385,7 +391,7 @@ fn participant_limit_keeps_source_backed_call_evidence() {
             .find(|n| n.name == c.callee_text)
             .map(|n| n.id.clone());
     }
-    let view = build_sequence(7, &initial.seed, &g.files[0], &g.calls, false).unwrap();
+    let view = build_sequence(test_pin(7), &initial.seed, &g.files[0], &g.calls, false).unwrap();
     assert!(view.truncated);
     assert_eq!(view.participants.len(), 20);
     let steps = flatten(&view.steps);

@@ -7,24 +7,30 @@ Neither output proves runtime ordering or constitutes a sequence diagram.
 
 ## Authorization and startup
 
-The user authorized a new $5 budget for the feature-factory snapshot. Its independent
-ledger is `.baleyg/jev-question-budget`; the previous experiment ledger stays closed.
+The user authorized a $5 budget for the feature-factory snapshot. Its original independent
+ledger was `.baleyg/jev-question-budget`; that in-checkout path is no longer allowed. With
+Baleyg stopped, manually move the existing ledger to an external private directory before
+reopening it; do not create a fresh ledger to reset its balance. The previous experiment
+ledger stays closed.
 Supply `JEV_KEY` through the process environment from a local secret store. The daemon
 never reads `.env` itself. Do not put the key in command arguments, source or logs.
 
 ```sh
+mkdir -m 700 -p "$HOME/.baleyg-private"
+# With Baleyg stopped, first move the old ledger here if it still exists in .baleyg/.
 cargo run --locked -- serve \
   --workspace tests/fixtures/extraction/inputs/feature-factory \
-  --state-dir .baleyg/native-smoke \
+  --token-file "$HOME/.baleyg-private/token" \
   --scip tests/fixtures/extraction/feature-factory.scip \
   --manifest tests/fixtures/extraction/feature-factory.hashes.json \
-  --jev-budget-dir .baleyg/jev-question-budget \
+  --jev-budget-dir "$HOME/.baleyg-private/jev-question-budget" \
   --jev-budget-cents 500
 ```
 
 Without both budget flags, live inference is disabled. Existing ledger caps and workspace
 bindings cannot be changed on reopen. Keep this durable budget directory separate from
-rebuildable index caches. Never delete or replace it to restore available budget.
+rebuildable index caches and outside the selected checkout. Never delete or replace it
+to restore available budget.
 
 ## Accounting and privacy
 

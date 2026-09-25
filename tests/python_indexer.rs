@@ -1,7 +1,7 @@
+mod common;
 use baleyg::{
     indexer::{IndexOptions, index_workspace},
     model::*,
-    store::Store,
 };
 use std::{
     collections::BTreeSet,
@@ -81,13 +81,29 @@ fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
     }
     assert!(!graph.regions.is_empty());
     let state = tempfile::tempdir().unwrap();
-    let store = Store::open(&state.path().join("state"), dir.path()).unwrap();
+    let store = crate::common::open_store(&state.path().join("state"), dir.path()).unwrap();
     store
-        .publish(&graph, Some(0), &Arc::new(AtomicBool::new(false)))
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
     assert!(
         store
-            .publish(&graph, Some(1), &Arc::new(AtomicBool::new(true)))
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 1
+                },
+                &Arc::new(AtomicBool::new(true))
+            )
             .is_err()
     );
 }

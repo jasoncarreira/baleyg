@@ -1,3 +1,4 @@
+mod common;
 use baleyg::{
     indexer::{IndexOptions, index_workspace},
     model::*,
@@ -148,9 +149,14 @@ fn shared_start_call_ids_are_unique_and_publishable() {
         })
     }));
     let state = tempfile::tempdir().unwrap();
-    baleyg::store::Store::open(&state.path().join("state"), dir.path())
-        .unwrap()
-        .publish(&graph, Some(0), &Arc::new(AtomicBool::new(false)))
+    let store = crate::common::open_store(&state.path().join("state"), dir.path()).unwrap();
+    store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
 }
 #[test]

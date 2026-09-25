@@ -1,4 +1,5 @@
 //! Bounded, offline question evidence and selection policy. No model or network calls.
+use crate::model::IndexPin;
 use crate::{model::*, store::Store};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ fn default_visible() -> usize {
 pub struct QuestionRequest {
     pub seed: String,
     pub question: String,
-    pub expected_revision: u64,
+    pub expected_revision: IndexPin,
     #[serde(default = "default_depth")]
     pub evidence_depth: usize,
     #[serde(default = "default_visible")]
@@ -57,7 +58,7 @@ impl QuestionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct QuestionPacket {
     pub packet_id: String,
-    pub revision: u64,
+    pub revision: IndexPin,
     pub request: QuestionRequest,
     pub context: ViewResult,
     pub source_files: Vec<SourceFile>,
@@ -89,7 +90,7 @@ pub struct SelectionEnvelope {
 #[serde(rename_all = "camelCase")]
 pub struct FocusedView {
     pub packet_id: String,
-    pub revision: u64,
+    pub revision: IndexPin,
     pub question: String,
     pub selection_source: String,
     pub nodes: Vec<Symbol>,

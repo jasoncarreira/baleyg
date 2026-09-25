@@ -115,8 +115,8 @@
     if (text !== undefined) node.textContent = text;
     return node;
   };
-  const context = () => ({session: api.currentSession(), revision: api.currentRevision()});
-  const valid = c => !!api && c.session === api.currentSession() && c.revision === api.currentRevision();
+  const context = () => ({session: api.currentSession(), revision: window.BaleygIndexPin.copy(api.currentRevision())});
+  const valid = c => !!api && c.session === api.currentSession() && window.BaleygIndexPin.equal(c.revision, api.currentRevision());
   const state = (text, kind = "ready") => { ui.state.textContent = text; ui.state.dataset.state = kind; };
   function renderWarnings(warnings = []) {
     if (!warningBox) {
@@ -278,22 +278,31 @@
   }
   async function lookup({path = "", q = "", offset = 0, autoOpen = false} = {}) {
     const c = context(), ticket = ++searchSerial;
+    // Lookup supersedes a pending diagram request. Restore the visible diagram's
+    // action ticket; the old response is still rejected by searchSerial.
+    if (diagram && snapshot && valid(snapshot)) displayTicket = serial;
     if (api.onChange) api.onChange();
-    serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
-    controls.hidden = true;
-    if (!offset) {
-      showAll = false; membersOpen.clear(); expanded = [];
-      seed = null; diagram = null; diagramGeneration++; ui.diagram.replaceChildren();
-      stage = null; cards = new Map(); positions = new Map(); ui.results.replaceChildren();
-    }
     ui.diagram.setAttribute("aria-busy", "false");
+    // Keep the current diagram and its callbacks usable while lookup is pending.
+    // A failed non-revision request must not discard the only loaded view.
     state("Looking for indexed classes…", "loading");
     try {
-      const params = new URLSearchParams({q, offset: String(offset), limit: "100", revision: String(c.revision)});
+      const params = new URLSearchParams({q, offset: String(offset), limit: "100", indexGeneration: c.revision.indexGeneration, indexRevision: String(c.revision.indexRevision)});
       if (path) params.set("path", path);
       const data = await api.request(`/api/classes?${params}`);
       if (ticket !== searchSerial || !valid(c)) return;
-      if (data.revision !== c.revision) { state("Workspace revision changed. Search again.", "stale"); return; }
+      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) {
+        reset(); api.onStale?.("Workspace revision changed. Search again.");
+        state("Workspace revision changed. Search again.", "stale"); return;
+      }
+      serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
+      controls.hidden = true;
+      if (!offset) {
+        showAll = false; membersOpen.clear(); expanded = [];
+        seed = null; diagram = null; snapshot = null; diagramGeneration++; ui.diagram.replaceChildren();
+        stage = null; cards = new Map(); positions = new Map(); ui.results.replaceChildren();
+      }
+      ui.diagram.setAttribute("aria-busy", "false");
       const items = data.items || [];
       for (const definition of items) {
         const button = el("button", undefined, "classes-result"); button.type = "button";
@@ -312,12 +321,16 @@
       state(`${unindexed ? "Index workspace to populate class declarations." : items.length ? "Choose a class to show its declared relationships." : "No matching classes. Try another name or index Java / Python files."}${data.truncated ? " Results are partial." : ""}`, unindexed ? "unindexed" : data.truncated ? "partial" : items.length ? "ready" : "empty");
       if (autoOpen && items.length) await loadDiagram(items[0].symbol.id, [], true);
     } catch (error) {
-      if (ticket === searchSerial && valid(c) && error.name !== "AbortError") state(error.message || "Class lookup failed. Try Search again.", "error");
+      if (ticket === searchSerial && valid(c) && error.name !== "AbortError") {
+        const conflict = window.BaleygIndexPin.isConflict(error);
+        if (conflict) { reset(); api.onStale?.("Workspace revision changed. Search again."); }
+        state(error.message || "Class lookup failed. Try Search again.", conflict ? "stale" : "error");
+      }
     }
   }
   async function loadDiagram(nextSeed, nextExpanded, fresh = false, focusId = null) {
     // A chosen diagram owns status/notices; late catalog pages must not replace them.
-    searchSerial++;
+    const searchTicket = ++searchSerial;
     const c = context(), ticket = ++serial, focusBefore = document.activeElement;
     const restoreFocus = () => {
       if ((!fresh && !focusId) || ticket !== serial || !valid(c) || displayTicket !== ticket) return;
@@ -332,16 +345,20 @@
     const expansion = [...nextExpanded];
     try {
       const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: true, includeUnmatched: !!ui.unmatched.checked}});
-      if (ticket !== serial || !valid(c)) return;
-      if (data.revision !== c.revision) { state("Workspace revision changed. Open the class again.", "stale"); return; }
+      if (ticket !== serial || searchTicket !== searchSerial || !valid(c)) return;
+      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) {
+        reset(); api.onStale?.("Workspace revision changed. Open the class again.");
+        state("Workspace revision changed. Open the class again.", "stale"); return;
+      }
       if (fresh) { positions = new Map(); cards = new Map(); stage = null; showAll = false; membersOpen.clear(); ui.diagram.replaceChildren(); }
       ui.results.hidden = true; changeButton.setAttribute("aria-expanded", "false");
       seed = data.seed; expanded = expansion; diagram = data; snapshot = c; diagramGeneration++; displayTicket = ticket;
       render(data); renderWarnings(data.warnings || []);
       updateStatus(); restoreFocus();
     } catch (error) {
-      if (ticket === serial && valid(c) && error.name !== "AbortError") {
-        const recoverable = diagram && snapshot && valid(snapshot) && ![401, 403, 409].includes(error.status);
+      if (ticket === serial && searchTicket === searchSerial && valid(c) && error.name !== "AbortError") {
+        const conflict = window.BaleygIndexPin.isConflict(error);
+        const recoverable = diagram && snapshot && valid(snapshot) && ![401, 403].includes(error.status) && !conflict;
         if (recoverable) {
           // This request never published a new view. Restore only the still-current cached view.
           displayTicket = ticket;
@@ -350,10 +367,11 @@
         } else {
           diagramGeneration++; diagram = null; snapshot = null; seed = null; expanded = [];
           stage = null; cards = new Map(); positions = new Map(); controls.hidden = true; ui.diagram.replaceChildren();
-          state(`${error.message || "Class diagram unavailable."} ${error.status === 409 ? "Workspace revision changed. Refresh status and open the class again." : "Try opening the class again."}`, error.status === 409 ? "stale" : "error");
+          if (conflict) api.onStale?.("Workspace revision changed. Refresh status and open the class again.");
+          state(`${error.message || "Class diagram unavailable."} ${conflict ? "Workspace revision changed. Refresh status and open the class again." : "Try opening the class again."}`, conflict ? "stale" : "error");
         }
       }
-    } finally { if (ticket === serial && valid(c)) ui.diagram.setAttribute("aria-busy", "false"); }
+    } finally { if (ticket === serial && searchTicket === searchSerial && valid(c)) ui.diagram.setAttribute("aria-busy", "false"); }
   }
   function classActions(node) {
     const c = snapshot, generation = diagramGeneration;

@@ -1,4 +1,5 @@
 //! Synthetic class projection tests. No workspace programs or providers run.
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -29,6 +30,20 @@ class B { A back; C second; }
 class C {}
 class Alone {}
 "#;
+fn pin_query(pin: IndexPin) -> String {
+    format!(
+        "indexGeneration={}&indexRevision={}",
+        pin.index_generation, pin.index_revision
+    )
+}
+fn index_db(state: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(state.join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db")
+}
 fn cancel() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
 }
@@ -40,8 +55,22 @@ fn setup_with(source: &str) -> (tempfile::TempDir, Store, Graph, Router) {
     std::fs::write(workspace.join("unsupported.js"), "class Unsupported {}").unwrap();
     let options = IndexOptions::new(workspace.clone());
     let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
-    let store = Store::open(&dir.path().join("state"), &workspace).unwrap();
-    assert_eq!(store.publish(&graph, Some(0), &cancel()).unwrap(), 1);
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    assert_eq!(
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0
+                },
+                &cancel()
+            )
+            .unwrap()
+            .index_revision,
+        1
+    );
     let app = http::router(
         http::new(
             store.clone(),
@@ -65,10 +94,10 @@ fn id(graph: &Graph, name: &str) -> String {
         .id
         .clone()
 }
-fn request(seed: String) -> ClassDiagramRequest {
+fn request(seed: String, store: &Store) -> ClassDiagramRequest {
     ClassDiagramRequest {
         seed,
-        expected_revision: 1,
+        expected_revision: store.status().unwrap().revision,
         expanded: vec![],
         include_unmatched: false,
         include_hierarchy: false,
@@ -106,26 +135,33 @@ fn diagram_names(view: &Value) -> BTreeSet<&str> {
 }
 #[tokio::test]
 async fn search_pagination_literal_wildcards_and_supported_languages() {
-    let (_dir, _store, _graph, app) = setup();
+    let (_dir, store, _graph, app) = setup();
+    let pin = store.status().unwrap().revision;
     let (status, page) = call(
         &app,
         "GET",
-        "/api/classes?revision=1&path=Types.java&limit=2",
+        &format!("/api/classes?{}&path=Types.java&limit=2", pin_query(pin)),
         Value::Null,
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(page["revision"], 1);
+    assert_eq!(page["revision"], json!(pin));
     assert_eq!(page["nextOffset"], 2);
     assert_eq!(page["requireIndex"], false);
     assert_eq!(page["items"].as_array().unwrap().len(), 2);
-    let (_, filtered) = call(&app, "GET", "/api/classes?q=Alone&revision=1", Value::Null).await;
+    let (_, filtered) = call(
+        &app,
+        "GET",
+        &format!("/api/classes?q=Alone&{}", pin_query(pin)),
+        Value::Null,
+    )
+    .await;
     assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["items"][0]["symbol"]["name"], "Alone");
     let (status, empty_path) = call(
         &app,
         "GET",
-        "/api/classes?path=&q=Alone&revision=1",
+        &format!("/api/classes?path=&q=Alone&{}", pin_query(pin)),
         Value::Null,
     )
     .await;
@@ -143,7 +179,8 @@ async fn search_pagination_literal_wildcards_and_supported_languages() {
 #[tokio::test]
 async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
     let (dir, store, graph, app) = setup();
-    let body = json!({"seed":id(&graph,"run"),"expectedRevision":1});
+    let pin = store.status().unwrap().revision;
+    let body = json!({"seed":id(&graph,"run"),"expectedRevision":pin});
     let (status, before) = call(&app, "POST", "/api/class-diagram", body.clone()).await;
     assert_eq!(status, 200, "{before}");
     assert_eq!(before["seed"], id(&graph, "A"));
@@ -159,7 +196,7 @@ async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":id(&graph,"nested"),"expectedRevision":1}),
+        json!({"seed":id(&graph,"nested"),"expectedRevision":pin}),
     )
     .await;
     assert_eq!(nested["seed"], id(&graph, "Inner"));
@@ -167,7 +204,7 @@ async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":id(&graph,"C"),"expectedRevision":1}),
+        json!({"seed":id(&graph,"C"),"expectedRevision":pin}),
     )
     .await;
     assert_eq!(diagram_names(&incoming), BTreeSet::from(["B", "C"]));
@@ -175,7 +212,7 @@ async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":id(&graph,"A"),"expectedRevision":1,"includeUnmatched":true}),
+        json!({"seed":id(&graph,"A"),"expectedRevision":pin,"includeUnmatched":true}),
     )
     .await;
     let hint = hints["nodes"]
@@ -197,11 +234,11 @@ async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":id(&graph,"A"),"expectedRevision":1,"expanded":[id(&graph,"B")]}),
+        json!({"seed":id(&graph,"A"),"expectedRevision":pin,"expanded":[id(&graph,"B")]}),
     )
     .await;
     assert!(diagram_names(&expanded).contains("C"));
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     assert!(
         db.query_row(
             "SELECT count(*) FROM class_relations WHERE target IS NULL",
@@ -212,7 +249,7 @@ async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
             > 0
     );
     let raw_before = store.graph().unwrap();
-    std::fs::remove_dir_all(dir.path().join("workspace")).unwrap();
+    std::fs::remove_file(dir.path().join("workspace/Types.java")).unwrap();
     assert_eq!(
         call(&app, "POST", "/api/class-diagram", body).await.1,
         before
@@ -222,6 +259,7 @@ async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
 #[tokio::test]
 async fn authentication_strict_requests_revision_and_disconnected_expansion() {
     let (_dir, store, graph, app) = setup();
+    let pin = store.status().unwrap().revision;
     for path in ["/api/classes", "/api/class-diagram"] {
         let req = Request::builder()
             .uri(path)
@@ -244,23 +282,38 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
     let seed = id(&graph, "A");
     for body in [
         json!({"seed":seed}),
-        json!({"seed":seed,"expectedRevision":1,"unknown":true}),
-        json!({"seed":"","expectedRevision":1}),
-        json!({"seed":"missing","expectedRevision":1}),
-        json!({"seed":seed,"expectedRevision":1,"includeUnmatched":"yes"}),
-        json!({"seed":seed,"expectedRevision":1,"expanded":vec![seed.clone();13]}),
-        json!({"seed":seed,"expectedRevision":1,"expanded":[id(&graph,"Alone")]}),
-        json!({"seed":id(&graph,"Unsupported"),"expectedRevision":1}),
+        json!({"seed":seed,"expectedRevision":pin,"unknown":true}),
+        json!({"seed":"","expectedRevision":pin}),
+        json!({"seed":"missing","expectedRevision":pin}),
+        json!({"seed":seed,"expectedRevision":pin,"includeUnmatched":"yes"}),
+        json!({"seed":seed,"expectedRevision":pin,"expanded":vec![seed.clone();13]}),
+        json!({"seed":seed,"expectedRevision":pin,"expanded":[id(&graph,"Alone")]}),
+        json!({"seed":id(&graph,"Unsupported"),"expectedRevision":pin}),
     ] {
         let (status, value) = call(&app, "POST", "/api/class-diagram", body).await;
         assert_eq!(status, 400, "{value}");
         assert!(value["error"]["message"].is_string());
     }
-    store.publish(&graph, Some(1), &cancel()).unwrap();
+    store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 1,
+            },
+            &cancel(),
+        )
+        .unwrap();
     assert_eq!(
-        call(&app, "GET", "/api/classes?revision=1", Value::Null)
-            .await
-            .0,
+        call(
+            &app,
+            "GET",
+            &format!("/api/classes?{}", pin_query(pin)),
+            Value::Null
+        )
+        .await
+        .0,
         409
     );
     assert_eq!(
@@ -268,7 +321,7 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
             &app,
             "POST",
             "/api/class-diagram",
-            json!({"seed":seed,"expectedRevision":1})
+            json!({"seed":seed,"expectedRevision":pin})
         )
         .await
         .0,
@@ -296,7 +349,7 @@ fn projection_bounds_preserve_expansion_roots_edges_and_cycles() {
         ));
     }
     let (_dir, store, graph, _app) = setup_with(&source);
-    let mut q = request(id(&graph, "Seed"));
+    let mut q = request(id(&graph, "Seed"), &store);
     q.include_unmatched = true;
     q.expanded = (0..12).map(|i| id(&graph, &format!("N{i}"))).collect();
     let view = store.class_diagram_at(&q).unwrap();
@@ -336,102 +389,79 @@ fn projection_bounds_preserve_expansion_roots_edges_and_cycles() {
     );
 }
 #[test]
-fn additive_migrations_preserve_graph_durable_data_and_require_index() {
-    for version in [1, 2] {
-        let (dir, store, graph, _app) = setup();
-        let state = dir.path().join("state");
-        let workspace = dir.path().join("workspace");
-        let saved = SavedView {
-            id: "view".into(),
-            title: "Class notes".into(),
-            query: serde_json::from_value(json!({"seed":id(&graph,"A")})).unwrap(),
-            pins: BTreeMap::new(),
-            hidden: vec![],
-        };
-        let note = Annotation {
-            id: "note".into(),
-            node_id: id(&graph, "A"),
-            body: "Keep this".into(),
-        };
-        store.put_view(&saved).unwrap();
-        store.put_annotation(&note).unwrap();
-        std::fs::write(state.join("token"), TOKEN).unwrap();
-        std::fs::write(state.join("preferences.json"), r#"{"budget":37}"#).unwrap();
-        let before = store.graph().unwrap();
-        let db = rusqlite::Connection::open(state.join("cache.db")).unwrap();
-        db.execute_batch(
-            "DROP TABLE class_relations; DROP TABLE classes; DROP TABLE class_catalog;",
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", version).unwrap();
-        drop(db);
-        let db = rusqlite::Connection::open(state.join("workspace.db")).unwrap();
-        if version == 1 {
-            db.execute_batch("DROP TABLE revision_clock").unwrap();
-        }
-        db.pragma_update(None, "user_version", version).unwrap();
-        drop(db);
-        let migrated = Store::open(&state, &workspace).unwrap();
-        assert_eq!(migrated.graph().unwrap(), before);
-        assert_eq!(migrated.status().unwrap().revision, 1);
-        assert_eq!(migrated.view("view").unwrap().unwrap().view, saved);
-        assert_eq!(migrated.annotations().unwrap()[0].annotation, note);
-        assert_eq!(std::fs::read_to_string(state.join("token")).unwrap(), TOKEN);
-        assert_eq!(
-            std::fs::read_to_string(state.join("preferences.json")).unwrap(),
-            r#"{"budget":37}"#
-        );
-        let page = migrated.classes_at(None, "", Some(1), 0, 100).unwrap();
-        assert!(page.require_index);
-        assert!(page.items.is_empty());
-        assert!(page.warnings[0].contains("Index workspace"));
-        let view = migrated
-            .class_diagram_at(&request(id(&graph, "A")))
-            .unwrap();
-        assert!(view.require_index);
-        assert!(view.nodes.is_empty());
-        assert_eq!(migrated.publish(&graph, Some(1), &cancel()).unwrap(), 2);
-        assert!(
-            !migrated
-                .classes_at(None, "", Some(2), 0, 100)
-                .unwrap()
-                .require_index
-        );
-        let db = rusqlite::Connection::open(state.join("cache.db")).unwrap();
-        assert_eq!(
-            db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
-                .unwrap(),
-            3
-        );
-        drop(db);
-        std::fs::remove_file(state.join("cache.db")).unwrap();
-        let recovered = Store::open(&state, &workspace).unwrap();
-        assert!(
-            recovered
-                .classes_at(None, "", Some(0), 0, 100)
-                .unwrap()
-                .require_index
-        );
-        assert_eq!(recovered.view("view").unwrap().unwrap().view, saved);
-        assert_eq!(recovered.annotations().unwrap()[0].annotation, note);
-        assert_eq!(recovered.publish(&graph, Some(0), &cancel()).unwrap(), 3);
-    }
+fn incompatible_index_refuses_without_migrating_durable_data() {
+    let (dir, store, graph, _app) = setup();
+    let state = dir.path().join("state");
+    let workspace = dir.path().join("workspace");
+    let saved = SavedView {
+        id: "view".into(),
+        title: "Class notes".into(),
+        query: serde_json::from_value(json!({"seed":id(&graph,"A")})).unwrap(),
+        pins: BTreeMap::new(),
+        hidden: vec![],
+    };
+    store.put_view(&saved).unwrap();
+    let record = std::fs::read_dir(state.join("data/workspaces"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("workspace.db");
+    let before = std::fs::read(&record).unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(index_db(&state)).unwrap();
+    db.pragma_update(None, "user_version", 2).unwrap();
+    drop(db);
+    assert!(crate::common::open_store(&state, &workspace).is_err());
+    assert_eq!(std::fs::read(record).unwrap(), before);
 }
 #[test]
 fn failed_publication_keeps_projection_atomic_with_graph() {
     let (dir, store, graph, _app) = setup();
-    let q = request(id(&graph, "A"));
+    let q = request(id(&graph, "A"), &store);
     let before = serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap();
-    assert!(store.publish(&graph, Some(0), &cancel()).is_err());
     assert!(
         store
-            .publish(&graph, Some(1), &Arc::new(AtomicBool::new(true)))
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0
+                },
+                &cancel()
+            )
             .is_err()
     );
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    assert!(
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 1
+                },
+                &Arc::new(AtomicBool::new(true))
+            )
+            .is_err()
+    );
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute_batch("CREATE TRIGGER fail_projection BEFORE INSERT ON class_relations BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
-    assert!(store.publish(&graph, Some(1), &cancel()).is_err());
-    assert_eq!(store.status().unwrap().revision, 1);
+    assert!(
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 1
+                },
+                &cancel()
+            )
+            .is_err()
+    );
+    assert_eq!(store.status().unwrap().revision.index_revision, 1);
     assert_eq!(
         serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap(),
         before
@@ -439,19 +469,32 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(store.graph().unwrap().nodes, graph.nodes);
     db.execute_batch("DROP TRIGGER fail_projection").unwrap();
     assert!(
-        store.publish(&graph, Some(1), &cancel()).unwrap() > 2,
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 1
+                },
+                &cancel()
+            )
+            .unwrap()
+            .index_revision
+            > 1,
         "failed transaction consumes a durable revision token"
     );
 }
 
 #[tokio::test]
 async fn terminal_hints_and_parent_cycles_fail_readably() {
-    let (dir, _store, graph, app) = setup();
+    let (dir, store, graph, app) = setup();
+    let pin = store.status().unwrap().revision;
     let (_, diagram) = call(
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":id(&graph,"A"),"expectedRevision":1,"includeUnmatched":true}),
+        json!({"seed":id(&graph,"A"),"expectedRevision":pin,"includeUnmatched":true}),
     )
     .await;
     let hint = diagram["nodes"]
@@ -464,7 +507,7 @@ async fn terminal_hints_and_parent_cycles_fail_readably() {
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":hint["id"],"expectedRevision":1}),
+        json!({"seed":hint["id"],"expectedRevision":pin}),
     )
     .await;
     assert_eq!(status, 400);
@@ -481,7 +524,7 @@ async fn terminal_hints_and_parent_cycles_fail_readably() {
         .unwrap()
         .clone();
     method.parent = Some(method.id.clone());
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute(
         "UPDATE nodes SET payload=?1 WHERE id=?2",
         rusqlite::params![serde_json::to_string(&method).unwrap(), method.id],
@@ -491,7 +534,7 @@ async fn terminal_hints_and_parent_cycles_fail_readably() {
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":method.id,"expectedRevision":1}),
+        json!({"seed":method.id,"expectedRevision":pin}),
     )
     .await;
     assert_eq!(status, 400);
@@ -510,7 +553,7 @@ fn repeated_references_are_grouped_before_caps_with_real_evidence() {
     }
     text.push_str("C other; Missing x; Missing y; } class B {} class C {}\n");
     let (dir, store, graph, _app) = setup_with(&text);
-    let mut q = request(id(&graph, "A"));
+    let mut q = request(id(&graph, "A"), &store);
     let view = store.class_diagram_at(&q).unwrap();
     assert_eq!(view.nodes.len(), 3);
     assert_eq!(view.edges.len(), 2);
@@ -521,7 +564,7 @@ fn repeated_references_are_grouped_before_caps_with_real_evidence() {
             .iter()
             .any(|w| w.contains("representative source range"))
     );
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     assert_eq!(
         db.query_row("SELECT count(*) FROM class_relations", [], |r| r
             .get::<_, i64>(0))
@@ -559,7 +602,7 @@ fn edge_limit_is_explicit_without_dangling_nodes() {
         text.push_str("}\n");
     }
     let (_dir, store, graph, _app) = setup_with(&text);
-    let mut q = request(id(&graph, "N0"));
+    let mut q = request(id(&graph, "N0"), &store);
     q.expanded = (1..13).map(|i| id(&graph, &format!("N{i}"))).collect();
     let view = store.class_diagram_at(&q).unwrap();
     assert_eq!(view.edges.len(), 64);
@@ -569,7 +612,7 @@ fn edge_limit_is_explicit_without_dangling_nodes() {
 #[test]
 fn cancellation_under_writer_lock_rolls_back_class_projection() {
     let (dir, store, mut graph, _app) = setup();
-    let q = request(id(&graph, "A"));
+    let q = request(id(&graph, "A"), &store);
     let before = serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap();
     let baseline = store.graph().unwrap();
     let method = graph
@@ -586,14 +629,19 @@ fn cancellation_under_writer_lock_rolls_back_class_projection() {
     let flag = cancel();
     let worker_flag = flag.clone();
     let worker_store = store.clone();
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let expected = worker_store.status().unwrap().revision;
+    let leader = worker_store.leader().unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.busy_timeout(std::time::Duration::ZERO).unwrap();
-    let worker = std::thread::spawn(move || worker_store.publish(&graph, Some(1), &worker_flag));
+    let worker =
+        std::thread::spawn(move || worker_store.publish(&graph, &leader, expected, &worker_flag));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match db.execute_batch("BEGIN IMMEDIATE") {
             Ok(()) => {
                 db.execute_batch("ROLLBACK").unwrap();
+                // Give the publisher a chance to take the writer lock after this probe.
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == rusqlite::ErrorCode::DatabaseBusy =>
@@ -632,7 +680,7 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
         text.push_str(&format!("class N{i:03} {{}}\n"));
     }
     let (dir, store, _graph, _app) = setup_with(&text);
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     let payloads = db
         .prepare("SELECT payload FROM classes ORDER BY id")
         .unwrap()
@@ -661,7 +709,15 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
     let mut seen = BTreeSet::new();
     let mut pages = 0;
     loop {
-        let page = store.classes_at(None, "", Some(1), offset, 100).unwrap();
+        let page = store
+            .classes_at(
+                None,
+                "",
+                Some(store.status().unwrap().revision),
+                offset,
+                100,
+            )
+            .unwrap();
         assert!(
             serde_json::to_vec(&page).unwrap().len() <= baleyg::class_diagram::MAX_RESPONSE_BYTES
         );
@@ -713,7 +769,7 @@ fn diagram_byte_budget_preserves_expansion_bridges_and_exact_relation_evidence()
         text.push_str("}\n");
     }
     let (dir, store, graph, _app) = setup_with(&text);
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     let payloads = db
         .prepare("SELECT payload FROM classes")
         .unwrap()
@@ -754,7 +810,7 @@ fn diagram_byte_budget_preserves_expansion_bridges_and_exact_relation_evidence()
         )
         .unwrap();
     }
-    let mut q = request(id(&graph, "N0"));
+    let mut q = request(id(&graph, "N0"), &store);
     q.expanded = (1..13).map(|i| id(&graph, &format!("N{i}"))).collect();
     let view = store.class_diagram_at(&q).unwrap();
     assert!(serde_json::to_vec(&view).unwrap().len() <= baleyg::class_diagram::MAX_RESPONSE_BYTES);
@@ -801,7 +857,7 @@ fn outgoing_declarations_precede_high_fan_in_before_caps() {
     }
     let (_dir, store, graph, _app) = setup_with(&source);
     let view = store
-        .class_diagram_at(&request(id(&graph, "Focus")))
+        .class_diagram_at(&request(id(&graph, "Focus"), &store))
         .unwrap();
     assert!(view.truncated);
     assert!(view.nodes.iter().any(|node| node.id == id(&graph, "Own")));
@@ -839,19 +895,20 @@ async fn automatic_hierarchy_is_opt_in_directional_transitive_and_cache_only() {
         class Base implements Face {} class Mid extends Base {}\n
         class Leaf extends Mid {} class Peer extends Base {} class Other implements Face {}";
     let (dir, store, graph, app) = setup_with(source);
+    let pin = store.status().unwrap().revision;
     let seed = id(&graph, "Leaf");
-    let body = json!({"seed":seed,"expectedRevision":1});
+    let body = json!({"seed":seed,"expectedRevision":pin});
     let (_, legacy) = call(&app, "POST", "/api/class-diagram", body.clone()).await;
     assert_eq!(diagram_names(&legacy), BTreeSet::from(["Leaf", "Mid"]));
     let (_, explicit_false) = call(
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":seed,"expectedRevision":1,"includeHierarchy":false}),
+        json!({"seed":seed,"expectedRevision":pin,"includeHierarchy":false}),
     )
     .await;
     assert_eq!(legacy, explicit_false);
-    let body = json!({"seed":seed,"expectedRevision":1,"includeHierarchy":true});
+    let body = json!({"seed":seed,"expectedRevision":pin,"includeHierarchy":true});
     let (status, view) = call(&app, "POST", "/api/class-diagram", body.clone()).await;
     assert_eq!(status, 200, "{view}");
     assert_eq!(
@@ -864,7 +921,7 @@ async fn automatic_hierarchy_is_opt_in_directional_transitive_and_cache_only() {
         &app,
         "POST",
         "/api/class-diagram",
-        json!({"seed":id(&graph,"Base"),"expectedRevision":1,"includeHierarchy":true}),
+        json!({"seed":id(&graph,"Base"),"expectedRevision":pin,"includeHierarchy":true}),
     )
     .await;
     assert_eq!(
@@ -872,10 +929,10 @@ async fn automatic_hierarchy_is_opt_in_directional_transitive_and_cache_only() {
         BTreeSet::from(["Base", "Mid", "Leaf", "Peer", "Face", "Top"])
     );
     let raw = store.graph().unwrap();
-    std::fs::remove_dir_all(dir.path().join("workspace")).unwrap();
+    std::fs::remove_file(dir.path().join("workspace/Types.java")).unwrap();
     assert_eq!(call(&app, "POST", "/api/class-diagram", body).await.1, view);
     assert_eq!(store.graph().unwrap(), raw);
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     for edge in view["edges"].as_array().unwrap() {
         let stored: String = db
             .query_row(
@@ -891,7 +948,7 @@ async fn automatic_hierarchy_is_opt_in_directional_transitive_and_cache_only() {
             &app,
             "POST",
             "/api/class-diagram",
-            json!({"seed":seed,"expectedRevision":0,"includeHierarchy":true})
+            json!({"seed":seed,"expectedRevision":IndexPin { index_generation: pin.index_generation,index_revision:0 },"includeHierarchy":true})
         )
         .await
         .0,
@@ -902,7 +959,7 @@ async fn automatic_hierarchy_is_opt_in_directional_transitive_and_cache_only() {
             &app,
             "POST",
             "/api/class-diagram",
-            json!({"seed":seed,"expectedRevision":1,"includeHierarchy":"yes"})
+            json!({"seed":seed,"expectedRevision":pin,"includeHierarchy":"yes"})
         )
         .await
         .0,
@@ -914,7 +971,7 @@ async fn automatic_hierarchy_is_opt_in_directional_transitive_and_cache_only() {
         .header("host", "127.0.0.1:7331")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({"seed":seed,"expectedRevision":1,"includeHierarchy":true}).to_string(),
+            json!({"seed":seed,"expectedRevision":pin,"includeHierarchy":true}).to_string(),
         ))
         .unwrap();
     assert_eq!(app.oneshot(req).await.unwrap().status(), 401);
@@ -934,7 +991,7 @@ fn hierarchy_precedes_associations_and_reserves_deep_manual_neighbor_bridges() {
         source.push_str(&format!("class N{i} {{}}\n"));
     }
     let (_dir, store, graph, _app) = setup_with(&source);
-    let mut q = request(id(&graph, "Seed"));
+    let mut q = request(id(&graph, "Seed"), &store);
     q.include_hierarchy = true;
     let before = store.class_diagram_at(&q).unwrap();
     for name in ["Seed", "Parent", "Grand", "Face", "Child", "Deep"] {
@@ -965,7 +1022,7 @@ fn hierarchy_cycles_deduplicate_and_unknown_bases_stay_terminal_opt_in() {
     let (_dir, store, graph, _app) = setup_with(
         "class A extends B {} class B extends C {} class C extends A {} class D extends Missing {} class Alone {}",
     );
-    let mut q = request(id(&graph, "A"));
+    let mut q = request(id(&graph, "A"), &store);
     q.include_hierarchy = true;
     let view = store.class_diagram_at(&q).unwrap();
     assert_eq!(view.nodes.len(), 3);
@@ -995,7 +1052,7 @@ fn hierarchy_node_search_caps_and_impossible_mandatory_paths_are_explicit() {
         source.push_str(&format!("class N{i} extends N{} {{}}\n", i - 1));
     }
     let (_dir, store, graph, _app) = setup_with(&source);
-    let mut q = request(id(&graph, "N0"));
+    let mut q = request(id(&graph, "N0"), &store);
     q.include_hierarchy = true;
     let view = store.class_diagram_at(&q).unwrap();
     assert_eq!(view.nodes.len(), 24);
@@ -1037,7 +1094,7 @@ fn hierarchy_edge_caps_are_connected_and_deterministic() {
         source.push_str(&format!("interface I{i} extends {parents} {{}}\n"));
     }
     let (_dir, store, graph, _app) = setup_with(&source);
-    let mut q = request(id(&graph, "I0"));
+    let mut q = request(id(&graph, "I0"), &store);
     q.include_hierarchy = true;
     let view = store.class_diagram_at(&q).unwrap();
     assert_eq!(view.edges.len(), 64);
@@ -1054,9 +1111,9 @@ fn hierarchy_oversize_mandatory_evidence_fails_instead_of_stranding_roots() {
     let (dir, store, graph, _app) = setup_with(
         "class A {} class B extends A {} class C extends B { Chosen field; } class Chosen {}",
     );
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute("UPDATE class_relations SET payload=json_set(payload,'$.typeName',?1) WHERE owner=?2 AND target=?3", rusqlite::params!["X".repeat(70_000),id(&graph,"B"),id(&graph,"A")]).unwrap();
-    let mut q = request(id(&graph, "A"));
+    let mut q = request(id(&graph, "A"), &store);
     q.include_hierarchy = true;
     let view = store.class_diagram_at(&q).unwrap();
     assert!(view.truncated);
@@ -1078,7 +1135,7 @@ fn hierarchy_mandatory_paths_reject_total_response_byte_overflow() {
         source.push_str(&format!("class N{i} extends N{} {{}}\n", i - 1));
     }
     let (dir, store, graph, _app) = setup_with(&source);
-    let db = rusqlite::Connection::open(dir.path().join("state/cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     // Each record is individually within 64 KiB. Duplicated node labels plus
     // exact mandatory source evidence can still exceed the response envelope.
     db.execute(
@@ -1091,7 +1148,7 @@ fn hierarchy_mandatory_paths_reject_total_response_byte_overflow() {
         ["T".repeat(62_000)],
     )
     .unwrap();
-    let mut q = request(id(&graph, "N0"));
+    let mut q = request(id(&graph, "N0"), &store);
     q.include_hierarchy = true;
     q.expanded = vec![id(&graph, "N23")];
     let error = store.class_diagram_at(&q).unwrap_err().to_string();

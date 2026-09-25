@@ -3,12 +3,13 @@ use baleyg::{
     auth, http,
     indexer::{IndexOptions, index_workspace},
     model::{CancelFlag, ViewQuery},
-    store::Store,
+    store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    },
 };
 use clap::{Args, Parser, Subcommand};
-use directories::ProjectDirs;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -42,15 +43,29 @@ enum Command {
     Query(QueryArgs),
     /// Export the normalized snapshot graph as JSON, including indexed source.
     Export(ExportArgs),
+    /// Inspect existing derived indexes and saved records without changing them.
+    Gc(GcArgs),
+    /// Permanently remove one saved workspace record by its exact ID.
+    Forget(ForgetArgs),
+}
+#[derive(Args)]
+struct ForgetArgs {
+    record_id: String,
+    /// Confirm without an interactive terminal.
+    #[arg(long)]
+    yes: bool,
+}
+#[derive(Args)]
+struct GcArgs {
+    /// Print the read-only cleanup inventory.
+    #[arg(long, required = true)]
+    report: bool,
 }
 #[derive(Args, Clone)]
 struct WorkspaceArgs {
-    /// Repository to inspect. Defaults to cwd; state defaults outside this directory.
-    #[arg(long, default_value = ".")]
-    workspace: PathBuf,
-    /// Override the per-workspace application data directory.
+    /// Existing workspace directory; defaults to the nearest Git checkout from cwd.
     #[arg(long)]
-    state_dir: Option<PathBuf>,
+    workspace: Option<PathBuf>,
 }
 #[derive(Args, Clone)]
 struct IndexArgs {
@@ -143,24 +158,20 @@ struct ExportArgs {
     output: Option<PathBuf>,
 }
 impl WorkspaceArgs {
-    fn resolve(&self) -> Result<(PathBuf, PathBuf)> {
-        let root = self.workspace.canonicalize().context("resolve workspace")?;
-        ensure!(root.is_dir(), "workspace must be a directory");
-        let name = root.to_str().context("workspace path must be UTF-8")?;
-        let dir = match &self.state_dir {
-            Some(p) => p.clone(),
-            None => {
-                let dirs = ProjectDirs::from("dev", "odin", "baleyg")
-                    .context("cannot determine application data directory; use --state-dir")?;
-                let key = hex::encode(Sha256::digest(name.as_bytes()));
-                dirs.data_local_dir().join("workspaces").join(key)
-            }
-        };
-        Ok((root, dir))
+    fn resolve_unattached(&self) -> Result<(TopologyRoots, WorkspaceIdentity)> {
+        let roots = TopologyRoots::production()?;
+        let cwd = std::env::current_dir()?;
+        let identity = WorkspaceIdentity::discover_unattached(self.workspace.as_deref(), &cwd)?;
+        roots.reject_root_overlap(&identity)?;
+        Ok((roots, identity))
+    }
+    fn resolve(&self) -> Result<(TopologyRoots, WorkspaceIdentity)> {
+        let (roots, identity) = self.resolve_unattached()?;
+        Ok((roots, identity.attach_marker()?))
     }
     fn store(&self) -> Result<Store> {
-        let (root, dir) = self.resolve()?;
-        Store::open(&dir, &root)
+        let (roots, identity) = self.resolve()?;
+        Store::open(roots, identity)
     }
 }
 impl IndexArgs {
@@ -169,13 +180,15 @@ impl IndexArgs {
             (1..=16_777_216).contains(&self.max_file_bytes),
             "max-file-bytes must be 1..16777216"
         );
-        let (root, dir) = self.workspace.resolve()?;
-        let store = Store::open(&dir, &root)?;
+        let (roots, identity) = self.workspace.resolve()?;
+        let root = identity.root.clone();
+        let cache = roots.cache.clone();
+        let store = Store::open(roots, identity)?;
         let mut options = IndexOptions::new(root);
         options.scip_path = self.scip.clone();
         options.manifest_path = self.manifest.clone();
         options.max_file_bytes = self.max_file_bytes;
-        Ok((store, options, dir))
+        Ok((store, options, cache))
     }
 }
 fn print_json(value: &impl Serialize) -> Result<()> {
@@ -206,6 +219,41 @@ async fn main() -> Result<()> {
         )
         .init();
     match Cli::parse().command {
+        Command::Gc(_) => print_json(&TopologyRoots::production()?.gc_report()?)?,
+        Command::Forget(args) => {
+            use std::io::{self, Write};
+            let deleted = TopologyRoots::production()?.forget_with_confirmation(
+                &args.record_id,
+                |record, paths| {
+                    eprintln!("Record ID: {}", record.id);
+                    eprintln!(
+                        "Saved views: {}; annotations: {}",
+                        record.views, record.annotations
+                    );
+                    for path in paths {
+                        eprintln!("Saved path: {path}");
+                    }
+                    eprintln!("WARNING: every checkout sharing this UUID loses these saved items.");
+                    if args.yes {
+                        return Ok(true);
+                    }
+                    ensure!(
+                        unsafe { libc::isatty(libc::STDIN_FILENO) } == 1,
+                        "confirmation requires a terminal or --yes"
+                    );
+                    eprint!("Type the exact record ID to forget: ");
+                    io::stderr().flush()?;
+                    let mut answer = String::new();
+                    io::stdin().read_line(&mut answer)?;
+                    Ok(answer.trim_end_matches(['\r', '\n']) == record.id)
+                },
+            )?;
+            ensure!(
+                deleted,
+                "record ID confirmation did not match; no files removed"
+            );
+            eprintln!("Forgot record {}", args.record_id);
+        }
         Command::Index(args) => {
             let (store, options, _) = args.resolve()?;
             let expected = store.status()?.revision;
@@ -215,14 +263,15 @@ async fn main() -> Result<()> {
                 shutdown_signal().await;
                 flag.store(true, Ordering::Release);
             });
+            let leader = store.leader()?;
             let writer = store.clone();
-            let work = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let work = tokio::task::spawn_blocking(move || -> Result<baleyg::model::IndexPin> {
                 let graph = index_workspace(&options, &cancel, |p| {
                     if p.completed == p.total {
                         eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
                     }
                 })?;
-                writer.publish(&graph, Some(expected), &cancel)
+                writer.publish(&graph, &leader, expected, &cancel)
             })
             .await
             .context("index worker panicked")?;
@@ -237,8 +286,29 @@ async fn main() -> Result<()> {
                 args.bind.ip().is_loopback(),
                 "only loopback bind addresses are supported"
             );
-            let (store, options, dir) = args.index.resolve()?;
-            let token_path = args.token_file.unwrap_or_else(|| dir.join("daemon.token"));
+            let token_path = args
+                .token_file
+                .context("serve requires explicit --token-file")?;
+            let (roots, identity) = args.index.workspace.resolve_unattached()?;
+            let mut destinations = vec![token_path.clone()];
+            if let Some(path) = &args.jev_budget_dir {
+                destinations.push(path.clone());
+            }
+            if let Some(path) = &args.acp_state_dir {
+                destinations.push(path.clone());
+            }
+            roots.validate_external(&identity, &destinations)?;
+            let identity = identity.attach_marker()?;
+            ensure!(
+                (1..=16_777_216).contains(&args.index.max_file_bytes),
+                "max-file-bytes must be 1..16777216"
+            );
+            let mut options = IndexOptions::new(identity.root.clone());
+            options.scip_path = args.index.scip.clone();
+            options.manifest_path = args.index.manifest.clone();
+            options.max_file_bytes = args.index.max_file_bytes;
+            let dir = roots.cache.clone();
+            let store = Store::open(roots, identity)?;
             let token = auth::load_or_create_token(&token_path)?;
             let listener = tokio::net::TcpListener::bind(args.bind)
                 .await
@@ -253,7 +323,7 @@ async fn main() -> Result<()> {
                     key,
                     args.jev_budget_cents
                         .context("Jev budget cap is required")?,
-                    &args.index.workspace.workspace.canonicalize()?,
+                    &options.workspace_root,
                 )?))
             } else {
                 None
@@ -265,7 +335,7 @@ async fn main() -> Result<()> {
                         .acp_state_dir
                         .context("ACP state directory is required")?,
                     max_attempts: args.acp_max_attempts.context("ACP allowance is required")?,
-                    workspace: args.index.workspace.workspace.canonicalize()?,
+                    workspace: options.workspace_root.clone(),
                 })?))
             } else {
                 None
@@ -352,7 +422,11 @@ async fn main() -> Result<()> {
             print_json(&view)?;
         }
         Command::Export(args) => {
-            let graph = args.workspace.store()?.graph()?;
+            let (roots, identity) = args.workspace.resolve_unattached()?;
+            if let Some(path) = args.output.as_ref() {
+                roots.validate_external(&identity, std::slice::from_ref(path))?;
+            }
+            let graph = Store::open(roots, identity.attach_marker()?)?.graph()?;
             if let Some(path) = args.output {
                 use std::io::Write;
                 let mut options = std::fs::OpenOptions::new();
@@ -391,7 +465,7 @@ mod workspace_defaults {
         else {
             panic!("expected serve");
         };
-        assert_eq!(args.index.workspace.workspace, PathBuf::from("."));
+        assert_eq!(args.index.workspace.workspace, None);
         let options = IndexOptions::new(PathBuf::from("/chosen/project"));
         assert_eq!(
             resolve_browse_root(&options, args.browse_root),

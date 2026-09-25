@@ -1,4 +1,5 @@
 //! HTTP protocol fixtures are offline; synthetic responses are not model quality evidence.
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -47,8 +48,18 @@ fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
         .unwrap()
         .id
         .clone();
-    let store = Store::open(&dir.path().join("state"), &workspace).unwrap();
-    store.publish(&graph, Some(0), &cancel).unwrap();
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel,
+        )
+        .unwrap();
     let state = http::new(
         store.clone(),
         options,
@@ -56,12 +67,13 @@ fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
+    let pin = store.status().unwrap().revision;
     (
         dir,
         store,
         graph,
         http::router(state),
-        json!({"seed":seed,"question":"helper leaf", "expectedRevision":1}),
+        json!({"seed":seed,"question":"helper leaf", "expectedRevision":pin}),
     )
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
@@ -199,7 +211,7 @@ async fn offline_roundtrip_is_stable_and_preserves_display_policy() {
     assert_eq!(status, 200);
     assert_eq!(manual["view"]["selectionSource"], "manual");
     assert_eq!(manual["view"]["calls"], imported["view"]["calls"]);
-    assert_eq!(store.status().unwrap().revision, 1);
+    assert_eq!(store.status().unwrap().revision.index_revision, 1);
 }
 #[tokio::test]
 async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
@@ -283,7 +295,15 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
         404
     );
     store
-        .publish(&graph, Some(1), &Arc::new(AtomicBool::new(false)))
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 1,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
     assert_eq!(
         call(&app, "POST", "/api/questions/preview", request)
@@ -431,5 +451,55 @@ async fn oversized_export_explains_how_to_narrow_without_truncation() {
         message.contains("176000")
             && message.contains("Narrow")
             && message.contains("cannot be truncated")
+    );
+}
+
+#[tokio::test]
+async fn packet_operation_pair_matrix() {
+    use baleyg::store::topology::UseGuard;
+    let (temp, _store, graph, app, request) = setup(0);
+    let (code, preview) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
+    assert_eq!(code, 200, "{preview}");
+    let old: IndexPin = serde_json::from_value(preview["packet"]["revision"].clone()).unwrap();
+    let index_root = temp.path().join("state/cache/indexes");
+    let dir = std::fs::read_dir(&index_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    let lock = index_root.join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let exclusive = UseGuard::acquire_existing(&lock, true, true).unwrap();
+    std::fs::remove_file(dir.join("index.db")).unwrap();
+    std::fs::remove_file(dir.join("leader.lock")).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+    exclusive.remove_last().unwrap();
+    let recreated =
+        crate::common::open_store(&temp.path().join("state"), &temp.path().join("workspace"))
+            .unwrap();
+    recreated
+        .publish(
+            &graph,
+            &recreated.leader().unwrap(),
+            recreated.status().unwrap().revision,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+    let fresh = recreated.status().unwrap().revision;
+    assert_eq!(old.index_revision, fresh.index_revision);
+    assert_ne!(old.index_generation, fresh.index_generation);
+    assert_eq!(
+        call(&app, "POST", "/api/questions/preview", request)
+            .await
+            .0,
+        409
+    );
+    assert_eq!(
+        call(&app, "GET", &path(&preview, "jev-request"), Value::Null)
+            .await
+            .0,
+        409
     );
 }

@@ -1,4 +1,5 @@
 //! Bounded Cargo discovery without Cargo execution, network, or archive extraction.
+use crate::model::IndexPin;
 use crate::{
     dependencies::*,
     file_tree::{SourceDir, valid_path},
@@ -167,7 +168,7 @@ fn partial(package: &mut Package, warning: &str) {
 
 pub(crate) fn build(
     workspace: &Path,
-    revision: u64,
+    revision: IndexPin,
     options: &CatalogOptions,
     cancel: &AtomicBool,
 ) -> Result<Catalog> {
@@ -198,7 +199,8 @@ pub(crate) fn build(
                 "catalog:{}",
                 hash(&[
                     PARSER_VERSION.as_bytes(),
-                    &revision.to_be_bytes(),
+                    revision.index_generation.as_bytes(),
+                    &revision.index_revision.to_be_bytes(),
                     b"no-cargo"
                 ])
             );
@@ -580,7 +582,8 @@ pub(crate) fn build(
         "catalog:{}",
         hash(&[
             PARSER_VERSION.as_bytes(),
-            &revision.to_be_bytes(),
+            revision.index_generation.as_bytes(),
+            &revision.index_revision.to_be_bytes(),
             &serde_json::to_vec(&catalog.packages)?,
             &serde_json::to_vec(&sources)?,
             &serde_json::to_vec(&fingerprints.fingerprints)?
@@ -848,7 +851,10 @@ mod budget_tests {
         p.index_state = "complete".into();
         let mut catalog = Catalog {
             id: String::new(),
-            workspace_revision: 0,
+            workspace_revision: crate::model::IndexPin {
+                index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
+                index_revision: 0,
+            },
             packages: vec![],
             symbols: vec![],
             warnings: vec![],

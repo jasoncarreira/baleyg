@@ -11,22 +11,26 @@ No provider, ACP agent, shell, semantic indexer or source package script runs im
 
 ```sh
 cargo run --locked -- index --workspace /path/to/repository
-cargo run --locked -- serve --workspace /path/to/repository
+mkdir -m 700 -p "$HOME/.baleyg-private"
+cargo run --locked -- serve --workspace /path/to/repository \
+  --token-file "$HOME/.baleyg-private/token"
 ```
 
 Open http://127.0.0.1:8877/. Read the private token file at the path printed by `serve`
 and paste its contents into the Connect form. The token itself is never printed by the
-daemon. Default state is under the OS local application-data directory, keyed by a hash
-of the canonical workspace path. There is no default write into the source repository.
+daemon. `--token-file` is required and must be outside the selected checkout. The
+disposable path-keyed index and first-save durable record use fixed per-user cache/data
+locations. A Git workspace UUID marker is written inside the selected Git directory;
+there are no other checkout topology writes.
 
 `serve` does **not** index at startup. Use **Index workspace** to refresh; **Refresh status
 & view** only reloads the already published data. Ctrl-C or SIGTERM cancels an active index job and
 stops serving. A cancellation request cannot undo a revision already committed.
 
-`--state-dir /private/path` overrides storage. Existing state directories must belong to
-the current user and have no group/other permissions (`chmod 700` on Unix). New ones are
-created private. Do not point this option at a general-purpose shared directory. A state
-directory is bound to one canonical workspace root; another root is rejected.
+`--state-dir` is removed; there is no placement override or automatic old-state migration.
+Keep the token and optional Jev/ACP ledgers at explicit private paths outside the selected
+checkout and fixed topology. Move old in-checkout token/ledger data manually with Baleyg stopped.
+The example above creates a private parent; a new token file is created with private permissions.
 
 `--bind 127.0.0.1:0` selects a free port. Non-loopback addresses are rejected. The first
 HTTP/token implementation requires Unix permissions; Windows daemon authentication is
@@ -43,10 +47,12 @@ cargo run --locked -- index \
   --scip tests/fixtures/extraction/feature-factory.scip \
   --manifest tests/fixtures/extraction/feature-factory.hashes.json
 
+mkdir -m 700 -p "$HOME/.baleyg-private"
 cargo run --locked -- serve \
   --workspace tests/fixtures/extraction/inputs/feature-factory \
   --scip tests/fixtures/extraction/feature-factory.scip \
-  --manifest tests/fixtures/extraction/feature-factory.hashes.json
+  --manifest tests/fixtures/extraction/feature-factory.hashes.json \
+  --token-file "$HOME/.baleyg-private/token"
 ```
 
 Search for `transition`, select it, and inspect its immediate call sites. Read source
@@ -134,37 +140,44 @@ each. Traversal is cycle-safe. Truncation is explicit. `omittedNodes` counts dis
 omitted targets, not all unseen reachable nodes. A retained call may point to a target
 outside the displayed node budget; do not invent a connecting box/edge to hide that.
 
-A result includes `revision`, the effective query, `nodes`, `calls`, `regions`,
-`truncated`, `omittedNodes` and `warnings`. The revision and all facts are read in one
-SQLite transaction. Pass it to source/symbol lookups; a mismatch returns HTTP 409.
-Only the current revision is stored server-side; this is not historical time travel.
+A result includes `revision` as the complete `{indexGeneration,indexRevision}` pair,
+the effective query, `nodes`, `calls`, `regions`, `truncated`, `omittedNodes` and `warnings`.
+The pair and all facts are read in one SQLite transaction. Forward both fields to pinned
+source/symbol lookups; a stale pair returns HTTP 409. A bare numeric pin is invalid.
+Only the current snapshot is stored server-side; this is not historical time travel.
 
 ## Storage and publication
 
-`cache.db` holds normalized files, nodes, calls and regions, plus typed JSON row payloads
-and current revision metadata. Foreign keys enforce file/caller/owner relationships.
+The disposable `<cache>/indexes/<root-key>/index.db` holds normalized files, nodes,
+calls and regions, plus typed JSON row payloads and paired revision metadata. Foreign keys
+enforce file/caller/owner relationships.
 Graph validation checks source hashes/ranges, unique IDs, internal targets, containment
 and region references before publication. Structural statistics are recounted.
 
-A writer takes `BEGIN IMMEDIATE`, checks its expected current revision, inserts the full
-replacement graph and commits once. Error or cancellation leaves the prior graph visible.
-Readers pin the previous or new revision through WAL. A durable revision allocator in
-`workspace.db` prevents revision reuse after cache deletion; failed publication can consume
-revision numbers, so gaps are expected. There is no atomic transaction spanning both DBs.
+A writer takes `BEGIN IMMEDIATE`, checks its expected current `{indexGeneration,indexRevision}`
+pair, inserts the full replacement graph and commits once. Error or cancellation leaves
+the prior graph visible. A new disposable index gets a new random generation; ordinary
+publication keeps the generation and advances the numeric revision. Deleting and recreating
+the index can reuse a revision number, but never its generation. There is no durable
+revision allocator in `workspace.db`.
 
-`workspace.db` preserves saved queries, pins, hidden IDs and annotations. It deliberately
+The first-save durable `<data>/workspaces/<record-id>/workspace.db` preserves saved queries,
+pins, hidden IDs and annotations. It deliberately
 has no foreign key to rebuildable symbol IDs. Reads report missing IDs as orphans. The
 inspector edits saved queries and notes; pin/hidden storage is ready for a future canvas,
 but it does not implement layout or hidden-node editing.
 
-Database schema version is **2** (`PRAGMA user_version`), with a tested v1-to-v2 migration.
-Graph JSON schema version is **1**. Future database versions and unversioned nonempty
-schemas are refused without resetting them. No downgrade command is supplied.
+The disposable index schema is version **4**; durable record schema is version **1**.
+Graph JSON schema version is **1**. Incompatible or incomplete durable records are refused,
+not silently reset or migrated. No downgrade or legacy-state migration is supplied.
 
-**Cache rebuild:** stop every process using the state directory first. Remove only
-`cache.db` and its `cache.db-wal`/`cache.db-shm` sidecars, then index again. Never remove
-`workspace.db` or its sidecars to refresh an index. Do not unlink a live SQLite database.
-Back up durable data with SQLite's backup mechanism, or with all processes stopped.
+**Manual cleanup:** `baleyg gc --report` only prints read-only JSON inventory; it does
+not delete indexes. `baleyg forget <record-id>` removes one saved record only after
+verified exclusive use and exact-ID interactive confirmation (or explicit `--yes`).
+It refuses unsafe contents and SQLite recovery sidecars even with `--yes`; resolve those
+manually rather than deleting them. Never remove a durable `workspace.db` to refresh an
+index, and never unlink a live SQLite database. Back up durable data with SQLite's
+backup mechanism, or with all processes stopped.
 The tests demonstrate transactional failure/cancellation, not simulated power loss.
 
 Search is bounded literal substring search, prioritizing exact symbol names. It is **not
@@ -184,8 +197,9 @@ credentials/Host headers and permissive CORS are not accepted. Responses use no-
 CSP and nosniff. JSON requests are capped at 1 MiB. No frontend dev-origin exception exists
 in this first pass; use the embedded client or same-origin proxying later.
 
-Only the configured workspace can be indexed. No API accepts another root, arbitrary
-file read, executable or provider request. Discovery respects ignores, skips hidden/build/
+Only the configured workspace can be indexed. No API accepts another root or arbitrary
+file reads/executables. Optional Jev/ACP provider requests require explicit startup opt-in,
+allowances and user action. Discovery respects ignores, skips hidden/build/
 dependency/state directories and does not traverse symlinks. Unix reads use no-follow
 and post-open checks. **This is not a capability-based sandbox against hostile concurrent
 ancestor-directory replacement**, nor a defense against another process with the same
@@ -199,14 +213,14 @@ without publishing. These are guardrails, not a proven hostile-input resource sa
 | Method | Path | Response / behavior |
 | --- | --- | --- |
 | GET | `/healthz` | Public `ok`, version; no workspace details |
-| GET | `/api/status` | Current `IndexStatus` (revision 0 if empty) |
-| POST | `/api/index` | Empty body or `{expectedRevision}`; 202 background job |
+| GET | `/api/status` | Current `IndexStatus` (paired revision, numeric part 0 if empty) |
+| POST | `/api/index` | Empty body or `{expectedRevision:{indexGeneration,indexRevision}}`; 202 background job |
 | GET | `/api/jobs/current` | Latest job or null |
 | GET | `/api/jobs/{id}` | Job, or 404 |
 | POST | `/api/jobs/{id}/cancel` | Request cancellation; completed jobs stay completed |
-| GET | `/api/symbols?q=...&limit=50` | `{revision, items}`; limit 1–150 |
-| GET | `/api/symbol?id=...&revision=...` | `{revision, symbol}`; optional revision guard |
-| GET | `/api/source?path=...&revision=...` | `{revision, file}`; cached source only |
+| GET | `/api/symbols?q=...&limit=50` | `{revision, items}` with paired revision; limit 1–150 |
+| GET | `/api/symbol?id=...&indexGeneration=...&indexRevision=...` | `{revision, symbol}`; optional complete pair guard |
+| GET | `/api/source?path=...&indexGeneration=...&indexRevision=...` | `{revision, file}`; cached source only, optional complete pair guard |
 | POST | `/api/query` | Bounded `ViewResult` |
 | GET | `/api/views` | Saved views with `orphanedIds` |
 | GET/PUT/DELETE | `/api/views/{id}` | Read, upsert full definition, delete |
@@ -220,16 +234,19 @@ at most 150 pins and 150 hidden IDs are accepted. Unknown request fields are rej
 
 Errors use `{error:{code,message}}`, without raw SQL or source-bearing diagnostics.
 Expect 401 for missing credentials, 403 for Host/Origin rejection, 404 for missing data,
-409 for revision conflicts/active jobs, 413 for body limits, and 400/422 for invalid input.
+409 for stale paired pins/active jobs, 413 for body limits, and 400/422 for invalid input.
 Jobs use `running`, `cancelling`, `completed`, `cancelled`, `failed`, with progress,
 optional published revision/error, and epoch-millisecond string timestamps. Only the
 latest 100 job records are retained in memory; restart does not resume old jobs.
 
 For DTO details, see [the frontend handoff](daemon-v1-api-handoff.md).
 
-## Not implemented
+## Current limits
 
-Question planning, Jev selection and selective ACP review are accepted architecture,
-not daemon endpoints yet. No paid calls were made. No watcher, dependency-aware
-invalidation, Java/TypeScript grammar, indexer orchestration, class diagram renderer,
-true sequence engine, LSP, terminal, Tauri shell, ORM or external database connection.
+Question planning, optional budget-controlled Jev selection and opt-in ACP answers are
+implemented separately from this original daemon slice; live requests require explicit
+authorization. Java/Python native indexing, class diagrams and static sequence diagrams
+are also available. There is no watcher or #39 reconciliation/read fencing, automatic
+GC (#16), rich durable anchor model (#38), TypeScript grammar, LSP, terminal, Tauri
+shell, ORM or external database connection. See [local topology](local-topology.md)
+for the shipped-versus-future boundary.

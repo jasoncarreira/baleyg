@@ -1,3 +1,4 @@
+mod common;
 use baleyg::{model::*, store::Store};
 use std::{
     collections::BTreeMap,
@@ -16,8 +17,22 @@ fn private_state() -> TempDir {
 fn fixture() -> (TempDir, TempDir, Store) {
     let state = private_state();
     let work = tempfile::tempdir().unwrap();
-    let store = Store::open(state.path(), work.path()).unwrap();
+    let store = crate::common::open_store(state.path(), work.path()).unwrap();
     (state, work, store)
+}
+fn pin(store: &Store, revision: u64) -> IndexPin {
+    IndexPin {
+        index_generation: store.status().unwrap().revision.index_generation,
+        index_revision: revision,
+    }
+}
+fn index_db(state: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(state.join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db")
 }
 fn cancel() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
@@ -89,30 +104,69 @@ fn query() -> ViewQuery {
 fn publication_is_atomic_and_reopens() {
     let (state, work, store) = fixture();
     let graph = graph();
-    assert_eq!(store.status().unwrap().revision, 0);
-    assert_eq!(store.publish(&graph, Some(0), &cancel()).unwrap(), 1);
+    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0
+                },
+                &cancel()
+            )
+            .unwrap()
+            .index_revision,
+        1
+    );
     let old = store.graph().unwrap();
     let mut duplicate = graph.clone();
     duplicate.nodes.push(node("a"));
-    assert!(store.publish(&duplicate, Some(1), &cancel()).is_err());
+    assert!(
+        store
+            .publish(
+                &duplicate,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 1
+                },
+                &cancel()
+            )
+            .is_err()
+    );
     assert_eq!(store.graph().unwrap(), old);
     assert!(
         store
-            .publish(&Graph::default(), Some(0), &cancel())
+            .publish(
+                &Graph::default(),
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0
+                },
+                &cancel()
+            )
             .unwrap_err()
             .to_string()
             .starts_with("revision conflict")
     );
     assert!(
         store
-            .publish(&Graph::default(), None, &Arc::new(AtomicBool::new(true)))
+            .publish(
+                &Graph::default(),
+                &store.leader().unwrap(),
+                store.status().unwrap().revision,
+                &Arc::new(AtomicBool::new(true))
+            )
             .unwrap_err()
             .to_string()
             .contains("cancelled")
     );
-    assert_eq!(store.status().unwrap().revision, 1);
+    assert_eq!(store.status().unwrap().revision.index_revision, 1);
     drop(store);
-    let store = Store::open(state.path(), work.path()).unwrap();
+    let store = crate::common::open_store(state.path(), work.path()).unwrap();
     assert_eq!(store.graph().unwrap(), old);
     assert_eq!(
         store.source("a.js").unwrap().unwrap().text,
@@ -120,33 +174,65 @@ fn publication_is_atomic_and_reopens() {
     );
     assert!(
         store
-            .source_at("a.js", Some(0))
+            .source_at("a.js", Some(pin(&store, 0)))
             .unwrap_err()
             .to_string()
             .starts_with("revision conflict")
     );
-    assert_eq!(store.symbol_at("a", Some(1)).unwrap().unwrap().0, 1);
-    assert_eq!(store.symbols_at("", 5).unwrap().0, 1);
+    assert_eq!(
+        store
+            .symbol_at("a", Some(pin(&store, 1)))
+            .unwrap()
+            .unwrap()
+            .0
+            .index_revision,
+        1
+    );
+    assert_eq!(store.symbols_at("", 5).unwrap().0.index_revision, 1);
     let mut reverse = graph.clone();
     reverse.nodes.reverse();
     reverse.calls.reverse();
-    store.publish(&reverse, Some(1), &cancel()).unwrap();
+    store
+        .publish(
+            &reverse,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 1,
+            },
+            &cancel(),
+        )
+        .unwrap();
     assert_eq!(store.graph().unwrap(), old);
 }
 #[test]
-fn wal_reader_pins_old_revision_during_publish() {
+fn delete_reader_pins_snapshot_and_blocks_publish() {
     let (state, _work, store) = fixture();
-    store.publish(&graph(), None, &cancel()).unwrap();
-    let db = rusqlite::Connection::open(state.path().join("cache.db")).unwrap();
+    let baseline = store.status().unwrap().revision;
+    store
+        .publish(&graph(), &store.leader().unwrap(), baseline, &cancel())
+        .unwrap();
+    let leader = store.leader().unwrap();
+    let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
+    db.busy_timeout(std::time::Duration::ZERO).unwrap();
     db.execute_batch("BEGIN").unwrap();
     let revision = || {
-        db.query_row("SELECT revision FROM revision", [], |r| r.get::<_, i64>(0))
-            .unwrap()
+        db.query_row("SELECT index_revision FROM index_metadata", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
     };
     assert_eq!(revision(), 1);
-    store
-        .publish(&Graph::default(), Some(1), &cancel())
-        .unwrap();
+    assert!(
+        store
+            .publish(
+                &Graph::default(),
+                &leader,
+                store.status().unwrap().revision,
+                &cancel()
+            )
+            .is_err()
+    );
     assert_eq!(revision(), 1);
     assert_eq!(
         db.query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, i64>(0))
@@ -154,46 +240,42 @@ fn wal_reader_pins_old_revision_during_publish() {
         3
     );
     db.execute_batch("COMMIT").unwrap();
+    store
+        .publish(
+            &Graph::default(),
+            &leader,
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     assert_eq!(revision(), 2);
 }
 #[test]
-fn workspace_binding_migrations_and_corruption() {
+fn incompatible_index_refuses_without_touching_legacy_state() {
     let (state, work, store) = fixture();
+    let index = index_db(state.path());
     drop(store);
-    let other = tempfile::tempdir().unwrap();
-    assert!(Store::open(state.path(), other.path()).is_err());
-    for name in ["cache.db", "workspace.db"] {
-        let db = rusqlite::Connection::open(state.path().join(name)).unwrap();
-        let original_version: u32 = db
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        db.pragma_update(None, "user_version", 99).unwrap();
-        drop(db);
-        assert!(
-            Store::open(state.path(), work.path())
-                .unwrap_err()
-                .to_string()
-                .contains("future")
-        );
-        let db = rusqlite::Connection::open(state.path().join(name)).unwrap();
-        db.pragma_update(None, "user_version", original_version)
-            .unwrap();
-    }
-    let bad = tempfile::tempdir().unwrap();
-    std::fs::write(bad.path().join("cache.db"), "not sqlite").unwrap();
-    assert!(Store::open(bad.path(), work.path()).is_err());
-    let bad = tempfile::tempdir().unwrap();
-    let db = rusqlite::Connection::open(bad.path().join("cache.db")).unwrap();
-    db.execute_batch("CREATE TABLE random(x)").unwrap();
+    let legacy = state.path().join("cache.db");
+    std::fs::write(&legacy, "untouched legacy bytes").unwrap();
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.pragma_update(None, "user_version", 99).unwrap();
     drop(db);
-    assert!(Store::open(bad.path(), work.path()).is_err());
+    assert!(crate::common::open_store(state.path(), work.path()).is_err());
+    assert_eq!(std::fs::read(legacy).unwrap(), b"untouched legacy bytes");
 }
 #[test]
 fn literal_search_and_snapshot_only_sources() {
     let (_state, work, store) = fixture();
     let mut graph = graph();
     graph.nodes.push(node("a%_' OR 1=1 --"));
-    store.publish(&graph, None, &cancel()).unwrap();
+    store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     assert_eq!(store.symbols("%_", 1000).unwrap().len(), 1);
     assert!(store.symbols("' OR 1=1 --no", 1000).unwrap().is_empty());
     assert!(store.symbol("' OR 1=1 --").unwrap().is_none());
@@ -214,7 +296,14 @@ fn traversal_cycles_bounds_callbacks_and_boundaries() {
     external.resolution = Resolution::External;
     external.callback_arguments.push("callback".into());
     graph.calls.push(external.clone());
-    store.publish(&graph, None, &cancel()).unwrap();
+    store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     let mut q = query();
     let view = store.query_view(&q).unwrap().unwrap();
     assert_eq!(
@@ -251,7 +340,14 @@ fn traversal_cycles_bounds_callbacks_and_boundaries() {
 #[test]
 fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     let (state, work, store) = fixture();
-    store.publish(&graph(), None, &cancel()).unwrap();
+    store
+        .publish(
+            &graph(),
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     let annotation = Annotation {
         id: "note".into(),
         node_id: "a".into(),
@@ -269,18 +365,32 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     assert!(!store.annotations().unwrap()[0].orphaned);
     assert_eq!(store.views().unwrap()[0].orphaned_ids, vec!["missing"]);
     drop(store);
-    std::fs::remove_file(state.path().join("cache.db")).unwrap();
-    let store = Store::open(state.path(), work.path()).unwrap();
-    assert_eq!(store.status().unwrap().revision, 0);
+    std::fs::remove_file(index_db(state.path())).unwrap();
+    let store = crate::common::open_store(state.path(), work.path()).unwrap();
+    assert_eq!(store.status().unwrap().revision.index_revision, 0);
     assert!(store.annotations().unwrap()[0].orphaned);
     assert_eq!(store.annotations().unwrap()[0].annotation, annotation);
     assert_eq!(
         store.view("view").unwrap().unwrap().orphaned_ids,
         vec!["a", "b", "missing"]
     );
-    store.publish(&graph(), None, &cancel()).unwrap();
+    store
+        .publish(
+            &graph(),
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     assert!(!store.annotations().unwrap()[0].orphaned);
-    store.publish(&Graph::default(), None, &cancel()).unwrap();
+    store
+        .publish(
+            &Graph::default(),
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     assert!(store.annotations().unwrap()[0].orphaned);
     assert!(store.delete_annotation("note").unwrap());
     assert!(!store.delete_annotation("note").unwrap());
@@ -305,7 +415,14 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
 #[test]
 fn cancellation_during_transaction_rolls_back() {
     let (state, _work, store) = fixture();
-    store.publish(&graph(), None, &cancel()).unwrap();
+    store
+        .publish(
+            &graph(),
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     let mut large = Graph {
         files: graph().files,
         ..Graph::default()
@@ -314,10 +431,16 @@ fn cancellation_during_transaction_rolls_back() {
     let flag = cancel();
     let worker_flag = flag.clone();
     let worker_store = store.clone();
-    let db = rusqlite::Connection::open(state.path().join("cache.db")).unwrap();
+    let expected = worker_store.status().unwrap().revision;
+    let leader = worker_store.leader().unwrap();
+    let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.busy_timeout(std::time::Duration::ZERO).unwrap();
-    let worker = std::thread::spawn(move || worker_store.publish(&large, Some(1), &worker_flag));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let worker =
+        std::thread::spawn(move || worker_store.publish(&large, &leader, expected, &worker_flag));
+    // A competing BEGIN IMMEDIATE is the only observation available without a
+    // production hook. Do not spin on it: a zero-timeout contender can otherwise
+    // keep taking the writer slot before the publisher gets to its transaction.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match db.execute_batch("BEGIN IMMEDIATE") {
             Ok(()) => {
@@ -330,11 +453,17 @@ fn cancellation_during_transaction_rolls_back() {
             }
             Err(error) => panic!("unexpected SQLite error: {error}"),
         }
+        if worker.is_finished() {
+            panic!(
+                "publisher finished without an observed write transaction: {:?}",
+                worker.join().unwrap()
+            );
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "publisher never acquired write transaction"
         );
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     flag.store(true, std::sync::atomic::Ordering::Release);
     assert!(
@@ -345,7 +474,7 @@ fn cancellation_during_transaction_rolls_back() {
             .to_string()
             .contains("cancelled")
     );
-    assert_eq!(store.status().unwrap().revision, 1);
+    assert_eq!(store.status().unwrap().revision.index_revision, 1);
     assert_eq!(store.graph().unwrap().nodes.len(), 3);
 }
 
@@ -353,13 +482,15 @@ fn cancellation_during_transaction_rolls_back() {
 fn concurrent_publish_cas_has_one_winner() {
     let (_state, _work, store) = fixture();
     let barrier = Arc::new(std::sync::Barrier::new(3));
+    let baseline = store.status().unwrap().revision;
     let workers: Vec<_> = (0..2)
         .map(|_| {
             let store = store.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                store.publish(&graph(), Some(0), &cancel())
+                let leader = store.leader()?;
+                store.publish(&graph(), &leader, baseline, &cancel())
             })
         })
         .collect();
@@ -373,14 +504,25 @@ fn concurrent_publish_cas_has_one_winner() {
             .unwrap()
             .to_string()
             .starts_with("revision conflict")
+            || outcomes.iter().any(|r| r
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().starts_with("storage_busy")))
     );
-    assert_eq!(store.status().unwrap().revision, 1);
+    assert_eq!(store.status().unwrap().revision.index_revision, 1);
 }
 
 #[test]
 fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
     let (_state, _work, store) = fixture();
-    store.publish(&graph(), None, &cancel()).unwrap();
+    store
+        .publish(
+            &graph(),
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     let baseline = store.graph().unwrap();
     assert_eq!(baseline.stats.symbols, 3);
     assert_eq!(baseline.stats.internal, 3);
@@ -396,18 +538,38 @@ fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
             _ => bad.nodes[0].range.start_line = 0,
         }
         assert!(
-            store.publish(&bad, Some(1), &cancel()).is_err(),
+            store
+                .publish(
+                    &bad,
+                    &store.leader().unwrap(),
+                    baleyg::model::IndexPin {
+                        index_generation: store.status().unwrap().revision.index_generation,
+                        index_revision: 1
+                    },
+                    &cancel()
+                )
+                .is_err(),
             "case {kind}"
         );
-        assert_eq!(store.status().unwrap().revision, 1);
+        assert_eq!(store.status().unwrap().revision.index_revision, 1);
         assert_eq!(store.graph().unwrap(), baseline);
     }
 }
 #[test]
 fn cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys() {
     let (state, work, store) = fixture();
-    let rev = store.publish(&graph(), Some(0), &cancel()).unwrap();
-    let db = rusqlite::Connection::open(state.path().join("cache.db")).unwrap();
+    let rev = store
+        .publish(
+            &graph(),
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel(),
+        )
+        .unwrap();
+    let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.pragma_update(None, "foreign_keys", true).unwrap();
     assert!(
         db.execute("DELETE FROM files WHERE path='a.js'", [])
@@ -416,54 +578,38 @@ fn cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys() {
     assert!(db.execute("DELETE FROM nodes WHERE id='a'", []).is_err());
     drop(db);
     drop(store);
-    std::fs::remove_file(state.path().join("cache.db")).unwrap();
-    let store = Store::open(state.path(), work.path()).unwrap();
-    assert_eq!(store.status().unwrap().revision, 0);
-    assert!(store.publish(&graph(), Some(rev), &cancel()).is_err());
-    let new_rev = store.publish(&graph(), Some(0), &cancel()).unwrap();
-    assert!(new_rev > rev);
+    std::fs::remove_file(index_db(state.path())).unwrap();
+    let store = crate::common::open_store(state.path(), work.path()).unwrap();
+    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert!(
+        store
+            .publish(&graph(), &store.leader().unwrap(), rev, &cancel())
+            .is_err()
+    );
+    let new_rev = store
+        .publish(
+            &graph(),
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel(),
+        )
+        .unwrap();
+    assert_ne!(new_rev.index_generation, rev.index_generation);
     assert!(store.source_at("a.js", Some(rev)).is_err());
 }
 #[test]
-fn migrates_v1_preserving_data() {
-    let state = private_state();
-    let work = tempfile::tempdir().unwrap();
-    let db = rusqlite::Connection::open(state.path().join("cache.db")).unwrap();
-    db.execute_batch("CREATE TABLE revision(singleton INTEGER PRIMARY KEY, revision INTEGER, indexed_at TEXT, stats TEXT, diagnostics TEXT);
-      CREATE TABLE files(path TEXT PRIMARY KEY,hash TEXT,payload TEXT);
-      CREATE TABLE nodes(id TEXT PRIMARY KEY,name TEXT,path TEXT,payload TEXT);
-      CREATE TABLE calls(id TEXT PRIMARY KEY,caller TEXT,target TEXT,path TEXT,payload TEXT);
-      CREATE TABLE regions(id TEXT PRIMARY KEY,owner TEXT,path TEXT,payload TEXT); PRAGMA user_version=1;").unwrap();
-    let file = graph().files.remove(0);
-    db.execute(
-        "INSERT INTO files VALUES(?1,?2,?3)",
-        rusqlite::params![file.path, file.hash, serde_json::to_string(&file).unwrap()],
-    )
-    .unwrap();
+fn refuses_unversioned_existing_index_without_migration() {
+    let (state, work, store) = fixture();
+    let index = index_db(state.path());
+    drop(store);
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.pragma_update(None, "user_version", 1).unwrap();
     drop(db);
-    let db = rusqlite::Connection::open(state.path().join("workspace.db")).unwrap();
-    db.execute_batch("CREATE TABLE binding(singleton INTEGER PRIMARY KEY,workspace_root TEXT);
-      CREATE TABLE views(id TEXT PRIMARY KEY,payload TEXT);
-      CREATE TABLE annotations(id TEXT PRIMARY KEY,node_id TEXT,payload TEXT); PRAGMA user_version=1;").unwrap();
-    drop(db);
-    let store = Store::open(state.path(), work.path()).unwrap();
-    assert_eq!(store.source("a.js").unwrap(), Some(file));
-    let db = rusqlite::Connection::open(state.path().join("cache.db")).unwrap();
-    assert_eq!(
-        db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        3
-    );
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM pragma_foreign_key_list('calls')",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        2
-    );
-    assert_eq!(store.publish(&graph(), Some(0), &cancel()).unwrap(), 1);
+    assert!(crate::common::open_store(state.path(), work.path()).is_err());
+    assert!(index.exists());
 }
 
 #[test]
@@ -474,9 +620,74 @@ fn unresolved_candidate_evidence_need_not_be_a_graph_node() {
         "external package symbol".into(),
         "local callback parameter".into(),
     ];
-    store.publish(&graph, None, &cancel()).unwrap();
+    store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
     assert_eq!(
         store.graph().unwrap().calls[0].candidate_symbols,
         graph.calls[0].candidate_symbols
     );
+}
+
+#[test]
+fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_managed() {
+    let (state, _work, store) = fixture();
+    let baseline = store.status().unwrap().revision;
+    store
+        .publish(&graph(), &store.leader().unwrap(), baseline, &cancel())
+        .unwrap();
+    let previous = store.status().unwrap().revision;
+    let leader = store.leader().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let path = index_db(state.path());
+    let writer = std::thread::spawn(move || {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "BEGIN IMMEDIATE; UPDATE index_metadata SET index_revision=2 WHERE singleton=1",
+        )
+        .unwrap();
+        ready_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+        db.execute_batch("ROLLBACK").unwrap();
+        drop(leader);
+    });
+    ready_rx.recv().unwrap();
+    assert!(
+        index_db(state.path())
+            .with_file_name("index.db-journal")
+            .exists()
+    );
+    let status = store.status();
+    match status {
+        Ok(status) => assert_eq!(status.revision, previous),
+        Err(e) => assert!(e.to_string().contains("storage_busy"), "{e:#}"),
+    }
+    let source = store.source_at("a.js", Some(previous));
+    match source {
+        Ok(Some((pin, source))) => {
+            assert_eq!(pin, previous);
+            assert_eq!(source.text, "function a() {}");
+        }
+        Err(e) => assert!(e.to_string().contains("storage_busy"), "{e:#}"),
+        Ok(other) => panic!("unexpected pinned source: {other:?}"),
+    }
+    done_tx.send(()).unwrap();
+    writer.join().unwrap();
+    let journal = index_db(state.path()).with_file_name("index.db-journal");
+    std::fs::write(&journal, [0u8; 512]).unwrap();
+    assert_eq!(store.status().unwrap().revision, previous);
+    assert!(
+        store
+            .leader()
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required")
+    );
+    assert!(journal.exists());
 }

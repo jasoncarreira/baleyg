@@ -1,5 +1,6 @@
 //! Synthetic Java/Python file -> method -> static sequence integration.
 //! Workspace code, build scripts, and Python imports must never execute.
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -46,6 +47,7 @@ struct Fixture {
     workspace: PathBuf,
     sentinel: PathBuf,
     store: Store,
+    pin: baleyg::model::IndexPin,
     graph: Graph,
     app: Router,
 }
@@ -100,8 +102,22 @@ fn setup() -> Fixture {
     let cancel = Arc::new(AtomicBool::new(false));
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
     assert!(!sentinel.exists(), "indexing executed workspace code");
-    let store = Store::open(&temp.path().join("state"), &workspace).unwrap();
-    assert_eq!(store.publish(&graph, Some(0), &cancel).unwrap(), 1);
+    let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    assert_eq!(
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0
+                },
+                &cancel
+            )
+            .unwrap()
+            .index_revision,
+        1
+    );
     let app = http::router(
         http::new(
             store.clone(),
@@ -115,10 +131,18 @@ fn setup() -> Fixture {
         temp,
         workspace,
         sentinel,
+        pin: store.status().unwrap().revision,
         store,
         graph,
         app,
     }
+}
+fn pinned(f: &Fixture, path: &str) -> String {
+    let join = if path.contains('?') { '&' } else { '?' };
+    format!(
+        "{path}{join}indexGeneration={}&indexRevision={}",
+        f.pin.index_generation, f.pin.index_revision
+    )
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (u16, Value) {
     let response = app
@@ -153,7 +177,7 @@ fn flatten<'a>(steps: &'a [SequenceStep], out: &mut Vec<&'a SequenceStep>) {
 #[tokio::test]
 async fn mixed_catalog_tree_and_lexical_parents_remain_language_neutral() {
     let f = setup();
-    let (code, files) = call(&f.app, "GET", "/api/files?revision=1", Value::Null).await;
+    let (code, files) = call(&f.app, "GET", &pinned(&f, "/api/files"), Value::Null).await;
     assert_eq!(code, 200);
     let (code, tree) = call(&f.app, "GET", "/api/tree", Value::Null).await;
     assert_eq!(code, 200);
@@ -192,7 +216,7 @@ async fn mixed_catalog_tree_and_lexical_parents_remain_language_neutral() {
         let (code, methods) = call(
             &f.app,
             "GET",
-            &format!("/api/methods?path={path}&revision=1"),
+            &pinned(&f, &format!("/api/methods?path={path}")),
             Value::Null,
         )
         .await;
@@ -254,7 +278,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
             .iter()
             .find(|n| n.path == path && n.name == "run")
             .unwrap();
-        let request = json!({"seed":seed.id,"expectedRevision":1});
+        let request = json!({"seed":seed.id,"expectedRevision":f.pin});
         let before = call(&f.app, "POST", "/api/sequence", request.clone()).await;
         assert_eq!(before.0, 200, "{}", before.1);
         let sequence: SequenceView = serde_json::from_value(before.1.clone()).unwrap();
@@ -296,7 +320,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         let (code, source) = call(
             &f.app,
             "GET",
-            &format!("/api/source?path={path}&revision=1"),
+            &pinned(&f, &format!("/api/source?path={path}")),
             Value::Null,
         )
         .await;
@@ -314,7 +338,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
             call(
                 &f.app,
                 "GET",
-                &format!("/api/methods?path={path}&revision=1"),
+                &pinned(&f, &format!("/api/methods?path={path}")),
                 Value::Null
             )
             .await
@@ -325,7 +349,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
             &f.app,
             "POST",
             "/api/sequence",
-            json!({"seed":seed.id,"expectedRevision":1,"showAll":true}),
+            json!({"seed":seed.id,"expectedRevision":f.pin,"showAll":true}),
         )
         .await;
         assert_eq!(code, 200);
@@ -354,7 +378,7 @@ async fn declarations_without_bodies_are_navigable_without_fabricated_calls() {
     let (code, methods) = call(
         &f.app,
         "GET",
-        "/api/methods?path=Worker.java&revision=1",
+        &pinned(&f, "/api/methods?path=Worker.java"),
         Value::Null,
     )
     .await;
@@ -371,7 +395,7 @@ async fn declarations_without_bodies_are_navigable_without_fabricated_calls() {
             &f.app,
             "POST",
             "/api/sequence",
-            json!({"seed":seed,"expectedRevision":1}),
+            json!({"seed":seed,"expectedRevision":f.pin}),
         )
         .await;
         assert_eq!(code, 200, "{name}: {value}");
@@ -392,7 +416,11 @@ async fn declarations_without_bodies_are_navigable_without_fabricated_calls() {
         .iter()
         .find(|n| n.path == "worker.py" && n.name == "empty")
         .unwrap();
-    let sequence = f.store.sequence_at(&empty.id, 1, false).unwrap().unwrap();
+    let sequence = f
+        .store
+        .sequence_at(&empty.id, f.store.status().unwrap().revision, false)
+        .unwrap()
+        .unwrap();
     let mut steps = Vec::new();
     flatten(&sequence.steps, &mut steps);
     assert!(steps.iter().all(|s| s.call_id.is_none()));
@@ -403,7 +431,21 @@ async fn declarations_without_bodies_are_navigable_without_fabricated_calls() {
 async fn java_python_cached_endpoints_enforce_revision_and_auth() {
     let f = setup();
     let cancel = Arc::new(AtomicBool::new(false));
-    assert_eq!(f.store.publish(&f.graph, Some(1), &cancel).unwrap(), 2);
+    assert_eq!(
+        f.store
+            .publish(
+                &f.graph,
+                &f.store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: f.store.status().unwrap().revision.index_generation,
+                    index_revision: 1
+                },
+                &cancel
+            )
+            .unwrap()
+            .index_revision,
+        2
+    );
     for path in ["Worker.java", "worker.py"] {
         let seed = &f
             .graph
@@ -413,9 +455,9 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
             .unwrap()
             .id;
         for endpoint in [
-            format!("/api/methods?path={path}&revision=1"),
-            format!("/api/source?path={path}&revision=1"),
-            "/api/files?revision=1".into(),
+            pinned(&f, &format!("/api/methods?path={path}")),
+            pinned(&f, &format!("/api/source?path={path}")),
+            pinned(&f, "/api/files"),
         ] {
             assert_eq!(call(&f.app, "GET", &endpoint, Value::Null).await.0, 409);
         }
@@ -424,7 +466,7 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
                 &f.app,
                 "POST",
                 "/api/sequence",
-                json!({"seed":seed,"expectedRevision":1})
+                json!({"seed":seed,"expectedRevision":f.pin})
             )
             .await
             .0,
@@ -435,7 +477,7 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
                 &f.app,
                 "POST",
                 "/api/sequence",
-                json!({"seed":seed,"expectedRevision":2})
+                json!({"seed":seed,"expectedRevision":f.store.status().unwrap().revision})
             )
             .await
             .0,
@@ -458,7 +500,7 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
                         .header("host", "127.0.0.1:7331")
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            json!({"seed":seed,"expectedRevision":2}).to_string(),
+                            json!({"seed":seed,"expectedRevision":f.store.status().unwrap().revision}).to_string(),
                         ))
                         .unwrap(),
                 )

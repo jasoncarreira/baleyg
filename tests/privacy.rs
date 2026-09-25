@@ -1,4 +1,4 @@
-use baleyg::store::Store;
+mod common;
 use std::fs;
 use tempfile::TempDir;
 
@@ -10,29 +10,59 @@ fn state_and_databases_are_private_and_symlink_safe() {
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
     let state = temp.path().join("private-state");
-    let store = Store::open(&state, &source).unwrap();
+    let store = crate::common::open_store(&state, &source).unwrap();
     assert_eq!(
         fs::metadata(&state).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    for name in ["cache.db", "workspace.db"] {
-        assert_eq!(
-            fs::metadata(state.join(name)).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-    assert_eq!(store.status().unwrap().revision, 0);
+    let indexes = state.join("cache/indexes");
+    let index = fs::read_dir(&indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    assert_eq!(
+        fs::metadata(index.join("index.db"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(index.join("leader.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(
+        !state.join("data/workspaces").exists(),
+        "reads do not initialize durable data"
+    );
+    assert_eq!(store.status().unwrap().revision.index_revision, 0);
     let public = temp.path().join("public");
     fs::create_dir(&public).unwrap();
     fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(Store::open(&public, &source).is_err());
+    let public_store = crate::common::open_store(&public, &source).unwrap();
+    assert_eq!(
+        fs::metadata(public.join("cache"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    drop(public_store);
     let alias = temp.path().join("alias");
     symlink(&state, &alias).unwrap();
-    assert!(Store::open(&alias, &source).is_err());
-    fs::remove_file(state.join("cache.db")).unwrap();
+    // The existing parent alias is not itself a Baleyg-managed component.
+    assert!(crate::common::open_store(&alias, &source).is_ok());
+    fs::remove_file(index.join("index.db")).unwrap();
     let other = temp.path().join("not-a-cache");
     fs::write(&other, b"sensitive").unwrap();
-    symlink(&other, state.join("cache.db")).unwrap();
+    symlink(&other, index.join("index.db")).unwrap();
     assert!(store.status().is_err());
     assert_eq!(fs::read(&other).unwrap(), b"sensitive");
 }

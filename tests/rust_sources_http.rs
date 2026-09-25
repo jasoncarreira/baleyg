@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -19,7 +20,7 @@ fn setup() -> (tempfile::TempDir, Store, Router) {
     )
     .unwrap();
     std::fs::write(source.join("secret"), "SECRET_MUST_NOT_LEAK").unwrap();
-    let store = Store::open(&temp.path().join("state"), &workspace).unwrap();
+    let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
     let app = http::router(
         http::new_with_source_roots(
             store.clone(),
@@ -72,7 +73,10 @@ async fn candidates_are_separate_and_ranges_match_returned_snapshot() {
     )
     .await;
     assert_eq!(tree["indexedWorkspace"], "");
-    assert_eq!(tree["revision"], 0);
+    assert_eq!(
+        tree["revision"],
+        serde_json::json!(store.status().unwrap().revision)
+    );
     assert!(tree["items"][0]["indexedPath"].is_null());
     let endpoint = "/api/rust-sources/file?root=rust&path=std/src/fs.rs";
     let (status, snap) = call(&app, endpoint).await;
@@ -133,7 +137,7 @@ async fn invalid_paths_unknown_roots_limits_and_parse_warnings() {
             &format!("/api/rust-sources/file?root=rust&path={path}"),
         )
         .await;
-        assert_eq!(status, 422, "{path}: {body}");
+        assert_eq!(status, 400, "{path}: {body}");
         assert!(!body.to_string().contains("SECRET_MUST_NOT_LEAK"));
     }
     for suffix in ["path=..", "limit=201", "limit=0", "offset=10001", "extra=1"] {
@@ -141,7 +145,7 @@ async fn invalid_paths_unknown_roots_limits_and_parse_warnings() {
             call(&app, &format!("/api/rust-sources/tree?root=rust&{suffix}"))
                 .await
                 .0,
-            422
+            400
         );
     }
     assert_eq!(
@@ -170,7 +174,7 @@ async fn invalid_paths_unknown_roots_limits_and_parse_warnings() {
         call(&app, "/api/rust-sources/file?root=rust&path=invalid.rs")
             .await
             .0,
-        422
+        400
     );
     std::fs::write(root.join("broken.rs"), "fn broken( {").unwrap();
     let (status, snap) = call(&app, "/api/rust-sources/file?root=rust&path=broken.rs").await;
@@ -209,11 +213,11 @@ async fn symlinks_and_non_regular_files_are_never_read() {
             &format!("/api/rust-sources/file?root=rust&path={path}"),
         )
         .await;
-        assert!([403, 422].contains(&status), "{path}: {body}");
+        assert!([403, 400].contains(&status), "{path}: {body}");
         assert!(!body.to_string().contains("SECRET_MUST_NOT_LEAK"));
     }
     assert!(
-        [403, 422].contains(
+        [403, 400].contains(
             &call(&app, "/api/rust-sources/tree?root=rust&path=alias")
                 .await
                 .0

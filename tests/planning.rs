@@ -1,3 +1,4 @@
+mod common;
 use baleyg::{
     indexer::{IndexOptions, index_workspace},
     model::*,
@@ -36,8 +37,18 @@ fn fixture(code: &str) -> (TempDir, TempDir, Store, Graph, QuestionRequest) {
             call.resolution = Resolution::Internal;
         }
     }
-    let store = Store::open(state.path(), work.path()).unwrap();
-    let revision = store.publish(&graph, Some(0), &cancel).unwrap();
+    let store = crate::common::open_store(state.path(), work.path()).unwrap();
+    let revision = store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel,
+        )
+        .unwrap();
     let request = serde_json::from_value(serde_json::json!({"seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id, "question":"Where is helper called?", "expectedRevision":revision})).unwrap();
     (work, state, store, graph, request)
 }
@@ -204,7 +215,8 @@ fn revision_drift_rejected_snapshot_remains_immutable() {
     store
         .publish(
             &graph,
-            Some(request.expected_revision),
+            &store.leader().unwrap(),
+            request.expected_revision,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -271,7 +283,8 @@ fn assembly_preserves_boundaries_and_never_expands_callbacks() {
     request.expected_revision = store
         .publish(
             &graph,
-            Some(request.expected_revision),
+            &store.leader().unwrap(),
+            request.expected_revision,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();

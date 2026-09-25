@@ -53,11 +53,14 @@ files are not silently treated as JavaScript.
 
 ## Inspect another repository
 
-Run Baleyg from its own directory. Keep state outside the inspected repository:
+Run Baleyg from its own directory. Indexes and saved records use fixed per-user storage;
+`--state-dir` is removed. Put the required private token outside the inspected checkout:
 
 ```sh
-target/debug/baleyg index --workspace /path/to/repository --state-dir /private/state
-target/debug/baleyg serve --workspace /path/to/repository --state-dir /private/state --bind 127.0.0.1:8879
+mkdir -m 700 -p "$HOME/.baleyg-private"
+target/debug/baleyg index --workspace /path/to/repository
+target/debug/baleyg serve --workspace /path/to/repository \
+  --token-file "$HOME/.baleyg-private/token" --bind 127.0.0.1:8879
 ```
 
 The file tree and index use the same workspace by default. Serving does not run the application

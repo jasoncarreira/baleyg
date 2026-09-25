@@ -1,3 +1,9 @@
+fn test_pin(revision: u64) -> baleyg::model::IndexPin {
+    baleyg::model::IndexPin {
+        index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
+        index_revision: revision,
+    }
+}
 use baleyg::{
     behavior::{SequenceStep, SequenceView, build_sequence},
     indexer::{IndexOptions, index_workspace},
@@ -18,7 +24,7 @@ fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
         .iter()
         .find(|n| n.name == name && matches!(n.kind, SymbolKind::Function | SymbolKind::Method))
         .unwrap_or_else(|| panic!("missing {name}: {:?}", graph.nodes));
-    let view = build_sequence(7, seed, &graph.files[0], &graph.calls, false).unwrap();
+    let view = build_sequence(test_pin(7), seed, &graph.files[0], &graph.calls, false).unwrap();
     (graph, view)
 }
 fn flatten(steps: &[SequenceStep]) -> Vec<&SequenceStep> {
@@ -85,7 +91,7 @@ fn receiver_arguments_constructor_assignment_order_and_measured_evidence() {
     );
     assert_eq!(
         view,
-        build_sequence(7, &view.seed, &graph.files[0], &graph.calls, true).unwrap()
+        build_sequence(test_pin(7), &view.seed, &graph.files[0], &graph.calls, true).unwrap()
     );
 }
 #[test]
@@ -157,7 +163,8 @@ fn nested_lambda_and_anonymous_bodies_never_execute_at_construction() {
         .iter()
         .find(|s| s.name.starts_with("<lambda@"))
         .unwrap();
-    let lambda_view = build_sequence(7, lambda, &graph.files[0], &graph.calls, true).unwrap();
+    let lambda_view =
+        build_sequence(test_pin(7), lambda, &graph.files[0], &graph.calls, true).unwrap();
     assert_eq!(calls(&lambda_view.steps), ["inside"]);
 }
 #[test]

@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -35,7 +36,7 @@ fn setup(enabled: bool) -> Fixture {
     )
     .unwrap();
     std::fs::write(library.join("std/src/lib.rs"), "// café\npub struct LibraryType;\nimpl LibraryType { pub fn method(&self) { hidden_call(); } }\npub enum Other { A }\n").unwrap();
-    let store = Store::open(&temp.path().join("state"), &workspace).unwrap();
+    let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
     let state = http::new_with_dependency_options(
         store.clone(),
         IndexOptions::new(workspace.clone()),
@@ -196,7 +197,7 @@ async fn startup_catalog_is_separate_paged_and_source_is_explicit() {
             &fixture.app,
             "POST",
             "/api/sequence",
-            &json!({"seed":external_id,"expectedRevision":0}).to_string()
+            &json!({"seed":external_id,"expectedRevision":fixture.store.status().unwrap().revision}).to_string()
         )
         .await
         .0,
@@ -238,7 +239,8 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
         .store
         .publish(
             &Graph::default(),
-            Some(0),
+            &fixture.store.leader().unwrap(),
+            fixture.store.status().unwrap().revision,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -250,7 +252,10 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
     );
     let (_, status) = request(&fixture.app, "GET", "/api/dependencies", "").await;
     assert_eq!(status["state"], "failed");
-    assert_eq!(status["workspaceRevision"], 1);
+    assert_eq!(
+        status["workspaceRevision"],
+        serde_json::json!(fixture.store.status().unwrap().revision)
+    );
     assert!(status["catalogId"].is_null());
     assert_eq!(
         request(&fixture.app, "POST", "/api/dependencies/refresh", "{}")
@@ -258,7 +263,10 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
             .0,
         202
     );
-    assert_eq!(ready(&fixture.app).await["workspaceRevision"], 1);
+    assert_eq!(
+        ready(&fixture.app).await["workspaceRevision"],
+        serde_json::json!(fixture.store.status().unwrap().revision)
+    );
 }
 #[tokio::test]
 async fn request_validation_and_capability_only_access() {
@@ -427,7 +435,10 @@ async fn successful_workspace_index_automatically_rebuilds_catalog() {
     .await
     .unwrap();
     let new = ready(&fixture.app).await;
-    assert_eq!(new["workspaceRevision"], 1);
+    assert_eq!(
+        new["workspaceRevision"],
+        serde_json::json!(fixture.store.status().unwrap().revision)
+    );
     assert_ne!(old["catalogId"], new["catalogId"]);
 }
 #[cfg(unix)]
@@ -453,4 +464,47 @@ async fn sources_keep_pinned_roots_and_reject_symlink_replacement() {
     let (status, response) = request(&fixture.app, "GET", &source, "").await;
     assert_eq!(status, 403);
     assert!(!response.to_string().contains("replacement"));
+}
+
+#[tokio::test]
+async fn workspace_generation_reuse() {
+    use baleyg::store::topology::UseGuard;
+    let fixture = setup(true);
+    fixture.state.start_dependency_index();
+    let catalog = ready(&fixture.app).await;
+    let old = fixture.store.status().unwrap().revision;
+    let source = source_url(&fixture.app, &catalog).await;
+    let indexes = fixture.temp.path().join("state/cache/indexes");
+    let index = std::fs::read_dir(&indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    let lock = indexes.join(format!(
+        "{}.lock",
+        index.file_name().unwrap().to_string_lossy()
+    ));
+    let exclusive = UseGuard::acquire_existing(&lock, true, true).unwrap();
+    std::fs::remove_file(index.join("index.db")).unwrap();
+    std::fs::remove_file(index.join("leader.lock")).unwrap();
+    std::fs::remove_dir(index).unwrap();
+    exclusive.remove_last().unwrap();
+    let replacement = crate::common::open_store(
+        &fixture.temp.path().join("state"),
+        &fixture.temp.path().join("workspace"),
+    )
+    .unwrap();
+    let fresh = replacement.status().unwrap().revision;
+    assert_eq!(fresh.index_revision, old.index_revision);
+    assert_ne!(fresh.index_generation, old.index_generation);
+    assert_eq!(
+        request(&fixture.app, "GET", &symbol_url(&catalog), "")
+            .await
+            .0,
+        409
+    );
+    assert_eq!(request(&fixture.app, "GET", &source, "").await.0, 409);
+    let (_, status) = request(&fixture.app, "GET", "/api/dependencies", "").await;
+    assert_eq!(status["workspaceRevision"], serde_json::json!(fresh));
+    assert_eq!(status["state"], "failed");
 }

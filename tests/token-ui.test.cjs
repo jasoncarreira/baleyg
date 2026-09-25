@@ -31,8 +31,8 @@ function harness({saved, blocked = false} = {}) {
     document:{getElementById:get, createElement:node, createElementNS:(_,tag) => node(tag), createDocumentFragment:node, createTextNode:text => ({textContent:text}), body:node()},
     fetch:async (url, options) => {
       requests.push({url,options});
-      if (url === "/api/status") return response({revision:1,workspaceRoot:"/synthetic",stats:{}});
-      if (url.startsWith("/api/tree?")) return response({revision:1,path:"",root:"/synthetic",items:[],nextOffset:null});
+      if (url === "/api/status") return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/synthetic",stats:{}});
+      if (url.startsWith("/api/tree?")) return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});
       if (["/api/views","/api/annotations"].includes(url)) return response([]);
       if (["/api/jev/status","/api/acp/status"].includes(url)) return response({enabled:false});
       throw new Error(`Unexpected request: ${url}`);
