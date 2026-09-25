@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
+const { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { delimiter, join } = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -119,6 +119,59 @@ test("recognized issue lookup failures remain failures", () => {
     const result = resolve(config, fakeDir, "123", { FAKE_GH_EXIT: "23" });
     assert.equal(result.status, 23);
     assert.deepEqual(result.args?.slice(0, 3), ["issue", "view", "123"]);
+  } finally {
+    rmSync(fakeDir, { recursive: true, force: true });
+  }
+});
+
+test("verify is one executable command and retains all checks", () => {
+  const config = loadConfig();
+  assert.equal(config.verify, "./tools/verify");
+  assert.notEqual(statSync(join(ROOT, "tools/verify")).mode & 0o111, 0);
+  const fakeDir = mkdtempSync(join(tmpdir(), "baleyg-factory-verify-"));
+  const log = join(fakeDir, "verify.log");
+  const fakeTool = `#!/bin/sh
+printf '%s' "\${0##*/}" >> "$FAKE_VERIFY_LOG"
+printf '\\t%s' "$@" >> "$FAKE_VERIFY_LOG"
+printf '\\n' >> "$FAKE_VERIFY_LOG"
+if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; fi
+`;
+  try {
+    for (const name of ["cargo", "node"]) {
+      const command = join(fakeDir, name);
+      writeFileSync(command, fakeTool);
+      chmodSync(command, 0o755);
+    }
+    function runVerify(extraEnv = {}) {
+      const result = spawnSync(config.verify, [], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${fakeDir}${delimiter}${process.env.PATH ?? ""}`,
+          FAKE_VERIFY_LOG: log,
+          ...extraEnv,
+        },
+      });
+      const commands = readFileSync(log, "utf8").trimEnd().split("\n").map((line) => line.split("\t"));
+      return { result, commands };
+    }
+    const expected = [
+      ["cargo", "fmt", "--all", "--", "--check"],
+      ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+      ["cargo", "test", "--locked", "--all-targets"],
+      ["node", "--test", "runtime/acp/runner.test.mjs"],
+      ["node", "--test", "tests/factory-config.test.cjs"],
+      ["node", "--check", "web/app.js"],
+      ["node", "--test", "tests/question-ui.test.cjs", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs"],
+    ];
+    const success = runVerify();
+    assert.equal(success.result.status, 0, success.result.stderr);
+    assert.deepEqual(success.commands, expected);
+    rmSync(log);
+    const failure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" });
+    assert.equal(failure.result.status, 23);
+    assert.deepEqual(failure.commands, expected.slice(0, 2));
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }
