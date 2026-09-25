@@ -148,6 +148,7 @@ export function checkCoverage(loaded,records){
       !semanticProofsById.has(proofId)&&expectedProducers.get(producerId)?.kind==='semantic')fail('FRESHNESS.USE','provenanceIds','proof outside producer and captured tuple');
    return proof;
   });
+  if(proofs.length&&expectedProducers.get(producerId)?.kind==='semantic'&&!coverage.selected)fail('FRESHNESS.USE','coverage','semantic proof requires selected producer-specific tuple');
   return {coverage,proofs,freshness:proofs.map(x=>x.freshness)};
  }
  function checkTarget(binding,proof,verifiedDeclarations){
