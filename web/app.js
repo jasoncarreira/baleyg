@@ -398,8 +398,10 @@ function renderViews() {
 form("save-form", async () => {
   if (focused) throw new Error("Focused selections cannot be saved as raw queries. Return to the raw hierarchy first.");
   if (!result) throw new Error("Run a query before saving a view.");
+  const pin = IndexPin.copy(result.revision);
+  if (!IndexPin.equal(pin, IndexPin.copy(status?.revision))) throw new Error("Index snapshot changed. Refresh status & view before saving.");
   const id = crypto.randomUUID();
-  await api(`/api/views/${id}`, "PUT", {id, title: $("view-title").value.trim(), query: result.query, pins: {}, hidden: []});
+  await api(`/api/views/${id}?${IndexPin.query(pin)}`, "PUT", {id, title: $("view-title").value.trim(), query: result.query, pins: {}, hidden: []});
   $("view-title").value = ""; await loadSaved();
 });
 function resetNote() { editingNote = null; $("note").value = ""; $("save-note").textContent = "Add note"; $("reset-note").hidden = true; }
@@ -417,8 +419,10 @@ function renderNotes() {
 }
 form("annotation-form", async () => {
   if (!seed && !editingNote) throw new Error("Select a symbol first.");
+  if (result && !IndexPin.equal(IndexPin.copy(result.revision), IndexPin.copy(status?.revision))) throw new Error("Index snapshot changed. Refresh status & view before saving.");
+  const pin = IndexPin.copy(status?.revision);
   const id = editingNote?.id || crypto.randomUUID();
-  await api(`/api/annotations/${id}`, "PUT", {id, nodeId: editingNote?.nodeId || seed, body: $("note").value});
+  await api(`/api/annotations/${id}?${IndexPin.query(pin)}`, "PUT", {id, nodeId: editingNote?.nodeId || seed, body: $("note").value});
   resetNote(); await loadSaved();
 });
 function activeJob(value) { return ["queued", "running", "cancelling", "canceling", "pending"].includes(value.state); }
