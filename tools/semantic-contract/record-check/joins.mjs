@@ -32,8 +32,9 @@ function target(ref,measurements,context) {
 }
 function targets(refs,measurements,context) {
  const values=refs.map(ref=>target(ref,measurements,context));
- if(new Set(values.map(key)).size!==values.length)reject('REFERENCE.RESOLUTION','candidates','duplicate candidate');
- return values.sort(compare);
+ if(values.some((value,index)=>index&&compare(values[index-1],value)>=0))
+  reject('REFERENCE.RESOLUTION','candidates','candidates must be unique and canonically ordered');
+ return values;
 }
 function resolution(row) {
  const ok=row.resolution==='resolved'&&row.declaredTarget?.kind==='internal'&&!row.candidates.length ||
@@ -42,7 +43,10 @@ function resolution(row) {
   row.resolution==='unresolved'&&row.declaredTarget===null&&!row.candidates.length;
  if(!ok)reject('REFERENCE.RESOLUTION','resolution','invalid resolution cardinality');
 }
-function roles(row,language,callee) {
+function roles(row,language,callee,declarationSite) {
+ if(row.site==='declaration'&&!declarationSite)
+  reject('REFERENCE.ROLES','site','declaration site requires a measured declaration name');
+ if(!row.roles.length)reject('REFERENCE.ROLES','roles','reference roles must be nonempty');
  const applicable=applicableRoles(language);
  let last=-1;
  for(const role of row.roles) {
@@ -63,8 +67,10 @@ function closure(field,expected,actual,assertion) {
 
 // Native candidates come from the admitted source ranges and U2's measured identities;
 // neither normalized joins nor an injected candidate index participates in this lookup.
-export function checkJoins(loaded,records,measurement) {
+export function checkJoins(loaded,records,coverage,measurement) {
  validate('NormalizedRecordsV1',records);
+ if(!(coverage?.semanticProofsById instanceof Map)||typeof coverage.checkUse!=='function')
+  reject('JOIN.TUPLE','provenanceId','verified coverage required');
  if(!(measurement?.identityByRef instanceof Map)||!(measurement.recordByNativeRef instanceof Map))
   reject('JOIN.TUPLE','anchor','verified measurement inventory required');
  const native=loaded.native, nativeProducer=loaded.fixture.producers.find(p=>p.id===native.producerId&&p.kind==='native');
@@ -97,28 +103,30 @@ export function checkJoins(loaded,records,measurement) {
  }
  for(const candidates of measured.values())if(candidates.length>1)
   reject('JOIN.CARDINALITY','anchor','duplicate native owner/family/range measurement');
- const proofById=new Map(records.provenance.map(x=>[x.id,x]));
+ const verifiedProofs=new Map(records.provenance.map(x=>[x.id,x]));
  const nativeReferences=new Map(native.references.map(row=>[row.ref,row]));
  const facts=loaded.annotations.flatMap(annotation=>annotation.facts.filter(f=>['declarationBinding','callBinding','reference'].includes(f.kind)).map(f=>({fact:f,annotation})));
- const joined=new Map(),expectedDiagnostics=[],expectedReferences=[],seenFacts=new Set(),referenceClaims=new Map();
+ const joined=new Map(),recordByFactRef=new Map(),expectedDiagnostics=[],expectedReferences=[],seenFacts=new Set(),referenceClaims=new Map();
  for(const {fact,annotation} of facts) {
   if(seenFacts.has(fact.ref))reject('JOIN.CARDINALITY','factRef','duplicate semantic fact reference');
   seenFacts.add(fact.ref);
   const family=fact.anchor.kind;
   if(fact.kind==='declarationBinding'&&family!=='declarationName'||fact.kind==='callBinding'&&!['callee','invocation'].includes(family)||fact.kind==='reference'&&family!=='reference')
    reject('JOIN.FAMILY','anchor.kind','fact anchor family differs');
-  const proof=proofById.get(fact.record.provenanceId);
+  const proof=verifiedProofs.get(fact.record.provenanceId);
+  const captured=coverage.semanticProofsById.get(fact.record.provenanceId);
   const producer=loaded.fixture.producers.find(x=>x.id===proof?.producerId&&x.kind==='semantic');
-  if(!proof||!producer||proof.evidenceKind!==(fact.kind==='declarationBinding'?'declarationBinding':'semanticReference')||
-   !same(proof.document,annotation.document)||proof.revisionId!==annotation.revisionId)
-   reject('JOIN.TUPLE','provenanceId','unadmitted producer/proof/fact source tuple');
-  const captured=loaded.annotations.flatMap(item=>item.facts).find(row=>row.kind==='provenance'&&row.record.id===proof.id)?.record;
-  if(!captured||!same((({freshness,...row})=>row)(captured),(({freshness,...row})=>row)(proof)))
-   reject('JOIN.TUPLE','provenanceId','fact proof differs from captured provenance');
+  if(!proof||!captured||!producer||proof.evidenceKind!==(fact.kind==='declarationBinding'?'declarationBinding':'semanticReference')||
+   !same(proof.document,annotation.document)||proof.revisionId!==annotation.revisionId||
+   !same((({freshness,...row})=>row)(captured),(({freshness,...row})=>row)(proof)))
+   reject('JOIN.TUPLE','provenanceId','unverified producer/proof/fact source tuple');
   const selector=fact.anchor;
   if(!same(selector.document,annotation.document)||selector.revisionId!==annotation.revisionId||
     !same(selector.document,proof.document)||selector.revisionId!==proof.revisionId||selector.contentHash!==proof.contentHash)
    reject('JOIN.TUPLE','anchor','semantic anchor disagrees with captured proof');
+  // Coverage selection belongs to the semantic producer, not the native measurement.
+  // Verify every fact, including those that will remain unmatched or unsupported.
+  coverage.checkUse({producerId:proof.producerId,document:selector.document,revisionId:selector.revisionId,provenanceIds:[proof.id]});
   if(selector.range.encoding!==producer.positionEncoding)reject('JOIN.TUPLE','anchor.range','semantic producer encoding differs');
   const source=loaded.sources.get(JSON.stringify([selector.document.sourceSetId,selector.revisionId,selector.document.path]));
   const document=loaded.revisions.get(JSON.stringify([selector.document.sourceSetId,selector.revisionId]))?.documents.find(x=>same(x.key,selector.document));
@@ -139,10 +147,13 @@ export function checkJoins(loaded,records,measurement) {
    reject('JOIN.SUPPORT','measurementSupport','family availability/diagnostic differs');
   const status=!support.available?'unsupported':candidateIds.length===0?'unmatched':candidateIds.length===1?'exact':'ambiguous';
   const join={anchor,status,candidateIds:status==='unsupported'?[]:candidateIds,diagnostic:status==='exact'?null:status==='unsupported'?support.diagnostic:status};
-  joined.set(fact.ref,join);
-  if(fact.kind!=='reference')continue;
+  const nativeRefs=status==='exact'?matches.map(x=>x.ref):[];
+  joined.set(fact.ref,{join,installedId:status==='exact'?candidateIds[0]:null,
+   producerId:proof.producerId,provenanceIds:[proof.id],nativeRefs});
+  if(fact.kind!=='reference'){recordByFactRef.set(fact.ref,join);continue;}
   if(status!=='exact') {
-   expectedDiagnostics.push({factRef:fact.ref,provenanceId:proof.id,join});
+   const diagnostic={factRef:fact.ref,provenanceId:proof.id,join};
+   expectedDiagnostics.push(diagnostic);recordByFactRef.set(fact.ref,diagnostic);
    continue;
   }
   const row=nativeReferences.get(matches[0].ref),descriptor=measurement.nativeReferenceDescriptors.find(x=>x.ref===row?.ref);
@@ -150,15 +161,18 @@ export function checkJoins(loaded,records,measurement) {
    reject('REFERENCE.SOURCE','id','native reference lacks verified measured identity');
   const value={id:descriptor.id,ownerSyntaxId:descriptor.ownerSyntaxId,ordinal:descriptor.ordinal,document:row.document,revisionId:row.revisionId,range:anchor.range,spelling:row.spelling,lookupKey:descriptor.lookupKey,site:fact.record.site,roles:fact.record.roles,resolution:fact.record.resolution,declaredTarget:target(fact.record.declaredTarget,measurement,proof.document),candidates:targets(fact.record.candidates,measurement,proof.document),provenanceId:proof.id};
   const callee=native.calls.some(call=>call.ownerRef===row.ownerRef&&same(call.document,row.document)&&call.revisionId===row.revisionId&&call.calleeRange!==null&&same(position(source,call.calleeRange),anchor.range));
-  roles(value,row.document.language,callee);resolution(value);validate('Reference',value);
+  const declarationSite=(measured.get(key([{...anchor,kind:'declarationName'},selector.ownerRef]))??[])
+   .some(candidate=>declarations.has(candidate.ref)&&same(declarations.get(candidate.ref).document,row.document)&&declarations.get(candidate.ref).revisionId===row.revisionId);
+  roles(value,row.document.language,callee,declarationSite);resolution(value);validate('Reference',value);
   const group=key([proof.producerId,value.id]),prior=referenceClaims.get(group);
   if(prior&&!same((({provenanceId,...claim})=>claim)(prior),(({provenanceId,...claim})=>claim)(value)))
    reject('REFERENCE.SOURCE','references','conflicting facts for same producer/reference');
-  referenceClaims.set(group,value);expectedReferences.push(value);
+  referenceClaims.set(group,value);expectedReferences.push(value);recordByFactRef.set(fact.ref,value);
  }
  // A diagnostic is the sole normalized trace of a non-exact reference. Exact
  // references have no diagnostic and cannot be created by a non-exact fact.
  closure('referenceJoinDiagnostics',expectedDiagnostics,records.referenceJoinDiagnostics,'JOIN.DIAGNOSTIC');
  closure('references',expectedReferences,records.references,'REFERENCE.SOURCE');
- return {joined,referenceClaims};
+ return {joined,referenceClaims,expectedReferences:orderedEnvelope('references',expectedReferences,{collapseIdentical:true}),
+  expectedDiagnostics:orderedEnvelope('referenceJoinDiagnostics',expectedDiagnostics,{collapseIdentical:true}),recordByFactRef};
 }
