@@ -1439,3 +1439,212 @@ fn browser_occurrences_follow_complete_source_and_basis_capture() {
     assert_eq!(changed_basis.0, body.0);
     assert_ne!(changed_basis.1, body.1);
 }
+
+#[test]
+fn java_capture_measures_member_name_without_semantic_promotion() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Café.java",
+        "class Café { void work() { obj.fóo(); obj.method().next(); new Café(); } }",
+    );
+    let mut admission = capture_admission(root);
+    admission.languages = vec![baleyg::model::v1::Language::Java];
+    admission.producers.clear();
+    let capture = baleyg::indexer::capture_revision(
+        &IndexOptions::new(root.to_owned()),
+        &admission,
+        &cancel(),
+    )
+    .unwrap();
+    let doc = &capture.documents[0];
+    let calls: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Invocation)
+        .collect();
+    assert!(calls.len() >= 3);
+    assert!(calls.iter().all(|w| {
+        w.stable_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("occ:v1:"))
+    }));
+    let member = calls
+        .iter()
+        .find(|w| w.spelling.as_deref() == Some("fóo"))
+        .unwrap();
+    assert!(member.verified_member_token);
+    assert_eq!(
+        &doc.bytes[member.token_start_byte..member.token_end_byte],
+        "fóo".as_bytes()
+    );
+    assert!(
+        calls.iter().any(|w| !w.verified_member_token
+            && doc.bytes[w.start_byte..w.end_byte].starts_with(b"new Caf"))
+    );
+    let graph = run(&IndexOptions::new(root.to_owned()));
+    assert!(
+        graph
+            .calls
+            .iter()
+            .filter(|c| c.path.ends_with(".java"))
+            .all(|c| c.target.is_none() && c.candidate_symbols.is_empty())
+    );
+}
+
+#[test]
+fn java_anonymous_type_and_lambda_have_distinct_canonical_kinds() {
+    use baleyg::model::v1::{Key, Kind, Language, Signature, Text, UInt};
+    use baleyg::semantic_identity::syntax_id;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Kinds.java",
+        "class Kinds { void run() { Object a = new Object() { void inside() {} }; Runnable r = () -> work(); } }\n",
+    );
+    let mut admission = capture_admission(root);
+    admission.languages = vec![Language::Java];
+    let captured =
+        baleyg::indexer::capture_revision(&capture_options(root), &admission, &cancel()).unwrap();
+    let doc = &captured.documents[0];
+    let key = |kind, name: Option<&str>, signature| Key {
+        kind,
+        name: name.map(|value| Text::new(value.to_owned()).unwrap()),
+        signature,
+        ordinal: UInt::new(0).unwrap(),
+    };
+    let module = key(Kind::Module, None, None);
+    let class = key(Kind::Type, Some("Kinds"), None);
+    let method = key(
+        Kind::Method,
+        Some("run"),
+        Some(Signature {
+            parameter_types: vec![],
+            type_parameter_count: UInt::new(0).unwrap(),
+            variadic: false,
+        }),
+    );
+    let ancestors = [module, class, method];
+    let id = |kind| {
+        syntax_id(
+            &doc.key.source_set_id,
+            &doc.key.path,
+            Language::Java,
+            &ancestors,
+            &key(kind, None, None),
+        )
+        .unwrap()
+        .as_str()
+        .to_owned()
+    };
+    assert!(
+        syntax_id(
+            &doc.key.source_set_id,
+            &doc.key.path,
+            Language::Java,
+            &ancestors,
+            &key(Kind::Type, None, None),
+        )
+        .is_ok()
+    );
+    let anonymous = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "class_body" && w.stable_id.is_some())
+        .unwrap();
+    let lambda = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "lambda_expression" && w.stable_id.is_some())
+        .unwrap();
+    assert_eq!(
+        anonymous.stable_id.as_deref(),
+        Some(id(Kind::Type).as_str())
+    );
+    assert_eq!(
+        lambda.stable_id.as_deref(),
+        Some(id(Kind::AnonymousFunction).as_str())
+    );
+    assert_ne!(anonymous.stable_id, lambda.stable_id);
+    // A named type remains a separate canonical key; other declaration kinds
+    // cannot borrow the anonymous-type exception.
+    assert_ne!(
+        id(Kind::Type),
+        syntax_id(
+            &doc.key.source_set_id,
+            &doc.key.path,
+            Language::Java,
+            &ancestors,
+            &key(Kind::Type, Some("Named"), None),
+        )
+        .unwrap()
+        .as_str()
+    );
+    assert!(
+        syntax_id(
+            &doc.key.source_set_id,
+            &doc.key.path,
+            Language::Java,
+            &ancestors,
+            &key(Kind::Method, None, None),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn java_control_candidates_match_measured_graph_regions() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    use baleyg::model::v1::Language;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Flow.java",
+        "class Flow { void run(int x) { ordinary(); { nested(); } if (x > 0) { yes(); } switch (x) { case 1: one(); break; default: other(); } try { risky(); } catch (Exception e) { recover(); } } }\n",
+    );
+    let mut admission = capture_admission(root);
+    admission.languages = vec![Language::Java];
+    let captured =
+        baleyg::indexer::capture_revision(&capture_options(root), &admission, &cancel()).unwrap();
+    let doc = &captured.documents[0];
+    let regions: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::ControlRegion)
+        .collect();
+    assert!(!regions.is_empty());
+    assert!(regions.iter().any(|w| w.node_kind == "if_statement"));
+    assert!(
+        regions
+            .iter()
+            .any(|w| w.node_kind == "switch_block_statement_group")
+    );
+    assert!(regions.iter().all(|w| {
+        w.stable_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("occ:v1:"))
+    }));
+    assert!(!regions.iter().any(|w| matches!(
+        w.node_kind.as_str(),
+        "statement_block" | "expression_statement" | "switch_statement"
+    )));
+    let graph = run(&IndexOptions::new(root.to_owned()));
+    let graph_regions: std::collections::BTreeSet<_> = graph
+        .regions
+        .iter()
+        .filter(|r| r.path.ends_with("Flow.java"))
+        .map(|r| {
+            assert!(r.id.starts_with("occ:v1:"));
+            (r.kind.as_str(), r.range.start_byte, r.range.end_byte)
+        })
+        .collect();
+    let measured: std::collections::BTreeSet<_> = regions
+        .iter()
+        .map(|w| (w.node_kind.as_str(), w.start_byte, w.end_byte))
+        .collect();
+    assert_eq!(measured, graph_regions);
+}

@@ -45,7 +45,11 @@ class Café {
     assert_eq!(g, run(&opts));
     assert_eq!(g.stats.parse_error_files, 0, "{:?}", g.diagnostics);
     assert_eq!(g.files.len(), 3);
-    let class = g.nodes.iter().find(|n| n.name == "Café").unwrap();
+    let class = g
+        .nodes
+        .iter()
+        .find(|n| n.name == "Café" && n.kind == SymbolKind::Class)
+        .unwrap();
     assert_eq!(class.kind, SymbolKind::Class);
     let method = g.nodes.iter().find(|n| n.name == "run").unwrap();
     assert_eq!(method.parent.as_ref(), Some(&class.id));
@@ -176,5 +180,43 @@ fn recovery_and_cancellation_are_explicit() {
             .unwrap_err()
             .to_string()
             .contains("cancel")
+    );
+}
+
+#[test]
+fn stable_java_declarations_overloads_and_revision_local_occurrences() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Types.java");
+    fs::write(&path, "class Types { void work(String s) { obj.foo(); } void work(int i) { obj.foo(); } void same() {} void same() {} }").unwrap();
+    let first = run(&IndexOptions::new(dir.path().to_owned()));
+    let methods: Vec<_> = first.nodes.iter().filter(|n| n.name == "work").collect();
+    assert_eq!(methods.len(), 2);
+    assert!(methods.iter().all(|n| n.id.starts_with("sid:v1:")));
+    assert_ne!(methods[0].id, methods[1].id);
+    let same: Vec<_> = first.nodes.iter().filter(|n| n.name == "same").collect();
+    assert_eq!(same.len(), 2);
+    assert_ne!(same[0].id, same[1].id);
+    assert!(
+        first
+            .calls
+            .iter()
+            .all(|c| c.id.starts_with("occ:v1:") && c.target.is_none())
+    );
+    fs::write(&path, "class Types { void work(String s) { obj.foo(); extra(); } void work(int i) { obj.foo(); } void same() {} void same() {} }").unwrap();
+    let second = run(&IndexOptions::new(dir.path().to_owned()));
+    let second_methods: Vec<_> = second.nodes.iter().filter(|n| n.name == "work").collect();
+    assert_eq!(
+        methods.iter().map(|n| &n.id).collect::<Vec<_>>(),
+        second_methods.iter().map(|n| &n.id).collect::<Vec<_>>()
+    );
+    assert_ne!(first.calls[0].id, second.calls[0].id);
+    assert_eq!(
+        same.iter().map(|n| &n.id).collect::<Vec<_>>(),
+        second
+            .nodes
+            .iter()
+            .filter(|n| n.name == "same")
+            .map(|n| &n.id)
+            .collect::<Vec<_>>()
     );
 }
