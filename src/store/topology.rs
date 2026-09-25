@@ -1189,54 +1189,148 @@ fn inspect_index(dir: &Path, key: &str, now_secs: i64) -> Result<(&'static str, 
     }
 }
 
+fn ensure_safe_record_contents(dir: &Path) -> Result<()> {
+    private_dir(dir)?;
+    let mut count = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        ensure!(
+            entry.file_name() == "workspace.db",
+            "unsafe record contents: unknown entry"
+        );
+        let file = open_file(&entry.path(), false)?;
+        private_file(&entry.path(), &file)?;
+        count += 1;
+    }
+    ensure!(count == 1, "incomplete_record: missing database");
+    Ok(())
+}
+fn validate_record_schema(db: &rusqlite::Connection) -> Result<()> {
+    type SchemaObject = (String, String, String, Option<String>);
+    fn objects(db: &rusqlite::Connection) -> rusqlite::Result<Vec<SchemaObject>> {
+        db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect()
+    }
+    // SQLite generates internal autoindex names for the package's PRIMARY KEY constraints.
+    // Compare those as well as the original table SQL, not just queryable columns: a
+    // countable record with weaker constraints must never be destroyed automatically.
+    let expected = rusqlite::Connection::open_in_memory()?;
+    expected.execute_batch(RECORD_SCHEMA)?;
+    ensure!(
+        objects(db)? == objects(&expected)?,
+        "incompatible_record: unexpected SQLite schema"
+    );
+    Ok(())
+}
+
+fn inspect_record(dir: &Path, id: &str) -> Result<(RecordReport, Vec<String>)> {
+    private_dir(dir)?;
+    let db = readonly_db(&dir.join("workspace.db"))?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(version == 1, "incompatible_record: schema version");
+    validate_record_schema(&db)?;
+    let row: (i64, String, i64) = db.query_row(
+        "SELECT schema_version,record_id,initialized FROM record_metadata WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    ensure!(
+        row == (1, id.to_owned(), 1),
+        "incomplete_record: metadata mismatch"
+    );
+    let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    ensure!(
+        integrity == "ok",
+        "incomplete_record: database integrity check failed"
+    );
+    db.prepare("SELECT path,device,inode FROM known_roots")?;
+    db.prepare("SELECT id,payload FROM views")?;
+    db.prepare("SELECT id,node_id,payload FROM annotations")?;
+    let views = db.query_row("SELECT count(*) FROM views", [], |r| r.get(0))?;
+    let annotations = db.query_row("SELECT count(*) FROM annotations", [], |r| r.get(0))?;
+    let paths = db
+        .prepare("SELECT path FROM known_roots ORDER BY path")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let missing_known_paths = paths
+        .iter()
+        .filter(|p| {
+            fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .cloned()
+        .collect();
+    Ok((
+        RecordReport {
+            id: id.to_owned(),
+            views,
+            annotations,
+            missing_known_paths,
+        },
+        paths,
+    ))
+}
+
 impl TopologyRoots {
     /// Resolve a durable record by validated ID without discovering a checkout marker.
     pub fn record_by_id(&self, id: &str) -> Result<Option<RecordReport>> {
+        let Some((parent, dir)) = self.existing_record_paths(id)? else {
+            return Ok(None);
+        };
+        let guard = UseGuard::acquire_existing(&parent.join(format!("{id}.lock")), false, true)?;
+        let (report, _) = inspect_record(&dir, id)?;
+        guard.verify()?;
+        Ok(Some(report))
+    }
+    fn existing_record_paths(&self, id: &str) -> Result<Option<(PathBuf, PathBuf)>> {
         ensure!(valid_record_id(id), "invalid record ID");
         let Some(parent) = managed_existing(&self.data, "workspaces")? else {
             return Ok(None);
         };
         let dir = parent.join(id);
         match fs::symlink_metadata(&dir) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-            Ok(_) => private_dir(&dir)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+            Ok(_) => {
+                private_dir(&dir)?;
+                Ok(Some((parent, dir)))
+            }
         }
-        let guard = UseGuard::acquire_existing(&parent.join(format!("{id}.lock")), false, true)?;
-        let db = readonly_db(&dir.join("workspace.db"))?;
-        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        ensure!(version == 1, "incompatible_record: schema version");
-        let row: (i64, String, i64) = db.query_row(
-            "SELECT schema_version,record_id,initialized FROM record_metadata WHERE singleton=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        ensure!(
-            row == (1, id.to_owned(), 1),
-            "incomplete_record: metadata mismatch"
-        );
-        db.prepare("SELECT path,device,inode FROM known_roots")?;
-        db.prepare("SELECT id,payload FROM views")?;
-        db.prepare("SELECT id,node_id,payload FROM annotations")?;
-        let views = db.query_row("SELECT count(*) FROM views", [], |r| r.get(0))?;
-        let annotations = db.query_row("SELECT count(*) FROM annotations", [], |r| r.get(0))?;
-        let paths = db
-            .prepare("SELECT path FROM known_roots ORDER BY path")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let missing_known_paths = paths
-            .into_iter()
-            .filter(|p| {
-                fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-            })
-            .collect();
+    }
+    /// Hold the existing exclusive use lock across inventory, confirmation and removal.
+    pub fn forget_with_confirmation(
+        &self,
+        id: &str,
+        confirm: impl FnOnce(&RecordReport, &[String]) -> Result<bool>,
+    ) -> Result<bool> {
+        let (parent, dir) = self
+            .existing_record_paths(id)?
+            .context("record not found")?;
+        let guard = UseGuard::acquire_existing(&parent.join(format!("{id}.lock")), true, true)
+            .context("incomplete_record: missing, unsafe or busy use lock")?;
+        let (report, paths) = inspect_record(&dir, id)?;
+        ensure_safe_record_contents(&dir)?;
         guard.verify()?;
-        Ok(Some(RecordReport {
-            id: id.to_owned(),
-            views,
-            annotations,
-            missing_known_paths,
-        }))
+        if !confirm(&report, &paths)? {
+            return Ok(false);
+        }
+        private_dir(&dir)?;
+        guard.verify()?;
+        ensure_safe_record_contents(&dir)?;
+        // Reinspect the database after user input, before removing any bytes.
+        let _ = inspect_record(&dir, id)?;
+        let db = dir.join("workspace.db");
+        let file = open_file(&db, false)?;
+        private_file(&db, &file)?;
+        drop(file);
+        fs::remove_file(&db)?;
+        sync_directory(&dir)?;
+        fs::remove_dir(&dir)?;
+        sync_directory(&parent)?;
+        guard.remove_last()?;
+        Ok(true)
     }
     pub fn gc_report(&self) -> Result<GcReport> {
         let now_secs = std::time::SystemTime::now()

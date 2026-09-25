@@ -1702,3 +1702,210 @@ fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
         assert!(record.missing_known_paths[0].ends_with("-a"));
     }
 }
+
+#[test]
+fn forget_requires_safe_exclusive_record_and_recreates_on_later_save() {
+    use baleyg::{
+        model::SavedView,
+        store::topology::{DurableRecords, valid_record_id},
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    common::private(&work.join(".git"));
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let id = identity.record_id.clone();
+    let copy = temp.path().join("copy");
+    fs::create_dir(&copy).unwrap();
+    common::private(&copy.join(".git"));
+    common::private(&copy.join(".git/baleyg"));
+    fs::copy(
+        work.join(".git/baleyg/workspace-id"),
+        copy.join(".git/baleyg/workspace-id"),
+    )
+    .unwrap();
+    let copied = WorkspaceIdentity::discover(Some(&copy), &copy).unwrap();
+    assert_eq!(copied.record_id, id);
+    assert!(valid_record_id(&id));
+    for bad in [
+        "",
+        "../bad",
+        "00000000-0000-0000-0000-000000000000",
+        "PATH-bad",
+        "path-ABC",
+        "ABCDEFAB-CDEF-4ABC-ABCD-ABCDEFABCDEF",
+    ] {
+        assert!(!valid_record_id(bad));
+        assert!(
+            roots
+                .forget_with_confirmation(bad, |_, _| Ok(true))
+                .is_err()
+        );
+    }
+    let records = DurableRecords::new(&roots, &identity);
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    records.put_view(&view).unwrap();
+    let directory = roots.record_dir(&identity);
+    let lock = roots.record_use_lock(&identity);
+    let shared = UseGuard::acquire_existing(&lock, false, true).unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&id, |_, _| Ok(true))
+            .is_err()
+    );
+    drop(shared);
+    assert!(
+        !roots
+            .forget_with_confirmation(&id, |report, paths| {
+                assert_eq!(report.views, 1);
+                assert_eq!(report.annotations, 0);
+                assert_eq!(paths, &[identity.root.to_str().unwrap().to_string()]);
+                Ok(false)
+            })
+            .unwrap()
+    );
+    assert!(directory.exists());
+    fs::write(directory.join("unknown"), "leave untouched").unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&id, |_, _| Ok(true))
+            .is_err()
+    );
+    assert!(directory.join("unknown").exists());
+    fs::remove_file(directory.join("unknown")).unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&id, |_, _| Ok(true))
+            .unwrap()
+    );
+    assert!(!directory.exists());
+    assert!(!lock.exists());
+    assert!(work.join(".git/baleyg/workspace-id").exists());
+    assert!(copy.join(".git/baleyg/workspace-id").exists());
+    assert!(
+        DurableRecords::new(&roots, &copied)
+            .views()
+            .unwrap()
+            .is_empty()
+    );
+    records.put_view(&view).unwrap();
+    assert_eq!(records.views().unwrap(), vec![view]);
+}
+
+#[test]
+fn forget_empty_record_and_recovery_sidecars_refuse() {
+    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    records.put_view(&view).unwrap();
+    records.delete_view("view1").unwrap();
+    let db = roots.record_db(&identity);
+    fs::write(db.with_file_name("workspace.db-wal"), "recovery").unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&identity.record_id, |_, _| Ok(true))
+            .is_err()
+    );
+    assert!(db.exists());
+    fs::remove_file(db.with_file_name("workspace.db-wal")).unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&identity.record_id, |report, _| {
+                assert_eq!(report.views, 0);
+                Ok(true)
+            })
+            .unwrap()
+    );
+}
+
+#[test]
+fn forget_refuses_countable_records_with_unknown_sqlite_schema() {
+    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    for (n, change) in [
+        "CREATE TABLE unexpected (id INTEGER)",
+        "CREATE VIEW unexpected AS SELECT id FROM views",
+        "CREATE TRIGGER unexpected AFTER INSERT ON views BEGIN SELECT 1; END",
+        "CREATE INDEX unexpected ON views(payload)",
+        "ALTER TABLE views ADD COLUMN unexpected TEXT",
+        "UPDATE sqlite_master SET sql=replace(sql,'CHECK(schema_version=1)','CHECK(schema_version>0)') WHERE name='record_metadata'",
+    ].iter().enumerate() {
+        let work = temp.path().join(format!("unsafe-schema-{n}"));
+        fs::create_dir(&work).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        DurableRecords::new(&roots, &identity).put_view(&view).unwrap();
+        let path = roots.record_db(&identity);
+        let lock = roots.record_use_lock(&identity);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        if n == 5 {
+            db.pragma_update(None, "writable_schema", "ON").unwrap();
+        }
+        db.execute_batch(change).unwrap();
+        if n == 5 {
+            db.pragma_update(None, "writable_schema", "OFF").unwrap();
+            db.pragma_update(None, "schema_version", 100).unwrap();
+        }
+        assert_eq!(db.query_row("SELECT count(*) FROM views", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(db);
+        let before_db = fs::read(&path).unwrap();
+        let before_lock = fs::read(&lock).unwrap();
+        let unrelated = temp.path().join(format!("unrelated-{n}"));
+        fs::write(&unrelated, "keep").unwrap();
+        let before_unrelated = fs::read(&unrelated).unwrap();
+        let mut asked = false;
+        let result = roots.forget_with_confirmation(&identity.record_id, |_, _| {
+            asked = true;
+            Ok(true)
+        });
+        assert!(result.is_err(), "{change}");
+        assert!(!asked, "must reject before confirmation: {change}");
+        assert_eq!(fs::read(&path).unwrap(), before_db, "{change}");
+        assert_eq!(fs::read(&lock).unwrap(), before_lock, "{change}");
+        assert_eq!(fs::read(&unrelated).unwrap(), before_unrelated, "{change}");
+    }
+}
+
+#[test]
+fn forget_rechecks_sqlite_schema_after_confirmation() {
+    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    DurableRecords::new(&roots, &identity)
+        .put_view(&view)
+        .unwrap();
+    let path = roots.record_db(&identity);
+    let lock = roots.record_use_lock(&identity);
+    assert!(
+        roots
+            .forget_with_confirmation(&identity.record_id, |_, _| {
+                let db = rusqlite::Connection::open(&path)?;
+                db.execute_batch("CREATE TABLE late_entry(id INTEGER)")?;
+                Ok(true)
+            })
+            .is_err()
+    );
+    assert!(path.exists() && lock.exists());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM views", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
