@@ -1,0 +1,149 @@
+// Closed v1 shape definitions. Semantic cross-field checks belong to the invariant layers.
+const object = fields => ({object: fields});
+const array = item => ({array: item});
+const nullable = item => ({nullable: item});
+const enumOf = (...values) => ({enum: values});
+const literal = value => ({literal: value});
+const union = (tag, variants) => ({union: {tag, variants}});
+export const types = Object.freeze({
+  Text: 'text', Language: enumOf('java','rust','python','javascript'), UInt: 'uint', Hash: 'hash', Path: 'path',
+  Range: object({start:'UInt',end:'UInt'}),
+  Kind: enumOf('module','namespace','type','implementation','function','method','constructor','field','variable','parameter','typeParameter','alias','anonymousFunction'),
+  SyntaxId:'syntaxId', OccurrenceId:'occurrenceId',
+  Role:enumOf('definition','read','write','call','type','import','alias'),
+  Resolution:enumOf('resolved','external','ambiguous','unresolved'),
+  Producer:object({id:'Text',version:'Text',executableHash:'Hash',kind:enumOf('native','semantic'),languages:array('Language'),positionEncoding:enumOf('utf8','utf16','unicodeScalar')}),
+  SourceSet:object({id:'Text',rootId:'Text',languages:array('Language'),dependencies:array('Text')}),
+  DocumentKey:object({sourceSetId:'Text',language:'Language',path:'Path'}),
+  Document:object({key:'DocumentKey',revisionId:'Text',contentHash:'Hash',byteLength:'UInt'}),
+  Revision:object({id:'Text',sourceSetId:'Text',documents:array('Document'),toolchainHash:'Hash',configHash:'Hash',dependencyHash:'Hash'}),
+  Coverage:object({producerId:'Text',language:'Language',sourceSetId:'Text',documentPath:'Path',revisionId:'Text',requested:'boolean',selected:'boolean',state:enumOf('notRequested','omitted','unsupported','failed','partial','complete'),supportedRoles:array('Role'),observedRoles:array('Role'),diagnostic:nullable('Text')}),
+  SemanticBasis:object({producerId:'Text',producerVersion:'Text',producerHash:'Hash',artifactHash:'Hash',language:'Language',sourceSetId:'Text',revisionId:'Text',sourceManifestHash:'Hash',toolchainHash:'Hash',configHash:'Hash',dependencyHash:'Hash',lookupDependencies:array('Text')}),
+  Provenance:object({id:'Text',producerId:'Text',document:'DocumentKey',revisionId:'Text',contentHash:'Hash',evidenceKind:enumOf('measuredSyntax','declarationBinding','semanticReference','typeRelationship'),basis:nullable('SemanticBasis'),freshness:enumOf('fresh','possiblyStale','stale')}),
+  Signature:object({parameterTypes:array('Text'),typeParameterCount:'UInt',variadic:'boolean'}),
+  Key:object({kind:'Kind',name:nullable('Text'),signature:nullable('Signature'),ordinal:'UInt'}),
+  Parameter:object({name:nullable('Text'),type:nullable('Text'),variadic:'boolean'}),
+  Header:object({kind:'Kind',name:nullable('Text'),modifiers:array('Text'),typeParameters:array('Text'),parameters:array('Parameter'),resultType:nullable('Text'),bases:array('Text')}),
+  Declaration:object({syntaxId:'SyntaxId',document:'DocumentKey',revisionId:'Text',kind:'Kind',name:nullable('Text'),lookupKey:nullable('Text'),ancestors:array('Key'),key:'Key',range:'Range',nameRange:nullable('Range'),header:'Header',provenanceId:'Text'}),
+  SymbolKey:object({scheme:literal('scip'),symbol:'Text',scope:enumOf('global','document'),document:nullable('DocumentKey')}),
+  Target:union('kind',{internal:object({kind:literal('internal'),syntaxId:'SyntaxId',document:'DocumentKey',revisionId:'Text'}),external:object({kind:literal('external'),symbol:'SymbolKey'})}),
+  Symbol:object({key:'SymbolKey',displayName:nullable('Text'),declarations:array('Target'),provenanceId:'Text'}),
+  MeasuredAnchor:object({document:'DocumentKey',revisionId:'Text',contentHash:'Hash',range:'Range',kind:enumOf('declarationName','callee','invocation','reference')}),
+  Join:object({anchor:'MeasuredAnchor',status:enumOf('exact','ambiguous','unmatched','unsupported'),candidateIds:array({either:['SyntaxId','OccurrenceId']}),diagnostic:nullable('Text')}),
+  DeclarationBinding:object({syntaxId:nullable('SyntaxId'),symbols:array('SymbolKey'),join:'Join',provenanceId:'Text'}),
+  TypeRelationship:object({kind:enumOf('extends','implements','overrides'),source:'Target',target:'Target',provenanceId:'Text'}),
+  Call:object({id:'OccurrenceId',ownerSyntaxId:'SyntaxId',ordinal:'UInt',document:'DocumentKey',revisionId:'Text',range:'Range',calleeRange:nullable('Range'),spelling:nullable('Text'),regionIds:array('OccurrenceId'),provenanceId:'Text'}),
+  ControlRegion:object({id:'OccurrenceId',ownerSyntaxId:'SyntaxId',ordinal:'UInt',document:'DocumentKey',revisionId:'Text',kind:'Text',range:'Range',parentId:nullable('OccurrenceId'),arm:nullable('Text'),provenanceId:'Text'}),
+  Reference:object({id:'OccurrenceId',ownerSyntaxId:'SyntaxId',ordinal:'UInt',document:'DocumentKey',revisionId:'Text',range:'Range',spelling:'Text',lookupKey:'Text',site:enumOf('declaration','use'),roles:array('Role'),resolution:'Resolution',declaredTarget:nullable('Target'),candidates:array('Target'),provenanceId:'Text'}),
+  CallBinding:object({callId:nullable('OccurrenceId'),join:'Join',resolution:'Resolution',declaredTarget:nullable('Target'),candidates:array('Target'),dispatch:enumOf('direct','constructor','virtual','interface','dynamic','unknown'),possibleDispatch:array('Target'),possibleDispatchComplete:literal(false),staleTarget:nullable('boolean'),provenanceId:'Text'}),
+  DurableAnchor:object({syntaxId:'SyntaxId',document:'DocumentKey',capturedRevisionId:'Text',headerHash:'Hash',siblingGroupHash:'Hash',siblingCount:'UInt',identicalHeaderCount:'UInt'}),
+  GroupContinuity:object({fromRevisionId:'Text',toRevisionId:'Text',state:enumOf('unchanged','changed','unknown'),evidence:nullable('Text')}),
+  AnchorResult:object({status:enumOf('attached','orphaned'),targetId:nullable('SyntaxId'),reason:enumOf('none','missing','headerMismatch','groupChanged','unprovenContinuity')}),
+  GraphRequest:object({sourceSetId:'Text',revisionId:'Text',rootSyntaxId:'SyntaxId',semanticProducerId:nullable('Text'),depth:'UInt',maxNodes:'UInt',maxCalls:'UInt'}),
+  GraphNode:object({declaration:'Declaration',depth:'UInt'}),
+  GraphEdge:object({call:'Call',from:'SyntaxId',to:nullable('SyntaxId'),binding:nullable('CallBinding'),visit:enumOf('new','seen','boundary'),boundaryReason:enumOf('none','external','unresolved','ambiguous','dispatch','stale','nodeLimit','missingEvidence')}),
+  Frontier:object({reason:enumOf('depth','nodeLimit','callLimit'),nodeId:'SyntaxId',callId:nullable('OccurrenceId'),targetId:nullable('SyntaxId'),nextOrdinal:nullable('UInt'),omittedCalls:'UInt'}),
+  Warning:object({code:enumOf('coverageIncomplete','staleEvidence','staleTarget','bindingAmbiguous','syntaxOnly'),message:'Text',provenanceId:nullable('Text')}),
+  GraphResult:object({request:'GraphRequest',resolvedRevisionId:'Text',nodes:array('GraphNode'),edges:array('GraphEdge'),frontier:array('Frontier'),coverage:array('Coverage'),provenance:array('Provenance'),partial:'boolean',truncated:'boolean',warnings:array('Warning')}),
+  Error:object({code:enumOf('invalidRequest','invalidRecord','invalidRange','invalidDigest','unsupportedEncoding','sourceSetDenied','revisionUnavailable','rootMissing','producerUnavailable'),message:'Text',field:nullable('Text')}),
+  Success:object({ok:literal(true),result:'GraphResult'}),Failure:object({ok:literal(false),error:'Error'}),
+  GraphAnswer:union('ok',{true:'Success',false:'Failure'}),
+  SyntaxDigestInput:object({sourceSet:'Text',path:'Path',language:'Language',ancestors:array('Key'),declaration:'Key'}),
+  OccurrenceDigestInput:object({revisionId:'Text',ownerSyntaxId:'SyntaxId',kind:enumOf('call','reference','control'),ordinal:'UInt'}),
+  SourceManifestRow:object({document:'DocumentKey',contentHash:'Hash'}),
+  SourceManifestInput:array('SourceManifestRow'), SiblingGroupInput:object({headers:array('Hash')}),HeaderDigestInput:'Header',
+  PositionRange:object({encoding:enumOf('utf8','utf16','unicodeScalar'),start:'UInt',end:'UInt'}),
+  SourceWitness:object({range:'PositionRange',text:'Text'}),
+  WitnessEntry:object({field:'Text',witness:'SourceWitness'}),
+  CapturedDocument:object({key:'DocumentKey',revisionId:'Text',sourceFile:'Path'}),
+  CapturedRevision:object({id:'Text',sourceSetId:'Text',documents:array('CapturedDocument'),toolchainHash:'Hash',configHash:'Hash',dependencyHash:'Hash'}),
+  ComparisonContext:object({sourceSetId:'Text',revisionId:'Text',producers:array('Producer')}),
+  CaptureFile:object({ref:'Text',kind:enumOf('executable','toolchain','config','dependency','semanticArtifact'),file:'Path',hash:'Hash'}),
+  MeasurementSupport:object({kind:enumOf('declarationName','callee','invocation','reference'),available:'boolean',diagnostic:nullable('Text')}),
+  CoverageIntent:object({producerId:'Text',document:'DocumentKey',revisionId:'Text',requestedRoles:array('Role'),measurementSupport:array('MeasurementSupport')}),
+  FixtureV1:object({formatVersion:literal(1),profile:enumOf('example','corpus'),language:'Language',sourceSets:array('SourceSet'),producers:array('Producer'),revisions:array('CapturedRevision'),comparison:'ComparisonContext',coverageIntents:array('CoverageIntent'),nativeArtifact:'Path',semanticArtifacts:array('Path'),annotationFiles:array('Path'),answersFile:'Path',dispositionsFile:'Path',anchorCasesFile:'Path',captures:array('CaptureFile')}),
+  AnchorSelector:object({document:'DocumentKey',revisionId:'Text',contentHash:'Hash',kind:enumOf('declarationName','callee','invocation','reference'),range:'PositionRange',ownerRef:'Text'}),
+  NativeDeclaration:object({ref:'Text',nativeId:nullable('Text'),document:'DocumentKey',revisionId:'Text',parentRef:nullable('Text'),kind:'Kind',name:nullable('Text'),range:'PositionRange',nameRange:nullable('PositionRange'),header:'Header',signature:nullable('Signature'),witnesses:array('WitnessEntry')}),
+  NativeCall:object({ref:'Text',nativeId:nullable('Text'),document:'DocumentKey',revisionId:'Text',ownerRef:'Text',range:'PositionRange',calleeRange:nullable('PositionRange'),spelling:nullable('Text'),regionRefs:array('Text'),witnesses:array('WitnessEntry')}),
+  NativeControl:object({ref:'Text',nativeId:nullable('Text'),document:'DocumentKey',revisionId:'Text',ownerRef:'Text',parentRef:nullable('Text'),kind:'Text',range:'PositionRange',arm:nullable('Text'),witnesses:array('WitnessEntry')}),
+  NativeReference:object({ref:'Text',nativeId:nullable('Text'),document:'DocumentKey',revisionId:'Text',ownerRef:'Text',range:'PositionRange',spelling:'Text',witnesses:array('WitnessEntry')}),
+  NativeArtifact:object({formatVersion:literal(1),producerId:'Text',declarations:array('NativeDeclaration'),calls:array('NativeCall'),controls:array('NativeControl'),references:array('NativeReference')}),
+  IdentityRef:object({ref:'Text'}),RecordRef:object({recordRef:'Text'}),
+  TargetRef:union('kind',{internal:object({kind:literal('internal'),declarationRef:'Text',revisionId:'Text'}),external:object({kind:literal('external'),symbol:'SymbolKey'})}),
+  TypeRelationshipFact:object({kind:literal('typeRelationship'),ref:'Text',relationshipKind:enumOf('extends','implements','overrides'),source:'TargetRef',target:'TargetRef',provenanceRef:'Text'}),
+  InternalTargetRef:object({kind:literal('internal'),declarationRef:'Text',revisionId:'Text'}),
+  ReferenceEvidenceTemplate:object({site:enumOf('declaration','use'),roles:array('Role'),resolution:'Resolution',declaredTarget:nullable('TargetRef'),candidates:array('TargetRef'),provenanceId:'Text'}),
+  ReferenceFact:object({kind:literal('reference'),ref:'Text',anchor:'AnchorSelector',record:'ReferenceEvidenceTemplate'}),
+  DeclarationBindingFact:object({kind:literal('declarationBinding'),ref:'Text',anchor:'AnchorSelector',record:'DeclarationBindingEvidenceTemplate'}),
+  CallBindingFact:object({kind:literal('callBinding'),ref:'Text',anchor:'AnchorSelector',record:'CallBindingEvidenceTemplate'}),
+  SymbolFact:object({kind:literal('symbol'),ref:'Text',record:'SymbolTemplate'}),
+  CoverageFact:object({kind:literal('coverage'),ref:'Text',record:'Coverage'}),
+  ProvenanceFact:object({kind:literal('provenance'),ref:'Text',record:'Provenance'}),
+  Fact:union('kind',{declarationBinding:'DeclarationBindingFact',callBinding:'CallBindingFact',reference:'ReferenceFact',typeRelationship:'TypeRelationshipFact',symbol:'SymbolFact',coverage:'CoverageFact',provenance:'ProvenanceFact'}),
+  Scenario:object({id:'Text',category:enumOf('sameNameOverload','importsAliases','callableValues','recursion','relationshipsDispatch','unicodeCoordinates','coverageFreshness','compatibilityControl'),anchors:array('AnchorSelector'),factRefs:array('Text')}),
+  AnnotationFile:object({formatVersion:literal(1),document:'DocumentKey',revisionId:'Text',scenarios:array('Scenario'),facts:array('Fact')}),
+  SemanticCapture:object({formatVersion:literal(1),producerId:'Text',facts:array('Fact')}),
+  ReferenceJoinDiagnostic:object({factRef:'Text',provenanceId:'Text',join:'NonExactReferenceJoin'}),
+  NonExactReferenceJoin:object({anchor:'ReferenceAnchor',status:enumOf('ambiguous','unmatched','unsupported'),candidateIds:array('OccurrenceId'),diagnostic:'Text'}),
+  ReferenceAnchor:object({document:'DocumentKey',revisionId:'Text',contentHash:'Hash',range:'Range',kind:literal('reference')}),
+  NormalizedRecordsV1:object({formatVersion:literal(1),comparison:'ComparisonContext',producers:array('Producer'),sourceSets:array('SourceSet'),revisions:array('Revision'),coverage:array('Coverage'),provenance:array('Provenance'),declarations:array('Declaration'),symbols:array('Symbol'),declarationBindings:array('DeclarationBinding'),typeRelationships:array('TypeRelationship'),calls:array('Call'),controlRegions:array('ControlRegion'),references:array('Reference'),referenceJoinDiagnostics:array('ReferenceJoinDiagnostic'),callBindings:array('CallBinding'),durableAnchors:array('DurableAnchor'),groupContinuities:array('GroupContinuity'),anchorResults:array('AnchorResult')}),
+  AttemptedGraphRequest:object({sourceSetId:'Text',revisionId:'Text',rootSyntaxId:'SyntaxId',semanticProducerId:nullable('Text'),depth:'UInt',maxNodes:'UInt',maxCalls:'UInt'}),
+  AnswerCase:object({id:'Text',attemptedRequest:'GraphRequestTemplate',answer:'GraphAnswerTemplate'}),
+  AnswersInputV1:object({formatVersion:literal(1),answers:array('AnswerCase')}),
+  MaterializedAnswerCase:object({id:'Text',attemptedRequest:'AttemptedGraphRequest',answer:'GraphAnswer'}),
+  AnswersV1:object({formatVersion:literal(1),answers:array('MaterializedAnswerCase')}),
+  JoinDisposition:object({kind:literal('join'),factRef:'Text',disposition:enumOf('exact','ambiguous','unmatched','unsupported')}),
+  ResolutionDisposition:object({kind:literal('resolution'),factRef:'Text',disposition:enumOf('resolved','provenExternal','ambiguous','unresolved')}),
+  Disposition:union('kind',{join:'JoinDisposition',resolution:'ResolutionDisposition'}),
+  CallableValueNegative:object({scenarioId:'Text',referenceRef:'Text',ownerRef:'Text',range:'PositionRange'}),
+  DispositionsV1:object({formatVersion:literal(1),assertions:array('Disposition'),callableValueNegatives:array('CallableValueNegative')}),
+  AnchorResultTemplate:object({status:enumOf('attached','orphaned'),targetId:nullable({either:['SyntaxId','IdentityRef']}),reason:enumOf('none','missing','headerMismatch','groupChanged','unprovenContinuity')}),
+  AnchorCase:object({id:'Text',capturedDeclarationRef:'Text',currentRevisionId:'Text',continuity:'GroupContinuity',expectedResult:'AnchorResultTemplate'}),
+  AnchorCasesV1:object({formatVersion:literal(1),cases:array('AnchorCase')}),
+  CategoryCount:object({category:enumOf('sameNameOverload','importsAliases','callableValues','recursion','relationshipsDispatch','unicodeCoordinates','coverageFreshness','compatibilityControl'),count:'UInt'}),
+  OutcomeCount:object({disposition:enumOf('resolved','provenExternal','ambiguous','unresolved','unsupported'),count:'UInt'}),
+  CountsV1:object({formatVersion:literal(1),language:'Language',profile:enumOf('example','corpus'),floorsEnforced:'boolean',scenariosTotal:'UInt',scenariosByCategory:array('CategoryCount'),measuredCalls:'UInt',references:'UInt',callableValueNegatives:'UInt',typeRelationships:'UInt',outcomes:array('OutcomeCount'),observedRoles:array('Role')}),
+  FileDigest:object({path:'Path',hash:'Hash'}),
+  ManifestV1:object({formatVersion:literal(1),contractVersion:literal(1),warningsVersion:literal('warnings-v1'),language:'Language',profile:enumOf('example','corpus'),inputHash:'Hash',bundleHash:'Hash',records:'FileDigest',answers:'FileDigest',counts:'FileDigest'}),
+  BundleDigestInput:object({recordsHash:'Hash',answersHash:'Hash',countsHash:'Hash',inputHash:'Hash'}),
+  InputDigestRow:object({path:'Path',hash:'Hash'}),InputDigestInput:array('InputDigestRow')
+});
+// The only places where an authored answer may substitute an identity or a record.
+const identity = name => ({either:[name,'IdentityRef']});
+const record = name => ({either:[name,'RecordRef']});
+const templateTarget = union('kind', {internal:object({kind:literal('internal'),declarationRef:'Text',revisionId:'Text'}),external:types.Target.union.variants.external});
+export const schemas = Object.freeze({...types,
+ TargetTemplate:templateTarget,
+ DeclarationBindingTemplate:object({syntaxId:nullable(identity('SyntaxId')),symbols:array('SymbolKey'),join:'Join',provenanceId:'Text'}),
+ DeclarationBindingEvidenceTemplate:object({symbols:array('SymbolKey'),provenanceId:'Text'}),
+ CallBindingEvidenceTemplate:object({resolution:'Resolution',declaredTarget:nullable('TargetRef'),candidates:array('TargetRef'),dispatch:enumOf('direct','constructor','virtual','interface','dynamic','unknown'),possibleDispatch:array('TargetRef'),possibleDispatchComplete:literal(false),provenanceId:'Text'}),
+ CallBindingTemplate:object({callId:nullable(identity('OccurrenceId')),join:'Join',resolution:'Resolution',declaredTarget:nullable('TargetRef'),candidates:array('TargetRef'),dispatch:enumOf('direct','constructor','virtual','interface','dynamic','unknown'),possibleDispatch:array('TargetRef'),possibleDispatchComplete:literal(false),staleTarget:nullable('boolean'),provenanceId:'Text'}),
+ SymbolTemplate:object({key:'SymbolKey',displayName:nullable('Text'),declarations:array('TargetRef'),provenanceId:'Text'}),
+ GraphRequestTemplate:object({...types.GraphRequest.object,rootSyntaxId:identity('SyntaxId')}),
+ GraphNodeTemplate:object({declaration:record('Declaration'),depth:'UInt'}),
+ GraphEdgeTemplate:object({call:record('Call'),from:identity('SyntaxId'),to:nullable(identity('SyntaxId')),binding:nullable(record('CallBinding')),visit:types.GraphEdge.object.visit,boundaryReason:types.GraphEdge.object.boundaryReason}),
+ FrontierTemplate:object({reason:types.Frontier.object.reason,nodeId:identity('SyntaxId'),callId:nullable(identity('OccurrenceId')),targetId:nullable(identity('SyntaxId')),nextOrdinal:nullable('UInt'),omittedCalls:'UInt'}),
+ GraphResultTemplate:object({request:'GraphRequestTemplate',resolvedRevisionId:'Text',nodes:array('GraphNodeTemplate'),edges:array('GraphEdgeTemplate'),frontier:array('FrontierTemplate'),coverage:array(record('Coverage')),provenance:array(record('Provenance')),partial:'boolean',truncated:'boolean',warnings:array('Warning')}),
+ SuccessTemplate:object({ok:literal(true),result:'GraphResultTemplate'}),FailureTemplate:types.Failure,
+ GraphAnswerTemplate:union('ok',{true:'SuccessTemplate',false:'FailureTemplate'})
+});
+export const enums = Object.freeze(Object.fromEntries(Object.entries(schemas).filter(([,s]) => s?.enum).map(([n,s]) => [n,s.enum])));
+
+// Field-path tables retain the contract's declaration order (not lexical order).
+export const enumTables = Object.freeze((function collect() {
+ const found = {};
+ function visit(spec, path, seen=new Set()) {
+  if (typeof spec === 'string') {
+   if (!Object.hasOwn(schemas,spec) || seen.has(spec)) return;
+   return visit(schemas[spec],path,new Set([...seen,spec]));
+  }
+  if (spec.enum) { found[path]=Object.freeze([...spec.enum]); return; }
+  if (spec.nullable) return visit(spec.nullable,path,seen);
+  if (spec.array) return visit(spec.array,`${path}[]`,seen);
+  if (spec.either) return spec.either.forEach((v,i)=>visit(v,`${path}|${i}`,seen));
+  if (spec.union) return Object.entries(spec.union.variants).forEach(([variant,v])=>visit(v,`${path}:${variant}`,seen));
+  if (spec.object) Object.entries(spec.object).forEach(([key,v])=>visit(v,`${path}.${key}`,seen));
+ }
+ for (const [name,spec] of Object.entries(schemas)) visit(spec,name,new Set([name]));
+ return found;
+})());
