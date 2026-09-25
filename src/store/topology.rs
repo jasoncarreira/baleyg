@@ -1205,11 +1205,33 @@ fn ensure_safe_record_contents(dir: &Path) -> Result<()> {
     ensure!(count == 1, "incomplete_record: missing database");
     Ok(())
 }
+fn validate_record_schema(db: &rusqlite::Connection) -> Result<()> {
+    type SchemaObject = (String, String, String, Option<String>);
+    fn objects(db: &rusqlite::Connection) -> rusqlite::Result<Vec<SchemaObject>> {
+        db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect()
+    }
+    // SQLite generates internal autoindex names for the package's PRIMARY KEY constraints.
+    // Compare those as well as the original table SQL, not just queryable columns: a
+    // countable record with weaker constraints must never be destroyed automatically.
+    let expected = rusqlite::Connection::open_in_memory()?;
+    expected.execute_batch(RECORD_SCHEMA)?;
+    ensure!(
+        objects(db)? == objects(&expected)?,
+        "incompatible_record: unexpected SQLite schema"
+    );
+    Ok(())
+}
+
 fn inspect_record(dir: &Path, id: &str) -> Result<(RecordReport, Vec<String>)> {
     private_dir(dir)?;
     let db = readonly_db(&dir.join("workspace.db"))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     ensure!(version == 1, "incompatible_record: schema version");
+    validate_record_schema(&db)?;
     let row: (i64, String, i64) = db.query_row(
         "SELECT schema_version,record_id,initialized FROM record_metadata WHERE singleton=1",
         [],

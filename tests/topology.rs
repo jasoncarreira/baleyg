@@ -1825,3 +1825,87 @@ fn forget_empty_record_and_recovery_sidecars_refuse() {
             .unwrap()
     );
 }
+
+#[test]
+fn forget_refuses_countable_records_with_unknown_sqlite_schema() {
+    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    for (n, change) in [
+        "CREATE TABLE unexpected (id INTEGER)",
+        "CREATE VIEW unexpected AS SELECT id FROM views",
+        "CREATE TRIGGER unexpected AFTER INSERT ON views BEGIN SELECT 1; END",
+        "CREATE INDEX unexpected ON views(payload)",
+        "ALTER TABLE views ADD COLUMN unexpected TEXT",
+        "UPDATE sqlite_master SET sql=replace(sql,'CHECK(schema_version=1)','CHECK(schema_version>0)') WHERE name='record_metadata'",
+    ].iter().enumerate() {
+        let work = temp.path().join(format!("unsafe-schema-{n}"));
+        fs::create_dir(&work).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        DurableRecords::new(&roots, &identity).put_view(&view).unwrap();
+        let path = roots.record_db(&identity);
+        let lock = roots.record_use_lock(&identity);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        if n == 5 {
+            db.pragma_update(None, "writable_schema", "ON").unwrap();
+        }
+        db.execute_batch(change).unwrap();
+        if n == 5 {
+            db.pragma_update(None, "writable_schema", "OFF").unwrap();
+            db.pragma_update(None, "schema_version", 100).unwrap();
+        }
+        assert_eq!(db.query_row("SELECT count(*) FROM views", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(db);
+        let before_db = fs::read(&path).unwrap();
+        let before_lock = fs::read(&lock).unwrap();
+        let unrelated = temp.path().join(format!("unrelated-{n}"));
+        fs::write(&unrelated, "keep").unwrap();
+        let before_unrelated = fs::read(&unrelated).unwrap();
+        let mut asked = false;
+        let result = roots.forget_with_confirmation(&identity.record_id, |_, _| {
+            asked = true;
+            Ok(true)
+        });
+        assert!(result.is_err(), "{change}");
+        assert!(!asked, "must reject before confirmation: {change}");
+        assert_eq!(fs::read(&path).unwrap(), before_db, "{change}");
+        assert_eq!(fs::read(&lock).unwrap(), before_lock, "{change}");
+        assert_eq!(fs::read(&unrelated).unwrap(), before_unrelated, "{change}");
+    }
+}
+
+#[test]
+fn forget_rechecks_sqlite_schema_after_confirmation() {
+    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    DurableRecords::new(&roots, &identity)
+        .put_view(&view)
+        .unwrap();
+    let path = roots.record_db(&identity);
+    let lock = roots.record_use_lock(&identity);
+    assert!(
+        roots
+            .forget_with_confirmation(&identity.record_id, |_, _| {
+                let db = rusqlite::Connection::open(&path)?;
+                db.execute_batch("CREATE TABLE late_entry(id INTEGER)")?;
+                Ok(true)
+            })
+            .is_err()
+    );
+    assert!(path.exists() && lock.exists());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM views", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}

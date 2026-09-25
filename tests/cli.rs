@@ -581,3 +581,49 @@ fn forget_cli_requires_confirmation_and_preserves_unrelated_state() {
     assert_eq!(fs::read_to_string(other).unwrap(), "still here");
     assert!(!run(id, true).status.success());
 }
+
+#[test]
+fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
+    use baleyg::{
+        model::SavedView,
+        store::topology::{DurableRecords, TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let work = temp.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let data = home.join(if cfg!(target_os = "macos") {
+        "Library/Application Support/dev.odin.baleyg"
+    } else {
+        ".local/share/baleyg"
+    });
+    let roots = TopologyRoots::isolated_for_tests(home.join("cache"), data);
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    DurableRecords::new(&roots, &identity)
+        .put_view(&view)
+        .unwrap();
+    let path = roots.record_db(&identity);
+    let lock = roots.record_use_lock(&identity);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE unknown(id INTEGER)")
+        .unwrap();
+    drop(db);
+    let before = fs::read(&path).unwrap();
+    let lock_before = fs::read(&lock).unwrap();
+    let unrelated = home.join("unrelated");
+    fs::write(&unrelated, "keep").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .args(["forget", &identity.record_id, "--yes"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unexpected SQLite schema"));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&lock).unwrap(), lock_before);
+    assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+}
