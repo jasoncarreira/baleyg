@@ -21,7 +21,7 @@ const plans=[
  {state:'failed',requestedRoles:['read'],supportedRoles:['read'],observedRoles:[],requested:true,selected:true,diagnostic:'capture failed'},
  {state:'notRequested',requestedRoles:[],supportedRoles:[],observedRoles:[],requested:false,selected:false,diagnostic:null}
 ];
-async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,requestedChange=null,language="javascript",setId="main",captureValues={},secondSet=false,comparisonSet=setId,omitSelectedDocument=false,completeHistorical=false}={}){
+async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,requestedChange=null,language="javascript",setId="main",captureValues={},secondSet=false,comparisonSet=setId,omitSelectedDocument=false,completeHistorical=false,zeroFactHistorical=false}={}){
  const root=await mkdtemp(join(tmpdir(),'coverage-u1-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const files=new Map(),put=(name,data)=>files.set(name,typeof data==='string'?data:JSON.stringify(data));
  const natives='native-executable', sem1='semantic-one',sem2='semantic-two';
@@ -42,7 +42,7 @@ async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,request
  for(const revision of revisions)for(const doc of revision.documents){
   const annotationFile=`${doc.sourceFile}.annotations.json`;annotationFacts.set(annotationFile,[]);
   for(const producer of producers){
-   const plan=completeHistorical&&producer.id==='one'&&revision.id==='r1'&&doc.key.path==='a.js'?{...plans[0],requestedRoles:['read','type'],supportedRoles:['read','type'],observedRoles:['read','type']}:producer.id==='one'&&revision.id==='r2'&&doc.key.path==='a.js'?plans[4]:producer.id==='two'&&revision.id==='r1'&&doc.key.path==='a.js'?plans[1]:plans[count%plans.length];count++;
+   const plan=zeroFactHistorical&&producer.id==='one'&&doc.key.path==='b.js'?(revision.id==='r1'?plans[0]:plans[2]):completeHistorical&&producer.id==='one'&&revision.id==='r1'&&doc.key.path==='a.js'?{...plans[0],requestedRoles:['read','type'],supportedRoles:['read','type'],observedRoles:['read','type']}:producer.id==='one'&&revision.id==='r2'&&doc.key.path==='a.js'?plans[4]:producer.id==='two'&&revision.id==='r1'&&doc.key.path==='a.js'?plans[1]:plans[count%plans.length];count++;
    const record={producerId:producer.id,language:doc.key.language,sourceSetId:doc.key.sourceSetId,documentPath:doc.key.path,revisionId:revision.id,requested:plan.requested,selected:plan.selected,state:plan.state,supportedRoles:plan.supportedRoles,observedRoles:plan.observedRoles,diagnostic:plan.diagnostic};
    const ref=`coverage-${producer.id}-${revision.id}-${doc.key.path}`;
    annotationFacts.get(annotationFile).push({kind:'coverage',ref,record});
@@ -305,6 +305,19 @@ test('all role families require their own admitted measurement support',async t=
 
 
 
+test('captured zero-fact complete tuple remains distinct from later omitted coverage',async t=>{
+ const b=await specimen(t,{zeroFactHistorical:true}),C=checkCoverage(b.loaded,b.records);
+ const doc=b.docs[1],historical=C.checkUse({producerId:'one',document:doc,revisionId:'r1',provenanceIds:[]});
+ assert.equal(historical.coverage.state,'complete');assert.deepEqual(historical.proofs,[]);
+ const current=C.checkUse({producerId:'one',document:doc,revisionId:'r2',provenanceIds:[]});
+ assert.equal(current.coverage.state,'omitted');assert.equal(current.coverage.selected,false);
+ assert.equal(C.checkUse({producerId:'two',document:doc,revisionId:'r1',provenanceIds:[]}).coverage.producerId,'two');
+ const control=registerControls([{id:'U1.zero-fact-captured-tuple-not-requested-r2',
+  baseline:()=>({producerId:'one',document:doc,revisionId:'r1',provenanceIds:[]}),
+  mutate:value=>({...value,provenanceIds:[b.proofs[0].id]}),check:value=>C.checkUse(value),
+  expectedAssertion:'FRESHNESS.USE',expectedCode:'invalidRecord',expectedField:'provenanceIds'}])[0];
+ await t.test(control.id,()=>runControl(control));
+});
 test('both semantic producers retain historical r1 proofs despite failed r2 refresh',async t=>{
  const b=await specimen(t),C=checkCoverage(b.loaded,b.records);
  assert.equal(b.records.coverage.find(x=>x.producerId==='one'&&x.revisionId==='r2'&&x.documentPath==='a.js').state,'failed');

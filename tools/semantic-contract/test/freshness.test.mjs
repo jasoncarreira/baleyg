@@ -37,7 +37,7 @@ function verifiedDeclarations(loaded){
 async function prepared(t) {
  const s=await specimen();t.after(s.cleanup);
  const initial=await loadFixture(s.root), captured=initial.selected;
- const base={id:'proof1',producerId:'semantic',document:s.document,revisionId:'r1',contentHash:captured.documents[0].contentHash,evidenceKind:'semanticReference',basis:{producerId:'semantic',producerVersion:'1',producerHash:s.fixture.producers[1].executableHash,artifactHash:s.fixture.captures.find(x=>x.ref==='fact').hash,language:'javascript',sourceSetId:'main',revisionId:'r1',sourceManifestHash:initial.sourceManifestHash(captured),toolchainHash:captured.toolchainHash,configHash:captured.configHash,dependencyHash:captured.dependencyHash,lookupDependencies:[]},freshness:'fresh'};
+ const base={id:'proof1',producerId:'semantic',document:s.document,revisionId:'r1',contentHash:captured.documents[0].contentHash,evidenceKind:'declarationBinding',basis:{producerId:'semantic',producerVersion:'1',producerHash:s.fixture.producers[1].executableHash,artifactHash:s.fixture.captures.find(x=>x.ref==='fact').hash,language:'javascript',sourceSetId:'main',revisionId:'r1',sourceManifestHash:initial.sourceManifestHash(captured),toolchainHash:captured.toolchainHash,configHash:captured.configHash,dependencyHash:captured.dependencyHash,lookupDependencies:[]},freshness:'fresh'};
  const fact={kind:'symbol',ref:'symbol1',record:{key:{scheme:'scip',symbol:'example/go',scope:'global',document:null},displayName:'go',declarations:[],provenanceId:'proof1'}};
  const raw={formatVersion:1,producerId:'semantic',facts:[fact]};
  const encoded=JSON.stringify(raw);s.files['captures/fact.json']=encoded;
@@ -60,6 +60,13 @@ test('BASIS.* validates each captured descriptor and byte claim before freshness
  const native={...base,producerId:'native',evidenceKind:'measuredSyntax',basis:null};
  assert.equal(checkFreshness(native,r1),'fresh');
  assert.throws(()=>checkCapturedBasis({...native,basis:base.basis},r1),{assertion:'BASIS.NATIVE_PAIRING'});
+});
+test('BASIS.RAW_FACT compares captured wrapper fields without depending on JSON key order',async t=>{
+ const {r1,base}=await prepared(t);
+ const reordered={...base,basis:Object.fromEntries(Object.entries(base.basis).reverse())};
+ assert.equal(checkCapturedBasis(reordered,r1).producer.id,'semantic');
+ const wrong={...reordered,basis:{...reordered.basis,producerVersion:'other'}};
+ assert.throws(()=>checkCapturedBasis(wrong,r1),{assertion:'BASIS.PRODUCERVERSION',field:'producerVersion'});
 });
 test('FRESHNESS.TWO_REVISION_CONTEXT retains r1 proof but compares pinned r2 snapshot',async t=>{
  const {s,r1,base}=await prepared(t);assert.equal(checkFreshness(base,r1),'fresh');
