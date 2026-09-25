@@ -13,7 +13,8 @@ The authenticated daemon currently requires Unix private-file permissions.
 ```sh
 cargo test --locked --all-targets
 cargo run --locked -- index
-cargo run --locked -- serve
+mkdir -m 700 -p "$HOME/.baleyg-private"
+cargo run --locked -- serve --token-file "$HOME/.baleyg-private/token"
 ```
 
 Open **http://127.0.0.1:8877/**. Paste the token or load the private token file whose path
@@ -27,13 +28,13 @@ Without SCIP, calls are visible as unresolved syntax; Baleyg does not guess thei
 For the existing feature-factory snapshot with semantic resolution, see
 [the daemon guide](docs/daemon-v1.md#use-the-existing-semantic-snapshot).
 
-State defaults to a per-workspace OS application-data directory **outside the repository**.
-Use `--state-dir /path/to/state` to override it. A state directory belongs to one canonical
-workspace. Indexing never runs package scripts, installs source dependencies, or edits source.
-The accepted direction keeps each checkout's index as a pure cache in the per-user cache directory,
-keyed by the checkout's path, and keys saved views and notes by a UUID in the checkout's Git
-directory so they follow a moved checkout. The `--state-dir` flag goes away, and there are no state
-migrations. See [local topology](docs/local-topology.md#storage).
+Current storage uses fixed per-user cache/data locations **outside the repository**; `--state-dir`
+is removed. A disposable index follows the checkout path. Saved views and notes use a Git UUID
+marker and follow a moved Git checkout; a copied marker shares those items. Non-Git saved records
+are path-bound. `serve` requires an explicit private `--token-file` outside the selected checkout;
+Jev and ACP ledgers also require explicit external paths when enabled. No old state migrates
+automatically. Indexing never runs package scripts, installs source dependencies, or edits source.
+See [local topology](docs/local-topology.md#storage).
 
 ## What works
 
