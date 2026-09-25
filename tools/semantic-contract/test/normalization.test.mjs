@@ -6,6 +6,7 @@ import {join,dirname} from 'node:path';
 import {loadFixture} from '../load.mjs';
 import {normalize,normalizeRelationship,buildAnchorIndex,joinAnchor} from '../normalize.mjs';
 import {contentHash} from '../identity.mjs';
+import {registerControls,runControl} from './mutations.mjs';
 const hash=x=>contentHash(Buffer.from(x));
 async function specimen() {
   const root=await mkdtemp(join(tmpdir(),'admission-'));
@@ -66,6 +67,55 @@ test('source leaves include parameter, signature, modifiers, bases, and result t
 test('source identity and ordering are deterministic under shuffled rows and nativeId changes',async t=>{const {loaded}=await loadedMeasured(t);const before=normalize(loaded);for(const group of ['declarations','calls','references'])loaded.native[group].reverse().forEach(x=>x.nativeId='different');const after=normalize(loaded);assert.deepEqual(after.records,before.records);assert.deepEqual([...after.identityMap],[...before.identityMap]);});
 test('control chain requires unique ordered containing regions',async t=>{const {loaded}=await loadedMeasured(t),n=loaded.native;const base={nativeId:null,document:n.declarations[0].document,revisionId:'r1',ownerRef:'decl',arm:null,witnesses:[]};n.controls=[{...base,ref:'outer',parentRef:null,kind:'block',range:span(0,30)},{...base,ref:'inner',parentRef:'outer',kind:'if',range:span(15,22)}];n.calls[0].regionRefs=['outer','inner'];assert.equal(normalize(loaded).records.calls[0].regionIds.length,2);n.calls[0].regionRefs=['inner','outer'];assert.throws(()=>normalize(loaded),/NORMALIZE.REGION/);n.calls[0].regionRefs=['outer','outer'];assert.throws(()=>normalize(loaded),/NORMALIZE.REGION/);});
 
+
+// Keep the invocation evidence independent of the declaration-name witnesses.
+async function invocationFixture(t){
+ const s=await specimen();t.after(s.cleanup);
+ s.source='function main() { target(); }\nfunction target() {}\n';
+ s.files['src/go.js']=s.source;
+ const declaration=(ref,name,start,end,nameStart)=>({
+  ref,nativeId:null,document:s.document,revisionId:'r1',parentRef:null,kind:'function',name,
+  range:span(start,end),nameRange:span(nameStart,nameStart+name.length),
+  header:{kind:'function',name,modifiers:[],typeParameters:[],parameters:[],resultType:null,bases:[]},
+  signature:null,witnesses:['name','header.name'].map(field=>({field,witness:{range:span(nameStart,nameStart+name.length),text:name}}))
+ });
+ const native={formatVersion:1,producerId:'native',declarations:[declaration('main','main',0,29,9),declaration('target','target',30,50,39)],
+  calls:[{ref:'invocation',nativeId:null,document:s.document,revisionId:'r1',ownerRef:'main',range:span(18,27),calleeRange:span(18,24),spelling:null,regionRefs:[],witnesses:[]}],controls:[],references:[]};
+ s.files['captures/native.json']=JSON.stringify(native);await s.flush();
+ return {loaded:await loadFixture(s.root),native};
+}
+const invocationWitness=()=>({field:'spelling',witness:{range:span(18,24),text:'target'}});
+test('real measured target() retains all four independent nullable spelling/callee combinations',async t=>{
+ const {loaded,native}=await invocationFixture(t);
+ for(const [calleeRange,spelling,witnesses] of [
+  [span(18,24),null,[]],[null,'target',[invocationWitness()]],
+  [span(18,24),'target',[invocationWitness()]],[null,null,[]]
+ ]){
+  const input=structuredClone(native);Object.assign(input.calls[0],{calleeRange,spelling,witnesses});
+  const output=normalize({...loaded,native:input});
+  assert.equal(output.records.calls.length,1);
+  assert.deepEqual(output.records.calls[0].calleeRange,calleeRange===null?null:{start:18,end:24});
+  assert.equal(output.records.calls[0].spelling,spelling);
+  assert.equal(output.recordMap.get('invocation').spelling,spelling);
+  assert.equal(output.records.declarations.length,2);
+ }
+});
+
+test('nullable call spelling controls use admitted source and exact logical failures',async t=>{
+ const {loaded,native}=await invocationFixture(t);
+ const withWitness=()=>{const input=structuredClone(native);Object.assign(input.calls[0],{calleeRange:null,spelling:'target',witnesses:[invocationWitness()]});return input;};
+ const rows=registerControls([
+  {id:'F2.spelling-witness-missing',baseline:withWitness,check:input=>normalize({...loaded,native:input}),mutate:input=>{input.calls[0].witnesses=[];return input;},expectedAssertion:'WITNESS.MISSING',expectedCode:'invalidRecord',expectedField:'spelling'},
+  {id:'F2.authored-spelling-changed',baseline:withWitness,check:input=>normalize({...loaded,native:input}),mutate:input=>{input.calls[0].spelling='different';return input;},expectedAssertion:'NORMALIZE.WITNESS',expectedCode:'invalidRecord',expectedField:'spelling'},
+  {id:'F2.spelling-witness-encoding',baseline:withWitness,check:input=>normalize({...loaded,native:input}),mutate:input=>{input.calls[0].witnesses[0].witness.range.encoding='utf16';return input;},expectedAssertion:'NORMALIZE.ENCODING',expectedCode:'invalidRecord',expectedField:'witnesses.spelling'},
+  {id:'F2.callee-outside-invocation',baseline:()=>structuredClone(native),check:input=>normalize({...loaded,native:input}),mutate:input=>{input.calls[0].calleeRange=span(39,45);return input;},expectedAssertion:'NORMALIZE.CALLEE',expectedCode:'invalidRecord',expectedField:'calleeRange'}
+ ]);
+ for(const row of rows)await t.test(row.id,()=>runControl(row));
+ const outside=withWitness();outside.calls[0].witnesses[0].witness.range=span(39,45);
+ assert.throws(()=>normalize({...loaded,native:outside}),error=>error instanceof RangeError&&/WITNESS.CONTAINMENT/.test(error.message));
+ const changed=withWitness();changed.calls[0].witnesses[0].witness.range=span(18,23);
+ assert.throws(()=>normalize({...loaded,native:changed}),error=>/WITNESS.BYTES/.test(error.message));
+});
 async function semanticFixture(t,facts,proofKinds){
  const s=await specimen();t.after(s.cleanup);s.files['captures/native.json']=JSON.stringify(measured(s));
  const artifact=JSON.stringify({formatVersion:1,producerId:'semantic',facts});s.files['captures/fact.json']=artifact;s.fixture.captures.find(x=>x.ref==='fact').hash=hash(artifact);await s.flush();
