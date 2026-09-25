@@ -1571,9 +1571,9 @@ fn gc_age_and_record_inventory_are_read_only() {
     assert_eq!(report.records.len(), 1);
     assert_eq!(
         (report.records[0].views, report.records[0].annotations),
-        (0, 0)
+        (Some(0), Some(0))
     );
-    assert!(report.records[0].missing_known_paths.is_empty());
+    assert_eq!(report.records[0].missing_known_paths, Some(vec![]));
     assert_eq!(
         roots.record_by_id(&identity.record_id).unwrap().unwrap().id,
         identity.record_id
@@ -1596,7 +1596,7 @@ fn gc_age_and_record_inventory_are_read_only() {
     assert_eq!(missing.derived[0].reason, "root_missing");
     assert_eq!(
         missing.records[0].missing_known_paths,
-        vec![identity.root.to_string_lossy()]
+        Some(vec![identity.root.to_string_lossy().to_string()])
     );
     fs::create_dir(&work).unwrap();
     assert_eq!(
@@ -1653,7 +1653,14 @@ fn gc_rejects_dangling_recovery_sidecars_without_writes() {
             let before = gc_manifest(temp.path());
             if is_record {
                 assert!(roots.record_by_id(&identity.record_id).is_err(), "{suffix}");
-                assert!(roots.gc_report_at(1_800_000_000).is_err(), "{suffix}");
+                let report = roots.gc_report_at(1_800_000_000).unwrap();
+                assert_eq!(report.records[0].id, identity.record_id);
+                assert_eq!(
+                    (report.records[0].status, report.records[0].reason),
+                    ("unknown", "recovery_sidecar"),
+                    "{suffix}"
+                );
+                assert_eq!(report.records[0].views, None);
             } else {
                 let report = roots.gc_report_at(1_800_000_000).unwrap();
                 assert_eq!(
@@ -1708,10 +1715,18 @@ fn gc_refuses_countable_records_with_missing_durable_columns() {
             roots.record_by_id(&identity.record_id).is_err(),
             "{table}.{column}"
         );
-        assert!(
-            roots.gc_report_at(1_800_000_000).is_err(),
+        let report = roots.gc_report_at(1_800_000_000).unwrap();
+        let entry = report
+            .records
+            .iter()
+            .find(|r| r.id == identity.record_id)
+            .unwrap();
+        assert_eq!(
+            (entry.status, entry.reason),
+            ("unknown", "incompatible_record"),
             "{table}.{column}"
         );
+        assert_eq!(entry.views, None);
     }
 }
 
@@ -1774,11 +1789,12 @@ fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
         expected_ids
     );
     for record in &report.records {
-        let mut expected = record.missing_known_paths.clone();
+        let paths = record.missing_known_paths.as_ref().unwrap();
+        let mut expected = paths.clone();
         expected.sort();
-        assert_eq!(record.missing_known_paths, expected);
-        assert_eq!(record.missing_known_paths.len(), 3);
-        assert!(record.missing_known_paths[0].ends_with("-a"));
+        assert_eq!(paths, &expected);
+        assert_eq!(paths.len(), 3);
+        assert!(paths[0].ends_with("-a"));
     }
 }
 

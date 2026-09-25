@@ -1055,7 +1055,7 @@ impl<'a> DurableRecords<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct GcReport {
     pub derived: Vec<DerivedReport>,
-    pub records: Vec<RecordReport>,
+    pub records: Vec<GcRecordReport>,
 }
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1071,6 +1071,45 @@ pub struct RecordReport {
     pub views: i64,
     pub annotations: i64,
     pub missing_known_paths: Vec<String>,
+}
+/// GC can report a record without reading its inventory; forget cannot.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcRecordReport {
+    pub id: String,
+    pub status: &'static str,
+    pub reason: &'static str,
+    // Do not present missing or untrusted inventory as zero saved items.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub views: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_known_paths: Option<Vec<String>>,
+}
+impl GcRecordReport {
+    fn unavailable(id: String, status: &'static str, reason: &'static str) -> Self {
+        Self {
+            id,
+            status,
+            reason,
+            views: None,
+            annotations: None,
+            missing_known_paths: None,
+        }
+    }
+}
+impl From<RecordReport> for GcRecordReport {
+    fn from(report: RecordReport) -> Self {
+        Self {
+            id: report.id,
+            status: "valid",
+            reason: "record_readable",
+            views: Some(report.views),
+            annotations: Some(report.annotations),
+            missing_known_paths: Some(report.missing_known_paths),
+        }
+    }
 }
 
 const GC_AGE_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -1375,17 +1414,55 @@ impl TopologyRoots {
         }
         let mut records = Vec::new();
         if let Some(parent) = managed_existing(&self.data, "workspaces")? {
-            for entry in fs::read_dir(parent)? {
-                let name = entry?
+            for entry in fs::read_dir(&parent)? {
+                let entry = entry?;
+                let name = entry
                     .file_name()
                     .into_string()
                     .map_err(|_| anyhow::anyhow!("non-UTF8 record name"))?;
-                if valid_record_id(&name) {
-                    records.push(
-                        self.record_by_id(&name)?
-                            .context("incomplete_record: missing record")?,
-                    );
+                if !valid_record_id(&name) {
+                    continue;
                 }
+                // Report one safely named record at a time. Never create a missing use
+                // lock or expose error text containing local paths or SQLite details.
+                let lock = parent.join(format!("{name}.lock"));
+                let report = match UseGuard::acquire_existing(&lock, true, true) {
+                    Err(e) if e.to_string().contains("storage_busy") => {
+                        GcRecordReport::unavailable(name, "busy", "use_lock_busy")
+                    }
+                    Err(_) => GcRecordReport::unavailable(name, "unknown", "unsafe_use_lock"),
+                    Ok(guard) => {
+                        let result = inspect_record(&entry.path(), &name);
+                        if guard.verify().is_err() {
+                            GcRecordReport::unavailable(name, "unknown", "unsafe_use_lock")
+                        } else {
+                            match result {
+                                Ok((report, _)) => report.into(),
+                                Err(e) => {
+                                    let reason = if e
+                                        .to_string()
+                                        .contains("recovery sidecar present")
+                                    {
+                                        "recovery_sidecar"
+                                    } else if e.to_string().contains("incompatible_record") {
+                                        "incompatible_record"
+                                    } else if e.to_string().contains("incomplete_record")
+                                        || fs::symlink_metadata(entry.path().join("workspace.db"))
+                                            .is_err_and(|error| {
+                                                error.kind() == std::io::ErrorKind::NotFound
+                                            })
+                                    {
+                                        "incomplete_record"
+                                    } else {
+                                        "metadata_unreadable"
+                                    };
+                                    GcRecordReport::unavailable(name, "unknown", reason)
+                                }
+                            }
+                        }
+                    }
+                };
+                records.push(report);
             }
             records.sort_by(|a, b| a.id.cmp(&b.id));
         }
