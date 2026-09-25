@@ -260,3 +260,109 @@ async fn index_admission_and_publication_pair() {
         pin.index_revision + 1
     );
 }
+
+#[test]
+fn sqlite_journal_child() {
+    let Some(path) = std::env::var_os("BALEYG_SQLITE_JOURNAL_CHILD") else {
+        return;
+    };
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute_batch("PRAGMA cache_size=10; BEGIN IMMEDIATE; UPDATE index_metadata SET index_revision=3 WHERE singleton=1; UPDATE files SET payload=hex(randomblob(2048)) WHERE path LIKE 'spill-%'")
+        .unwrap();
+    println!("JOURNAL_READY");
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    db.execute_batch("ROLLBACK").unwrap();
+}
+
+#[tokio::test]
+async fn active_and_hot_journal_keep_pinned_http_safe() {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let (temp, store, _graph, app, _id) = fixture();
+    let previous = store.status().unwrap().revision;
+    let db_path = std::fs::read_dir(temp.path().join("state/cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for i in 0..100 {
+        db.execute(
+            "INSERT INTO files(path,hash,payload) VALUES(?1,'x',?2)",
+            rusqlite::params![format!("spill-{i}"), "x".repeat(4096)],
+        )
+        .unwrap();
+    }
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    let journal = db_path.with_file_name("index.db-journal");
+    let leader_path = db_path.with_file_name("leader.lock");
+    let leader = store.leader().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "sqlite_journal_child", "--nocapture"])
+        .env("BALEYG_SQLITE_JOURNAL_CHILD", &db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while output.read_line(&mut line).unwrap() != 0 && !line.contains("JOURNAL_READY") {
+        line.clear();
+    }
+    assert!(
+        line.contains("JOURNAL_READY"),
+        "writer exited before barrier: {line}"
+    );
+    assert!(journal.exists());
+    match store.status() {
+        Ok(status) => assert_eq!(status.revision, previous),
+        Err(error) => assert!(error.to_string().contains("storage_busy"), "{error:#}"),
+    }
+    let url = format!("/api/source?path=Types.java&{}", query(previous));
+    let (code, body) = call(&app, "GET", &url, Value::Null).await;
+    assert!(
+        code == 200 || ((code == 409 || code == 503) && body["error"]["code"] == "storage_busy"),
+        "{code}: {body}"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        &std::fs::read(&journal).unwrap()[..8],
+        &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
+        "SQLite did not flush a genuine hot journal"
+    );
+    drop(leader);
+    let unrelated =
+        baleyg::store::topology::UseGuard::acquire_existing(&leader_path, true, true).unwrap();
+    let before = [
+        std::fs::read(&db_path).unwrap(),
+        std::fs::read(&journal).unwrap(),
+        std::fs::read(&leader_path).unwrap(),
+    ];
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required")
+    );
+    let (code, body) = call(&app, "GET", &url, Value::Null).await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(body["error"]["code"], "recovery_required");
+    assert!(store.leader().is_err());
+    assert_eq!(
+        before,
+        [
+            std::fs::read(&db_path).unwrap(),
+            std::fs::read(&journal).unwrap(),
+            std::fs::read(&leader_path).unwrap()
+        ]
+    );
+    drop(unrelated);
+}

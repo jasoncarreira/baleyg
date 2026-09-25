@@ -54,19 +54,13 @@ impl DerefMut for IndexConnection {
         &mut self.db
     }
 }
-fn reject_sidecars(path: &Path, writable: bool, leader_lock: &Path) -> Result<()> {
+fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
+        if suffix == "-journal" && !writable {
+            continue;
+        }
         let sidecar = path.with_file_name(format!("index.db{suffix}"));
         match std::fs::symlink_metadata(&sidecar) {
-            Ok(_) if suffix == "-journal" && !writable => {
-                // Only a held, verified publisher lock can account for a live journal.
-                // Never give a writable SQLite opener a chance to recover one.
-                match topology::UseGuard::acquire_existing(leader_lock, true, true) {
-                    Err(e) if e.to_string().starts_with("storage_busy:") => {}
-                    Ok(_) => anyhow::bail!("recovery_required: {}", sidecar.display()),
-                    Err(e) => return Err(e.context("recovery_required: unverified journal leader")),
-                }
-            }
             Ok(_) => anyhow::bail!("recovery_required: {}", sidecar.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -107,45 +101,50 @@ fn verify_index_file(path: &Path) -> Result<()> {
     let _ = file.as_raw_fd();
     Ok(())
 }
-fn open_index(path: &Path, writable: bool, leader_lock: &Path) -> Result<Connection> {
+fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     use rusqlite::OpenFlags;
-    reject_sidecars(path, writable, leader_lock)?;
+    reject_sidecars(path, writable)?;
     verify_index_file(path)?;
     let flags = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let db = Connection::open_with_flags(path, flags)?;
-    db.busy_timeout(Duration::ZERO)?;
-    db.pragma_update(None, "temp_store", "MEMORY")?;
-    db.pragma_update(None, "foreign_keys", "ON")?;
+    let db = storage_result(Connection::open_with_flags(path, flags))?;
+    storage_result(db.busy_timeout(Duration::ZERO))?;
+    storage_result(db.pragma_update(None, "temp_store", "MEMORY"))?;
+    storage_result(db.pragma_update(None, "foreign_keys", "ON"))?;
     if writable {
-        db.pragma_update(None, "synchronous", "FULL")?;
+        storage_result(db.pragma_update(None, "synchronous", "FULL"))?;
     } else {
-        db.pragma_update(None, "query_only", "ON")?;
+        storage_result(db.pragma_update(None, "query_only", "ON"))?;
     }
-    let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+    let mode: String = storage_result(db.pragma_query_value(None, "journal_mode", |r| r.get(0)))?;
     ensure!(mode == "delete", "incompatible_index: journal mode");
-    let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     ensure!(
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: schema version {version}"
     );
-    db.prepare(
+    storage_result(db.prepare(
         "SELECT index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata",
-    )?;
-    db.prepare("SELECT path,hash,payload FROM files")?;
-    db.prepare("SELECT id,name,path,payload FROM nodes")?;
-    db.prepare("SELECT id,caller,target,path,payload FROM calls")?;
-    db.prepare("SELECT id,owner,path,payload FROM regions")?;
-    db.prepare("SELECT warnings,truncated FROM class_catalog")?;
-    db.prepare("SELECT id,name,qualified_name,path,payload FROM classes")?;
-    db.prepare("SELECT id,owner,target,payload FROM class_relations")?;
+    ))?;
+    storage_result(db.prepare("SELECT path,hash,payload FROM files"))?;
+    storage_result(db.prepare("SELECT id,name,path,payload FROM nodes"))?;
+    storage_result(db.prepare("SELECT id,caller,target,path,payload FROM calls"))?;
+    storage_result(db.prepare("SELECT id,owner,path,payload FROM regions"))?;
+    storage_result(db.prepare("SELECT warnings,truncated FROM class_catalog"))?;
+    storage_result(db.prepare("SELECT id,name,qualified_name,path,payload FROM classes"))?;
+    storage_result(db.prepare("SELECT id,owner,target,payload FROM class_relations"))?;
     Ok(db)
 }
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     match result {
+        Err(rusqlite::Error::SqliteFailure(info, _))
+            if info.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK =>
+        {
+            anyhow::bail!("recovery_required: hot index journal")
+        }
         Err(rusqlite::Error::SqliteFailure(info, _))
             if matches!(
                 info.code,
@@ -161,12 +160,14 @@ fn json<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 fn rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<Vec<T>> {
-    let mut stmt = db.prepare(sql)?;
-    let values = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    values.map(|v| Ok(serde_json::from_str(&v?)?)).collect()
+    let mut stmt = storage_result(db.prepare(sql))?;
+    let values = storage_result(stmt.query_map([], |r| r.get::<_, String>(0)))?;
+    values
+        .map(|v| Ok(serde_json::from_str(&storage_result(v)?)?))
+        .collect()
 }
 fn one<T: DeserializeOwned>(db: &Connection, sql: &str, id: &str) -> Result<Option<T>> {
-    let value: Option<String> = db.query_row(sql, [id], |r| r.get(0)).optional()?;
+    let value: Option<String> = storage_result(db.query_row(sql, [id], |r| r.get(0)).optional())?;
     value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
 }
 fn check_cancel(cancel: &CancelFlag) -> Result<()> {
@@ -833,7 +834,7 @@ impl Store {
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
         let path = self.roots.index_db(&self.identity);
-        reject_sidecars(&path, true, &self.roots.leader_lock(&self.identity))?;
+        reject_sidecars(&path, true)?;
         if path.exists() {
             return Ok(());
         }
@@ -912,11 +913,7 @@ impl Store {
     fn connect_index(&self, writable: bool) -> Result<IndexConnection> {
         self.identity.verify()?;
         let use_guard = self.roots.index_use_existing(&self.identity)?;
-        let db = open_index(
-            &self.roots.index_db(&self.identity),
-            writable,
-            &self.roots.leader_lock(&self.identity),
-        )?;
+        let db = open_index(&self.roots.index_db(&self.identity), writable)?;
         self.identity.verify()?;
         use_guard.verify()?;
         Ok(IndexConnection {
@@ -928,9 +925,9 @@ impl Store {
         topology::DurableRecords::new(&self.roots, &self.identity)
     }
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
-        let row: (i64,String,String,String,String,String,i64,String,String,String) = db.query_row(
+        let row: (i64,String,String,String,String,String,i64,String,String,String) = storage_result(db.query_row(
             "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata WHERE singleton=1",
-            [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)))?;
+            [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))))?;
         ensure!(
             row.0 == 4 && row.1 == EXTRACTOR_VERSION,
             "incompatible_index: extractor or schema"
@@ -1076,7 +1073,7 @@ impl Store {
     ) -> Result<crate::navigation::NavigationResult> {
         request.validate()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(request.expected_revision() == revision, "revision conflict");
         crate::navigation::navigate(&tx, request, revision)
@@ -1111,7 +1108,7 @@ impl Store {
             );
         }
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         let Some((mut warnings, truncated)) = class_metadata(&tx)? else {
@@ -1190,7 +1187,7 @@ impl Store {
         use crate::class_diagram::{self, InvalidRequest, MAX_EDGES};
         request.validate()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(revision == request.expected_revision, "revision conflict");
         let Some((mut warnings, mut truncated)) = class_metadata(&tx)? else {
@@ -1340,7 +1337,7 @@ impl Store {
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         ensure!(query.len() <= 8192, "search query too long");
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE instr(lower(name),lower(?1)) > 0 OR instr(lower(id),lower(?1)) > 0 ORDER BY CASE WHEN lower(name)=lower(?1) THEN 0 WHEN instr(lower(name),lower(?1))=1 THEN 1 ELSE 2 END,name,id LIMIT ?2")?;
         let values = stmt.query_map(params![query, limit.min(150) as i64], |r| {
@@ -1364,7 +1361,7 @@ impl Store {
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, T)>> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(
             expected_revision.is_none_or(|r| r == revision),
@@ -1402,7 +1399,7 @@ impl Store {
         items: &mut [crate::file_tree::Entry],
     ) -> Result<(IndexPin, String)> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         let workspace = Path::new(&self.workspace_root);
         let mut stmt = tx.prepare("SELECT (SELECT count(*) FROM nodes n WHERE n.path=f.path AND json_extract(n.payload,'$.kind') IN ('function','method')) FROM files f WHERE f.path=?1")?;
@@ -1433,7 +1430,7 @@ impl Store {
             "invalid catalog pagination"
         );
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         let mut stmt = tx.prepare("SELECT f.path,json_extract(f.payload,'$.language'),(SELECT count(*) FROM nodes n WHERE n.path=f.path AND json_extract(n.payload,'$.kind') IN ('function','method')) FROM files f ORDER BY f.path LIMIT ?1 OFFSET ?2")?;
@@ -1450,7 +1447,7 @@ impl Store {
         expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         if !tx.query_row(
@@ -1483,7 +1480,7 @@ impl Store {
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(revision == expected, "revision conflict");
         let Some(symbol) = one::<Symbol>(&tx, "SELECT payload FROM nodes WHERE id=?1", seed)?
@@ -1520,15 +1517,15 @@ impl Store {
     }
     pub fn graph(&self) -> Result<Graph> {
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let graph = self.read_graph(&tx)?;
-        tx.commit()?;
+        storage_result(tx.commit())?;
         Ok(graph)
     }
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
         query.validate()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         let seed: Option<Symbol> = one(&tx, "SELECT payload FROM nodes WHERE id=?1", &query.seed)?;
         let Some(seed) = seed else { return Ok(None) };
@@ -1605,7 +1602,7 @@ impl Store {
                 regions.insert(id, region);
             }
         }
-        tx.commit()?;
+        storage_result(tx.commit())?;
         Ok(Some(ViewResult {
             revision,
             query: query.clone(),
@@ -1664,7 +1661,7 @@ impl Store {
     pub fn views(&self) -> Result<Vec<SavedViewState>> {
         let views = self.records().views()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         views
             .into_iter()
             .map(|v| Self::resolve_view(&tx, v))
@@ -1673,7 +1670,7 @@ impl Store {
     pub fn view(&self, id: &str) -> Result<Option<SavedViewState>> {
         let view = self.records().view(id)?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         view.map(|v| Self::resolve_view(&tx, v)).transpose()
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
@@ -1687,7 +1684,7 @@ impl Store {
     pub fn annotations(&self) -> Result<Vec<AnnotationState>> {
         let annotations = self.records().annotations()?;
         let mut db = self.cache()?;
-        let tx = db.transaction()?;
+        let tx = storage_result(db.transaction())?;
         annotations
             .into_iter()
             .map(|annotation| {

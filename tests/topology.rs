@@ -1165,3 +1165,31 @@ fn leader_records_open_age_and_follower_preserves_it() {
     assert_eq!(follower.status().unwrap().revision, baseline);
     drop(leader);
 }
+
+#[test]
+fn guard_drop_unlocks_even_when_fork_child_keeps_descriptor() {
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let guard = roots.leader(&id).unwrap();
+    let mut pipe = [0; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        unsafe { libc::close(pipe[1]) };
+        let mut byte = 0u8;
+        unsafe { libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1) };
+        unsafe { libc::_exit(0) };
+    }
+    unsafe { libc::close(pipe[0]) };
+    drop(guard);
+    let exclusive = UseGuard::acquire_existing(&roots.index_use_lock(&id), true, true).unwrap();
+    drop(exclusive);
+    let next = roots.leader(&id).unwrap();
+    drop(next);
+    unsafe { libc::close(pipe[1]) };
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert_eq!(status, 0);
+}

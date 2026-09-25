@@ -626,8 +626,8 @@ fn unresolved_candidate_evidence_need_not_be_a_graph_node() {
 }
 
 #[test]
-fn active_delete_journal_allows_prior_pair_or_busy_but_orphan_refuses() {
-    let (state, work, store) = fixture();
+fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_managed() {
+    let (state, _work, store) = fixture();
     let baseline = store.status().unwrap().revision;
     store
         .publish(&graph(), &store.leader().unwrap(), baseline, &cancel())
@@ -671,9 +671,14 @@ fn active_delete_journal_allows_prior_pair_or_busy_but_orphan_refuses() {
     done_tx.send(()).unwrap();
     writer.join().unwrap();
     let journal = index_db(state.path()).with_file_name("index.db-journal");
-    std::fs::write(&journal, b"orphan journal").unwrap();
-    let error = store.status().unwrap_err();
-    assert!(error.to_string().contains("recovery_required"), "{error:#}");
-    assert!(crate::common::open_store(state.path(), work.path()).is_err());
+    std::fs::write(&journal, [0u8; 512]).unwrap();
+    assert_eq!(store.status().unwrap().revision, previous);
+    assert!(
+        store
+            .leader()
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required")
+    );
     assert!(journal.exists());
 }

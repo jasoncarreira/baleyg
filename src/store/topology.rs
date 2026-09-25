@@ -706,6 +706,12 @@ impl UseGuard {
         sync_directory(self.path.parent().context("lock parent missing")?)
     }
 }
+impl Drop for UseGuard {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 #[derive(Debug)]
 pub struct LeaderGuard {
     use_guard: UseGuard,
@@ -721,6 +727,12 @@ impl LeaderGuard {
     pub fn verify(&self) -> Result<()> {
         self.use_guard.verify()?;
         private_file(&self.path, &self.file)
+    }
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
