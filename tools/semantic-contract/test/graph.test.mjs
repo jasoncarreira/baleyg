@@ -297,6 +297,50 @@ test('captured failed and omitted refresh answers pass the complete graph checke
  }
 });
 
+test('captured current binding: selected complete/partial self-call and failed leaked edge',async t=>{
+ for(const state of ['complete','partial','failed']){
+  const {loaded,records,checked}=await admittedGraph(t,{state,r2Binding:true});
+  const declaration=records.declarations.find(row=>row.revisionId==='r2');
+  const call=records.calls.find(row=>row.revisionId==='r2');
+  const binding=records.callBindings.find(row=>row.provenanceId==='r2-call-proof');
+  assert.ok(binding);assert.equal(binding.callId,call.id);
+  assert.equal(binding.join.anchor.revisionId,'r2');
+  assert.equal(loaded.semanticProofs.get('r2-call-proof').factRef,'r2-binding');
+  const usable=state!=='failed';
+  const request={sourceSetId:'main',revisionId:'r2',rootSyntaxId:declaration.syntaxId,
+   semanticProducerId:'semantic',depth:2,maxNodes:150,maxCalls:500};
+  const proofIds=[declaration.provenanceId,call.provenanceId,...(usable?['r2-call-proof']:['r1-proof'])];
+  const provenance=proofIds.map(id=>records.provenance.find(row=>row.id===id))
+   .sort((a,b)=>Buffer.compare(Buffer.from(a.id),Buffer.from(b.id)));
+  const coverage=records.coverage.filter(row=>row.revisionId==='r2'||!usable&&row.revisionId==='r1'&&row.producerId==='semantic')
+   .sort((a,b)=>Buffer.compare(Buffer.from(a.producerId),Buffer.from(b.producerId))||
+    Buffer.compare(Buffer.from(a.revisionId),Buffer.from(b.revisionId)));
+  const warnings=[...(state==='complete'?[]:[{code:'coverageIncomplete',provenanceId:null,message:'selected coverage incomplete'}]),
+   ...(usable?[]:[{code:'staleEvidence',provenanceId:null,message:'historical declaration'}])];
+  const edge={call,from:declaration.syntaxId,to:usable?declaration.syntaxId:null,binding:usable?binding:null,
+   visit:usable?'seen':'boundary',boundaryReason:usable?'none':'missingEvidence'};
+  const answer={id:`captured-${state}`,attemptedRequest:request,answer:{ok:true,result:{request,
+   resolvedRevisionId:'r2',nodes:[{declaration,depth:0}],edges:[edge],frontier:[],coverage,
+   provenance,partial:!usable||state==='partial',truncated:false,warnings}}};
+  assert.equal(checkAnswers(loaded,records,checked,{answers:[answer]}),true);
+  assert.equal(provenance.some(row=>row.id==='r1-call-proof'||row.id==='r1-reference-proof'),false);
+  if(!usable){
+   const row=registerControls([{id:'GRAPH.captured.failed-leaked-binding',baseline:()=>answer,
+    mutate:x=>{x.answer.result.edges[0].binding=binding;return x;},
+    check:x=>checkAnswers(loaded,records,checked,{answers:[x]}),
+    expectedAssertion:'GRAPH.TRAVERSAL',expectedCode:'invalidRecord',expectedField:'answers.captured-failed.result.edges'}])[0];
+   await t.test(row.id,()=>runControl(row));
+  }
+ }
+});
+
+test('authored current binding under omitted coverage fails source-backed admission',async t=>{
+ await assert.rejects(()=>admittedGraph(t,{state:'omitted',r2Binding:true}),error=>{
+  assert.equal(error.assertion,'FRESHNESS.USE');assert.equal(error.code,'invalidRecord');
+  assert.equal(error.field,'coverage');return true;
+ });
+});
+
 test('finite graph boundaries: cap with no work, defaults, syntax-only, resolution precedence',()=>{
  {const s=specimen(),e=s.authored();e.attemptedRequest.maxCalls=e.answer.result.request.maxCalls=0;
   assert.equal(verify(s,e),true);assert.equal(e.answer.result.frontier.length,0);assert.equal(e.answer.result.truncated,false);}

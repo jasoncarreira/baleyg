@@ -227,6 +227,29 @@ test('captured r2 binding cannot survive a failed or omitted current tuple',asyn
   assert.equal(s.loaded.semanticProofs.get('r2-call-proof').factRef,'r2-binding');
   const initial=select(s);
   assert.deepEqual(checkGraphEvidence(s.loaded,s.records,s.checked,{...s.result,...initial},s.result),initial);
+  const changed=structuredClone(s.records);
+  const current=changed.coverage.find(row=>row.producerId==='semantic'&&row.revisionId==='r2');
+  current.state=state;current.selected=state!=='omitted';current.observedRoles=[];
+  current.diagnostic='refresh unavailable';
+  const traversed=traverseGraph({request:s.result.request,records:changed});
+  assert.equal(traversed.ok,true);
+  const result=traversed.result;
+  assert.equal(result.nodes.length,1);assert.equal(result.edges.length,1);
+  assert.equal(result.edges[0].call.id,edge.call.id);
+  assert.equal(result.edges[0].binding,null);
+  assert.equal(result.edges[0].to,null);
+  assert.equal(result.edges[0].visit,'boundary');
+  assert.equal(result.edges[0].boundaryReason,'missingEvidence');
+  assert.equal(result.partial,true);
+  const evidence=selectGraphEvidence(s.loaded,changed,s.checked,result);
+  assert.equal(evidence.provenance.some(row=>row.id==='r2-call-proof'||row.id==='r1-call-proof'||row.id==='r1-reference-proof'),false);
+  assert.equal(evidence.provenance.some(row=>row.id==='r1-proof'),true);
+  assert.deepEqual(checkGraphEvidence(s.loaded,changed,s.checked,{...result,...evidence},result),evidence);
+  const leaked={...result,edges:[{...result.edges[0],binding:edge.binding}]};
+  assert.throws(()=>selectGraphEvidence(s.loaded,changed,s.checked,leaked),error=>{
+   assert.equal(error.assertion,'GRAPH.OCCURRENCE');assert.equal(error.code,'invalidRecord');
+   assert.equal(error.field,'edges.binding');return true;
+  });
   const row=registerControls([{id:`GRAPH.capturedR2Binding.${state}`,
    baseline:()=>({records:s.records,result:s.result}),
    // Change only the returned tuple; keep the authenticated call, join and proof intact.
