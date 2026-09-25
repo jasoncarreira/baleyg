@@ -1,7 +1,7 @@
 //! JavaScript-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
 use crate::behavior::{Participant, SequenceStep, SequenceView};
-use crate::model::{CallSite, Resolution, SourceFile, SourceRange, Symbol, SymbolKind};
+use crate::model::{CallSite, IndexPin, Resolution, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Context, Result, ensure};
 use tree_sitter::Node;
 
@@ -578,7 +578,7 @@ impl Builder<'_> {
 }
 
 pub fn build(
-    revision: u64,
+    revision: IndexPin,
     seed: &Symbol,
     file: &SourceFile,
     calls: &[CallSite],

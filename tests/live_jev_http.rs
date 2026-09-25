@@ -1,4 +1,5 @@
 //! No credentials or outbound calls. Enabled fixtures use an already exhausted local ledger.
+mod common;
 mod offline {
 
     use axum::{
@@ -46,8 +47,18 @@ mod offline {
             .unwrap()
             .id
             .clone();
-        let store = Store::open(&dir.path().join("state"), &workspace).unwrap();
-        store.publish(&graph, Some(0), &cancel).unwrap();
+        let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0,
+                },
+                &cancel,
+            )
+            .unwrap();
         let state = http::new(
             store.clone(),
             options,
@@ -55,12 +66,13 @@ mod offline {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
+        let pin = store.status().unwrap().revision;
         (
             dir,
             store,
             graph,
             http::router(state),
-            json!({"seed":seed,"question":"helper leaf", "expectedRevision":1}),
+            json!({"seed":seed,"question":"helper leaf", "expectedRevision":pin}),
         )
     }
     pub(super) async fn call(
@@ -188,7 +200,7 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
         &app,
         "POST",
         "/api/questions/preview",
-        json!({"seed":leaf.id,"question":"leaf", "expectedRevision":1}),
+        json!({"seed":leaf.id,"question":"leaf", "expectedRevision":store.status().unwrap().revision}),
     )
     .await;
     assert_eq!(code, 200);
@@ -212,7 +224,15 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
     );
     assert_eq!(call(&app, "POST", &url, json!({})).await.0, 429);
     store
-        .publish(&graph, Some(1), &Arc::new(AtomicBool::new(false)))
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 1,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
     assert_eq!(call(&app, "POST", &url, json!({})).await.0, 409);
     assert_eq!(

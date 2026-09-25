@@ -5,6 +5,52 @@ use std::sync::{Arc, atomic::AtomicBool};
 pub const SCHEMA_VERSION: u32 = 1;
 pub type CancelFlag = Arc<AtomicBool>;
 
+/// Identity of one published disposable index snapshot. Numeric revisions are local to a generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "UncheckedIndexPin"
+)]
+pub struct IndexPin {
+    #[serde(with = "uuid_text")]
+    pub index_generation: uuid::Uuid,
+    pub index_revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UncheckedIndexPin {
+    index_generation: String,
+    index_revision: u64,
+}
+impl TryFrom<UncheckedIndexPin> for IndexPin {
+    type Error = String;
+    fn try_from(value: UncheckedIndexPin) -> Result<Self, Self::Error> {
+        let generation =
+            uuid::Uuid::parse_str(&value.index_generation).map_err(|e| e.to_string())?;
+        if generation.is_nil()
+            || generation.get_version_num() != 4
+            || generation.to_string() != value.index_generation
+        {
+            return Err("indexGeneration must be a canonical non-nil UUIDv4".into());
+        }
+        if value.index_revision > 9_007_199_254_740_991 {
+            return Err("indexRevision exceeds the safe integer range".into());
+        }
+        Ok(Self {
+            index_generation: generation,
+            index_revision: value.index_revision,
+        })
+    }
+}
+mod uuid_text {
+    use serde::Serializer;
+    pub fn serialize<S: Serializer>(value: &uuid::Uuid, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceRange {
@@ -149,7 +195,7 @@ pub struct IndexProgress {
 #[serde(rename_all = "camelCase")]
 pub struct IndexStatus {
     pub workspace_root: String,
-    pub revision: u64,
+    pub revision: IndexPin,
     pub indexed_at: Option<String>,
     pub stats: IndexStats,
     pub diagnostics: Vec<Diagnostic>,
@@ -203,7 +249,7 @@ impl ViewQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewResult {
-    pub revision: u64,
+    pub revision: IndexPin,
     pub query: ViewQuery,
     pub nodes: Vec<Symbol>,
     pub calls: Vec<CallSite>,

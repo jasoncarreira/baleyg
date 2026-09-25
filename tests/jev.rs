@@ -1,9 +1,9 @@
 //! Synthetic protocol fixtures only: not recorded model runs or quality evidence.
+mod common;
 use baleyg::{
     indexer::{IndexOptions, index_workspace},
     jev::{parse_response, request_for, response_warnings},
     planning::{QuestionPacket, QuestionRequest, prepare},
-    store::Store,
 };
 use serde_json::{Value, json};
 #[path = "common/jev_wire.rs"]
@@ -48,8 +48,18 @@ fn packet_with_links(code: &str, question: &str, synthetic_links: bool) -> Quest
             }
         }
     }
-    let store = Store::open(state.path(), work.path()).unwrap();
-    let revision = store.publish(&graph, Some(0), &cancel).unwrap();
+    let store = crate::common::open_store(state.path(), work.path()).unwrap();
+    let revision = store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel,
+        )
+        .unwrap();
     let request: QuestionRequest = serde_json::from_value(json!({
         "seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id,
         "question":question,"expectedRevision":revision
@@ -502,5 +512,17 @@ fn rounding_warnings_count_only_distributions_needing_exception() {
         vec![
             "Accepted hundredth-rounded probabilities for 2 candidates (sum 0.99 or 1.01); original scores retained, not calibrated confidence."
         ]
+    );
+}
+
+#[test]
+fn wire_keeps_pair() {
+    let packet = packet();
+    let wire = request_for(&packet).unwrap();
+    let decoded = decode_packet(&wire);
+    assert_eq!(decoded["revision"], json!(packet.revision));
+    assert_eq!(
+        decoded["request"]["expectedRevision"],
+        json!(packet.revision)
     );
 }

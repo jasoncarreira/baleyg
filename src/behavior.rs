@@ -1,13 +1,13 @@
 //! Language-neutral static possible-path sequence contract.
 //! Adapters consume cached source and measured calls. This is not a runtime trace.
-use crate::model::{CallSite, Resolution, SourceFile, SourceRange, Symbol};
+use crate::model::{CallSite, IndexPin, Resolution, SourceFile, SourceRange, Symbol};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SequenceView {
-    pub revision: u64,
+    pub revision: IndexPin,
     pub seed: Symbol,
     pub participants: Vec<Participant>,
     pub steps: Vec<SequenceStep>,
@@ -40,7 +40,7 @@ pub struct SequenceStep {
     pub hidden: bool,
 }
 pub fn build_sequence(
-    revision: u64,
+    revision: IndexPin,
     seed: &Symbol,
     file: &SourceFile,
     calls: &[CallSite],

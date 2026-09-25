@@ -1,3 +1,4 @@
+mod common;
 use baleyg::{
     indexer::{IndexOptions, index_workspace},
     model::*,
@@ -187,8 +188,16 @@ fn chained_calls_have_unique_range_ids_and_publish() {
         })
     }));
     let state = tempfile::tempdir().unwrap();
-    let store = baleyg::store::Store::open(&state.path().join("state"), d.path()).unwrap();
+    let store = crate::common::open_store(&state.path().join("state"), d.path()).unwrap();
     store
-        .publish(&graph, Some(0), &Arc::new(AtomicBool::new(false)))
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
 }

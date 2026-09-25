@@ -1,4 +1,5 @@
 //! Read-only, descriptor-relative directory metadata and bounded regular-file reads.
+use crate::model::IndexPin;
 use serde::Serialize;
 use std::{
     io,
@@ -23,7 +24,7 @@ pub struct Page {
     pub root: String,
     pub indexed_workspace: String,
     pub path: String,
-    pub revision: u64,
+    pub revision: IndexPin,
     pub items: Vec<Entry>,
     pub next_offset: Option<usize>,
     pub truncated: bool,

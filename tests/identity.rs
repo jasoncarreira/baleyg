@@ -1,7 +1,7 @@
+mod common;
 use baleyg::{
     indexer::{IndexOptions, index_workspace},
     model::*,
-    store::Store,
 };
 use std::{
     fs,
@@ -23,8 +23,18 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     assert_eq!(graph, again);
     let symbol = graph.nodes.iter().find(|n| n.name == "first").unwrap();
     let old_id = symbol.id.clone();
-    let store = Store::open(&state, &root).unwrap();
-    let rev = store.publish(&graph, Some(0), &cancel).unwrap();
+    let store = crate::common::open_store(&state, &root).unwrap();
+    let rev = store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel,
+        )
+        .unwrap();
     assert_eq!(store.graph().unwrap(), graph);
     store
         .put_annotation(&Annotation {
@@ -53,7 +63,9 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     fs::write(root.join("flow.js"), text.replace("first", "other")).unwrap();
     let changed = index_workspace(&opts, &cancel, |_| {}).unwrap();
     assert!(changed.nodes.iter().all(|n| n.id != old_id));
-    store.publish(&changed, Some(rev), &cancel).unwrap();
+    store
+        .publish(&changed, &store.leader().unwrap(), rev, &cancel)
+        .unwrap();
     assert!(store.annotations().unwrap()[0].orphaned);
     assert_eq!(
         store.annotations().unwrap()[0].annotation.body,
@@ -108,6 +120,14 @@ fn class_instance_initializers_are_not_calls_from_definition_context() {
             .any(|d| d.code == "instance-initializer-boundary")
     );
 }
+fn index_db(state: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(state.join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db")
+}
 #[test]
 fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let temp = TempDir::new().unwrap();
@@ -118,21 +138,35 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let options = IndexOptions::new(root.canonicalize().unwrap());
     let cancel = Arc::new(AtomicBool::new(false));
     let first = index_workspace(&options, &cancel, |_| {}).unwrap();
-    let store = Store::open(&state, &root).unwrap();
-    let revision = store.publish(&first, Some(0), &cancel).unwrap();
+    let store = crate::common::open_store(&state, &root).unwrap();
+    let revision = store
+        .publish(
+            &first,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel,
+        )
+        .unwrap();
     fs::write(root.join("flow.js"), "function after() { c(); d(); }\n").unwrap();
     let next = index_workspace(&options, &cancel, |_| {}).unwrap();
     let id = next.calls[1].id.replace('\'', "''");
-    let db = rusqlite::Connection::open(state.join("cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch(&format!("CREATE TRIGGER abort_second_call BEFORE INSERT ON calls WHEN NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'injected post-write failure'); END;")).unwrap();
     drop(db);
-    let failure = store.publish(&next, Some(revision), &cancel).unwrap_err();
+    let failure = store
+        .publish(&next, &store.leader().unwrap(), revision, &cancel)
+        .unwrap_err();
     assert!(failure.to_string().contains("injected post-write failure"));
     assert_eq!(store.status().unwrap().revision, revision);
     assert_eq!(store.graph().unwrap(), first);
-    let db = rusqlite::Connection::open(state.join("cache.db")).unwrap();
+    let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch("DROP TRIGGER abort_second_call").unwrap();
     drop(db);
-    let next_revision = store.publish(&next, Some(revision), &cancel).unwrap();
-    assert!(next_revision > revision + 1);
+    let next_revision = store
+        .publish(&next, &store.leader().unwrap(), revision, &cancel)
+        .unwrap();
+    assert_eq!(next_revision.index_revision, revision.index_revision + 1);
 }

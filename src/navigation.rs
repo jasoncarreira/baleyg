@@ -1,5 +1,6 @@
 //! Revision-bound navigation from cached, measured declarations and scoped type evidence.
 //! This is line navigation, not token go-to-definition or global name resolution.
+use crate::model::IndexPin;
 use crate::{
     classes::{ClassMember, ClassRelation},
     model::{Symbol, SymbolKind},
@@ -37,21 +38,21 @@ pub enum NavigationRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceSelector {
-    pub expected_revision: u64,
+    pub expected_revision: IndexPin,
     pub path: String,
     pub line: usize,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemberSelector {
-    pub expected_revision: u64,
+    pub expected_revision: IndexPin,
     pub class_id: String,
     pub member_name: String,
     pub start_byte: usize,
     pub end_byte: usize,
 }
 impl NavigationRequest {
-    pub fn expected_revision(&self) -> u64 {
+    pub fn expected_revision(&self) -> IndexPin {
         match self {
             Self::Source(s) => s.expected_revision,
             Self::Member(s) => s.expected_revision,
@@ -94,7 +95,7 @@ pub struct NavigationTarget {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NavigationResult {
-    pub revision: u64,
+    pub revision: IndexPin,
     pub targets: Vec<NavigationTarget>,
     pub warnings: Vec<String>,
     pub truncated: bool,
@@ -712,7 +713,7 @@ impl CachedJava {
 pub(crate) fn navigate(
     db: &Connection,
     request: &NavigationRequest,
-    revision: u64,
+    revision: IndexPin,
 ) -> Result<NavigationResult> {
     let metadata: Option<bool> = db
         .query_row(

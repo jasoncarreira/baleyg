@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -22,9 +23,17 @@ fn setup() -> (tempfile::TempDir, Store, Router) {
     std::fs::write(workspace.join("demo.js"), "function run() { save(); }").unwrap();
     let opts = IndexOptions::new(workspace.clone());
     let graph = index_workspace(&opts, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
-    let store = Store::open(&temp.path().join("state"), &workspace).unwrap();
+    let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
     store
-        .publish(&graph, Some(0), &Arc::new(AtomicBool::new(false)))
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
     let app = http::router(
         http::new_with_browser_root(
@@ -67,7 +76,10 @@ async fn cwd_metadata_maps_nested_index_without_content_or_mutation() {
             .ends_with("/cwd/sample")
     );
     assert_eq!(page["items"][0]["name"], "sample");
-    assert_eq!(page["revision"], 1);
+    assert_eq!(
+        page["revision"],
+        serde_json::json!(store.status().unwrap().revision)
+    );
     let rust = page["items"]
         .as_array()
         .unwrap()
@@ -85,7 +97,16 @@ async fn cwd_metadata_maps_nested_index_without_content_or_mutation() {
     assert_eq!(nested["items"][0]["methodCount"], 1);
     assert!(nested["items"][0].get("unindexedReason").is_none());
     assert_eq!(
-        call(&app, "/api/methods?path=demo.js&revision=1").await.0,
+        call(
+            &app,
+            &format!(
+                "/api/methods?path=demo.js&indexGeneration={}&indexRevision={}",
+                store.status().unwrap().revision.index_generation,
+                store.status().unwrap().revision.index_revision
+            )
+        )
+        .await
+        .0,
         200
     );
     std::fs::write(
@@ -117,10 +138,10 @@ async fn paths_errors_auth_and_guards() {
         "/api/tree?limit=0",
         "/api/tree?offset=10001",
         "/api/tree?extra=1",
-        "/api/tree?path=main.rs",
     ] {
-        assert_eq!(call(&app, path).await.0, 422, "{path}");
+        assert_eq!(call(&app, path).await.0, 400, "{path}");
     }
+    assert_eq!(call(&app, "/api/tree?path=main.rs").await.0, 422);
     assert_eq!(call(&app, "/api/tree?path=gone").await.0, 404);
     for (host, origin, token, expected) in [
         ("127.0.0.1:7331", None, None, 401),

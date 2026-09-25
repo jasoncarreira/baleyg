@@ -1,8 +1,8 @@
+mod common;
 use baleyg::{
     answer::*,
     indexer::{IndexOptions, index_workspace},
     planning::*,
-    store::Store,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -19,8 +19,18 @@ fn packet(code: &str) -> QuestionPacket {
     std::fs::write(work.path().join("a.js"), code).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let graph = index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
-    let store = Store::open(state.path(), work.path()).unwrap();
-    let revision = store.publish(&graph, Some(0), &cancel).unwrap();
+    let store = crate::common::open_store(state.path(), work.path()).unwrap();
+    let revision = store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel,
+        )
+        .unwrap();
     let request = serde_json::from_value(json!({"seed": graph.nodes.iter().find(|n| n.name == "seed").unwrap().id,"question":"Which branches run?", "expectedRevision":revision})).unwrap();
     prepare(&store, request).unwrap()
 }
@@ -219,4 +229,15 @@ fn rejects_blank_evidence_and_bounds_each_unverified_limitation() {
     let mut a = answer(&p);
     a["limitations"] = json!(["雪".repeat(400)]);
     assert!(parse_response(&p, &a).is_ok());
+}
+
+#[test]
+fn prompt_keeps_pair() {
+    let packet = packet(CODE);
+    let prompt = build_prompt(&packet).unwrap();
+    let evidence: Value =
+        serde_json::from_str(prompt.split_once("UNTRUSTED EVIDENCE JSON:\n").unwrap().1).unwrap();
+    assert_eq!(evidence["revision"], json!(packet.revision));
+    assert!(evidence["revision"]["indexGeneration"].as_str().is_some());
+    assert_eq!(evidence["revision"]["indexRevision"], 1);
 }

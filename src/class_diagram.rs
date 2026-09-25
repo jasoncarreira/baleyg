@@ -1,5 +1,6 @@
 //! Bounded, presentation-only class diagrams. Stored relation certainty is never changed.
 use crate::classes::{ClassDefinition, ClassRelation};
+use crate::model::IndexPin;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +32,7 @@ pub fn valid_id(id: &str) -> bool {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClassDiagramRequest {
     pub seed: String,
-    pub expected_revision: u64,
+    pub expected_revision: IndexPin,
     #[serde(default)]
     pub expanded: Vec<String>,
     #[serde(default)]
@@ -64,7 +65,7 @@ pub struct ClassDiagramNode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassDiagram {
-    pub revision: u64,
+    pub revision: IndexPin,
     pub seed: String,
     pub nodes: Vec<ClassDiagramNode>,
     pub edges: Vec<ClassRelation>,
@@ -75,7 +76,7 @@ pub struct ClassDiagram {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassPage {
-    pub revision: u64,
+    pub revision: IndexPin,
     pub items: Vec<ClassDefinition>,
     pub next_offset: Option<usize>,
     pub truncated: bool,
@@ -83,7 +84,7 @@ pub struct ClassPage {
     pub require_index: bool,
 }
 impl ClassDiagram {
-    pub fn unindexed(revision: u64, seed: String) -> Self {
+    pub fn unindexed(revision: IndexPin, seed: String) -> Self {
         Self {
             revision,
             seed,
@@ -100,7 +101,7 @@ impl ClassDiagram {
 /// connects each expansion to an earlier seed, so caps cannot strand an expansion.
 /// Relations are already bounded by the store, with actual links before hints.
 pub(crate) fn project(
-    revision: u64,
+    revision: IndexPin,
     seeds: &[String],
     classes: &BTreeMap<String, ClassDefinition>,
     bridges: Vec<ClassRelation>,
