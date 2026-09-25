@@ -208,7 +208,7 @@ a mutable global “current project.” Future registry enumeration must itself 
 | --- | --- |
 | `baleyg_workspace_describe` | Describe the launch checkout, current basis, index state, coverage and limits; no indexing on request |
 | `baleyg_find_symbols` | Bounded literal name/ID lookup in the current cached snapshot |
-| `baleyg_inspect` | Bounded views of one symbol: first `declaration`, `outgoing_calls` and `incoming_calls`; later `call_paths`, `usages`, `type_hierarchy`, `implementations` and `coverage`; no arbitrary graph query |
+| `baleyg_inspect` | Bounded views of one symbol: first `declaration` and `outgoing_calls`; later `incoming_calls`, `call_paths`, `usages`, `type_hierarchy`, `implementations` and `coverage`; no arbitrary graph query |
 | `baleyg_read_source` | Bounded cached source range, with hash and exact range |
 
 Every read comes from one snapshot and reports its basis. Pins are optional: a client may send a
