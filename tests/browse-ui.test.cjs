@@ -824,3 +824,71 @@ test("request handlers reject bare numeric pins without sending a request", asyn
  await assert.rejects(h.run("showSource({path:'x',range:{startLine:1,endLine:1}},1)"),/older revision/);
  assert.deepEqual(requests,[]);
 });
+
+
+test("expand outgoing calls checks the complete response pair before painting a branch", async () => {
+  for (const mismatch of [false, true]) {
+    const h = harness(), requests = [];
+    const target = {...symbol("target"), kind:"method"};
+    const root = {...symbol("root"), kind:"method"};
+    const call = {id:"entry",caller:"root",target:"target",calleeText:"target",path:"src/a.js",range:{startLine:2,endLine:2},resolution:"resolved"};
+    const child = {id:"child",caller:"target",calleeText:"leaf",path:"src/a.js",range:{startLine:3,endLine:3},resolution:"unresolved"};
+    h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root';`);
+    h.context.result = {revision:oldPair,nodes:[root,target],calls:[call]};
+    h.run("result = globalThis.result; renderResult()");
+    const expand = descendants(h.get("calls")).find(n => n.textContent === "Expand outgoing calls");
+    assert.ok(expand, "renderResult must expose an expandable call without throwing");
+    const branch = descendants(h.get("calls")).find(n => n.tagName === "ul");
+    descendants(h.get("calls")).forEach(n => { n.isConnected = true; });
+    h.context.fetch = async (url, options) => {
+      requests.push({url,method:options.method,body:options.body && JSON.parse(options.body)});
+      if (url === "/api/query") return response({revision:mismatch?newPair:oldPair,nodes:[target],calls:[child]});
+      if (url === "/api/status") return response({revision:newPair,workspaceRoot:"/same",stats:{}});
+      if (url.startsWith("/api/tree")) return response({...treePage("",[]),revision:newPair});
+      if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:newPair,catalogId:null,packages:[],warnings:[]});
+      throw Error(`Unexpected request ${url}`);
+    };
+    expand.listeners.click(); await new Promise(setImmediate); await new Promise(setImmediate);
+    assert.equal(requests[0].url,"/api/query"); assert.equal(requests[0].method,"POST");
+    assert.equal(requests[0].body.seed,"target");
+    assert.equal(requests.filter(r => r.url === "/api/status").length,mismatch?1:0);
+    assert.equal(descendants(branch).some(n => n.textContent === "leaf"),!mismatch);
+    assert.equal(branch.hidden,mismatch);
+    assert.equal(h.run("result") === null,mismatch);
+    assert.ok(requests.every(r => !/questions|answer|provider/.test(r.url)));
+  }
+});
+
+test("failed status reconciliation allows the next unexpected pair to retry", async () => {
+  for (const failure of ["network","http"]) {
+    const h=harness(), requests=[];
+    h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root';
+      result={revision:status.revision,calls:[],nodes:[]};packet={packetId:'old',revision:status.revision};
+      focused={revision:status.revision,calls:[],nodes:[]};selectedMethod={id:'old'};`);
+    h.context.fetch=async (url, options) => {
+      requests.push({url,method:options.method});
+      if(url==='/api/status') {
+        if(requests.filter(r=>r.url==='/api/status').length===1) {
+          if(failure==='network') throw Error('offline');
+          return {ok:false,status:500,json:async()=>({error:{message:'unavailable'}})};
+        }
+        return response({revision:newPair,workspaceRoot:'/same',stats:{}});
+      }
+      if(url.startsWith('/api/tree')) return response({...treePage('',[]),revision:newPair});
+      if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
+      if(url.startsWith('/api/files')) return response({revision:newPair,items:[],nextOffset:null});
+      throw Error(`Unexpected request ${url}`);
+    };
+    await h.run('loadFiles(true)'); await new Promise(setImmediate);
+    assert.equal(requests.filter(r=>r.url==='/api/status').length,1,failure);
+    assert.equal(h.run('status.revision.indexGeneration'),oldPair.indexGeneration);
+    await h.run('loadFiles(true)'); await new Promise(setImmediate); await new Promise(setImmediate);
+    assert.equal(requests.filter(r=>r.url==='/api/status').length,2,failure);
+    assert.equal(h.run('status.revision.indexGeneration'),newPair.indexGeneration,failure);
+    for(const value of ['result','packet','focused','selectedMethod','seed']) assert.equal(h.run(value),null,`${failure}: ${value}`);
+    assert.ok(requests.length<=6,`${failure}: bounded requests`);
+    assert.ok(requests.every(r=>! /questions|answer|provider/.test(r.url)));
+    assert.equal(requests.filter(r=>r.url.startsWith('/api/files')).length,2);
+    assert.ok(requests.filter(r=>r.url.startsWith('/api/files')).every(r=>r.method==='GET'));
+  }
+});

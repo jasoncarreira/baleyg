@@ -325,7 +325,7 @@ function callRow(call, view, ancestors, level, expandable) {
     else if (level >= 7) li.append(element("span", "Branch limit reached. Select this method as a new root to continue.", "detail"));
     else {
       const branch = element("ul", undefined, "plain call-branch"); branch.hidden = true;
-      let loaded = false; retryCatalogReset = reset;
+      let loaded = false;
       const expand = button("Expand outgoing calls", async () => {
         if (!branch.hidden) { branch.hidden = true; expand.textContent = "Expand outgoing calls"; expand.setAttribute("aria-expanded", "false"); return; }
         if (!loaded) {
