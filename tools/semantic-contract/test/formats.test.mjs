@@ -75,8 +75,13 @@ test('RELATIONSHIP_FORMAT.NESTED: captured relationship facts enforce source and
     for (const relationshipKind of ['extends','implements','overrides']) validate(type,make({...relationship,relationshipKind}));
     const baseline=() => make(structuredClone(relationship));
     const cases=[
-      ['missing',fact => { delete fact.relationshipKind; },`${field}.relationshipKind`],
-      ['unknown',fact => { fact.relationshipKind='inherits'; },`${field}.relationshipKind`],
+      ['missingKind',fact => { delete fact.kind; },`${field}.kind`],
+      ['unknownKind',fact => { fact.kind='__unknown__'; },`${field}.kind`],
+      ['conflictingDiscriminator',fact => { fact.kind='implements'; fact.relationshipKind='extends'; },`${field}.kind`],
+      ['conflictingRelationshipKind',fact => { fact.kind='extends'; fact.relationshipKind='implements'; },`${field}.kind`],
+      ['missingRelationshipKind',fact => { delete fact.relationshipKind; },`${field}.relationshipKind`],
+      ['unknownRelationshipKind',fact => { fact.relationshipKind='inherits'; },`${field}.relationshipKind`],
+      ['discriminatorAsRelationshipKind',fact => { fact.relationshipKind='typeRelationship'; },`${field}.relationshipKind`],
       ['legacy',fact => { fact.relationship='extends'; },`${field}.relationship`],
       ['nestedLegacy',fact => { fact.target.relationshipKind='extends'; },`${field}.target.relationshipKind`],
       ['nestedConflict',fact => { fact.target.kind='overrides'; },`${field}.target.kind`],
