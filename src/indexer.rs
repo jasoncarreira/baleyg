@@ -219,17 +219,24 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         } else {
             None
         };
+        // A typed declaration without a measured name is still present in
+        // syntax, but cannot supply an exact declaration witness. In particular,
+        // let_declaration and lexical_declaration own patterns/declarators rather
+        // than a direct name field.
+        if declaration && name_node.is_none() {
+            continue;
+        }
         let token = name_node.unwrap_or(node);
         let header_end = if declaration {
             nodes
                 .iter()
                 .filter(|child| {
                     child.parent_id == Some(node.id)
-                        && matches!(child.field_name.as_deref(), Some("body"))
+                        && matches!(child.field_name.as_deref(), Some("body" | "value"))
                 })
                 .map(|child| child.start_byte)
                 .min()
-                .unwrap_or(node.end_byte)
+                .unwrap_or(token.end_byte)
         } else {
             node.start_byte
         };

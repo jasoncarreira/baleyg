@@ -982,6 +982,86 @@ fn capture_native_witnesses_preserve_token_header_and_typed_regions() {
 }
 
 #[test]
+fn capture_excludes_unmeasured_declarations_without_losing_native_syntax() {
+    use baleyg::indexer::NativeCandidateKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.rs",
+        "fn greet() { let item = before(); consume(item); }\n",
+    );
+    write(
+        root,
+        "b.js",
+        "function greet() { let item = before(); consume(item); }\n",
+    );
+    let admission = capture_admission(root);
+    let options = capture_options(root);
+    let first = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    write(
+        root,
+        "a.rs",
+        "fn greet() { let item = changed(); consume(item); }\n",
+    );
+    write(
+        root,
+        "b.js",
+        "function greet() { let item = changed(); consume(item); }\n",
+    );
+    let second = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    assert_ne!(first.revision_id, second.revision_id);
+    for (before, after) in first.documents.iter().zip(second.documents.iter()) {
+        let unsupported = if before.key.path.as_str().ends_with(".rs") {
+            "let_declaration"
+        } else {
+            "lexical_declaration"
+        };
+        for doc in [before, after] {
+            assert!(doc.syntax.iter().any(|node| node.kind == unsupported));
+            assert!(!doc.native_candidates.iter().any(|w| {
+                w.candidate_kind == NativeCandidateKind::Declaration && w.node_kind == unsupported
+            }));
+            assert!(doc.native_candidates.iter().any(|w| {
+                w.candidate_kind == NativeCandidateKind::Invocation
+                    && w.owner_id < doc.syntax.len()
+                    && w.token_end_byte <= doc.bytes.len()
+            }));
+            for witness in doc
+                .native_candidates
+                .iter()
+                .filter(|w| w.candidate_kind == NativeCandidateKind::Declaration)
+            {
+                assert_eq!(
+                    witness.token_bytes,
+                    doc.bytes[witness.token_start_byte..witness.token_end_byte]
+                );
+                assert_eq!(witness.name_bytes, witness.token_bytes);
+                assert_ne!(
+                    witness.token_bytes,
+                    doc.syntax[witness.node_id].source_bytes
+                );
+            }
+        }
+        let declarations = |doc: &baleyg::indexer::CapturedDocument| {
+            doc.native_candidates
+                .iter()
+                .filter(|w| w.candidate_kind == NativeCandidateKind::Declaration)
+                .map(|w| {
+                    (
+                        w.node_kind.clone(),
+                        w.name_bytes.clone(),
+                        w.header_bytes.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(declarations(before), declarations(after));
+    }
+}
+
+#[test]
 fn capture_rejects_mid_acquisition_source_set_and_required_read_changes() {
     for change in ["remove", "add", "content", "ignore"] {
         let dir = tempfile::tempdir().unwrap();
