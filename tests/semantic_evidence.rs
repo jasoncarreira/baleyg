@@ -1,7 +1,7 @@
 use baleyg::{
     indexer::{CaptureAdmission, CapturedRevision, IndexOptions, capture_revision},
     model::v1::*,
-    semantic_evidence::{EvidenceError, validate_capture, validate_evidence},
+    semantic_evidence::{EvidenceError, validate_capture, validate_evidence, validate_native},
 };
 use protobuf::Message;
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ fn fixture() -> (tempfile::TempDir, CapturedRevision, Evidence) {
     fs::create_dir_all(root.join("rust/src")).unwrap();
     fs::write(
         root.join("java/src/A.java"),
-        "class Child extends Base { void foo() { é(); } }
+        "class Child extends Base { void foo() { if (true) { é(); } } }
 ",
     )
     .unwrap();
@@ -419,5 +419,324 @@ fn captured_root_document_hash_and_manifest_are_immutable() {
     assert!(matches!(
         validate_capture(&changed, &evidence),
         Err(EvidenceError::Revision(_))
+    ));
+}
+
+fn native_file(
+    capture: &CapturedRevision,
+    evidence: &Evidence,
+    index: usize,
+) -> NativeFileEvidence {
+    let doc = &capture.documents[index];
+    let admitted = evidence
+        .context
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key == doc.key)
+        .unwrap();
+    let coverage = evidence
+        .coverage
+        .iter()
+        .find(|c| c.producer_id.as_str() == "N" && c.document_path == doc.key.path)
+        .unwrap();
+    NativeFileEvidence {
+        document: admitted.clone(),
+        coverage: coverage.clone(),
+        provenance: Provenance {
+            id: text(&format!("native-{}", index)),
+            producer_id: text("N"),
+            document: doc.key.clone(),
+            revision_id: text(&capture.revision_id),
+            content_hash: admitted.content_hash.clone(),
+            evidence_kind: EvidenceKind::MeasuredSyntax,
+            basis: None,
+            freshness: Freshness::Fresh,
+        },
+        declarations: vec![],
+        calls: vec![],
+        control_regions: vec![],
+        diagnostics: vec![],
+    }
+}
+fn span(start: usize, end: usize) -> Range {
+    Range {
+        start: UInt::new(start as u64).unwrap(),
+        end: UInt::new(end as u64).unwrap(),
+    }
+}
+
+#[test]
+fn native_provenance_is_bound_to_each_captured_document() {
+    let (_dir, capture, mut evidence) = fixture();
+    evidence.native_files = (0..capture.documents.len())
+        .map(|index| native_file(&capture, &evidence, index))
+        .collect();
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    let mut bad = evidence.clone();
+    bad.native_files[0].provenance.content_hash = hash(b"not the document");
+    assert!(matches!(
+        validate_native(&capture, &bad),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.native_files[0].provenance.freshness = Freshness::PossiblyStale;
+    assert!(matches!(
+        validate_native(&capture, &bad),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.native_files.push(bad.native_files[0].clone());
+    assert!(matches!(
+        validate_native(&capture, &bad),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut forged_capture = capture.clone();
+    forged_capture.documents[0].native_candidates[0].token_bytes = b"forged".to_vec();
+    assert!(matches!(
+        validate_native(&forged_capture, &evidence),
+        Err(EvidenceError::Native(_))
+    ));
+}
+
+#[test]
+fn native_declaration_uses_real_ast_name_and_identity() {
+    let (_dir, capture, mut evidence) = fixture();
+    let index = capture
+        .documents
+        .iter()
+        .position(|d| d.key.language == Language::Java)
+        .unwrap();
+    let doc = &capture.documents[index];
+    let witness = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "class_declaration" && w.stable_id.is_some())
+        .unwrap();
+    let module = Key {
+        kind: Kind::Module,
+        name: None,
+        signature: None,
+        ordinal: UInt::new(0).unwrap(),
+    };
+    let name = text(std::str::from_utf8(&witness.name_bytes).unwrap());
+    let key = Key {
+        kind: Kind::Type,
+        name: Some(name.clone()),
+        signature: None,
+        ordinal: UInt::new(0).unwrap(),
+    };
+    let row = Declaration {
+        syntax_id: SyntaxId::new(witness.stable_id.clone().unwrap()).unwrap(),
+        document: doc.key.clone(),
+        revision_id: text(&capture.revision_id),
+        kind: Kind::Type,
+        name: Some(name.clone()),
+        lookup_key: Some(name.clone()),
+        ancestors: vec![module],
+        key,
+        range: span(witness.start_byte, witness.end_byte),
+        name_range: Some(span(witness.token_start_byte, witness.token_end_byte)),
+        header: Header {
+            kind: Kind::Type,
+            name: Some(name),
+            modifiers: vec![],
+            type_parameters: vec![],
+            parameters: vec![],
+            result_type: None,
+            bases: vec![text("Base")],
+        },
+        provenance_id: text(&format!("native-{index}")),
+    };
+    evidence
+        .native_files
+        .push(native_file(&capture, &evidence, index));
+    evidence.native_files[0].declarations.push(row);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].declarations[0].key.ordinal = UInt::new(1).unwrap();
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].declarations[0].name_range = Some(span(1, 2));
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].declarations[0].header.bases = vec![text("Forged")];
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].declarations[0].lookup_key = Some(text("Base"));
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    let duplicate = wrong.native_files[0].declarations[0].clone();
+    wrong.native_files[0].declarations.push(duplicate);
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+}
+
+#[test]
+fn native_call_ordinal_owner_and_member_span_are_source_checked() {
+    let (_dir, capture, mut evidence) = fixture();
+    let index = capture
+        .documents
+        .iter()
+        .position(|d| d.key.language == Language::Java)
+        .unwrap();
+    let doc = &capture.documents[index];
+    let class = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "class_declaration" && w.stable_id.is_some())
+        .unwrap();
+    let method = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "method_declaration" && w.stable_id.is_some())
+        .unwrap();
+    let invocation = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "method_invocation" && w.stable_id.is_some())
+        .unwrap();
+    let module = Key {
+        kind: Kind::Module,
+        name: None,
+        signature: None,
+        ordinal: UInt::new(0).unwrap(),
+    };
+    let mut file = native_file(&capture, &evidence, index);
+    for (w, ancestors, kind, signature) in [
+        (class, vec![module.clone()], Kind::Type, None),
+        (
+            method,
+            vec![
+                module.clone(),
+                Key {
+                    kind: Kind::Type,
+                    name: Some(text("Child")),
+                    signature: None,
+                    ordinal: UInt::new(0).unwrap(),
+                },
+            ],
+            Kind::Method,
+            Some(Signature {
+                parameter_types: vec![],
+                type_parameter_count: UInt::new(0).unwrap(),
+                variadic: false,
+            }),
+        ),
+    ] {
+        let name = text(std::str::from_utf8(&w.name_bytes).unwrap());
+        file.declarations.push(Declaration {
+            syntax_id: SyntaxId::new(w.stable_id.clone().unwrap()).unwrap(),
+            document: doc.key.clone(),
+            revision_id: text(&capture.revision_id),
+            kind,
+            name: Some(name.clone()),
+            lookup_key: Some(name.clone()),
+            ancestors,
+            key: Key {
+                kind,
+                name: Some(name.clone()),
+                signature,
+                ordinal: UInt::new(0).unwrap(),
+            },
+            range: span(w.start_byte, w.end_byte),
+            name_range: Some(span(w.token_start_byte, w.token_end_byte)),
+            header: Header {
+                kind,
+                name: Some(name),
+                modifiers: vec![],
+                type_parameters: vec![],
+                parameters: vec![],
+                result_type: None,
+                bases: if kind == Kind::Type {
+                    vec![text("Base")]
+                } else {
+                    vec![]
+                },
+            },
+            provenance_id: file.provenance.id.clone(),
+        });
+    }
+    let call = Call {
+        id: OccurrenceId::new(invocation.stable_id.clone().unwrap()).unwrap(),
+        owner_syntax_id: SyntaxId::new(method.stable_id.clone().unwrap()).unwrap(),
+        ordinal: UInt::new(0).unwrap(),
+        document: doc.key.clone(),
+        revision_id: text(&capture.revision_id),
+        range: span(invocation.start_byte, invocation.end_byte),
+        callee_range: invocation
+            .verified_member_token
+            .then(|| span(invocation.token_start_byte, invocation.token_end_byte)),
+        spelling: invocation.spelling.as_deref().map(text),
+        region_ids: vec![],
+        provenance_id: file.provenance.id.clone(),
+    };
+    file.calls.push(call);
+    let region = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "if_statement" && w.stable_id.is_some())
+        .unwrap();
+    let control = ControlRegion {
+        id: OccurrenceId::new(region.stable_id.clone().unwrap()).unwrap(),
+        owner_syntax_id: SyntaxId::new(method.stable_id.clone().unwrap()).unwrap(),
+        ordinal: UInt::new(0).unwrap(),
+        document: doc.key.clone(),
+        revision_id: text(&capture.revision_id),
+        kind: text(&region.node_kind),
+        range: span(region.start_byte, region.end_byte),
+        parent_id: None,
+        arm: None,
+        provenance_id: file.provenance.id.clone(),
+    };
+    file.calls[0].region_ids.push(control.id.clone());
+    file.control_regions.push(control);
+    evidence.native_files.push(file);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    let mut wrong = evidence.clone();
+    let own_id = wrong.native_files[0].control_regions[0].id.clone();
+    wrong.native_files[0].control_regions[0].parent_id = Some(own_id);
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].calls[0].region_ids.clear();
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].calls[0].ordinal = UInt::new(1).unwrap();
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].calls[0].callee_range = Some(span(0, 1));
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].calls[0].owner_syntax_id =
+        SyntaxId::new(class.stable_id.clone().unwrap()).unwrap();
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
     ));
 }

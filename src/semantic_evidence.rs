@@ -1,6 +1,9 @@
 //! Admission of immutable captured bytes before syntax and semantic validation.
 use crate::{
-    indexer::{CapturedProducer, CapturedRevision},
+    indexer::{
+        CapturedDocument, CapturedNativeWitness, CapturedProducer, CapturedRevision,
+        NativeCandidateKind,
+    },
     model::v1::*,
 };
 use sha2::{Digest, Sha256};
@@ -15,6 +18,7 @@ pub enum EvidenceError {
     Document(&'static str),
     Coverage(&'static str),
     NotYetValidated(&'static str),
+    Native(&'static str),
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -326,6 +330,357 @@ fn valid_coverage(c: &Coverage) -> bool {
     flags.0 && flags.1 && (c.diagnostic.is_some() == flags.2)
 }
 
+fn native_error(message: &'static str) -> EvidenceError {
+    EvidenceError::Native(message)
+}
+
+fn measured<'a>(
+    doc: &'a CapturedDocument,
+    witness: &CapturedNativeWitness,
+) -> Result<(&'a [u8], &'a [u8]), EvidenceError> {
+    let bytes = &doc.bytes;
+    let node = doc
+        .syntax
+        .get(witness.node_id)
+        .ok_or_else(|| native_error("missing AST node"))?;
+    if node.id != witness.node_id
+        || node.parent_id != witness.parent_id
+        || node.kind != witness.node_kind
+        || node.start_byte != witness.start_byte
+        || node.end_byte != witness.end_byte
+        || node.source_bytes
+            != bytes
+                .get(witness.start_byte..witness.end_byte)
+                .unwrap_or_default()
+        || witness.token_start_byte < witness.start_byte
+        || witness.token_end_byte > witness.end_byte
+        || witness.token_start_byte >= witness.token_end_byte
+        || bytes.get(witness.token_start_byte..witness.token_end_byte)
+            != Some(witness.token_bytes.as_slice())
+        || (witness.candidate_kind == NativeCandidateKind::Declaration
+            && !doc.syntax.iter().any(|n| {
+                n.parent_id == Some(node.id)
+                    && n.start_byte == witness.token_start_byte
+                    && n.end_byte == witness.token_end_byte
+            })
+            && (witness.token_start_byte != witness.start_byte
+                || witness.token_end_byte != witness.end_byte))
+    {
+        return Err(native_error("candidate differs from captured AST or bytes"));
+    }
+    let whole = bytes
+        .get(witness.start_byte..witness.end_byte)
+        .ok_or_else(|| native_error("invalid AST range"))?;
+    let token = bytes
+        .get(witness.token_start_byte..witness.token_end_byte)
+        .ok_or_else(|| native_error("invalid token range"))?;
+    std::str::from_utf8(whole).map_err(|_| native_error("non-scalar AST range"))?;
+    std::str::from_utf8(token).map_err(|_| native_error("non-scalar token range"))?;
+    Ok((whole, token))
+}
+fn same_range(range: &Range, start: usize, end: usize) -> bool {
+    range.start.get() == start as u64 && range.end.get() == end as u64
+}
+fn contains(outer: &Range, inner: &Range) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
+/// Validate only captured native syntax and provenance. No semantic facts or joins are admitted.
+pub fn validate_native(
+    capture: &CapturedRevision,
+    evidence: &Evidence,
+) -> Result<(), EvidenceError> {
+    validate_capture(capture, evidence)?;
+    let revision = &evidence.context.revision;
+    let producer = &evidence.context.producer;
+    let mut seen_files = BTreeSet::new();
+    let mut seen_provenance = BTreeSet::new();
+    let mut seen_ids = BTreeSet::new();
+    for file in &evidence.native_files {
+        let doc = capture
+            .documents
+            .iter()
+            .find(|d| d.key == file.document.key)
+            .ok_or_else(|| native_error("unknown native document"))?;
+        let coverage = evidence
+            .coverage
+            .iter()
+            .find(|c| {
+                c.producer_id == producer.id
+                    && c.language == doc.key.language
+                    && c.document_path == doc.key.path
+            })
+            .ok_or_else(|| native_error("missing native coverage"))?;
+        if !seen_files.insert((language_order(doc.key.language), doc.key.path.as_str()))
+            || file.document
+                != *revision
+                    .documents
+                    .iter()
+                    .find(|d| d.key == doc.key)
+                    .ok_or_else(|| native_error("missing admitted document"))?
+            || file.coverage != *coverage
+            || coverage.state != CoverageState::Complete
+            || file.provenance.producer_id != producer.id
+            || file.provenance.document != doc.key
+            || file.provenance.revision_id != revision.id
+            || file.provenance.content_hash != file.document.content_hash
+            || file.provenance.evidence_kind != EvidenceKind::MeasuredSyntax
+            || file.provenance.basis.is_some()
+            || file.provenance.freshness != Freshness::Fresh
+            || !seen_provenance.insert(file.provenance.id.as_str())
+        {
+            return Err(native_error("invalid native file or provenance"));
+        }
+        let witnesses = &doc.native_candidates;
+        for witness in witnesses {
+            measured(doc, witness)?;
+        }
+        let declaration = |id: &SyntaxId| file.declarations.iter().find(|d| d.syntax_id == *id);
+        for row in &file.declarations {
+            let matches: Vec<_> = witnesses
+                .iter()
+                .filter(|w| {
+                    w.candidate_kind == NativeCandidateKind::Declaration
+                        && w.stable_id.as_deref() == Some(row.syntax_id.as_str())
+                })
+                .collect();
+            if matches.len() != 1 {
+                return Err(native_error("declaration not uniquely captured"));
+            }
+            let witness = matches[0];
+            let named = witness.token_start_byte != witness.start_byte
+                || witness.token_end_byte != witness.end_byte;
+            if !seen_ids.insert(row.syntax_id.as_str().to_owned())
+                || row.document != doc.key
+                || row.revision_id != revision.id
+                || row.provenance_id != file.provenance.id
+                || !same_range(&row.range, witness.start_byte, witness.end_byte)
+                || row.kind != row.key.kind
+                || row.name != row.key.name
+                || row.header.kind != row.kind
+                || row.header.name != row.name
+                || named != row.name_range.is_some()
+                || row.name_range.as_ref().is_some_and(|r| {
+                    !same_range(r, witness.token_start_byte, witness.token_end_byte)
+                })
+                || row
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.as_str().as_bytes() != witness.name_bytes)
+                || row.lookup_key.as_ref().map(Text::as_str)
+                    != row
+                        .name
+                        .as_ref()
+                        .and_then(|name| {
+                            crate::semantic_identity::lookup_key(doc.key.language, name.as_str())
+                                .ok()
+                        })
+                        .as_deref()
+                || crate::semantic_identity::syntax_id(
+                    &doc.key.source_set_id,
+                    &doc.key.path,
+                    doc.key.language,
+                    &row.ancestors,
+                    &row.key,
+                )
+                .ok()
+                .as_ref()
+                    != Some(&row.syntax_id)
+            {
+                return Err(native_error(
+                    "declaration ID, token, header or lookup mismatch",
+                ));
+            }
+            if row.kind == Kind::Type {
+                let measured_bases: Vec<_> = doc
+                    .heritage
+                    .iter()
+                    .filter(|h| h.class_node_id == witness.node_id)
+                    .map(|h| std::str::from_utf8(&h.base_bytes))
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| native_error("invalid heritage bytes"))?;
+                if row
+                    .header
+                    .bases
+                    .iter()
+                    .map(Text::as_str)
+                    .collect::<Vec<_>>()
+                    != measured_bases
+                {
+                    return Err(native_error(
+                        "declaration bases differ from measured syntax",
+                    ));
+                }
+            }
+            if let Some(owner) = witness.ancestor_ids.last()
+                && row.ancestors.last().is_none_or(|key| {
+                    crate::semantic_identity::syntax_id(
+                        &doc.key.source_set_id,
+                        &doc.key.path,
+                        doc.key.language,
+                        &row.ancestors[..row.ancestors.len() - 1],
+                        key,
+                    )
+                    .map_or(true, |id| id.as_str() != owner)
+                })
+            {
+                return Err(native_error("declaration owner differs from AST"));
+            }
+        }
+        let mut occurrence_ranges = Vec::new();
+        for call in &file.calls {
+            let matches: Vec<_> = witnesses
+                .iter()
+                .filter(|w| {
+                    w.candidate_kind == NativeCandidateKind::Invocation
+                        && w.stable_id.as_deref() == Some(call.id.as_str())
+                })
+                .collect();
+            if matches.len() != 1 {
+                return Err(native_error("call not uniquely captured"));
+            }
+            let w = matches[0];
+            if !seen_ids.insert(call.id.as_str().to_owned())
+                || call.document != doc.key
+                || call.revision_id != revision.id
+                || call.provenance_id != file.provenance.id
+                || !same_range(&call.range, w.start_byte, w.end_byte)
+                || w.ancestor_ids.last().map(String::as_str) != Some(call.owner_syntax_id.as_str())
+                || call.callee_range.as_ref().is_some_and(|r| {
+                    !w.verified_member_token || !same_range(r, w.token_start_byte, w.token_end_byte)
+                })
+                || (w.verified_member_token && call.callee_range.is_none())
+                || call.spelling.as_ref().map(Text::as_str) != w.spelling.as_deref()
+                || call
+                    .callee_range
+                    .as_ref()
+                    .is_some_and(|r| !contains(&call.range, r))
+                || declaration(&call.owner_syntax_id).is_none()
+                    && !module_owner(doc, &call.owner_syntax_id)
+            {
+                return Err(native_error("call owner, token or source range mismatch"));
+            }
+            occurrence_ranges.push((
+                call.owner_syntax_id.clone(),
+                crate::semantic_identity::OccurrenceKind::Call,
+                call.range.start.get(),
+                call.range.end.get(),
+            ));
+        }
+        for region in &file.control_regions {
+            let matches: Vec<_> = witnesses
+                .iter()
+                .filter(|w| {
+                    w.candidate_kind == NativeCandidateKind::ControlRegion
+                        && w.stable_id.as_deref() == Some(region.id.as_str())
+                })
+                .collect();
+            if matches.len() != 1 {
+                return Err(native_error("region not uniquely captured"));
+            }
+            let w = matches[0];
+            if !seen_ids.insert(region.id.as_str().to_owned())
+                || region.document != doc.key
+                || region.revision_id != revision.id
+                || region.provenance_id != file.provenance.id
+                || !same_range(&region.range, w.start_byte, w.end_byte)
+                || region.kind.as_str() != w.node_kind
+                || w.ancestor_ids.last().map(String::as_str)
+                    != Some(region.owner_syntax_id.as_str())
+                || declaration(&region.owner_syntax_id).is_none()
+                    && !module_owner(doc, &region.owner_syntax_id)
+            {
+                return Err(native_error("region owner, kind or range mismatch"));
+            }
+            if let Some(parent) = &region.parent_id {
+                let ancestor = file
+                    .control_regions
+                    .iter()
+                    .find(|r| r.id == *parent)
+                    .ok_or_else(|| native_error("missing region parent"))?;
+                if ancestor.id == region.id
+                    || ancestor.owner_syntax_id != region.owner_syntax_id
+                    || !contains(&ancestor.range, &region.range)
+                    || ancestor.range == region.range
+                {
+                    return Err(native_error("cyclic or foreign region parent"));
+                }
+            }
+            occurrence_ranges.push((
+                region.owner_syntax_id.clone(),
+                crate::semantic_identity::OccurrenceKind::Control,
+                region.range.start.get(),
+                region.range.end.get(),
+            ));
+        }
+        let ordinals = crate::semantic_identity::occurrence_ordinals(&occurrence_ranges)
+            .map_err(|_| native_error("duplicate occurrence ranges"))?;
+        for (row, ordinal) in file
+            .calls
+            .iter()
+            .map(|c| (c.owner_syntax_id.clone(), c.id.clone(), c.ordinal))
+            .chain(
+                file.control_regions
+                    .iter()
+                    .map(|r| (r.owner_syntax_id.clone(), r.id.clone(), r.ordinal)),
+            )
+            .zip(ordinals)
+        {
+            if row.2 != ordinal
+                || crate::semantic_identity::occurrence_id(
+                    &revision.id,
+                    &row.0,
+                    if file.calls.iter().any(|c| c.id == row.1) {
+                        crate::semantic_identity::OccurrenceKind::Call
+                    } else {
+                        crate::semantic_identity::OccurrenceKind::Control
+                    },
+                    ordinal,
+                )
+                .ok()
+                    != Some(row.1)
+            {
+                return Err(native_error("incorrect occurrence ordinal or ID"));
+            }
+        }
+        for call in &file.calls {
+            let mut enclosing: Vec<_> = file
+                .control_regions
+                .iter()
+                .filter(|r| {
+                    r.owner_syntax_id == call.owner_syntax_id && contains(&r.range, &call.range)
+                })
+                .collect();
+            enclosing.sort_by_key(|r| (r.range.start.get(), std::cmp::Reverse(r.range.end.get())));
+            if enclosing.iter().map(|r| &r.id).ne(call.region_ids.iter())
+                || enclosing
+                    .windows(2)
+                    .any(|pair| !contains(&pair[0].range, &pair[1].range))
+            {
+                return Err(native_error(
+                    "call region ancestry differs from measured regions",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+fn module_owner(doc: &CapturedDocument, id: &SyntaxId) -> bool {
+    crate::semantic_identity::syntax_id(
+        &doc.key.source_set_id,
+        &doc.key.path,
+        doc.key.language,
+        &[],
+        &Key {
+            kind: Kind::Module,
+            name: None,
+            signature: None,
+            ordinal: UInt::new(0).unwrap(),
+        },
+    )
+    .is_ok_and(|module| module == *id)
+}
+
 pub fn validate_evidence(
     capture: &CapturedRevision,
     evidence: &Evidence,
@@ -337,6 +692,7 @@ pub fn validate_evidence(
             "snapshot comparison awaits basis validation",
         ));
     }
+    validate_native(capture, evidence)?;
     if !evidence.native_files.is_empty()
         || !evidence.provenance.is_empty()
         || !evidence.symbols.is_empty()
