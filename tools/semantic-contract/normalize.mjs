@@ -15,6 +15,8 @@ function requireValue(value,id,field){if(value===undefined)fail(id,field,'missin
 function unique(rows,key,id,field){const seen=new Set();for(const row of rows){const k=key(row);if(seen.has(k))fail(id,field,'duplicate measured row');seen.add(k);}}
 function indexed(rows){return new Map(rows.map(x=>[x.ref,x]));}
 function same(a,b){return encode(a)===encode(b);}
+function encoding(range,expected,field){if(range?.encoding!==expected)fail('NORMALIZE.ENCODING',field,'producer position encoding differs');}
+function producerEncoding(loaded,id){return requireValue(loaded.fixture.producers.find(x=>x.id===id),'NORMALIZE.PRODUCER','producerId').positionEncoding;}
 function contains(outer,inner){return inner.start>=outer.start&&inner.end<=outer.end;}
 function sourceLeaves(row){
  const leaves=[];
@@ -31,7 +33,7 @@ function sourceLeaves(row){
  }else if(Object.hasOwn(row,'spelling'))add('spelling',row.spelling,row.calleeRange??(row.regionRefs?null:row.range));
  return leaves;
 }
-function checkWitnesses(row,source,within){
+function checkWitnesses(row,source,within,expectedEncoding){
  const leaves=sourceLeaves(row), expected=new Map(leaves.map(x=>[x.field,x]));
  if(expected.size!==leaves.length)fail('NORMALIZE.WITNESS','field','duplicate source leaf');
  const seen=new Set();
@@ -39,24 +41,25 @@ function checkWitnesses(row,source,within){
   const leaf=expected.get(entry.field);
   if(!leaf||seen.has(entry.field))fail('NORMALIZE.WITNESS',entry.field,'unknown or duplicate witness');
   seen.add(entry.field);
+  encoding(entry.witness.range,expectedEncoding,`witnesses.${entry.field}`);
   const actual=verifyWitness(source,entry.witness,{within});
-  if(entry.witness.text!==leaf.value || (leaf.range!==null&&!same(actual,toByteRange(source,leaf.range))))fail('NORMALIZE.WITNESS',entry.field,'source leaf differs');
+  if(entry.witness.text!==leaf.value || (leaf.range!==null&&(encoding(leaf.range,expectedEncoding,entry.field),!same(actual,toByteRange(source,leaf.range)))))fail('NORMALIZE.WITNESS',entry.field,'source leaf differs');
  }
  for(const leaf of leaves)if(!seen.has(leaf.field))fail('WITNESS.MISSING',leaf.field,'source leaf witness missing');
 }
 function symbolKey(key){if((key.scope==='document')!==(key.document!==null))fail('NORMALIZE.SYMBOL','key','symbol scope/document mismatch');}
 
-function sortRecords(rows){return rows.sort((a,b)=>a.syntaxId&&b.syntaxId?order(a.syntaxId,b.syntaxId):a.id&&b.id?order(a.id,b.id):compare(a,b));}
-function insert(map,ref,value){if(map.has(ref)&&encode(map.get(ref))!==encode(value))fail('NORMALIZE.RECORD_REF','recordRef','conflicting record reference');map.set(ref,value);}
-function resolveTarget(ref,ids,decls){if(ref===null)return null;if(ref.kind==='external')return {kind:'external',symbol:ref.symbol};const row=requireValue(decls.get(ref.declarationRef),'NORMALIZE.TARGET','declarationRef');if(row.revisionId!==ref.revisionId)fail('NORMALIZE.TARGET','revisionId','target revision differs');return {kind:'internal',syntaxId:requireValue(ids.get(ref.declarationRef),'NORMALIZE.TARGET','declarationRef'),document:row.document,revisionId:row.revisionId};}
+function sortRecords(rows){return rows.sort((a,b)=>a.syntaxId&&b.syntaxId?(order(a.syntaxId,b.syntaxId)||order(a.revisionId,b.revisionId)||compare(a.document,b.document)):a.id&&b.id?(order(a.id,b.id)||compare(a,b)):compare(a,b));}
+function insert(map,ref,value){if(map.has(ref))fail('NORMALIZE.RECORD_REF','recordRef','conflicting record reference');map.set(ref,value);}
+function resolveTarget(ref,ids,decls,context=null){if(ref===null)return null;if(ref.kind==='external')return {kind:'external',symbol:ref.symbol};const row=requireValue(decls.get(ref.declarationRef),'NORMALIZE.TARGET','declarationRef');if(row.revisionId!==ref.revisionId)fail('NORMALIZE.TARGET','revisionId','target revision differs');if(context&&row.document.sourceSetId!==context.sourceSetId)fail('NORMALIZE.TARGET','sourceSetId','other source set requires external target');return {kind:'internal',syntaxId:requireValue(ids.get(ref.declarationRef),'NORMALIZE.TARGET','declarationRef'),document:row.document,revisionId:row.revisionId};}
 function distinctTargets(targets){if(new Set(targets.map(encode)).size!==targets.length)fail('NORMALIZE.TARGET','candidates','duplicate target');return [...targets].sort(compare);}
 function resolution(target,candidates,status){if(status==='resolved'&&target?.kind==='internal'&&!candidates.length)return;if(status==='external'&&target?.kind==='external'&&!candidates.length)return;if(status==='ambiguous'&&target===null&&distinctTargets(candidates).length>=2)return;if(status==='unresolved'&&target===null&&!candidates.length)return;fail('NORMALIZE.RESOLUTION','resolution','target cardinality differs');}
 
 // The unit seam accepts distinct measured candidates, but fixture compilation always
 // rejects duplicate owner/kind/range measurements before constructing this index.
 export function buildAnchorIndex(measurements){const index=new Map();for(const x of measurements){const k=encode([x.anchor,x.ownerRef]);if(!index.has(k))index.set(k,[]);index.get(k).push(x);}return index;}
-export function joinAnchor(selector,index,loaded,ids=new Map()){
- validate('AnchorSelector',selector);
+export function joinAnchor(selector,index,loaded,ids=new Map(),expectedEncoding=null){
+ validate('AnchorSelector',selector);if(expectedEncoding!==null)encoding(selector.range,expectedEncoding,'anchor.range');
  const source=requireValue(loaded.sources.get(JSON.stringify([selector.document.sourceSetId,selector.revisionId,selector.document.path])),'JOIN.DOCUMENT','document');
  const snapshot=loaded.revisions.get(tuple(selector.document.sourceSetId,selector.revisionId));
  const document=snapshot?.documents.find(x=>encode(x.key)===encode(selector.document));
@@ -73,24 +76,25 @@ export function joinAnchor(selector,index,loaded,ids=new Map()){
 }
 
 export function assignKeys(loaded,registry=identityRegistry()){
- const native=loaded.native, declarations=indexed(native.declarations), ids=new Map(), entries=new Map(), active=new Set();
+ const native=loaded.native, nativeEncoding=producerEncoding(loaded,native.producerId), declarations=indexed(native.declarations), ids=new Map(), entries=new Map(), active=new Set();
  const measured=new Map();
  const position=row=>{
   const source=requireValue(loaded.sources.get(sourceKey(row)),'NORMALIZE.SOURCE','document');
+  encoding(row.range,nativeEncoding,'range');if(row.nameRange!==null)encoding(row.nameRange,nativeEncoding,'nameRange');
   const range=toByteRange(source,row.range),nameRange=row.nameRange===null?null:toByteRange(source,row.nameRange);
   if(range.start===range.end&&row.kind!=='module')fail('NORMALIZE.RANGE','range','empty non-module declaration');
   if((row.name===null)!==(nameRange===null)|| (row.kind==='module'||row.kind==='anonymousFunction')!==(row.name===null))fail('NORMALIZE.NAME','nameRange','name/kind nullability differs');
   if(nameRange&&!contains(range,nameRange))fail('NORMALIZE.NAME','nameRange','outside declaration');
   if(row.header.kind!==row.kind||row.header.name!==row.name)fail('NORMALIZE.HEADER','header','header differs from declaration');
   if(row.signature&&(row.signature.parameterTypes.length!==row.header.parameters.length||row.signature.typeParameterCount!==row.header.typeParameters.length||row.signature.variadic!==row.header.parameters.some(x=>x.variadic)))fail('NORMALIZE.SIGNATURE','signature','header disagrees');
-  checkWitnesses(row,source,range);
+  checkWitnesses(row,source,range,nativeEncoding);
   return {range,nameRange};
  };
  for(const row of native.declarations)measured.set(row.ref,position(row));
  const records=[], pending=new Set(native.declarations.map(x=>x.ref));
  while(pending.size){const ready=native.declarations.filter(x=>pending.has(x.ref)&&(x.parentRef===null||!pending.has(x.parentRef)));
   if(!ready.length)fail('NORMALIZE.OWNER','parentRef','declaration cycle');
-  const ordinalRows=ready.map(row=>{let ancestors=[];if(row.parentRef!==null){const parent=requireValue(declarations.get(row.parentRef),'NORMALIZE.OWNER','parentRef');if(sourceKey(parent)!==sourceKey(row))fail('NORMALIZE.OWNER','parentRef','cross-document parent');const p=requireValue(entries.get(parent.ref),'NORMALIZE.OWNER','parentRef');const childRange=measured.get(row.ref).range;if(!contains(p.range,childRange))fail('NORMALIZE.OWNER','range','child outside parent');for(const candidate of native.declarations){if(candidate.ref===row.ref||candidate.ref===parent.ref||sourceKey(candidate)!==sourceKey(row))continue;const middle=measured.get(candidate.ref).range;if(contains(p.range,middle)&&contains(middle,childRange)&&!same(middle,p.range)&&!same(middle,childRange))fail('NORMALIZE.OWNER','parentRef','not immediate container');}ancestors=parent.kind==='module'?p.ancestors:[...p.ancestors,p.key];}return {row,sourceSetId:row.document.sourceSetId,language:row.document.language,documentPath:row.document.path,revisionId:row.revisionId,container:ancestors,kind:row.kind,name:row.name,signature:row.signature,range:measured.get(row.ref).range};});
+  const ordinalRows=ready.map(row=>{let ancestors=[];if(row.parentRef===null&&row.kind!=='module'){const child=measured.get(row.ref).range;for(const candidate of native.declarations){if(candidate.ref===row.ref||sourceKey(candidate)!==sourceKey(row))continue;const outer=measured.get(candidate.ref).range;if(contains(outer,child)&&!same(outer,child))fail('NORMALIZE.OWNER','parentRef','nested declaration requires immediate owner');}}if(row.parentRef!==null){const parent=requireValue(declarations.get(row.parentRef),'NORMALIZE.OWNER','parentRef');if(sourceKey(parent)!==sourceKey(row))fail('NORMALIZE.OWNER','parentRef','cross-document parent');const p=requireValue(entries.get(parent.ref),'NORMALIZE.OWNER','parentRef');const childRange=measured.get(row.ref).range;if(!contains(p.range,childRange))fail('NORMALIZE.OWNER','range','child outside parent');for(const candidate of native.declarations){if(candidate.ref===row.ref||candidate.ref===parent.ref||sourceKey(candidate)!==sourceKey(row))continue;const middle=measured.get(candidate.ref).range;if(contains(p.range,middle)&&contains(middle,childRange)&&!same(middle,p.range)&&!same(middle,childRange))fail('NORMALIZE.OWNER','parentRef','not immediate container');}ancestors=parent.kind==='module'?p.ancestors:[...p.ancestors,p.key];}return {row,sourceSetId:row.document.sourceSetId,language:row.document.language,documentPath:row.document.path,revisionId:row.revisionId,container:ancestors,kind:row.kind,name:row.name,signature:row.signature,range:measured.get(row.ref).range};});
   const ordinals=assignOrdinals(ordinalRows);
   for(const entry of ordinalRows){const {row}=entry,key={kind:row.kind,name:row.name,signature:row.signature,ordinal:ordinals.get(entry)},ancestors=entry.container;const syntaxId=registry.register('syntax',{sourceSet:row.document.sourceSetId,path:row.document.path,language:row.document.language,ancestors,declaration:key});ids.set(row.ref,syntaxId);entries.set(row.ref,{key,ancestors,range:entry.range});pending.delete(row.ref);const out={syntaxId,document:row.document,revisionId:row.revisionId,kind:row.kind,name:row.name,lookupKey:row.name===null?null:lookupKey(row.document.language,row.name),ancestors,key,range:entry.range,nameRange:measured.get(row.ref).nameRange,header:row.header,provenanceId:`native:${row.revisionId}:${syntaxId}`};validate('Declaration',out);records.push(out);}
  }
@@ -99,11 +103,11 @@ export function assignKeys(loaded,registry=identityRegistry()){
 }
 
 export function normalizeOccurrences(loaded,keys){
- const {native}=loaded, decl=indexed(native.declarations), controls=indexed(native.controls), ids=new Map(), measurements=[], rows=[];
+ const {native}=loaded,nativeEncoding=producerEncoding(loaded,native.producerId), decl=indexed(native.declarations), controls=indexed(native.controls), ids=new Map(), measurements=[], rows=[];
  for(const [kind,items] of [['call',native.calls],['control',native.controls],['reference',native.references]])for(const row of items){
-  const owner=requireValue(decl.get(row.ownerRef),'NORMALIZE.OWNER','ownerRef');if(sourceKey(owner)!==sourceKey(row))fail('NORMALIZE.OWNER','ownerRef','cross-document occurrence');const source=requireValue(loaded.sources.get(sourceKey(row)),'NORMALIZE.SOURCE','document');const range=toByteRange(source,row.range);const ownerRange=toByteRange(source,owner.range);if(range.start<ownerRange.start||range.end>ownerRange.end)fail('NORMALIZE.OWNER','range','outside owner');checkWitnesses(row,source,range);
+  const owner=requireValue(decl.get(row.ownerRef),'NORMALIZE.OWNER','ownerRef');if(sourceKey(owner)!==sourceKey(row))fail('NORMALIZE.OWNER','ownerRef','cross-document occurrence');const source=requireValue(loaded.sources.get(sourceKey(row)),'NORMALIZE.SOURCE','document');encoding(row.range,nativeEncoding,'range');const range=toByteRange(source,row.range);const ownerRange=toByteRange(source,owner.range);if(range.start<ownerRange.start||range.end>ownerRange.end)fail('NORMALIZE.OWNER','range','outside owner');checkWitnesses(row,source,range,nativeEncoding);
   const own=requireValue(keys.ids.get(row.ownerRef),'NORMALIZE.OWNER','ownerRef');let calleeRange=null;
-  if(kind==='call'){calleeRange=row.calleeRange===null?null:toByteRange(source,row.calleeRange);if(calleeRange&&(calleeRange.start<range.start||calleeRange.end>range.end))fail('NORMALIZE.CALLEE','calleeRange','outside invocation');if(calleeRange&&row.spelling===null)fail('NORMALIZE.CALLEE','spelling','measured callee needs spelling');if(!calleeRange&&row.spelling!==null){const witness=row.witnesses.find(x=>x.field==='spelling')?.witness;verifyCallSpelling(source,{calleeRange:null,spelling:row.spelling,range},witness);}}
+  if(kind==='call'){if(row.calleeRange!==null)encoding(row.calleeRange,nativeEncoding,'calleeRange');calleeRange=row.calleeRange===null?null:toByteRange(source,row.calleeRange);if(calleeRange&&(calleeRange.start<range.start||calleeRange.end>range.end))fail('NORMALIZE.CALLEE','calleeRange','outside invocation');if(calleeRange&&row.spelling===null)fail('NORMALIZE.CALLEE','spelling','measured callee needs spelling');if(!calleeRange&&row.spelling!==null){const witness=row.witnesses.find(x=>x.field==='spelling')?.witness;verifyCallSpelling(source,{calleeRange:null,spelling:row.spelling,range},witness);}}
   if(kind==='reference'&&source.subarray(range.start,range.end).toString('utf8')!==row.spelling)fail('NORMALIZE.REFERENCE','spelling','reference bytes differ');
   rows.push({row,kind,range,calleeRange,revisionId:row.revisionId,ownerSyntaxId:own});
  }
@@ -121,7 +125,7 @@ export function normalizeOccurrences(loaded,keys){
 export function collapseFacts(rows){const by=new Map();for(const row of rows){const key=encode(row);if(!by.has(key))by.set(key,row);}return sortRecords([...by.values()]);}
 
 function nativeProof(row,loaded,id){const snapshot=loaded.revisions.get(tuple(row.document.sourceSetId,row.revisionId)),document=snapshot.documents.find(x=>encode(x.key)===encode(row.document));const proof={id,producerId:loaded.native.producerId,document:row.document,revisionId:row.revisionId,contentHash:document.contentHash,evidenceKind:'measuredSyntax',basis:null,freshness:'fresh'};proof.freshness=expectedFreshness(proof,loaded);validate('Provenance',proof);return proof;}
-function normalizeRelationship(fact,ids,decls){const record={kind:fact.relationshipKind,source:resolveTarget(fact.source,ids,decls),target:resolveTarget(fact.target,ids,decls),provenanceId:fact.provenanceRef};if(record.source.kind!=='internal')fail('NORMALIZE.RELATIONSHIP','source','internal source required');validate('TypeRelationship',record);return record;}
+function normalizeRelationship(fact,ids,decls,context=null){const record={kind:fact.relationshipKind,source:resolveTarget(fact.source,ids,decls,context),target:resolveTarget(fact.target,ids,decls,context),provenanceId:fact.provenanceRef};if(record.target.kind==='external')symbolKey(record.target.symbol);if(record.source.kind!=='internal')fail('NORMALIZE.RELATIONSHIP','source','internal source required');validate('TypeRelationship',record);return record;}
 export {normalizeRelationship};
 
 export function normalizeFixture(loaded){
@@ -130,39 +134,44 @@ export function normalizeFixture(loaded){
  unique([...loaded.native.declarations,...loaded.native.calls,...loaded.native.controls,...loaded.native.references],x=>x.ref,'NORMALIZE.NATIVE','ref');
  const keys=assignKeys(loaded),occ=normalizeOccurrences(loaded,keys),decl=indexed(loaded.native.declarations),nativeRows=[...loaded.native.declarations,...loaded.native.calls,...loaded.native.controls,...loaded.native.references];
  const records={formatVersion:1,comparison:structuredClone(loaded.comparison),producers:sortRecords(structuredClone(loaded.fixture.producers)),sourceSets:sortRecords(structuredClone(loaded.fixture.sourceSets)),revisions:sortRecords([...loaded.revisions.values()].map(x=>structuredClone(x))),coverage:[],provenance:[],declarations:keys.records,symbols:[],declarationBindings:[],typeRelationships:[],calls:occ.calls,controlRegions:occ.controlRegions,references:[],referenceJoinDiagnostics:[],callBindings:[],durableAnchors:[],groupContinuities:[],anchorResults:[]};
- const recordMap=new Map(),identityMap=new Map([...keys.ids,...occ.ids]);for(const row of nativeRows){const output=records.declarations.find(x=>x.syntaxId===keys.ids.get(row.ref))??records.calls.find(x=>x.id===occ.ids.get(row.ref))??records.controlRegions.find(x=>x.id===occ.ids.get(row.ref));if(output)recordMap.set(row.ref,output);const proof=nativeProof(row,loaded,`native:${row.revisionId}:${identityMap.get(row.ref)}`);records.provenance.push(proof);}
+ const recordMap=new Map(),identityMap=new Map([...keys.ids,...occ.ids]);for(const row of nativeRows){const output=records.declarations.find(x=>x.syntaxId===keys.ids.get(row.ref)&&x.revisionId===row.revisionId&&same(x.document,row.document))??records.calls.find(x=>x.id===occ.ids.get(row.ref))??records.controlRegions.find(x=>x.id===occ.ids.get(row.ref));if(output)insert(recordMap,row.ref,output);const proof=nativeProof(row,loaded,`native:${row.revisionId}:${identityMap.get(row.ref)}`);records.provenance.push(proof);}
  const factRefs=new Set(),provenances=new Map(records.provenance.map(x=>[x.id,x]));
  const facts=loaded.annotations.flatMap(x=>x.facts);
- for(const fact of facts){validate('Fact',fact);if(factRefs.has(fact.ref))fail('NORMALIZE.FACT_REF','ref','duplicate fixture-wide fact reference');factRefs.add(fact.ref);if(fact.kind!=='provenance')continue;const proof={...fact.record,freshness:expectedFreshness(fact.record,loaded)};checkCapturedBasis(proof,loaded);const old=provenances.get(proof.id);if(old&&encode(old)!==encode(proof))fail('NORMALIZE.PROVENANCE','id','conflicting proof');provenances.set(proof.id,proof);records.provenance.push(proof);recordMap.set(fact.ref,proof);}
+ for(const fact of facts){validate('Fact',fact);if(identityMap.has(fact.ref)||loaded.anchors.cases.some(x=>x.id===fact.ref))fail('NORMALIZE.RECORD_REF','recordRef','cross-namespace reference collision');if(factRefs.has(fact.ref))fail('NORMALIZE.FACT_REF','ref','duplicate fixture-wide fact reference');factRefs.add(fact.ref);if(fact.kind!=='provenance')continue;const proof={...fact.record,freshness:expectedFreshness(fact.record,loaded)};checkCapturedBasis(proof,loaded);const old=provenances.get(proof.id);if(old&&encode(old)!==encode(proof))fail('NORMALIZE.PROVENANCE','id','conflicting proof');provenances.set(proof.id,proof);records.provenance.push(proof);insert(recordMap,fact.ref,proof);}
  const getProof=id=>requireValue(provenances.get(id),'NORMALIZE.PROVENANCE','provenanceId');
- const target=ref=>{const value=resolveTarget(ref,keys.ids,decl);if(value?.kind==='external')symbolKey(value.symbol);return value;};
+ const target=(ref,context)=>{const value=resolveTarget(ref,keys.ids,decl,context);if(value?.kind==='external')symbolKey(value.symbol);return value;};
  const bindingGroups=new Map(),referenceGroups=new Map();
  for(const fact of facts){if(fact.kind==='provenance')continue;
   if(fact.kind==='coverage'){validate('Coverage',fact.record);const value=fact.record;const annotation=loaded.annotations.find(x=>x.facts.includes(fact));if(!same(annotation.document,{sourceSetId:value.sourceSetId,language:value.language,path:value.documentPath})||annotation.revisionId!==value.revisionId)fail('NORMALIZE.COVERAGE','record','annotation tuple mismatch');if(!loaded.fixture.producers.some(x=>x.id===value.producerId&&x.languages.includes(value.language))||!loaded.revisions.get(tuple(value.sourceSetId,value.revisionId))?.documents.some(x=>x.key.path===value.documentPath&&x.key.language===value.language))fail('NORMALIZE.COVERAGE','record','unadmitted coverage tuple');const applicable=applicableRoles(value.language),ordered=roles=>roles.every((role,i)=>applicable.includes(role)&&(i===0||applicable.indexOf(role)>applicable.indexOf(roles[i-1])));const selected=['failed','partial','complete'].includes(value.state),requested=value.state!=='notRequested';
-   if(value.requested!==requested||value.selected!==selected||(value.diagnostic===null)!==['notRequested','complete'].includes(value.state)||!ordered(value.supportedRoles)||!ordered(value.observedRoles)||value.observedRoles.some(x=>!value.supportedRoles.includes(x)))fail('NORMALIZE.COVERAGE','record','state/roles/diagnostic mismatch');
-   records.coverage.push(value);recordMap.set(fact.ref,value);continue;}
+   const intent=loaded.fixture.coverageIntents.find(x=>x.producerId===value.producerId&&x.revisionId===value.revisionId&&same(x.document,annotation.document));
+   const roles=intent?.requestedRoles.filter(x=>applicable.includes(x))??[];
+   const unsupported=roles.some(x=>!value.supportedRoles.includes(x));
+   const missing=roles.some(x=>value.supportedRoles.includes(x)&&!value.observedRoles.includes(x));
+   const unsupportedMeasurement=intent?.measurementSupport.some(x=>!x.available)??false;
+   if(value.requested!==requested||value.selected!==selected||(value.diagnostic===null)!==['notRequested','complete'].includes(value.state)||!ordered(value.supportedRoles)||!ordered(value.observedRoles)||value.observedRoles.some(x=>!value.supportedRoles.includes(x))||value.state==='complete'&&(unsupported||missing||unsupportedMeasurement)||value.state==='partial'&&!(unsupported||missing||unsupportedMeasurement))fail('NORMALIZE.COVERAGE','record','state/roles/diagnostic mismatch');
+   records.coverage.push(value);insert(recordMap,fact.ref,value);continue;}
   const proof=getProof(fact.kind==='typeRelationship'?fact.provenanceRef:fact.record.provenanceId);
   const expectedKind={symbol:'declarationBinding',declarationBinding:'declarationBinding',callBinding:'semanticReference',reference:'semanticReference',typeRelationship:'typeRelationship'}[fact.kind];
   if(proof.evidenceKind!==expectedKind)fail('NORMALIZE.EVIDENCE_KIND','provenanceId','wrong fact-class proof');
   const annotation=loaded.annotations.find(x=>x.facts.includes(fact));
   if(!same(proof.document,annotation.document)||proof.revisionId!==annotation.revisionId)fail('NORMALIZE.FACT_TUPLE','provenanceId','proof outside authored document/revision');
   if(fact.anchor&&(!same(fact.anchor.document,proof.document)||fact.anchor.revisionId!==proof.revisionId||fact.anchor.contentHash!==proof.contentHash))fail('NORMALIZE.FACT_TUPLE','anchor','anchor/proof tuple mismatch');
-  if(fact.kind==='symbol'){symbolKey(fact.record.key);const value={...fact.record,declarations:fact.record.declarations.map(target)};if(new Set(value.declarations.map(encode)).size!==value.declarations.length)fail('NORMALIZE.SYMBOL','declarations','duplicate target');validate('Symbol',value);records.symbols.push(value);recordMap.set(fact.ref,value);continue;}
-  if(fact.kind==='typeRelationship'){if(proof.evidenceKind!=='typeRelationship')fail('NORMALIZE.RELATIONSHIP','provenanceRef','wrong independent proof');const value=normalizeRelationship(fact,keys.ids,decl);records.typeRelationships.push(value);recordMap.set(fact.ref,value);continue;}
+  if(fact.kind==='symbol'){symbolKey(fact.record.key);const value={...fact.record,declarations:fact.record.declarations.map(x=>target(x,proof.document))};if(new Set(value.declarations.map(encode)).size!==value.declarations.length)fail('NORMALIZE.SYMBOL','declarations','duplicate target');validate('Symbol',value);records.symbols.push(value);insert(recordMap,fact.ref,value);continue;}
+  if(fact.kind==='typeRelationship'){if(proof.evidenceKind!=='typeRelationship')fail('NORMALIZE.RELATIONSHIP','provenanceRef','wrong independent proof');const value=normalizeRelationship(fact,keys.ids,decl,proof.document);records.typeRelationships.push(value);insert(recordMap,fact.ref,value);continue;}
   if((fact.kind==='declarationBinding'&&fact.anchor.kind!=='declarationName')||(fact.kind==='reference'&&fact.anchor.kind!=='reference')||(fact.kind==='callBinding'&&!['callee','invocation'].includes(fact.anchor.kind)))fail('NORMALIZE.JOIN_FAMILY','anchor.kind','fact anchor family mismatch');
-  const join=joinAnchor(fact.anchor,occ.index,loaded,identityMap);
-  if(fact.kind==='declarationBinding'){const value={syntaxId:join.status==='exact'?join.candidateIds[0]:null,symbols:fact.record.symbols,join,provenanceId:proof.id};if(join.status==='exact'&&!value.symbols.length||new Set(value.symbols.map(encode)).size!==value.symbols.length)fail('NORMALIZE.DECLARATION_BINDING','symbols','missing/duplicate symbol');for(const symbol of value.symbols)symbolKey(symbol);validate('DeclarationBinding',value);records.declarationBindings.push(value);recordMap.set(fact.ref,value);continue;}
+  const join=joinAnchor(fact.anchor,occ.index,loaded,identityMap,producerEncoding(loaded,proof.producerId));
+  if(fact.kind==='declarationBinding'){const value={syntaxId:join.status==='exact'?join.candidateIds[0]:null,symbols:fact.record.symbols,join,provenanceId:proof.id};if(join.status==='exact'&&!value.symbols.length||new Set(value.symbols.map(encode)).size!==value.symbols.length)fail('NORMALIZE.DECLARATION_BINDING','symbols','missing/duplicate symbol');for(const symbol of value.symbols)symbolKey(symbol);validate('DeclarationBinding',value);records.declarationBindings.push(value);insert(recordMap,fact.ref,value);continue;}
   if(fact.kind==='reference'){
    if(proof.evidenceKind!=='semanticReference')fail('NORMALIZE.REFERENCE','provenanceId','semantic reference proof required');
-   if(join.status!=='exact'){const diagnostic={factRef:fact.ref,provenanceId:proof.id,join};validate('ReferenceJoinDiagnostic',diagnostic);records.referenceJoinDiagnostics.push(diagnostic);recordMap.set(fact.ref,diagnostic);continue;}
+   if(join.status!=='exact'){const diagnostic={factRef:fact.ref,provenanceId:proof.id,join};validate('ReferenceJoinDiagnostic',diagnostic);records.referenceJoinDiagnostics.push(diagnostic);insert(recordMap,fact.ref,diagnostic);continue;}
    const native=occ.referenceRows.find(x=>x.id===join.candidateIds[0]);if(!native)fail('NORMALIZE.REFERENCE','anchor','reference measurement missing');const row=native.row;
-   const value={id:native.id,ownerSyntaxId:native.ownerSyntaxId,ordinal:native.ordinal,document:row.document,revisionId:row.revisionId,range:native.range,spelling:row.spelling,lookupKey:lookupKey(row.document.language,row.spelling),site:fact.record.site,roles:fact.record.roles,resolution:fact.record.resolution,declaredTarget:target(fact.record.declaredTarget),candidates:distinctTargets(fact.record.candidates.map(target)),provenanceId:proof.id};
+   const value={id:native.id,ownerSyntaxId:native.ownerSyntaxId,ordinal:native.ordinal,document:row.document,revisionId:row.revisionId,range:native.range,spelling:row.spelling,lookupKey:lookupKey(row.document.language,row.spelling),site:fact.record.site,roles:fact.record.roles,resolution:fact.record.resolution,declaredTarget:target(fact.record.declaredTarget,proof.document),candidates:distinctTargets(fact.record.candidates.map(x=>target(x,proof.document))),provenanceId:proof.id};
    validateRoles(row.document.language,value.roles,{site:value.site,callee:occ.calls.some(x=>x.ownerSyntaxId===value.ownerSyntaxId&&x.calleeRange&&encode(x.calleeRange)===encode(value.range))});resolution(value.declaredTarget,value.candidates,value.resolution);validate('Reference',value);
-   const referenceKey=encode([proof.producerId,value.id]);if(!referenceGroups.has(referenceKey))referenceGroups.set(referenceKey,[]);referenceGroups.get(referenceKey).push({fact,value});recordMap.set(fact.ref,value);continue;
+   const referenceKey=encode([proof.producerId,value.id]);if(!referenceGroups.has(referenceKey))referenceGroups.set(referenceKey,[]);referenceGroups.get(referenceKey).push({fact,value});insert(recordMap,fact.ref,value);continue;
   }
   if(fact.kind==='callBinding'){
-   const value={callId:join.status==='exact'?join.candidateIds[0]:null,join,resolution:fact.record.resolution,declaredTarget:target(fact.record.declaredTarget),candidates:distinctTargets(fact.record.candidates.map(target)),dispatch:fact.record.dispatch,possibleDispatch:distinctTargets(fact.record.possibleDispatch.map(target)),possibleDispatchComplete:false,staleTarget:null,provenanceId:proof.id};resolution(value.declaredTarget,value.candidates,value.resolution);value.staleTarget=expectedStaleTarget(value,proof,loaded,keys.verified);validate('CallBinding',value);
-   const k=encode([proof.producerId,join.status==='exact'?join.candidateIds[0]:join.anchor,join.anchor.document,join.anchor.revisionId]);if(!bindingGroups.has(k))bindingGroups.set(k,[]);bindingGroups.get(k).push({fact,value,proof});recordMap.set(fact.ref,value);
+   const value={callId:join.status==='exact'?join.candidateIds[0]:null,join,resolution:fact.record.resolution,declaredTarget:target(fact.record.declaredTarget,proof.document),candidates:distinctTargets(fact.record.candidates.map(x=>target(x,proof.document))),dispatch:fact.record.dispatch,possibleDispatch:distinctTargets(fact.record.possibleDispatch.map(x=>target(x,proof.document))),possibleDispatchComplete:false,staleTarget:null,provenanceId:proof.id};resolution(value.declaredTarget,value.candidates,value.resolution);value.staleTarget=expectedStaleTarget(value,proof,loaded,keys.verified);validate('CallBinding',value);
+   const k=encode([proof.producerId,join.status==='exact'?join.candidateIds[0]:join.anchor,join.anchor.document,join.anchor.revisionId]);if(!bindingGroups.has(k))bindingGroups.set(k,[]);bindingGroups.get(k).push({fact,value,proof});insert(recordMap,fact.ref,value);
   }
  }
  for(const group of referenceGroups.values()){const values=collapseFacts(group.map(x=>x.value));const first=values[0];if(values.some(x=>encode({...x,provenanceId:null})!==encode({...first,provenanceId:null})))fail('NORMALIZE.REFERENCE_CONFLICT','resolution','conflicting reference facts');records.references.push(...values);}
@@ -173,15 +182,15 @@ export function normalizeFixture(loaded){
   const targets=distinctTargets([...new Map(items.map(x=>[encode(x.declaredTarget),x.declaredTarget])).values()]);if(targets.length<2){if(items.some(x=>encode({...x,provenanceId:null})!==encode({...baseline,provenanceId:null})))fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','conflicting duplicate facts');records.callBindings.push(...items);continue;}
   for(const x of items){const value={...x,resolution:'ambiguous',declaredTarget:null,candidates:targets,staleTarget:null};validate('CallBinding',value);records.callBindings.push(value);for(const entry of group)if(entry.value.provenanceId===x.provenanceId)recordMap.set(entry.fact.ref,value);}
  }
- for(const anchorCase of loaded.anchors.cases){
-  if(anchorCase.currentRevisionId!==loaded.comparison.revisionId||anchorCase.continuity.fromRevisionId===anchorCase.continuity.toRevisionId||anchorCase.continuity.fromRevisionId!==decl.get(anchorCase.capturedDeclarationRef)?.revisionId||anchorCase.continuity.toRevisionId!==anchorCase.currentRevisionId)fail('NORMALIZE.ANCHOR','continuity','case/revision link differs');const captured=requireValue(decl.get(anchorCase.capturedDeclarationRef),'NORMALIZE.ANCHOR','capturedDeclarationRef');
+ for(const anchorCase of loaded.anchors.cases){if(identityMap.has(anchorCase.id))fail('NORMALIZE.RECORD_REF','recordRef','anchor/native reference collision');
+  if(anchorCase.currentRevisionId!==loaded.comparison.revisionId||anchorCase.continuity.fromRevisionId!==decl.get(anchorCase.capturedDeclarationRef)?.revisionId||anchorCase.continuity.toRevisionId!==anchorCase.currentRevisionId)fail('NORMALIZE.ANCHOR','continuity','case/revision link differs');const captured=requireValue(decl.get(anchorCase.capturedDeclarationRef),'NORMALIZE.ANCHOR','capturedDeclarationRef');
   const declaration=requireValue(keys.records.find(x=>x.syntaxId===keys.ids.get(captured.ref)&&x.revisionId===captured.revisionId),'NORMALIZE.ANCHOR','capturedDeclarationRef');
   const siblings=keys.records.filter(x=>encode(x.document)===encode(declaration.document)&&x.revisionId===declaration.revisionId&&encode(x.ancestors)===encode(declaration.ancestors)&&x.key.kind===declaration.key.kind&&x.key.name===declaration.key.name&&encode(x.key.signature)===encode(declaration.key.signature)).sort((a,b)=>a.range.start-b.range.start||a.range.end-b.range.end);
   const focusedHash=headerHash(declaration.header);const headers=siblings.map(x=>headerHash(x.header));
   const durable={syntaxId:declaration.syntaxId,document:declaration.document,capturedRevisionId:declaration.revisionId,headerHash:focusedHash,siblingGroupHash:siblingGroupHash(headers),siblingCount:siblings.length,identicalHeaderCount:headers.filter(x=>x===focusedHash).length};
   validate('DurableAnchor',durable);records.durableAnchors.push(durable);records.groupContinuities.push(anchorCase.continuity);
   const answer=anchorCase.expectedResult;const targetId=answer.targetId===null?null:typeof answer.targetId==='string'?answer.targetId:requireValue(identityMap.get(answer.targetId.ref),'NORMALIZE.ANCHOR','targetId');
-  if(targetId!==null&&!keys.records.some(x=>x.syntaxId===targetId&&x.revisionId===anchorCase.currentRevisionId))fail('NORMALIZE.ANCHOR','targetId','target outside current revision');if((answer.status==='attached')!==(targetId!==null)||(answer.reason==='none')!==(answer.status==='attached'))fail('NORMALIZE.ANCHOR','expectedResult','status/target/reason mismatch');const result={...answer,targetId};validate('AnchorResult',result);records.anchorResults.push(result);recordMap.set(anchorCase.id,durable);
+  if(anchorCase.continuity.fromRevisionId===anchorCase.continuity.toRevisionId&&(anchorCase.continuity.state!=='unchanged'||targetId!==declaration.syntaxId))fail('NORMALIZE.ANCHOR','continuity','same-revision identity differs');if(targetId!==null&&!keys.records.some(x=>x.syntaxId===targetId&&x.revisionId===anchorCase.currentRevisionId))fail('NORMALIZE.ANCHOR','targetId','target outside current revision');if((answer.status==='attached')!==(targetId!==null)||(answer.reason==='none')!==(answer.status==='attached'))fail('NORMALIZE.ANCHOR','expectedResult','status/target/reason mismatch');const result={...answer,targetId};validate('AnchorResult',result);records.anchorResults.push(result);insert(recordMap,anchorCase.id,durable);
  }
  for(const field of ['coverage','provenance','symbols','declarationBindings','typeRelationships','references','referenceJoinDiagnostics','callBindings'])records[field]=collapseFacts(records[field]);
  for(const [field,key] of [['coverage',x=>encode([x.producerId,x.sourceSetId,x.documentPath,x.revisionId])],['symbols',x=>encode([provenances.get(x.provenanceId)?.producerId,x.key])],['declarations',x=>encode([x.revisionId,x.syntaxId])],['calls',x=>encode([x.revisionId,x.id])]]){
