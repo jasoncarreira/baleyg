@@ -684,6 +684,15 @@ fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Re
     }
 }
 #[derive(Debug)]
+struct StorageBusy;
+impl std::fmt::Display for StorageBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("storage_busy")
+    }
+}
+impl std::error::Error for StorageBusy {}
+
+#[derive(Debug)]
 pub struct UseGuard {
     file: File,
     path: PathBuf,
@@ -735,7 +744,7 @@ impl UseGuard {
             if status != 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() == std::io::ErrorKind::WouldBlock {
-                    bail!("storage_busy: {}", path.display());
+                    return Err(StorageBusy.into());
                 }
                 return Err(e.into());
             }
@@ -1151,6 +1160,23 @@ pub fn valid_record_id(id: &str) -> bool {
         .is_some_and(|key| lower_hex(key, 64))
         || Uuid::parse_str(id).is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == id)
 }
+#[derive(Debug)]
+enum RecordIssue {
+    RecoverySidecar,
+    Incompatible(&'static str),
+    Incomplete(&'static str),
+}
+impl std::fmt::Display for RecordIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecoverySidecar => f.write_str("recovery sidecar present"),
+            Self::Incompatible(detail) => write!(f, "incompatible_record: {detail}"),
+            Self::Incomplete(detail) => write!(f, "incomplete_record: {detail}"),
+        }
+    }
+}
+impl std::error::Error for RecordIssue {}
+
 fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
     use rusqlite::{Connection, OpenFlags};
     let file = open_file(path, false)?;
@@ -1160,7 +1186,7 @@ fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
             path.file_name().unwrap().to_string_lossy()
         ));
         match fs::symlink_metadata(&sidecar) {
-            Ok(_) => anyhow::bail!("recovery sidecar present"),
+            Ok(_) => return Err(RecordIssue::RecoverySidecar.into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -1258,10 +1284,9 @@ fn validate_record_schema(db: &rusqlite::Connection) -> Result<()> {
     // countable record with weaker constraints must never be destroyed automatically.
     let expected = rusqlite::Connection::open_in_memory()?;
     expected.execute_batch(RECORD_SCHEMA)?;
-    ensure!(
-        objects(db)? == objects(&expected)?,
-        "incompatible_record: unexpected SQLite schema"
-    );
+    if objects(db)? != objects(&expected)? {
+        return Err(RecordIssue::Incompatible("unexpected SQLite schema").into());
+    }
     Ok(())
 }
 
@@ -1269,22 +1294,22 @@ fn inspect_record(dir: &Path, id: &str) -> Result<(RecordReport, Vec<String>)> {
     private_dir(dir)?;
     let db = readonly_db(&dir.join("workspace.db"))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version == 1, "incompatible_record: schema version");
+    if version != 1 {
+        return Err(RecordIssue::Incompatible("schema version").into());
+    }
     validate_record_schema(&db)?;
     let row: (i64, String, i64) = db.query_row(
         "SELECT schema_version,record_id,initialized FROM record_metadata WHERE singleton=1",
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    ensure!(
-        row == (1, id.to_owned(), 1),
-        "incomplete_record: metadata mismatch"
-    );
+    if row != (1, id.to_owned(), 1) {
+        return Err(RecordIssue::Incomplete("metadata mismatch").into());
+    }
     let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    ensure!(
-        integrity == "ok",
-        "incomplete_record: database integrity check failed"
-    );
+    if integrity != "ok" {
+        return Err(RecordIssue::Incomplete("database integrity check failed").into());
+    }
     db.prepare("SELECT path,device,inode FROM known_roots")?;
     db.prepare("SELECT id,payload FROM views")?;
     db.prepare("SELECT id,node_id,payload FROM annotations")?;
@@ -1383,16 +1408,16 @@ impl TopologyRoots {
         if let Some(parent) = managed_existing(&self.cache, "indexes")? {
             for entry in fs::read_dir(&parent)? {
                 let entry = entry?;
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("non-UTF8 index name"))?;
+                // Index keys are ASCII hex; no non-UTF8 name can be a managed key.
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
                 if !lower_hex(&name, 64) {
                     continue;
                 }
                 let lock = parent.join(format!("{name}.lock"));
                 let (status, reason) = match UseGuard::acquire_existing(&lock, true, true) {
-                    Err(e) if e.to_string().contains("storage_busy") => ("busy", "use_lock_busy"),
+                    Err(e) if e.is::<StorageBusy>() => ("busy", "use_lock_busy"),
                     Err(_) => ("unknown", "unsafe_use_lock"),
                     Ok(guard) => {
                         let result = inspect_index(&entry.path(), &name, now_secs)
@@ -1416,10 +1441,10 @@ impl TopologyRoots {
         if let Some(parent) = managed_existing(&self.data, "workspaces")? {
             for entry in fs::read_dir(&parent)? {
                 let entry = entry?;
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("non-UTF8 record name"))?;
+                // Durable IDs are ASCII; unrelated non-UTF8 entries are not records.
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
                 if !valid_record_id(&name) {
                     continue;
                 }
@@ -1427,7 +1452,7 @@ impl TopologyRoots {
                 // lock or expose error text containing local paths or SQLite details.
                 let lock = parent.join(format!("{name}.lock"));
                 let report = match UseGuard::acquire_existing(&lock, true, true) {
-                    Err(e) if e.to_string().contains("storage_busy") => {
+                    Err(e) if e.is::<StorageBusy>() => {
                         GcRecordReport::unavailable(name, "busy", "use_lock_busy")
                     }
                     Err(_) => GcRecordReport::unavailable(name, "unknown", "unsafe_use_lock"),
@@ -1439,22 +1464,20 @@ impl TopologyRoots {
                             match result {
                                 Ok((report, _)) => report.into(),
                                 Err(e) => {
-                                    let reason = if e
-                                        .to_string()
-                                        .contains("recovery sidecar present")
-                                    {
-                                        "recovery_sidecar"
-                                    } else if e.to_string().contains("incompatible_record") {
-                                        "incompatible_record"
-                                    } else if e.to_string().contains("incomplete_record")
-                                        || fs::symlink_metadata(entry.path().join("workspace.db"))
-                                            .is_err_and(|error| {
-                                                error.kind() == std::io::ErrorKind::NotFound
-                                            })
-                                    {
-                                        "incomplete_record"
-                                    } else {
-                                        "metadata_unreadable"
+                                    let reason = match e.downcast_ref::<RecordIssue>() {
+                                        Some(RecordIssue::RecoverySidecar) => "recovery_sidecar",
+                                        Some(RecordIssue::Incompatible(_)) => "incompatible_record",
+                                        Some(RecordIssue::Incomplete(_)) => "incomplete_record",
+                                        None if fs::symlink_metadata(
+                                            entry.path().join("workspace.db"),
+                                        )
+                                        .is_err_and(|error| {
+                                            error.kind() == std::io::ErrorKind::NotFound
+                                        }) =>
+                                        {
+                                            "incomplete_record"
+                                        }
+                                        None => "metadata_unreadable",
                                     };
                                     GcRecordReport::unavailable(name, "unknown", reason)
                                 }

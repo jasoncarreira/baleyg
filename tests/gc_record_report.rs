@@ -192,3 +192,67 @@ fn incomplete_record_does_not_hide_valid_peer_or_create_missing_lock() {
         "unsafe_use_lock"
     );
 }
+
+#[test]
+fn hostile_path_text_and_non_utf8_entries_cannot_spoof_status_or_abort_inventory() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt, os::unix::fs::PermissionsExt};
+    let temp = tempfile::tempdir().unwrap();
+    let hostile = temp
+        .path()
+        .join("storage_busy recovery sidecar present incomplete_record");
+    common::private(&hostile);
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        hostile.join("cache"),
+        hostile.join("data"),
+    );
+    let mut ids: Vec<_> = (0..2)
+        .map(|n| {
+            let work = temp.path().join(format!("workspace-{n}"));
+            fs::create_dir(&work).unwrap();
+            WorkspaceIdentity::discover(Some(&work), &work).unwrap()
+        })
+        .collect();
+    ids.sort_by(|a, b| a.record_id.cmp(&b.record_id));
+    for id in &ids {
+        annotation(&roots, id);
+    }
+    roots.prepare_index(&ids[0]).unwrap();
+    for directory in [roots.cache.join("indexes"), roots.data.join("workspaces")] {
+        let raw_name = directory.join(OsString::from_vec(b"not-a-managed-id-\xff".to_vec()));
+        if let Err(error) = fs::write(raw_name, b"unrelated") {
+            // macOS/APFS refuses non-UTF8 names at creation (EILSEQ); Linux
+            // accepts the raw entry and exercises report enumeration below.
+            assert!(
+                cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EILSEQ),
+                "{error}"
+            );
+        }
+    }
+    let unsafe_lock = roots.record_use_lock(&ids[0]);
+    fs::set_permissions(&unsafe_lock, fs::Permissions::from_mode(0o644)).unwrap();
+    let before = snapshot(temp.path());
+    let report = roots.gc_report_at(1_800_000_000).unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+    assert_eq!(report.records.len(), 2);
+    assert_eq!(
+        (report.records[0].status, report.records[0].reason),
+        ("unknown", "unsafe_use_lock")
+    );
+    assert_eq!(report.records[1].status, "valid");
+    fs::set_permissions(&unsafe_lock, fs::Permissions::from_mode(0o600)).unwrap();
+    let unsafe_db = roots.record_db(&ids[0]);
+    fs::set_permissions(&unsafe_db, fs::Permissions::from_mode(0o644)).unwrap();
+    let before = snapshot(temp.path());
+    let report = roots.gc_report_at(1_800_000_000).unwrap();
+    assert_eq!(before, snapshot(temp.path()));
+    assert_eq!(report.records.len(), 2);
+    assert_eq!(
+        (report.records[0].status, report.records[0].reason),
+        ("unknown", "metadata_unreadable")
+    );
+    assert_eq!(report.records[1].status, "valid");
+    assert!(
+        roots.record_by_id(&ids[0].record_id).is_err(),
+        "forget inventory must remain strict"
+    );
+}
