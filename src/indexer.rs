@@ -118,6 +118,7 @@ pub struct CapturedDocument {
     pub syntax: Vec<CapturedSyntaxNode>,
     pub native_candidates: Vec<CapturedNativeWitness>,
     pub semantic_positions: Vec<CapturedPosition>,
+    pub heritage: Vec<CapturedHeritageWitness>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,6 +156,21 @@ pub struct CapturedNativeWitness {
     pub end_byte: usize,
     pub token_start_byte: usize,
     pub token_end_byte: usize,
+    pub stable_id: Option<String>,
+    pub ancestor_ids: Vec<String>,
+    pub spelling: Option<String>,
+    pub verified_member_token: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedHeritageWitness {
+    pub class_node_id: usize,
+    pub owner_id: usize,
+    pub subclass_name_start: usize,
+    pub subclass_name_end: usize,
+    pub base_start: usize,
+    pub base_end: usize,
+    pub base_bytes: Vec<u8>,
 }
 
 // These are AST candidates, not validated declarations/occurrences or graph facts.
@@ -268,9 +284,239 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
             end_byte: node.end_byte,
             token_start_byte: token.start_byte,
             token_end_byte: token.end_byte,
+            stable_id: None,
+            ancestor_ids: Vec::new(),
+            spelling: None,
+            verified_member_token: false,
         });
     }
     output
+}
+
+// Only JavaScript candidates receive IDs here. Other languages have separate adapter waves.
+fn identify_javascript(document: &mut CapturedDocument, revision_id: &str) -> Result<()> {
+    use crate::model::v1::{Key, Kind, Language, Text};
+    use crate::semantic_identity::{self as identity, OccurrenceKind};
+    let nodes = &document.syntax;
+    let source_set = &document.key.source_set_id;
+    let path = &document.key.path;
+    let module = Key {
+        kind: Kind::Module,
+        name: None,
+        signature: None,
+        ordinal: crate::model::v1::UInt::new(0).unwrap(),
+    };
+    let module_id = identity::syntax_id(source_set, path, Language::Javascript, &[], &module)?;
+    let mut keys: HashMap<usize, Key> = HashMap::new();
+    let mut declarations: Vec<(usize, Vec<Key>, Key, u64, u64)> = Vec::new();
+    for witness in &document.native_candidates {
+        if witness.candidate_kind != NativeCandidateKind::Declaration {
+            continue;
+        }
+        let kind = match witness.node_kind.as_str() {
+            "class_declaration" | "class" => Kind::Type,
+            "method_definition" => Kind::Method,
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function" => Kind::Function,
+            _ => continue,
+        };
+        let Ok(name) = std::str::from_utf8(&witness.name_bytes) else {
+            continue;
+        };
+        // A computed method name or destructuring pattern is not a named declaration.
+        if !nodes.iter().any(|n| {
+            n.parent_id == Some(witness.node_id)
+                && n.start_byte == witness.token_start_byte
+                && n.end_byte == witness.token_end_byte
+                && matches!(
+                    n.kind.as_str(),
+                    "identifier" | "property_identifier" | "private_property_identifier"
+                )
+        }) {
+            continue;
+        }
+        let mut ancestors = vec![module.clone()];
+        let mut parent = witness.parent_id;
+        while let Some(id) = parent {
+            if let Some(key) = keys.get(&id) {
+                ancestors.push(key.clone());
+            }
+            parent = nodes[id].parent_id;
+        }
+        ancestors[1..].reverse();
+        let key = Key {
+            kind,
+            name: Some(Text::new(name.to_owned()).context("invalid JS declaration name")?),
+            signature: None,
+            ordinal: crate::model::v1::UInt::new(0).unwrap(),
+        };
+        declarations.push((
+            witness.node_id,
+            ancestors,
+            key,
+            witness.start_byte as u64,
+            witness.end_byte as u64,
+        ));
+        // The ordinal is filled after all declarations are grouped below.
+        keys.insert(witness.node_id, declarations.last().unwrap().2.clone());
+    }
+    // Parents must receive their final ordinal before children acquire ancestor keys.
+    let mut ids = HashMap::from([(0usize, module_id.as_str().to_owned())]);
+    let mut resolved: HashMap<usize, Key> = HashMap::new();
+    declarations.sort_by_key(|(id, _, _, _, _)| nodes[*id].start_byte);
+    let entries: Vec<_> = declarations
+        .iter()
+        .map(|(_, ancestors, key, start, end)| (ancestors.clone(), key.clone(), *start, *end))
+        .collect();
+    let ordinals = identity::sibling_ordinals(&entries)?;
+    let mut collisions = identity::CollisionRegistry::default();
+    for (index, (node_id, _, mut key, _, _)) in declarations.into_iter().enumerate() {
+        let mut ancestors = vec![module.clone()];
+        let mut lineage = Vec::new();
+        let mut parent = nodes[node_id].parent_id;
+        while let Some(id) = parent {
+            if let Some(k) = resolved.get(&id) {
+                lineage.push((id, k.clone()));
+            }
+            parent = nodes[id].parent_id;
+        }
+        lineage.reverse();
+        ancestors.extend(lineage.iter().map(|(_, k)| k.clone()));
+        key.ordinal = ordinals[index];
+        let dig =
+            identity::syntax_digest(source_set, path, Language::Javascript, &ancestors, &key)?;
+        let id = identity::syntax_id(source_set, path, Language::Javascript, &ancestors, &key)?;
+        collisions.syntax(&id, dig.input)?;
+        ids.insert(node_id, id.as_str().to_owned());
+        resolved.insert(node_id, key);
+    }
+    let mut occurrence_entries = Vec::new();
+    let mut occurrence_indices = Vec::new();
+    for (index, witness) in document.native_candidates.iter_mut().enumerate() {
+        let mut lineage = Vec::new();
+        let mut parent = witness.parent_id;
+        while let Some(id) = parent {
+            if let Some(sid) = ids.get(&id) {
+                lineage.push(sid.clone());
+            }
+            parent = nodes[id].parent_id;
+        }
+        lineage.reverse();
+        if lineage.is_empty() {
+            lineage.push(module_id.as_str().to_owned());
+        }
+        witness.ancestor_ids = lineage;
+        if witness.candidate_kind == NativeCandidateKind::Declaration {
+            witness.stable_id = ids.get(&witness.node_id).cloned();
+        } else if matches!(
+            witness.candidate_kind,
+            NativeCandidateKind::Invocation | NativeCandidateKind::ControlRegion
+        ) {
+            let owner =
+                crate::model::v1::SyntaxId::new(witness.ancestor_ids.last().unwrap().clone())
+                    .unwrap();
+            let kind = if witness.candidate_kind == NativeCandidateKind::Invocation {
+                OccurrenceKind::Call
+            } else {
+                OccurrenceKind::Control
+            };
+            occurrence_entries.push((
+                owner,
+                kind,
+                witness.start_byte as u64,
+                witness.end_byte as u64,
+            ));
+            occurrence_indices.push(index);
+        }
+        if witness.candidate_kind == NativeCandidateKind::Invocation {
+            let function = nodes.iter().find(|n| {
+                n.parent_id == Some(witness.node_id) && n.field_name.as_deref() == Some("function")
+            });
+            if let Some(function) = function {
+                // Optional chaining, subscripts and compound callees do not have a
+                // proved simple member token. The invocation span remains measurable.
+                let optional = nodes
+                    .iter()
+                    .any(|n| n.parent_id == Some(function.id) && n.kind == "optional_chain");
+                let property = (function.kind == "member_expression" && !optional)
+                    .then(|| {
+                        nodes.iter().find(|n| {
+                            n.parent_id == Some(function.id)
+                                && n.field_name.as_deref() == Some("property")
+                        })
+                    })
+                    .flatten();
+                if let Some(property) = property.filter(|n| {
+                    matches!(
+                        n.kind.as_str(),
+                        "property_identifier" | "private_property_identifier"
+                    ) && n.end_byte <= document.bytes.len()
+                }) {
+                    if let Ok(raw) =
+                        std::str::from_utf8(&document.bytes[property.start_byte..property.end_byte])
+                        && let Ok(decoded) = identity::lookup_key(Language::Javascript, raw)
+                    {
+                        witness.token_start_byte = property.start_byte;
+                        witness.token_end_byte = property.end_byte;
+                        witness.token_bytes = raw.as_bytes().to_vec();
+                        witness.name_bytes = witness.token_bytes.clone();
+                        witness.spelling = Some(decoded);
+                        witness.verified_member_token = true;
+                    }
+                } else if function.kind == "identifier" {
+                    witness.spelling = std::str::from_utf8(&function.source_bytes)
+                        .ok()
+                        .and_then(|s| identity::lookup_key(Language::Javascript, s).ok());
+                }
+            }
+        }
+    }
+    let ordinals = identity::occurrence_ordinals(&occurrence_entries)?;
+    let revision = Text::new(revision_id.to_owned()).context("invalid revision ID")?;
+    for (index, ordinal) in occurrence_indices.into_iter().zip(ordinals) {
+        let witness = &mut document.native_candidates[index];
+        let owner =
+            crate::model::v1::SyntaxId::new(witness.ancestor_ids.last().unwrap().clone()).unwrap();
+        let kind = if witness.candidate_kind == NativeCandidateKind::Invocation {
+            OccurrenceKind::Call
+        } else {
+            OccurrenceKind::Control
+        };
+        let dig = identity::occurrence_digest(&revision, &owner, kind, ordinal)?;
+        let id = identity::occurrence_id(&revision, &owner, kind, ordinal)?;
+        collisions.occurrence(&id, dig.input)?;
+        witness.stable_id = Some(id.as_str().to_owned());
+    }
+    for node in nodes
+        .iter()
+        .filter(|n| matches!(n.kind.as_str(), "class_declaration" | "class"))
+    {
+        let name = nodes
+            .iter()
+            .find(|n| n.parent_id == Some(node.id) && n.field_name.as_deref() == Some("name"));
+        let heritage = nodes
+            .iter()
+            .find(|n| n.parent_id == Some(node.id) && n.kind == "class_heritage");
+        if let (Some(name), Some(heritage)) = (name, heritage) {
+            let base = nodes
+                .iter()
+                .find(|n| n.parent_id == Some(heritage.id) && n.kind == "identifier");
+            if let Some(base) = base {
+                document.heritage.push(CapturedHeritageWitness {
+                    class_node_id: node.id,
+                    owner_id: node.parent_id.unwrap_or(0),
+                    subclass_name_start: name.start_byte,
+                    subclass_name_end: name.end_byte,
+                    base_start: base.start_byte,
+                    base_end: base.end_byte,
+                    base_bytes: base.source_bytes.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_declaration(kind: &str) -> bool {
@@ -593,6 +839,7 @@ pub fn capture_revision_with_hook(
                 native_candidates: native_candidates(&syntax),
                 syntax,
                 semantic_positions: Vec::new(),
+                heritage: Vec::new(),
             });
         } else {
             source_inputs.push((relative, bytes));
@@ -779,6 +1026,9 @@ pub fn capture_revision_with_hook(
     }
     let revision_id = format!("rev:v1:{}", hex::encode(revision.finalize()));
     for document in &mut documents {
+        if document.key.language == Language::Javascript {
+            identify_javascript(document, &revision_id)?;
+        }
         for position in &mut document.semantic_positions {
             position.revision_id = revision_id.clone();
         }

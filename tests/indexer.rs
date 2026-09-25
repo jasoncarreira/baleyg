@@ -1154,3 +1154,93 @@ fn capture_accepts_authentic_scip_tool_name_without_conflating_producer_id() {
         baleyg::indexer::capture_revision(&capture_options(root), &admission, &cancel()).is_err()
     );
 }
+
+#[test]
+fn javascript_capture_ids_tokens_heritage_and_revision_local_occurrences() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "b.js",
+        "class Child extends Base { foo() { obj.foo(); obj[key](); obj?.foo(); } }\nfunction same() { obj.\\u{0066}oo(); }\nfunction same() { obj.foo(); }\n",
+    );
+    let admission = capture_admission(root);
+    let options = capture_options(root);
+    let first = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    let doc = &first.documents[0];
+    assert_eq!(doc.heritage.len(), 1);
+    let heritage = &doc.heritage[0];
+    assert_eq!(&doc.bytes[heritage.base_start..heritage.base_end], b"Base");
+    assert_eq!(
+        &doc.bytes[heritage.subclass_name_start..heritage.subclass_name_end],
+        b"Child"
+    );
+    let decl: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Declaration && w.name_bytes == b"same")
+        .collect();
+    assert_eq!(decl.len(), 2);
+    assert_ne!(decl[0].stable_id, decl[1].stable_id);
+    assert!(
+        decl.iter()
+            .all(|w| w.stable_id.as_deref().unwrap().starts_with("sid:v1:"))
+    );
+    let calls: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Invocation)
+        .collect();
+    assert!(calls.len() >= 5);
+    assert!(
+        calls
+            .iter()
+            .all(|w| w.stable_id.as_deref().unwrap().starts_with("occ:v1:")
+                && !w.ancestor_ids.is_empty())
+    );
+    assert!(calls.iter().any(|w| w.verified_member_token
+        && w.spelling.as_deref() == Some("foo")
+        && &doc.bytes[w.token_start_byte..w.token_end_byte] == b"foo"));
+    assert!(calls.iter().any(|w| !w.verified_member_token
+        && doc.bytes[w.start_byte..w.end_byte].starts_with(b"obj[key]")));
+    assert!(calls.iter().any(|w| !w.verified_member_token
+        && doc.bytes[w.start_byte..w.end_byte].starts_with(b"obj?.foo")));
+    assert!(calls.iter().any(|w| w.verified_member_token
+        && w.spelling.as_deref() == Some("foo")
+        && w.token_bytes == b"\\u{0066}oo"));
+    write(
+        root,
+        "b.js",
+        "class Child extends Base { foo() { obj.foo(); obj[key](); obj?.foo(); extra(); } }\nfunction same() { obj.foo(); }\nfunction same() { obj.foo(); }\n",
+    );
+    let second = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    assert_ne!(first.revision_id, second.revision_id);
+    let first_child = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.candidate_kind == K::Declaration && w.name_bytes == b"Child")
+        .unwrap();
+    let second_child = second.documents[0]
+        .native_candidates
+        .iter()
+        .find(|w| w.candidate_kind == K::Declaration && w.name_bytes == b"Child")
+        .unwrap();
+    assert_eq!(first_child.stable_id, second_child.stable_id);
+    let second_dupes: Vec<_> = second.documents[0]
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Declaration && w.name_bytes == b"same")
+        .collect();
+    assert_eq!(decl[0].stable_id, second_dupes[0].stable_id);
+    assert_eq!(decl[1].stable_id, second_dupes[1].stable_id);
+    assert_ne!(
+        calls[0].stable_id,
+        second.documents[0]
+            .native_candidates
+            .iter()
+            .find(|w| w.candidate_kind == K::Invocation)
+            .unwrap()
+            .stable_id
+    );
+}
