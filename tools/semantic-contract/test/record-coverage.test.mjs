@@ -21,7 +21,7 @@ const plans=[
  {state:'failed',requestedRoles:['read'],supportedRoles:['read'],observedRoles:[],requested:true,selected:true,diagnostic:'capture failed'},
  {state:'notRequested',requestedRoles:[],supportedRoles:[],observedRoles:[],requested:false,selected:false,diagnostic:null}
 ];
-async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,requestedChange=null,language="javascript",setId="main",captureValues={},secondSet=false,comparisonSet=setId}={}){
+async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,requestedChange=null,language="javascript",setId="main",captureValues={},secondSet=false,comparisonSet=setId,omitSelectedDocument=false,completeHistorical=false}={}){
  const root=await mkdtemp(join(tmpdir(),'coverage-u1-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const files=new Map(),put=(name,data)=>files.set(name,typeof data==='string'?data:JSON.stringify(data));
  const natives='native-executable', sem1='semantic-one',sem2='semantic-two';
@@ -31,7 +31,7 @@ async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,request
  for(const [i,bytes] of [natives,sem1,sem2].entries())add(`executable-${i}`,'executable',`captures/executable-${i}`,bytes);
  for(const [kind,text] of [['toolchain','tool'],['config','config'],['dependency','deps']])add(kind,kind,`captures/${kind}`,captureValues[kind]??text);
  const docs=[{sourceSetId:setId,language,path:'a.js'},{sourceSetId:setId,language,path:'b.js'}],source=language==='java'?{r1:['class A {}\n','class B {}\n'],r2:['class A { int a; }\n','class B {}\n']}:{r1:['function a() {}\n','function b() {}\n'],r2:[sameCallerBytes?'function a() {}\n':'function a() { return 1; }\n',sameCallerBytes?'function b() { return 2; }\n':'function b() {}\n']};
- const revisions=['r1','r2'].map(revisionId=>({id:revisionId,sourceSetId:setId,documents:docs.map((key,i)=>{const sourceFile=`sources/${revisionId}/${key.path}`;put(sourceFile,source[revisionId][i]);return {key,revisionId,sourceFile};}),toolchainHash:hash(captureValues.toolchain??'tool'),configHash:hash(captureValues.config??'config'),dependencyHash:hash(captureValues.dependency??'deps')}));
+ const revisions=['r1','r2'].map(revisionId=>({id:revisionId,sourceSetId:setId,documents:docs.filter(key=>!omitSelectedDocument||revisionId!=='r2'||key.path!=='a.js').map((key)=>{const i=docs.indexOf(key);const sourceFile=`sources/${revisionId}/${key.path}`;put(sourceFile,source[revisionId][i]);return {key,revisionId,sourceFile};}),toolchainHash:hash(captureValues.toolchain??'tool'),configHash:hash(captureValues.config??'config'),dependencyHash:hash(captureValues.dependency??'deps')}));
  if(secondSet){
   const key={sourceSetId:'other',language,path:'a.js'},sourceFile='sources/other/r1/a.js';
   put(sourceFile,source.r1[0]);
@@ -42,7 +42,7 @@ async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,request
  for(const revision of revisions)for(const doc of revision.documents){
   const annotationFile=`${doc.sourceFile}.annotations.json`;annotationFacts.set(annotationFile,[]);
   for(const producer of producers){
-   const plan=producer.id==='one'&&revision.id==='r2'&&doc.key.path==='a.js'?plans[4]:producer.id==='two'&&revision.id==='r1'&&doc.key.path==='a.js'?plans[1]:plans[count%plans.length];count++;
+   const plan=completeHistorical&&producer.id==='one'&&revision.id==='r1'&&doc.key.path==='a.js'?{...plans[0],requestedRoles:['read','type'],supportedRoles:['read','type'],observedRoles:['read','type']}:producer.id==='one'&&revision.id==='r2'&&doc.key.path==='a.js'?plans[4]:producer.id==='two'&&revision.id==='r1'&&doc.key.path==='a.js'?plans[1]:plans[count%plans.length];count++;
    const record={producerId:producer.id,language:doc.key.language,sourceSetId:doc.key.sourceSetId,documentPath:doc.key.path,revisionId:revision.id,requested:plan.requested,selected:plan.selected,state:plan.state,supportedRoles:plan.supportedRoles,observedRoles:plan.observedRoles,diagnostic:plan.diagnostic};
    const ref=`coverage-${producer.id}-${revision.id}-${doc.key.path}`;
    annotationFacts.get(annotationFile).push({kind:'coverage',ref,record});
@@ -61,7 +61,7 @@ async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,request
  for(const [producer,ref,id,fact] of rawFacts){
   const revision=revisions[0],doc=revision.documents[0].key;
   const basis={producerId:producer.id,producerVersion:producer.version,producerHash:producer.executableHash,artifactHash:captures.find(x=>x.ref===`artifact-${producer.id}`).hash,language,sourceSetId:setId,revisionId:'r1',sourceManifestHash:sourceManifestHash(revision.documents.map((x,i)=>({document:x.key,contentHash:hash(source.r1[i])}))),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:['target']};
-  const proof={id,producerId:producer.id,document:doc,revisionId:'r1',contentHash:hash(source.r1[0]),evidenceKind:'declarationBinding',basis,freshness:comparisonSet!==setId?'possiblyStale':comparisonRevision==='r1'?(requestedChange&&producer.id==='one'?'possiblyStale':'fresh'):sameCallerBytes?'possiblyStale':'stale'};
+  const proof={id,producerId:producer.id,document:doc,revisionId:'r1',contentHash:hash(source.r1[0]),evidenceKind:'declarationBinding',basis,freshness:comparisonSet!==setId?'possiblyStale':omitSelectedDocument?'stale':comparisonRevision==='r1'?(requestedChange&&producer.id==='one'?'possiblyStale':'fresh'):sameCallerBytes?'possiblyStale':'stale'};
   historical.push({kind:'provenance',ref:`fact-${id}`,record:proof},fact);
   expectedProofs.push(proof);
  }
@@ -70,6 +70,7 @@ async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,request
  const requested=structuredClone(producers);
  if(requestedChange){
   if(requestedChange==='absent')requested.splice(1,1);
+  if(requestedChange==='id')requested[1].id='alternate-one';
   if(requestedChange==='version')requested[1].version='2';
    if(requestedChange==='kind')requested[1].kind='native';
   if(requestedChange==='hash')requested[1].executableHash=hash('different executable');
@@ -474,18 +475,47 @@ test('both producer uses reject absent tuples, wrong proofs and cross-revision a
 });
 
 
-test('changed and missing selected evidence bytes are stale, independent of complete coverage',async t=>{
- for(const [name,options,removeDocument] of [['changed-bytes',{},false],['missing-bytes',{sameCallerBytes:true},true]]){
-  const b=await specimen(t,options),loaded=removeDocument?{...b.loaded,revisions:new Map(b.loaded.revisions)}:b.loaded;
-  if(removeDocument){const selected=structuredClone(loaded.revisions.get('["main","r2"]'));selected.documents=selected.documents.filter(x=>x.key.path!=='a.js');loaded.revisions.set('["main","r2"]',selected);}
-  const records=structuredClone(b.records),annotations=structuredClone(b.loaded.annotations);
-  if(removeDocument)for(const proof of records.provenance)proof.freshness='stale';
-  const row=records.coverage.find(x=>x.producerId==='one'&&x.revisionId==='r1'&&x.documentPath==='a.js');
-  const authored=annotations.flatMap(x=>x.facts).find(x=>x.kind==='coverage'&&x.record.producerId==='one'&&x.record.revisionId==='r1'&&x.record.documentPath==='a.js').record;
-  Object.assign(row,{observedRoles:['read','type'],state:'complete',diagnostic:null});Object.assign(authored,row);
-  const admitted={...loaded,annotations};
-  assert.equal(checkCoverage(admitted,records).coverageByTuple.size,12);
-  const control=registerControls([{id:`U1.freshness-${name}-complete-stale`,baseline:()=>records,check:x=>checkCoverage(admitted,x),mutate:x=>{x.provenance.find(y=>y.producerId==='one').freshness=removeDocument?'possiblyStale':'fresh';return x;},expectedAssertion:'FRESHNESS.STATE',expectedCode:'invalidRecord',expectedField:'freshness'}])[0];
+test('native proof uses authenticated freshness seam for fresh, stale and possiblyStale',async t=>{
+ for(const [name,options,expected] of [
+  ['fresh',{comparisonRevision:'r1'},'fresh'],
+  ['stale',{},'stale'],
+  ['possiblyStale',{sameCallerBytes:true},'possiblyStale']
+ ]){
+  const b=await specimen(t,options);
+  const native={id:`native-r1-${name}`,producerId:'native',document:b.docs[0],revisionId:'r1',
+   contentHash:hash(b.source.r1[0]),evidenceKind:'measuredSyntax',basis:null,freshness:expected};
+  b.records.provenance.push(native);
+  assert.equal(checkCoverage(b.loaded,b.records).coverageByTuple.size,12);
+  const control=registerControls([{id:`U1.native-${name}-false-fresh`,baseline:()=>b.records,
+   check:x=>checkCoverage(b.loaded,x),mutate:x=>{x.provenance.find(y=>y.id===native.id).freshness=expected==='fresh'?'stale':'fresh';return x;},
+   expectedAssertion:'FRESHNESS.STATE',expectedCode:'invalidRecord',expectedField:'freshness'}])[0];
+  await t.test(control.id,()=>runControl(control));
+  const bad=structuredClone(b.records);
+  bad.provenance.find(x=>x.id===native.id).contentHash=hash('wrong captured bytes');
+  bad.provenance.find(x=>x.id===native.id).freshness='fresh';
+  assert.throws(()=>checkCoverage(b.loaded,bad),e=>e.assertion==='FRESHNESS.BASIS'&&e.code==='invalidRecord'&&e.field==='contentHash');
+ }
+});
+
+test('admitted changed and missing selected bytes outrank same-byte component drift',async t=>{
+ for(const [name,options,count] of [
+  ['changed-bytes',{completeHistorical:true},12],
+  ['missing-bytes',{sameCallerBytes:true,omitSelectedDocument:true,completeHistorical:true},9]
+ ]){
+  const b=await specimen(t,options);
+  assert.equal(b.loaded.fixture.revisions.find(x=>x.id==='r2').documents.length,name==='missing-bytes'?1:2);
+  assert.equal(b.loaded.annotations.length,name==='missing-bytes'?3:4);
+  assert.equal(b.records.coverage.length,count);
+  const C=checkCoverage(b.loaded,b.records);
+  assert.equal(C.coverageByTuple.size,count);
+  const proof=b.records.provenance.find(x=>x.producerId==='one');
+  assert.equal(b.records.coverage.find(x=>x.producerId==='one'&&x.revisionId==='r1'&&x.documentPath==='a.js').state,'complete');
+  assert.equal(proof.freshness,'stale');
+  const selected=b.loaded.revisions.get('["main","r2"]');
+  if(name==='missing-bytes')assert.equal(selected.documents.some(x=>x.key.path==='a.js'),false);
+  const control=registerControls([{id:`U1.freshness-${name}-complete-stale`,baseline:()=>b.records,
+   check:x=>checkCoverage(b.loaded,x),mutate:x=>{x.provenance.find(y=>y.id===proof.id).freshness=name==='missing-bytes'?'possiblyStale':'fresh';return x;},
+   expectedAssertion:'FRESHNESS.STATE',expectedCode:'invalidRecord',expectedField:'freshness'}])[0];
   await t.test(control.id,()=>runControl(control));
  }
  const b=await specimen(t,{comparisonRevision:'r1'}),proof=b.records.provenance.find(x=>x.producerId==='one');
@@ -517,7 +547,7 @@ test('authenticated component comparison isolates each same-byte request change'
   configHash:await specimen(t,{comparisonRevision:'r1',captureValues:{config:'alternate config'}}),
   dependencyHash:await specimen(t,{comparisonRevision:'r1',captureValues:{dependency:'alternate dependency'}}),
   sourceSetId:await specimen(t,{comparisonRevision:'r1',setId:'other'}),
-  producerId:base,producerKind:await specimen(t,{comparisonRevision:'r1',requestedChange:'kind'}),producerVersion:await specimen(t,{comparisonRevision:'r1',requestedChange:'version'}),
+  producerId:await specimen(t,{comparisonRevision:'r1',requestedChange:'id'}),producerKind:await specimen(t,{comparisonRevision:'r1',requestedChange:'kind'}),producerVersion:await specimen(t,{comparisonRevision:'r1',requestedChange:'version'}),
   producerHash:await specimen(t,{comparisonRevision:'r1',requestedChange:'hash'}),
   language:await specimen(t,{comparisonRevision:'r1',language:'java'}),
   positionEncoding:await specimen(t,{comparisonRevision:'r1',requestedChange:'encoding'}),
@@ -530,7 +560,7 @@ test('authenticated component comparison isolates each same-byte request change'
    case 'sourceManifestHash':return sourceManifestHash(snapshot.documents.map(x=>({document:x.key,contentHash:x.contentHash})));
    case 'toolchainHash':case 'configHash':case 'dependencyHash':return snapshot[field];
    case 'sourceSetId':return fixture.loaded.comparison.sourceSetId;
-   case 'producerId':return fixture.loaded.comparison.producers.find(x=>x.id==='two').id;
+   case 'producerId':return fixture.loaded.comparison.producers.find(x=>x.id==='alternate-one').id;
    case 'producerKind':return requested.kind;
    case 'producerVersion':return requested.version;
    case 'producerHash':return requested.executableHash;

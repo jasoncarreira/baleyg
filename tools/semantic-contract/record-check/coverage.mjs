@@ -54,8 +54,14 @@ function freshness(proof,loaded,producer){
  const selected=loaded.revisions.get(snapshotKey(loaded.comparison.sourceSetId,loaded.comparison.revisionId));
  const wanted=selected?.documents.find(x=>x.key.path===proof.document.path&&x.key.language===proof.document.language);
  if(producer.kind==='native'){
-  if(!wanted||wanted.contentHash!==proof.contentHash)return 'stale';
-  return loaded.comparison.sourceSetId===proof.document.sourceSetId&&loaded.comparison.revisionId===proof.revisionId?'fresh':'possiblyStale';
+  const captured={documentHash:proof.contentHash,revisionId:proof.revisionId,sourceSetId:proof.document.sourceSetId,
+   sourceManifestHash:'native',toolchainHash:'native',configHash:'native',dependencyHash:'native',
+   producerId:producer.id,producerKind:producer.kind,producerVersion:producer.version,
+   producerHash:producer.executableHash,language:proof.document.language,
+   positionEncoding:producer.positionEncoding,producerLanguages:producer.languages};
+  const requested={...captured,documentHash:wanted?.contentHash??null,revisionId:selected?.id??null,
+   sourceSetId:loaded.comparison.sourceSetId};
+  return assertFreshnessComponents(captured,requested,proof.freshness);
  }
  const basis=proof.basis,requestedProducer=loaded.comparison.producers.find(x=>x.id===basis.producerId);
  const captured={documentHash:proof.contentHash,revisionId:basis.revisionId,sourceManifestHash:basis.sourceManifestHash,
