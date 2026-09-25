@@ -15,7 +15,8 @@ import {registerControls,runControl} from './mutations.mjs';
 // Independently authored source offsets, digest inputs and expected normalized rows.
 const source='function main() { target(); callback; }\nfunction target() {}\n';
 const alternateSource=kind=>`${source}// admitted ${kind} snapshot\n`;
-const document={sourceSetId:'main',language:'javascript',path:'src/main.js'};
+const baseDocument={sourceSetId:'main',language:'javascript',path:'src/main.js'};
+const document=baseDocument;
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const canonical=value=>value===null||typeof value!=='object'?JSON.stringify(value):Array.isArray(value)?'['+value.map(canonical).join(',')+']':'{'+Object.keys(value).sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b))).map(k=>canonical(k)+':'+canonical(value[k])).join(',')+'}';
 const domain=(name,input)=>createHash('sha256').update(`baleyg.${name}.v1\0`).update(canonical(input)).digest('hex').slice(0,32);
@@ -49,7 +50,8 @@ function makeFact(family,status,ref='fact') {
  const coordinates=(status==='exact'?exactSpans:unmatchedSpans)[family];
  return {kind:factType[family],ref,anchor:{document,revisionId:'r1',contentHash,kind:family,range:span(...coordinates),ownerRef:owned[family]},record:structuredClone(templates[factType[family]])};
 }
-async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,twoProducers=false,selectSecond=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false,normalized=false,sourceOverride=null,mutateSecond=null,secondEncoding=null}={}) {
+async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,twoProducers=false,selectSecond=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false,normalized=false,sourceOverride=null,mutateSecond=null,secondEncoding=null,documentOverride=null,profile='example',scenarios=[],dispositions=null,mutateCoverage=null,requestedRoles=['read'],includeSecondInComparison=false}={}) {
+ const document=documentOverride??baseDocument;
  const parent=await mkdtemp(join(tmpdir(),'count-u5-')),root=join(parent,'example');await mkdir(root);t.after(()=>rm(parent,{recursive:true,force:true}));
  const fs=new Map(),put=(path,value)=>fs.set(path,typeof value==='string'?value:JSON.stringify(value));
  const shifted=emojiPrefix||encoding!=='utf8',offset=shifted?5:0,positionOffset=encoding==='utf16'?3:encoding==='unicodeScalar'?2:offset;
@@ -65,27 +67,37 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
  mutateNative?.(measuredNative);
  put('snapshots/src/main.js',sourceText);put('captures/native.json',measuredNative);
  for(const [name,value] of [['native','native-executable'],['semantic','semantic-executable'],['toolchain','toolchain'],['config','config'],['dependency','dependency']])put(`captures/${name}.txt`,value);
+ for(const scenario of scenarios)for(const anchor of scenario.anchors)anchor.contentHash=sourceHash;
  const authored=structuredClone(facts??[makeFact(family,status)]);
- for(const fact of authored){fact.anchor.contentHash=sourceHash;if(shifted){fact.anchor.range.start+=positionOffset;fact.anchor.range.end+=positionOffset;fact.anchor.range.encoding=encoding;}if(callbackSite&&fact.kind==='reference'){fact.anchor.range=span(28+positionOffset,36+positionOffset,encoding);fact.record.roles=['read'];}if(declarationSite&&fact.kind==='reference'&&fact.anchor.range.start===18+positionOffset){fact.anchor.range=span(49+positionOffset,55+positionOffset,encoding);fact.anchor.ownerRef='target';fact.record.site='declaration';fact.record.roles=['definition'];}mutateFact?.(fact);}
- for(let i=1;i<authored.length;i++)authored[i].record.provenanceId=`proof-${authored[i].ref}`;
- if(twoProducers){const other=structuredClone(authored[0]);other.ref='fact-b';other.record.provenanceId='proof-b';mutateSecond?.(other);authored.push(other);}
+ for(const fact of authored){if(!fact.anchor)continue;fact.anchor.contentHash=sourceHash;if(shifted){fact.anchor.range.start+=positionOffset;fact.anchor.range.end+=positionOffset;fact.anchor.range.encoding=encoding;}if(callbackSite&&fact.kind==='reference'){fact.anchor.range=span(28+positionOffset,36+positionOffset,encoding);fact.record.roles=['read'];}if(declarationSite&&fact.kind==='reference'&&fact.anchor.range.start===18+positionOffset){fact.anchor.range=span(49+positionOffset,55+positionOffset,encoding);fact.anchor.ownerRef='target';fact.record.site='declaration';fact.record.roles=['definition'];}mutateFact?.(fact);}
+ for(let i=0;i<authored.length;i++) {
+  const id=i===0?'proof':`proof-${authored[i].ref}`;
+  if(authored[i].kind==='typeRelationship')authored[i].provenanceRef=id;
+  else authored[i].record.provenanceId=id;
+ }
+ if(twoProducers){const other=structuredClone(authored[0]);other.ref='fact-b';
+  if(other.kind==='typeRelationship')other.provenanceRef='proof-b';else other.record.provenanceId='proof-b';
+  mutateSecond?.(other);authored.push(other);}
  put('captures/semantic.json',{formatVersion:1,producerId:'semantic',facts:authored.filter(f=>f.ref!=='fact-b')});
  if(twoProducers){put('captures/semantic-b.txt','semantic-b-executable');put('captures/semantic-b.json',{formatVersion:1,producerId:'semantic-b',facts:authored.filter(f=>f.ref==='fact-b')});}
  const captures=[['native','executable','captures/native.txt'],['semantic','executable','captures/semantic.txt'],['toolchain','toolchain','captures/toolchain.txt'],['config','config','captures/config.txt'],['dependency','dependency','captures/dependency.txt'],['artifact','semanticArtifact','captures/semantic.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(fs.get(file))}));
  if(twoProducers)captures.push(...[['semantic-b-executable','executable','captures/semantic-b.txt'],['semantic-b-artifact','semanticArtifact','captures/semantic-b.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(fs.get(file))})));
  const revision={id:'r1',sourceSetId:'main',documents:[{key:document,revisionId:'r1',sourceFile:'snapshots/src/main.js'}],toolchainHash:captures[2].hash,configHash:captures[3].hash,dependencyHash:captures[4].hash};
- const basis={producerId:'semantic',producerVersion:'1',producerHash:semanticProducer.executableHash,artifactHash:captures[5].hash,language:'javascript',sourceSetId:'main',revisionId:'r1',sourceManifestHash:sha(canonical(alternateTuples?[{document,contentHash:sourceHash},{document:{...document,path:'src/other.js'},contentHash:sha(alternateText('document'))}]:[{document,contentHash:sourceHash}])),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
+ const basis={producerId:'semantic',producerVersion:'1',producerHash:semanticProducer.executableHash,artifactHash:captures[5].hash,language:document.language,sourceSetId:'main',revisionId:'r1',sourceManifestHash:sha(canonical(alternateTuples?[{document,contentHash:sourceHash},{document:{...document,path:'src/other.js'},contentHash:sha(alternateText('document'))}]:[{document,contentHash:sourceHash}])),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
  const proof={id:'proof',producerId:'semantic',document,revisionId:'r1',contentHash:sourceHash,evidenceKind:family==='declarationName'?'declarationBinding':'semanticReference',basis,freshness:'fresh'};
- const proofs=authored.map(fact=>fact.ref==='fact-b'?{...proof,id:'proof-b',producerId:'semantic-b',basis:{...basis,producerId:'semantic-b',producerHash:sha('semantic-b-executable'),artifactHash:sha(fs.get('captures/semantic-b.json'))},freshness:'possiblyStale'}:{...proof,id:fact.record.provenanceId});
+ const proofs=authored.map(fact=>{
+  const evidenceKind=fact.kind==='typeRelationship'?'typeRelationship':fact.kind==='declarationBinding'?'declarationBinding':'semanticReference';
+  return fact.ref==='fact-b'?{...proof,evidenceKind,id:'proof-b',producerId:'semantic-b',basis:{...basis,producerId:'semantic-b',producerHash:sha('semantic-b-executable'),artifactHash:sha(fs.get('captures/semantic-b.json'))},freshness:'possiblyStale'}:{...proof,evidenceKind,id:fact.provenanceRef??fact.record.provenanceId};
+ });
  const proofFacts=proofs.map((record,i)=>({kind:'provenance',ref:`proof-fact-${i}`,record}));
  const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:!(status==='unsupported'&&kind===unsupportedFamily),diagnostic:status==='unsupported'&&kind===unsupportedFamily?'native family unavailable':null}));
  mutateSupport?.(support);
  const coverage=(producerId)=>({producerId,language:document.language,sourceSetId:document.sourceSetId,documentPath:document.path,revisionId:'r1',requested:true,selected:producerId!=='semantic-b'||selectSecond,state:producerId==='semantic-b'?(selectSecond?'partial':'omitted'):status==='unsupported'&&unsupportedFamily==='reference'?'partial':'complete',supportedRoles:['read'],observedRoles:producerId==='semantic-b'||status==='unsupported'&&unsupportedFamily==='reference'?[]:['read'],diagnostic:producerId==='semantic-b'?(selectSecond?'reference not observed':'producer not selected'):status==='unsupported'&&unsupportedFamily==='reference'?'reference unavailable':null});
- put('snapshots/src/main.js.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios:[],facts:[...(twoProducers?['native','semantic','semantic-b']:['native','semantic']).map(id=>({kind:'coverage',ref:`coverage-${id}`,record:coverage(id)})),...proofFacts,...authored]});
+ put('snapshots/src/main.js.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios,facts:[...(twoProducers?['native','semantic','semantic-b']:['native','semantic']).map(id=>({kind:'coverage',ref:`coverage-${id}`,record:mutateCoverage?.(coverage(id))??coverage(id)})),...proofFacts,...authored]});
  const selectedSemantic={...semanticProducer,positionEncoding:encoding};
  const unselectedSemantic={...semanticProducer,id:'semantic-b',executableHash:sha('semantic-b-executable'),positionEncoding:secondEncoding??encoding};
- const producers=twoProducers?[nativeProducer,selectedSemantic,unselectedSemantic]:[nativeProducer,selectedSemantic];
- const fixture={formatVersion:1,profile:'example',language:'javascript',sourceSets:[{id:'main',rootId:'root',languages:['javascript'],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:[nativeProducer,selectedSemantic]},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles:['read'],measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:twoProducers?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ const producers=(twoProducers?[nativeProducer,selectedSemantic,unselectedSemantic]:[nativeProducer,selectedSemantic]).map(p=>({...p,languages:[document.language]}));
+ const fixture={formatVersion:1,profile,language:document.language,sourceSets:[{id:'main',rootId:'root',languages:[document.language],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:includeSecondInComparison?producers:producers.slice(0,2)},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles,measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:twoProducers?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  if(alternateTuples){
   const alternatives=[
    {document:{...document,path:'src/other.js'},revisionId:'r1',file:'snapshots/src/other.js',kind:'document'},
@@ -95,7 +107,7 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
   fixture.revisions[0].documents.push({key:alternatives[0].document,revisionId:'r1',sourceFile:alternatives[0].file});
   fixture.revisions.push({...revision,id:'r2',documents:[{key:document,revisionId:'r2',sourceFile:alternatives[1].file}]});
   fixture.revisions.push({...revision,sourceSetId:'alternate',documents:[{key:alternatives[2].document,revisionId:'r1',sourceFile:alternatives[2].file}]});
-  fixture.sourceSets.push({id:'alternate',rootId:'alternate-root',languages:['javascript'],dependencies:[]});
+  fixture.sourceSets.push({id:'alternate',rootId:'alternate-root',languages:[document.language],dependencies:[]});
   for(const alt of alternatives){
    put(alt.file,alternateText(alt.kind));
    const rows=producers.map(producer=>({kind:'coverage',ref:`coverage-${producer.id}-${alt.revisionId}-${alt.document.path}`,record:{...coverage(producer.id),sourceSetId:alt.document.sourceSetId,documentPath:alt.document.path,revisionId:alt.revisionId}}));
@@ -106,7 +118,7 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
   }
   // The captured semantic proof's manifest includes both documents of r1/main.
  }
- put('fixture.json',fixture);put('expected/answers.json',{formatVersion:1,answers:[]});put('expected/dispositions.json',{formatVersion:1,assertions:[],callableValueNegatives:[]});put('expected/anchors.json',{formatVersion:1,cases:[]});
+ put('fixture.json',fixture);put('expected/answers.json',{formatVersion:1,answers:[]});put('expected/dispositions.json',dispositions??{formatVersion:1,assertions:[],callableValueNegatives:[]});put('expected/anchors.json',{formatVersion:1,cases:[]});
  for(const [path,value] of fs){await mkdir(dirname(join(root,path)),{recursive:true});await writeFile(join(root,path),value);}
  const loaded=await loadFixture(root),records=absent();records.comparison=fixture.comparison;records.producers=ordered(structuredClone(fixture.producers));records.sourceSets=ordered(structuredClone(fixture.sourceSets));
  records.revisions=ordered(fixture.revisions.map(rev=>({...rev,documents:rev.documents.map(item=>({key:item.key,revisionId:item.revisionId,contentHash:sha(fs.get(item.sourceFile)),byteLength:Buffer.byteLength(fs.get(item.sourceFile))}))})));records.provenance=proofs;
@@ -163,8 +175,10 @@ test('callable reference outside callee counts as negative, not a second call',a
 });
 test('unsupported source capability rejects an authored label',async t=>{
  const s=await specimen(t);
- s.loaded.dispositions.assertions.push({kind:'join',factRef:'fact',disposition:'unsupported'});
- assert.throws(()=>result(s.loaded,s.records),e=>e.assertion==='COUNT.DISPOSITION'&&e.code==='invalidRecord'&&e.field==='assertions');
+ const rows=registerControls([{id:'COUNT.disposition.unsupported-label',baseline:()=>s.loaded.dispositions,
+  mutate:rows=>{rows.assertions.push({kind:'join',factRef:'fact',disposition:'unsupported'});return rows;},
+  check:rows=>checkCounts(s.loaded,s.records,rows),expectedAssertion:'COUNT.DISPOSITION',expectedCode:'invalidRecord',expectedField:'assertions'}]);
+ for(const row of rows)await runControl(row);
 });
 test('corpus profile enforces all floors, not only totals',async t=>{
  const s=await specimen(t);s.loaded.fixture.profile='corpus';
@@ -175,8 +189,11 @@ test('exact mutation controls on source-backed native membership and captured di
  const sample=await specimen(t);
  const disposition=await specimen(t);disposition.loaded.dispositions.assertions.push({kind:'resolution',factRef:'fact',disposition:'resolved'});
  const controls=registerControls([
-  {id:'COUNT.calls.native-membership',baseline:()=>sample.records,mutate:records=>{
-   records.calls[0].id=`occ:v1:${'a'.repeat(32)}`;return records;
+  {id:'COUNT.calls.forged-owner-span-provenance',baseline:()=>sample.records,mutate:records=>{
+   const forged=`occ:v1:${'a'.repeat(32)}`;
+   records.calls[0]={...records.calls[0],id:forged,ownerSyntaxId:targetId,
+    range:range(49,55),calleeRange:range(49,55),provenanceId:`native:r1:${forged}`};
+   return records;
   },check:records=>result(sample.loaded,records),expectedAssertion:'COUNT.CALLS',expectedCode:'invalidRecord',expectedField:'measuredCalls'},
   {id:'COUNT.disposition.source-proof',baseline:()=>disposition.loaded.dispositions,mutate:rows=>{
    rows.assertions[0].disposition='unresolved';return rows;
@@ -247,9 +264,11 @@ test('nested declaration-name anchors use the measured parent, not the focused d
  s.loaded.annotations[0].scenarios.push({id:'nested',category:'compatibilityControl',
   anchors:[s.authored[0].anchor,anchor],factRefs:['fact']});
  assert.equal(checkCounts(s.loaded,s.records).scenariosTotal,1);
- const copy=structuredClone(s.loaded.annotations);copy[0].scenarios[0].anchors[1].ownerRef='target';
- assert.throws(()=>checkCounts({...s.loaded,annotations:copy},s.records),e=>
-  e.assertion==='COUNT.SCENARIO'&&e.code==='invalidRecord'&&e.field==='anchors');
+ const controls=registerControls([{id:'COUNT.scenario.nested-owner',baseline:()=>s.loaded.annotations,
+  mutate:annotations=>{annotations[0].scenarios[0].anchors[1].ownerRef='target';return annotations;},
+  check:annotations=>checkCounts({...s.loaded,annotations},s.records),
+  expectedAssertion:'COUNT.SCENARIO',expectedCode:'invalidRecord',expectedField:'anchors'}]);
+ for(const control of controls)await runControl(control);
 });
 
 test('member-name reference inside a larger measured callee cannot be a callable-value negative',async t=>{
@@ -260,8 +279,11 @@ test('member-name reference inside a larger measured callee cannot be a callable
  },mutateFact:fact=>{fact.record.roles=['read'];}});
  s.loaded.annotations[0].scenarios.push({id:'callee-member',category:'callableValues',anchors:[s.authored[0].anchor],factRefs:['fact']});
  assert.equal(checkCounts(s.loaded,s.records).scenariosTotal,1);
- s.loaded.dispositions.callableValueNegatives.push({scenarioId:'callee-member',referenceRef:'fact',ownerRef:'main',range:s.authored[0].anchor.range});
- assert.throws(()=>checkCounts(s.loaded,s.records),e=>e.assertion==='COUNT.NEGATIVE'&&e.code==='invalidRecord'&&e.field==='callableValueNegatives');
+ const controls=registerControls([{id:'COUNT.negative.compound-callee',baseline:()=>s.loaded.dispositions,
+  mutate:rows=>{rows.callableValueNegatives.push({scenarioId:'callee-member',referenceRef:'fact',ownerRef:'main',range:s.authored[0].anchor.range});return rows;},
+  check:rows=>checkCounts(s.loaded,s.records,rows),
+  expectedAssertion:'COUNT.NEGATIVE',expectedCode:'invalidRecord',expectedField:'callableValueNegatives'}]);
+ for(const control of controls)await runControl(control);
 });
 
 test('UTF-16 callable negative converts to UTF-8 source before comparison',async t=>{
@@ -299,8 +321,12 @@ test('unicode coordinates require source bytes; ASCII anchors cannot be relabell
  s.loaded.annotations[0].scenarios.push({id:'unicode',category:'unicodeCoordinates',anchors:[s.authored[0].anchor],factRefs:['fact']});
  assert.equal(checkCounts(s.loaded,s.records).scenariosByCategory.find(x=>x.category==='unicodeCoordinates').count,1);
  const ascii=await specimen(t);
- ascii.loaded.annotations[0].scenarios.push({id:'fake-unicode',category:'unicodeCoordinates',anchors:[ascii.authored[0].anchor],factRefs:['fact']});
- assert.throws(()=>checkCounts(ascii.loaded,ascii.records),e=>e.assertion==='COUNT.SCENARIO'&&e.field==='category');
+ ascii.loaded.annotations[0].scenarios.push({id:'ascii',category:'compatibilityControl',anchors:[ascii.authored[0].anchor],factRefs:['fact']});
+ const controls=registerControls([{id:'COUNT.scenario.ascii-relabel',baseline:()=>ascii.loaded.annotations,
+  mutate:annotations=>{annotations[0].scenarios[0].category='unicodeCoordinates';return annotations;},
+  check:annotations=>checkCounts({...ascii.loaded,annotations},ascii.records),
+  expectedAssertion:'COUNT.SCENARIO',expectedCode:'invalidRecord',expectedField:'category'}]);
+ for(const control of controls)await runControl(control);
 });
 test('coverageFreshness requires an authenticated partial tuple, not a relabelled scenario',async t=>{
  const s=await specimen(t);
@@ -319,8 +345,42 @@ test('relationshipsDispatch requires a captured dispatch fact, not a reference n
  s.loaded.annotations[0].scenarios.push({id:'dispatch',category:'relationshipsDispatch',anchors:[s.authored[0].anchor],factRefs:['fact']});
  assert.equal(checkCounts(s.loaded,s.records).scenariosByCategory.find(x=>x.category==='relationshipsDispatch').count,1);
  const ref=await specimen(t);
- ref.loaded.annotations[0].scenarios.push({id:'fake-dispatch',category:'relationshipsDispatch',anchors:[ref.authored[0].anchor],factRefs:['fact']});
- assert.throws(()=>checkCounts(ref.loaded,ref.records),e=>e.assertion==='COUNT.SCENARIO'&&e.field==='category');
+ ref.loaded.annotations[0].scenarios.push({id:'plain-read',category:'compatibilityControl',anchors:[ref.authored[0].anchor],factRefs:['fact']});
+ const controls=registerControls([{id:'COUNT.scenario.dispatch-relabel',baseline:()=>ref.loaded.annotations,
+  mutate:annotations=>{annotations[0].scenarios[0].category='relationshipsDispatch';return annotations;},
+  check:annotations=>checkCounts({...ref.loaded,annotations},ref.records),
+  expectedAssertion:'COUNT.SCENARIO',expectedCode:'invalidRecord',expectedField:'category'}]);
+ for(const control of controls)await runControl(control);
+});
+
+test('captured directed relationship counts once and rejects wrong direction or producer copy',async t=>{
+ const text=`${source}class Child extends Base {}\nclass Base {}\n`;
+ const child=text.indexOf('class Child'),base=text.indexOf('class Base');
+ const relationship={kind:'typeRelationship',ref:'extends-child',source:{kind:'internal',declarationRef:'child',revisionId:'r1'},
+  target:{kind:'internal',declarationRef:'base',revisionId:'r1'},relationshipKind:'extends',provenanceRef:'proof-extends-child'};
+ const s=await specimen(t,{normalized:true,sourceOverride:text,facts:[makeFact('reference','exact'),relationship],
+  mutateNative:rows=>{
+   const type=(ref,name,begin,end,bases=[])=>({ref,nativeId:null,document,revisionId:'r1',parentRef:null,kind:'type',name,
+    range:span(begin,end),nameRange:span(begin+6,begin+6+name.length),
+    header:{kind:'type',name,modifiers:[],typeParameters:[],parameters:[],resultType:null,bases},signature:null,
+    witnesses:[witness('name',begin+6,begin+6+name.length,name),witness('header.name',begin+6,begin+6+name.length,name),
+     ...bases.map((value,i)=>witness(`header.bases[${i}]`,text.indexOf(value,begin+6),text.indexOf(value,begin+6)+value.length,value))]});
+   rows.declarations.push(type('child','Child',child,text.indexOf('\n',child),['Base']),type('base','Base',base,text.indexOf('\n',base)));
+  }});
+ const proof=s.loaded.annotations[0].facts.find(f=>f.ref==='extends-child');
+ const row=s.loaded.native.declarations.find(d=>d.ref==='child');
+ const anchor={document,revisionId:'r1',contentHash:sha(text),kind:'declarationName',range:row.nameRange,ownerRef:'child'};
+ s.loaded.annotations[0].scenarios.push({id:'directed',category:'relationshipsDispatch',anchors:[anchor],factRefs:['extends-child']});
+ assert.equal(checkCounts(s.loaded,s.records).typeRelationships,1);
+ const controls=registerControls([
+  {id:'COUNT.relationship.reverse-direction',baseline:()=>s.records,mutate:records=>{
+   const edge=records.typeRelationships[0];[edge.source,edge.target]=[edge.target,edge.source];return records;
+  },check:records=>checkCounts(s.loaded,records),expectedAssertion:'RELATIONSHIP.SOURCE',expectedCode:'invalidRecord',expectedField:'source'},
+  {id:'COUNT.relationship.producer-copy',baseline:()=>s.records,mutate:records=>{
+   records.typeRelationships[0].provenanceId='proof';return records;
+  },check:records=>checkCounts(s.loaded,records),expectedAssertion:'RELATIONSHIP.PROOF',expectedCode:'invalidRecord',expectedField:'provenanceId'}
+ ]);
+ for(const control of controls)await runControl(control);
 });
 
 for(const role of ['write','type'])test(`source-backed ${role} reference role`,async t=>{
@@ -387,4 +447,217 @@ test('unsupported copies in UTF-16 and scalar encodings share one source-byte sp
  s.loaded.dispositions.assertions.push({kind:'join',factRef:'fact',disposition:'unsupported'},
   {kind:'join',factRef:'fact-b',disposition:'unsupported'});
  assert.equal(checkCounts(s.loaded,s.records).outcomes.find(x=>x.disposition==='unsupported').count,1);
+});
+
+// The floor specimen is a captured source/candidate inventory, not an authored CountsV1.
+async function generatedCorpus(t,{duplicateProducer=false}={}) {
+ const doc={sourceSetId:'main',language:'java',path:'src/Corpus.java'};
+ let text='// é\n',decls=[],calls=[],refs=[],facts=[],scenarios=[];
+ const add=part=>{const start=Buffer.byteLength(text);text+=part;return start;};
+ const anchor=(kind,start,end,ownerRef)=>({document:doc,revisionId:'r1',contentHash:'0'.repeat(64),kind,range:span(start,end),ownerRef});
+ const simple=(ref,kind,name,begin,end,nameAt,parentRef=null,params=[],bases=[])=>{
+  const header={kind,name,modifiers:[],typeParameters:[],parameters:params.map(([type,value])=>({type,name:value,variadic:false})),resultType:null,bases};
+  const witnesses=[witness('name',nameAt,nameAt+name.length,name),witness('header.name',nameAt,nameAt+name.length,name)];
+  for(const [i,[type,value]] of params.entries()){
+   const at=Buffer.from(text).indexOf(type,begin);
+   witnesses.push(witness(`header.parameters[${i}].type`,at,at+type.length,type));
+   witnesses.push(witness(`header.parameters[${i}].name`,at+type.length+1,at+type.length+1+value.length,value));
+   witnesses.push(witness(`signature.parameterTypes[${i}]`,at,at+type.length,type));
+  }
+  for(const [i,base] of bases.entries()){
+   const at=Buffer.from(text).indexOf(base,begin);
+   witnesses.push(witness(`header.bases[${i}]`,at,at+base.length,base));
+  }
+  decls.push({ref,nativeId:null,document:doc,revisionId:'r1',parentRef,kind,name,range:span(begin,end),nameRange:span(nameAt,nameAt+name.length),header,
+   signature:params.length?{parameterTypes:params.map(([type])=>type),typeParameterCount:0,variadic:false}:null,witnesses});
+ };
+ const makeRef=(name,start,owner='drive')=>{
+  const ref=`ref-${refs.length}`;
+  refs.push({ref,nativeId:null,document:doc,revisionId:'r1',ownerRef:owner,range:span(start,start+name.length),spelling:name,witnesses:[witness('spelling',start,start+name.length,name)]});
+  return ref;
+ };
+ const addFact=(kind,selector,record,extra={})=>{
+  const ref=`fact-${facts.length}`,proof=`proof-${ref}`;
+  facts.push({kind,ref,...(selector?{anchor:selector}:{}),...(kind==='typeRelationship'?{...extra,provenanceRef:proof}:{record,...extra})});
+  return ref;
+ };
+ const host=add('class Host {\n'),targetStart=add(' void target() {}\n');
+ simple('target','method','target',targetStart,Buffer.byteLength(text)-1,targetStart+6,'host');
+ const driveStart=add(' void drive() {\n');
+ const callSelectors=[];
+ for(let i=0;i<120;i++){
+  const name=i<4?'drive':'target',start=add(`  ${name}();\n`)+2;
+  calls.push({ref:`call-${i}`,nativeId:null,document:doc,revisionId:'r1',ownerRef:'drive',range:span(start,start+name.length+3),calleeRange:span(start,start+name.length),spelling:name,regionRefs:[],witnesses:[witness('spelling',start,start+name.length,name)]});
+  callSelectors.push(anchor('callee',start,start+name.length,'drive'));
+  if(i>=4&&i<23)makeRef(name,start);
+ }
+ const refSelectors=[];
+ for(let i=0;i<20;i++){
+  const start=add('  target;\n')+2;
+  makeRef('target',start);
+  refSelectors.push(anchor('reference',start,start+6,'drive'));
+ }
+ const unsupportedSelectors=[];
+ for(let i=0;i<20;i++){
+  const start=add('  target;\n')+2;
+  unsupportedSelectors.push(anchor('invocation',start,start+7,'drive'));
+ }
+ add(' }\n');
+ simple('drive','method','drive',driveStart,Buffer.byteLength(text)-1,driveStart+6,'host');
+ for(let i=0;i<4;i++){
+  const name=`over${i}`;
+  for(const [j,type] of ['int','String'].entries()){
+   const start=add(` void ${name}(${type} value) {}\n`);
+   simple(`over-${i}-${j}`,'method',name,start,Buffer.byteLength(text)-1,start+6,'host',[[type,'value']]);
+  }
+ }
+ add('}\n');simple('host','type','Host',host,Buffer.byteLength(text)-1,host+6);
+ const other=add('class Other {\n'),otherMethod=add(' void over0(long value) {}\n');
+ simple('other-over0','method','over0',otherMethod,Buffer.byteLength(text)-1,otherMethod+6,'other',[['long','value']]);
+ add('}\n');simple('other','type','Other',other,Buffer.byteLength(text)-1,other+6);
+ const relationshipSelectors=[];
+ for(let i=0;i<20;i++){
+  const name=`Child${i}`,base=`Base${i}`;
+  const start=add(`class ${name} extends ${base} {}\n`);
+  simple(`child-${i}`,'type',name,start,Buffer.byteLength(text)-1,start+6,null,[],[base]);
+  relationshipSelectors.push(anchor('declarationName',start+6,start+6+name.length,`child-${i}`));
+  const baseStart=add(`class ${base} {}\n`);
+  simple(`base-${i}`,'type',base,baseStart,Buffer.byteLength(text)-1,baseStart+6);
+  addFact('typeRelationship',null,null,{source:{kind:'internal',declarationRef:`child-${i}`,revisionId:'r1'},
+   target:{kind:'internal',declarationRef:`base-${i}`,revisionId:'r1'},relationshipKind:'extends'});
+ }
+ const relationFacts=facts.map(x=>x.ref);
+ const targetRef={kind:'internal',declarationRef:'target',revisionId:'r1'},driveRef={kind:'internal',declarationRef:'drive',revisionId:'r1'};
+ const external={kind:'external',symbol:{scheme:'scip',symbol:'pkg external',scope:'global',document:null}};
+ const assertions=[];
+ const refFacts=[];
+ // Nineteen measured callees and twenty measured callable reads plus one definition.
+ for(let i=0;i<39;i++){
+  const selector=i<19?{...callSelectors[i+4],kind:'reference'}:refSelectors[i-19];
+  const roles=i<4?['read','call','import']:i<19?['read','call']:i===19?['read','write']:i===20?['read','type']:['read'];
+  const record={site:'use',roles,resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''};
+  const fact=addFact('reference',selector,record);refFacts.push(fact);
+  if(i>=19)assertions.push({kind:'resolution',factRef:fact,disposition:'resolved'});
+ }
+ for(const [group,resolution] of ['external','ambiguous','unresolved'].entries())for(let i=0;i<20;i++){
+  const selector=callSelectors[24+group*20+i];
+  const fact=addFact('callBinding',selector,{resolution,declaredTarget:resolution==='external'?external:null,
+   candidates:resolution==='ambiguous'?[targetRef,external]:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
+  assertions.push({kind:'resolution',factRef:fact,disposition:resolution==='external'?'provenExternal':resolution});
+ }
+ makeRef('target',targetStart+6,'host');
+ addFact('reference',anchor('reference',targetStart+6,targetStart+12,'host'),
+  {site:'declaration',roles:['definition'],resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''});
+ const callFacts=[];
+ for(let i=0;i<4;i++){
+  const fact=addFact('callBinding',callSelectors[i],{resolution:'resolved',declaredTarget:driveRef,candidates:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
+  callFacts.push(fact);
+ }
+ const unsupportedFacts=[];
+ for(let i=0;i<20;i++){
+  const fact=addFact('callBinding',unsupportedSelectors[i],{resolution:'unresolved',declaredTarget:null,candidates:[],dispatch:'unknown',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
+  unsupportedFacts.push(fact);assertions.push({kind:'join',factRef:fact,disposition:'unsupported'});
+ }
+ const overloadFacts=[];
+ for(let i=0;i<4;i++){
+  const row=decls.find(d=>d.ref===`over-${i}-1`);
+  overloadFacts.push(addFact('declarationBinding',anchor('declarationName',row.nameRange.start,row.nameRange.end,'host'),
+   {symbols:[{scheme:'scip',symbol:`pkg ${row.name} String`,scope:'global',document:null}],provenanceId:''}));
+ }
+ const overloadAnchors=[];
+ for(let i=0;i<4;i++)overloadAnchors.push([0,1].map(j=>{
+  const row=decls.find(d=>d.ref===`over-${i}-${j}`);return anchor('declarationName',row.nameRange.start,row.nameRange.end,'host');
+ }));
+ const scenario=(category,anchors,factRefs)=>scenarios.push({id:`scenario-${scenarios.length}`,category,anchors,factRefs});
+ for(let i=0;i<4;i++){
+  scenario('sameNameOverload',overloadAnchors[i],[overloadFacts[i]]);
+  scenario('importsAliases',[{...callSelectors[i+4],kind:'reference'}],[refFacts[i]]);
+  scenario('callableValues',Array.from({length:5},(_,j)=>refSelectors[i*5+j]),Array.from({length:5},(_,j)=>refFacts[19+i*5+j]));
+  scenario('recursion',[callSelectors[i]],[callFacts[i]]);
+  scenario('relationshipsDispatch',[relationshipSelectors[i]],[relationFacts[i]]);
+  scenario('unicodeCoordinates',[{...callSelectors[i+8],kind:'reference'}],[refFacts[i+4]]);
+  scenario('coverageFreshness',[{...callSelectors[i+12],kind:'reference'}],[refFacts[i+8]]);
+  scenario('compatibilityControl',[{...callSelectors[i+16],kind:'reference'}],[refFacts[i+12]]);
+ }
+ const negatives=Array.from({length:20},(_,i)=>({scenarioId:scenarios[Math.floor(i/5)*8+2].id,
+  referenceRef:refFacts[i+19],ownerRef:'drive',range:refSelectors[i].range}));
+ const s=await specimen(t,{normalized:true,documentOverride:doc,profile:'corpus',sourceOverride:text,facts,scenarios,
+  twoProducers:duplicateProducer,selectSecond:duplicateProducer,includeSecondInComparison:duplicateProducer,
+  dispositions:{formatVersion:1,assertions,callableValueNegatives:negatives},
+  mutateNative:rows=>{rows.declarations=decls;rows.calls=calls;rows.references=refs;rows.controls=[];},
+  mutateSupport:support=>{support.find(x=>x.kind==='invocation').available=false;support.find(x=>x.kind==='invocation').diagnostic='invocation unavailable';},
+  requestedRoles:['read','write','type'],mutateCoverage:row=>({...row,state:'partial',supportedRoles:['read','write','type'],observedRoles:['read','write'],diagnostic:'type not observed'})});
+ return s;
+}
+
+test('temporary captured Java corpus reaches each exact floor through checkCounts',async t=>{
+ const s=await generatedCorpus(t);
+ const count=checkCounts(s.loaded,s.records);
+ assert.equal(count.scenariosTotal,32);
+ assert.deepEqual(count.scenariosByCategory.map(x=>x.count),Array(8).fill(4));
+ assert.equal(count.measuredCalls,120);assert.equal(count.references,40);
+ assert.equal(count.callableValueNegatives,20);assert.equal(count.typeRelationships,20);
+ assert.deepEqual(count.outcomes.map(x=>x.count),Array(5).fill(20));
+ assert.deepEqual(count.observedRoles,['definition','read','write','call','type','import']);
+});
+
+test('integrated captured corpus rejects each count below its exact floor',async t=>{
+ const s=await generatedCorpus(t);
+ const baseline=()=>({native:s.loaded.native,annotations:s.loaded.annotations,dispositions:s.loaded.dispositions,records:s.records});
+ const controls=registerControls([
+  {id:'COUNT.corpus.scenario-31',mutate:value=>{value.annotations[0].scenarios.pop();return value;}},
+  {id:'COUNT.corpus.outcome-unsupported-19',mutate:value=>{value.dispositions.assertions.pop();return value;}},
+  {id:'COUNT.corpus.negative-19',mutate:value=>{value.dispositions.callableValueNegatives.pop();return value;}},
+  {id:'COUNT.corpus.relationship-19',mutate:value=>{
+   const fact=value.annotations[0].facts.filter(x=>x.kind==='typeRelationship').at(-1);
+   value.annotations[0].facts=value.annotations[0].facts.filter(x=>x!==fact);
+   value.records.typeRelationships=value.records.typeRelationships.filter(x=>x.provenanceId!==fact.provenanceRef);return value;
+  }},
+  {id:'COUNT.corpus.reference-39',mutate:value=>{
+   const fact=value.annotations[0].facts.find(x=>x.kind==='reference'&&x.record.site==='declaration');
+   value.annotations[0].facts=value.annotations[0].facts.filter(x=>x!==fact);
+   value.records.references=value.records.references.filter(x=>x.provenanceId!==fact.record.provenanceId);return value;
+  }},
+  {id:'COUNT.corpus.calls-119',mutate:value=>{
+   const native=value.native.calls.pop();
+   value.records.calls=value.records.calls.filter(x=>x.range.start!==native.range.start);return value;
+  }},
+  ...['sameNameOverload','importsAliases','callableValues','recursion','relationshipsDispatch','unicodeCoordinates','coverageFreshness','compatibilityControl']
+   .map(category=>({id:`COUNT.corpus.category-${category}-3`,mutate:value=>{
+    const rows=value.annotations[0].scenarios;
+    const [removed]=rows.splice(rows.findIndex(x=>x.category===category),1);
+    value.dispositions.callableValueNegatives=value.dispositions.callableValueNegatives.filter(x=>x.scenarioId!==removed.id);
+    return value;
+   }})),
+  ...['resolved','provenExternal','ambiguous','unresolved'].map(disposition=>({id:`COUNT.corpus.outcome-${disposition}-19`,mutate:value=>{
+   const assertions=value.dispositions.assertions;
+   assertions.splice(assertions.findIndex(x=>x.disposition===disposition),1);return value;
+  }}))
+ ].map(row=>({...row,baseline,check:value=>checkCounts({...s.loaded,native:value.native,annotations:value.annotations,dispositions:value.dispositions},value.records),
+  expectedAssertion:'COUNT.FLOOR',expectedCode:'invalidRecord',expectedField:'counts'})));
+ for(const control of controls)await runControl(control);
+});
+
+test('Java overloads accept distinct signatures but reject unrelated names and containers',async t=>{
+ const s=await generatedCorpus(t);
+ const declarations=s.loaded.native.declarations;
+ const a=declarations.find(x=>x.ref==='over-0-0'),b=declarations.find(x=>x.ref==='over-0-1');
+ assert.deepEqual([a.signature.parameterTypes,b.signature.parameterTypes],[['int'],['String']]);
+ assert.equal(checkCounts(s.loaded,s.records).scenariosByCategory[0].count,4);
+ const additional=ref=>{const row=declarations.find(x=>x.ref===ref);return {document:row.document,revisionId:row.revisionId,
+  contentHash:s.loaded.annotations[0].scenarios[0].anchors[0].contentHash,kind:'declarationName',
+  range:row.nameRange,ownerRef:row.parentRef??row.ref};};
+ const controls=registerControls([
+  {id:'COUNT.overload.unrelated-name',extra:additional('over-1-0')},
+  {id:'COUNT.overload.unrelated-container',extra:additional('other-over0')}
+ ].map(({id,extra})=>({id,baseline:()=>s.loaded.annotations,mutate:annotations=>{annotations[0].scenarios[0].anchors.push(extra);return annotations;},
+  check:annotations=>checkCounts({...s.loaded,annotations},s.records),
+  expectedAssertion:'COUNT.SCENARIO',expectedCode:'invalidRecord',expectedField:'category'})));
+ for(const control of controls)await runControl(control);
+});
+
+test('second captured producer cannot duplicate a directed edge at the corpus floor',async t=>{
+ const s=await generatedCorpus(t,{duplicateProducer:true});
+ assert.equal(s.records.typeRelationships.length,21);
+ assert.equal(checkCounts(s.loaded,s.records).typeRelationships,20);
 });

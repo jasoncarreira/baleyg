@@ -122,9 +122,11 @@ export function checkCounts(loaded,records,dispositions=loaded.dispositions) {
   const kinds=attached.map(x=>x.fact.kind);
   const source=loaded.sources.get(tuple(annotation));
   const siblings=anchors.map(x=>native.declarations.find(row=>row.ref===x.ref));
-  const identical=anchors.length>=2&&anchors.every(x=>x.anchor.kind==='declarationName')&&
+  const sameNamedSiblings=anchors.length>=2&&anchors.every(x=>x.anchor.kind==='declarationName')&&
    siblings.every(row=>row&&row.name===siblings[0].name&&row.kind===siblings[0].kind&&
-    row.parentRef===siblings[0].parentRef&&same(row.signature,siblings[0].signature));
+    row.parentRef===siblings[0].parentRef)&&
+   (annotation.document.language!=='java'||siblings.every(row=>row.signature!==null)&&
+    new Set(siblings.map(row=>identity(row.signature))).size===siblings.length);
   const includes=(role)=>attached.some(({fact})=>fact.kind==='reference'&&fact.record.roles.includes(role));
   const recursive=attached.some(({fact})=>fact.kind==='callBinding'&&fact.record.declaredTarget?.kind==='internal'&&
    fact.record.declaredTarget.declarationRef===fact.anchor.ownerRef);
@@ -134,7 +136,7 @@ export function checkCounts(loaded,records,dispositions=loaded.dispositions) {
   const incomplete=attached.some(({proof})=>records.coverage.some(row=>row.producerId===proof.producerId&&
    row.sourceSetId===annotation.document.sourceSetId&&row.documentPath===annotation.document.path&&
    row.revisionId===annotation.revisionId&&['partial','failed','omitted'].includes(row.state)));
-  const supported={sameNameOverload:identical,importsAliases:includes('import')||includes('alias'),
+  const supported={sameNameOverload:sameNamedSiblings,importsAliases:includes('import')||includes('alias'),
    callableValues:includes('read')&&anchors.some(x=>x.anchor.kind==='reference'),recursion:recursive,
    relationshipsDispatch:directed||dispatch,unicodeCoordinates:nonAscii,
    coverageFreshness:incomplete||attached.some(x=>x.proof.freshness!=='fresh'),
@@ -242,7 +244,7 @@ export function checkCounts(loaded,records,dispositions=loaded.dispositions) {
 }
 
 // The count inventory is independently source-checked above. Keep the floor
-// predicate separate so each boundary can be tested without forging sources.
+// predicate separate for direct boundary checks and captured corpus integration.
 export function assertCorpusFloors(count) {
  validate('CountsV1',count);
  const required=roles.filter(role=>count.language!=='java'||role!=='alias');
