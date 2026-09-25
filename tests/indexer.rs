@@ -1439,3 +1439,57 @@ fn browser_occurrences_follow_complete_source_and_basis_capture() {
     assert_eq!(changed_basis.0, body.0);
     assert_ne!(changed_basis.1, body.1);
 }
+
+#[test]
+fn java_capture_measures_member_name_without_semantic_promotion() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Café.java",
+        "class Café { void work() { obj.fóo(); obj.method().next(); new Café(); } }",
+    );
+    let mut admission = capture_admission(root);
+    admission.languages = vec![baleyg::model::v1::Language::Java];
+    admission.producers.clear();
+    let capture = baleyg::indexer::capture_revision(
+        &IndexOptions::new(root.to_owned()),
+        &admission,
+        &cancel(),
+    )
+    .unwrap();
+    let doc = &capture.documents[0];
+    let calls: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Invocation)
+        .collect();
+    assert!(calls.len() >= 3);
+    assert!(calls.iter().all(|w| {
+        w.stable_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("occ:v1:"))
+    }));
+    let member = calls
+        .iter()
+        .find(|w| w.spelling.as_deref() == Some("fóo"))
+        .unwrap();
+    assert!(member.verified_member_token);
+    assert_eq!(
+        &doc.bytes[member.token_start_byte..member.token_end_byte],
+        "fóo".as_bytes()
+    );
+    assert!(
+        calls.iter().any(|w| !w.verified_member_token
+            && doc.bytes[w.start_byte..w.end_byte].starts_with(b"new Caf"))
+    );
+    let graph = run(&IndexOptions::new(root.to_owned()));
+    assert!(
+        graph
+            .calls
+            .iter()
+            .filter(|c| c.path.ends_with(".java"))
+            .all(|c| c.target.is_none() && c.candidate_symbols.is_empty())
+    );
+}

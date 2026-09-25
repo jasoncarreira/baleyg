@@ -180,11 +180,28 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         let declaration = is_declaration(&node.kind)
             || matches!(
                 node.kind.as_str(),
-                "class" | "function_expression" | "generator_function" | "arrow_function"
-            );
+                "class"
+                    | "function_expression"
+                    | "generator_function"
+                    | "arrow_function"
+                    | "lambda_expression"
+                    | "compact_constructor_declaration"
+            )
+            || (node.kind == "class_body"
+                && node.parent_id.is_some_and(|parent| {
+                    matches!(
+                        nodes[parent].kind.as_str(),
+                        "object_creation_expression" | "enum_constant"
+                    )
+                }));
         let invocation = matches!(
             node.kind.as_str(),
-            "call_expression" | "new_expression" | "method_invocation" | "macro_invocation"
+            "call_expression"
+                | "new_expression"
+                | "method_invocation"
+                | "macro_invocation"
+                | "object_creation_expression"
+                | "explicit_constructor_invocation"
         );
         let control = matches!(
             node.kind.as_str(),
@@ -200,6 +217,11 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 | "for_expression"
                 | "while_statement"
                 | "while_expression"
+                | "enhanced_for_statement"
+                | "switch_block_statement_group"
+                | "switch_rule"
+                | "try_with_resources_statement"
+                | "synchronized_statement"
                 | "loop_expression"
                 | "try_statement"
                 | "catch_clause"
@@ -240,7 +262,11 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
             && !is_declaration(&nodes[owner].kind)
             && !matches!(
                 nodes[owner].kind.as_str(),
-                "class" | "function_expression" | "generator_function" | "arrow_function"
+                "class"
+                    | "function_expression"
+                    | "generator_function"
+                    | "arrow_function"
+                    | "lambda_expression"
             )
         {
             owner = nodes[owner].parent_id.unwrap_or(0);
@@ -274,8 +300,14 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         // declaration sites: their source header and parent give an exact key.
         let anonymous = matches!(
             node.kind.as_str(),
-            "function_expression" | "generator_function" | "arrow_function"
-        );
+            "function_expression" | "generator_function" | "arrow_function" | "lambda_expression"
+        ) || node.kind == "class_body"
+            && node.parent_id.is_some_and(|parent| {
+                matches!(
+                    nodes[parent].kind.as_str(),
+                    "object_creation_expression" | "enum_constant"
+                )
+            });
         if declaration && name_node.is_none() && !anonymous {
             continue;
         }
@@ -1162,6 +1194,8 @@ pub fn capture_revision_with_hook(
     for document in &mut documents {
         if document.key.language == Language::Javascript {
             identify_javascript(document, &revision_id)?;
+        } else if document.key.language == Language::Java {
+            crate::indexer_java::identify_document(document, &revision_id)?;
         }
         for position in &mut document.semantic_positions {
             position.revision_id = revision_id.clone();
@@ -1577,7 +1611,11 @@ pub fn index_workspace(
             Err(e) => diag(&mut g, None, "scip-unavailable", e.to_string()),
         }
     }
-    let browser_capture = if g.files.iter().any(|f| f.language == "javascript") {
+    let browser_capture = if g
+        .files
+        .iter()
+        .any(|f| matches!(f.language.as_str(), "javascript" | "java"))
+    {
         Some(capture_browser_revision(
             options,
             &workspace_root,
@@ -1597,7 +1635,21 @@ pub fn index_workspace(
         if file.language != "javascript" {
             match file.language.as_str() {
                 "rust" => crate::indexer_rust::extract(&mut g, &file, cancel)?,
-                "java" => crate::indexer_java::extract(&mut g, &file, cancel)?,
+                "java" => {
+                    let source_set =
+                        crate::store::topology::WorkspaceIdentity::discover_unattached(
+                            Some(&workspace_root),
+                            &workspace_root,
+                        )?
+                        .record_id;
+                    crate::indexer_java::extract_with_identity(
+                        &mut g,
+                        &file,
+                        cancel,
+                        &browser_capture.as_ref().unwrap().revision_id,
+                        &source_set,
+                    )?
+                }
                 "python" => crate::indexer_python::extract(&mut g, &file, cancel)?,
                 _ => unreachable!("source discovery returned an unsupported language"),
             }
