@@ -42,18 +42,22 @@ function rejects(error,assertion,field) {
  return true;
 }
 
-test('publication: two generations are byte-identical; both check commands never write',async()=>{
- const {root,parent,cleanup}=await copyFixture();
+test('publication: independent pristine generations are byte-identical; both check commands never write',async()=>{
+ const firstCopy=await copyFixture(),secondCopy=await copyFixture();
  try {
-  const first=await generateFixture(root),firstBytes=await publicationBytes(root,first);
-  const second=await generateFixture(root);
+  const first=await generateFixture(firstCopy.root);
+  const firstBytes=await publicationBytes(firstCopy.root,first);
+  const second=await generateFixture(secondCopy.root);
   assert.deepEqual(second,first);
-  assert.deepEqual(await publicationBytes(root,second),firstBytes);
-  const before=await tree(root);
-  assert.deepEqual(await main(['generate','--check','--fixtures-root',parent]),first);
-  assert.deepEqual(await main(['check','--fixtures-root',parent,'--fixture','example']),first);
-  assert.deepEqual(await tree(root),before);
- } finally {await cleanup();}
+  assert.deepEqual(await publicationBytes(secondCopy.root,second),firstBytes);
+  const rerun=await generateFixture(firstCopy.root);
+  assert.deepEqual(rerun,first);
+  assert.deepEqual(await publicationBytes(firstCopy.root,rerun),firstBytes);
+  const before=await tree(firstCopy.root);
+  assert.deepEqual(await main(['generate','--check','--fixtures-root',firstCopy.parent]),first);
+  assert.deepEqual(await main(['check','--fixtures-root',firstCopy.parent,'--fixture','example']),first);
+  assert.deepEqual(await tree(firstCopy.root),before);
+ } finally {await Promise.all([firstCopy.cleanup(),secondCopy.cleanup()]);}
 });
 
 test('publication: admitted native raw order and native IDs do not change semantic IDs',async()=>{
@@ -84,17 +88,23 @@ test('publication: changed admitted answer bytes invalidate manifest with zero w
  } finally {await cleanup();}
 });
 
-test('publication: staged and installed faults preserve prior manifest and bundle',async()=>{
+test('publication: staged and installed faults preserve prior valid manifest and bundle',async()=>{
  for(const boundary of ['stage:records','stage:answers','stage:counts','stage:verified','install:bundle','install:records','install:answers','install:counts','install:verified','install:manifest']) {
   const {root,cleanup}=await copyFixture();
   try {
    const previous=await generateFixture(root),bytes=await publicationBytes(root,previous);
-   await addWhitespace(root);
-   await assert.rejects(()=>generateFixture(root,{fault:at=>{if(at===boundary)throw Error(`fault:${at}`);}}),
-    new RegExp(`fault:${boundary}`));
+   const before=await tree(root);
+   const expected=join(root,'expected/answers.json'),original=await readFile(expected);
+   try {
+    await addWhitespace(root);
+    await assert.rejects(()=>generateFixture(root,{fault:at=>{if(at===boundary)throw Error(`fault:${at}`);}}),
+     new RegExp(`fault:${boundary}`));
+   } finally {await writeFile(expected,original);}
+   assert.deepEqual(await checkPublication(root),previous,boundary);
    assert.deepEqual(await publicationBytes(root,previous),bytes,boundary);
    assert.deepEqual((await readdir(join(root,'generated'))).sort(),['bundles','manifest.json'],boundary);
    assert.deepEqual(await readdir(join(root,'generated/bundles')),[previous.bundleHash],boundary);
+   assert.deepEqual(await tree(root),before,boundary);
   } finally {await cleanup();}
  }
 });
