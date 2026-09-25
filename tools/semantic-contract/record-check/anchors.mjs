@@ -46,6 +46,10 @@ export function checkAnchors(loaded,records,measurement) {
      anchorCase.continuity.fromRevisionId!==captured.revisionId ||
      anchorCase.continuity.toRevisionId!==currentRevisionId)
    reject('ANCHOR.TUPLE','continuity','unadmitted document, revision or continuity');
+  if(anchorCase.continuity.state==='unknown' && anchorCase.continuity.evidence!==null ||
+     currentRevisionId!==captured.revisionId && anchorCase.continuity.state==='unchanged' &&
+     (typeof anchorCase.continuity.evidence!=='string' || !anchorCase.continuity.evidence.trim()))
+   reject('ANCHOR.CONTINUITY','continuity.evidence','unknown cannot assert proof; cross-revision unchanged needs independent proof');
   const old=measurement.recordByNativeRef.get(captured.ref);
   if(!old?.syntaxId || old.revisionId!==captured.revisionId || !same(old.document,captured.document))
    reject('ANCHOR.TUPLE','capturedDeclarationRef','missing captured measured declaration');
@@ -74,7 +78,7 @@ export function checkAnchors(loaded,records,measurement) {
     if(durable.identicalHeaderCount>1 || currentCount>1) {
      if(durable.siblingGroupHash!==measuredSiblingGroupHash(headers) ||
         durable.siblingCount!==headers.length || durable.identicalHeaderCount!==currentCount ||
-        anchorCase.continuity.state==='changed') reason='groupChanged';
+        currentRevisionId!==captured.revisionId && anchorCase.continuity.state==='changed') reason='groupChanged';
      else if(currentRevisionId!==captured.revisionId && anchorCase.continuity.state!=='unchanged')
       reason='unprovenContinuity';
     }

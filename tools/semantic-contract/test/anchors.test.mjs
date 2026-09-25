@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {checkAnchors} from '../record-check/anchors.mjs';
-import {measuredHeaderHash,measuredSiblingGroupHash,orderedEnvelope} from '../record-check/measurement.mjs';
+import {measuredHeaderHash,measuredSiblingGroupHash} from '../record-check/measurement.mjs';
 import {registerControls,runControl} from './mutations.mjs';
 
 const document={sourceSetId:'core',language:'java',path:'src/A.java'};
@@ -10,8 +10,8 @@ const header=name=>({kind:'method',name,modifiers:[],typeParameters:[],parameter
 const h0=header('method'), hx=header('different');
 const row=(ref,revisionId,syntaxId,head)=>({ref,revisionId,document,syntaxId,header:head});
 function specimen({captured=[row('old','r1',id(0),h0)],current=[row('new','r2',id(0),h0)],
- state='unknown',expected='none'}={}) {
- const all=[...captured,...current],byRef=new Map(all.map(x=>[x.ref,x]));
+ state='unknown',expected='none',currentRevisionId=current[0].revisionId}={}) {
+ const all=currentRevisionId==='r1'?captured:[...captured,...current],byRef=new Map(all.map(x=>[x.ref,x]));
  const groups=new Map();
  for(const group of [captured,current])for(const member of group)
   groups.set(member.ref,{memberRefs:group.map(x=>x.ref),headers:group.map(x=>measuredHeaderHash(x.header))});
@@ -20,10 +20,10 @@ function specimen({captured=[row('old','r1',id(0),h0)],current=[row('new','r2',i
   siblingGroupHash:measuredSiblingGroupHash(headers),siblingCount:headers.length,
   identicalHeaderCount:headers.filter(x=>x===hash).length};
  const result={status:expected==='none'?'attached':'orphaned',targetId:expected==='none'?id(0):null,reason:expected};
- const continuity={fromRevisionId:'r1',toRevisionId:'r2',state,evidence:state==='unknown'?null:'independent member/order proof'};
- const loaded={native:{declarations:all},comparison:{revisionId:'r2'},
+ const continuity={fromRevisionId:'r1',toRevisionId:currentRevisionId,state,evidence:state==='unknown'?null:'independent member/order proof'};
+ const loaded={native:{declarations:all},comparison:{revisionId:currentRevisionId},
   revisions:new Map(['r1','r2'].map(rev=>[JSON.stringify(['core',rev]),{documents:[{key:document}]}])),
-  anchors:{cases:[{id:'A',capturedDeclarationRef:'old',currentRevisionId:'r2',continuity,expectedResult:result}]}};
+  anchors:{cases:[{id:'A',capturedDeclarationRef:'old',currentRevisionId,continuity,expectedResult:result}]}};
  const records={durableAnchors:[durable],groupContinuities:[continuity],anchorResults:[result]};
  const measurement={recordByNativeRef:byRef,groupsByDeclarationRef:groups,
   identityByRef:new Map(all.map(x=>[x.ref,x.syntaxId]))};
@@ -37,6 +37,7 @@ const cases=[
  ['duplicate count changes',{captured:[row('old','r1',id(0),h0),row('peer1','r1',id(1),h0)],current:[row('new','r2',id(0),h0),row('peer2','r2',id(1),h0),row('extra','r2',id(2),h0)],state:'changed'},'groupChanged'],
  ['same-count duplicate membership unknown',{captured:[row('old','r1',id(0),h0),row('peer1','r1',id(1),h0)],current:[row('new','r2',id(0),h0),row('peer2','r2',id(1),h0)]},'unprovenContinuity'],
  ['same-count duplicate membership changed',{captured:[row('old','r1',id(0),h0),row('peer1','r1',id(1),h0)],current:[row('new','r2',id(0),h0),row('peer2','r2',id(1),h0)],state:'changed'},'groupChanged'],
+ ['same-revision duplicate ignores contradictory continuity state',{captured:[row('old','r1',id(0),h0),row('peer1','r1',id(1),h0)],current:[row('old','r1',id(0),h0),row('peer1','r1',id(1),h0)],state:'changed'},'none'],
  ['missing old identity never name-searches',{current:[row('replacement','r2',id(4),h0)]},'missing']
 ];
 for(const [name,inputs,reason] of cases)test(name,()=>{
@@ -57,6 +58,12 @@ const controls=registerControls([
  {id:'ANCHOR.missing.old',baseline:()=>specimen({current:[row('replacement','r2',id(4),h0)],expected:'missing'}),
   mutate:value=>{value.loaded.anchors.cases[0].expectedResult={status:'attached',targetId:id(4),reason:'none'};return value;},
   check:value=>checkAnchors(value.loaded,value.records,value.measurement),expectedAssertion:'ANCHOR.RESULT',expectedCode:'invalidRecord',expectedField:'expectedResult'},
+ {id:'ANCHOR.continuity.unchangedWithoutEvidence',baseline:()=>specimen({...duplicate,state:'unchanged'}),
+  mutate:value=>{value.loaded.anchors.cases[0].continuity.evidence=null;value.records.groupContinuities[0].evidence=null;return value;},
+  check:value=>checkAnchors(value.loaded,value.records,value.measurement),expectedAssertion:'ANCHOR.CONTINUITY',expectedCode:'invalidRecord',expectedField:'continuity.evidence'},
+ {id:'ANCHOR.continuity.unknownWithEvidence',baseline:()=>specimen({...duplicate,expected:'unprovenContinuity'}),
+  mutate:value=>{value.loaded.anchors.cases[0].continuity.evidence='unrelated assertion';value.records.groupContinuities[0].evidence='unrelated assertion';return value;},
+  check:value=>checkAnchors(value.loaded,value.records,value.measurement),expectedAssertion:'ANCHOR.CONTINUITY',expectedCode:'invalidRecord',expectedField:'continuity.evidence'},
  {id:'ANCHOR.inventory.hash',baseline:()=>specimen(),
   mutate:value=>{value.records.durableAnchors[0].siblingGroupHash='0'.repeat(64);return value;},
   check:value=>checkAnchors(value.loaded,value.records,value.measurement),expectedAssertion:'ANCHOR.MEMBERSHIP',expectedCode:'invalidRecord',expectedField:'durableAnchors'}
