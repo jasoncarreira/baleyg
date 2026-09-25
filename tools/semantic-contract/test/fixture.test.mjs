@@ -86,7 +86,7 @@ async function writeJavaCorpus(root,{document,text,decls,calls,refs,facts,scenar
 
 async function authorJavaCorpus(root) {
  const doc={sourceSetId:'main',language:'java',path:'src/Corpus.java'};
- let text='// é\n',decls=[],calls=[],refs=[],facts=[],scenarios=[];
+ let text='// é\npackage corpus;\n',decls=[],calls=[],refs=[],facts=[],scenarios=[];
  const add=part=>{const start=Buffer.byteLength(text);text+=part;return start;};
  const anchor=(kind,start,end,ownerRef)=>({document:doc,revisionId:'r1',contentHash:'0'.repeat(64),kind,range:span(start,end),ownerRef});
  const simple=(ref,kind,name,begin,end,nameAt,parentRef=null,params=[],bases=[])=>{
@@ -102,7 +102,7 @@ async function authorJavaCorpus(root) {
    const at=Buffer.from(text).indexOf(base,begin);
    witnesses.push(witness(`header.bases[${i}]`,at,at+base.length,base));
   }
-  decls.push({ref,nativeId:null,document:doc,revisionId:'r1',parentRef,kind,name,range:span(begin,end),nameRange:span(nameAt,nameAt+name.length),header,
+  decls.push({ref,nativeId:null,document:doc,revisionId:'r1',parentRef:parentRef??(kind==='type'?'unit':null),kind,name,range:span(begin,end),nameRange:span(nameAt,nameAt+name.length),header,
    signature:params.length?{parameterTypes:params.map(([type])=>type),typeParameterCount:0,variadic:false}:null,witnesses});
  };
  const makeRef=(name,start,owner='drive')=>{
@@ -115,27 +115,54 @@ async function authorJavaCorpus(root) {
   facts.push({kind,ref,...(selector?{anchor:selector}:{}),...(kind==='typeRelationship'?{...extra,provenanceRef:proof}:{record,...extra})});
   return ref;
  };
+ // Java imports are actual imported type names, not call-site aliases.
+ const importSelectors=[];
+ for(const name of ['List','Map','Set','Collection']) {
+  const start=add(`import java.util.${name};\n`)+17;
+  const ref=makeRef(name,start,'unit');
+  importSelectors.push({selector:anchor('reference',start,start+name.length,'unit'),ref,name});
+ }
  const host=add('class Host {\n'),targetStart=add(' void target() {}\n');
  simple('target','method','target',targetStart,Buffer.byteLength(text)-1,targetStart+6,'host');
+ const fieldStart=add(' Host field;\n');
+ simple('field','field','field',fieldStart,Buffer.byteLength(text)-1,fieldStart+6,'host');
+ const ambiguousStart=add(' void ambiguous(String value) {}\n');
+ simple('ambiguous-string','method','ambiguous',ambiguousStart,Buffer.byteLength(text)-1,ambiguousStart+6,'host',[['String','value']]);
+ const ambiguousOther=add(' void ambiguous(Integer value) {}\n');
+ simple('ambiguous-integer','method','ambiguous',ambiguousOther,Buffer.byteLength(text)-1,ambiguousOther+6,'host',[['Integer','value']]);
  const driveStart=add(' void drive() {\n');
- const callSelectors=[];
+ // Calls 44-63 deliberately have an overload error; 64-83 have an unknown method.
+ // Both are valid Java syntax, but javac correctly rejects those semantic cases.
+ const callSelectors=[],unsupportedSelectors=[];
  for(let i=0;i<120;i++){
-  const name=i<4?'drive':'target',start=add(`  ${name}();\n`)+2;
-  calls.push({ref:`call-${i}`,nativeId:null,document:doc,revisionId:'r1',ownerRef:'drive',range:span(start,start+name.length+3),calleeRange:span(start,start+name.length),spelling:name,regionRefs:[],witnesses:[witness('spelling',start,start+name.length,name)]});
+  const expression=i<4?'drive()':i<24||i>=84?'target()':
+   i<44?'java.util.Objects.requireNonNull(this)':i<64?'ambiguous(null)':'unknown()';
+  const name=i<4?'drive':i<24||i>=84?'target':i<44?'requireNonNull':i<64?'ambiguous':'unknown';
+  const line=`  ${expression};\n`,begin=add(line),start=begin+2+expression.indexOf(name);
+  const invocationStart=begin+2,invocationEnd=invocationStart+expression.length;
+  calls.push({ref:`call-${i}`,nativeId:null,document:doc,revisionId:'r1',ownerRef:'drive',range:span(invocationStart,invocationEnd),calleeRange:span(start,start+name.length),spelling:name,regionRefs:[],witnesses:[witness('spelling',start,start+name.length,name)]});
   callSelectors.push(anchor('callee',start,start+name.length,'drive'));
   if(i>=4&&i<23)makeRef(name,start);
  }
+ // Native callee capture is partial: these 20 valid Java invocations have no
+ // native Call row, and the producer cannot supply invocation-family joins.
+ for(let i=0;i<20;i++){
+  const expression='this.target()',start=add(`  ${expression};\n`)+2;
+  unsupportedSelectors.push(anchor('invocation',start,start+expression.length,'drive'));
+ }
  const refSelectors=[];
  for(let i=0;i<20;i++){
-  const start=add('  target;\n')+2;
+  const line=`  Runnable callback${i} = this::target;\n`;
+  const start=add(line)+line.indexOf('target');
   makeRef('target',start);
   refSelectors.push(anchor('reference',start,start+6,'drive'));
  }
- const unsupportedSelectors=[];
- for(let i=0;i<20;i++){
-  const start=add('  target;\n')+2;
-  unsupportedSelectors.push(anchor('invocation',start,start+7,'drive'));
- }
+ const writeLine='  this.field = this;\n',writeStart=add(writeLine)+writeLine.indexOf('field');
+ makeRef('field',writeStart);
+ const writeSelector=anchor('reference',writeStart,writeStart+5,'drive');
+ const typeLine='  List<String> items = null;\n',typeStart=add(typeLine)+2;
+ makeRef('List',typeStart);
+ const typeSelector=anchor('reference',typeStart,typeStart+4,'drive');
  add(' }\n');
  simple('drive','method','drive',driveStart,Buffer.byteLength(text)-1,driveStart+6,'host');
  for(let i=0;i<4;i++){
@@ -149,34 +176,41 @@ async function authorJavaCorpus(root) {
  const other=add('class Other {\n'),otherMethod=add(' void over0(long value) {}\n');
  simple('other-over0','method','over0',otherMethod,Buffer.byteLength(text)-1,otherMethod+6,'other',[['long','value']]);
  add('}\n');simple('other','type','Other',other,Buffer.byteLength(text)-1,other+6);
+ decls.push({ref:'unit',nativeId:null,document:doc,revisionId:'r1',parentRef:null,kind:'module',name:null,range:span(0,0),nameRange:null,header:{kind:'module',name:null,modifiers:[],typeParameters:[],parameters:[],resultType:null,bases:[]},signature:null,witnesses:[]});
  const relationshipSelectors=[];
  for(let i=0;i<20;i++){
   const name=`Child${i}`,base=`Base${i}`;
   const start=add(`class ${name} extends ${base} {}\n`);
   simple(`child-${i}`,'type',name,start,Buffer.byteLength(text)-1,start+6,null,[],[base]);
-  relationshipSelectors.push(anchor('declarationName',start+6,start+6+name.length,`child-${i}`));
+  relationshipSelectors.push(anchor('declarationName',start+6,start+6+name.length,'unit'));
   const baseStart=add(`class ${base} {}\n`);
   simple(`base-${i}`,'type',base,baseStart,Buffer.byteLength(text)-1,baseStart+6);
   addFact('typeRelationship',null,null,{source:{kind:'internal',declarationRef:`child-${i}`,revisionId:'r1'},
    target:{kind:'internal',declarationRef:`base-${i}`,revisionId:'r1'},relationshipKind:'extends'});
  }
+ decls.find(row=>row.ref==='unit').range=span(0,Buffer.byteLength(text));
  const relationFacts=facts.map(x=>x.ref);
  const targetRef={kind:'internal',declarationRef:'target',revisionId:'r1'},driveRef={kind:'internal',declarationRef:'drive',revisionId:'r1'};
- const external={kind:'external',symbol:{scheme:'scip',symbol:'pkg external',scope:'global',document:null}};
+ const external={kind:'external',symbol:{scheme:'scip',symbol:'java.util.Objects requireNonNull',scope:'global',document:null}};
  const assertions=[];
  const refFacts=[];
- // Nineteen measured callees and twenty measured callable reads plus one definition.
+ // Each role is witnessed by its own Java source construct: imported names,
+ // assignment, generic type use, invocation callee, method-reference read and declaration.
  for(let i=0;i<39;i++){
   const selector=i<19?{...callSelectors[i+4],kind:'reference'}:refSelectors[i-19];
-  const roles=i<4?['read','call','import']:i<19?['read','call']:i===19?['read','write']:i===20?['read','type']:['read'];
+  const roles=i<19?['read','call']:['read'];
   const record={site:'use',roles,resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''};
   const fact=addFact('reference',selector,record);refFacts.push(fact);
   if(i>=19)assertions.push({kind:'resolution',factRef:fact,disposition:'resolved'});
  }
+ const importFacts=importSelectors.map(({selector,name})=>addFact('reference',selector,
+  {site:'use',roles:['import'],resolution:'external',declaredTarget:{kind:'external',symbol:{scheme:'scip',symbol:`java.util ${name}`,scope:'global',document:null}},candidates:[],provenanceId:''}));
+ addFact('reference',writeSelector,{site:'use',roles:['write'],resolution:'resolved',declaredTarget:{kind:'internal',declarationRef:'field',revisionId:'r1'},candidates:[],provenanceId:''});
+ addFact('reference',typeSelector,{site:'use',roles:['type'],resolution:'external',declaredTarget:{kind:'external',symbol:{scheme:'scip',symbol:'java.util List',scope:'global',document:null}},candidates:[],provenanceId:''});
  for(const [group,resolution] of ['external','ambiguous','unresolved'].entries())for(let i=0;i<20;i++){
   const selector=callSelectors[24+group*20+i];
   const fact=addFact('callBinding',selector,{resolution,declaredTarget:resolution==='external'?external:null,
-   candidates:resolution==='ambiguous'?[targetRef,external]:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
+   candidates:resolution==='ambiguous'?[{kind:'internal',declarationRef:'ambiguous-integer',revisionId:'r1'},{kind:'internal',declarationRef:'ambiguous-string',revisionId:'r1'}]:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
   assertions.push({kind:'resolution',factRef:fact,disposition:resolution==='external'?'provenExternal':resolution});
  }
  makeRef('target',targetStart+6,'host');
@@ -205,7 +239,7 @@ async function authorJavaCorpus(root) {
  const scenario=(category,anchors,factRefs)=>scenarios.push({id:`scenario-${scenarios.length}`,category,anchors,factRefs});
  for(let i=0;i<4;i++){
   scenario('sameNameOverload',overloadAnchors[i],[overloadFacts[i]]);
-  scenario('importsAliases',[{...callSelectors[i+4],kind:'reference'}],[refFacts[i]]);
+  scenario('importsAliases',[importSelectors[i].selector],[importFacts[i]]);
   scenario('callableValues',Array.from({length:5},(_,j)=>refSelectors[i*5+j]),Array.from({length:5},(_,j)=>refFacts[19+i*5+j]));
   scenario('recursion',[callSelectors[i]],[callFacts[i]]);
   scenario('relationshipsDispatch',[relationshipSelectors[i]],[relationFacts[i]]);
@@ -221,6 +255,20 @@ async function authorJavaCorpus(root) {
 test('a source-backed Java corpus is discovered and published through the common runner',async t=>{
  const {root,cleanup}=await copyExample();t.after(cleanup);
  await authorJavaCorpus(join(root,'java'));
+ const source=await readFile(join(root,'java','snapshots/src/Corpus.java'),'utf8');
+ const native=JSON.parse(await readFile(join(root,'java','captures/native.json'),'utf8'));
+ const semantic=JSON.parse(await readFile(join(root,'java','captures/semantic.json'),'utf8'));
+ const captured=semantic.facts.filter(fact=>fact.kind==='reference');
+ assert.equal(native.calls.length,120);
+ assert.equal((source.match(/this::target/g)??[]).length,20);
+ assert.equal((source.match(/this\.target\(\)/g)??[]).length,20);
+ assert.equal((source.match(/ambiguous\(null\)/g)??[]).length,20);
+ assert.equal((source.match(/unknown\(\)/g)??[]).length,20);
+ assert.deepEqual(captured.filter(fact=>fact.record.roles.includes('import'))
+  .map(fact=>Buffer.from(source).subarray(fact.anchor.range.start,fact.anchor.range.end).toString('utf8')).sort(),['Collection','List','Map','Set']);
+ assert.equal(captured.filter(fact=>fact.record.roles.includes('write')).length,1);
+ assert.equal(captured.filter(fact=>fact.record.roles.includes('type')).length,1);
+ assert.equal(semantic.facts.filter(fact=>fact.kind==='callBinding'&&fact.anchor.kind==='invocation').length,20);
  assert.deepEqual(await discoverFixtures(root),[join(root,'example'),join(root,'java')]);
  assert.equal(await runFixtures(parseRunnerArgs(['--fixtures-root',root])),2);
 });
