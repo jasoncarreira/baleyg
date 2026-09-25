@@ -118,7 +118,8 @@ Non-production use (reading, modifying, testing) is always free; anyone may also
 production for up to 30 days. While a version is under the BSL, offering it, or a product
 substantially derived from it, to third parties as a commercial hosted service or embedded
 product is outside the free grant and needs a commercial license. Each version converts to the
-Apache License 2.0 three years after it is first published, and those restrictions then end.
+Apache License 2.0 three years after it is first publicly distributed under BSL-1.1, and those
+restrictions then end.
 For commercial licensing, contact jcarreira@gmail.com. The [LICENSE](LICENSE) text governs; this
 summary does not.
 
