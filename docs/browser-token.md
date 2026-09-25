@@ -1,8 +1,13 @@
 # Browser token convenience
 
-Use **Load token file instead** if pasting into the password field does not work. Select
-`.baleyg/native-smoke/daemon.token` for this inspector. The browser reads the selected file
-locally; it fills only the password field and does not connect automatically.
+Use **Load token file instead** if pasting into the password field does not work.
+`.baleyg/native-smoke/daemon.token` was the token used by an earlier inspector snapshot;
+do not use an in-checkout token path for current startup. Run
+`serve --workspace /path/to/repository --token-file /absolute/private/path/outside/checkout/daemon.token`
+with an existing private parent directory. `--token-file` is required and its absolute
+path must be outside the selected checkout; no old token or state migrates automatically.
+Select the file configured for the running inspector. The browser reads it locally; it
+fills only the password field and does not connect automatically.
 
 Select **Remember token on this browser**, then **Connect**. Only a successful connection
 saves the credential in this browser's localStorage for this exact origin (scheme/host/port).
