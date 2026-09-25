@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {cp, mkdtemp, readFile, rm, rename, writeFile} from 'node:fs/promises';
+import {cp, mkdir, mkdtemp, readFile, rm, rename, writeFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
 import {tmpdir} from 'node:os';
-import {join, resolve} from 'node:path';
+import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {discoverFixtures} from '../load.mjs';
 import {checkPublication} from '../publish.mjs';
@@ -47,16 +48,189 @@ test('the committed example publication passes no-write checks',async()=>{
  await checkPublication(join(fixturesRoot,'example'));
 });
 
-test('a copied corpus-profile language is discovered from data only',async t=>{
+
+// Source, measurements, semantic capture and expected evidence are all authored under
+// this temporary language directory. The runner must derive every published count.
+const sha=value=>createHash('sha256').update(value).digest('hex');
+const canonical=value=>value===null||typeof value!=='object'?JSON.stringify(value):Array.isArray(value)?'['+value.map(canonical).join(',')+']':'{'+Object.keys(value).sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b))).map(k=>canonical(k)+':'+canonical(value[k])).join(',')+'}';
+const span=(start,end)=>({start,end,encoding:'utf8'});
+const witness=(field,start,end,text)=>({field,witness:{range:span(start,end),text}});
+async function writeJavaCorpus(root,{document,text,decls,calls,refs,facts,scenarios,assertions,negatives}) {
+ const files=new Map(),put=(path,value)=>files.set(path,typeof value==='string'?value:JSON.stringify(value));
+ const sourceHash=sha(text);
+ for(const scenario of scenarios)for(const anchor of scenario.anchors)anchor.contentHash=sourceHash;
+ for(const fact of facts)if(fact.anchor)fact.anchor.contentHash=sourceHash;
+ const native={formatVersion:1,producerId:'native',declarations:decls,calls,controls:[],references:refs};
+ put('snapshots/src/Corpus.java',text);
+ put('captures/native.json',native);
+ for(const [name,value] of [['native','native-executable'],['semantic','semantic-executable-0'],['toolchain','toolchain'],['config','config'],['dependency','dependency']])put(`captures/${name}.txt`,value);
+ for(const fact of facts){const id=`proof-${fact.ref}`;if(fact.kind==='typeRelationship')fact.provenanceRef=id;else fact.record.provenanceId=id;}
+ put('captures/semantic.json',{formatVersion:1,producerId:'semantic',facts});
+ const captures=[['native','executable','captures/native.txt'],['semantic','executable','captures/semantic.txt'],['toolchain','toolchain','captures/toolchain.txt'],['config','config','captures/config.txt'],['dependency','dependency','captures/dependency.txt'],['artifact','semanticArtifact','captures/semantic.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(files.get(file))}));
+ const revision={id:'r1',sourceSetId:'main',documents:[{key:document,revisionId:'r1',sourceFile:'snapshots/src/Corpus.java'}],toolchainHash:captures[2].hash,configHash:captures[3].hash,dependencyHash:captures[4].hash};
+ const nativeProducer={id:'native',version:'1',executableHash:captures[0].hash,kind:'native',languages:['java'],positionEncoding:'utf8'};
+ const semanticProducer={id:'semantic',version:'1',executableHash:captures[1].hash,kind:'semantic',languages:['java'],positionEncoding:'utf8'};
+ const producers=[nativeProducer,semanticProducer].sort((a,b)=>Buffer.compare(Buffer.from(canonical(a)),Buffer.from(canonical(b))));
+ const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:kind!=='invocation',diagnostic:kind==='invocation'?'invocation unavailable':null}));
+ const coverage=producerId=>({producerId,language:'java',sourceSetId:'main',documentPath:document.path,revisionId:'r1',requested:true,selected:true,state:'partial',supportedRoles:['read','write','type'],observedRoles:['read','write'],diagnostic:'type not observed'});
+ const basis={producerId:'semantic',producerVersion:'1',producerHash:semanticProducer.executableHash,artifactHash:captures[5].hash,language:'java',sourceSetId:'main',revisionId:'r1',sourceManifestHash:sha(canonical([{document,contentHash:sourceHash}])),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
+ const provenance=facts.map(fact=>({kind:'provenance',ref:`proof-fact-${fact.ref}`,record:{id:`proof-${fact.ref}`,producerId:'semantic',document,revisionId:'r1',contentHash:sourceHash,evidenceKind:fact.kind==='typeRelationship'?'typeRelationship':fact.kind==='declarationBinding'?'declarationBinding':'semanticReference',basis,freshness:'fresh'}}));
+ put('snapshots/src/Corpus.java.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios,facts:[...producers.map(p=>({kind:'coverage',ref:`coverage-${p.id}`,record:coverage(p.id)})),...provenance,...facts]});
+ const fixture={formatVersion:1,profile:'corpus',language:'java',sourceSets:[{id:'main',rootId:'root',languages:['java'],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles:['read','write','type'],measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:['captures/semantic.json'],annotationFiles:['snapshots/src/Corpus.java.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ put('fixture.json',fixture);
+ put('expected/answers.json',{formatVersion:1,answers:[]});
+ put('expected/dispositions.json',{formatVersion:1,assertions,callableValueNegatives:negatives});
+ put('expected/anchors.json',{formatVersion:1,cases:[]});
+ for(const [path,value] of files){await mkdir(dirname(join(root,path)),{recursive:true});await writeFile(join(root,path),value);}
+}
+
+async function authorJavaCorpus(root) {
+ const doc={sourceSetId:'main',language:'java',path:'src/Corpus.java'};
+ let text='// é\n',decls=[],calls=[],refs=[],facts=[],scenarios=[];
+ const add=part=>{const start=Buffer.byteLength(text);text+=part;return start;};
+ const anchor=(kind,start,end,ownerRef)=>({document:doc,revisionId:'r1',contentHash:'0'.repeat(64),kind,range:span(start,end),ownerRef});
+ const simple=(ref,kind,name,begin,end,nameAt,parentRef=null,params=[],bases=[])=>{
+  const header={kind,name,modifiers:[],typeParameters:[],parameters:params.map(([type,value])=>({type,name:value,variadic:false})),resultType:null,bases};
+  const witnesses=[witness('name',nameAt,nameAt+name.length,name),witness('header.name',nameAt,nameAt+name.length,name)];
+  for(const [i,[type,value]] of params.entries()){
+   const at=Buffer.from(text).indexOf(type,begin);
+   witnesses.push(witness(`header.parameters[${i}].type`,at,at+type.length,type));
+   witnesses.push(witness(`header.parameters[${i}].name`,at+type.length+1,at+type.length+1+value.length,value));
+   witnesses.push(witness(`signature.parameterTypes[${i}]`,at,at+type.length,type));
+  }
+  for(const [i,base] of bases.entries()){
+   const at=Buffer.from(text).indexOf(base,begin);
+   witnesses.push(witness(`header.bases[${i}]`,at,at+base.length,base));
+  }
+  decls.push({ref,nativeId:null,document:doc,revisionId:'r1',parentRef,kind,name,range:span(begin,end),nameRange:span(nameAt,nameAt+name.length),header,
+   signature:params.length?{parameterTypes:params.map(([type])=>type),typeParameterCount:0,variadic:false}:null,witnesses});
+ };
+ const makeRef=(name,start,owner='drive')=>{
+  const ref=`ref-${refs.length}`;
+  refs.push({ref,nativeId:null,document:doc,revisionId:'r1',ownerRef:owner,range:span(start,start+name.length),spelling:name,witnesses:[witness('spelling',start,start+name.length,name)]});
+  return ref;
+ };
+ const addFact=(kind,selector,record,extra={})=>{
+  const ref=`fact-${facts.length}`,proof=`proof-${ref}`;
+  facts.push({kind,ref,...(selector?{anchor:selector}:{}),...(kind==='typeRelationship'?{...extra,provenanceRef:proof}:{record,...extra})});
+  return ref;
+ };
+ const host=add('class Host {\n'),targetStart=add(' void target() {}\n');
+ simple('target','method','target',targetStart,Buffer.byteLength(text)-1,targetStart+6,'host');
+ const driveStart=add(' void drive() {\n');
+ const callSelectors=[];
+ for(let i=0;i<120;i++){
+  const name=i<4?'drive':'target',start=add(`  ${name}();\n`)+2;
+  calls.push({ref:`call-${i}`,nativeId:null,document:doc,revisionId:'r1',ownerRef:'drive',range:span(start,start+name.length+3),calleeRange:span(start,start+name.length),spelling:name,regionRefs:[],witnesses:[witness('spelling',start,start+name.length,name)]});
+  callSelectors.push(anchor('callee',start,start+name.length,'drive'));
+  if(i>=4&&i<23)makeRef(name,start);
+ }
+ const refSelectors=[];
+ for(let i=0;i<20;i++){
+  const start=add('  target;\n')+2;
+  makeRef('target',start);
+  refSelectors.push(anchor('reference',start,start+6,'drive'));
+ }
+ const unsupportedSelectors=[];
+ for(let i=0;i<20;i++){
+  const start=add('  target;\n')+2;
+  unsupportedSelectors.push(anchor('invocation',start,start+7,'drive'));
+ }
+ add(' }\n');
+ simple('drive','method','drive',driveStart,Buffer.byteLength(text)-1,driveStart+6,'host');
+ for(let i=0;i<4;i++){
+  const name=`over${i}`;
+  for(const [j,type] of ['int','String'].entries()){
+   const start=add(` void ${name}(${type} value) {}\n`);
+   simple(`over-${i}-${j}`,'method',name,start,Buffer.byteLength(text)-1,start+6,'host',[[type,'value']]);
+  }
+ }
+ add('}\n');simple('host','type','Host',host,Buffer.byteLength(text)-1,host+6);
+ const other=add('class Other {\n'),otherMethod=add(' void over0(long value) {}\n');
+ simple('other-over0','method','over0',otherMethod,Buffer.byteLength(text)-1,otherMethod+6,'other',[['long','value']]);
+ add('}\n');simple('other','type','Other',other,Buffer.byteLength(text)-1,other+6);
+ const relationshipSelectors=[];
+ for(let i=0;i<20;i++){
+  const name=`Child${i}`,base=`Base${i}`;
+  const start=add(`class ${name} extends ${base} {}\n`);
+  simple(`child-${i}`,'type',name,start,Buffer.byteLength(text)-1,start+6,null,[],[base]);
+  relationshipSelectors.push(anchor('declarationName',start+6,start+6+name.length,`child-${i}`));
+  const baseStart=add(`class ${base} {}\n`);
+  simple(`base-${i}`,'type',base,baseStart,Buffer.byteLength(text)-1,baseStart+6);
+  addFact('typeRelationship',null,null,{source:{kind:'internal',declarationRef:`child-${i}`,revisionId:'r1'},
+   target:{kind:'internal',declarationRef:`base-${i}`,revisionId:'r1'},relationshipKind:'extends'});
+ }
+ const relationFacts=facts.map(x=>x.ref);
+ const targetRef={kind:'internal',declarationRef:'target',revisionId:'r1'},driveRef={kind:'internal',declarationRef:'drive',revisionId:'r1'};
+ const external={kind:'external',symbol:{scheme:'scip',symbol:'pkg external',scope:'global',document:null}};
+ const assertions=[];
+ const refFacts=[];
+ // Nineteen measured callees and twenty measured callable reads plus one definition.
+ for(let i=0;i<39;i++){
+  const selector=i<19?{...callSelectors[i+4],kind:'reference'}:refSelectors[i-19];
+  const roles=i<4?['read','call','import']:i<19?['read','call']:i===19?['read','write']:i===20?['read','type']:['read'];
+  const record={site:'use',roles,resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''};
+  const fact=addFact('reference',selector,record);refFacts.push(fact);
+  if(i>=19)assertions.push({kind:'resolution',factRef:fact,disposition:'resolved'});
+ }
+ for(const [group,resolution] of ['external','ambiguous','unresolved'].entries())for(let i=0;i<20;i++){
+  const selector=callSelectors[24+group*20+i];
+  const fact=addFact('callBinding',selector,{resolution,declaredTarget:resolution==='external'?external:null,
+   candidates:resolution==='ambiguous'?[targetRef,external]:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
+  assertions.push({kind:'resolution',factRef:fact,disposition:resolution==='external'?'provenExternal':resolution});
+ }
+ makeRef('target',targetStart+6,'host');
+ addFact('reference',anchor('reference',targetStart+6,targetStart+12,'host'),
+  {site:'declaration',roles:['definition'],resolution:'resolved',declaredTarget:targetRef,candidates:[],provenanceId:''});
+ const callFacts=[];
+ for(let i=0;i<4;i++){
+  const fact=addFact('callBinding',callSelectors[i],{resolution:'resolved',declaredTarget:driveRef,candidates:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
+  callFacts.push(fact);
+ }
+ const unsupportedFacts=[];
+ for(let i=0;i<20;i++){
+  const fact=addFact('callBinding',unsupportedSelectors[i],{resolution:'unresolved',declaredTarget:null,candidates:[],dispatch:'unknown',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:''});
+  unsupportedFacts.push(fact);assertions.push({kind:'join',factRef:fact,disposition:'unsupported'});
+ }
+ const overloadFacts=[];
+ for(let i=0;i<4;i++){
+  const row=decls.find(d=>d.ref===`over-${i}-1`);
+  overloadFacts.push(addFact('declarationBinding',anchor('declarationName',row.nameRange.start,row.nameRange.end,'host'),
+   {symbols:[{scheme:'scip',symbol:`pkg ${row.name} String`,scope:'global',document:null}],provenanceId:''}));
+ }
+ const overloadAnchors=[];
+ for(let i=0;i<4;i++)overloadAnchors.push([0,1].map(j=>{
+  const row=decls.find(d=>d.ref===`over-${i}-${j}`);return anchor('declarationName',row.nameRange.start,row.nameRange.end,'host');
+ }));
+ const scenario=(category,anchors,factRefs)=>scenarios.push({id:`scenario-${scenarios.length}`,category,anchors,factRefs});
+ for(let i=0;i<4;i++){
+  scenario('sameNameOverload',overloadAnchors[i],[overloadFacts[i]]);
+  scenario('importsAliases',[{...callSelectors[i+4],kind:'reference'}],[refFacts[i]]);
+  scenario('callableValues',Array.from({length:5},(_,j)=>refSelectors[i*5+j]),Array.from({length:5},(_,j)=>refFacts[19+i*5+j]));
+  scenario('recursion',[callSelectors[i]],[callFacts[i]]);
+  scenario('relationshipsDispatch',[relationshipSelectors[i]],[relationFacts[i]]);
+  scenario('unicodeCoordinates',[{...callSelectors[i+8],kind:'reference'}],[refFacts[i+4]]);
+  scenario('coverageFreshness',[{...callSelectors[i+12],kind:'reference'}],[refFacts[i+8]]);
+  scenario('compatibilityControl',[{...callSelectors[i+16],kind:'reference'}],[refFacts[i+12]]);
+ }
+ const negatives=Array.from({length:20},(_,i)=>({scenarioId:scenarios[Math.floor(i/5)*8+2].id,
+  referenceRef:refFacts[i+19],ownerRef:'drive',range:refSelectors[i].range}));
+ await writeJavaCorpus(root,{document:doc,text,decls,calls,refs,facts,scenarios,assertions,negatives});
+}
+
+test('a source-backed Java corpus is discovered and published through the common runner',async t=>{
+ const {root,cleanup}=await copyExample();t.after(cleanup);
+ await authorJavaCorpus(join(root,'java'));
+ assert.deepEqual(await discoverFixtures(root),[join(root,'example'),join(root,'java')]);
+ assert.equal(await runFixtures(parseRunnerArgs(['--fixtures-root',root])),2);
+});
+
+test('a copied minimal example cannot evade corpus floors by changing its profile',async t=>{
  const {root,cleanup}=await copyExample();t.after(cleanup);
  await rename(join(root,'example'),join(root,'javascript'));
  await descriptor(root,'javascript',value=>{value.profile='corpus';});
  assert.deepEqual(await discoverFixtures(root),[join(root,'javascript')]);
- // The minimal example is not a full corpus: it must NOT bypass the corpus floors.
- await assert.rejects(runFixtures(root),value=>{
-  assert.match(value.message,/Fixture .*javascript.*COUNT\./s);
-  return true;
- });
+ await assert.rejects(runFixtures(root),error('COUNT.FLOOR','counts'));
 });
 
 test('discovery rejects unknown directory name with stable assertion and path',async t=>{
