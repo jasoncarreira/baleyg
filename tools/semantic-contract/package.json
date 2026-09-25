@@ -1,1 +1,12 @@
-{"name":"@baleyg/semantic-contract","version":"1.0.0","private":true,"type":"module","engines":{"node":">=24"},"scripts":{"test":"node test/run.mjs"}}
+{
+  "name": "@baleyg/semantic-contract",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node test/run.mjs"
+  }
+}
