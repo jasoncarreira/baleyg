@@ -22,6 +22,7 @@ mod indexer_rust;
 pub mod model;
 pub mod navigation;
 mod rust_sources;
+pub mod semantic_evidence;
 pub mod semantic_identity;
 pub mod store;
 
