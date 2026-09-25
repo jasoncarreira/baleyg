@@ -59,7 +59,7 @@
     const source = Object.prototype.hasOwnProperty.call(selector, "path");
     const allowed = source ? ["expectedRevision", "path", "line"] : ["expectedRevision", "classId", "memberName", "startByte", "endByte"];
     if (Object.keys(selector).some(key => !allowed.includes(key))) return null;
-    if (selector.expectedRevision !== undefined && selector.expectedRevision !== revision) return null;
+    if (selector.expectedRevision !== undefined && !window.BaleygIndexPin.equal(selector.expectedRevision, revision)) return null;
     if (source) {
       if (typeof selector.path !== "string" || !selector.path || selector.path.length > 4096 || !positive(selector.line)) return null;
       return {expectedRevision: revision, path: selector.path, line: selector.line};
@@ -84,9 +84,9 @@
       if (typeof node.scrollTop === "number" && typeof node.scrollLeft === "number") menuScroll.set(node, [node.scrollTop, node.scrollLeft]);
     }
     if (!owner) return;
-    const revision = owner.currentRevision(), session = owner.currentSession();
+    const revision = window.BaleygIndexPin.copy(owner.currentRevision()), session = owner.currentSession();
     const current = () => {
-      try { return owner === api && ticket === serial && revision === owner.currentRevision() &&
+      try { return owner === api && ticket === serial && window.BaleygIndexPin.equal(revision, owner.currentRevision()) &&
         session === owner.currentSession() && (!isCurrent || isCurrent()); }
       catch (_) { return false; }
     };
@@ -119,7 +119,7 @@
     try {
       const data = await owner.request("/api/navigation", {method: "POST", body});
       if (!mayPublish()) return;
-      if (!data || data.revision !== revision) {
+      if (!data || !window.BaleygIndexPin.equal(data.revision, revision)) {
         display([notice("Navigation is stale. Refresh the indexed view and try again."), close]); return;
       }
       if (!Array.isArray(data.targets)) throw new Error("Invalid navigation response.");
@@ -182,7 +182,7 @@
     const previous = attributes.map(name => container.getAttribute(name));
     container.setAttribute("tabindex", "0"); container.setAttribute("aria-haspopup", "menu");
     const owner = api, session = owner?.currentSession();
-    const usable = () => !disposed && api === owner && owner?.currentRevision() === revision &&
+    const usable = () => !disposed && api === owner && window.BaleygIndexPin.equal(owner?.currentRevision(), revision) &&
       owner.currentSession() === session && (!isCurrent || isCurrent());
     function update() {
       const line = lines[active];

@@ -34,9 +34,9 @@ function harness(windowOptions = {}) {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; seed = 'root'; status = {revision:1};`);
+  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   const preserveNewFocus = () => {
-    run(`querySerial++; questionSerial++; status = {revision:status.revision+1};
+    run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
       packet = {packetId:'new'}; focused = {marker:'new'};
       $('focus-state').textContent = 'new valid focus'; $('error').hidden = true;`);
     return run("packet");
@@ -51,7 +51,7 @@ function harness(windowOptions = {}) {
 
 
 const symbol = id => ({id, name:id, path:"src/a.js", range:{startLine:1,endLine:5}});
-const view = id => ({revision:1,seed:symbol(id),participants:[{id,label:id,kind:"method"},{id:"unknown",label:"external?",kind:"boundary"}],steps:[],warnings:[],hiddenSteps:0,truncated:false});
+const view = id => ({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},seed:symbol(id),participants:[{id,label:id,kind:"method"},{id:"unknown",label:"external?",kind:"boundary"}],steps:[],warnings:[],hiddenSteps:0,truncated:false});
 const response = data => ({ok:true,status:200,json:async()=>data});
 function descendants(node) { return [node, ...node.children.flatMap(descendants)]; }
 function text(node) { return descendants(node).map(n=>n.textContent).join(" "); }
@@ -60,8 +60,8 @@ test("file tree expands methods inline, backend flags filter conservatively, pag
   const h = harness(), paths = [];
   h.context.fetch = async (path) => {
     paths.push(path);
-    if (path.startsWith("/api/files")) return response({revision:1,items:[{path:paths.length===1?"src/a.js":"lib/b.js",methodCount:2}],nextOffset:paths.length===1?1:null});
-    return response({revision:1,items:[{symbol:symbol("check"),consequential:true,reason:"validation"},{symbol:symbol("getter"),consequential:false,reason:"trivial"}],truncated:false});
+    if (path.startsWith("/api/files")) return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:paths.length===1?"src/a.js":"lib/b.js",methodCount:2}],nextOffset:paths.length===1?1:null});
+    return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{symbol:symbol("check"),consequential:true,reason:"validation"},{symbol:symbol("getter"),consequential:false,reason:"trivial"}],truncated:false});
   };
   await h.run("loadFiles(true)");
   await h.run("toggleFile(files[0])");
@@ -92,17 +92,17 @@ test("file close and reopen invalidates old method failures", async()=>{
   const h=harness(), old=deferred(); h.run(`files=[{path:'src/a.js',methodCount:1}];`);
   h.context.fetch=()=>old.promise; const pending=h.run("toggleFile(files[0])");
   await h.run("toggleFile(files[0])");
-  h.context.fetch=async()=>response({revision:1,items:[{symbol:symbol("fresh"),consequential:true}],truncated:false});
+  h.context.fetch=async()=>response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{symbol:symbol("fresh"),consequential:true}],truncated:false});
   await h.run("toggleFile(files[0])");
   old.resolve({ok:false,status:409,json:async()=>({error:{message:"obsolete"}})}); await pending;
   assert.match(text(h.get("file-tree")),/fresh/); assert.equal(h.run("files.length"),1);
 });
 
-for(const invalidate of ["clearBrowse()", "status={revision:2}", "$('logout').listeners.click()"])
+for(const invalidate of ["clearBrowse()", "status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}", "$('logout').listeners.click()"])
  test(`obsolete catalog success after ${invalidate} is ignored`,async()=>{
   const h=harness(), old=deferred(); h.context.fetch=()=>old.promise;
   const pending=h.run("loadFiles(true)"); h.run(invalidate);
-  old.resolve(response({revision:1,items:[{path:"old.js",methodCount:1}],nextOffset:null})); await pending;
+  old.resolve(response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:"old.js",methodCount:1}],nextOffset:null})); await pending;
   assert.equal(h.run("files.length"),0);
 });
 
@@ -113,7 +113,7 @@ test("sequence selection sends no query or provider calls; Show all steps is exp
   h.get("all-steps").checked=true; await h.get("all-steps").listeners.change();
   assert.deepEqual(requests.map(r=>r[0]),["/api/sequence","/api/sequence"]);
   assert.equal(requests[0][1].showAll,false); assert.equal(requests[1][1].showAll,true);
-  assert.equal(requests[0][1].expectedRevision,1);
+  assert.deepEqual(requests[0][1].expectedRevision,JSON.parse(JSON.stringify(h.run("status.revision"))));
 });
 
 test("native SVG preserves nested branch loop try, safe labels, unknown lifelines and keyboard source",()=>{
@@ -171,7 +171,7 @@ test("same-revision refresh retains paginated files, open methods, collapsed fol
   const h = harness();
   h.run(`files=[{path:'src/a.js',methodCount:1},{path:'lib/b.js',methodCount:1}]; nextFileOffset=400;
     closedDirectories.add('lib/'); fileStates.set('src/a.js',{open:true,items:[]}); selectedMethod={id:'selected'};`);
-  h.context.fetch = async () => response({revision:1,items:[{path:'src/a.js',methodCount:1}],nextOffset:200});
+  h.context.fetch = async () => response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:'src/a.js',methodCount:1}],nextOffset:200});
   await h.run("loadFiles(true)");
   assert.equal(h.run("files.length"), 2); assert.equal(h.run("nextFileOffset"), 400);
   assert.equal(h.run("fileStates.get('src/a.js').open"), true);
@@ -180,9 +180,9 @@ test("same-revision refresh retains paginated files, open methods, collapsed fol
 for (const fail of [false,true]) test(`obsolete catalog ${fail ? 'failure' : 'success'} cannot overwrite newer refresh`, async () => {
   const h = harness(), old = deferred(); h.context.fetch = () => old.promise;
   const pending = h.run("loadFiles(true)");
-  h.context.fetch = async () => response({revision:1,items:[{path:'new.js',methodCount:0}],nextOffset:null});
+  h.context.fetch = async () => response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:'new.js',methodCount:0}],nextOffset:null});
   await h.run("loadFiles(true)");
-  if (fail) old.reject(new Error('obsolete')); else old.resolve(response({revision:1,items:[{path:'old.js',methodCount:0}],nextOffset:200}));
+  if (fail) old.reject(new Error('obsolete')); else old.resolve(response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:'old.js',methodCount:0}],nextOffset:200}));
   await pending;
   assert.equal(h.run("files.length"), 1); assert.equal(h.run("files[0].path"), "new.js");
   assert.match(h.get("files-state").textContent, /loaded files/);
@@ -195,7 +195,7 @@ test("empty paths explain indexing and unmatched filter explains loaded-only sco
 test("catalog errors have an explicit retry and successful retry clears it", async () => {
   const h = harness(); h.context.fetch = async () => { throw new Error('offline'); };
   await h.run("loadFiles(true)"); assert.equal(h.get("retry-files").hidden, false);
-  h.context.fetch = async () => response({revision:1,items:[],nextOffset:null});
+  h.context.fetch = async () => response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[],nextOffset:null});
   await h.run("loadFiles(retryCatalogReset)"); assert.equal(h.get("retry-files").hidden, true);
 });
 test("reveal selected method clears filter and reopens its folder and file", () => {
@@ -207,7 +207,7 @@ test("reveal selected method clears filter and reopens its folder and file", () 
   assert.ok(descendants(h.get('file-tree')).some(n => n.attrs?.['aria-pressed'] === 'true'));
 });
 
-const treePage = (path, items, nextOffset = null) => ({root:'/cwd',indexedWorkspace:'/cwd/sample',path,revision:1,items,nextOffset,truncated:false});
+const treePage = (path, items, nextOffset = null) => ({root:'/cwd',indexedWorkspace:'/cwd/sample',path,revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items,nextOffset,truncated:false});
 const folder = path => ({path,name:path.split('/').at(-1),kind:'directory',indexedPath:null,methodCount:null});
 const treeFile = (path, indexedPath = null) => ({path,name:path.split('/').at(-1),kind:'file',indexedPath,methodCount:indexedPath ? 1 : null});
 test("cwd root renders files without a filter and expands folders lazily", async () => {
@@ -390,7 +390,7 @@ test("nonindexed files and symlinks expose metadata without clickable source or 
 });
 test("indexed tree file uses indexedPath rather than cwd path for inline methods", async () => {
   const h=harness(), requests=[];
-  h.context.fetch=async path=>{requests.push(path); return response(path.startsWith('/api/tree') ? treePage('',[treeFile('sample/a.js','a.js')]) : {revision:1,items:[{symbol:symbol('method'),consequential:true}],truncated:false});};
+  h.context.fetch=async path=>{requests.push(path); return response(path.startsWith('/api/tree') ? treePage('',[treeFile('sample/a.js','a.js')]) : {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{symbol:symbol('method'),consequential:true}],truncated:false});};
   await h.run('loadTreeRoot()');
   const pick=descendants(h.get('file-tree')).find(n=>n.tagName==='button');
   pick.listeners.click(); await new Promise(resolve=>setImmediate(resolve));
@@ -429,7 +429,7 @@ test("filter reveals loaded descendants without changing collapsed folder prefer
   h.get('file-filter').value=''; h.run('renderFiles()'); assert.doesNotMatch(text(h.get('file-tree')),/a.js/);
   assert.equal(h.run("directories.get('src').open"),false);
 });
-for(const invalidation of ["clearBrowse()", "status={revision:2}", "$('logout').listeners.click()"])
+for(const invalidation of ["clearBrowse()", "status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}", "$('logout').listeners.click()"])
  test(`cwd tree ignores pending response after ${invalidation}`,async()=>{
   const h=harness(), old=deferred();h.context.fetch=()=>old.promise;
   const pending=h.run('loadTreeRoot()'); h.run(invalidation);
@@ -499,13 +499,13 @@ test("index scope mismatch stays in primary roots and action label, same root ad
 
 test("workspace change invalidates selections and source even when revision stays equal", async () => {
   const h = harness(), requests = [];
-  h.run(`status = {revision:1, workspaceRoot:'/old'}; seed='old';
-    result={revision:1,calls:[],nodes:[]}; packet={packetId:'old'}; focused={};
+  h.run(`status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, workspaceRoot:'/old'}; seed='old';
+    result={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},calls:[],nodes:[]}; packet={packetId:'old'}; focused={};
     selectedMethod={id:'old'}; sourceCache.set('old','cached');
     $('source').append(element('span','old source'));`);
   h.context.fetch = async path => {
     requests.push(path);
-    return response(path === '/api/status' ? {revision:1,workspaceRoot:'/new'}
+    return response(path === '/api/status' ? {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:'/new'}
       : {...treePage('',[treeFile('new.rs')]),root:'/new',indexedWorkspace:'/new'});
   };
   await h.run('refreshStatus()');
@@ -535,7 +535,7 @@ test("obsolete class context actions cannot cross revision or session changes", 
   h.context.window.BaleygClasses = {showContextMenu: (e,a)=>menus.push(a),open:opts=>opened.push(opts)};
   h.run(`attachClassMenu($('class-file'), {path:'Thing.py'});`);
   h.get("class-file").listeners.contextmenu({preventDefault(){}});
-  h.run("status={revision:2}"); await menus[0][0].run();
+  h.run("status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}"); await menus[0][0].run();
   assert.equal(opened.length,0);
   h.get("class-file").listeners.contextmenu({preventDefault(){throw new Error('obsolete menu');}});
   assert.equal(menus.length,1);
@@ -545,13 +545,13 @@ test("class controller uses authenticated API and clears pending source on navig
   const h = harness(); let hooks;
   h.context.window.BaleygClasses={init:value=>{hooks=value;}}; h.run("initClassView()");
   const requests=[];
-  h.context.fetch=async(p,o)=>{requests.push([p,o]);return response({revision:1});};
+  h.context.fetch=async(p,o)=>{requests.push([p,o]);return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}});};
   await hooks.request('/api/class-diagram',{method:'POST',body:{seed:'class',expectedRevision:1}});
   assert.equal(requests.length,1);assert.equal(requests[0][0],'/api/class-diagram');
   assert.equal(requests[0][1].headers.Authorization,'Bearer synthetic');
   assert.deepEqual(JSON.parse(requests[0][1].body),{seed:'class',expectedRevision:1});
   const before=h.run('sourceSerial');hooks.onChange();assert.ok(h.run('sourceSerial')>before);
-  h.run("status={revision:2,workspaceRoot:'/different'}");assert.equal(hooks.currentRevision(),2);
+  h.run("status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2},workspaceRoot:'/different'}");assert.equal(hooks.currentRevision().indexRevision,2);
   assert.match(hooks.currentSession(),/different/);
 });
 
@@ -568,8 +568,8 @@ test("source navigation attaches without lookup and follows source serial and do
   h.context.window.BaleygNavigation={reset(){resets++;},attachSource(node,options){attached.push({node,options});}};
   h.context.window.BaleygShell={showSource(){h.get('source-dock').hidden=false;h.get('workspace-source-panel').hidden=false;}};
   h.get('source').scrollIntoView=()=>{};
-  const requests=[];h.context.fetch=async p=>{requests.push(p);return response({revision:1,file:{path:'sample.py',text:'def run():\n    work()\n'}});};
-  await h.run("showSource({path:'sample.py',range:{startLine:2,endLine:2}},1)");
+  const requests=[];h.context.fetch=async p=>{requests.push(p);return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:'sample.py',text:'def run():\n    work()\n'}});};
+  await h.run("showSource({path:'sample.py',range:{startLine:2,endLine:2}},status.revision)");
   assert.equal(requests.length,1);assert.ok(requests[0].startsWith('/api/source?'));
   assert.equal(attached.length,1);assert.equal(attached[0].options.path,'sample.py');assert.equal(attached[0].options.startLine,2);
   assert.ok(attached[0].options.isCurrent());
@@ -603,11 +603,29 @@ test("navigation source action forwards measured range and snapshot without sele
   let hooks;const h=harness({BaleygNavigation:{init(options){hooks=options;},reset(){},attachSource(){}}});
   const requests=[];h.get('source').scrollIntoView=()=>{};
   h.context.window.BaleygShell={showSource(){h.get('source-dock').hidden=false;h.get('workspace-source-panel').hidden=false;}};
-  h.context.fetch=async p=>{requests.push(p);return response({revision:1,file:{path:'A.java',text:'class A {\n void target() {}\n}\n'}});};
+  h.context.fetch=async p=>{requests.push(p);return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:'A.java',text:'class A {\n void target() {}\n}\n'}});};
   h.run("selectedMethod={id:'caller'}");
   const target={id:'target',path:'A.java',range:{startLine:2,endLine:2}};
-  assert.equal(requests.length,0);await hooks.openSource(target,1);
-  assert.equal(requests.length,1);assert.match(requests[0],/^\/api\/source\?path=A.java&revision=1$/);
+  assert.equal(requests.length,0);await hooks.openSource(target,h.run("({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1})"));
+  assert.equal(requests.length,1);assert.match(requests[0],/^\/api\/source\?path=A.java&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=1$/);
   assert.equal(h.run('selectedMethod.id'),'caller');assert.ok(h.get('source').children[0].children[1].classList.contains('highlight'));
-  h.run('status={revision:2}');await hooks.openSource(target,1);assert.equal(requests.length,1);assert.match(h.get('error').textContent,/older revision/);
+  h.run(`status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}`);await hooks.openSource(target,h.run("({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1})"));assert.equal(requests.length,1);assert.match(h.get('error').textContent,/older revision/);
+});
+
+test("same numeric revision with new generation clears browse and source state", async () => {
+  const h = harness(), old = deferred();
+  h.run(`status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:'/same'};
+    seed='old'; result={revision:status.revision,calls:[],nodes:[]}; sourceCache.set(IndexPin.key(status.revision)+':old.js',{file:{text:'old'}});`);
+  h.context.fetch = async url => url === '/api/status' ? response({revision:{indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1},workspaceRoot:'/same',stats:{}}) : response({...treePage('',[]),revision:{indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1}});
+  await h.run('refreshStatus()');
+  assert.equal(h.run('seed'),null); assert.equal(h.run('result'),null);
+  assert.equal(h.run('sourceCache.size'),0);
+  assert.equal(h.run('status.revision.indexGeneration'),'87654321-4321-4321-8321-abcdef123456');
+});
+test("late catalog with reused numeric revision cannot paint the new generation", async () => {
+  const h=harness(), old=deferred();h.context.fetch=()=>old.promise;
+  const pending=h.run('loadFiles(true)');
+  h.run(`status={revision:{indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1}}`);
+  old.resolve(response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:'old.js',methodCount:1}],nextOffset:null}));
+  await pending;assert.equal(h.run('files.length'),0);
 });

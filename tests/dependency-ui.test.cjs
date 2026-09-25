@@ -34,9 +34,9 @@ function harness() {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; seed = 'root'; status = {revision:1};`);
+  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   const preserveNewFocus = () => {
-    run(`querySerial++; questionSerial++; status = {revision:status.revision+1};
+    run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
       packet = {packetId:'new'}; focused = {marker:'new'};
       $('focus-state').textContent = 'new valid focus'; $('error').hidden = true;`);
     return run("packet");
@@ -57,8 +57,8 @@ function text(node) { return descendants(node).map(n=>n.textContent).join(" "); 
 
 const pkg = {id:"cargo:thing@1", ecosystem:"cargo", name:"thing", version:"1.2.3", source:"registry", aliases:["thing_alias"], sourceState:"present", indexState:"partial", warnings:["cfg unknown <script>"]};
 const symbol = {id:"decl",packageId:pkg.id,name:"Client",qualifiedName:"thing::Client",kind:"struct",signature:"pub struct Client",sourceRef:"immutable-ref",path:"src/lib.rs",range:{startLine:1,endLine:1}};
-const catalog = (id="catalog-1") => ({state:"ready",workspaceRevision:1,catalogId:id,packages:[pkg],symbolCount:201,warnings:["Syntax candidates only <b>not semantic</b>"]});
-const symbols = (items=[symbol], nextOffset=null, id="catalog-1") => ({catalogId:id,workspaceRevision:1,items,nextOffset});
+const catalog = (id="catalog-1") => ({state:"ready",workspaceRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},catalogId:id,packages:[pkg],symbolCount:201,warnings:["Syntax candidates only <b>not semantic</b>"]});
+const symbols = (items=[symbol], nextOffset=null, id="catalog-1") => ({catalogId:id,workspaceRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items,nextOffset});
 const snapshot = () => ({id:symbol.sourceRef,rootId:pkg.id,rootLabel:"thing 1.2.3",path:symbol.path,hash:"hash123",file:{text:"pub struct Client;\n<script>unsafe</script>\n"+"line\n".repeat(1298)},definitions:[symbol],warnings:["Candidate only"]});
 const click = (container,label) => {
  const item=descendants(container).find(n=>n.tagName==="button" && n.textContent===label);
@@ -69,13 +69,13 @@ async function select(h) {await ready(h);h.context.fetch=async()=>response(symbo
 
 test("automatic workspace status refresh requests only catalog metadata; optional failures do not block",async()=>{
  const h=harness(), requests=[];
- h.context.fetch=async url=>{requests.push(url);if(url==="/api/status")return response({revision:1,stats:{}});if(url==="/api/dependencies")return response(catalog());throw Error(url);};
+ h.context.fetch=async url=>{requests.push(url);if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});if(url==="/api/dependencies")return response(catalog());throw Error(url);};
  await h.run("refreshStatus()"); await new Promise(setImmediate);
  assert.deepEqual(requests,["/api/status","/api/dependencies"]);
  assert.match(text(h.get("dependency-packages")),/thing 1.2.3.*source: present.*index: partial.*thing_alias/s);
  assert.match(text(h.get("dependency-warnings")),/<b>not semantic<\/b>/);
  assert.equal(descendants(h.get("dependency-warnings")).some(n=>n.tagName==="b"),false);
- h.context.fetch=async url=>{if(url==="/api/status")return response({revision:1,stats:{}});throw Error("old daemon");};
+ h.context.fetch=async url=>{if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});throw Error("old daemon");};
  await h.run("refreshStatus()"); await new Promise(setImmediate);
  assert.match(h.get("dependency-state").textContent,/unavailable/); assert.equal(h.get("error").hidden,true);
 });
@@ -133,7 +133,7 @@ for(const failure of ["success","http","network","json"]) test(`obsolete ${failu
  else old.resolve(response(snapshot()));
  await pending;assert.match(h.get("external-source-path").textContent,/newhash/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("seed"),"root");
 });
-for(const change of ["clearDependencyCatalog()","status={revision:2}","status={revision:1,workspaceRoot:'new'}","$('logout').listeners.click()"])
+for(const change of ["clearDependencyCatalog()","status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}","status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:'new'}","$('logout').listeners.click()"])
  test(`late catalog and source ignored after ${change}`,async()=>{
  const h=harness();await select(h);const old=deferred();h.context.fetch=()=>old.promise;
  const pending=h.run(`loadDependencySource(${JSON.stringify(symbol)})`);h.run(change);old.resolve(response(snapshot()));await pending;
@@ -178,7 +178,7 @@ test("UI keeps catalog visible and manual roots collapsed; flags do not claim se
 });
 
 test("connect and completed workspace index automatically refresh metadata, never source",async()=>{
- const h=harness(),requests=[]; let revision=1;
+ const h=harness(),requests=[]; let revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
  h.context.fetch=async(url,opts)=>{requests.push([url,opts.method]);
  if(url==="/api/status")return response({revision,stats:{}});
  if(url==="/api/dependencies")return response({...catalog(),workspaceRevision:revision});
@@ -186,12 +186,12 @@ test("connect and completed workspace index automatically refresh metadata, neve
  if(url==="/api/views"||url==="/api/annotations")return response([]);
  if(url==="/api/jev/status"||url==="/api/acp/status")return response({enabled:false});
  if(url==="/api/index")return response({id:"job",state:"running"});
- if(url==="/api/jobs/job"){revision=2;return response({id:"job",state:"completed"});}
+ if(url==="/api/jobs/job"){revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2};return response({id:"job",state:"completed"});}
  throw Error(url);};
  h.get("token").value="synthetic";h.get("connect-form").listeners.submit({preventDefault(){}});await new Promise(setImmediate);
  assert.equal(h.get("workspace").hidden,false);assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,1);
  await h.get("index").listeners.click();const poll=[...h.timers.values()].find(t=>t.delay===700);assert.ok(poll);await poll.callback();await new Promise(setImmediate);
- assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,2);assert.equal(h.run("dependencyCatalog.workspaceRevision"),2);
+ assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,2);assert.equal(h.run("dependencyCatalog.workspaceRevision.indexRevision"),2);
  assert.ok(requests.every(([url])=>!url.includes("/source?")&&!url.startsWith("/api/questions")));
 });
 test("old package results cannot replace a new filter page",async()=>{
@@ -207,4 +207,13 @@ test("catalog readiness tells an existing method selection to refresh without re
  assert.match(h.get("dependency-state").textContent,/Reselect the workspace method.*syntax-candidate lanes/);
  assert.equal(h.get("sequence-diagram").textContent,"keep diagram");assert.equal(h.run("selectedMethod.id"),"keep");
  assert.deepEqual(requests,["/api/dependencies","/api/dependencies"]);
+});
+
+test("dependency catalog with reused revision and old generation is rejected",async()=>{
+  const h=harness();
+  h.run(`status={revision:{indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1},workspaceRoot:'/workspace'}`);
+  h.context.fetch=async url=>{if(url==='/api/dependencies')return response(catalog());throw Error(url);};
+  await h.run('refreshDependencies()');
+  assert.equal(h.run('dependencyCatalog'),null);
+  assert.match(h.get('dependency-state').textContent,/another workspace revision/);
 });

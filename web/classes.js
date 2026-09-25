@@ -115,8 +115,8 @@
     if (text !== undefined) node.textContent = text;
     return node;
   };
-  const context = () => ({session: api.currentSession(), revision: api.currentRevision()});
-  const valid = c => !!api && c.session === api.currentSession() && c.revision === api.currentRevision();
+  const context = () => ({session: api.currentSession(), revision: window.BaleygIndexPin.copy(api.currentRevision())});
+  const valid = c => !!api && c.session === api.currentSession() && window.BaleygIndexPin.equal(c.revision, api.currentRevision());
   const state = (text, kind = "ready") => { ui.state.textContent = text; ui.state.dataset.state = kind; };
   function renderWarnings(warnings = []) {
     if (!warningBox) {
@@ -289,11 +289,11 @@
     ui.diagram.setAttribute("aria-busy", "false");
     state("Looking for indexed classes…", "loading");
     try {
-      const params = new URLSearchParams({q, offset: String(offset), limit: "100", revision: String(c.revision)});
+      const params = new URLSearchParams({q, offset: String(offset), limit: "100", indexGeneration: c.revision.indexGeneration, indexRevision: String(c.revision.indexRevision)});
       if (path) params.set("path", path);
       const data = await api.request(`/api/classes?${params}`);
       if (ticket !== searchSerial || !valid(c)) return;
-      if (data.revision !== c.revision) { state("Workspace revision changed. Search again.", "stale"); return; }
+      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) { state("Workspace revision changed. Search again.", "stale"); return; }
       const items = data.items || [];
       for (const definition of items) {
         const button = el("button", undefined, "classes-result"); button.type = "button";
@@ -333,7 +333,7 @@
     try {
       const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: true, includeUnmatched: !!ui.unmatched.checked}});
       if (ticket !== serial || !valid(c)) return;
-      if (data.revision !== c.revision) { state("Workspace revision changed. Open the class again.", "stale"); return; }
+      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) { state("Workspace revision changed. Open the class again.", "stale"); return; }
       if (fresh) { positions = new Map(); cards = new Map(); stage = null; showAll = false; membersOpen.clear(); ui.diagram.replaceChildren(); }
       ui.results.hidden = true; changeButton.setAttribute("aria-expanded", "false");
       seed = data.seed; expanded = expansion; diagram = data; snapshot = c; diagramGeneration++; displayTicket = ticket;

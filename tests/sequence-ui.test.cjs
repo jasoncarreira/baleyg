@@ -18,7 +18,7 @@ function render(participants) {
   });
   const container = new Element("div");
   const steps = participants.filter(p=>p.id !== "seed").map(p=>({id:`call-${p.id}`,kind:"call",label:"sample",target:p.id,path:"main.rs",range:{startLine:1,endLine:1}}));
-  window.BaleygSequence.render(container, {seed: {id:"seed",name:"sample"},participants,steps}, () => {});
+  window.BaleygSequence.render(container, {revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},seed: {id:"seed",name:"sample"},participants,steps}, () => {});
   function all(node) { return [node, ...node.children.flatMap(all)]; }
   return all(container);
 }
@@ -488,4 +488,9 @@ test("proven name bindings and deferred definitions stay explicit without invent
   assert.equal(rowLabel(d.row(binding.id)),`effect · ${binding.label}`);
   assert.equal(rowLabel(d.row(definition.id)),`definition · ${definition.label}`);
   assert.equal(JSON.stringify(view),before);
+});
+
+test("sequence SVG describes both snapshot identity fields without making a request", () => {
+  const nodes = render([{id:"seed",label:"sample",kind:"method"}]);
+  assert.ok(nodes.some(node => node.tag === "title" && /revision 12345678:1/.test(node.textContent)));
 });

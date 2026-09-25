@@ -22,14 +22,14 @@ function harness(withApp = false) {
   const run = code => vm.runInContext(code,context);
   if(withApp)run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
-  if(withApp){run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";status={revision:1,workspaceRoot:"/repo"};`);}
+  if(withApp){run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   return {get,document,context,run,requests,shell:context.window.BaleygShell};
 }
 const all = node => [node,...node.children.flatMap(all)];
 const text = node => all(node).map(n=>n.textContent).join(" ");
 const range={startLine:3,startColumn:2,endLine:9,endColumn:7};
 const call=(id="entry",target="candidate")=>({id,callId:id,kind:"call",label:`Call full::${id} <script>`,path:"main.rs",range,target,resolution:"unresolved",children:[],alternate:[]});
-const view=(steps=[])=>({revision:1,seed:{id:"root",name:"root",path:"main.rs",range},participants:[{id:"root",kind:"method",label:"root"},{id:"candidate",kind:"externalCandidate",label:"Builder",identification:"Lexical type candidate, not resolved dispatch"},{id:"other",kind:"unresolvedReceiver",label:"Chain result"}],steps,warnings:[],hiddenSteps:0});
+const view=(steps=[])=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},seed:{id:"root",name:"root",path:"main.rs",range},participants:[{id:"root",kind:"method",label:"root"},{id:"candidate",kind:"externalCandidate",label:"Builder",identification:"Lexical type candidate, not resolved dispatch"},{id:"other",kind:"unresolvedReceiver",label:"Chain result"}],steps,warnings:[],hiddenSteps:0});
 const response=data=>({ok:true,status:200,json:async()=>data});
 const key=(element,value)=>{let prevented=false;element.listeners.keydown({key:value,preventDefault(){prevented=true;}});return prevented;};
 
@@ -61,7 +61,7 @@ test("inspector uses safe original evidence, never claims candidate confidence",
   h.shell.selectStep(step,view([step]),()=>opened++);
   assert.equal(opened,0);assert.equal(h.get("inspector-title").textContent,step.label);assert.equal(h.get("inspector-clear").disabled,false);
   assert.match(h.get("inspector-target").textContent,/candidate, not resolved dispatch/);
-  assert.match(h.get("inspector-location").textContent,/main.rs:3:2–9:7 · revision 1/);
+  assert.match(h.get("inspector-location").textContent,/main.rs:3:2–9:7 · revision 12345678:1/);
   assert.match(h.get("inspector-evidence").textContent,/unresolved/);
   assert.doesNotMatch(text(h.get("inspector-content"))+text(h.get("inspector-detail")),/confidence.*1\.0/);
   assert.equal(all(h.get("inspector-detail")).some(n=>n.tagName==="script"),false);
@@ -81,8 +81,9 @@ test("group keeps first-entry target limitation, full source callback and all gu
   assert.doesNotMatch(h.get("inspector-target").textContent,/First measured entry/);
 });
 test("inspector reset and disconnect erase source callback and workspace metadata",()=>{
-  const h=harness();let opened=0;h.shell.updateWorkspace({workspaceRoot:"/a/repo",revision:7,stats:{files:10}});
+  const h=harness();let opened=0;h.shell.updateWorkspace({workspaceRoot:"/a/repo",revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:7},stats:{files:10}});
   assert.equal(h.get("workspace-name").textContent,"repo");
+  assert.match(h.get("workspace-meta").textContent,/Revision 12345678:7/);
   h.shell.selectStep(call(),view(),()=>opened++);h.shell.resetInspector();h.get("inspector-open-source").listeners.click();
   assert.equal(opened,0);assert.equal(h.get("inspector-open-source").disabled,true);assert.equal(h.get("inspector-clear").disabled,true);assert.equal(h.get("inspector-content").hidden,true);
   h.shell.selectStep(call(),view(),()=>opened++);h.shell.showSource("workspace");h.shell.setConnected(false);h.get("inspector-open-source").listeners.click();
@@ -96,7 +97,7 @@ test("responsive drawers use classes rather than hiding desktop panels",()=>{
 });
 async function selectedHarness() {
   const h=harness(true),step=call(),data=view([step]);
-  h.context.fetch=async path=>{h.requests.push(path);if(path==="/api/sequence")return response(data);if(path.startsWith("/api/source?"))return response({revision:1,file:{path:"main.rs",text:"line1\nline2\nline3"}});throw new Error("Unexpected "+path);};
+  h.context.fetch=async path=>{h.requests.push(path);if(path==="/api/sequence")return response(data);if(path.startsWith("/api/source?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:"main.rs",text:"line1\nline2\nline3"}});throw new Error("Unexpected "+path);};
   await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
   const pick=all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source"));assert.ok(pick);
   pick.listeners.click();
@@ -131,7 +132,7 @@ test("in-flight call source cannot reopen the dock after a new method clears it"
   h.context.fetch=()=>new Promise(done=>{resolve=done;});
   const pending=h.get("inspector-open-source").listeners.click();
   h.run("clearBrowse();clearSource();");
-  resolve(response({revision:1,file:{path:"main.rs",text:"obsolete"}}));await pending;
+  resolve(response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:"main.rs",text:"obsolete"}}));await pending;
   assert.equal(h.get("source-dock").hidden,true);assert.doesNotMatch(text(h.get("source")),/obsolete/);
 });
 test("successful candidate source opens the library dock without changing method or active view",async()=>{

@@ -93,7 +93,7 @@
     if (get("inspector-clear")) get("inspector-clear").disabled = false;
     text("inspector-title", step.label || step.id || "Selected step");
     text("inspector-kind", step.kind || "Step");
-    text("inspector-location", `${location(step)} · revision ${view.revision}`);
+    text("inspector-location", `${location(step)} · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}`);
     const children = step.children || [];
     const flat = step.kind === "group" && !step.alternate?.length && children.length && children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length);
     const entry = flat ? children[0] : step;
@@ -125,7 +125,7 @@
   function updateWorkspace(status) {
     const root = status?.workspaceRoot || "";
     text("workspace-name", root.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
-    text("workspace-meta", status ? `Revision ${status.revision} · ${status.stats?.files ?? 0} files · ${status.stats?.semanticState === "unavailable" ? "Syntax only" : status.stats?.semanticState || "syntax evidence"}` : "Connect to a local daemon");
+    text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${status.stats?.semanticState === "unavailable" ? "Syntax only" : status.stats?.semanticState || "syntax evidence"}` : "Connect to a local daemon");
     if (get("workspace-name")) get("workspace-name").title = root;
   }
   function reset() {

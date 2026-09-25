@@ -34,9 +34,9 @@ function harness() {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; seed = 'root'; status = {revision:1};`);
+  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   const preserveNewFocus = () => {
-    run(`querySerial++; questionSerial++; status = {revision:status.revision+1};
+    run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
       packet = {packetId:'new'}; focused = {marker:'new'};
       $('focus-state').textContent = 'new valid focus'; $('error').hidden = true;`);
     return run("packet");

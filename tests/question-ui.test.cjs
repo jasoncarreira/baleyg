@@ -34,9 +34,9 @@ function harness() {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; seed = 'root'; status = {revision:1};`);
+  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   const preserveNewFocus = () => {
-    run(`querySerial++; questionSerial++; status = {revision:status.revision+1};
+    run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
       packet = {packetId:'new'}; focused = {marker:'new'};
       $('focus-state').textContent = 'new valid focus'; $('error').hidden = true;`);
     return run("packet");
@@ -132,7 +132,7 @@ for (const size of [176000, 176001]) {
     const payload = {code: "é".repeat(87994) + "x".repeat(size - 175999)};
     const compact = JSON.stringify(payload);
     assert.equal(new TextEncoder().encode(compact).byteLength, size);
-    h.run("packet = {packetId:'synthetic', revision:1, request:{seed:'root'}};");
+    h.run("packet = {packetId:'synthetic', revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, request:{seed:'root'}};");
     h.context.fetch = async () => ({status: 200, ok: true, json: async () => payload});
     await h.get("export-jev").listeners.click();
     if (size === 176000) {
@@ -162,7 +162,7 @@ for (const code of [200, 409, 429, 502]) {
   });
 }
 function readyJev(h) {
-  h.run(`packet = {packetId:'synthetic', revision:1, request:{seed:'root'}};
+  h.run(`packet = {packetId:'synthetic', revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, request:{seed:'root'}};
     jevStatus = {enabled:true,budget:{remainingCents:500}}; syncFocusControls();`);
 }
 test('Run Jev requires per-click confirmation and sends no source override', async () => {
@@ -181,7 +181,7 @@ test('Run Jev requires per-click confirmation and sends no source override', asy
     if (url === '/api/jev/status') return {status:200,ok:true,json:async()=>({enabled:true,budget:{capCents:500,reservedCents:10,remainingCents:490,attempts:1}})};
     assert.equal(options.method, 'POST');
     assert.equal(options.body, '{}');
-    return {status:200,ok:true,json:async()=>({view:{revision:1,nodes:[],calls:[],selectionSource:'liveJev'},latencyMs:20})};
+    return {status:200,ok:true,json:async()=>({view:{revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},nodes:[],calls:[],selectionSource:'liveJev'},latencyMs:20})};
   };
   await h.get('run-jev').listeners.click();
   assert.deepEqual(calls, ['/api/questions/synthetic/jev-run','/api/jev/status']);
@@ -208,11 +208,11 @@ test('typing and preparing settings never trigger live inference', () => {
 });
 
 function readyAcp(h) {
-  h.run(`packet = {packetId:'synthetic', revision:1, request:{seed:'root'}};
+  h.run(`packet = {packetId:'synthetic', revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, request:{seed:'root'}};
     acpStatus = {enabled:true,status:{remainingAttempts:2,maxAttempts:3,attempts:1,model:'sonnet',maxEstimatedUsdPerAttempt:1}}; syncFocusControls();`);
 }
 function acpAnswer() {
-  return {packetId:'synthetic',revision:1,source:'liveAcp',attemptId:'attempt-1',latencyMs:12,estimatedUsd:null,
+  return {packetId:'synthetic',revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},source:'liveAcp',attemptId:'attempt-1',latencyMs:12,estimatedUsd:null,
     answer:{packetId:'synthetic',summary:[{text:'<img src=x onerror=alert(1)>',citations:[{path:'src/<script>.rs',startLine:2,endLine:3,quote:'<b>source</b>\nnext'}]}],branches:[{text:'A branch',citations:[]}],limitations:['<svg onload=alert(1)>']}};
 }
 function acpFetch(calls, answer = acpAnswer()) {
@@ -224,7 +224,7 @@ function acpFetch(calls, answer = acpAnswer()) {
 }
 test('ACP needs known status, separate allowance, and explicit full-source confirmation', async () => {
   const h = harness(), calls = [];
-  h.run("packet = {packetId:'synthetic',revision:1,request:{seed:'root'}}; syncFocusControls();");
+  h.run("packet = {packetId:'synthetic',revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},request:{seed:'root'}}; syncFocusControls();");
   assert.equal(h.get('explain-acp').disabled,true);
   readyAcp(h);
   h.context.fetch = acpFetch(calls);
@@ -267,8 +267,8 @@ test('answer claims, citations and caveats stay text; citation opens indexed sou
   assert.equal(link.title,'<b>source</b>\nnext');
   assert.equal(content.children.at(-1).children[0].textContent,'<svg onload=alert(1)>');
   h.context.fetch = async url => {
-    assert.equal(url,'/api/source?path=src%2F%3Cscript%3E.rs&revision=1');
-    return {ok:true,status:200,json:async()=>({revision:1,file:{path:'src/<script>.rs',text:'first\n<b>source</b>\nnext\nlast'}})};
+    assert.equal(url,'/api/source?path=src%2F%3Cscript%3E.rs&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=1');
+    return {ok:true,status:200,json:async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:'src/<script>.rs',text:'first\n<b>source</b>\nnext\nlast'}})};
   };
   await link.listeners.click();
   const lines = h.get('source').children[0].children;
@@ -304,7 +304,7 @@ for (const change of ['question','packet','revision','session']) {
     if (change==='question') h.get('question-form').listeners.input();
     if (change==='packet') h.run('invalidateFocus()');
     if (change==='revision') {
-      h.context.fetch = async()=>({ok:true,status:200,json:async()=>({revision:2,stats:{}})});
+      h.context.fetch = async()=>({ok:true,status:200,json:async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2},stats:{}})});
       await h.run('refreshStatus()');
     }
     if (change==='session') h.get('logout').listeners.click();
@@ -378,4 +378,17 @@ test('ACP answer status preserves actionable authentication error without retry'
   assert.equal(h.get('answer').hidden,true);
   assert.equal(h.get('answer-state').textContent,message);
   assert.equal(h.get('error').textContent,message);
+});
+
+test("source cache never reuses a same-revision snapshot from another generation",async()=>{
+  const h=harness(),requests=[];
+  h.get('source').scrollIntoView=()=>{};
+  h.context.fetch=async url=>{requests.push(url);return {ok:true,status:200,json:async()=>({revision:h.run('status.revision'),file:{path:'src/a.rs',text:'source'}})};};
+  const item={path:'src/a.rs',range:{startLine:1,endLine:1}};
+  await h.run(`showSource(${JSON.stringify(item)},status.revision)`);
+  h.run(`status={revision:{indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1}}`);
+  await h.run(`showSource(${JSON.stringify(item)},status.revision)`);
+  assert.equal(requests.length,2);
+  assert.match(requests[0],/indexGeneration=12345678-1234-4123-8123-123456789abc/);
+  assert.match(requests[1],/indexGeneration=87654321-4321-4321-8321-abcdef123456/);
 });
