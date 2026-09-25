@@ -210,7 +210,7 @@ fn short_marker_disappearing_or_replaced_at_barrier_is_not_regenerated() {
         fs::write(&marker, b"partial").unwrap();
         let mut saw_short = false;
         let error = WorkspaceIdentity::discover_with_marker_hook(Some(&work), &work, |stage| {
-            if stage == MarkerStage::ShortRead {
+            if stage == MarkerStage::ShortRechecked {
                 saw_short = true;
                 fs::remove_file(&marker)?;
                 if let Some(bytes) = replacement {

@@ -542,6 +542,7 @@ fn parse_git_pointer(path: &Path) -> Result<PathBuf> {
 pub enum MarkerStage {
     CreatedBeforeWrite,
     ShortRead,
+    ShortRechecked,
     MarkerSync,
     PrivateDirSync,
     GitDirSync,
@@ -582,6 +583,7 @@ fn read_marker_during_creation(
     hook: &mut impl FnMut(MarkerStage) -> Result<()>,
 ) -> Result<(Uuid, File)> {
     let mut current = first;
+    let mut original_short: Option<File> = None;
     for attempt in 0..20 {
         match current {
             MarkerRead::Valid(id, file) => return Ok((id, file)),
@@ -591,8 +593,23 @@ fn read_marker_during_creation(
                 if attempt == 19 {
                     bail!("invalid workspace-id marker: persistently short");
                 }
+                if original_short.is_none() {
+                    original_short = Some(file);
+                }
+                hook(MarkerStage::ShortRechecked)?;
                 std::thread::sleep(Duration::from_millis(5));
-                current = read_marker_file(path)?;
+                let reopened = read_marker_file(path)?;
+                let reopened_file = match &reopened {
+                    MarkerRead::Valid(_, file) | MarkerRead::Short(file) => file,
+                };
+                let original = original_short.as_ref().expect("short marker was observed");
+                let before = original.metadata()?;
+                let after = reopened_file.metadata()?;
+                ensure!(
+                    (before.dev(), before.ino()) == (after.dev(), after.ino()),
+                    "workspace-id marker changed during retry"
+                );
+                current = reopened;
             }
         }
     }
