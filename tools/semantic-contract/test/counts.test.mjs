@@ -454,7 +454,7 @@ test('unsupported copies in UTF-16 and scalar encodings share one source-byte sp
 });
 
 // The floor specimen is a captured source/candidate inventory, not an authored CountsV1.
-async function generatedCorpus(t,{duplicateProducer=false,omitRole=null}={}) {
+async function generatedCorpus(t,{duplicateProducer=false,omitRole=null,noOverloadSignatures=false}={}) {
  const doc={sourceSetId:'main',language:'java',path:'src/Corpus.java'};
  let text='// é\n',decls=[],calls=[],refs=[],facts=[],scenarios=[];
  const add=part=>{const start=Buffer.byteLength(text);text+=part;return start;};
@@ -602,6 +602,11 @@ async function generatedCorpus(t,{duplicateProducer=false,omitRole=null}={}) {
   requestedRoles:['read','write','type'],mutateCoverage:row=>({...row,state:'partial',supportedRoles:['read','write','type'],observedRoles:['read','write'],diagnostic:'type not observed'})});
  return s;
 }
+
+test('measured same-name Java sibling category does not require a signature heuristic',async t=>{
+ const s=await generatedCorpus(t,{noOverloadSignatures:true});
+ assert.equal(checkCounts(s.loaded,s.records).scenariosByCategory.find(row=>row.category==='sameNameOverload').count,4);
+});
 
 test('temporary captured Java corpus reaches each exact floor through checkCounts',async t=>{
  const s=await generatedCorpus(t);

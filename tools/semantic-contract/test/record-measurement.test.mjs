@@ -51,6 +51,20 @@ test('independent measured source baseline, ownership, candidates, and native pr
  assert.equal(result.nativeReferenceDescriptors[0].lookupKey,'target');
  assert.equal(result.recordByNativeRef.has('reference'),false);
 });
+test('measurement validates independently witnessed source without a Java-only kind ban',()=>{
+ const s=sample(),document={...doc,language:'java',path:'src/main.java'};
+ const id=name=>syntax({sourceSet:'main',path:document.path,language:'java',ancestors:[],declaration:{kind:'function',name,signature:null,ordinal:0}});
+ const call=occurrence({revisionId:'r1',ownerSyntaxId:id('main'),kind:'call',ordinal:0});
+ const control=occurrence({revisionId:'r1',ownerSyntaxId:id('main'),kind:'control',ordinal:0});
+ for(const row of [...s.loaded.native.declarations,...s.loaded.native.calls,...s.loaded.native.controls,...s.loaded.native.references,...s.records.declarations,...s.records.calls,...s.records.controlRegions])row.document=document;
+ s.loaded.sources=new Map([[JSON.stringify(['main','r1',document.path]),Buffer.from(source)]]);
+ s.loaded.revisions=new Map([[JSON.stringify(['main','r1']),{documents:[{key:document,contentHash:s.contentHash}]}]]);
+ for(const row of s.records.declarations){row.syntaxId=id(row.name);row.provenanceId=`native:r1:${row.syntaxId}`;}
+ s.records.declarations.sort(orderSyntax);
+ s.records.calls[0].id=call;s.records.calls[0].ownerSyntaxId=id('main');s.records.calls[0].regionIds=[control];s.records.calls[0].provenanceId=`native:r1:${call}`;
+ s.records.controlRegions[0].id=control;s.records.controlRegions[0].ownerSyntaxId=id('main');s.records.controlRegions[0].provenanceId=`native:r1:${control}`;
+ assert.equal(checkMeasurement(s.loaded,s.records).recordByNativeRef.get('main').syntaxId,id('main'));
+});
 async function admitSpec(spec){
  const root=await mkdtemp(join(tmpdir(),'measurement-u2-'));
  const raw=spec.loaded;

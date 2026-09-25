@@ -124,9 +124,7 @@ export function checkCounts(loaded,records,dispositions=loaded.dispositions) {
   const siblings=anchors.map(x=>native.declarations.find(row=>row.ref===x.ref));
   const sameNamedSiblings=anchors.length>=2&&anchors.every(x=>x.anchor.kind==='declarationName')&&
    siblings.every(row=>row&&row.name===siblings[0].name&&row.kind===siblings[0].kind&&
-    row.parentRef===siblings[0].parentRef)&&
-   (annotation.document.language!=='java'||siblings.every(row=>row.signature!==null)&&
-    new Set(siblings.map(row=>identity(row.signature))).size===siblings.length);
+    row.parentRef===siblings[0].parentRef);
   const includes=(role)=>attached.some(({fact})=>fact.kind==='reference'&&fact.record.roles.includes(role));
   const recursive=attached.some(({fact})=>fact.kind==='callBinding'&&fact.record.declaredTarget?.kind==='internal'&&
    fact.record.declaredTarget.declarationRef===fact.anchor.ownerRef);

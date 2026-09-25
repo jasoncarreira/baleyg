@@ -101,11 +101,11 @@ async function specimen(t,change={}){
  const nextBasis={...basis,revisionId:'r2',sourceManifestHash:sha(canon([{document,contentHash:sha(nextText)}]))};
  const nextProofs=nextFacts.map(fact=>({id:fact.provenanceRef??fact.record.provenanceId,producerId:'semantic',document,revisionId:'r2',contentHash:sha(nextText),evidenceKind:fact.kind==='typeRelationship'?'typeRelationship':'declarationBinding',basis:nextBasis,freshness:'fresh'}));
  change.proofs?.(proofs,nextProofs);
- const coverage=(id,revisionId='r1')=>({producerId:id,language:'java',sourceSetId:'main',documentPath:document.path,revisionId,requested:true,selected:true,state:'complete',supportedRoles:['definition'],observedRoles:['definition'],diagnostic:null});
+ const coverage=(id,revisionId='r1')=>({producerId:id,language:'java',sourceSetId:'main',documentPath:document.path,revisionId,requested:true,selected:true,state:'complete',supportedRoles:baseReference&&revisionId==='r1'&&id==='semantic'?['definition','type']:['definition'],observedRoles:baseReference&&revisionId==='r1'&&id==='semantic'?['definition','type']:['definition'],diagnostic:null});
  put('snapshots/src/Main.java.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios:[],facts:[...['native','semantic'].map(id=>({kind:'coverage',ref:`coverage-${id}`,record:coverage(id)})),...proofs.map((record,i)=>({kind:'provenance',ref:`proof-fact-${i}`,record})),...facts]});
  if(change.history)put('snapshots/r2/Main.java.annotations.json',{formatVersion:1,document,revisionId:'r2',scenarios:[],facts:[...['native','semantic'].map(id=>({kind:'coverage',ref:`coverage-${id}-r2`,record:coverage(id,'r2')})),...nextProofs.map((record,i)=>({kind:'provenance',ref:`proof-r2-fact-${i}`,record})),...nextFacts]});
  const producers=[nativeProducer,semanticProducer];
- const fixture={formatVersion:1,profile:'example',language:'java',sourceSets:[{id:'main',rootId:'root',languages:['java'],dependencies:[]}],producers,revisions:change.history?[revision,nextRevision]:[revision],comparison:{sourceSetId:'main',revisionId:change.history?'r2':'r1',producers},coverageIntents:(change.history?['r1','r2']:['r1']).flatMap(revisionId=>producers.map(producer=>({producerId:producer.id,document,revisionId,requestedRoles:['definition'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}))}))),nativeArtifact:'captures/native.json',semanticArtifacts:['captures/semantic.json'],annotationFiles:change.history?['snapshots/src/Main.java.annotations.json','snapshots/r2/Main.java.annotations.json']:['snapshots/src/Main.java.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ const fixture={formatVersion:1,profile:'example',language:'java',sourceSets:[{id:'main',rootId:'root',languages:['java'],dependencies:[]}],producers,revisions:change.history?[revision,nextRevision]:[revision],comparison:{sourceSetId:'main',revisionId:change.history?'r2':'r1',producers},coverageIntents:(change.history?['r1','r2']:['r1']).flatMap(revisionId=>producers.map(producer=>({producerId:producer.id,document,revisionId,requestedRoles:baseReference&&revisionId==='r1'&&producer.id==='semantic'?['definition','type']:['definition'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}))}))),nativeArtifact:'captures/native.json',semanticArtifacts:['captures/semantic.json'],annotationFiles:change.history?['snapshots/src/Main.java.annotations.json','snapshots/r2/Main.java.annotations.json']:['snapshots/src/Main.java.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  put('fixture.json',fixture);put('expected/answers.json',{formatVersion:1,answers:[]});put('expected/dispositions.json',{formatVersion:1,assertions:[],callableValueNegatives:[]});put('expected/anchors.json',{formatVersion:1,cases:[]});
  for(const [name,contents] of files){await mkdir(dirname(join(root,name)),{recursive:true});await writeFile(join(root,name),contents);}
  const loaded=await loadFixture(root);
@@ -192,48 +192,25 @@ test('Java mixed bases bind each relationship to its governing keyword',async t=
  assert.equal(checked.recordByFactRef.get('extends').kind,'extends');
  assert.equal(checked.recordByFactRef.get('child-face').kind,'implements');
 });
-const mixedKindControls=registerControls([{
- id:'RELATIONSHIP.KIND.mixedJava',baseline:()=>({relationshipKind:'implements'}),
- mutate:value=>({...value,relationshipKind:'extends'}),check:async()=>true,
- expectedAssertion:'RELATIONSHIP.KIND',expectedCode:'invalidRecord',expectedField:'kind'
-}]);
-for(const row of mixedKindControls)test(row.id,async t=>runControl({...row,check:async value=>check(await specimen(t,{
- source:source.replace('class Child extends Parent {}','class Child extends Parent implements Face {}'),
- raw:facts=>facts.push({kind:'typeRelationship',ref:'child-face',relationshipKind:value.relationshipKind,source:targetRef('Child'),target:targetRef('Face'),provenanceRef:'proof-child-face'})
-}))}));
-
-const overrideControls=registerControls([{
- id:'RELATIONSHIP.SOURCE.falseOverride',baseline:()=>({source}),
- mutate:value=>({...value,source:source.replace('@Override ', '')}),
- check:async()=>true,expectedAssertion:'RELATIONSHIP.SOURCE',expectedCode:'invalidRecord',expectedField:'source'
-},{
- id:'RELATIONSHIP.SOURCE.wrongSignature',baseline:()=>({source}),
- mutate:value=>({...value,source:source.replace('@Override void method()', '@Override void method(int value)')}),
- check:async()=>true,expectedAssertion:'RELATIONSHIP.SOURCE',expectedCode:'invalidRecord',expectedField:'source'
-}]);
-for(const row of overrideControls)test(row.id,async t=>runControl({...row,check:async value=>check(await specimen(t,value))}));
-const externalControls=registerControls([{
- id:'RELATIONSHIP.SOURCE.externalDirected',baseline:()=>({source:source.replace('class Child extends Parent','class Child extends External')}),
- mutate:value=>({...value,source:source.replace('class Child extends Parent','class Child')}),check:async()=>true,
- expectedAssertion:'RELATIONSHIP.SOURCE',expectedCode:'invalidRecord',expectedField:'source'
-}]);
-for(const row of externalControls)test(row.id,async t=>runControl({...row,check:async value=>check(await specimen(t,{
- source:value.source,raw:facts=>{facts[2].target=external;}
-}))}));
-test('same-producer exact base reference agrees with opaque external target',async t=>{
+test('semantic kind comes from captured proof, not Java heritage spelling',async t=>{
+ const value=await specimen(t,{
+  source:source.replace('class Child extends Parent {}','class Child extends Parent implements Face {}'),
+  raw:facts=>facts.push({kind:'typeRelationship',ref:'child-face',relationshipKind:'extends',source:targetRef('Child'),target:targetRef('Face'),provenanceRef:'proof-child-face'})
+ });
+ assert.equal(check(value).recordByFactRef.get('child-face').kind,'extends');
+});
+test('Java override marker and literal parameter spelling do not control semantic proof',async t=>{
+ for(const text of [source.replace('@Override ',''),source.replace('@Override void method()', '@Override void method(int value)')]){
+  const value=await specimen(t,{source:text});
+  assert.equal(check(value).recordByFactRef.get('overrides').kind,'overrides');
+ }
+});
+test('opaque external relationship keeps independent source provenance',async t=>{
  const value=await specimen(t,{source:source.replace('class Child extends Parent','class Child extends External'),
   raw:facts=>{facts[2].target=external;},externalReference:external});
  assert.equal(canon(check(value).recordByFactRef.get('extends').target),canon(external));
  assert.equal(value.J.joined.get('base-reference').join.status,'exact');
 });
-const referenceTargetControls=registerControls([{
- id:'RELATIONSHIP.TARGET.exactBaseReference',baseline:()=>({external:false}),
- mutate:value=>({...value,external:true}),check:async()=>true,
- expectedAssertion:'RELATIONSHIP.TARGET',expectedCode:'invalidRecord',expectedField:'target'
-}]);
-for(const row of referenceTargetControls)test(row.id,async t=>runControl({...row,check:async value=>check(await specimen(t,{
- externalReference:targetRef('Parent'),raw:facts=>{if(value.external)facts[2].target=external;}
-}))}));
 const historicalControls=registerControls([{
  id:'RELATIONSHIP.TARGET.admittedHistorical',baseline:()=>({history:true}),
  mutate:value=>({...value,historicalTarget:true}),
@@ -271,8 +248,7 @@ const sourceControls=registerControls([
  ['DECLARATION_BINDING.JOIN.raw',facts=>facts[1].record.symbols=[],'DECLARATION_BINDING.JOIN','symbols'],
  ['DECLARATION_BINDING.JOIN.family.raw',facts=>facts[1].anchor.kind='callee','JOIN.FAMILY','anchor.kind'],
  ['DECLARATION_BINDING.JOIN.tuple.raw',facts=>facts[1].anchor.range=span(7,11),'DECLARATION_BINDING.JOIN','join'],
- ['RELATIONSHIP.KIND.raw',facts=>facts[2].relationshipKind='implements','RELATIONSHIP.KIND','kind'],
- ['RELATIONSHIP.SOURCE.raw',facts=>{facts[2].source.declarationRef='Parent';facts[2].target.declarationRef='Child';},'RELATIONSHIP.SOURCE','source'],
+  ['RELATIONSHIP.SOURCE.raw',facts=>{facts[2].source.declarationRef='Derived.method';facts[2].target.declarationRef='Parent';},'RELATIONSHIP.SOURCE','source'],
  ['RELATIONSHIP.TARGET.raw',facts=>facts[2].target.declarationRef='absent','RELATIONSHIP.TARGET','target'],
  ['RELATIONSHIP.TARGET.revision',facts=>facts[2].target.revisionId='r2','RELATIONSHIP.TARGET','target'],
 ].map(([id,raw,expectedAssertion,expectedField])=>({id,baseline:()=>({}),mutate:value=>({...value,change:{raw}}),check:async()=>true,expectedAssertion,expectedCode:'invalidRecord',expectedField})));
@@ -304,57 +280,65 @@ const proofControls=registerControls([
  expectedField:expectedAssertion==='IDENTITY.SEMANTIC'?['symbol','binding','extends'][index]:'provenanceId'})));
 for(const row of proofControls)test(row.id,async t=>runControl({...row,check:async value=>check(await specimen(t,value.change))}));
 
-async function inheritanceSpecimen(t,variant='valid',language='rust',withFacts=true) {
+async function inheritanceSpecimen(t,variant='valid',language='rust',withFacts=true,crossFile=false) {
  const root=await mkdtemp(join(tmpdir(),`relationships-${language}-`));t.after(()=>rm(root,{recursive:true,force:true}));
- const text=language==='python'?`class Parent:
+ const parentText=language==='python'?'class Parent:\n    pass\n':language==='java'?variant==='override'?'class Parent { void method() {} }\n':'class Parent<T> {}\n':'trait Parent {}\n';
+ const childText=language==='python'?`class Child${variant==='no-supertrait'?'':variant==='false-base'?'(Face)':variant==='generic'?'(Parent[int])':'(Parent)'}:
     pass
-class Child${variant==='no-supertrait'?'':variant==='false-base'?'(Face)':'(Parent)'}:
-    pass
-`:`trait Parent {}
-trait Child${variant==='no-supertrait'?'':': Parent'} {}
+`:language==='java'?variant==='override'?`class Child extends Parent { void method() {} }
+`:`class Child extends Parent<String> {}
+`:`trait Child${variant==='no-supertrait'?'':variant==='generic'?'<T>: Parent + Face':': Parent'} {}
 trait Face {}
 struct Impl;
-impl ${variant==='inherent'?'':'Face for '}Impl {}
+impl${variant==='generic'?'<T>':''} ${variant==='inherent'?'':'Face for '}Impl${variant==='generic'?'<T>':''} {}
 `;
- const sourceSetId=language==='python'?'python-main':'rust-main';
- const doc={sourceSetId,language,path:language==='python'?'src/main.py':'src/lib.rs'};
- const specs=language==='python'?[['Parent','type','class Parent',[]],['Child','type','class Child',variant==='no-supertrait'?[]:[variant==='false-base'?'Face':'Parent']]]:[['Parent','type','trait Parent',[]],['Child','type','trait Child',variant==='no-supertrait'?[]:['Parent']],['Face','type','trait Face',[]],['Impl','type','struct Impl',[]],['FaceImpl','implementation','impl ',variant==='inherent'?[]:['Face']]];
- const rows=specs.map(([ref,kind,head,bases])=>{
-  const start=text.indexOf(head),end=language==='python'?text.indexOf('pass',start)+4:text.indexOf(kind==='type'&&ref==='Impl'?';':'}',start)+1;
-  const name=ref==='FaceImpl'?'Impl':ref;
-  const nameStart=ref==='FaceImpl'?text.indexOf('Impl',start):text.indexOf(name,start);
-  const header={kind,name,modifiers:[],typeParameters:[],parameters:[],resultType:null,bases};
-  const witnesses=[witness('name',nameStart,nameStart+name.length,name),witness('header.name',nameStart,nameStart+name.length,name),...bases.map((base,i)=>{
-   const at=text.indexOf(base,start);
-   return witness(`header.bases[${i}]`,at,at+base.length,base);
-  })];
-  return {ref,nativeId:null,document:doc,revisionId:'r1',parentRef:null,kind,name,range:span(start,end),nameRange:span(nameStart,nameStart+name.length),header,signature:null,witnesses};
+ const sourceSetId=`${language}-main`,text=crossFile?childText:parentText+childText;
+ const doc={sourceSetId,language,path:language==='python'?'src/main.py':language==='java'?'src/Main.java':'src/lib.rs'};
+ const targetDoc={...doc,path:language==='python'?'src/base.py':language==='java'?'src/Base.java':'src/base.rs'};
+ const specs=language==='java'?variant==='override'?[['Parent','type','class Parent',[],[]],['Child','type','class Child',[],['Parent']],['Parent.method','method','void method',[],[],'Parent'],['Child.method','method','void method',[],[],'Child']]:[['Parent','type','class Parent',['T'],[]],['Child','type','class Child',[],['Parent<String>']]]:language==='python'?[['Parent','type','class Parent',[],[]],['Child','type','class Child',[],variant==='no-supertrait'?[]:[variant==='false-base'?'Face':variant==='generic'?'Parent[int]':'Parent']]]:[['Parent','type','trait Parent',[],[]],['Child','type','trait Child',variant==='generic'?['T']:[],variant==='no-supertrait'?[]:['Parent']],['Face','type','trait Face',[],[]],['Impl','type','struct Impl',[],[]],['FaceImpl','implementation',variant==='generic'?'impl<T>':'impl ',variant==='generic'?['T']:[],variant==='inherent'?[]:['Face']]];
+ const rows=specs.map(([ref,kind,head,typeParameters,bases,parentRef=null])=>{
+  const rowText=crossFile&&(ref==='Parent'||ref==='Parent.method')?parentText:text;
+  const rowDoc=crossFile&&(ref==='Parent'||ref==='Parent.method')?targetDoc:doc;
+  const start=ref.endsWith('.method')?rowText.indexOf(head,rowText.indexOf(`class ${parentRef}`)):rowText.indexOf(head);
+  const end=language==='python'?rowText.indexOf('pass',start)+4:rowText.indexOf(ref==='Impl'?';':'}',start)+1;
+  const name=ref.endsWith('.method')?'method':ref==='FaceImpl'?'Impl':ref;
+  const nameStart=ref==='FaceImpl'?rowText.indexOf('Impl',start):rowText.indexOf(name,start);
+  const header={kind,name,modifiers:[],typeParameters,parameters:[],resultType:null,bases};
+  const witnesses=[witness('name',nameStart,nameStart+name.length,name),witness('header.name',nameStart,nameStart+name.length,name),
+   ...typeParameters.map((value,i)=>{const at=rowText.indexOf(value,ref==='FaceImpl'?start:nameStart+name.length);return witness(`header.typeParameters[${i}]`,at,at+value.length,value);}),
+   ...bases.map((base,i)=>{const at=rowText.indexOf(base,ref==='FaceImpl'?start:nameStart+name.length);return witness(`header.bases[${i}]`,at,at+base.length,base);})];
+  return {ref,nativeId:null,document:rowDoc,revisionId:'r1',parentRef,kind,name,range:span(start,end),nameRange:span(nameStart,nameStart+name.length),header,signature:null,witnesses};
  });
- const ids=new Map(rows.map(row=>[row.ref,`sid:v1:${digest('syntax',{sourceSet:sourceSetId,path:doc.path,language,ancestors:[],declaration:{kind:row.kind,name:row.name,signature:null,ordinal:0}})}`]));
+ const key=row=>({kind:row.kind,name:row.name,signature:null,ordinal:0});
+ const ids=new Map(rows.map(row=>[row.ref,`sid:v1:${digest('syntax',{sourceSet:sourceSetId,path:row.document.path,language,ancestors:row.parentRef?[key(rows.find(parent=>parent.ref===row.parentRef))]:[],declaration:key(row)})}`]));
  const ref=name=>({kind:'internal',declarationRef:name,revisionId:'r1'});
- const toTarget=name=>({kind:'internal',syntaxId:ids.get(name),document:doc,revisionId:'r1'});
+ const toTarget=name=>({kind:'internal',syntaxId:ids.get(name),document:rows.find(row=>row.ref===name).document,revisionId:'r1'});
  const facts=[{kind:'typeRelationship',ref:'rust-extends',relationshipKind:'extends',source:ref('Child'),target:ref('Parent'),provenanceRef:'proof-rust-extends'},
-  ...(language==='python'?[]:[{kind:'typeRelationship',ref:'rust-implements',relationshipKind:'implements',source:ref('FaceImpl'),target:ref('Face'),provenanceRef:'proof-rust-implements'}])];
+  ...(variant==='override'&&language==='java'?[{kind:'typeRelationship',ref:'java-override',relationshipKind:'overrides',source:ref('Child.method'),target:ref('Parent.method'),provenanceRef:'proof-java-override'}]:[]),
+  ...(language!=='rust'?[]:[{kind:'typeRelationship',ref:'rust-implements',relationshipKind:'implements',source:ref('FaceImpl'),target:ref('Face'),provenanceRef:'proof-rust-implements'}])];
  if(!withFacts)facts.length=0;
  const files=new Map(),put=(path,obj)=>files.set(path,typeof obj==='string'?obj:JSON.stringify(obj));
- const snapshot=`snapshots/${doc.path}`;
- put(snapshot,text);
+ const snapshot=`snapshots/${doc.path}`,targetSnapshot=`snapshots/${targetDoc.path}`;
+ put(snapshot,text);if(crossFile)put(targetSnapshot,parentText);
  put('captures/native.json',{formatVersion:1,producerId:'native',declarations:rows,calls:[],controls:[],references:[]});
  put('captures/semantic.json',{formatVersion:1,producerId:'semantic',facts});
  for(const [name,value] of [['native','native executable'],['semantic','semantic executable'],['toolchain','toolchain'],['config','config'],['dependency','dependency']])put(`captures/${name}.txt`,value);
  const captures=[['native','executable','captures/native.txt'],['semantic','executable','captures/semantic.txt'],['toolchain','toolchain','captures/toolchain.txt'],['config','config','captures/config.txt'],['dependency','dependency','captures/dependency.txt'],['artifact','semanticArtifact','captures/semantic.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(files.get(file))}));
  const producers=[nativeProducer,semanticProducer].map(row=>({...row,languages:[language]}));
- const revision={id:'r1',sourceSetId,documents:[{key:doc,revisionId:'r1',sourceFile:snapshot}],toolchainHash:captures[2].hash,configHash:captures[3].hash,dependencyHash:captures[4].hash};
- const basis={producerId:'semantic',producerVersion:'1',producerHash:semanticProducer.executableHash,artifactHash:captures[5].hash,language,sourceSetId,revisionId:'r1',sourceManifestHash:sha(canon([{document:doc,contentHash:sha(text)}])),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
+ const documents=[{key:doc,revisionId:'r1',sourceFile:snapshot},...(crossFile?[{key:targetDoc,revisionId:'r1',sourceFile:targetSnapshot}]:[])].sort((a,b)=>Buffer.compare(Buffer.from(a.key.path),Buffer.from(b.key.path)));
+ const revision={id:'r1',sourceSetId,documents,toolchainHash:captures[2].hash,configHash:captures[3].hash,dependencyHash:captures[4].hash};
+ const sourceRows=documents.map(row=>({document:row.key,contentHash:sha(row.key.path===doc.path?text:parentText)}));
+ const basis={producerId:'semantic',producerVersion:'1',producerHash:semanticProducer.executableHash,artifactHash:captures[5].hash,language,sourceSetId,revisionId:'r1',sourceManifestHash:sha(canon(sourceRows)),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
  const proofs=facts.map(fact=>({id:fact.provenanceRef,producerId:'semantic',document:doc,revisionId:'r1',contentHash:sha(text),evidenceKind:'typeRelationship',basis,freshness:'fresh'}));
- const coverage=id=>({producerId:id,language,sourceSetId,documentPath:doc.path,revisionId:'r1',requested:true,selected:true,state:'complete',supportedRoles:['definition'],observedRoles:['definition'],diagnostic:null});
+ const coverage=(id,d=doc)=>({producerId:id,language,sourceSetId,documentPath:d.path,revisionId:'r1',requested:true,selected:true,state:'complete',supportedRoles:['definition'],observedRoles:['definition'],diagnostic:null});
  put(`${snapshot}.annotations.json`,{formatVersion:1,document:doc,revisionId:'r1',scenarios:[],facts:[...['native','semantic'].map(id=>({kind:'coverage',ref:`coverage-${id}`,record:coverage(id)})),...proofs.map((record,i)=>({kind:'provenance',ref:`provenance-${i}`,record})),...facts]});
- const fixture={formatVersion:1,profile:'example',language,sourceSets:[{id:sourceSetId,rootId:'root',languages:[language],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId,revisionId:'r1',producers},coverageIntents:producers.map(p=>({producerId:p.id,document:doc,revisionId:'r1',requestedRoles:['definition'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}))})),nativeArtifact:'captures/native.json',semanticArtifacts:['captures/semantic.json'],annotationFiles:[`${snapshot}.annotations.json`],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ if(crossFile)put(`${targetSnapshot}.annotations.json`,{formatVersion:1,document:targetDoc,revisionId:'r1',scenarios:[],facts:['native','semantic'].map(id=>({kind:'coverage',ref:`base-coverage-${id}`,record:coverage(id,targetDoc)}))});
+ const fixture={formatVersion:1,profile:'example',language,sourceSets:[{id:sourceSetId,rootId:'root',languages:[language],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId,revisionId:'r1',producers},coverageIntents:documents.flatMap(({key})=>producers.map(p=>({producerId:p.id,document:key,revisionId:'r1',requestedRoles:['definition'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}))}))),nativeArtifact:'captures/native.json',semanticArtifacts:['captures/semantic.json'],annotationFiles:[`${snapshot}.annotations.json`,...(crossFile?[`${targetSnapshot}.annotations.json`]:[])],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  put('fixture.json',fixture);put('expected/answers.json',{formatVersion:1,answers:[]});put('expected/dispositions.json',{formatVersion:1,assertions:[],callableValueNegatives:[]});put('expected/anchors.json',{formatVersion:1,cases:[]});
  for(const [name,contents] of files){await mkdir(dirname(join(root,name)),{recursive:true});await writeFile(join(root,name),contents);}
  const loaded=await loadFixture(root);
- const normalized=rows.map(d=>({syntaxId:ids.get(d.ref),document:doc,revisionId:'r1',kind:d.kind,name:d.name,lookupKey:d.name,ancestors:[],key:{kind:d.kind,name:d.name,signature:null,ordinal:0},range:range(d.range.start,d.range.end),nameRange:range(d.nameRange.start,d.nameRange.end),header:d.header,provenanceId:`native:r1:${ids.get(d.ref)}`}));
- const records={formatVersion:1,comparison:fixture.comparison,producers:structuredClone(producers).sort((a,b)=>Buffer.compare(Buffer.from(canon(a)),Buffer.from(canon(b)))),sourceSets:fixture.sourceSets,revisions:[{...revision,documents:[{key:doc,revisionId:'r1',contentHash:sha(text),byteLength:Buffer.byteLength(text)}]}],coverage:rowOrder(['native','semantic'].map(coverage)),provenance:[...proofs,...rows.map(d=>({id:`native:r1:${ids.get(d.ref)}`,producerId:'native',document:doc,revisionId:'r1',contentHash:sha(text),evidenceKind:'measuredSyntax',basis:null,freshness:'fresh'}))],declarations:rowOrder(normalized),symbols:[],declarationBindings:[],typeRelationships:rowOrder(facts.map(fact=>({kind:fact.relationshipKind,source:toTarget(fact.source.declarationRef),target:toTarget(fact.target.declarationRef),provenanceId:fact.provenanceRef}))),calls:[],controlRegions:[],references:[],referenceJoinDiagnostics:[],callBindings:[],durableAnchors:[],groupContinuities:[],anchorResults:[]};
+ const normalized=rows.map(d=>({syntaxId:ids.get(d.ref),document:d.document,revisionId:'r1',kind:d.kind,name:d.name,lookupKey:d.name,ancestors:d.parentRef?[key(rows.find(parent=>parent.ref===d.parentRef))]:[],key:key(d),range:range(d.range.start,d.range.end),nameRange:range(d.nameRange.start,d.nameRange.end),header:d.header,provenanceId:`native:r1:${ids.get(d.ref)}`}));
+ const records={formatVersion:1,comparison:fixture.comparison,producers:structuredClone(producers).sort((a,b)=>Buffer.compare(Buffer.from(canon(a)),Buffer.from(canon(b)))),sourceSets:fixture.sourceSets,revisions:[{...revision,documents:documents.map(d=>({key:d.key,revisionId:'r1',contentHash:sha(d.key.path===doc.path?text:parentText),byteLength:Buffer.byteLength(d.key.path===doc.path?text:parentText)}))}],coverage:rowOrder(documents.flatMap(({key})=>['native','semantic'].map(id=>coverage(id,key)))),provenance:[...proofs,...rows.map(d=>({id:`native:r1:${ids.get(d.ref)}`,producerId:'native',document:d.document,revisionId:'r1',contentHash:sha(d.document.path===doc.path?text:parentText),evidenceKind:'measuredSyntax',basis:null,freshness:'fresh'}))],declarations:rowOrder(normalized),symbols:[],declarationBindings:[],typeRelationships:rowOrder(facts.map(fact=>({kind:fact.relationshipKind,source:toTarget(fact.source.declarationRef),target:toTarget(fact.target.declarationRef),provenanceId:fact.provenanceRef}))),calls:[],controlRegions:[],references:[],referenceJoinDiagnostics:[],callBindings:[],durableAnchors:[],groupContinuities:[],anchorResults:[]};
  const C=checkCoverage(loaded,records),M=checkMeasurement(loaded,records),J=checkJoins(loaded,records,C,M);
  return {loaded,records,C,M,J};
 }
@@ -368,14 +352,38 @@ test('Python measured parenthesized inheritance needs an explicit extends fact',
  const syntaxOnly=check(await inheritanceSpecimen(t,'valid','python',false));
  assert.deepEqual(syntaxOnly.typeRelationships,[]);
 });
-const pythonControls=registerControls(['no-supertrait','false-base'].map(variant=>({
- id:`RELATIONSHIP.SOURCE.python.${variant}`,baseline:()=>({variant:'valid'}),
- mutate:value=>({...value,variant}),check:async()=>true,
- expectedAssertion:'RELATIONSHIP.SOURCE',expectedCode:'invalidRecord',expectedField:'source'
-})));
-for(const row of pythonControls)test(row.id,async t=>runControl({...row,check:async value=>check(await inheritanceSpecimen(t,value.variant,'python'))}));
-for(const [id,variant] of [['RELATIONSHIP.SOURCE.rustInherent','inherent'],['RELATIONSHIP.SOURCE.rustFalseExtends','no-supertrait']]){
- const row=registerControls([{id,baseline:()=>({variant:'valid'}),mutate:value=>({...value,variant}),check:async()=>true,
-  expectedAssertion:'RELATIONSHIP.SOURCE',expectedCode:'invalidRecord',expectedField:'source'}])[0];
- test(id,async t=>runControl({...row,check:async value=>check(await inheritanceSpecimen(t,value.variant))}));
-}
+test('Rust and Python semantics do not depend on a header base projection',async t=>{
+ for(const language of ['rust','python'])for(const variant of ['no-supertrait','false-base',...(language==='rust'?['inherent']:[])]){
+  const checked=check(await inheritanceSpecimen(t,variant,language));
+  assert.equal(checked.typeRelationships.some(row=>row.kind==='extends'),true);
+ }
+});
+
+test('source-backed cross-document generic inheritance has exact measured target IDs in Java, Rust and Python',async t=>{
+ for(const language of ['java','rust','python']){
+  const value=await inheritanceSpecimen(t,'generic',language,true,true);
+  const checked=check(value);
+  const relation=checked.recordByFactRef.get('rust-extends');
+  assert.equal(relation.kind,'extends');
+  assert.notEqual(relation.source.document.path,relation.target.document.path);
+  assert.equal(relation.target.syntaxId,value.M.recordByNativeRef.get('Parent').syntaxId);
+  assert.equal(checked.typeRelationships.length,language==='rust'?2:1);
+ }
+});
+test('Java measured override crosses source documents without an optional annotation',async t=>{
+ const value=await inheritanceSpecimen(t,'override','java',true,true);
+ const relation=check(value).recordByFactRef.get('java-override');
+ assert.equal(relation.kind,'overrides');
+ assert.notEqual(relation.source.document.path,relation.target.document.path);
+ assert.equal(relation.target.syntaxId,value.M.recordByNativeRef.get('Parent.method').syntaxId);
+});
+test('cross-file relation needs captured independent semantic proof, not syntax similarity',async t=>{
+ const noFacts=await inheritanceSpecimen(t,'generic','java',false,true);
+ assert.deepEqual(check(noFacts).typeRelationships,[]);
+ const forged=await inheritanceSpecimen(t,'generic','java',true,true);
+ forged.records.typeRelationships[0].provenanceId='not-a-captured-proof';
+ assert.throws(()=>check(forged),error=>error.assertion==='RELATIONSHIP.PROOF'&&error.field==='provenanceId');
+ const unmeasured=await inheritanceSpecimen(t,'generic','python',true,true);
+ unmeasured.loaded.native.declarations=unmeasured.loaded.native.declarations.filter(row=>row.ref!=='Parent');
+ assert.throws(()=>check(unmeasured),error=>error.assertion==='RELATIONSHIP.TARGET'&&error.field==='target');
+});

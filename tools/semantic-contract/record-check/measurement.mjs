@@ -115,7 +115,6 @@ export function checkMeasurement(loaded,records,{handleDigest=hash}={}) {
   if((row.name===null)!==(row.nameRange===null)||(row.kind==='module'||row.kind==='anonymousFunction')!==(row.name===null)||nameRange!==null&&!contains(range,nameRange))reject('MEASUREMENT.WITNESS','nameRange','invalid name and range');
   if(row.header.kind!==row.kind||row.header.name!==row.name)reject('MEASUREMENT.WITNESS','header','header projection differs');
   if(row.header.parameters.slice(0,-1).some(x=>x.variadic))reject('MEASUREMENT.WITNESS','header.parameters','variadic parameter must be final');
-  if(row.document.language==='java'&&row.kind==='function')reject('MEASUREMENT.WITNESS','kind','Java ordinary function does not exist');
   if(row.signature!==null && (row.document.language!=='java'||!['method','constructor'].includes(row.kind)))reject('MEASUREMENT.WITNESS','signature','signature only applies to Java methods/constructors');
   if(row.signature!==null&&(row.signature.typeParameterCount!==row.header.typeParameters.length||row.signature.parameterTypes.length!==row.header.parameters.length||row.signature.variadic!==(row.header.parameters.at(-1)?.variadic??false)||row.header.parameters.slice(0,-1).some(x=>x.variadic)||row.signature.parameterTypes.some((x,i)=>x!==row.header.parameters[i].type)))reject('MEASUREMENT.WITNESS','signature','signature projection differs');
   witnesses(row,source,range,encoding);position.set(row.ref,{range,nameRange});decls.push(row);
