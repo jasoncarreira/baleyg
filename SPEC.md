@@ -632,8 +632,9 @@ fake tool calls. `_meta` correlation is not a replacement for a versioned tool s
 
 The first catalog is `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect` and
 `baleyg_read_source`, served by `baleyg mcp` over stdio (MCP `2026-07-28`). The first release of
-`baleyg_inspect` offers `declaration`, `outgoing_calls` and `incoming_calls` over syntax-tier evidence;
-later stages add views and semantic evidence. Every result reports its basis
+`baleyg_inspect` offers `declaration` and `outgoing_calls` over syntax-tier evidence;
+later stages ratify and add `incoming_calls` and other views, plus semantic evidence.
+Every result reports its basis
 `{indexGeneration, indexRevision}` and per-item tier and freshness; pins are optional, carry the
 complete basis, and always conflict when stale. No registry, grep scan, artifact write, shell or on-request index operation is part
 of this path. Snapshot text search gets its own bounded literal-scan design; FTS does not exist today.
