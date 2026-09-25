@@ -50,7 +50,20 @@ test('authored graph answers select latest declaration proofs, never old occurre
  assert.equal(result('history-foreign').warnings.some(w=>w.code==='coverageIncomplete'),false);
  assert.equal(result('history-unchanged').edges[0].binding,null);
  assert.equal(records.references.some(ref=>ref.revisionId==='r2'),false);
- assert.equal(records.callBindings.every(binding=>binding.join.anchor.revisionId==='r1'),true);
+ assert.deepEqual(records.callBindings.map(binding=>binding.join.anchor.revisionId).sort(),['r1','r2']);
+ assert.deepEqual(result('history-foreign').nodes.map(node=>node.declaration.syntaxId),['sid:v1:e976f46fdd13c71c3616d596ff531f3e','sid:v1:c0834332f03e9a936f94aa462d15d1e2']);
+ assert.equal(result('history-foreign').edges[0].to,'sid:v1:c0834332f03e9a936f94aa462d15d1e2');
+ assert.equal(result('history-foreign').edges[0].visit,'new');
+ assert.equal(result('history-foreign').edges[0].binding.provenanceId,'proof:fresh-call');
+ assert.deepEqual(result('history-foreign').coverage.map(c=>[c.producerId,c.revisionId,c.state]),[['P','r2','complete'],['native','r2','complete']]);
+ assert.deepEqual(result('history-foreign').warnings,[]);
+ assert.equal(result('history-other-producer').provenance.some(p=>p.producerId==='Q'),false);
+ assert.equal(records.provenance.some(p=>p.id==='proof:Q-anchor'&&p.producerId==='Q'&&p.revisionId==='r1'),true);
+ assert.equal(records.declarationBindings.find(b=>b.provenanceId==='proof:Q-anchor').syntaxId,result('history-other-producer').nodes[0].declaration.syntaxId);
+ assert.equal(records.provenance.find(p=>p.id==='proof:Q-anchor').document.path,'src/anchors.js');
+ assert.equal(records.coverage.some(c=>c.producerId==='Q'&&c.documentPath==='src/anchors.js'&&c.revisionId==='r1'&&c.selected&&c.state==='complete'),true);
+ assert.deepEqual(result('history-other-producer').coverage.map(c=>[c.producerId,c.revisionId,c.state]),[['P','r1','complete'],['P','r2','failed'],['native','r2','complete']]);
+ assert.equal(result('history-other-producer').warnings[0].code,'coverageIncomplete');
  for(const id of ['old-call','old-reference','unreturned-hidden','foreign-only'])
   assert.equal(result('history-unchanged').provenance.some(proof=>proof.id===`proof:${id}`),false);
  assert.deepEqual(result('syntax-only').warnings.map(row=>row.code),['syntaxOnly']);
@@ -94,6 +107,8 @@ const controls=registerControls([
  control('history-unchanged/foreign-document',entry=>{entry.answer.result.provenance.push(records.provenance.find(p=>p.id==='proof:foreign-only'));return entry},'GRAPH.PROVENANCE','provenance'),
  control('history-unchanged/old-call-binding',entry=>{entry.answer.result.edges[0].binding=records.callBindings[0];return entry},'GRAPH.TRAVERSAL','answers.history-unchanged.result.edges'),
  control('history-unchanged/old-reference-proof',entry=>{entry.answer.result.provenance.push(records.provenance.find(p=>p.id==='proof:old-reference'));return entry},'GRAPH.PROVENANCE','provenance'),
+ control('history-other-producer/Q-proof-in-P-answer',entry=>{entry.answer.result.provenance.push(records.provenance.find(p=>p.id==='proof:Q-anchor'));return entry},'GRAPH.PROVENANCE','provenance'),
+ control('history-unchanged/promoted-r1-proof-as-r2',entry=>{const proof=entry.answer.result.provenance.find(p=>p.id==='proof:latest-unchanged');Object.assign(proof,{revisionId:'r2',freshness:'fresh'});return entry},'GRAPH.PROVENANCE','provenance'),
  control('history-zero/missing-zero-fact-coverage',entry=>{entry.answer.result.coverage=entry.answer.result.coverage.filter(row=>row.revisionId!=='r1');return entry},'GRAPH.COVERAGE','coverage'),
  control('history-changed/relabelled-stale',entry=>{entry.answer.result.provenance.find(p=>p.id==='proof:latest-changed').freshness='possiblyStale';return entry},'GRAPH.PROVENANCE','provenance'),
  control('history-unchanged/relabelled-possibly-stale',entry=>{entry.answer.result.provenance.find(p=>p.id==='proof:latest-unchanged').freshness='fresh';return entry},'GRAPH.PROVENANCE','provenance'),
