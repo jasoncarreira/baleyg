@@ -103,6 +103,8 @@ Take a returned `GraphNode.declaration` with syntax ID `S` in document `D`, an a
 - the provenance of **every** `P` fact captured at `r1` whose provenance document is `D` and which names `S`, meaning a `DeclarationBinding.syntaxId`, an internal `Symbol.declarations` target, or a `TypeRelationship.source`. A fact whose evidence document is not `D` is excluded even if it targets `S`;
 - `P`'s captured `r1` coverage row for `D`, beside the required `r2` row.
 
+The `r1` tuple supersedes every earlier one for `(P,D)`. Its coverage row is returned even when no `r1` fact names `S`: the latest complete or partial analysis reported nothing for `S`. The checker must never fall back to an older revision's proof for `S`. Here `complete` has its coverage meaning: complete for the requested, supported roles, not every possible fact. A `partial` `r1` row signals its uncertainty through `coverageIncomplete`, not through older history.
+
 Each such provenance keeps its captured revision. Its freshness compares the captured bytes of `D` with the requested `r2` bytes of `D`:
 - unchanged bytes are `possiblyStale`, because the captured revision differs;
 - changed or missing bytes are `stale`.
