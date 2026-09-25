@@ -38,6 +38,14 @@ function capturedDocument(provenance, loaded) {
   );
   return { revision, document };
 }
+// Actual digests of the captured bytes of one kind, for mismatch diagnostics.
+function capturedHashes(loaded, kind) {
+  return loaded.fixture.captures
+    .filter((x) => x.kind === kind && loaded.captureBytes.has(x.ref))
+    .map((x) => contentHash(loaded.captureBytes.get(x.ref)));
+}
+const oneOf = (hashes, actual) =>
+  `expected one of [${hashes.join(", ")}], actual ${actual}`;
 function captureExists(loaded, kind, hash) {
   return loaded.fixture.captures.some(
     (x) =>
@@ -64,7 +72,7 @@ export function checkCapturedBasis(provenance, loaded) {
     captureExists(loaded, "executable", producer.executableHash),
     "BASIS.EXECUTABLE",
     "producerHash",
-    "missing or changed executable bytes",
+    `missing or changed executable bytes: ${oneOf(capturedHashes(loaded, "executable"), producer.executableHash)}`,
   );
   if (producer.kind === "native") {
     assert(
@@ -116,7 +124,7 @@ export function checkCapturedBasis(provenance, loaded) {
       captureExists(loaded, kind, basis[field]),
       `BASIS.${field.toUpperCase()}`,
       field,
-      "captured bytes unavailable",
+      `captured bytes unavailable: ${oneOf(capturedHashes(loaded, kind), basis[field])}`,
     );
   assert(
     loaded.semanticBytes.some(
@@ -126,7 +134,12 @@ export function checkCapturedBasis(provenance, loaded) {
     ),
     "BASIS.ARTIFACTHASH",
     "artifactHash",
-    "semantic artifact bytes differ",
+    `semantic artifact bytes differ: ${oneOf(
+      loaded.semanticBytes
+        .filter(({ value }) => value.producerId === producer.id)
+        .map(({ bytes }) => contentHash(bytes)),
+      basis.artifactHash,
+    )}`,
   );
   const deps = basis.lookupDependencies;
   assert(

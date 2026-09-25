@@ -158,7 +158,7 @@ async function readPublished(root, expected) {
     fail(
       "PUBLICATION.MANIFEST",
       "manifest",
-      "published manifest bytes differ from admitted inputs",
+      `published manifest bytes differ from admitted inputs: expected ${contentHash(canonicalBytes(expected))}, actual ${contentHash(manifestBytes)}`,
     );
   return manifest;
 }
@@ -174,7 +174,7 @@ export async function checkPublication(root) {
       fail(
         "PUBLICATION.BYTES",
         name,
-        "published bytes differ from checked canonical result",
+        `published bytes differ from checked canonical result: expected ${contentHash(built.bytes[name])}, actual ${contentHash(actual)}`,
       );
   }
   return built.manifest;
