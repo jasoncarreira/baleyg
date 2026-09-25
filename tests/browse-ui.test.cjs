@@ -695,3 +695,132 @@ test("producer and browse boundaries use complete pairs and reject reused revisi
     assert.equal(h.run("result"),null,operation);
   }
 });
+
+
+test("unchanged status does not permanently suppress a later unexpected generation", async () => {
+  const h=harness(), requests=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}`);
+  h.context.fetch=async url => {
+    requests.push(url);
+    if(url==='/api/status') return response({revision:requests.filter(p=>p==='/api/status').length===1?oldPair:newPair,workspaceRoot:'/same',stats:{}});
+    if(url.startsWith('/api/tree')) return response({...treePage('',[]),revision:newPair});
+    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
+    return response({revision:newPair,items:[],nextOffset:null});
+  };
+  await h.run('loadFiles(true)'); await new Promise(setImmediate);
+  assert.equal(requests.filter(p=>p==='/api/status').length,1);
+  await h.run('loadFiles(true)'); await new Promise(setImmediate);
+  assert.equal(requests.filter(p=>p==='/api/status').length,2);
+  assert.equal(h.run('status.revision.indexGeneration'),newPair.indexGeneration);
+});
+
+test("tree mismatch discovered during status reconciliation gets one bounded follow-up", async () => {
+  const h=harness(), statusRead=deferred(), requests=[];
+  const third={...newPair,indexGeneration:'abcdef12-1234-4123-8123-123456789abc'};
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}`);
+  h.context.fetch=async url => {
+    requests.push(url);
+    if(url==='/api/status') return requests.filter(p=>p==='/api/status').length===1?statusRead.promise:response({revision:third,workspaceRoot:'/same',stats:{}});
+    if(url.startsWith('/api/tree')) return response({...treePage('',[]),revision:third});
+    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:third,packages:[],warnings:[]});
+    return response({revision:newPair,items:[],nextOffset:null});
+  };
+  const first=h.run('loadFiles(true)');
+  statusRead.resolve(response({revision:newPair,workspaceRoot:'/same',stats:{}}));
+  await first; await new Promise(setImmediate); await new Promise(setImmediate);
+  assert.equal(requests.filter(p=>p==='/api/status').length,2);
+  assert.equal(h.run('status.revision.indexGeneration'),third.indexGeneration);
+});
+
+test("late source generation mismatch clears every derived panel before status resolves", async () => {
+  const h=harness(), source=deferred(), statusRead=deferred(), requests=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}; seed='root';
+    result={revision:status.revision,calls:[],nodes:[]}; packet={packetId:'p',revision:status.revision};
+    focused={revision:status.revision,calls:[],nodes:[]}; selectedMethod={id:'m'};`);
+  h.get('source').scrollIntoView=()=>{};
+  h.context.fetch=url=>{requests.push(url);return url==='/api/status'?statusRead.promise:source.promise;};
+  const pending=h.run(`perform(() => showSource({path:'x.rs',range:{startLine:1,endLine:1}},status.revision))`);
+  source.resolve(response({revision:newPair,file:{path:'x.rs',text:'old'}}));
+  await pending;
+  assert.ok(requests.includes('/api/status'));
+  for (const value of ['result','packet','focused','selectedMethod','seed']) assert.equal(h.run(value),null,value);
+  assert.equal(h.get('source').children.length,0);
+  statusRead.resolve(response({revision:oldPair,workspaceRoot:'/same',stats:{}}));
+  await new Promise(setImmediate);
+  assert.equal(h.run('result'),null);
+});
+
+
+test("branch expansion rejects a new generation before rendering the branch", async () => {
+  const h=harness(), requests=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}`);
+  h.context.fetch=async url=>{
+    requests.push(url);
+    if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',stats:{}});
+    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
+    return response({...treePage(url.includes('path=src')?'src':'',url.includes('path=src')?[treeFile('src/new.rs')]:[folder('src')]),revision:newPair});
+  };
+  await h.run("toggleDirectory('src')"); await new Promise(setImmediate);
+  assert.ok(requests.some(url=>url.startsWith('/api/tree?path=src&offset=0&limit=200')));
+  assert.ok(requests.includes('/api/status'));
+  assert.doesNotMatch(text(h.get('file-tree')),/new.rs/);
+});
+
+test("later tree page cannot mix equal numeric revisions from distinct generations", async () => {
+  const h=harness(), requests=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}`);
+  h.context.fetch=async url=>{
+    requests.push(url);
+    if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',stats:{}});
+    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
+    if(url.includes('offset=1&')) return response({...treePage('',[treeFile('new.rs')]),revision:newPair});
+    return response({...treePage('',[treeFile('old.rs')],1),revision:requests.includes('/api/status')?newPair:oldPair});
+  };
+  await h.run('loadTreeRoot()');
+  await h.run("loadDirectory('')"); await new Promise(setImmediate);
+  assert.ok(requests.some(url=>url.includes('offset=1&')));
+  assert.ok(requests.includes('/api/status'));
+  assert.doesNotMatch(text(h.get('file-tree')),/new.rs/);
+});
+
+
+test("same-workspace automatic Pair refresh retains list/save/delete payloads for views and notes", async () => {
+ const h=harness(), calls=[];
+ let viewsData=[], notesData=[];
+ h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}; seed='root'; result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:1}}`);
+ h.context.crypto={randomUUID:(()=>{let n=0;return ()=>`item-${++n}`;})()};
+ h.context.fetch=async(url,opts)=>{
+   calls.push({url,method:opts.method,body:opts.body && JSON.parse(opts.body)});
+   if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',stats:{}});
+   if(url.startsWith('/api/tree?')) return response({...treePage('',[]),revision:newPair});
+   if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
+   if(url==='/api/views') return response(viewsData);
+   if(url==='/api/annotations') return response(notesData);
+   if(url==='/api/views/item-1' && opts.method==='PUT') {viewsData=[{view:opts.body&&JSON.parse(opts.body)}];return response({});}
+   if(url==='/api/annotations/item-2' && opts.method==='PUT') {notesData=[{annotation:JSON.parse(opts.body)}];return response({});}
+   if(url==='/api/views/item-1' && opts.method==='DELETE') {viewsData=[];return response(null);}
+   if(url==='/api/annotations/item-2' && opts.method==='DELETE') {notesData=[];return response(null);}
+   return response({revision:newPair,items:[],nextOffset:null});
+ };
+ await h.run('loadFiles(true)'); await new Promise(setImmediate);
+ assert.equal(h.run('status.revision.indexGeneration'),newPair.indexGeneration);
+ await h.run('loadSaved()');
+ h.run(`result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:1}}; seed='root'`);
+ h.get('view-title').value='Keep';h.get('save-form').listeners.submit({preventDefault(){}}); await new Promise(setImmediate);
+ h.get('note').value='Remember';h.get('annotation-form').listeners.submit({preventDefault(){}});await new Promise(setImmediate);
+ assert.deepEqual(calls.find(c=>c.url==='/api/views/item-1'&&c.method==='PUT').body,{id:'item-1',title:'Keep',query:{seed:'root',depth:1},pins:{},hidden:[]});
+ assert.deepEqual(calls.find(c=>c.url==='/api/annotations/item-2'&&c.method==='PUT').body,{id:'item-2',nodeId:'root',body:'Remember'});
+ const viewDelete=descendants(h.get('views')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
+ const noteDelete=descendants(h.get('annotations')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
+ await viewDelete.listeners.click();await noteDelete.listeners.click();
+ assert.equal(calls.find(c=>c.url==='/api/views/item-1'&&c.method==='DELETE').body,undefined);
+ assert.equal(calls.find(c=>c.url==='/api/annotations/item-2'&&c.method==='DELETE').body,undefined);
+ assert.equal(h.run('views.length + annotations.length'),0);
+});
+
+
+test("request handlers reject bare numeric pins without sending a request", async () => {
+ const h=harness(), requests=[];h.context.fetch=async url=>{requests.push(url);throw Error('invalid request was sent');};
+ await assert.rejects(h.run("showSource({path:'x',range:{startLine:1,endLine:1}},1)"),/older revision/);
+ assert.deepEqual(requests,[]);
+});

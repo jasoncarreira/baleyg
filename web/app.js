@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 let token = "", epoch = 0, querySerial = 0, sourceSerial = 0, searchSerial = 0;
 let status = null, result = null, seed = null, views = [], annotations = [], editingNote = null;
 let statusSerial = 0, savedSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
+let pairRefreshQueued = null, pairRefreshFollowup = false;
 let job = null, pollTimer = null;
 let packet = null, focused = null, questionSerial = 0;
 let jevStatus = null, jevStatusSerial = 0, jevRunning = false;
@@ -99,7 +100,7 @@ function clearSource() {
   if (!$("source-dock")?.hidden) window.BaleygShell?.closeSource?.();
 }
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
-async function refreshStatus() {
+async function refreshStatus(followup = false) {
   statusRefreshDepth++;
   try {
   const serial = ++statusSerial, session = epoch;
@@ -122,7 +123,6 @@ async function refreshStatus() {
     renderResult();
   }
   if (browseChanged) clearDependencyCatalog();
-  if (browseChanged) pairRefreshObserved = null;
   status = {...data, revision:nextPin};
   data = status;
   window.BaleygShell?.updateWorkspace(status);
@@ -135,11 +135,22 @@ async function refreshStatus() {
   $("stale").hidden = true;
   if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax is indexed, but semantic links are disabled. Regenerate SCIP and its paired manifest from unchanged inputs to restore them.`);
   if (result && !IndexPin.equal(result.revision, status.revision)) stale("This view is from an older revision. Refresh status & view to update it.");
-  // Optional catalog status must not block connecting to older daemons.
-  void refreshDependencies();
-  } finally { statusRefreshDepth--; }
+  // A rejected optional catalog must not recursively request status when status is unchanged.
+  if (browseChanged || !pairRefreshPending) void refreshDependencies();
+  } finally {
+    statusRefreshDepth--;
+    if (!statusRefreshDepth && pairRefreshQueued) {
+      const queued = pairRefreshQueued;
+      pairRefreshQueued = null;
+      if (!followup && queued.session === epoch &&
+          (!status || queued.key !== `${status.workspaceRoot}:${IndexPin.key(status.revision)}`)) {
+        pairRefreshFollowup = true;
+        void refreshStatus(true).catch(() => {}).finally(() => { pairRefreshFollowup = false; });
+      }
+    }
+  }
 }
-function unexpectedPair(message = "Index snapshot changed. Refresh status.") {
+function unexpectedPair(message = "Index snapshot changed. Refresh status.", receivedPair) {
   clearBrowse(message); clearSource(); sourceCache.clear(); querySerial++; searchSerial++;
   result = null; seed = null; $("symbols").replaceChildren();
   $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
@@ -149,15 +160,19 @@ function unexpectedPair(message = "Index snapshot changed. Refresh status.") {
   $("dependency-state").textContent = message;
   $("dependency-symbol-state").textContent = message;
   stale(message);
-  const observed = status?.revision && `${status.workspaceRoot}:${IndexPin.key(status.revision)}`;
-  if (!statusRefreshDepth && !pairRefreshPending && observed !== pairRefreshObserved) {
-    pairRefreshObserved = observed;
+  let observed = null;
+  try { if (receivedPair) observed = IndexPin.copy(receivedPair); } catch (_) { /* Status remains authoritative. */ }
+  if (statusRefreshDepth) {
+    if (!pairRefreshFollowup && observed) pairRefreshQueued = {session:epoch, key:`${status?.workspaceRoot}:${IndexPin.key(observed)}`};
+    return;
+  }
+  if (!pairRefreshPending) {
     pairRefreshPending = true;
     void refreshStatus().catch(() => {}).finally(() => { pairRefreshPending = false; });
   }
 }
 function requireCurrentPair(value) {
-  if (!IndexPin.equal(value?.revision, status?.revision)) { unexpectedPair(); throw new Error("Index snapshot changed. Refresh status."); }
+  if (!IndexPin.equal(value?.revision, status?.revision)) { unexpectedPair(undefined, value?.revision); throw new Error("Index snapshot changed. Refresh status."); }
   return value;
 }
 async function loadSaved() {
@@ -317,7 +332,7 @@ function callRow(call, view, ancestors, level, expandable) {
           const serial = querySerial, selection = questionSerial;
           const data = await api("/api/query", "POST", {seed: target.id, depth: 1, maxNodes: 40, maxCalls: 200, includeCallbacks: false, excludePaths: []});
           if (serial !== querySerial || selection !== questionSerial || !li.isConnected) return;
-          if (!IndexPin.equal(data.revision, view.revision) || (status && !IndexPin.equal(data.revision, status.revision))) { unexpectedPair("Index changed. Refresh before expanding this branch."); return; }
+          if (!IndexPin.equal(data.revision, view.revision) || (status && !IndexPin.equal(data.revision, status.revision))) { unexpectedPair("Index changed. Refresh before expanding this branch.", data.revision); return; }
           const path = new Set(ancestors); path.add(target.id);
           for (const child of data.calls.filter(c => c.caller === target.id)) branch.append(callRow(child, data, path, level + 1, true));
           if (!branch.children.length) branch.append(element("li", "No measured outgoing calls."));
@@ -338,7 +353,7 @@ async function showSource(item, revision) {
   $("source-path").textContent = `Loading ${item.path}…`; $("source").replaceChildren();
   const data = sourceCache.get(key) || await api(`/api/source?path=${encodeURIComponent(item.path)}&${IndexPin.query(revision)}`);
   if (serial !== sourceSerial || !IndexPin.equal(status?.revision, revision)) return;
-  if (!IndexPin.equal(data.revision, revision) || !IndexPin.equal(status?.revision, revision)) { void refreshStatus().catch(() => {}); throw new Error("Source snapshot changed. Refresh status."); }
+  if (!IndexPin.equal(data.revision, revision) || !IndexPin.equal(status?.revision, revision)) { unexpectedPair("Source snapshot changed. Refresh status.", data.revision); throw new Error("Source snapshot changed. Refresh status."); }
   sourceCache.set(key, data);
   $("source-path").textContent = `${data.file.path} · revision ${IndexPin.label(data.revision)} · cached snapshot`;
   const fragment = document.createDocumentFragment();
@@ -482,7 +497,7 @@ form("question-form", async () => {
     evidenceDepth: Number($("evidence-depth").value), maxVisible: Number($("max-visible").value),
     allowDeeperDisplay: $("allow-deeper").checked, focusTerms: terms});
   if (serial !== questionSerial || queryAtStart !== querySerial || seed !== selectedSeed || !IndexPin.equal(status?.revision, revision)) return;
-  if (!IndexPin.equal(data.packet.revision, revision) || !IndexPin.equal(data.view.revision, revision)) { unexpectedPair("Preview revision changed. Refresh and try again."); throw new Error("Preview revision changed. Refresh and try again."); }
+  if (!IndexPin.equal(data.packet.revision, revision) || !IndexPin.equal(data.view.revision, revision)) { unexpectedPair("Preview revision changed. Refresh and try again.", data.packet.revision); throw new Error("Preview revision changed. Refresh and try again."); }
   packet = data.packet; focused = data.view;
   $("focus-state").textContent = `Local preview—not Jev/ACP · deterministic term matching · revision ${IndexPin.label(revision)}. ${packet.warnings?.map(describe).join(" · ") || ""}`;
   renderResult();
@@ -518,7 +533,7 @@ $("import-jev").addEventListener("change", () => {
     if (epoch !== session || packet !== current || serial !== questionSerial) return;
     const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/jev-response`, "POST", data);
     if (packet !== current || serial !== questionSerial) return;
-    if (!IndexPin.equal(response.view.revision, status?.revision)) { unexpectedPair(); throw new Error("Imported Jev revision changed. Refresh status."); }
+    if (!IndexPin.equal(response.view.revision, status?.revision)) { unexpectedPair(undefined, response.view.revision); throw new Error("Imported Jev revision changed. Refresh status."); }
     clearSource(); focused = response.view;
     $("focus-state").textContent = "Imported Jev · user-supplied, unverified response. No live Jev/ACP call was made.";
     renderResult();
@@ -538,7 +553,7 @@ $("run-jev").addEventListener("click", () => perform(async () => {
   try {
     const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/jev-run`, "POST", {});
     if (packet !== current || serial !== questionSerial) return;
-    if (!IndexPin.equal(response.view.revision, status?.revision)) { unexpectedPair(); throw new Error("Jev revision changed. Refresh status."); }
+    if (!IndexPin.equal(response.view.revision, status?.revision)) { unexpectedPair(undefined, response.view.revision); throw new Error("Jev revision changed. Refresh status."); }
     clearSource(); focused = response.view;
     $("focus-state").textContent = `Live Jev · provider selection, not proof of correctness or execution order · revision ${IndexPin.label(response.view.revision)} · ${response.latencyMs} ms.`;
     renderResult();
@@ -622,7 +637,7 @@ $("explain-acp").addEventListener("click", () => perform(async () => {
     const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/acp-answer`, "POST", {});
     if (!currentRequest()) return;
     if (!IndexPin.equal(response.revision, status?.revision)) {
-      unexpectedPair("ACP answer provenance does not match this packet. Refresh status.");
+      unexpectedPair("ACP answer provenance does not match this packet. Refresh status.", response.revision);
       $("answer-state").textContent = "ACP answer provenance does not match this packet. Refresh status.";
       $("error").textContent = $("answer-state").textContent; $("error").hidden = false;
       throw new Error("ACP answer provenance does not match this packet. Refresh status.");
@@ -687,7 +702,7 @@ async function loadFiles(reset = false) {
   await browseRequest(async () => {
     const data = await api(`/api/files?${IndexPin.query(revision)}&offset=${offset}&limit=200`);
     if (!current()) return;
-    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(); throw new Error("File catalog revision does not match. Refresh status."); }
+    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("File catalog revision does not match. Refresh status."); }
     const hadFiles = files.length > 0;
     const known = new Set(files.map(f => f.path));
     files.push(...data.items.filter(f => !known.has(f.path)));
@@ -747,7 +762,7 @@ async function toggleFile(file) {
   try {
     const data = await api(`/api/methods?${IndexPin.query(revision)}&path=${encodeURIComponent(file.path)}`);
     if (!current()) return;
-    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(); throw new Error("Methods revision mismatch. Refresh status."); }
+    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("Methods revision mismatch. Refresh status."); }
     state.items = data.items; state.truncated = data.truncated;
   } catch (error) {
     if (!current() || error.name === "AbortError") return;
@@ -775,7 +790,7 @@ async function loadSequence() {
   await browseRequest(async () => {
     const data = await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked});
     if (!current()) return;
-    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
+    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     const options = {showDetails: !!$("all-steps").checked};
@@ -941,7 +956,7 @@ async function loadDirectory(path, reset = false) {
     try {
       const data = await api(`/api/tree?path=${encodeURIComponent(path)}&offset=${offset}&limit=200`);
       if (!current()) return;
-      if (!IndexPin.equal(data.revision, status.revision)) { unexpectedPair(); throw new Error("Index changed. Refresh status before browsing methods."); }
+      if (!IndexPin.equal(data.revision, status.revision)) { unexpectedPair(undefined, data.revision); throw new Error("Index changed. Refresh status before browsing methods."); }
       if (data.path !== path) throw new Error("Directory response does not match the requested path.");
       if (treeRoot !== null && treeRoot !== data.root) {
         clearBrowse("Browser root changed. Choose a method again.");
@@ -955,7 +970,7 @@ async function loadDirectory(path, reset = false) {
         const page = await api(`/api/tree?path=${encodeURIComponent(path)}&offset=${next}&limit=200`);
         if (!current()) return;
         if (page.root !== data.root || page.path !== path || !IndexPin.equal(page.revision, data.revision) || (page.nextOffset != null && page.nextOffset <= next))
-          { unexpectedPair(); throw new Error("Directory changed while refreshing. Retry folder."); }
+          { unexpectedPair(undefined, page.revision); throw new Error("Directory changed while refreshing. Retry folder."); }
         data.items.push(...page.items); data.nextOffset = page.nextOffset; data.truncated ||= page.truncated;
       }
       // Keep per-file and child expansion state.
@@ -1248,7 +1263,7 @@ async function refreshDependencies() {
   try {
     const data = await api("/api/dependencies");
     if (!current()) return;
-    if (!IndexPin.equal(data.workspaceRevision, status.revision)) { unexpectedPair(); throw new Error("Library catalog belongs to another workspace revision. Refresh workspace status."); }
+    if (!IndexPin.equal(data.workspaceRevision, status.revision)) { unexpectedPair(undefined, data.workspaceRevision); throw new Error("Library catalog belongs to another workspace revision. Refresh workspace status."); }
     if (!["disabled", "loading", "ready", "failed"].includes(data.state)) throw new Error("Library catalog status unavailable.");
     const catalogChanged = dependencyCatalog?.catalogId !== data.catalogId;
     if (catalogChanged || data.state !== "ready") {
@@ -1299,7 +1314,7 @@ async function loadDependencySymbols(offset = 0, query = dependencyQuery) {
   try {
     const data = await api(`/api/dependencies/symbols?catalogId=${encodeURIComponent(catalogId)}&packageId=${encodeURIComponent(pkg.id)}&q=${encodeURIComponent(query)}&offset=${offset}&limit=100`);
     if (!current()) return;
-    if (!IndexPin.equal(data.workspaceRevision, status.revision)) { unexpectedPair(); throw new Error("Library definition revision changed. Refresh workspace status."); }
+    if (!IndexPin.equal(data.workspaceRevision, status.revision)) { unexpectedPair(undefined, data.workspaceRevision); throw new Error("Library definition revision changed. Refresh workspace status."); }
     if (data.catalogId !== catalogId || data.items.some(item => item.packageId !== pkg.id)) throw new Error("Library definition provenance mismatch. Refresh library status.");
     dependencyOffset = offset; dependencyNext = data.nextOffset; dependencyQuery = query;
     for (const symbol of data.items) {

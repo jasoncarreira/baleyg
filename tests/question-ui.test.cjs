@@ -429,3 +429,47 @@ test("preview and live provider responses reject reused revisions and refresh au
    else assert.equal(requests[0].url,`/api/questions/p/${operation==='jev'?'jev-run':'acp-answer'}`);
  }
 });
+
+
+test("export and import refuse a stale packet before any provider request", async () => {
+ const h=harness(), requests=[];
+ const old={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ const next={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+ h.run(`packet={packetId:'p',revision:${JSON.stringify(old)},request:{seed:'root'}};status={revision:${JSON.stringify(next)}};syncFocusControls()`);
+ h.context.fetch=async url=>{requests.push(url);throw Error('unexpected provider request')};
+ await h.get('export-jev').listeners.click();
+ h.get('import-jev').files=[{size:10,text:async()=>'{"selection":[]}'}];
+ h.get('import-jev').listeners.change();await new Promise(setImmediate);
+ assert.deepEqual(requests,[]);
+ assert.match(h.get('error').textContent,/stale/);
+});
+
+test("export request GET and import selection POST preserve unchanged wire payloads", async () => {
+ const h=harness(), calls=[];
+ h.run(`packet={packetId:'p',revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},request:{seed:'root'}};syncFocusControls()`);
+ h.context.fetch=async(url,options)=>{
+   calls.push({url,method:options.method,body:options.body});
+   if(url.endsWith('/jev-request'))return {ok:true,status:200,json:async()=>({packetId:'p'})};
+   return {ok:true,status:200,json:async()=>({view:{revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},calls:[],nodes:[]}})};
+ };
+ await h.get('export-jev').listeners.click();
+ h.get('import-jev').files=[{size:20,text:async()=>'{"selectedCallIds":["call"]}'}];
+ h.get('import-jev').listeners.change();await new Promise(setImmediate);
+ assert.deepEqual(calls.map(c=>c.url),['/api/questions/p/jev-request','/api/questions/p/jev-response']);
+ assert.equal(calls[0].method,'GET');assert.equal(calls[0].body,undefined);
+ assert.equal(calls[1].method,'POST');assert.equal(calls[1].body,'{"selectedCallIds":["call"]}');
+});
+
+
+test("selection guards fail closed when the seed, question, or generation changes", async () => {
+ for(const mutation of ["seed='other'", "$('question-form').listeners.input()", "status={revision:{indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1}}"]){
+   const h=harness(), calls=[];
+   h.run(`packet={packetId:'p',revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},request:{seed:'root'}};jevStatus={enabled:true,budget:{remainingCents:10}};syncFocusControls()`);
+   h.context.fetch=async url=>{calls.push(url);throw Error('no provider request expected')};
+   h.run(mutation);
+   await h.get('run-jev').listeners.click();
+   await h.get('export-jev').listeners.click();
+   assert.deepEqual(calls,[]);
+   assert.match(h.get('error').textContent,/stale|first/);
+ }
+});

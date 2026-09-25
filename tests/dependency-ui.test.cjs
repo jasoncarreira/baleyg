@@ -241,3 +241,28 @@ test("library status and definition pages reject reused numeric revisions, clear
    assert.equal(h.get('dependency-symbols').children.length,0,boundary);
  }
 });
+
+
+test("late external-source catalog response cannot paint after same-number new-generation refresh", async()=>{
+ const h=harness(), pendingSource=deferred(), requests=[];
+ await select(h);
+ h.run("status.workspaceRoot='/same'");
+ const old=h.run('status.revision');
+ const next={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+ h.context.fetch=async url=>{
+   requests.push(url);
+   if(url.startsWith('/api/dependencies/source?')) return pendingSource.promise;
+   if(url==='/api/status') return response({workspaceRoot:'/same',revision:next,stats:{}});
+   if(url.startsWith('/api/tree?')) return response({path:'',root:'/same',indexedWorkspace:'/same',revision:next,items:[],nextOffset:null});
+   if(url==='/api/dependencies') return response({...catalog(),workspaceRevision:next});
+   throw Error(url);
+ };
+ const loading=h.run(`loadDependencySource(${JSON.stringify(symbol)})`);
+ assert.match(requests[0],/^\/api\/dependencies\/source\?catalogId=catalog-1&sourceRef=immutable-ref$/);
+ assert.doesNotMatch(requests[0],/indexGeneration|indexRevision/);
+ await h.run('refreshStatus()');
+ pendingSource.resolve(response(snapshot()));await loading;
+ assert.equal(h.run('status.revision.indexGeneration'),next.indexGeneration);
+ assert.equal(h.run('externalSnapshot'),null);
+ assert.equal(h.get('external-source').children.length,0);
+});
