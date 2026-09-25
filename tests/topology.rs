@@ -682,7 +682,7 @@ fn durable_git_move_and_copy_share_payload_without_rewriting() {
         .unwrap();
     assert_eq!(
         DurableRecords::new(&roots, &copy).annotations().unwrap(),
-        vec![note]
+        vec![note.clone()]
     );
     assert!(
         DurableRecords::new(&roots, &original)
@@ -690,12 +690,33 @@ fn durable_git_move_and_copy_share_payload_without_rewriting() {
             .is_err()
     );
     let db = rusqlite::Connection::open(roots.record_db(&copy)).unwrap();
-    assert_eq!(
-        db.query_row("SELECT count(*) FROM known_roots", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        2
-    );
+    let rows: Vec<(String, String, String)> = db
+        .prepare("SELECT path,device,inode FROM known_roots ORDER BY path")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut expected = vec![
+        (
+            original.root.to_str().unwrap().to_owned(),
+            original.device.to_string(),
+            original.inode.to_string(),
+        ),
+        (
+            moved_id.root.to_str().unwrap().to_owned(),
+            moved_id.device.to_string(),
+            moved_id.inode.to_string(),
+        ),
+    ];
+    expected.sort();
+    assert_eq!(rows, expected);
+    let payload: String = db
+        .query_row("SELECT payload FROM annotations WHERE id='note'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(payload, serde_json::to_string(&note).unwrap());
 }
 
 #[test]
@@ -723,4 +744,332 @@ fn durable_incomplete_and_incompatible_refused() {
     drop(db);
     drop(_lock);
     assert!(DurableRecords::new(&roots, &id).annotations().is_err());
+}
+
+#[test]
+fn durable_absent_parent_is_verified() {
+    use baleyg::store::topology::DurableRecords;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    fs::create_dir(&roots.data).unwrap();
+    fs::set_permissions(&roots.data, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(DurableRecords::new(&roots, &id).views().is_err());
+    fs::set_permissions(&roots.data, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(roots.data.join("workspaces")).unwrap();
+    fs::set_permissions(
+        roots.data.join("workspaces"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(
+        DurableRecords::new(&roots, &id)
+            .delete_view("absent")
+            .is_err()
+    );
+    fs::remove_dir(roots.data.join("workspaces")).unwrap();
+    std::os::unix::fs::symlink(temp.path(), roots.data.join("workspaces")).unwrap();
+    assert!(DurableRecords::new(&roots, &id).annotations().is_err());
+}
+
+#[test]
+fn durable_existing_lock_unlink_never_recreates() {
+    use baleyg::store::topology::DurableRecords;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let note = baleyg::model::Annotation {
+        id: "n".into(),
+        node_id: "node".into(),
+        body: "body".into(),
+    };
+    DurableRecords::new(&roots, &id)
+        .put_annotation(&note)
+        .unwrap();
+    let lock = roots.record_use_lock(&id);
+    assert!(
+        UseGuard::acquire_existing_with_hook(&lock, false, false, || {
+            fs::remove_file(&lock)?;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(!lock.exists(), "existing-only reopen created a lock");
+    assert!(DurableRecords::new(&roots, &id).annotations().is_err());
+    assert!(!lock.exists(), "durable read created a lock");
+    assert!(
+        DurableRecords::new(&roots, &id)
+            .delete_annotation("n")
+            .is_err()
+    );
+    assert!(!lock.exists(), "durable delete created a lock");
+}
+
+#[test]
+fn durable_existing_lock_replacement_checks_new_inode_and_holder() {
+    use std::io::{BufRead, BufReader};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    roots.prepare_records(&id).unwrap();
+    let lock = roots.record_use_lock(&id);
+    drop(roots.record_use(&id, true).unwrap());
+    let mut child = None;
+    let mut reader = None;
+    let result = UseGuard::acquire_existing_with_hook(&lock, false, true, || {
+        fs::remove_file(&lock)?;
+        drop(roots.record_use(&id, true)?);
+        let mut process = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("shared_holder_child")
+            .arg("--nocapture")
+            .env("TOPOLOGY_SHARED_HOLDER", &lock)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut output = BufReader::new(process.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(output.read_line(&mut line)?, 0);
+            if line.contains("SHARED_HELD") {
+                break;
+            }
+        }
+        reader = Some(output);
+        child = Some(process);
+        Ok(())
+    });
+    // The replacement is held shared. An exclusive acquisition must not use the old inode.
+    assert!(result.is_ok());
+    let process = child.as_mut().unwrap();
+    assert!(
+        UseGuard::acquire_existing(&lock, true, true)
+            .unwrap_err()
+            .to_string()
+            .contains("storage_busy")
+    );
+    process.stdin.take().unwrap().write_all(&[1]).unwrap();
+    assert!(process.wait().unwrap().success());
+}
+
+#[test]
+fn durable_annotation_first_commit_fault_and_sync_fault() {
+    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let note = Annotation {
+        id: "first".into(),
+        node_id: "node".into(),
+        body: "original".into(),
+    };
+    let records = DurableRecords::new(&roots, &id);
+    assert!(
+        records
+            .put_annotation_with_first_save_hook(&note, |phase| {
+                if phase == "before_commit" {
+                    anyhow::bail!("injected commit fault")
+                }
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("injected commit fault")
+    );
+    assert!(
+        records
+            .annotations()
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete_record")
+    );
+    assert!(
+        records.put_annotation(&note).is_err(),
+        "must not heal incomplete record"
+    );
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &id);
+    assert!(
+        records
+            .put_annotation_with_first_save_hook(&note, |phase| {
+                if phase == "before_sync" {
+                    anyhow::bail!("injected sync fault")
+                }
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("injected sync fault")
+    );
+    // A committed record is not silently erased or described as incomplete after sync refusal.
+    assert_eq!(records.annotations().unwrap(), vec![note]);
+}
+
+#[test]
+fn durable_creator_child() {
+    if let Some(base) = std::env::var_os("TOPOLOGY_DURABLE_CHILD") {
+        use baleyg::{model::Annotation, store::topology::DurableRecords};
+        let base = Path::new(&base);
+        let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+            base.join("cache"),
+            base.join("data"),
+        );
+        let work = base.join("work");
+        let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        let note = Annotation {
+            id: "loser".into(),
+            node_id: "node".into(),
+            body: "second".into(),
+        };
+        assert!(
+            DurableRecords::new(&roots, &id)
+                .put_annotation(&note)
+                .unwrap_err()
+                .to_string()
+                .contains("storage_busy")
+        );
+        println!("CREATOR_BUSY");
+        std::io::stdout().flush().unwrap();
+        let mut byte = [0];
+        std::io::stdin().read_exact(&mut byte).unwrap();
+        DurableRecords::new(&roots, &id)
+            .put_annotation(&note)
+            .unwrap();
+        println!("CREATOR_RETRIED");
+    }
+}
+
+#[test]
+fn durable_first_creator_process_contention_and_retry() {
+    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    use std::io::{BufRead, BufReader};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let lock = roots.record_use(&id, true).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("durable_creator_child")
+        .arg("--nocapture")
+        .env("TOPOLOGY_DURABLE_CHILD", temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(output.read_line(&mut line).unwrap(), 0);
+        if line.contains("CREATOR_BUSY") {
+            break;
+        }
+    }
+    drop(lock);
+    let first = Annotation {
+        id: "winner".into(),
+        node_id: "node".into(),
+        body: "first".into(),
+    };
+    DurableRecords::new(&roots, &id)
+        .put_annotation(&first)
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&[1]).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        DurableRecords::new(&roots, &id)
+            .annotations()
+            .unwrap()
+            .len(),
+        2
+    );
+    let db = rusqlite::Connection::open(roots.record_db(&id)).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM record_metadata", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn durable_non_git_move_retains_old_record_and_root_row() {
+    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let old = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let note = Annotation {
+        id: "n".into(),
+        node_id: "node".into(),
+        body: "unchanged".into(),
+    };
+    DurableRecords::new(&roots, &old)
+        .put_annotation(&note)
+        .unwrap();
+    let old_db = roots.record_db(&old);
+    fs::rename(&work, temp.path().join("moved")).unwrap();
+    let moved_path = temp.path().join("moved");
+    let moved = WorkspaceIdentity::discover(Some(&moved_path), &moved_path).unwrap();
+    assert_ne!(old.record_id, moved.record_id);
+    assert!(
+        DurableRecords::new(&roots, &moved)
+            .annotations()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(old_db.exists());
+    let db = rusqlite::Connection::open(&old_db).unwrap();
+    let saved: (String, String, String) = db
+        .query_row("SELECT path,device,inode FROM known_roots", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(
+        saved,
+        (
+            old.root.to_str().unwrap().into(),
+            old.device.to_string(),
+            old.inode.to_string()
+        )
+    );
+    let payload: String = db
+        .query_row("SELECT payload FROM annotations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Annotation>(&payload).unwrap(), note);
+}
+
+#[test]
+fn durable_marker_change_refuses_real_operation() {
+    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    common::private(&work.join(".git"));
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let note = Annotation {
+        id: "n".into(),
+        node_id: "node".into(),
+        body: "body".into(),
+    };
+    DurableRecords::new(&roots, &id)
+        .put_annotation(&note)
+        .unwrap();
+    fs::write(
+        work.join(".git/baleyg/workspace-id"),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    assert!(DurableRecords::new(&roots, &id).annotations().is_err());
+    assert!(
+        DurableRecords::new(&roots, &id)
+            .put_annotation(&note)
+            .is_err()
+    );
+    assert!(
+        DurableRecords::new(&roots, &id)
+            .delete_annotation("n")
+            .is_err()
+    );
 }

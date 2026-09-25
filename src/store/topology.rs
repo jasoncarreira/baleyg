@@ -598,6 +598,26 @@ impl UseGuard {
         nonblocking: bool,
         after_open: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
+        Self::acquire_mode(path, exclusive, nonblocking, true, after_open)
+    }
+    pub fn acquire_existing_with_hook(
+        path: &Path,
+        exclusive: bool,
+        nonblocking: bool,
+        after_open: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
+        Self::acquire_mode(path, exclusive, nonblocking, false, after_open)
+    }
+    pub fn acquire_existing(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Self> {
+        Self::acquire_existing_with_hook(path, exclusive, nonblocking, || Ok(()))
+    }
+    fn acquire_mode(
+        path: &Path,
+        exclusive: bool,
+        nonblocking: bool,
+        create: bool,
+        after_open: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         let flags = (if exclusive {
             libc::LOCK_EX
         } else {
@@ -605,7 +625,7 @@ impl UseGuard {
         }) | (if nonblocking { libc::LOCK_NB } else { 0 });
         let mut hook = Some(after_open);
         for _ in 0..20 {
-            let file = open_file(path, true)?;
+            let file = open_file(path, create)?;
             if let Some(after_open) = hook.take() {
                 after_open()?;
             }
@@ -683,6 +703,13 @@ impl<'a> DurableRecords<'a> {
     fn existing(&self) -> Result<bool> {
         self.identity.verify()?;
         self.roots.reject_root_overlap(self.identity)?;
+        for parent in [&self.roots.data, &self.roots.data.join("workspaces")] {
+            match fs::symlink_metadata(parent) {
+                Ok(_) => private_dir(parent)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+        }
         match fs::symlink_metadata(self.roots.record_dir(self.identity)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
@@ -695,11 +722,8 @@ impl<'a> DurableRecords<'a> {
         }
     }
     fn lock_existing(&self) -> Result<UseGuard> {
-        ensure!(
-            self.roots.record_use_lock(self.identity).exists(),
-            "incomplete_record: missing use lock"
-        );
-        UseGuard::acquire(&self.roots.record_use_lock(self.identity), false, false)
+        UseGuard::acquire_existing(&self.roots.record_use_lock(self.identity), false, false)
+            .context("incomplete_record: missing or unsafe use lock")
     }
     fn db(&self, writable: bool) -> Result<rusqlite::Connection> {
         use rusqlite::{Connection, OpenFlags};
@@ -732,6 +756,7 @@ impl<'a> DurableRecords<'a> {
         let journal: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
         ensure!(journal == "delete", "incompatible_record: journal mode");
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        ensure!(version != 0, "incomplete_record: schema not committed");
         ensure!(version == 1, "incompatible_record: schema version");
         let row: (i64, String, i64) = db.query_row("SELECT schema_version,record_id,initialized FROM record_metadata WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("incomplete_record: metadata")?;
         ensure!(
@@ -745,6 +770,16 @@ impl<'a> DurableRecords<'a> {
         Ok(db)
     }
     fn save(&self, table: &str, id: &str, node: Option<&str>, payload: String) -> Result<()> {
+        self.save_with_first_save_hook(table, id, node, payload, |_| Ok(()))
+    }
+    fn save_with_first_save_hook(
+        &self,
+        table: &str,
+        id: &str,
+        node: Option<&str>,
+        payload: String,
+        mut hook: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
         use rusqlite::{Connection, TransactionBehavior};
         let exists = self.existing()?;
         if !exists {
@@ -780,8 +815,10 @@ impl<'a> DurableRecords<'a> {
             self.write_root(&tx)?;
             self.identity.verify()?;
             guard.verify()?;
+            hook("before_commit")?;
             tx.commit()?;
             drop(db);
+            hook("before_sync")?;
             open_file(&path, false)?.sync_all()?;
             sync_directory(&self.roots.record_dir(self.identity))?;
             sync_directory(&self.roots.data.join("workspaces"))?;
@@ -853,12 +890,21 @@ impl<'a> DurableRecords<'a> {
         self.save("views", &view.id, None, serde_json::to_string(view)?)
     }
     pub fn put_annotation(&self, annotation: &crate::model::Annotation) -> Result<()> {
+        self.put_annotation_with_first_save_hook(annotation, |_| Ok(()))
+    }
+    /// Fixture fault at the first record's commit or post-commit sync boundary.
+    pub fn put_annotation_with_first_save_hook(
+        &self,
+        annotation: &crate::model::Annotation,
+        hook: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
         annotation.validate()?;
-        self.save(
+        self.save_with_first_save_hook(
             "annotations",
             &annotation.id,
             Some(&annotation.node_id),
             serde_json::to_string(annotation)?,
+            hook,
         )
     }
     fn delete(&self, table: &str, id: &str) -> Result<bool> {
