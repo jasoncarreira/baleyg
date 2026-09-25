@@ -69,6 +69,7 @@ fn normative_vectors_then_synthetic() {
     all_64_normative_vectors();
     synthetic_lookup_spellings_and_occurrence_namespaces();
     synthetic_ordinals_and_canonical_control_escapes();
+    synthetic_anchor_transitions_and_candidate_integrity();
 }
 
 fn all_64_normative_vectors() {
@@ -270,6 +271,18 @@ fn synthetic_lookup_spellings_and_occurrence_namespaces() {
         ids::occurrence_id(&r1, &owner, OccurrenceKind::Reference, zero).unwrap()
     );
     assert!(ids::lookup_key(Language::Javascript, "\\u{110000}").is_err());
+    let mut registry = ids::CollisionRegistry::default();
+    let bytes = ids::canonical_json(&json!({"name": "exact"})).unwrap();
+    registry.syntax(&owner, bytes.clone()).unwrap();
+    registry.syntax(&owner, bytes).unwrap();
+    assert!(
+        registry
+            .syntax(
+                &owner,
+                ids::canonical_json(&json!({"name": "different"})).unwrap()
+            )
+            .is_err()
+    );
 }
 
 fn synthetic_ordinals_and_canonical_control_escapes() {
@@ -316,4 +329,123 @@ fn synthetic_ordinals_and_canonical_control_escapes() {
             .unwrap(),
         "{\"a\":null,\"z\":\"\\u000a\\u0009\\\"\\\\\u{2028}\"}"
     );
+}
+
+fn synthetic_anchor_transitions_and_candidate_integrity() {
+    use v1::{AnchorReason as Reason, AnchorStatus as Status, ContinuityState};
+    let vectors: Vectors = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/id-test-vectors/stable-ids.json"
+    ))
+    .unwrap();
+    let baseline = &vectors.cases[0];
+    let duplicate = &vectors.cases[8];
+    let original = baseline.expected.anchor.clone();
+    let document = &original.document;
+    let revision = Text::new("synthetic-r2").unwrap();
+    let header = baseline.descriptor.header.clone();
+    let other = vectors.cases[2].descriptor.header.clone();
+    assert_ne!(header, other);
+    let candidate = |h: Header, group: Vec<Header>| vec![(original.syntax_id.clone(), h, group)];
+    let audit = |rows: Vec<(SyntaxId, Header, Vec<Header>)>| {
+        ids::evaluate_anchor(&original, document, &revision, &rows, None).unwrap()
+    };
+    let attached = audit(candidate(header.clone(), vec![header.clone()]));
+    assert_eq!(attached.status, Status::Attached);
+    assert_eq!(attached.target_id, Some(original.syntax_id.clone()));
+    assert_eq!(audit(vec![]).reason, Reason::Missing);
+    // An earlier same-key declaration inherits the old ordinal but not its header.
+    assert_eq!(
+        audit(candidate(
+            other.clone(),
+            vec![other.clone(), header.clone()]
+        ))
+        .reason,
+        Reason::HeaderMismatch
+    );
+    // A duplicate of the old header changes the group, never the captured anchor.
+    assert_eq!(
+        audit(candidate(
+            header.clone(),
+            vec![header.clone(), header.clone()]
+        ))
+        .reason,
+        Reason::GroupChanged
+    );
+    assert_eq!(
+        audit(candidate(
+            header.clone(),
+            vec![header.clone(), other.clone()]
+        ))
+        .status,
+        Status::Attached
+    );
+    assert!(
+        ids::evaluate_anchor(
+            &original,
+            document,
+            &revision,
+            &candidate(header.clone(), vec![other.clone()]),
+            None
+        )
+        .is_err()
+    );
+    let repeated = candidate(header.clone(), vec![header.clone()]);
+    assert!(
+        ids::evaluate_anchor(
+            &original,
+            document,
+            &revision,
+            &[repeated[0].clone(), repeated[0].clone()],
+            None
+        )
+        .is_err()
+    );
+    assert_eq!(original, baseline.expected.anchor);
+
+    let captured = &duplicate.expected.anchor;
+    let duplicate_header = duplicate.descriptor.header.clone();
+    let rows = vec![(
+        captured.syntax_id.clone(),
+        duplicate_header.clone(),
+        vec![duplicate_header.clone(), duplicate_header.clone()],
+    )];
+    let evaluate = |group: Vec<Header>, proof: Option<&v1::GroupContinuity>| {
+        ids::evaluate_anchor(
+            captured,
+            &captured.document,
+            &revision,
+            &[(captured.syntax_id.clone(), duplicate_header.clone(), group)],
+            proof,
+        )
+        .unwrap()
+    };
+    // Equal hashes/counts cannot prove which indistinguishable AST member survived.
+    assert_eq!(
+        evaluate(rows[0].2.clone(), None).reason,
+        Reason::UnprovenContinuity
+    );
+    let unknown = v1::GroupContinuity {
+        from_revision_id: captured.captured_revision_id.clone(),
+        to_revision_id: revision.clone(),
+        state: ContinuityState::Unknown,
+        evidence: None,
+    };
+    assert_eq!(
+        evaluate(rows[0].2.clone(), Some(&unknown)).reason,
+        Reason::UnprovenContinuity
+    );
+    assert_eq!(
+        evaluate(vec![duplicate_header.clone(), other], Some(&unknown)).reason,
+        Reason::GroupChanged
+    );
+    let unchanged = v1::GroupContinuity {
+        state: ContinuityState::Unchanged,
+        evidence: Some(Text::new("independently witnessed ordered AST members").unwrap()),
+        ..unknown
+    };
+    assert_eq!(
+        evaluate(rows[0].2.clone(), Some(&unchanged)).status,
+        Status::Attached
+    );
+    assert_eq!(*captured, duplicate.expected.anchor);
 }

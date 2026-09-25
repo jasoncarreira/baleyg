@@ -422,12 +422,13 @@ pub fn evaluate_anchor(
         target_id: None,
         reason,
     };
-    let Some((_, header, group)) = candidates
+    let mut matching = candidates
         .iter()
-        .find(|(id, _, _)| id == &captured.syntax_id)
-    else {
+        .filter(|(id, _, _)| id == &captured.syntax_id);
+    let Some((_, header, group)) = matching.next() else {
         return Ok(orphan(Reason::Missing));
     };
+    ensure!(matching.next().is_none(), "duplicate candidate syntax ID");
     let current_header = header_digest(header)?.sha256;
     if current_header != captured.header_hash.as_str() {
         return Ok(orphan(Reason::HeaderMismatch));
@@ -436,6 +437,10 @@ pub fn evaluate_anchor(
         .iter()
         .map(|header| header_digest(header).map(|d| d.sha256))
         .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        hashes.iter().any(|hash| hash == &current_header),
+        "candidate absent from sibling group"
+    );
     let identical = hashes
         .iter()
         .filter(|hash| *hash == &current_header)
