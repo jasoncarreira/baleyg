@@ -134,7 +134,7 @@ pub struct CapturedSyntaxNode {
     pub name_bytes: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NativeCandidateKind {
     Declaration,
     Occurrence,
@@ -177,10 +177,14 @@ pub struct CapturedHeritageWitness {
 fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness> {
     let mut output = Vec::new();
     for node in nodes {
-        let declaration = is_declaration(&node.kind);
+        let declaration = is_declaration(&node.kind)
+            || matches!(
+                node.kind.as_str(),
+                "function_expression" | "generator_function" | "arrow_function"
+            );
         let invocation = matches!(
             node.kind.as_str(),
-            "call_expression" | "method_invocation" | "macro_invocation"
+            "call_expression" | "new_expression" | "method_invocation" | "macro_invocation"
         );
         let control = matches!(
             node.kind.as_str(),
@@ -189,6 +193,10 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 | "if_expression_statement"
                 | "else_clause"
                 | "for_statement"
+                | "for_in_statement"
+                | "do_statement"
+                | "switch_case"
+                | "switch_default"
                 | "for_expression"
                 | "while_statement"
                 | "while_expression"
@@ -201,13 +209,40 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 | "match_expression"
                 | "conditional_expression"
                 | "ternary_expression"
+                | "binary_expression"
+                | "statement_block"
+                | "expression_statement"
+                | "class_static_block"
         );
+        let graph_region = node.parent_id.is_some_and(|id| {
+            let parent = &nodes[id];
+            (matches!(parent.kind.as_str(), "if_statement" | "ternary_expression")
+                && matches!(
+                    node.field_name.as_deref(),
+                    Some("consequence" | "alternative")
+                ))
+                || (parent.kind == "binary_expression"
+                    && node.field_name.as_deref() == Some("right")
+                    && nodes.iter().any(|op| {
+                        op.parent_id == Some(id)
+                            && op.field_name.as_deref() == Some("operator")
+                            && matches!(op.source_bytes.as_slice(), b"&&" | b"||" | b"??")
+                    }))
+                || (parent.kind == "field_definition"
+                    && node.field_name.as_deref() == Some("value"))
+        });
         let occurrence = node.kind.contains("identifier");
-        if !declaration && !occurrence && !invocation && !control {
+        if !declaration && !occurrence && !invocation && !control && !graph_region {
             continue;
         }
         let mut owner = node.parent_id.unwrap_or(0);
-        while owner > 0 && !is_declaration(&nodes[owner].kind) {
+        while owner > 0
+            && !is_declaration(&nodes[owner].kind)
+            && !matches!(
+                nodes[owner].kind.as_str(),
+                "function_expression" | "generator_function" | "arrow_function"
+            )
+        {
             owner = nodes[owner].parent_id.unwrap_or(0);
         }
         let name_node = if declaration {
@@ -235,11 +270,13 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         } else {
             None
         };
-        // A typed declaration without a measured name is still present in
-        // syntax, but cannot supply an exact declaration witness. In particular,
-        // let_declaration and lexical_declaration own patterns/declarators rather
-        // than a direct name field.
-        if declaration && name_node.is_none() {
+        // Anonymous JavaScript function expressions and arrows are still measured
+        // declaration sites: their source header and parent give an exact key.
+        let anonymous = matches!(
+            node.kind.as_str(),
+            "function_expression" | "generator_function" | "arrow_function"
+        );
+        if declaration && name_node.is_none() && !anonymous {
             continue;
         }
         let token = name_node.unwrap_or(node);
@@ -259,6 +296,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         let prefix_len = header_end
             .saturating_sub(node.start_byte)
             .min(node.source_bytes.len());
+        let extra_region = graph_region && (declaration || invocation || occurrence);
         output.push(CapturedNativeWitness {
             node_id: node.id,
             parent_id: node.parent_id,
@@ -267,7 +305,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 NativeCandidateKind::Declaration
             } else if invocation {
                 NativeCandidateKind::Invocation
-            } else if control {
+            } else if control || graph_region {
                 NativeCandidateKind::ControlRegion
             } else {
                 NativeCandidateKind::Occurrence
@@ -289,6 +327,11 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
             spelling: None,
             verified_member_token: false,
         });
+        if extra_region {
+            let mut region = output.last().unwrap().clone();
+            region.candidate_kind = NativeCandidateKind::ControlRegion;
+            output.push(region);
+        }
     }
     output
 }
@@ -307,8 +350,7 @@ fn identify_javascript(document: &mut CapturedDocument, revision_id: &str) -> Re
         ordinal: crate::model::v1::UInt::new(0).unwrap(),
     };
     let module_id = identity::syntax_id(source_set, path, Language::Javascript, &[], &module)?;
-    let mut keys: HashMap<usize, Key> = HashMap::new();
-    let mut declarations: Vec<(usize, Vec<Key>, Key, u64, u64)> = Vec::new();
+    let mut declarations: Vec<(usize, Key, u64, u64)> = Vec::new();
     for witness in &document.native_candidates {
         if witness.candidate_kind != NativeCandidateKind::Declaration {
             continue;
@@ -319,78 +361,120 @@ fn identify_javascript(document: &mut CapturedDocument, revision_id: &str) -> Re
             "function_declaration"
             | "generator_function_declaration"
             | "function_expression"
-            | "generator_function" => Kind::Function,
+            | "generator_function"
+            | "arrow_function" => Kind::Function,
             _ => continue,
         };
-        let Ok(name) = std::str::from_utf8(&witness.name_bytes) else {
-            continue;
-        };
-        // A computed method name or destructuring pattern is not a named declaration.
-        if !nodes.iter().any(|n| {
-            n.parent_id == Some(witness.node_id)
-                && n.start_byte == witness.token_start_byte
-                && n.end_byte == witness.token_end_byte
-                && matches!(
-                    n.kind.as_str(),
-                    "identifier" | "property_identifier" | "private_property_identifier"
-                )
-        }) {
-            continue;
-        }
-        let mut ancestors = vec![module.clone()];
-        let mut parent = witness.parent_id;
-        while let Some(id) = parent {
-            if let Some(key) = keys.get(&id) {
-                ancestors.push(key.clone());
+        let anonymous = matches!(
+            witness.node_kind.as_str(),
+            "function_expression" | "generator_function" | "arrow_function"
+        ) && witness.token_start_byte == witness.start_byte
+            && witness.token_end_byte == witness.end_byte;
+        let name = if anonymous {
+            None
+        } else {
+            let Ok(name) = std::str::from_utf8(&witness.name_bytes) else {
+                continue;
+            };
+            if !nodes.iter().any(|n| {
+                n.parent_id == Some(witness.node_id)
+                    && n.start_byte == witness.token_start_byte
+                    && n.end_byte == witness.token_end_byte
+                    && matches!(
+                        n.kind.as_str(),
+                        "identifier" | "property_identifier" | "private_property_identifier"
+                    )
+            }) {
+                continue;
             }
-            parent = nodes[id].parent_id;
-        }
-        ancestors[1..].reverse();
-        let key = Key {
-            kind,
-            name: Some(Text::new(name.to_owned()).context("invalid JS declaration name")?),
-            signature: None,
-            ordinal: crate::model::v1::UInt::new(0).unwrap(),
+            Some(Text::new(name.to_owned()).context("invalid JS declaration name")?)
         };
         declarations.push((
             witness.node_id,
-            ancestors,
-            key,
+            Key {
+                kind: if anonymous {
+                    Kind::AnonymousFunction
+                } else {
+                    kind
+                },
+                name,
+                signature: None,
+                ordinal: crate::model::v1::UInt::new(0).unwrap(),
+            },
             witness.start_byte as u64,
             witness.end_byte as u64,
         ));
-        // The ordinal is filled after all declarations are grouped below.
-        keys.insert(witness.node_id, declarations.last().unwrap().2.clone());
     }
-    // Parents must receive their final ordinal before children acquire ancestor keys.
+    // Resolve each depth independently: sibling grouping sees the finalized
+    // immediate-parent key, never an ancestor placeholder ordinal.
     let mut ids = HashMap::from([(0usize, module_id.as_str().to_owned())]);
     let mut resolved: HashMap<usize, Key> = HashMap::new();
-    declarations.sort_by_key(|(id, _, _, _, _)| nodes[*id].start_byte);
-    let entries: Vec<_> = declarations
-        .iter()
-        .map(|(_, ancestors, key, start, end)| (ancestors.clone(), key.clone(), *start, *end))
-        .collect();
-    let ordinals = identity::sibling_ordinals(&entries)?;
     let mut collisions = identity::CollisionRegistry::default();
-    for (index, (node_id, _, mut key, _, _)) in declarations.into_iter().enumerate() {
-        let mut ancestors = vec![module.clone()];
-        let mut lineage = Vec::new();
-        let mut parent = nodes[node_id].parent_id;
-        while let Some(id) = parent {
-            if let Some(k) = resolved.get(&id) {
-                lineage.push((id, k.clone()));
-            }
-            parent = nodes[id].parent_id;
+    declarations.sort_by_key(|(id, _, _, _)| {
+        let mut depth = 0;
+        let mut parent = nodes[*id].parent_id;
+        while let Some(p) = parent {
+            depth += 1;
+            parent = nodes[p].parent_id;
         }
-        lineage.reverse();
-        ancestors.extend(lineage.iter().map(|(_, k)| k.clone()));
-        key.ordinal = ordinals[index];
-        let dig =
-            identity::syntax_digest(source_set, path, Language::Javascript, &ancestors, &key)?;
-        let id = identity::syntax_id(source_set, path, Language::Javascript, &ancestors, &key)?;
-        collisions.syntax(&id, dig.input)?;
-        ids.insert(node_id, id.as_str().to_owned());
-        resolved.insert(node_id, key);
+        (depth, nodes[*id].start_byte)
+    });
+    let mut offset = 0;
+    while offset < declarations.len() {
+        let depth = {
+            let mut d = 0;
+            let mut p = nodes[declarations[offset].0].parent_id;
+            while let Some(id) = p {
+                d += 1;
+                p = nodes[id].parent_id;
+            }
+            d
+        };
+        let mut end = offset + 1;
+        while end < declarations.len() {
+            let mut d = 0;
+            let mut p = nodes[declarations[end].0].parent_id;
+            while let Some(id) = p {
+                d += 1;
+                p = nodes[id].parent_id;
+            }
+            if d != depth {
+                break;
+            }
+            end += 1;
+        }
+        let entries: Vec<_> = declarations[offset..end]
+            .iter()
+            .map(|(id, key, start, finish)| {
+                let mut lineage = Vec::new();
+                let mut parent = nodes[*id].parent_id;
+                while let Some(p) = parent {
+                    if let Some(k) = resolved.get(&p) {
+                        lineage.push(k.clone());
+                    }
+                    parent = nodes[p].parent_id;
+                }
+                lineage.reverse();
+                let mut ancestors = vec![module.clone()];
+                ancestors.extend(lineage);
+                (ancestors, key.clone(), *start, *finish)
+            })
+            .collect();
+        let ordinals = identity::sibling_ordinals(&entries)?;
+        for ((entry, ordinal), (ancestors, _, _, _)) in
+            declarations[offset..end].iter().zip(ordinals).zip(entries)
+        {
+            let (node_id, key, _, _) = entry;
+            let mut key = key.clone();
+            key.ordinal = ordinal;
+            let dig =
+                identity::syntax_digest(source_set, path, Language::Javascript, &ancestors, &key)?;
+            let id = identity::syntax_id(source_set, path, Language::Javascript, &ancestors, &key)?;
+            collisions.syntax(&id, dig.input)?;
+            ids.insert(*node_id, id.as_str().to_owned());
+            resolved.insert(*node_id, key);
+        }
+        offset = end;
     }
     let mut occurrence_entries = Vec::new();
     let mut occurrence_indices = Vec::new();
@@ -1289,6 +1373,7 @@ pub fn index_workspace(
     }
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
+    let mut semantic_nodes = HashMap::new();
     for i in 0..g.files.len() {
         check(cancel)?;
         // Temporarily move the text, rather than duplicate every source buffer.
@@ -1324,7 +1409,45 @@ pub fn index_workspace(
                 "Tree-sitter recovered from invalid JavaScript; results may be incomplete",
             );
         }
+        let source_set = crate::store::topology::WorkspaceIdentity::discover_unattached(
+            Some(&workspace_root),
+            &workspace_root,
+        )?
+        .record_id;
+        let key = crate::model::v1::DocumentKey {
+            source_set_id: crate::model::v1::Text::new(source_set).context("invalid source set")?,
+            language: crate::model::v1::Language::Javascript,
+            path: crate::model::v1::Path::new(file.path.clone()).context("invalid JS path")?,
+        };
+        let syntax = capture_syntax(crate::model::v1::Language::Javascript, file.text.as_bytes())?;
+        let mut native = CapturedDocument {
+            key,
+            bytes: file.text.as_bytes().to_vec(),
+            content_hash: file.hash.clone(),
+            byte_length: file.text.len() as u64,
+            native_candidates: native_candidates(&syntax),
+            syntax,
+            semantic_positions: Vec::new(),
+            heritage: Vec::new(),
+        };
+        // A browser index has no admitted captured revision. Its occurrence IDs
+        // are scoped to this source snapshot, not claimed as capture-revision IDs.
+        identify_javascript(&mut native, &format!("rev:v1:{}", file.hash))?;
+        let native_ids: HashMap<_, _> = native
+            .native_candidates
+            .iter()
+            .filter_map(|w| {
+                w.stable_id.as_ref().map(|id| {
+                    (
+                        (w.start_byte, w.end_byte, w.candidate_kind.clone()),
+                        id.clone(),
+                    )
+                })
+            })
+            .collect();
         let mut ex = Extractor {
+            native_ids: &native_ids,
+            semantic_nodes: &mut semantic_nodes,
             g: &mut g,
             file: &file,
             doc: if tree.root_node().has_error() {
@@ -1341,7 +1464,20 @@ pub fn index_workspace(
             classes: HashMap::new(),
             cancel,
         };
-        let module = format!("module:{}", file.path);
+        let module = crate::semantic_identity::syntax_id(
+            &native.key.source_set_id,
+            &native.key.path,
+            crate::model::v1::Language::Javascript,
+            &[],
+            &crate::model::v1::Key {
+                kind: crate::model::v1::Kind::Module,
+                name: None,
+                signature: None,
+                ordinal: crate::model::v1::UInt::new(0).unwrap(),
+            },
+        )?
+        .as_str()
+        .to_owned();
         ex.g.nodes.push(Symbol {
             id: module.clone(),
             name: file.path.clone(),
@@ -1370,15 +1506,21 @@ pub fn index_workspace(
         if c.candidate_symbols.len() > 1 {
             c.resolution = Resolution::Ambiguous;
         } else if let Some(id) = c.candidate_symbols.first() {
+            let native = semantic_nodes.get(id).unwrap_or(id);
             if by_id
-                .get(id)
+                .get(native)
                 .is_some_and(|(k, a)| *k != SymbolKind::Module && !a)
             {
-                c.target = Some(id.clone());
+                c.target = Some(native.clone());
                 c.resolution = Resolution::Internal;
             } else if !by_id.contains_key(id) && id.ends_with("().") {
                 c.target = Some(id.clone());
                 c.resolution = Resolution::External;
+            }
+        }
+        for callback in &mut c.callback_arguments {
+            if let Some(native) = semantic_nodes.get(callback) {
+                *callback = native.clone();
             }
         }
         c.callback_arguments.retain(|id| {
@@ -1454,6 +1596,8 @@ fn is_function(n: Node<'_>) -> bool {
 }
 struct Extractor<'a> {
     g: &'a mut Graph,
+    native_ids: &'a HashMap<(usize, usize, NativeCandidateKind), String>,
+    semantic_nodes: &'a mut HashMap<String, String>,
     file: &'a SourceFile,
     doc: Option<&'a scip::types::Document>,
     semantic: SemanticState,
@@ -1462,6 +1606,11 @@ struct Extractor<'a> {
     cancel: &'a CancelFlag,
 }
 impl Extractor<'_> {
+    fn native_id(&self, n: Node<'_>, kind: NativeCandidateKind) -> Option<String> {
+        self.native_ids
+            .get(&(n.start_byte(), n.end_byte(), kind))
+            .cloned()
+    }
     fn text(&self, n: Node<'_>) -> &str {
         &self.file.text[n.byte_range()]
     }
@@ -1533,17 +1682,17 @@ impl Extractor<'_> {
             }
             let ids = self.symbols(name, true);
             let semantic = ids.len() == 1 && !self.g.nodes.iter().any(|node| node.id == ids[0]);
-            let id = if semantic {
-                ids[0].clone()
-            } else {
-                format!(
-                    "syntax:{}:{}:{}:{}",
-                    self.file.path,
-                    self.file.hash,
-                    n.start_byte(),
-                    n.kind()
-                )
+            let Some(id) = self.native_id(n, NativeCandidateKind::Declaration) else {
+                // A declaration without an independently measured native name or
+                // anonymous-expression shape cannot claim a syntax identity.
+                for child in children(n) {
+                    self.declarations(child, &owner, depth + 1)?;
+                }
+                return Ok(());
             };
+            if semantic {
+                self.semantic_nodes.insert(ids[0].clone(), id.clone());
+            }
             let label = name.map(|v| self.text(v).to_owned()).unwrap_or_else(|| {
                 format!(
                     "<callback@{}:{}>",
@@ -1586,13 +1735,9 @@ impl Extractor<'_> {
         Ok(())
     }
     fn region(&mut self, n: Node<'_>, kind: &str, context: &[String], owner: &str) -> Vec<String> {
-        let id = format!(
-            "region:{}:{}:{}:{}",
-            self.file.path,
-            self.file.hash,
-            n.start_byte(),
-            kind
-        );
+        let Some(id) = self.native_id(n, NativeCandidateKind::ControlRegion) else {
+            return context.to_vec();
+        };
         self.g.regions.push(ControlRegion {
             id: id.clone(),
             kind: kind.into(),
@@ -1766,13 +1911,9 @@ impl Extractor<'_> {
                 }
             }
             self.g.calls.push(CallSite {
-                id: format!(
-                    "call:{}:{}:{}:{}",
-                    self.file.path,
-                    self.file.hash,
-                    n.start_byte(),
-                    n.end_byte()
-                ),
+                id: self
+                    .native_id(n, NativeCandidateKind::Invocation)
+                    .context("JavaScript graph call lacks native occurrence identity")?,
                 caller: caller.clone(),
                 callee_text: callee
                     .map(|v| self.text(v).to_owned())

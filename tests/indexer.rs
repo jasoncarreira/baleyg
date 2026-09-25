@@ -1244,3 +1244,100 @@ fn javascript_capture_ids_tokens_heritage_and_revision_local_occurrences() {
             .stable_id
     );
 }
+
+#[test]
+fn javascript_nested_duplicate_ordinals_inventory_and_graph_ids() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = "class Same { méthode() { new Thing(); obj.méthode(); } }\nclass Same { méthode() { obj.foo(); (obj.foo)(); obj?.foo(); obj[key](); } }\nfunction blocks() { const f = function named() {}; const g = function* () {}; const h = () => 1; for (const k in obj) { obj[k](); } do { work(); } while (flag); switch(x) { case 1: left(); break; default: right(); } return x && more(); }\n";
+    write(root, "b.js", source);
+    let admission = capture_admission(root);
+    let options = capture_options(root);
+    let first = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    let doc = &first.documents[0];
+    let classes: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.node_kind == "class_declaration" && w.stable_id.is_some())
+        .collect();
+    let methods: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.node_kind == "method_definition" && w.stable_id.is_some())
+        .collect();
+    assert_eq!((classes.len(), methods.len()), (2, 2));
+    assert_ne!(classes[0].stable_id, classes[1].stable_id);
+    assert_ne!(methods[0].stable_id, methods[1].stable_id);
+    assert_eq!(
+        methods[0].ancestor_ids.last(),
+        classes[0].stable_id.as_ref()
+    );
+    assert_eq!(
+        methods[1].ancestor_ids.last(),
+        classes[1].stable_id.as_ref()
+    );
+    for kind in [
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+    ] {
+        assert!(
+            doc.native_candidates.iter().any(|w| w.node_kind == kind
+                && w.candidate_kind == K::Declaration
+                && w.stable_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("sid:v1:"))),
+            "{kind}"
+        );
+    }
+    for kind in [
+        "new_expression",
+        "for_in_statement",
+        "do_statement",
+        "switch_case",
+        "switch_default",
+        "binary_expression",
+    ] {
+        assert!(
+            doc.native_candidates.iter().any(|w| w.node_kind == kind
+                && w.stable_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("occ:v1:"))),
+            "{kind}"
+        );
+    }
+    let calls: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Invocation)
+        .collect();
+    assert!(calls.iter().any(|w| w.verified_member_token
+        && w.token_bytes == "méthode".as_bytes()
+        && &doc.bytes[w.token_start_byte..w.token_end_byte] == "méthode".as_bytes()));
+    for callee in ["(obj.foo)()", "obj?.foo()", "obj[key]()"] {
+        assert!(
+            calls.iter().any(|w| !w.verified_member_token
+                && doc.bytes[w.start_byte..w.end_byte].starts_with(callee.as_bytes())),
+            "{callee}"
+        );
+    }
+    let graph = run(&IndexOptions::new(root.to_owned()));
+    assert!(graph.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
+    assert!(graph.calls.iter().all(|c| c.id.starts_with("occ:v1:")));
+    assert!(graph.regions.iter().all(|r| r.id.starts_with("occ:v1:")));
+    let edited = source
+        .replace("new Thing();", "new Other();")
+        .replace("obj.foo();", "obj.bar();");
+    write(root, "b.js", &edited);
+    let second = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    let next: Vec<_> = second.documents[0]
+        .native_candidates
+        .iter()
+        .filter(|w| w.node_kind == "method_definition" && w.stable_id.is_some())
+        .collect();
+    assert_eq!(
+        methods.iter().map(|m| &m.stable_id).collect::<Vec<_>>(),
+        next.iter().map(|m| &m.stable_id).collect::<Vec<_>>()
+    );
+}
