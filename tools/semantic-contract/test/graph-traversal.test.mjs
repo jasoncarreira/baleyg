@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {traverseGraph} from '../graph-traversal.mjs';
+import {registerControls,runControl} from './mutations.mjs';
 
 const sid=n=>`sid:v1:${n.toString(16).padStart(32,'0')}`;
 const oid=n=>`occ:v1:${n.toString(16).padStart(32,'0')}`;
@@ -12,12 +13,12 @@ function specimen(spec={}){
   declarations,calls:[],callBindings:[],provenance:[],coverage:[{producerId:'P',...{sourceSetId:'main',language:'javascript',documentPath:doc.path,revisionId:'r2'},selected:true,state:'complete'}]};
  const request={sourceSetId:'main',revisionId:'r2',rootSyntaxId:ids.A,semanticProducerId:'P',...spec.request};
  let counter=0;
- function add(owner,target,{start=counter*10,dispatch='direct',resolution='resolved',freshness='fresh',staleTarget=false,revision='r2',possibleDispatch=[],coverage=true}={}){
-  const number=++counter,call={id:oid(number),ownerSyntaxId:ids[owner],ordinal:number,document:doc,revisionId:'r2',range:{start,end:start+5}};
+ function add(owner,target,{start=counter*10,dispatch='direct',resolution='resolved',freshness='fresh',staleTarget=false,revision='r2',targetRevision=revision,callRevision='r2',possibleDispatch=[],coverage=true}={}){
+  const number=++counter,call={id:oid(number),ownerSyntaxId:ids[owner],ordinal:number,document:doc,revisionId:callRevision,range:{start,end:start+5}};
   records.calls.push(call);
   const provenanceId=`proof-${number}`;
   const binding={callId:call.id,join:{status:'exact',candidateIds:[call.id],anchor:{document:doc,revisionId:revision,contentHash:'bytes',kind:'callee',range:call.range}},
-   resolution,declaredTarget:resolution==='resolved'?{kind:'internal',syntaxId:ids[target],document:doc,revisionId:revision}:resolution==='external'?{kind:'external',symbol:{symbol:'external'}}:null,
+   resolution,declaredTarget:resolution==='resolved'?{kind:'internal',syntaxId:ids[target],document:doc,revisionId:targetRevision}:resolution==='external'?{kind:'external',symbol:{symbol:'external'}}:null,
    candidates:[],dispatch,possibleDispatch:possibleDispatch.map(name=>({kind:'internal',syntaxId:ids[name],document:doc,revisionId:'r2'})),possibleDispatchComplete:false,staleTarget,provenanceId};
   records.callBindings.push(binding);
   records.provenance.push({id:provenanceId,producerId:'P',document:doc,revisionId:revision,contentHash:'bytes',freshness});
@@ -81,8 +82,12 @@ test('boundary precedence and fresh exact static expansion, not possible dispatc
  assert.equal(r.nodes.length,1);assert.equal(r.edges.find(e=>e.call.id===missing.id).binding,null);
 });
 test('failed refresh and syntax-only cannot reuse old occurrence proof; incomplete coverage sets partial',()=>{
- const s=specimen();s.add('A','B',{revision:'r1'});s.records.coverage[0].state='failed';
- let r=s.run().result;assert.equal(r.edges[0].binding,null);assert.equal(r.edges[0].boundaryReason,'missingEvidence');assert.equal(r.partial,true);
+ const s=specimen();const old=s.add('A','B',{revision:'r1',callRevision:'r1'});
+ const current={...old,id:oid(101),revisionId:'r2',ordinal:0};s.records.calls.push(current);
+ s.records.references=[{id:oid(102),ownerSyntaxId:s.ids.A,revisionId:'r1',declaredTarget:{kind:'internal',syntaxId:s.ids.B,document:doc,revisionId:'r1'}}];
+ s.records.coverage[0].state='failed';
+ let r=s.run().result;assert.equal(r.edges.length,1);assert.equal(r.edges[0].call.id,current.id);
+ assert.notEqual(old.id,current.id);assert.equal(r.edges[0].binding,null);assert.equal(r.edges[0].boundaryReason,'missingEvidence');assert.equal(r.partial,true);
  s.records.coverage[0].state='complete';s.request.semanticProducerId=null;r=s.run().result;
  assert.equal(r.edges[0].binding,null);assert.equal(r.edges[0].boundaryReason,'missingEvidence');
  const empty=specimen();assert.equal(traverseGraph({records:empty.records,request:empty.request,selectedCoverageIncomplete:true}).result.partial,true);
@@ -105,4 +110,39 @@ test('fresh direct/constructor bindings expand while a stale proof and absent co
  assert.deepEqual(r.edges.map(e=>e.boundaryReason),['missingEvidence','missingEvidence','missingEvidence']);
  const t=specimen({request:{depth:1}});t.add('A','B',{dispatch:'constructor'});t.add('A','C',{freshness:'stale'});
  assert.deepEqual(t.run().result.edges.map(e=>e.boundaryReason),['none','stale']);
+});
+
+test('fresh r2 caller expands stable r1 internal target only when target bytes match',()=>{
+ const s=specimen();const call=s.add('A','B',{revision:'r2',targetRevision:'r1'});
+ const result=s.run().result;assert.deepEqual(result.nodes.map(n=>n.declaration.name),['A','B']);
+ assert.deepEqual(result.edges.map(e=>[e.call.id,e.to,e.visit,e.boundaryReason]),[[call.id,s.ids.B,'new','none']]);
+ const binding=s.records.callBindings[0];binding.staleTarget=true;
+ const changed=s.run().result;assert.deepEqual(changed.nodes.map(n=>n.declaration.name),['A']);
+ assert.deepEqual(changed.edges.map(e=>[e.to,e.visit,e.boundaryReason]),[[null,'boundary','stale']]);
+ binding.staleTarget=false;s.records.provenance[0].freshness='possiblyStale';
+ assert.equal(s.run().result.edges[0].boundaryReason,'stale');
+});
+
+function decisionCheck(answer,{assertion,field,expected,select}){
+ const actual=select(answer.result);
+ if(!Object.is(actual,expected)){
+  const error=new Error(`${assertion} ${field}: expected ${String(expected)}, got ${String(actual)}`);
+  Object.assign(error,{assertion,code:'invalidRecord',field});throw error;
+ }
+ return true;
+}
+const controls=registerControls([
+ {id:'GRAPH.nodeLimit.to',baseline:()=>{const s=specimen({request:{maxNodes:1}});s.add('A','B');return s.run();},
+  mutate:answer=>{answer.result.edges[0].to=sid(2);return answer;},
+  check:answer=>decisionCheck(answer,{assertion:'GRAPH.NODE_LIMIT',field:'edges[0].to',expected:null,select:r=>r.edges[0].to}),
+  expectedAssertion:'GRAPH.NODE_LIMIT',expectedCode:'invalidRecord',expectedField:'edges[0].to'},
+ {id:'GRAPH.failedRefresh.reason',baseline:()=>{const s=specimen();s.add('A','B',{revision:'r1',callRevision:'r1'});
+   s.records.calls.push({id:oid(101),ownerSyntaxId:s.ids.A,ordinal:0,document:doc,revisionId:'r2',range:{start:0,end:5}});
+   s.records.coverage[0].state='failed';return s.run();},
+  mutate:answer=>{answer.result.edges[0].boundaryReason='none';return answer;},
+  check:answer=>decisionCheck(answer,{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].boundaryReason',expected:'missingEvidence',select:r=>r.edges[0].boundaryReason}),
+  expectedAssertion:'GRAPH.FAILED_REFRESH',expectedCode:'invalidRecord',expectedField:'edges[0].boundaryReason'}
+]);
+for(const row of controls)test(`baseline → single mutation → exact assertion: ${row.id}`,async()=>{
+ assert.equal(await runControl(row),row.id);
 });

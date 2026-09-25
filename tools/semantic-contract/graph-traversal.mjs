@@ -70,13 +70,15 @@ export function traverseGraph({request,records,selectedCoverageIncomplete=false}
    const usable=covered?.selected&&['complete','partial'].includes(covered.state);
    let reason='none';
    if(!selected||!usable)reason='missingEvidence';
-   else if(p?.freshness!=='fresh'||selected.staleTarget===true)reason='stale';
+   else if(p?.freshness!=='fresh'||(selected.declaredTarget?.kind==='internal'&&selected.staleTarget!==false))reason='stale';
    else if(selected.resolution==='ambiguous')reason='ambiguous';
    else if(selected.resolution==='unresolved')reason='unresolved';
    else if(selected.resolution==='external')reason='external';
    else if(!['direct','constructor'].includes(selected.dispatch))reason='dispatch';
    const target=reason==='none'?selected.declaredTarget:null;
-   if(reason==='none'&&(!target||target.kind!=='internal'||target.revisionId!==effective.revisionId||
+   // A captured target can precede the pinned revision: staleTarget checks its bytes,
+   // while stable syntax identity and document membership locate its current body.
+   if(reason==='none'&&(!target||target.kind!=='internal'||
       !byId.has(target.syntaxId)||documentKey(byId.get(target.syntaxId).document)!==documentKey(target.document)))reason='stale';
    let to=null,visit='boundary';
    if(reason==='none'){
