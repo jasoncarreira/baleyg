@@ -79,7 +79,7 @@ export function checkCoverage(loaded,records){
  const actualRevisions=unique(records.revisions,x=>snapshotKey(x.sourceSetId,x.id),'RECORDS.IDENTITY','revisions');
  for(const [field,want,got] of [['producers',expectedProducers,actualProducers],['sourceSets',expectedSets,actualSets],['revisions',expectedRevisions,actualRevisions]]){
   if(want.size!==got.size)fail('RECORDS.IDENTITY',field,'identity inventory differs');
-  for(const [id,row] of want)requireEqual(got.get(id),row,'RECORDS.IDENTITY',field);
+  for(const [id,row] of want){if(!got.has(id))fail('RECORDS.IDENTITY',field,'missing admitted identity');requireEqual(got.get(id),row,'RECORDS.IDENTITY',field);}
   const ordered=[...got.values()];if(ordered.some((x,i)=>i&&Buffer.compare(canonicalBytes(ordered[i-1]),canonicalBytes(x))>0))fail('RECORDS.IDENTITY',field,'identity inventory unordered');
  }
  const intents=unique(loaded.fixture.coverageIntents,x=>key(x.producerId,x.document,x.revisionId),'COVERAGE.TUPLE','coverage');
@@ -133,6 +133,11 @@ export function checkCoverage(loaded,records){
   if(proof.freshness!==freshness(proof,loaded,producer))fail('FRESHNESS.STATE','freshness','incorrect freshness label');
   checkedProofs.set(proof.id,proof);
  }
+ const normalizedSemantic=records.provenance.filter(proof=>proof.basis!==null);
+ if(normalizedSemantic.length!==semanticProofsById.size||normalizedSemantic.some(proof=>{
+  const captured=semanticProofsById.get(proof.id);
+  return !captured||!equal((({freshness,...rest})=>rest)(captured),(({freshness,...rest})=>rest)(proof));
+ }))fail('FRESHNESS.BASIS','provenance','normalized semantic proof inventory differs from captured proofs');
  function checkUse({producerId,document,revisionId,provenanceIds}){
   const id=key(producerId,document,revisionId),coverage=coverageByTuple.get(id);
   if(!coverage)fail('FRESHNESS.USE','coverage','missing requested producer-specific tuple');

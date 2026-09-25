@@ -221,3 +221,130 @@ test('Java alias is inapplicable even when a coverage claim names it',async t=>{
  const control=registerControls([{id:'U1.java-alias',baseline:()=>({records:baseline.records}),check:x=>checkCoverage(baseline.loaded,x.records),mutate:x=>{x.records.coverage.find(y=>y.state==='complete').supportedRoles=['read','alias'];return x;},expectedAssertion:'COVERAGE.ROLES',expectedCode:'invalidRecord',expectedField:'coverage.supportedRoles'}])[0];
  await runControl(control);
 });
+
+
+test('captured semantic provenance inventory closes in both directions',async t=>{
+ const b=await specimen(t);
+ const rows=registerControls([
+  {id:'U1.normalized-proof-omitted',mutate:x=>{x.provenance.pop();return x;}},
+  {id:'U1.normalized-proof-conflict',mutate:x=>{x.provenance[0].id='other-proof';return x;}}
+ ].map(x=>({...x,baseline:()=>b.records,check:records=>checkCoverage(b.loaded,records),expectedAssertion:'FRESHNESS.BASIS',expectedCode:'invalidRecord',expectedField:'provenance'})));
+ for(const row of rows)await t.test(row.id,()=>runControl(row));
+});
+
+test('each admitted top-level identity field and inventory row is independently checked',async t=>{
+ const b=await specimen(t);
+ const variants=[
+  ['comparison-set',x=>x.comparison.sourceSetId='other','comparison'],
+  ['comparison-producers',x=>x.comparison.producers.reverse(),'comparison'],
+  ...['id','kind','version','executableHash','languages','positionEncoding'].map(field=>[`producer-${field}`,x=>{x.producers[0][field]=field==='languages'?['python']:field==='executableHash'?hash('different'):field==='kind'?(x.producers[0].kind==='native'?'semantic':'native'):field==='positionEncoding'?'utf16':'different';},'producers']),
+  ['producer-row',x=>x.producers.pop(),'producers'],
+  ...['id','rootId','languages','dependencies'].map(field=>[`source-set-${field}`,x=>{x.sourceSets[0][field]=field==='languages'?['python']:field==='dependencies'?['other']:'other';},'sourceSets']),
+  ['source-set-row',x=>x.sourceSets.pop(),'sourceSets'],
+  ...['id','sourceSetId','toolchainHash','configHash','dependencyHash'].map(field=>[`revision-${field}`,x=>{x.revisions[0][field]=field.endsWith('Hash')?hash('other'):'other';},'revisions']),
+  ['revision-row',x=>x.revisions.pop(),'revisions'],
+  ['revision-documents',x=>x.revisions[0].documents.pop(),'revisions'],
+  ['document-key',x=>x.revisions[0].documents[0].key.path='other.js','revisions'],
+  ['document-revision',x=>x.revisions[0].documents[0].revisionId='other','revisions'],
+  ['document-hash',x=>x.revisions[0].documents[0].contentHash=hash('other'),'revisions'],
+  ['document-length',x=>x.revisions[0].documents[0].byteLength++,'revisions'],
+ ];
+ const rows=registerControls(variants.map(([id,mutate,field])=>({id:`U1.inventory-${id}`,baseline:()=>b.records,check:records=>checkCoverage(b.loaded,records),mutate:x=>{mutate(x);return x;},expectedAssertion:'RECORDS.IDENTITY',expectedCode:'invalidRecord',expectedField:field})));
+ for(const row of rows)await t.test(row.id,()=>runControl(row));
+});
+
+test('captured byte sources and digests cannot counterfeit semantic basis',async t=>{
+ const b=await specimen(t);
+ const mutations=[
+  ['executable-byte','executable-1','producerId'],
+  ['semantic-artifact-byte','artifact-one','basis.artifactHash'],
+  ['toolchain-byte','toolchain','basis.toolchainHash'],
+  ['config-byte','config','basis.configHash'],
+  ['dependency-byte','dependency','basis.dependencyHash'],
+ ];
+ const rows=registerControls(mutations.map(([id,ref,field])=>({id:`U1.capture-${id}`,baseline:()=>({captureBytes:b.loaded.captureBytes}),check:x=>checkCoverage({...b.loaded,captureBytes:x.captureBytes},b.records),mutate:x=>{x.captureBytes.set(ref,Buffer.from('altered bytes'));return x;},expectedAssertion:'FRESHNESS.BASIS',expectedCode:'invalidRecord',expectedField:field})));
+ for(const row of rows)await t.test(row.id,()=>runControl(row));
+});
+
+
+test('every captured coverage state resists independent requested, selected, diagnostic and state contradictions',async t=>{
+ const b=await specimen(t);
+ const cases=[];
+ for(const state of ['notRequested','omitted','unsupported','failed','partial','complete'])for(const field of ['requested','selected','diagnostic','state']){
+  cases.push({id:`U1.state-${state}-${field}`,baseline:()=>b.records,check:records=>checkCoverage(b.loaded,records),mutate:records=>{
+   const row=records.coverage.find(x=>x.state===state);
+   row[field]=field==='state'?(state==='complete'?'failed':'complete'):field==='diagnostic'?(row.diagnostic===null?'unexpected':null):!row[field];return records;
+  },expectedAssertion:'COVERAGE.STATE',expectedCode:'invalidRecord',expectedField:'coverage'});
+ }
+ for(const row of registerControls(cases))await t.test(row.id,()=>runControl(row));
+});
+
+test('all role families require their own admitted measurement support',async t=>{
+ const b=await specimen(t);
+ const roleFamilies={definition:['reference','declarationName'],read:['reference'],write:['reference'],call:['reference','invocation','callee'],type:['reference'],import:['reference'],alias:['reference','declarationName']};
+ for(const [role,families] of Object.entries(roleFamilies))for(const family of families){
+  const loaded={...b.loaded,fixture:{...b.loaded.fixture,coverageIntents:structuredClone(b.loaded.fixture.coverageIntents)},annotations:structuredClone(b.loaded.annotations)};
+  const records=structuredClone(b.records);
+  const row=records.coverage.find(x=>x.producerId==='native'&&x.revisionId==='r1'&&x.documentPath==='a.js');
+  const intent=loaded.fixture.coverageIntents.find(x=>x.producerId==='native'&&x.revisionId==='r1'&&x.document.path==='a.js');
+  const authored=loaded.annotations.flatMap(x=>x.facts).find(x=>x.kind==='coverage'&&x.record.producerId==='native'&&x.record.revisionId==='r1'&&x.record.documentPath==='a.js').record;
+  Object.assign(row,{requested:true,selected:true,state:'complete',supportedRoles:[role],observedRoles:[role],diagnostic:null});Object.assign(authored,row);intent.requestedRoles=[role];
+  assert.equal(checkCoverage(loaded,records).coverageByTuple.size,12);
+  const control=registerControls([{id:`U1.family-${role}-${family}`,baseline:()=>({intents:loaded.fixture.coverageIntents}),check:x=>checkCoverage({...loaded,fixture:{...loaded.fixture,coverageIntents:x.intents}},records),mutate:x=>{x.intents.find(y=>y.producerId==='native'&&y.revisionId==='r1'&&y.document.path==='a.js').measurementSupport.find(y=>y.kind===family).available=false;return x;},expectedAssertion:'COVERAGE.ROLES',expectedCode:'invalidRecord',expectedField:'coverage.observedRoles'}])[0];
+  await t.test(control.id,()=>runControl(control));
+ }
+});
+
+
+
+
+test('both semantic producers retain historical r1 proofs despite failed r2 refresh',async t=>{
+ const b=await specimen(t),C=checkCoverage(b.loaded,b.records);
+ assert.equal(b.records.coverage.find(x=>x.producerId==='one'&&x.revisionId==='r2'&&x.documentPath==='a.js').state,'failed');
+ for(const proof of b.records.provenance){
+  assert.equal(C.checkUse({producerId:proof.producerId,document:proof.document,revisionId:'r1',provenanceIds:[proof.id]}).proofs[0].freshness,'stale');
+  const base={producerId:proof.producerId,document:proof.document,revisionId:'r2',provenanceIds:[]};
+  assert.equal(C.checkUse(base).proofs.length,0);
+  const control=registerControls([{id:`U1.historical-${proof.producerId}-not-r2`,baseline:()=>base,check:x=>C.checkUse(x),mutate:x=>{x.provenanceIds=[proof.id];return x;},expectedAssertion:'FRESHNESS.USE',expectedCode:'invalidRecord',expectedField:'provenanceIds'}])[0];
+  await t.test(control.id,()=>runControl(control));
+ }
+ const [first,second]=b.records.provenance;
+ const control=registerControls([{id:'U1.cross-producer-proof',baseline:()=>({producerId:first.producerId,document:first.document,revisionId:'r1',provenanceIds:[first.id]}),check:x=>C.checkUse(x),mutate:x=>{x.provenanceIds=[second.id];return x;},expectedAssertion:'FRESHNESS.USE',expectedCode:'invalidRecord',expectedField:'provenanceIds'}])[0];
+ await runControl(control);
+});
+
+
+test('fresh callers report target byte, declaration and document changes independently',async t=>{
+ const b=await specimen(t,{sameCallerBytes:true});const doc=b.docs[0],historical=b.docs[1];
+ const caller={id:`native:r2:sid:v1:${'a'.repeat(32)}`,producerId:'native',document:doc,revisionId:'r2',contentHash:hash(b.source.r2[0]),evidenceKind:'measuredSyntax',basis:null,freshness:'fresh'};
+ b.records.provenance.push(caller);const C=checkCoverage(b.loaded,b.records),syntaxId=`sid:v1:${'b'.repeat(32)}`;
+ const anchor={document:doc,revisionId:'r2',contentHash:caller.contentHash,range:{start:0,end:1},kind:'callee'};
+ const binding={callId:null,join:{anchor,status:'unmatched',candidateIds:[],diagnostic:'unmatched'},resolution:'resolved',declaredTarget:{kind:'internal',syntaxId,document:historical,revisionId:'r1'},candidates:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,staleTarget:true,provenanceId:caller.id};
+ const rows=[
+  ['changed-bytes',new Map([['["main","r1"]',new Map([[syntaxId,historical]])],['["main","r2"]',new Map([[syntaxId,historical]])]]),binding],
+  ['missing-current-declaration',new Map([['["main","r1"]',new Map([[syntaxId,historical]])]]),binding],
+ ];
+ for(const [name,declarations,expected] of rows){
+  const control=registerControls([{id:`U1.target-${name}-false-bit`,baseline:()=>({binding:expected,declarations}),check:x=>C.checkTarget(x.binding,caller,x.declarations),mutate:x=>{x.binding.staleTarget=false;return x;},expectedAssertion:'FRESHNESS.TARGET',expectedCode:'invalidRecord',expectedField:'staleTarget'}])[0];
+  await t.test(control.id,()=>runControl(control));
+ }
+ const same={...binding,declaredTarget:{...binding.declaredTarget,document:doc,revisionId:'r2'},staleTarget:false};
+ const sameDeclarations=new Map([['["main","r2"]',new Map([[syntaxId,doc]])]]);
+ assert.equal(C.checkTarget(same,caller,sameDeclarations),false);
+ const control=registerControls([{id:'U1.target-same-bytes-true-bit',baseline:()=>({binding:same,declarations:sameDeclarations}),check:x=>({staleTarget:C.checkTarget(x.binding,caller,x.declarations)}),mutate:x=>{x.binding.staleTarget=true;return x;},expectedAssertion:'FRESHNESS.TARGET',expectedCode:'invalidRecord',expectedField:'staleTarget'}])[0];
+ await runControl(control);
+});
+
+
+test('selected unsupported request and missing supported observation are distinct valid partial states',async t=>{
+ const b=await specimen(t);
+ for(const [name,supported] of [['unsupported-request',[]],['missing-observation',['read']]]){
+  const loaded={...b.loaded,annotations:structuredClone(b.loaded.annotations)},records=structuredClone(b.records);
+  const row=records.coverage.find(x=>x.state==='unsupported');
+  const authored=loaded.annotations.flatMap(a=>a.facts).find(f=>f.kind==='coverage'&&f.record.producerId===row.producerId&&f.record.revisionId===row.revisionId&&f.record.documentPath===row.documentPath).record;
+  Object.assign(row,{selected:true,state:'partial',supportedRoles:supported,observedRoles:[],diagnostic:name});Object.assign(authored,row);
+  assert.equal(checkCoverage(loaded,records).coverageByTuple.size,12);
+  const control=registerControls([{id:`U1.partial-${name}-not-complete`,baseline:()=>records,check:x=>checkCoverage(loaded,x),mutate:x=>{x.coverage.find(y=>y.producerId===row.producerId&&y.revisionId===row.revisionId&&y.documentPath===row.documentPath).state='complete';return x;},expectedAssertion:'COVERAGE.STATE',expectedCode:'invalidRecord',expectedField:'coverage'}])[0];
+  await t.test(control.id,()=>runControl(control));
+ }
+});
