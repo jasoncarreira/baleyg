@@ -1702,3 +1702,126 @@ fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
         assert!(record.missing_known_paths[0].ends_with("-a"));
     }
 }
+
+#[test]
+fn forget_requires_safe_exclusive_record_and_recreates_on_later_save() {
+    use baleyg::{
+        model::SavedView,
+        store::topology::{DurableRecords, valid_record_id},
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    common::private(&work.join(".git"));
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let id = identity.record_id.clone();
+    let copy = temp.path().join("copy");
+    fs::create_dir(&copy).unwrap();
+    common::private(&copy.join(".git"));
+    common::private(&copy.join(".git/baleyg"));
+    fs::copy(
+        work.join(".git/baleyg/workspace-id"),
+        copy.join(".git/baleyg/workspace-id"),
+    )
+    .unwrap();
+    let copied = WorkspaceIdentity::discover(Some(&copy), &copy).unwrap();
+    assert_eq!(copied.record_id, id);
+    assert!(valid_record_id(&id));
+    for bad in [
+        "",
+        "../bad",
+        "00000000-0000-0000-0000-000000000000",
+        "PATH-bad",
+        "path-ABC",
+        "ABCDEFAB-CDEF-4ABC-ABCD-ABCDEFABCDEF",
+    ] {
+        assert!(!valid_record_id(bad));
+        assert!(
+            roots
+                .forget_with_confirmation(bad, |_, _| Ok(true))
+                .is_err()
+        );
+    }
+    let records = DurableRecords::new(&roots, &identity);
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    records.put_view(&view).unwrap();
+    let directory = roots.record_dir(&identity);
+    let lock = roots.record_use_lock(&identity);
+    let shared = UseGuard::acquire_existing(&lock, false, true).unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&id, |_, _| Ok(true))
+            .is_err()
+    );
+    drop(shared);
+    assert!(
+        !roots
+            .forget_with_confirmation(&id, |report, paths| {
+                assert_eq!(report.views, 1);
+                assert_eq!(report.annotations, 0);
+                assert_eq!(paths, &[identity.root.to_str().unwrap().to_string()]);
+                Ok(false)
+            })
+            .unwrap()
+    );
+    assert!(directory.exists());
+    fs::write(directory.join("unknown"), "leave untouched").unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&id, |_, _| Ok(true))
+            .is_err()
+    );
+    assert!(directory.join("unknown").exists());
+    fs::remove_file(directory.join("unknown")).unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&id, |_, _| Ok(true))
+            .unwrap()
+    );
+    assert!(!directory.exists());
+    assert!(!lock.exists());
+    assert!(work.join(".git/baleyg/workspace-id").exists());
+    assert!(copy.join(".git/baleyg/workspace-id").exists());
+    assert!(
+        DurableRecords::new(&roots, &copied)
+            .views()
+            .unwrap()
+            .is_empty()
+    );
+    records.put_view(&view).unwrap();
+    assert_eq!(records.views().unwrap(), vec![view]);
+}
+
+#[test]
+fn forget_empty_record_and_recovery_sidecars_refuse() {
+    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    records.put_view(&view).unwrap();
+    records.delete_view("view1").unwrap();
+    let db = roots.record_db(&identity);
+    fs::write(db.with_file_name("workspace.db-wal"), "recovery").unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&identity.record_id, |_, _| Ok(true))
+            .is_err()
+    );
+    assert!(db.exists());
+    fs::remove_file(db.with_file_name("workspace.db-wal")).unwrap();
+    assert!(
+        roots
+            .forget_with_confirmation(&identity.record_id, |report, _| {
+                assert_eq!(report.views, 0);
+                Ok(true)
+            })
+            .unwrap()
+    );
+}

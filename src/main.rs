@@ -45,6 +45,15 @@ enum Command {
     Export(ExportArgs),
     /// Inspect existing derived indexes and saved records without changing them.
     Gc(GcArgs),
+    /// Permanently remove one saved workspace record by its exact ID.
+    Forget(ForgetArgs),
+}
+#[derive(Args)]
+struct ForgetArgs {
+    record_id: String,
+    /// Confirm without an interactive terminal.
+    #[arg(long)]
+    yes: bool,
 }
 #[derive(Args)]
 struct GcArgs {
@@ -211,6 +220,40 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().command {
         Command::Gc(_) => print_json(&TopologyRoots::production()?.gc_report()?)?,
+        Command::Forget(args) => {
+            use std::io::{self, Write};
+            let deleted = TopologyRoots::production()?.forget_with_confirmation(
+                &args.record_id,
+                |record, paths| {
+                    eprintln!("Record ID: {}", record.id);
+                    eprintln!(
+                        "Saved views: {}; annotations: {}",
+                        record.views, record.annotations
+                    );
+                    for path in paths {
+                        eprintln!("Saved path: {path}");
+                    }
+                    eprintln!("WARNING: every checkout sharing this UUID loses these saved items.");
+                    if args.yes {
+                        return Ok(true);
+                    }
+                    ensure!(
+                        unsafe { libc::isatty(libc::STDIN_FILENO) } == 1,
+                        "confirmation requires a terminal or --yes"
+                    );
+                    eprint!("Type the exact record ID to forget: ");
+                    io::stderr().flush()?;
+                    let mut answer = String::new();
+                    io::stdin().read_line(&mut answer)?;
+                    Ok(answer.trim_end_matches(['\r', '\n']) == record.id)
+                },
+            )?;
+            ensure!(
+                deleted,
+                "record ID confirmation did not match; no files removed"
+            );
+            eprintln!("Forgot record {}", args.record_id);
+        }
         Command::Index(args) => {
             let (store, options, _) = args.resolve()?;
             let expected = store.status()?.revision;

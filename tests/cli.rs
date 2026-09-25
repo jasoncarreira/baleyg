@@ -522,3 +522,62 @@ fn gc_cli_reports_multiple_indexes_in_sorted_order() {
     expected.sort();
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn forget_cli_requires_confirmation_and_preserves_unrelated_state() {
+    use baleyg::{
+        model::SavedView,
+        store::topology::{DurableRecords, TopologyRoots, UseGuard, WorkspaceIdentity},
+    };
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let root = temp.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let data = home.join(if cfg!(target_os = "macos") {
+        "Library/Application Support/dev.odin.baleyg"
+    } else {
+        ".local/share/baleyg"
+    });
+    let roots = TopologyRoots::isolated_for_tests(home.join("cache"), data);
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    records.put_view(&view).unwrap();
+    let id = identity.record_id.as_str();
+    let run = |which: &str, yes: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+        cmd.arg("forget").arg(which).env("HOME", &home);
+        if yes {
+            cmd.arg("--yes");
+        }
+        cmd.output().unwrap()
+    };
+    assert!(!run("../work", true).status.success());
+    let denied = run(id, false);
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("terminal or --yes"));
+    assert!(roots.record_db(&identity).exists());
+    let shared =
+        UseGuard::acquire_existing(&roots.record_use_lock(&identity), false, true).unwrap();
+    assert!(!run(id, true).status.success());
+    drop(shared);
+    let other = home.join("untouched");
+    fs::write(&other, "still here").unwrap();
+    let result = run(id, true);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("every checkout sharing this UUID"));
+    assert!(stderr.contains("Saved views: 1; annotations: 0"));
+    assert!(stderr.contains(identity.root.to_str().unwrap()));
+    assert!(!roots.record_dir(&identity).exists());
+    assert!(!roots.record_use_lock(&identity).exists());
+    assert_eq!(fs::read_to_string(other).unwrap(), "still here");
+    assert!(!run(id, true).status.success());
+}
