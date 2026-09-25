@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {materializeAnswers} from '../answers.mjs';
 import {validate} from '../formats.mjs';
+import {registerControls,runControl} from './mutations.mjs';
 
 const sid = `sid:v1:${'a'.repeat(32)}`;
 const oid = `occ:v1:${'b'.repeat(32)}`;
@@ -56,28 +57,45 @@ test('failure keeps invalid attempted request and authored error without graph c
     ...input.answers[0],attemptedRequest:{...input.answers[0].attemptedRequest,rootSyntaxId:sid}}]});
 });
 
-test('missing, cross-kind and unreturned normalized proof references fail at precise fields', () => {
-  const cases=[
-    ['attemptedRequest.rootSyntaxId',{ref:'missing'},/unknown identity ref missing/],
-    ['attemptedRequest.rootSyntaxId',{ref:'impostor'},/not SyntaxId/],
-    ['answer.result.edges[0].call',{recordRef:'source-function'},/not Call/],
-    ['answer.result.edges[0].call',{recordRef:'missing'},/unknown record ref missing/],
-    ['answer.result.provenance[0]',{recordRef:'not-returned-proof'},/not a returned normalized Provenance/]
-  ];
-  for (const [field,value,reason] of cases) {
-    const input=clone(authored);
-    if (field==='attemptedRequest.rootSyntaxId') input.answers[0].attemptedRequest.rootSyntaxId=value;
-    else if (field.includes('.call')) input.answers[0].answer.result.edges[0].call=value;
-    else input.answers[0].answer.result.provenance[0]=value;
-    assert.throws(()=>materializeAnswers(input,normalized),error => error.field===`AnswersInputV1.answers[0].${field}` && reason.test(error.message),field);
+const answerControls = registerControls([
+  {
+    id:'ANSWER.REF.identity-dangling',
+    mutate:input => { input.answers[0].attemptedRequest.rootSyntaxId={ref:'missing'}; return input; },
+    expectedAssertion:'ANSWER.REF', expectedField:'AnswersInputV1.answers[0].attemptedRequest.rootSyntaxId'
+  },
+  {
+    id:'ANSWER.REF.identity-cross-kind',
+    mutate:input => { input.answers[0].attemptedRequest.rootSyntaxId={ref:'impostor'}; return input; },
+    expectedAssertion:'ANSWER.REF', expectedField:'AnswersInputV1.answers[0].attemptedRequest.rootSyntaxId'
+  },
+  {
+    id:'ANSWER.REF.record-cross-kind',
+    mutate:input => { input.answers[0].answer.result.edges[0].call={recordRef:'source-function'}; return input; },
+    expectedAssertion:'ANSWER.REF', expectedField:'AnswersInputV1.answers[0].answer.result.edges[0].call'
+  },
+  {
+    id:'ANSWER.REF.record-dangling',
+    mutate:input => { input.answers[0].answer.result.edges[0].call={recordRef:'missing'}; return input; },
+    expectedAssertion:'ANSWER.REF', expectedField:'AnswersInputV1.answers[0].answer.result.edges[0].call'
+  },
+  {
+    id:'ANSWER.REF.proof-unreturned',
+    mutate:input => { input.answers[0].answer.result.provenance[0]={recordRef:'not-returned-proof'}; return input; },
+    expectedAssertion:'ANSWER.REF', expectedField:'AnswersInputV1.answers[0].answer.result.provenance[0]'
+  },
+  {
+    id:'FORMAT.SHAPE.identity-outside-slot',
+    mutate:input => { input.answers[0].answer.result.warnings[0].provenanceId={ref:'source-function'}; return input; },
+    expectedAssertion:'FORMAT.SHAPE', expectedField:'AnswersInputV1.answers[0].answer.result.warnings[0].provenanceId'
+  },
+  {
+    id:'FORMAT.SHAPE.record-in-identity-slot',
+    mutate:input => { input.answers[0].answer.result.edges[0].call={ref:'measured-invocation'}; return input; },
+    expectedAssertion:'FORMAT.SHAPE', expectedField:'AnswersInputV1.answers[0].answer.result.edges[0].call'
   }
-});
+].map(row => ({...row, baseline:() => authored, check:input => materializeAnswers(input,normalized),
+  expectedCode:'invalidRecord'})));
 
-test('refs cannot escape schema slots; malformed authored answer rejects before resolution', () => {
-  const input=clone(authored);
-  input.answers[0].answer.result.warnings[0].provenanceId={ref:'source-function'};
-  assert.throws(()=>materializeAnswers(input,normalized),/FORMAT.SHAPE.*warnings\[0\].provenanceId/);
-  const wrong=clone(authored);
-  wrong.answers[0].answer.result.edges[0].call={ref:'measured-invocation'};
-  assert.throws(()=>materializeAnswers(wrong,normalized),/FORMAT.SHAPE.*edges\[0\].call/);
+test('typed answer reference and malformed-slot baseline-to-single-mutation controls', async () => {
+  for (const row of answerControls) await runControl(row);
 });
