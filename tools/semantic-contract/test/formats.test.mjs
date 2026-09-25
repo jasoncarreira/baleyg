@@ -236,3 +236,123 @@ test('FORMAT.UNIONS.POPULATED: each nested union variant enforces closed fields'
     }
   }
 });
+
+// Each local alternative is installed in a complete, populated root envelope. The
+// registry records every negative, including nested element and typed-ref controls.
+function at(root, steps, value) {
+  const copy=structuredClone(root);
+  if (!steps.length) return structuredClone(value);
+  let node=copy;
+  for (const step of steps.slice(0,-1)) node=node[step];
+  node[steps.at(-1)]=structuredClone(value);
+  return copy;
+}
+function pathOf(type, steps) {
+  return type+steps.map(step => typeof step==='number' ? `[${step}]` : `.${step}`).join('');
+}
+function choice(spec) { return populated(spec); }
+function shapeError(type, value, field) {
+  try { validate(type,value); return false; }
+  catch (error) { return error.assertion==='FORMAT.SHAPE' && error.code==='invalidRecord' && error.field===field; }
+}
+test('FORMAT.SCHEMA_MATRIX: populated alternatives and registered precise negative controls', async () => {
+  const rows=[];
+  const covered=[];
+  function positive(type, root, steps, candidate, label) {
+    const changed=at(root,steps,candidate);
+    validate(type,changed);
+    covered.push(`${type}:${pathOf(type,steps)}:${label}`);
+    return changed;
+  }
+  function negative(type, root, steps, bad, field, label) {
+    const id=`FORMAT.MATRIX.${type}.${steps.map(String).join('.') || 'root'}.${label}`;
+    let expectedField=field;
+    try { validate(type,at(root,steps,bad)); throw Error(`Mutation survived: ${id}`); }
+    catch (error) {
+      if (error.assertion!=='FORMAT.SHAPE' || error.code!=='invalidRecord') throw error;
+      assert.ok(field===error.field || field.startsWith(`${error.field}.`),`${id}: ${error.field} not ${field}`);
+      expectedField=error.field;
+    }
+    rows.push({id,baseline:() => root,check:value => validate(type,value),
+      mutate:value => at(value,steps,bad),expectedAssertion:'FORMAT.SHAPE',
+      expectedCode:'invalidRecord',expectedField});
+  }
+  function wrong(type,root,steps,field,label,valid) {
+    for (const candidate of [false,123,'wrong',{},[],null]) {
+      if (candidate===null && valid?.nullable) continue;
+      if (shapeError(type,at(root,steps,candidate),field) || (() => {
+        try { validate(type,at(root,steps,candidate)); return false; }
+        catch (error) { return error.assertion==='FORMAT.SHAPE' && error.code==='invalidRecord' && field.startsWith(`${error.field}.`); }
+      })()) {
+        negative(type,root,steps,candidate,field,label); return;
+      }
+    }
+    throw Error(`No wrong value for ${type} ${field} ${label}`);
+  }
+  function visit(type, spec, root, steps, branch='primary') {
+    const path=pathOf(type,steps);
+    if (typeof spec==='string' && Object.hasOwn(schemas,spec)) return visit(type,schemas[spec],root,steps,branch);
+    if (typeof spec==='string') return;
+    if (spec.nullable) {
+      positive(type,root,steps,null,`${branch}.null`);
+      const nonnull=positive(type,root,steps,choice(spec.nullable),`${branch}.nonnull`);
+      wrong(type,nonnull,steps,path,`${branch}.nullableWrong`,spec);
+      visit(type,spec.nullable,nonnull,steps,`${branch}.nonnull`);
+      return;
+    }
+    if (spec.either) {
+      for (let i=0;i<spec.either.length;i++) {
+        const base=positive(type,root,steps,choice(spec.either[i]),`${branch}.either${i}`);
+        visit(type,spec.either[i],base,steps,`${branch}.either${i}`);
+      }
+      if (spec.either.includes('IdentityRef') || spec.either.includes('RecordRef')) {
+        const correct=spec.either.includes('IdentityRef') ? {ref:'identity'} : {recordRef:'record'};
+        const incorrect=spec.either.includes('IdentityRef') ? {recordRef:'record'} : {ref:'identity'};
+        const base=positive(type,root,steps,correct,`${branch}.typedRef`);
+        negative(type,base,steps,incorrect,path,`${branch}.crossKindRef`);
+      }
+      return;
+    }
+    if (spec.enum) {
+      for (const [i,value] of spec.enum.entries()) positive(type,root,steps,value,`${branch}.enum${i}`);
+      wrong(type,root,steps,path,`${branch}.enumWrong`,spec);
+      return;
+    }
+    if (spec.union) {
+      for (const [tag,variant] of Object.entries(spec.union.variants)) {
+        // Relationship facts require an internal source; the external target
+        // variant is covered by the target slot and standalone TargetRef.
+        if (steps.at(-1)==='source' && tag==='external' && steps.slice(0,-1).reduce((v,k)=>v[k],root).kind==='typeRelationship') continue;
+        const base=positive(type,root,steps,choice(variant),`${branch}.union${tag}`);
+        visit(type,variant,base,steps,`${branch}.union${tag}`);
+      }
+      const bad={...choice(Object.values(spec.union.variants)[0]),[spec.union.tag]:'__unknown__'};
+      negative(type,root,steps,bad,`${path}.${spec.union.tag}`,`${branch}.unknownVariant`);
+      return;
+    }
+    if (spec.array) {
+      const base=positive(type,root,steps,[choice(spec.array)],`${branch}.populatedArray`);
+      wrong(type,base,[...steps,0],`${path}[0]`,`${branch}.arrayElement`,spec.array);
+      visit(type,spec.array,base,[...steps,0],branch);
+      return;
+    }
+    if (spec.object) {
+      negative(type,root,steps,{...steps.reduce((v,k)=>v[k],root),unexpected:true},`${path}.unexpected`,`${branch}.extra`);
+      for (const [field,child] of Object.entries(spec.object)) {
+        const fieldSteps=[...steps,field], fieldPath=`${path}.${field}`;
+        const omitted=structuredClone(steps.reduce((v,k)=>v[k],root)); delete omitted[field];
+        negative(type,root,steps,omitted,fieldPath,`${branch}.${field}.missing`);
+        wrong(type,root,fieldSteps,fieldPath,`${branch}.${field}.wrong`,child);
+        visit(type,child,root,fieldSteps,branch);
+      }
+    }
+  }
+  for (const [type,spec] of Object.entries(schemas)) {
+    const root=populated(type); validate(type,root);
+    visit(type,spec,root,[]);
+  }
+  registerControls(rows);
+  assert.ok(covered.length > Object.keys(schemas).length);
+  for (const row of rows) await runControl(row);
+  assert.equal(rows.filter(row => controls.includes(row)).length,rows.length);
+});
