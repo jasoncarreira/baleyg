@@ -180,7 +180,7 @@ test('captured chain rejects relabelled and unlinked historical proofs with prec
 });
 // Source bytes, producer captures and annotations are admitted before the full checker runs.
 // The answer below is authored from known fixture identities and expected rows, not traversal.
-async function admittedGraph(t,{changed=false,state='failed',zero=false,r2Binding=false,readOnlyCurrent=false,unsupportedCurrent=false}={}){
+async function admittedGraph(t,{changed=false,state='failed',zero=false,r2Binding=false,readOnlyCurrent=false,unsupportedCurrent=false,unsupportedInvocationCurrent=false}={}){
  const root=await mkdtemp(join(tmpdir(),'graph-history-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const files=new Map(),put=(path,value)=>files.set(path,typeof value==='string'?value:JSON.stringify(value));
  const hash=text=>contentHash(Buffer.from(text));
@@ -241,7 +241,7 @@ async function admittedGraph(t,{changed=false,state='failed',zero=false,r2Bindin
    const observedRoles=(readOnlyCurrent||unsupportedCurrent)&&semantic&&id==='r2'?['read']:status==='complete'?requestedRoles:status==='partial'?['call']:[];
    facts.push({kind:'coverage',ref:`coverage-${producer.id}-${id}`,record:{producerId:producer.id,sourceSetId:document.sourceSetId,language:document.language,documentPath:document.path,
     revisionId:id,requested:true,selected:status!=='omitted',state:status,supportedRoles:requestedRoles,observedRoles,diagnostic:status==='complete'?null:'refresh unavailable'}});
-   coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles,measurementSupport:unsupportedCurrent&&id==='r2'?support.map(row=>row.kind==='callee'?{kind:'callee',available:false,diagnostic:'callee measurement unavailable'}:row):support});
+   coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles,measurementSupport:(unsupportedCurrent||unsupportedInvocationCurrent)&&id==='r2'?support.map(row=>row.kind===(unsupportedCurrent?'callee':'invocation')?{kind:row.kind,available:false,diagnostic:`${row.kind} measurement unavailable`}:row):support});
   }
   if(id==='r0')facts.push(olderProvenance,olderFact);
   if(id==='r1'&&!zero)facts.push(provenance,...oldProofs,fact,oldBinding,oldUse);
@@ -362,6 +362,28 @@ test('source-backed impossible r2 call facts reject atomically; absence remains 
    assert.equal(error.field,'coverage.observedRoles');return true;
   });
  });
+});
+
+test('exact callee binding survives independently unsupported invocation measurement',async t=>{
+ const {loaded,records,checked}=await admittedGraph(t,{state:'complete',r2Binding:true,unsupportedInvocationCurrent:true});
+ const declaration=records.declarations.find(row=>row.revisionId==='r2');
+ const call=records.calls.find(row=>row.revisionId==='r2');
+ const binding=records.callBindings.find(row=>row.provenanceId==='r2-call-proof');
+ assert.equal(binding.callId,call.id);
+ assert.equal(binding.join.anchor.kind,'callee');
+ assert.deepEqual(records.coverage.find(row=>row.producerId==='semantic'&&row.revisionId==='r2').observedRoles,['read','call']);
+ const request={sourceSetId:'main',revisionId:'r2',rootSyntaxId:declaration.syntaxId,
+  semanticProducerId:'semantic',depth:2,maxNodes:150,maxCalls:500};
+ const coverage=records.coverage.filter(row=>row.revisionId==='r2')
+  .sort((a,b)=>Buffer.compare(Buffer.from(a.producerId),Buffer.from(b.producerId)));
+ const provenance=[declaration.provenanceId,call.provenanceId,binding.provenanceId]
+  .map(id=>records.provenance.find(row=>row.id===id))
+  .sort((a,b)=>Buffer.compare(Buffer.from(a.id),Buffer.from(b.id)));
+ const answer={id:'callee-without-invocation-support',attemptedRequest:request,
+  answer:{ok:true,result:{request,resolvedRevisionId:'r2',nodes:[{declaration,depth:0}],
+   edges:[{call,from:declaration.syntaxId,to:declaration.syntaxId,binding,visit:'seen',boundaryReason:'none'}],
+   frontier:[],coverage,provenance,partial:false,truncated:false,warnings:[]}}};
+ assert.equal(checkAnswers(loaded,records,checked,{answers:[answer]}),true);
 });
 
 test('selected partial unsupported non-exact call stays diagnostic-only without observed call',async t=>{

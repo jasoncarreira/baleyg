@@ -288,7 +288,7 @@ test('every captured coverage state resists independent requested, selected, dia
 
 test('all role families require their own admitted measurement support',async t=>{
  const b=await specimen(t);
- const roleFamilies={definition:['reference','declarationName'],read:['reference'],write:['reference'],call:['reference','invocation','callee'],type:['reference'],import:['reference'],alias:['reference','declarationName']};
+ const roleFamilies={definition:['reference','declarationName'],read:['reference'],write:['reference'],type:['reference'],import:['reference'],alias:['reference','declarationName']};
  for(const [role,families] of Object.entries(roleFamilies))for(const family of families){
   const loaded={...b.loaded,fixture:{...b.loaded.fixture,coverageIntents:structuredClone(b.loaded.fixture.coverageIntents)},annotations:structuredClone(b.loaded.annotations)};
   const records=structuredClone(b.records);
@@ -304,6 +304,32 @@ test('all role families require their own admitted measurement support',async t=
 
 
 
+
+test('call capability uses measured callee OR invocation, never neither',async t=>{
+ const b=await specimen(t);
+ for(const [name,callee,invocation,allowed] of [
+  ['callee-only',true,false,true],['invocation-only',false,true,true],['neither',false,false,false]]){
+  await t.test(name,()=>{
+   const loaded={...b.loaded,fixture:{...b.loaded.fixture,coverageIntents:structuredClone(b.loaded.fixture.coverageIntents)},
+    annotations:structuredClone(b.loaded.annotations)};
+   const records=structuredClone(b.records);
+   const row=records.coverage.find(x=>x.producerId==='native'&&x.revisionId==='r1'&&x.documentPath==='a.js');
+   const intent=loaded.fixture.coverageIntents.find(x=>x.producerId==='native'&&x.revisionId==='r1'&&x.document.path==='a.js');
+   const authored=loaded.annotations.flatMap(x=>x.facts).find(x=>x.kind==='coverage'&&x.record.producerId==='native'&&x.record.revisionId==='r1'&&x.record.documentPath==='a.js').record;
+   for(const [family,available] of [['callee',callee],['invocation',invocation]]){
+    const support=intent.measurementSupport.find(x=>x.kind===family);
+    support.available=available;support.diagnostic=available?null:`${family} unavailable`;
+   }
+   intent.requestedRoles=['call'];
+   Object.assign(row,{requested:true,selected:true,state:'complete',supportedRoles:['call'],observedRoles:['call'],diagnostic:null});
+   Object.assign(authored,row);
+   if(allowed)assert.equal(checkCoverage(loaded,records).coverageByTuple.size,12);
+   else assert.throws(()=>checkCoverage(loaded,records),error=>{
+    assert.equal(error.assertion,'COVERAGE.ROLES');assert.equal(error.field,'coverage.observedRoles');return true;
+   });
+  });
+ }
+});
 
 test('captured zero-fact complete tuple remains distinct from later omitted coverage',async t=>{
  const b=await specimen(t,{zeroFactHistorical:true}),C=checkCoverage(b.loaded,b.records);

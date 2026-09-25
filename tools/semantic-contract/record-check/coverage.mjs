@@ -12,7 +12,7 @@ const order=(a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b));
 function fail(assertion,field,message){const error=new Error(`${assertion} ${field}: ${message}`);error.assertion=assertion;error.code='invalidRecord';error.field=field;throw error;}
 function requireEqual(a,b,assertion,field){if(!equal(a,b))fail(assertion,field,'record differs from admitted input');}
 function unique(rows,select,assertion,field){const result=new Map();for(const row of rows){const id=select(row);if(result.has(id))fail(assertion,field,'duplicate tuple or identity');result.set(id,row);}return result;}
-const families=role=>role==='call'?['reference','invocation','callee']:role==='definition'||role==='alias'?['reference','declarationName']:['reference'];
+const families=role=>role==='definition'||role==='alias'?['reference','declarationName']:['reference'];
 function sortedRoles(roles,language,field){const allowed=applicableRoles(language);let previous=-1;for(const role of roles){const index=allowed.indexOf(role);if(index<=previous)fail('COVERAGE.ROLES',field,'role is inapplicable, repeated or unordered');previous=index;}}
 function capture(loaded,kind,hash){return loaded.fixture.captures.some(x=>x.kind===kind&&x.hash===hash&&loaded.captureBytes.has(x.ref)&&contentHash(loaded.captureBytes.get(x.ref))===hash);}
 function documentAt(loaded,document,revisionId){return loaded.revisions.get(snapshotKey(document.sourceSetId,revisionId))?.documents.find(x=>equal(x.key,document));}
@@ -82,7 +82,10 @@ function freshness(proof,loaded,producer){
 }
 function coverageState(row,intent){
  const requested=intent.requestedRoles,support=new Map(intent.measurementSupport.map(x=>[x.kind,x.available]));
- const available=role=>families(role).every(x=>support.get(x)===true);
+ // A call may be joined at either its measured callee or invocation span.
+ // Unavailable support for one family does not invalidate a fact in the other.
+ const available=role=>role==='call'?support.get('callee')===true||support.get('invocation')===true:
+  families(role).every(x=>support.get(x)===true);
  const effective=requested.filter(x=>row.supportedRoles.includes(x)&&available(x));
  const unsupported=requested.some(x=>!row.supportedRoles.includes(x)||!available(x));
  const missing=effective.some(x=>!row.observedRoles.includes(x));

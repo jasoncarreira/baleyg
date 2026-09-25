@@ -282,7 +282,7 @@ test('UTF-16 and Unicode scalar producer offsets convert against astral CRLF sou
  }
 });
 
-test('coverage requires each source-derived Reference role measurement family',async t=>{
+test('coverage requires role-specific measurement families and either call anchor family',async t=>{
  const {loaded}=await loadedMeasured(t),doc=loaded.native.declarations[0].document;
  const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}));
  const intent={producerId:'native',document:doc,revisionId:'r1',requestedRoles:['read'],measurementSupport:support};loaded.fixture.coverageIntents=[intent];
@@ -293,20 +293,23 @@ test('coverage requires each source-derived Reference role measurement family',a
   {roles:['definition','alias'],unavailable:'reference'},
   {roles:['definition'],unavailable:'declarationName'},
   {roles:['definition','alias'],unavailable:'declarationName'},
-  {roles:['call'],unavailable:'reference'},
-  {roles:['call'],unavailable:'invocation'},
-  {roles:['call'],unavailable:'callee'},
+  {roles:['call'],unavailable:'reference',unrelated:true},
+  {roles:['call'],unavailable:'invocation',unrelated:true},
+  {roles:['call'],unavailable:'callee',unrelated:true},
   {roles:['read'],unavailable:'invocation',unrelated:true}
  ];
  for(const {roles,unavailable,unrelated} of cases){
   for(const item of support){item.available=item.kind!==unavailable;item.diagnostic=item.available?null:`${item.kind} measurement unavailable`;}
   intent.requestedRoles=roles;record.supportedRoles=[...roles];record.observedRoles=[...roles];record.state='complete';record.diagnostic=null;
-  if(unrelated){assert.equal(normalize(loaded).records.coverage[0].state,'complete','read needs reference, not invocation');continue;}
+  if(unrelated){assert.equal(normalize(loaded).records.coverage[0].state,'complete','unrelated support does not block the role');continue;}
   assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/,`${roles.join('+')} cannot be complete without ${unavailable}`);
   record.state='partial';record.observedRoles=[];record.diagnostic=`${unavailable} measurement unavailable`;
   const partial=normalize(loaded).records.coverage[0];assert.equal(partial.state,'partial');assert.equal(partial.diagnostic,`${unavailable} measurement unavailable`);
   record.observedRoles=[...roles];assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/,`${roles.join('+')} cannot be observed without ${unavailable}`);
  }
+ for(const item of support){item.available=!['callee','invocation'].includes(item.kind);item.diagnostic=item.available?null:`${item.kind} unavailable`;}
+ intent.requestedRoles=['call'];record.supportedRoles=['call'];record.observedRoles=['call'];record.state='complete';record.diagnostic=null;
+ assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/,'call cannot be observed without either measured call anchor family');
 });
 
 test('coverage intent reconciles all six states and unrelated unavailable families',async t=>{
