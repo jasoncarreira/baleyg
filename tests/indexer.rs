@@ -537,3 +537,143 @@ fn conventional_java_source_packages_are_not_confused_with_build_outputs() {
         ]
     );
 }
+
+fn capture_admission(root: &Path) -> baleyg::indexer::CaptureAdmission {
+    use baleyg::model::v1::Language;
+    write(root, "toolchain.capture", "toolchain-1");
+    write(root, "config.capture", "config-1");
+    write(root, "dependency.capture", "dependency-1");
+    write(root, "native.capture", "native executable");
+    write(root, "semantic.capture", "semantic executable");
+    write(root, "semantic.artifact", "original semantic artifact");
+    baleyg::indexer::CaptureAdmission {
+        source_set_id: "logical-source".into(),
+        root_id: "admitted-root".into(),
+        languages: vec![Language::Javascript, Language::Rust],
+        toolchain: root.join("toolchain.capture"),
+        config: root.join("config.capture"),
+        dependency: root.join("dependency.capture"),
+        producers: vec![
+            baleyg::indexer::ProducerInput {
+                id: "N".into(),
+                version: "native-1".into(),
+                position_encoding: "utf8".into(),
+                executable: root.join("native.capture"),
+                artifact: None,
+            },
+            baleyg::indexer::ProducerInput {
+                id: "S".into(),
+                version: "semantic-1".into(),
+                position_encoding: "utf16".into(),
+                executable: root.join("semantic.capture"),
+                artifact: Some(root.join("semantic.artifact")),
+            },
+        ],
+    }
+}
+
+#[test]
+fn capture_revision_owns_sorted_bytes_and_independent_producer_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "z.js", "const z = '😀';");
+    write(
+        root,
+        "a.rs",
+        "fn a() {}
+",
+    );
+    let admission = capture_admission(root);
+    let options = IndexOptions::new(root.to_owned());
+    let capture = || baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    let first = capture();
+    assert_eq!(first, capture());
+    assert_eq!(first.documents.len(), 2);
+    assert_eq!(first.documents[0].key.path.as_str(), "a.rs");
+    assert_eq!(first.documents[1].key.path.as_str(), "z.js");
+    for document in &first.documents {
+        assert_eq!(
+            document.content_hash,
+            hex::encode(Sha256::digest(&document.bytes))
+        );
+        assert_eq!(document.byte_length, document.bytes.len() as u64);
+        assert!(!document.syntax.is_empty());
+        for node in &document.syntax {
+            assert_eq!(
+                node.source_bytes,
+                document.bytes[node.start_byte..node.end_byte]
+            );
+            if let Some(parent) = node.parent_id {
+                assert!(parent < node.id);
+                assert!(document.syntax[parent].start_byte <= node.start_byte);
+                assert!(document.syntax[parent].end_byte >= node.end_byte);
+            }
+        }
+    }
+    assert_eq!(
+        first
+            .producers
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        ["N", "S"]
+    );
+    assert_eq!(first.producers[0].artifact_bytes, None);
+    assert_eq!(
+        first.producers[1].artifact_hash.as_deref(),
+        Some(hash("original semantic artifact").as_str())
+    );
+    let original = first.documents[1].bytes.clone();
+    write(root, "z.js", "const z = 'changed';");
+    let second = capture();
+    assert_ne!(first.revision_id, second.revision_id);
+    assert_eq!(first.documents[1].bytes, original);
+    write(root, "config.capture", "config-2");
+    assert_ne!(second.revision_id, capture().revision_id);
+    write(root, "semantic.artifact", "new semantic assertion");
+    assert_ne!(
+        second.producers[1].artifact_hash,
+        capture().producers[1].artifact_hash
+    );
+    assert_ne!(second.revision_id, capture().revision_id);
+}
+
+#[test]
+fn capture_refuses_missing_and_unsafe_required_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.rs",
+        "fn a() {}
+",
+    );
+    let admission = capture_admission(root);
+    let options = IndexOptions::new(root.to_owned());
+    fs::remove_file(root.join("semantic.artifact")).unwrap();
+    assert!(baleyg::indexer::capture_revision(&options, &admission, &cancel()).is_err());
+    write(root, "semantic.artifact", "repaired");
+    #[cfg(unix)]
+    {
+        fs::remove_file(root.join("config.capture")).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        write(external.path(), "outside", "unsafe");
+        std::os::unix::fs::symlink(external.path().join("outside"), root.join("config.capture"))
+            .unwrap();
+        assert!(baleyg::indexer::capture_revision(&options, &admission, &cancel()).is_err());
+    }
+}
+
+#[test]
+fn capture_does_not_claim_graph_or_semantic_completeness() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.js", "call();");
+    let admission = capture_admission(dir.path());
+    let options = IndexOptions::new(dir.path().to_owned());
+    let captured = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    assert_eq!(captured.producers.len(), 2);
+    assert_eq!(
+        run(&options).stats.semantic_state,
+        SemanticState::Unavailable
+    );
+}

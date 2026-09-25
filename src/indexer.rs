@@ -106,6 +106,394 @@ fn safe_read(path: &Path, cap: u64) -> Result<Vec<u8>> {
     ensure!(bytes.len() as u64 <= cap, "file grew beyond byte limit");
     Ok(bytes)
 }
+
+// These are internal acquisition records, not contract-v1 wire records. A capture
+// is independent of the disposable graph and of its storage generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedDocument {
+    pub key: crate::model::v1::DocumentKey,
+    pub bytes: Vec<u8>,
+    pub content_hash: String,
+    pub byte_length: u64,
+    pub syntax: Vec<CapturedSyntaxNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedSyntaxNode {
+    pub id: usize,
+    pub parent_id: Option<usize>,
+    pub kind: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub source_bytes: Vec<u8>,
+}
+
+fn capture_syntax(
+    language: crate::model::v1::Language,
+    bytes: &[u8],
+) -> Result<Vec<CapturedSyntaxNode>> {
+    use crate::model::v1::Language;
+    let grammar = match language {
+        Language::Java => tree_sitter_java::LANGUAGE,
+        Language::Rust => tree_sitter_rust::LANGUAGE,
+        Language::Python => tree_sitter_python::LANGUAGE,
+        Language::Javascript => tree_sitter_javascript::LANGUAGE,
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar.into())?;
+    let tree = parser
+        .parse(bytes, None)
+        .context("native AST parse failed")?;
+    let mut nodes = Vec::new();
+    let mut pending = vec![(tree.root_node(), None)];
+    while let Some((node, parent_id)) = pending.pop() {
+        ensure!(nodes.len() < 1_000_000, "AST exceeds node limit");
+        let id = nodes.len();
+        nodes.push(CapturedSyntaxNode {
+            id,
+            parent_id,
+            kind: node.kind().into(),
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            source_bytes: bytes[node.byte_range()].to_vec(),
+        });
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            pending.push((child, Some(id)));
+        }
+    }
+    Ok(nodes)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedProducer {
+    pub id: String,
+    pub version: String,
+    pub position_encoding: String,
+    pub executable_bytes: Vec<u8>,
+    pub executable_hash: String,
+    pub artifact_bytes: Option<Vec<u8>>,
+    pub artifact_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProducerInput {
+    pub id: String,
+    pub version: String,
+    pub position_encoding: String,
+    pub executable: PathBuf,
+    pub artifact: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureAdmission {
+    pub source_set_id: String,
+    pub root_id: String,
+    pub languages: Vec<crate::model::v1::Language>,
+    pub toolchain: PathBuf,
+    pub config: PathBuf,
+    pub dependency: PathBuf,
+    pub producers: Vec<ProducerInput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedRevision {
+    pub source_set_id: String,
+    pub root_id: String,
+    pub revision_id: String,
+    pub documents: Vec<CapturedDocument>,
+    pub manifest_bytes: Vec<u8>,
+    pub source_inputs: Vec<(String, Vec<u8>)>,
+    pub toolchain_bytes: Vec<u8>,
+    pub config_bytes: Vec<u8>,
+    pub dependency_bytes: Vec<u8>,
+    pub toolchain_hash: String,
+    pub config_hash: String,
+    pub dependency_hash: String,
+    pub producers: Vec<CapturedProducer>,
+}
+
+// A semantic adapter keeps the producer's original coordinate and encoding;
+// conversion and join validation are deliberately deferred to the validator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedPosition {
+    pub producer_id: String,
+    pub document: crate::model::v1::DocumentKey,
+    pub revision_id: String,
+    pub position_encoding: String,
+    pub coordinates: Vec<u64>,
+    pub artifact_hash: String,
+}
+
+fn capture_file(root: &Path, path: &Path, cap: u64) -> Result<Vec<u8>> {
+    let canonical_root = fs::canonicalize(root)?;
+    let parent = fs::canonicalize(path.parent().context("input has no parent")?)?;
+    ensure!(
+        parent.starts_with(&canonical_root),
+        "input escapes admitted root: {}",
+        path.display()
+    );
+    // A before/after read catches in-place edits and replacements during capture.
+    let first = safe_read(path, cap)?;
+    let second = safe_read(path, cap)?;
+    ensure!(
+        first == second,
+        "input changed during capture: {}",
+        path.display()
+    );
+    Ok(first)
+}
+
+pub fn capture_revision(
+    options: &IndexOptions,
+    admission: &CaptureAdmission,
+    cancel: &CancelFlag,
+) -> Result<CapturedRevision> {
+    use crate::model::v1::{DocumentKey, Language, Path as EvidencePath, Text};
+    check(cancel)?;
+    ensure!(
+        !admission.source_set_id.is_empty() && !admission.root_id.is_empty(),
+        "missing logical admission identity"
+    );
+    ensure!(
+        !admission.languages.is_empty(),
+        "missing admitted languages"
+    );
+    ensure!(
+        !fs::symlink_metadata(&options.workspace_root)?
+            .file_type()
+            .is_symlink(),
+        "workspace root is a symlink"
+    );
+    let root = fs::canonicalize(&options.workspace_root)?;
+    let mut documents = Vec::new();
+    let mut source_inputs = Vec::new();
+    let mut paths = Vec::new();
+    let mut walk = ignore::WalkBuilder::new(&root);
+    walk.require_git(false)
+        .follow_links(false)
+        .hidden(true)
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !matches!(
+                    e.file_name().to_str(),
+                    Some(
+                        ".git" | "node_modules" | ".venv" | ".baleyg" | "target" | "dist" | "build"
+                    )
+                )
+        });
+    for entry in walk.build() {
+        check(cancel)?;
+        let entry = entry.context("unsafe or unreadable source discovery")?;
+        if entry.file_type().is_some_and(|t| t.is_file()) {
+            let path = entry.into_path();
+            let name = path.file_name().and_then(|s| s.to_str());
+            let language = match path.extension().and_then(|s| s.to_str()) {
+                Some("rs") => Some(Language::Rust),
+                Some("java") => Some(Language::Java),
+                Some("py") => Some(Language::Python),
+                Some("js" | "mjs" | "cjs") => Some(Language::Javascript),
+                _ => None,
+            };
+            if language.is_some() || matches!(name, Some(".gitignore" | ".ignore")) {
+                paths.push((path, language));
+            }
+        }
+        ensure!(paths.len() <= 100_000, "capture exceeds 100000 inputs");
+    }
+    // The ignore policy itself affects discovery and therefore belongs to the snapshot.
+    // Also record root-level project metadata even if it is not a source document.
+    for name in [
+        ".gitignore",
+        ".ignore",
+        "package.json",
+        "tsconfig.json",
+        "jsconfig.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+        "Cargo.toml",
+        "Cargo.lock",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradle.properties",
+        "pyproject.toml",
+        "requirements.txt",
+        "uv.lock",
+        "poetry.lock",
+        "Pipfile",
+        "Pipfile.lock",
+    ] {
+        let path = root.join(name);
+        if fs::symlink_metadata(&path).is_ok() && !paths.iter().any(|(p, _)| p == &path) {
+            paths.push((path, None));
+        }
+    }
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut total = 0u64;
+    let mut observed_inputs = Vec::new();
+    for (path, language) in paths {
+        check(cancel)?;
+        let relative = path
+            .strip_prefix(&root)?
+            .to_str()
+            .context("non-UTF8 capture path")?
+            .replace('\\', "/");
+        let bytes = capture_file(&root, &path, options.max_file_bytes.min(256 * 1024 * 1024))?;
+        total += bytes.len() as u64;
+        ensure!(total <= 256 * 1024 * 1024, "capture exceeds 256 MiB");
+        observed_inputs.push((path, bytes.clone()));
+        if let Some(language) = language {
+            ensure!(
+                admission.languages.contains(&language),
+                "source language not admitted: {relative}"
+            );
+            let key = DocumentKey {
+                source_set_id: Text::new(&admission.source_set_id).context("invalid source set")?,
+                language,
+                path: EvidencePath::new(relative).context("invalid source path")?,
+            };
+            let syntax = capture_syntax(language, &bytes)?;
+            documents.push(CapturedDocument {
+                key,
+                content_hash: digest(&bytes),
+                byte_length: bytes.len() as u64,
+                bytes,
+                syntax,
+            });
+        } else {
+            source_inputs.push((relative, bytes));
+        }
+    }
+    // v1 canonical manifest is an array of {document,contentHash}, ordered by
+    // the language declaration order and then unsigned UTF-8 path bytes.
+    fn language_order(language: crate::model::v1::Language) -> u8 {
+        match language {
+            Language::Java => 0,
+            Language::Rust => 1,
+            Language::Python => 2,
+            Language::Javascript => 3,
+        }
+    }
+    documents.sort_by(|a, b| {
+        (
+            language_order(a.key.language),
+            a.key.path.as_str().as_bytes(),
+        )
+            .cmp(&(
+                language_order(b.key.language),
+                b.key.path.as_str().as_bytes(),
+            ))
+    });
+    let manifest: Vec<_> = documents
+        .iter()
+        .map(|d| serde_json::json!({"document":d.key,"contentHash":d.content_hash}))
+        .collect();
+    let manifest_bytes = serde_json::to_vec(&manifest)?;
+    let toolchain_bytes = capture_file(&root, &admission.toolchain, 16 * 1024 * 1024)?;
+    let config_bytes = capture_file(&root, &admission.config, 16 * 1024 * 1024)?;
+    let dependency_bytes = capture_file(&root, &admission.dependency, 16 * 1024 * 1024)?;
+    let mut producers = Vec::new();
+    for input in &admission.producers {
+        ensure!(
+            !input.id.is_empty() && !input.version.is_empty(),
+            "missing producer identity/version"
+        );
+        ensure!(
+            matches!(
+                input.position_encoding.as_str(),
+                "utf8" | "utf16" | "unicodeScalar"
+            ),
+            "unsupported position encoding"
+        );
+        ensure!(
+            !producers
+                .iter()
+                .any(|p: &CapturedProducer| p.id == input.id),
+            "duplicate producer"
+        );
+        let executable_bytes = capture_file(&root, &input.executable, 256 * 1024 * 1024)?;
+        let artifact_bytes = input
+            .artifact
+            .as_ref()
+            .map(|p| capture_file(&root, p, 256 * 1024 * 1024))
+            .transpose()?;
+        producers.push(CapturedProducer {
+            id: input.id.clone(),
+            version: input.version.clone(),
+            position_encoding: input.position_encoding.clone(),
+            executable_hash: digest(&executable_bytes),
+            executable_bytes,
+            artifact_hash: artifact_bytes.as_ref().map(|b| digest(b)),
+            artifact_bytes,
+        });
+    }
+    producers.sort_by(|a, b| a.id.cmp(&b.id));
+    let toolchain_hash = digest(&toolchain_bytes);
+    let config_hash = digest(&config_bytes);
+    let dependency_hash = digest(&dependency_bytes);
+    // Length-prefixed parts prevent boundary ambiguity; no machine path or graph
+    // index pin participates in this immutable identity.
+    let mut revision = Sha256::new();
+    for part in [
+        b"baleyg-captured-revision-v1".as_slice(),
+        admission.source_set_id.as_bytes(),
+        admission.root_id.as_bytes(),
+        &manifest_bytes,
+        &serde_json::to_vec(&source_inputs)?,
+        &toolchain_bytes,
+        &config_bytes,
+        &dependency_bytes,
+        &serde_json::to_vec(
+            &producers
+                .iter()
+                .map(|p| {
+                    (
+                        &p.id,
+                        &p.version,
+                        &p.position_encoding,
+                        &p.executable_hash,
+                        &p.artifact_hash,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?,
+    ] {
+        revision.update((part.len() as u64).to_be_bytes());
+        revision.update(part);
+    }
+    for (path, bytes) in observed_inputs {
+        check(cancel)?;
+        ensure!(
+            capture_file(&root, &path, options.max_file_bytes.min(256 * 1024 * 1024))? == bytes,
+            "source changed during capture: {}",
+            path.display()
+        );
+    }
+    check(cancel)?;
+    Ok(CapturedRevision {
+        source_set_id: admission.source_set_id.clone(),
+        root_id: admission.root_id.clone(),
+        revision_id: format!("rev:v1:{}", hex::encode(revision.finalize())),
+        documents,
+        manifest_bytes,
+        source_inputs,
+        toolchain_bytes,
+        config_bytes,
+        dependency_bytes,
+        toolchain_hash,
+        config_hash,
+        dependency_hash,
+        producers,
+    })
+}
+
 pub fn index_workspace(
     options: &IndexOptions,
     cancel: &CancelFlag,
