@@ -97,14 +97,24 @@ Freshness is independent from coverage and is evaluated only after captured-basi
 A failed refresh creates a `failed` coverage row and retains the old provenance as labelled historical evidence. It never relabels the old basis fresh and never binds old evidence to another revision's occurrences.
 
 <a id="historical-evidence-scope"></a>
-**Historical evidence scope (clarification, 2026-09-25).** This adds no field. Stable syntax IDs are the only cross-revision link. For a returned `GraphNode.declaration` with syntax ID `S` in document `D` of the requested source set, an answer at revision `r2` returns the selected producer's latest retained proof captured at an earlier revision `r1`, but only when all of the following hold:
-- the proof is a `Symbol`, `DeclarationBinding` or `TypeRelationship` that names `S` (`DeclarationBinding.syntaxId`, an internal `Symbol.declarations` target, or a relationship `source`);
-- the selected producer's `r2` tuple for `D` is `failed` or `omitted`;
-- the proof is labelled with its captured revision and a freshness derived by the rules above. That is `possiblyStale` when `D`'s bytes are unchanged. It is `stale` when they changed, and the overlay is then withheld.
+**Historical evidence scope (clarification, 2026-09-25).** This adds no field and no output record. `GraphResult` returns no `Symbol`, `DeclarationBinding` or `TypeRelationship` records. Retained declaration facts only determine which existing `Provenance` and `Coverage` rows an answer returns; the facts are never applied to the answer. Stable syntax IDs are the only cross-revision link.
 
-Such a proof contributes only returned provenance, its captured tuple's coverage, and warnings-v1 keys. It never supplies an `r2` answer's `GraphEdge.binding`, `to`, admission or traversal.
+Take a returned `GraphNode.declaration` with syntax ID `S` in document `D`, an answer at revision `r2`, and a selected producer `P` whose `r2` tuple for `D` is `failed` or `omitted`. Let `r1` be the latest earlier revision at which `P`'s tuple for `D` is `complete` or `partial`; if none exists, nothing historical is returned. The answer returns:
+- the provenance of **every** `P` fact captured at `r1` whose provenance document is `D` and which names `S`, meaning a `DeclarationBinding.syntaxId`, an internal `Symbol.declarations` target, or a `TypeRelationship.source`. A fact whose evidence document is not `D` is excluded even if it targets `S`;
+- `P`'s captured `r1` coverage row for `D`, beside the required `r2` row.
 
-Occurrence-keyed evidence never crosses revisions, because occurrence IDs include `revisionId`. This covers `CallBinding`, `Reference`, and their joins. After a failed `r2` refresh, `r2` calls have no selected-producer binding and remain boundaries. Include no historical proof for undisplayed declarations, other documents, other producers, or anything older than the latest retained proof per `(producer, S)`. A proof selected merely because it exists, or one that selects itself, is invalid.
+Each such provenance keeps its captured revision. Its freshness compares the captured bytes of `D` with the requested `r2` bytes of `D`:
+- unchanged bytes are `possiblyStale`, because the captured revision differs;
+- changed or missing bytes are `stale`.
+
+warnings-v1 applies unchanged to the returned rows: a selected `failed` or `partial` row triggers `coverageIncomplete`, while an unselected `omitted` row alone does not; stale and possibly-stale provenance trigger `staleEvidence`.
+
+Occurrence-keyed evidence never crosses revisions, because occurrence IDs include `revisionId`. This covers `CallBinding`, `Reference`, and their joins. After a failed `r2` refresh, `r2` calls have no selected-producer binding and remain boundaries. Return no historical provenance or coverage for:
+- declarations the answer does not return;
+- other documents or other producers;
+- revisions other than `r1`.
+
+Provenance selected merely because it exists, or that selects itself, is invalid.
 
 `CallBinding.staleTarget` is null when there is no internal declared target; true when that target is missing or its captured target document bytes differ from the requested snapshot; false when it exists with matching bytes. Thus a caller can be fresh while the target is stale. `possiblyStale`, `stale`, or `staleTarget=true` forbids expansion.
 
@@ -118,7 +128,7 @@ Hand-checks:
 | Caller bytes unchanged; dependency, config, or producer changes | Coverage is unchanged. | Each independently makes semantic evidence `possiblyStale`. |
 | Missing basis | Semantic artifact is malformed and atomically rejected; absence may be exposed as failed/missing coverage. | It cannot be called fresh. |
 | Fresh caller, changed target bytes | Caller may be fresh. | Internal binding has `staleTarget=true`; boundary, no expansion. |
-| Refresh fails | New tuple row is `failed`, diagnostic required. | Old basis remains historical with its old label; never promoted. Only declaration-keyed proofs for returned declarations may appear in the new answer ([scope](#historical-evidence-scope)); no old call binding does. |
+| Refresh fails | New tuple row is `failed`, diagnostic required. | Old basis remains historical with its old label; never promoted. Only provenance and coverage of declaration-keyed facts for returned declarations may appear in the new answer ([scope](#historical-evidence-scope)); no old call binding does. |
 
 ## Records and bindings
 
@@ -147,7 +157,7 @@ Hand-checks:
 | `Target.kind` | `internal \| external` | Selects exactly one variant. | Mixed/incomplete variant invalid. |
 | internal `.syntaxId` | `SyntaxId` | In answer source set/snapshot. | Dangling or other-source target cannot be internal. |
 | internal `.document` | `DocumentKey` | Matches syntax declaration. | Mismatch invalid. |
-| internal `.revisionId` | `Text` | Matches answer snapshot when current. | Old target may only be retained as labelled stale evidence, not promoted. |
+| internal `.revisionId` | `Text` | Matches answer snapshot when current. | Old target may only be retained as labelled historical evidence with derived freshness, not promoted. |
 | external `.symbol` | `SymbolKey` | Explicit external boundary, including other source sets in v1. | Missing key invalid. |
 | `DeclarationBinding.syntaxId` | `SyntaxId?` | Exact declaration-name join has its one ID; non-exact is null. | Wrong join/cardinality invalid. |
 | `.symbols` | `SymbolKey[]` | Exact binding has at least one explicit unique symbol; non-exact diagnostic evidence may be empty. | Exact empty list invalid. |
