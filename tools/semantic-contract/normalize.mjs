@@ -194,8 +194,10 @@ export function normalizeFixture(loaded){
  for(const group of bindingGroups.values()){
   const items=collapseFacts(group.map(x=>x.value));if(items.length===1){records.callBindings.push(items[0]);continue;}
   const baseline=items[0],same=items.every(x=>x.callId===baseline.callId&&encode(x.join)===encode(baseline.join)&&x.dispatch===baseline.dispatch&&encode(x.possibleDispatch)===encode(baseline.possibleDispatch));
-  if(!same||items.some(x=>x.join.status!=='exact'||!['resolved','external'].includes(x.resolution)||x.declaredTarget===null||x.candidates.length))fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','incompatible duplicate facts');
-  const targets=distinctTargets([...new Map(items.map(x=>[encode(x.declaredTarget),x.declaredTarget])).values()]);if(targets.length<2){if(items.some(x=>encode({...x,provenanceId:null})!==encode({...baseline,provenanceId:null})))fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','conflicting duplicate facts');records.callBindings.push(...items);continue;}
+  if(!same)fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','contributor non-target claims differ');
+  const targets=distinctTargets([...new Map(items.map(x=>[encode(x.declaredTarget),x.declaredTarget])).values()]);
+  if(targets.length>1&&items.some(x=>x.join.status!=='exact'||!['resolved','external'].includes(x.resolution)||x.declaredTarget===null||x.candidates.length))fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','contradictory targets need exact resolved or external claims');
+  if(targets.length<2){if(items.some(x=>encode({...x,provenanceId:null})!==encode({...baseline,provenanceId:null})))fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','conflicting duplicate facts');records.callBindings.push(...items);continue;}
   for(const x of items){const value={...x,resolution:'ambiguous',declaredTarget:null,candidates:targets,staleTarget:null};validate('CallBinding',value);records.callBindings.push(value);for(const entry of group)if(entry.value.provenanceId===x.provenanceId)recordMap.set(entry.fact.ref,value);}
  }
  for(const anchorCase of loaded.anchors.cases){if(identityMap.has(anchorCase.id))fail('NORMALIZE.RECORD_REF','recordRef','anchor/native reference collision');

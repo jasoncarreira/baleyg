@@ -314,6 +314,48 @@ test('two producers keep full separate proof inventories; reassignment merges on
   e.assertion==='BINDING.CONTRADICTION'&&e.code==='invalidRecord'&&e.field==='candidates');
 });
 
+test('source-backed agreeing duplicate claims keep each provenance and agree at normalization/checker boundary',async t=>{
+ const cases=[
+  {label:'resolved exact',options:{claims:['target','target']}},
+  {label:'external exact',options:{claims:['target','target'],resolution:'external'}},
+  {label:'unresolved exact',options:{claims:['target','target'],resolution:'unresolved'}},
+  {label:'ambiguous same candidates',options:{claims:['target','target'],resolution:'ambiguous'}},
+  {label:'unmatched diagnostic only',options:{claims:['target','target'],status:'unmatched'}},
+  {label:'unsupported diagnostic only',options:{claims:['target','target'],status:'unsupported'}}
+ ];
+ for(const {label,options} of cases){
+  const s=await specimen(t,options),compiled=normalizeFixture(s.loaded);
+  const {C,M,J}=s.prechecks(),checked=checkBindings(s.loaded,s.records,C,M,J);
+  assert.equal(canon(compiled.records.callBindings),canon(checked.callBindings),label);
+  assert.deepEqual(compiled.records.callBindings.map(x=>x.provenanceId).sort(),['proof-0','proof-1'],label);
+  for(const [factRef,proofId] of [['binding-0','proof-0'],['binding-1','proof-1']]){
+   assert.equal(compiled.recordMap.get(factRef).provenanceId,proofId,label);
+   assert.equal(canon(compiled.recordMap.get(factRef)),canon(checked.recordByFactRef.get(factRef)),label);
+  }
+  assert.equal(canon(checkBindings(s.loaded,{...s.records,callBindings:compiled.records.callBindings},C,M,J).callBindings),
+   canon(compiled.records.callBindings),label);
+ }
+});
+
+test('source-backed contradictory nonexact targets and mismatched non-target claims fail both boundaries',async t=>{
+ const cases=[
+  {label:'contradictory unmatched',options:{claims:['target','target'],status:'unmatched',raw:facts=>{
+   facts[1].fact.record.declaredTarget.declarationRef='r1:other';
+  }}},
+  {label:'mismatched dispatch',options:{claims:['target','target'],raw:facts=>{
+   facts[1].fact.record.dispatch='virtual';
+  }}},
+  {label:'mismatched possible dispatch',options:{claims:['target','target'],possibleDispatch:['third'],raw:facts=>{
+   facts[1].fact.record.possibleDispatch=[];
+  }}}
+ ];
+ for(const {label,options} of cases){
+  const s=await specimen(t,options),{C,M,J}=s.prechecks();
+  assert.throws(()=>normalizeFixture(s.loaded),e=>e.assertion==='NORMALIZE.BINDING_CONFLICT'&&e.code==='invalidRecord',label);
+  assert.throws(()=>checkBindings(s.loaded,s.records,C,M,J),e=>e.assertion==='BINDING.CONTRADICTION'&&e.code==='invalidRecord',label);
+ }
+});
+
 test('finite loaded binding controls run valid baseline before each one-property mutation',async t=>{
  const cases=[
   {id:'BINDING.FACT.proof',rawAfterProof:f=>{f[0].fact.record.provenanceId='proof-missing';},assertion:'IDENTITY.SEMANTIC',field:'binding-0'},
