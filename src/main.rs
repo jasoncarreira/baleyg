@@ -145,6 +145,7 @@ impl WorkspaceArgs {
         let roots = TopologyRoots::production()?;
         let cwd = std::env::current_dir()?;
         let identity = WorkspaceIdentity::discover_unattached(self.workspace.as_deref(), &cwd)?;
+        roots.reject_root_overlap(&identity)?;
         Ok((roots, identity))
     }
     fn resolve(&self) -> Result<(TopologyRoots, WorkspaceIdentity)> {

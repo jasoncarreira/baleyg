@@ -396,3 +396,36 @@ fn external_destinations_are_rejected_before_git_marker_creation() {
     assert!(!output.exists());
     assert!(!root.join(".git/baleyg/workspace-id").exists());
 }
+
+#[test]
+fn overlapping_git_workspace_refuses_before_marker_or_managed_entries() {
+    for fixed in ["cache", "data"] {
+        for sub in ["status", "index", "symbols", "query", "export", "serve"] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path().join("home");
+            let cache = home.join("Library/Caches/dev.odin.baleyg");
+            let data = home.join("Library/Application Support/dev.odin.baleyg");
+            let workspace = if fixed == "cache" { &cache } else { &data };
+            fs::create_dir_all(workspace.join(".git")).unwrap();
+            let mut cmd = command(workspace, &home, sub);
+            if sub == "query" {
+                cmd.arg("--seed").arg("a");
+            }
+            let output = cmd.output().unwrap();
+            assert!(!output.status.success(), "{fixed} {sub}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("workspace root overlaps fixed topology"),
+                "{fixed} {sub}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !workspace.join(".git/baleyg/workspace-id").exists(),
+                "{fixed} {sub}"
+            );
+            assert!(!cache.join("indexes").exists(), "{fixed} {sub}");
+            assert!(!data.join("workspaces").exists(), "{fixed} {sub}");
+            assert!(!home.join("token").exists(), "{fixed} {sub}");
+        }
+    }
+}

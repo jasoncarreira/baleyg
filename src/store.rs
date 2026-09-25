@@ -54,10 +54,19 @@ impl DerefMut for IndexConnection {
         &mut self.db
     }
 }
-fn reject_sidecars(path: &Path) -> Result<()> {
+fn reject_sidecars(path: &Path, writable: bool, leader_lock: &Path) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         let sidecar = path.with_file_name(format!("index.db{suffix}"));
         match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) if suffix == "-journal" && !writable => {
+                // Only a held, verified publisher lock can account for a live journal.
+                // Never give a writable SQLite opener a chance to recover one.
+                match topology::UseGuard::acquire_existing(leader_lock, true, true) {
+                    Err(e) if e.to_string().starts_with("storage_busy:") => {}
+                    Ok(_) => anyhow::bail!("recovery_required: {}", sidecar.display()),
+                    Err(e) => return Err(e.context("recovery_required: unverified journal leader")),
+                }
+            }
             Ok(_) => anyhow::bail!("recovery_required: {}", sidecar.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -98,9 +107,9 @@ fn verify_index_file(path: &Path) -> Result<()> {
     let _ = file.as_raw_fd();
     Ok(())
 }
-fn open_index(path: &Path, writable: bool) -> Result<Connection> {
+fn open_index(path: &Path, writable: bool, leader_lock: &Path) -> Result<Connection> {
     use rusqlite::OpenFlags;
-    reject_sidecars(path)?;
+    reject_sidecars(path, writable, leader_lock)?;
     verify_index_file(path)?;
     let flags = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -824,7 +833,7 @@ impl Store {
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
         let path = self.roots.index_db(&self.identity);
-        reject_sidecars(&path)?;
+        reject_sidecars(&path, true, &self.roots.leader_lock(&self.identity))?;
         if path.exists() {
             return Ok(());
         }
@@ -903,7 +912,11 @@ impl Store {
     fn connect_index(&self, writable: bool) -> Result<IndexConnection> {
         self.identity.verify()?;
         let use_guard = self.roots.index_use_existing(&self.identity)?;
-        let db = open_index(&self.roots.index_db(&self.identity), writable)?;
+        let db = open_index(
+            &self.roots.index_db(&self.identity),
+            writable,
+            &self.roots.leader_lock(&self.identity),
+        )?;
         self.identity.verify()?;
         use_guard.verify()?;
         Ok(IndexConnection {

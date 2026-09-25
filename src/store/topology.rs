@@ -132,7 +132,7 @@ impl TopologyRoots {
     pub fn record_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.record_dir(identity).join("workspace.db")
     }
-    fn reject_root_overlap(&self, identity: &WorkspaceIdentity) -> Result<()> {
+    pub fn reject_root_overlap(&self, identity: &WorkspaceIdentity) -> Result<()> {
         let cache = resolve_existing_ancestor(&self.cache)?;
         let data = resolve_existing_ancestor(&self.data)?;
         ensure!(

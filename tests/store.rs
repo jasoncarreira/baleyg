@@ -624,3 +624,56 @@ fn unresolved_candidate_evidence_need_not_be_a_graph_node() {
         graph.calls[0].candidate_symbols
     );
 }
+
+#[test]
+fn active_delete_journal_allows_prior_pair_or_busy_but_orphan_refuses() {
+    let (state, work, store) = fixture();
+    let baseline = store.status().unwrap().revision;
+    store
+        .publish(&graph(), &store.leader().unwrap(), baseline, &cancel())
+        .unwrap();
+    let previous = store.status().unwrap().revision;
+    let leader = store.leader().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let path = index_db(state.path());
+    let writer = std::thread::spawn(move || {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "BEGIN IMMEDIATE; UPDATE index_metadata SET index_revision=2 WHERE singleton=1",
+        )
+        .unwrap();
+        ready_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+        db.execute_batch("ROLLBACK").unwrap();
+        drop(leader);
+    });
+    ready_rx.recv().unwrap();
+    assert!(
+        index_db(state.path())
+            .with_file_name("index.db-journal")
+            .exists()
+    );
+    let status = store.status();
+    match status {
+        Ok(status) => assert_eq!(status.revision, previous),
+        Err(e) => assert!(e.to_string().contains("storage_busy"), "{e:#}"),
+    }
+    let source = store.source_at("a.js", Some(previous));
+    match source {
+        Ok(Some((pin, source))) => {
+            assert_eq!(pin, previous);
+            assert_eq!(source.text, "function a() {}");
+        }
+        Err(e) => assert!(e.to_string().contains("storage_busy"), "{e:#}"),
+        Ok(other) => panic!("unexpected pinned source: {other:?}"),
+    }
+    done_tx.send(()).unwrap();
+    writer.join().unwrap();
+    let journal = index_db(state.path()).with_file_name("index.db-journal");
+    std::fs::write(&journal, b"orphan journal").unwrap();
+    let error = store.status().unwrap_err();
+    assert!(error.to_string().contains("recovery_required"), "{error:#}");
+    assert!(crate::common::open_store(state.path(), work.path()).is_err());
+    assert!(journal.exists());
+}
