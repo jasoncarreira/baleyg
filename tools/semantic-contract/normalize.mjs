@@ -233,7 +233,11 @@ export function joinAnchor(
     (x) => encode(x.key) === encode(selector.document),
   );
   if (!document || document.contentHash !== selector.contentHash)
-    fail("JOIN.DOCUMENT", "contentHash", "anchor source tuple differs");
+    fail(
+      "JOIN.DOCUMENT",
+      "contentHash",
+      `anchor source tuple differs: expected ${document?.contentHash ?? "a captured document"}, actual ${selector.contentHash}`,
+    );
   const range = toByteRange(source, selector.range);
   const anchor = {
     document: selector.document,

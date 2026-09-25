@@ -1084,7 +1084,7 @@ test("explicit external relationship target and document-scoped key remain sourc
   assert.equal(checked.symbols[0].key.scope, "document");
 });
 
-test("Java mixed bases bind each relationship to its governing keyword", async (t) => {
+test("Java mixed bases take each relationship kind from its captured proof", async (t) => {
   const mixed = source.replace(
     "class Child extends Parent {}",
     "class Child extends Parent implements Face {}",

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { deriveWarnings, checkWarnings } from "../graph-warnings.mjs";
+import { checkWarnings } from "../graph-warnings.mjs";
 import { registerControls, runControl } from "./mutations.mjs";
 
 function specimen() {
@@ -30,18 +30,20 @@ function specimen() {
     warnings: [],
   };
 }
-const keys = (warnings) => warnings.map((x) => [x.code, x.provenanceId]);
+// Hand-authored warning keys; the checker must never supply its own expectation.
+const expectedKeys = [
+  ["coverageIncomplete", null],
+  ["staleEvidence", null],
+  ["staleEvidence", "stale-a"],
+  ["staleEvidence", "stale-z"],
+  ["staleTarget", "binding-z"],
+  ["bindingAmbiguous", "binding-z"],
+];
+const authored = (keys) =>
+  keys.map(([code, provenanceId]) => ({ code, provenanceId, message: code }));
 test("all warnings-v1 keys use enum ordering, stale aggregation and shared-edge dedup", () => {
   const s = specimen();
-  s.warnings = deriveWarnings(s);
-  assert.deepEqual(keys(s.warnings), [
-    ["coverageIncomplete", null],
-    ["staleEvidence", null],
-    ["staleEvidence", "stale-a"],
-    ["staleEvidence", "stale-z"],
-    ["staleTarget", "binding-z"],
-    ["bindingAmbiguous", "binding-z"],
-  ]);
+  s.warnings = authored(expectedKeys);
   assert.equal(checkWarnings(s), true);
   // Message text is independent of warning membership; Unicode is preserved.
   s.warnings.forEach((row, i) => (row.message = `Unicode 🦊 ${i}`));
@@ -54,14 +56,14 @@ test("unselected omitted, limits and boundary do not imply coverage warning; syn
   s.edges = [{ binding: null, boundaryReason: "missingEvidence" }];
   s.warnings = [];
   assert.equal(checkWarnings(s), true);
-  assert.deepEqual(deriveWarnings(s), []);
   s.request.semanticProducerId = null;
-  s.warnings = deriveWarnings(s);
-  assert.deepEqual(keys(s.warnings), [["syntaxOnly", null]]);
+  assert.throws(() => checkWarnings(s), { assertion: "WARNING.KEYS" });
+  s.warnings = authored([["syntaxOnly", null]]);
+  assert.equal(checkWarnings(s), true);
 });
 test("warning negatives run exact checker controls", async (t) => {
   const s = specimen();
-  s.warnings = deriveWarnings(s);
+  s.warnings = authored(expectedKeys);
   const rows = registerControls(
     [
       [

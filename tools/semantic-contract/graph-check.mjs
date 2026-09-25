@@ -101,7 +101,7 @@ export function expectedGraph(loaded, records, checked, request) {
       row,
     ]),
   );
-  const projection = graphProjection(records, effective);
+  const projection = graphProjection(loaded, records, effective);
   const proofs = new Map(
     records.provenance.map((row) => [row.id, projection.proof(row)]),
   );
@@ -194,14 +194,18 @@ export function expectedGraph(loaded, records, checked, request) {
         row?.selected && ["complete", "partial"].includes(row.state);
       // A failed/omitted row with a physically present fresh proof still cannot
       // authorize an occurrence. Its binding must not appear in GraphResult.
+      // Contradictory members share their ambiguous candidates; the edge carries
+      // the member with the lowest provenance ID, and evidence returns all of them.
       const selected = usable
-        ? ((bindings.get(call.id) ?? []).find(
-            (b) =>
-              documentKey(b.join.anchor.document) ===
-                documentKey(call.document) &&
-              b.join.anchor.contentHash ===
-                proofs.get(b.provenanceId)?.contentHash,
-          ) ?? null)
+        ? ((bindings.get(call.id) ?? [])
+            .toSorted((a, b) => bytes(a.provenanceId, b.provenanceId))
+            .find(
+              (b) =>
+                documentKey(b.join.anchor.document) ===
+                  documentKey(call.document) &&
+                b.join.anchor.contentHash ===
+                  proofs.get(b.provenanceId)?.contentHash,
+            ) ?? null)
         : null;
       const binding = selected === null ? null : projection.binding(selected);
       const proof = binding === null ? null : proofs.get(binding.provenanceId);

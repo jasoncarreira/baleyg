@@ -6,7 +6,6 @@ import {
   rename,
   rm,
   lstat,
-  link,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { loadFixture, confinedFile } from "./load.mjs";
@@ -125,11 +124,12 @@ async function readPublished(root, expected) {
     countsHash: manifest.counts.hash,
     inputHash: manifest.inputHash,
   };
-  if (contentHash(canonicalBytes(digest)) !== manifest.bundleHash)
+  const bundleHash = contentHash(canonicalBytes(digest));
+  if (bundleHash !== manifest.bundleHash)
     fail(
       "PUBLICATION.BUNDLE",
       "bundleHash",
-      "manifest bundle digest differs from its linked hashes",
+      `manifest bundle digest differs from its linked hashes: expected ${bundleHash}, actual ${manifest.bundleHash}`,
     );
   for (const name of names) {
     const descriptor = manifest[name];
@@ -180,91 +180,53 @@ export async function checkPublication(root) {
   return built.manifest;
 }
 
-async function verifyBundle(directory, built, assertion) {
+async function verifyBundle(directory, built) {
   for (const name of names) {
     let actual;
     try {
       actual = await readFile(join(directory, `${name}.json`));
     } catch (error) {
-      fail(assertion, name, `bundle file missing: ${error.message}`);
-    }
-    if (
-      contentHash(actual) !== built.manifest[name].hash ||
-      !actual.equals(built.bytes[name])
-    )
       fail(
-        assertion,
+        "PUBLICATION.IMMUTABLE",
         name,
-        "bundle bytes conflict with checked canonical output",
+        `bundle file missing: ${error.message}`,
       );
-    const type = {
-      records: "NormalizedRecordsV1",
-      answers: "AnswersV1",
-      counts: "CountsV1",
-    }[name];
-    try {
-      validate(type, parseJson(actual));
-    } catch (error) {
-      fail(assertion, name, `bundle content invalid: ${error.message}`);
     }
+    if (!actual.equals(built.bytes[name]))
+      fail(
+        "PUBLICATION.IMMUTABLE",
+        name,
+        `bundle bytes conflict with checked canonical output: expected ${built.manifest[name].hash}, actual ${contentHash(actual)}`,
+      );
   }
 }
 
-// Optional fault is a test seam, called only at publication boundaries.
-export async function generateFixture(root, { check = false, fault } = {}) {
+// Content-addressed bundles are immutable. The manifest is renamed into place
+// last, so a failure before that leaves the previous publication intact.
+export async function generateFixture(root, { check = false } = {}) {
   if (check) return checkPublication(root);
   const built = await compileFixture(root);
   const generated = join(root, "generated"),
-    bundles = join(generated, "bundles");
-  await mkdir(bundles, { recursive: true });
+    final = join(generated, "bundles", built.manifest.bundleHash);
+  await mkdir(join(generated, "bundles"), { recursive: true });
   const temporary = await mkdtemp(join(generated, ".publish-"));
-  const staged = join(temporary, "bundle"),
-    final = join(bundles, built.manifest.bundleHash);
-  let installed = false;
-  const step = async (name) => {
-    if (fault) await fault(name);
-  };
   try {
-    await mkdir(staged);
-    for (const name of names) {
-      await writeFile(join(staged, `${name}.json`), built.bytes[name], {
-        flag: "wx",
-      });
-      await step(`stage:${name}`);
+    if (await present(final)) await verifyBundle(final, built);
+    else {
+      const staged = join(temporary, "bundle");
+      await mkdir(staged);
+      for (const name of names)
+        await writeFile(join(staged, `${name}.json`), built.bytes[name], {
+          flag: "wx",
+        });
+      await rename(staged, final);
     }
-    await verifyBundle(staged, built, "PUBLICATION.STAGE");
-    await step("stage:verified");
-    await step("install:bundle");
-    try {
-      await mkdir(final);
-      installed = true;
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-    }
-    if (installed) {
-      // Exclusive directory creation and atomic hard links cannot overwrite old bytes.
-      // Only the final manifest rename makes a complete bundle visible to readers.
-      for (const name of names) {
-        await link(join(staged, `${name}.json`), join(final, `${name}.json`));
-        await step(`install:${name}`);
-      }
-      await verifyBundle(final, built, "PUBLICATION.STAGE");
-    } else await verifyBundle(final, built, "PUBLICATION.IMMUTABLE");
-    await step("install:verified");
     const manifestFile = join(temporary, "manifest.json");
     await writeFile(manifestFile, canonicalBytes(built.manifest), {
       flag: "wx",
     });
-    const stagedManifest = await readFile(manifestFile);
-    if (!stagedManifest.equals(canonicalBytes(built.manifest)))
-      fail("PUBLICATION.STAGE", "manifest", "staged manifest bytes differ");
-    await verifyBundle(final, built, "PUBLICATION.IMMUTABLE");
-    await step("install:manifest");
     await rename(manifestFile, join(generated, "manifest.json"));
     return built.manifest;
-  } catch (error) {
-    if (installed) await rm(final, { recursive: true, force: true });
-    throw error;
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

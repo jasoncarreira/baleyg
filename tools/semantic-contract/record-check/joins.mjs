@@ -307,7 +307,7 @@ export function checkJoins(loaded, records, coverage, measurement) {
       reject(
         "JOIN.TUPLE",
         "anchor",
-        "source set, document, revision or hash differs",
+        `source set, document, revision or hash differs: expected ${document?.contentHash ?? "a captured document"}, actual ${selector.contentHash}`,
       );
     const owner = declarations.get(selector.ownerRef);
     if (

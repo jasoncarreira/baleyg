@@ -305,7 +305,7 @@ test("CANONICAL.INTAKE: duplicate-safe strict Unicode and integer tokens", () =>
     '"\udc00"',
     '{"a":1,}',
   ])
-    assert.throws(() => parseJson(bad));
+    assert.throws(() => parseJson(bad), /JSON\.INTAKE /);
   assert.throws(() => parseJson(Buffer.from([0xff])), /encoded|UTF-8/i);
   assert.deepEqual(
     { ...parseJson('{"a":[0,true,null,"é"]}') },
@@ -325,7 +325,7 @@ test("CANONICAL.INTAKE: duplicate-safe strict Unicode and integer tokens", () =>
     "\ud800",
     { x: undefined },
   ])
-    assert.throws(() => canonicalBytes(value));
+    assert.throws(() => canonicalBytes(value), /JSON\.CANONICAL /);
 });
 
 // A populated specimen reaches nested policies which empty-envelope checks cannot reach.

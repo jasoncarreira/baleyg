@@ -42,13 +42,6 @@ function warningKeys(result) {
           : order(a.provenanceId, b.provenanceId)),
   );
 }
-export function deriveWarnings(result) {
-  return warningKeys(result).map(({ code, provenanceId }) => ({
-    code,
-    provenanceId,
-    message: code,
-  }));
-}
 export function checkWarnings(result) {
   if (!Array.isArray(result.warnings))
     fail("WARNING.KEYS", "warnings", "warnings must be an array");

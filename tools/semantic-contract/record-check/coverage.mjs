@@ -74,7 +74,11 @@ function capturedBasis(proof, loaded, proofRow) {
   validate("Provenance", proof);
   const document = documentAt(loaded, proof.document, proof.revisionId);
   if (!document || document.contentHash !== proof.contentHash)
-    fail("FRESHNESS.BASIS", "contentHash", "captured document bytes disagree");
+    fail(
+      "FRESHNESS.BASIS",
+      "contentHash",
+      `captured document bytes disagree: expected ${document?.contentHash ?? "a captured document"}, actual ${proof.contentHash}`,
+    );
   const producer = loaded.fixture.producers.find(
     (x) => x.id === proof.producerId,
   );
