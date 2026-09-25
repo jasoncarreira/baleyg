@@ -405,15 +405,18 @@ test('required identity fields are independently rejected as format omissions',a
  }
 });
 
-test('semantic use requires selected coverage for each producer without requiring freshness',async t=>{
+test('semantic facts require selected coverage; valid historical proofs stay on their r1 tuple',async t=>{
  const b=await specimen(t);
+ const checked=checkCoverage(b.loaded,b.records);
  for(const proof of b.records.provenance){
-  const source=structuredClone(b.records),annotations=structuredClone(b.loaded.annotations);
-  const row=source.coverage.find(x=>x.producerId===proof.producerId&&x.revisionId==='r1'&&x.documentPath==='a.js');
-  const authored=annotations.flatMap(x=>x.facts).find(x=>x.kind==='coverage'&&x.record.producerId===proof.producerId&&x.record.revisionId==='r1'&&x.record.documentPath==='a.js').record;
-  Object.assign(row,{selected:false,observedRoles:[],state:'omitted',diagnostic:'unselected'});Object.assign(authored,row);
-  const C=checkCoverage({...b.loaded,annotations},source),use={producerId:proof.producerId,document:proof.document,revisionId:'r1',provenanceIds:[]};
-  const control=registerControls([{id:`U1.use-${proof.producerId}-unselected`,baseline:()=>use,check:x=>C.checkUse(x),mutate:x=>{x.provenanceIds=[proof.id];return x;},expectedAssertion:'FRESHNESS.USE',expectedCode:'invalidRecord',expectedField:'coverage'}])[0];
+  assert.equal(checked.checkUse({producerId:proof.producerId,document:proof.document,revisionId:'r1',provenanceIds:[proof.id]}).proofs[0].freshness,'stale');
+  const control=registerControls([{id:`U1.fact-${proof.producerId}-unselected`,baseline:()=>({records:b.records,annotations:b.loaded.annotations}),
+   mutate:x=>{
+    const row=x.records.coverage.find(y=>y.producerId===proof.producerId&&y.revisionId==='r1'&&y.documentPath==='a.js');
+    const authored=x.annotations.flatMap(y=>y.facts).find(y=>y.kind==='coverage'&&y.record.producerId===proof.producerId&&y.record.revisionId==='r1'&&y.record.documentPath==='a.js').record;
+    Object.assign(row,{selected:false,observedRoles:[],state:'omitted',diagnostic:'unselected'});Object.assign(authored,row);return x;
+   },check:x=>checkCoverage({...b.loaded,annotations:x.annotations},x.records),
+   expectedAssertion:'COVERAGE.FACT',expectedCode:'invalidRecord',expectedField:'coverage'}])[0];
   await t.test(control.id,()=>runControl(control));
  }
 });

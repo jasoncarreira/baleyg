@@ -170,6 +170,28 @@ export function checkCoverage(loaded,records){
   const captured=semanticProofsById.get(proof.id);
   return !captured||!equal((({freshness,...rest})=>rest)(captured),(({freshness,...rest})=>rest)(proof));
  }))fail('FRESHNESS.BASIS','provenance','normalized semantic proof inventory differs from captured proofs');
+ // A selected coverage tuple can authorize only facts in roles it actually observed.
+ // In particular, a failed refresh cannot contain a current call fact, even if
+ // the graph traversal would otherwise hide that binding as missing evidence.
+ for(const annotation of loaded.annotations)for(const fact of annotation.facts){
+  if(!['symbol','declarationBinding','typeRelationship','reference','callBinding'].includes(fact.kind))continue;
+  const proofId=fact.kind==='typeRelationship'?fact.provenanceRef:fact.record.provenanceId;
+  const proof=checkedProofs.get(proofId);
+  if(!proof||!equal(proof.document,annotation.document)||proof.revisionId!==annotation.revisionId)
+   fail('COVERAGE.FACT','provenanceId','semantic fact has no captured proof in its document and revision');
+  const row=coverageByTuple.get(key(proof.producerId,annotation.document,annotation.revisionId));
+  if(!row?.selected||!['complete','partial'].includes(row.state))
+   fail('COVERAGE.FACT','coverage','semantic fact cannot exist in an unselected or failed tuple');
+  // Only installed occurrence facts claim observed roles. A non-exact join is
+  // diagnostic evidence, not a binding/reference applied to measured syntax.
+  // Do not guess roles for symbols, declaration bindings or relationships.
+  const installed=fact.kind==='callBinding'?
+   records.callBindings.some(binding=>binding.provenanceId===proofId&&binding.callId!==null&&binding.join.status==='exact'):
+   fact.kind==='reference'&&records.references.some(reference=>reference.provenanceId===proofId);
+  const roles=!installed?[]:fact.kind==='callBinding'?['call']:fact.record.roles;
+  for(const role of roles)if(!row.observedRoles.includes(role))
+   fail('COVERAGE.FACT','coverage.observedRoles',`${fact.kind} requires observed ${role} role`);
+ }
  function checkUse({producerId,document,revisionId,provenanceIds}){
   const id=key(producerId,document,revisionId),coverage=coverageByTuple.get(id);
   if(!coverage)fail('FRESHNESS.USE','coverage','missing requested producer-specific tuple');

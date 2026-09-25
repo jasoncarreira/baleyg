@@ -99,12 +99,14 @@ test('typed request failures preserve pinned order and no fallback',()=>{
  }
 });
 
-test('failed and omitted r2 keep r2 measured call, withhold even fresh r2 binding and old r1 occurrence evidence',()=>{
+test('failed and omitted r2 keep measured calls as missingEvidence when only r1 call facts exist',()=>{
  for(const state of ['failed','omitted'])for(const changed of [false,true]){
   const s=specimen({state,changed}),old=s.add(1,2,{oldBinding:true});
   const current=s.add(1,2);s.records.references.push({revisionId:'r1',ownerSyntaxId:sid(1),provenanceId:'old-reference',declaredTarget:{kind:'internal',syntaxId:sid(2)}});
-  // Only the current measured call is retained; remove the synthetic earlier call.
-  s.records.calls.shift();s.records.provenance=s.records.provenance.filter(row=>row.id!==old.call.provenanceId);
+  // Only the current measured call remains. r1 call facts stay historical and
+  // the current tuple contains no semantic occurrence fact at all.
+  s.records.calls.shift();s.records.callBindings=s.records.callBindings.filter(row=>row!==current.binding);
+  s.records.provenance=s.records.provenance.filter(row=>row.id!==old.call.provenanceId&&row.id!==current.binding.provenanceId);
   const warning=state==='failed'?[{code:'coverageIncomplete',provenanceId:null,message:'refresh failed'}]:[];
   const entry=s.authored({edges:[s.edge(current,1,{reason:'missingEvidence',binding:null})],extraCoverage:[s.records.coverage[2]],partial:true,warnings:warning});
   assert.equal(verify(s,entry),true);assert.equal(entry.answer.result.edges[0].binding,null);
@@ -178,7 +180,7 @@ test('captured chain rejects relabelled and unlinked historical proofs with prec
 });
 // Source bytes, producer captures and annotations are admitted before the full checker runs.
 // The answer below is authored from known fixture identities and expected rows, not traversal.
-async function admittedGraph(t,{changed=false,state='failed',zero=false,r2Binding=false}={}){
+async function admittedGraph(t,{changed=false,state='failed',zero=false,r2Binding=false,readOnlyCurrent=false,unsupportedCurrent=false}={}){
  const root=await mkdtemp(join(tmpdir(),'graph-history-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const files=new Map(),put=(path,value)=>files.set(path,typeof value==='string'?value:JSON.stringify(value));
  const hash=text=>contentHash(Buffer.from(text));
@@ -199,8 +201,8 @@ async function admittedGraph(t,{changed=false,state='failed',zero=false,r2Bindin
   range:span(7,source.indexOf('}')+1),nameRange:span(name,name+2),header,signature:null,
   witnesses:[{field:'name',witness:{range:span(name,name+2),text:'go'}},{field:'header.name',witness:{range:span(name,name+2),text:'go'}}]}));
  const call={ref:'r2call',nativeId:null,document,revisionId:'r2',ownerRef:'dr2',range:span(callee,callee+4),
-  calleeRange:span(callee,callee+2),spelling:'go',regionRefs:[],witnesses:[{field:'spelling',witness:{range:span(callee,callee+2),text:'go'}}]};
- const oldCall={...call,ref:'r1call',revisionId:'r1',ownerRef:'dr1'};
+  calleeRange:unsupportedCurrent?null:span(callee,callee+2),spelling:'go',regionRefs:[],witnesses:[{field:'spelling',witness:{range:span(callee,callee+2),text:'go'}}]};
+ const oldCall={...call,ref:'r1call',revisionId:'r1',ownerRef:'dr1',calleeRange:span(callee,callee+2)};
  const oldReference={ref:'r1reference',nativeId:null,document,revisionId:'r1',ownerRef:'dr1',
   range:span(callee,callee+2),spelling:'go',witnesses:[{field:'spelling',witness:{range:span(callee,callee+2),text:'go'}}]};
  put('captures/native.json',{formatVersion:1,producerId:'native',declarations,calls:[oldCall,call],controls:[],references:[oldReference]});
@@ -235,9 +237,11 @@ async function admittedGraph(t,{changed=false,state='failed',zero=false,r2Bindin
   const facts=[];
   for(const producer of producers){
    const semantic=producer.id==='semantic',status=semantic&&id==='r2'?state:'complete';
+   const requestedRoles=semantic&&!(readOnlyCurrent&&id==='r2'&&status==='complete')?['read','call']:['read'];
+   const observedRoles=(readOnlyCurrent||unsupportedCurrent)&&semantic&&id==='r2'?['read']:status==='complete'?requestedRoles:status==='partial'?['call']:[];
    facts.push({kind:'coverage',ref:`coverage-${producer.id}-${id}`,record:{producerId:producer.id,sourceSetId:document.sourceSetId,language:document.language,documentPath:document.path,
-    revisionId:id,requested:true,selected:status!=='omitted',state:status,supportedRoles:['read','call'],observedRoles:status==='complete'?['read','call']:status==='partial'?['call']:[],diagnostic:status==='complete'?null:'refresh unavailable'}});
-   coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles:['read','call'],measurementSupport:support});
+    revisionId:id,requested:true,selected:status!=='omitted',state:status,supportedRoles:requestedRoles,observedRoles,diagnostic:status==='complete'?null:'refresh unavailable'}});
+   coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles,measurementSupport:unsupportedCurrent&&id==='r2'?support.map(row=>row.kind==='callee'?{kind:'callee',available:false,diagnostic:'callee measurement unavailable'}:row):support});
   }
   if(id==='r0')facts.push(olderProvenance,olderFact);
   if(id==='r1'&&!zero)facts.push(provenance,...oldProofs,fact,oldBinding,oldUse);
@@ -308,19 +312,16 @@ test('captured current binding: selected complete/partial self-call and failed l
   assert.ok(binding);assert.equal(binding.callId,call.id);
   assert.equal(binding.join.anchor.revisionId,'r2');
   assert.equal(loaded.semanticProofs.get('r2-call-proof').factRef,'r2-binding');
-  const usable=state!=='failed';
   const request={sourceSetId:'main',revisionId:'r2',rootSyntaxId:declaration.syntaxId,
    semanticProducerId:'semantic',depth:2,maxNodes:150,maxCalls:500};
-  const proofIds=[declaration.provenanceId,call.provenanceId,...(usable?['r2-call-proof']:['r1-proof'])];
+  const proofIds=[declaration.provenanceId,call.provenanceId,'r2-call-proof'];
   const provenance=proofIds.map(id=>records.provenance.find(row=>row.id===id))
    .sort((a,b)=>Buffer.compare(Buffer.from(a.id),Buffer.from(b.id)));
-  const coverage=records.coverage.filter(row=>row.revisionId==='r2'||!usable&&row.revisionId==='r1'&&row.producerId==='semantic')
+  const coverage=records.coverage.filter(row=>row.revisionId==='r2')
    .sort((a,b)=>Buffer.compare(Buffer.from(a.producerId),Buffer.from(b.producerId))||
     Buffer.compare(Buffer.from(a.revisionId),Buffer.from(b.revisionId)));
-  const warnings=[...(state==='complete'?[]:[{code:'coverageIncomplete',provenanceId:null,message:'selected coverage incomplete'}]),
-   ...(usable?[]:[{code:'staleEvidence',provenanceId:null,message:'historical declaration'}])];
-  const edge={call,from:declaration.syntaxId,to:usable?declaration.syntaxId:null,binding:usable?binding:null,
-   visit:usable?'seen':'boundary',boundaryReason:usable?'none':'missingEvidence'};
+  const warnings=state==='complete'?[]:[{code:'coverageIncomplete',provenanceId:null,message:'selected coverage incomplete'}];
+  const edge={call,from:declaration.syntaxId,to:declaration.syntaxId,binding,visit:'seen',boundaryReason:'none'};
   const answer={id:`captured-${state}`,attemptedRequest:request,answer:{ok:true,result:{request,
    resolvedRevisionId:'r2',nodes:[{declaration,depth:0}],edges:[edge],frontier:[],coverage,
    provenance,partial:!usable||state==='partial',truncated:false,warnings}}};
@@ -336,10 +337,62 @@ test('captured current binding: selected complete/partial self-call and failed l
  }
 });
 
-test('authored current binding under omitted coverage fails source-backed admission',async t=>{
- await assert.rejects(()=>admittedGraph(t,{state:'omitted',r2Binding:true}),error=>{
-  assert.equal(error.assertion,'FRESHNESS.USE');assert.equal(error.code,'invalidRecord');
-  assert.equal(error.field,'coverage');return true;
+test('source-backed impossible r2 call facts reject atomically; absence remains a missingEvidence boundary',async t=>{
+ for(const state of ['failed','omitted']){
+  await t.test(`${state} tuple with physically present r2 binding`,async()=>{
+   await assert.rejects(()=>admittedGraph(t,{state,r2Binding:true}),error=>{
+    assert.equal(error.assertion,'COVERAGE.FACT');assert.equal(error.code,'invalidRecord');
+    assert.equal(error.field,'coverage');return true;
+   });
+  });
+ }
+ await t.test('complete read-only tuple cannot carry a call binding',async()=>{
+  await assert.rejects(()=>admittedGraph(t,{state:'complete',r2Binding:true,readOnlyCurrent:true}),error=>{
+   assert.equal(error.assertion,'COVERAGE.FACT');assert.equal(error.code,'invalidRecord');
+   assert.equal(error.field,'coverage.observedRoles');return true;
+  });
+ });
+ await t.test('partial tuple not observing call cannot carry a call binding',async()=>{
+  await assert.rejects(()=>admittedGraph(t,{state:'partial',r2Binding:true,readOnlyCurrent:true}),error=>{
+   assert.equal(error.assertion,'COVERAGE.FACT');assert.equal(error.code,'invalidRecord');
+   assert.equal(error.field,'coverage.observedRoles');return true;
+  });
+ });
+});
+
+test('selected partial unsupported non-exact call stays diagnostic-only without observed call',async t=>{
+ const {loaded,records,checked}=await admittedGraph(t,{state:'partial',r2Binding:true,unsupportedCurrent:true});
+ const call=records.calls.find(row=>row.revisionId==='r2');
+ const diagnostic=records.callBindings.find(row=>row.provenanceId==='r2-call-proof');
+ assert.ok(call);assert.equal(diagnostic.callId,null);
+ assert.equal(diagnostic.join.status,'unsupported');
+ assert.deepEqual(records.coverage.find(row=>row.producerId==='semantic'&&row.revisionId==='r2').observedRoles,['read']);
+ const declaration=records.declarations.find(row=>row.revisionId==='r2');
+ const request={sourceSetId:'main',revisionId:'r2',rootSyntaxId:declaration.syntaxId,
+  semanticProducerId:'semantic',depth:2,maxNodes:150,maxCalls:500};
+ const coverage=records.coverage.filter(row=>row.revisionId==='r2')
+  .sort((a,b)=>Buffer.compare(Buffer.from(a.producerId),Buffer.from(b.producerId)));
+ const provenance=[declaration.provenanceId,call.provenanceId].map(id=>records.provenance.find(row=>row.id===id))
+  .sort((a,b)=>Buffer.compare(Buffer.from(a.id),Buffer.from(b.id)));
+ const answer={id:'unsupported-diagnostic',attemptedRequest:request,answer:{ok:true,result:{request,
+  resolvedRevisionId:'r2',nodes:[{declaration,depth:0}],edges:[{call,from:declaration.syntaxId,
+   to:null,binding:null,visit:'boundary',boundaryReason:'missingEvidence'}],frontier:[],coverage,provenance,
+  partial:true,truncated:false,warnings:[{code:'coverageIncomplete',provenanceId:null,message:'call role unavailable'}]}}};
+ assert.equal(checkAnswers(loaded,records,checked,{answers:[answer]}),true);
+ assert.equal(answer.answer.result.provenance.some(row=>row.id==='r2-call-proof'),false);
+});
+
+test('captured reference roles must be observed by its selected producer/document tuple',async t=>{
+ const {loaded,records}=await admittedGraph(t,{state:'failed'});
+ const tuple=records.coverage.find(row=>row.producerId==='semantic'&&row.revisionId==='r1');
+ const authored=loaded.annotations.flatMap(annotation=>annotation.facts)
+  .find(fact=>fact.kind==='coverage'&&fact.record.producerId==='semantic'&&fact.record.revisionId==='r1').record;
+ assert.deepEqual(tuple.observedRoles,['read','call']);
+ tuple.observedRoles=['call'];tuple.state='partial';tuple.diagnostic='read role not observed';
+ Object.assign(authored,{observedRoles:['call'],state:'partial',diagnostic:'read role not observed'});
+ assert.throws(()=>checkCoverage(loaded,records),error=>{
+  assert.equal(error.assertion,'COVERAGE.FACT');assert.equal(error.field,'coverage.observedRoles');
+  assert.match(error.message,/reference requires observed read role/);return true;
  });
 });
 
