@@ -130,6 +130,10 @@ test('isolated r1/r2 comparison keeps historical provenance and never rebinds r1
  const native=JSON.parse(s.files['captures/native.json']);native.declarations.push(...cloned.declarations);native.calls.push(...cloned.calls);native.references.push(...cloned.references);s.files['captures/native.json']=JSON.stringify(native);
  for(const [label,text,expected] of [['changed','export function go() { return 2; }\n','stale'],['same',s.source,'possiblyStale']]){
   s.files['snapshots/r2.js']=text;s.files['expected/anchors.json']=JSON.stringify({formatVersion:1,cases:[{id:'r1-r2-case',capturedDeclarationRef:'decl',currentRevisionId:'r2',continuity:{fromRevisionId:'r1',toRevisionId:'r2',state:text===s.source?'unchanged':'changed',evidence:null},expectedResult:{status:'attached',targetId:{ref:'decl-r2'},reason:'none'}}]});await s.flush();const result=normalize(await loadFixture(s.root));assert.equal(result.records.anchorResults.length,1);assert.equal(result.records.anchorResults[0].targetId,result.identityMap.get('decl-r2'));assert.equal(result.records.provenance.find(x=>x.id==='old-proof').freshness,expected,label);assert.equal(result.records.callBindings.length,1);assert.equal(result.recordMap.get('decl').revisionId,'r1');assert.equal(result.recordMap.get('decl-r2').revisionId,'r2');assert.equal(result.recordMap.get('decl-r2').document.path,'src/go.js');assert.equal(result.records.callBindings[0].callId,result.identityMap.get('call'));assert.notEqual(result.records.callBindings[0].callId,result.identityMap.get('call-r2'));assert.equal(result.records.callBindings[0].staleTarget,label==='changed');
+  assert.equal(result.identityMap.get('decl'),result.identityMap.get('decl-r2'));
+  const permuted=await loadFixture(s.root);for(const group of ['declarations','calls','references'])permuted.native[group].reverse();
+  const alternate=normalize(permuted);assert.deepEqual(alternate.records.declarations.map(x=>[x.revisionId,x.syntaxId]),result.records.declarations.map(x=>[x.revisionId,x.syntaxId]));
+  for(const ref of ['decl','decl-r2','call','call-r2'])assert.equal(JSON.stringify(alternate.recordMap.get(ref)),JSON.stringify(result.recordMap.get(ref)),ref);
  }
  assert.equal(normalize(original).records.provenance.find(x=>x.id==='old-proof').freshness,'fresh');
 });
@@ -150,12 +154,12 @@ test('all three relationship kinds preserve direction and independent semantic p
  const swapped={...loaded,annotations:structuredClone(loaded.annotations)};swapped.annotations[0].facts.find(x=>x.ref==='relation').source={kind:'external',symbol:symbol()};assert.throws(()=>normalize(swapped),/NORMALIZE.RELATIONSHIP|FORMAT.SHAPE/);
  const wrong={...loaded,annotations:structuredClone(loaded.annotations)};wrong.annotations[0].facts.find(x=>x.ref==='relation').provenanceRef='missing-proof';assert.throws(()=>normalize(wrong),/NORMALIZE.PROVENANCE/);
 });
-test('anchor case must link captured and current revision and a measured current target',async t=>{const {loaded}=await loadedMeasured(t);loaded.anchors.cases=[{id:'case',capturedDeclarationRef:'decl',currentRevisionId:'r1',continuity:{fromRevisionId:'r1',toRevisionId:'r1',state:'unchanged',evidence:null},expectedResult:{status:'attached',targetId:{ref:'decl'},reason:'none'}}];const valid=normalize(loaded);assert.equal(valid.records.anchorResults[0].targetId,valid.identityMap.get('decl'));loaded.anchors.cases[0].currentRevisionId='r2';loaded.anchors.cases[0].continuity.toRevisionId='r2';assert.throws(()=>normalize(loaded),/NORMALIZE.ANCHOR/);});
+test('anchor case must link captured and current revision and a measured current target',async t=>{const {loaded}=await loadedMeasured(t);loaded.anchors.cases=[{id:'case',capturedDeclarationRef:'decl',currentRevisionId:'r1',continuity:{fromRevisionId:'r1',toRevisionId:'r1',state:'unknown',evidence:null},expectedResult:{status:'attached',targetId:{ref:'decl'},reason:'none'}}];const valid=normalize(loaded);assert.equal(valid.records.anchorResults[0].targetId,valid.identityMap.get('decl'));const wrong={...loaded,anchors:structuredClone(loaded.anchors)};wrong.anchors.cases[0].expectedResult.targetId='sid:v1:'+'a'.repeat(32);assert.throws(()=>normalize(wrong),/NORMALIZE.ANCHOR/);loaded.anchors.cases[0].currentRevisionId='r2';loaded.anchors.cases[0].continuity.toRevisionId='r2';assert.throws(()=>normalize(loaded),/NORMALIZE.ANCHOR/);});
 
 test('coverage tuple, state, roles, diagnostics and producer partitions',async t=>{
- const {loaded}=await loadedMeasured(t),base={producerId:'native',language:'javascript',sourceSetId:'main',documentPath:'src/go.js',revisionId:'r1',requested:true,selected:true,state:'complete',supportedRoles:['read'],observedRoles:['read'],diagnostic:null};loaded.annotations[0].facts.push({kind:'coverage',ref:'coverage',record:base});assert.equal(normalize(loaded).records.coverage[0].state,'complete');
+ const {loaded}=await loadedMeasured(t),base={producerId:'native',language:'javascript',sourceSetId:'main',documentPath:'src/go.js',revisionId:'r1',requested:true,selected:true,state:'complete',supportedRoles:['read'],observedRoles:['read'],diagnostic:null};loaded.annotations[0].facts.push({kind:'coverage',ref:'coverage',record:base});loaded.fixture.coverageIntents.push({producerId:'native',document:loaded.native.declarations[0].document,revisionId:'r1',requestedRoles:['read'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}))});assert.equal(normalize(loaded).records.coverage[0].state,'complete');
  for(const [field,value] of [['producerId','missing'],['sourceSetId','other'],['documentPath','missing.js'],['requested',false],['selected',false],['state','failed'],['diagnostic','unexpected'],['observedRoles',['call']]]){const copy={...loaded,annotations:structuredClone(loaded.annotations)};copy.annotations[0].facts.at(-1).record[field]=value;assert.throws(()=>normalize(copy),/NORMALIZE.COVERAGE/,field);}
- const two={...loaded,annotations:structuredClone(loaded.annotations)};two.annotations[0].facts.push({kind:'coverage',ref:'semantic-coverage',record:{...base,producerId:'semantic',state:'failed',diagnostic:'refresh unavailable',observedRoles:[]}});const result=normalize(two);assert.equal(result.records.coverage.length,2);assert.deepEqual(new Set(result.records.coverage.map(x=>x.producerId)),new Set(['native','semantic']));
+ const two={...loaded,annotations:structuredClone(loaded.annotations),fixture:structuredClone(loaded.fixture)};two.fixture.coverageIntents.push({...structuredClone(two.fixture.coverageIntents[0]),producerId:'semantic'});two.annotations[0].facts.push({kind:'coverage',ref:'semantic-coverage',record:{...base,producerId:'semantic',state:'failed',diagnostic:'refresh unavailable',observedRoles:[]}});const result=normalize(two);assert.equal(result.records.coverage.length,2);assert.deepEqual(new Set(result.records.coverage.map(x=>x.producerId)),new Set(['native','semantic']));
 });
 
 test('two semantic producers retain separate proof and binding partitions on the same measured call',async t=>{
@@ -191,7 +195,7 @@ test('producer conventions bind native ranges, witnesses and semantic anchors',a
 test('coverage intent requires partial diagnostic for unsupported or missing requested role',async t=>{
  const {loaded}=await loadedMeasured(t),doc=loaded.native.declarations[0].document;
  const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}));loaded.fixture.coverageIntents=[{producerId:'native',document:doc,revisionId:'r1',requestedRoles:['read','write'],measurementSupport:support}];
- const base={producerId:'native',language:'javascript',sourceSetId:'main',documentPath:'src/go.js',revisionId:'r1',requested:true,selected:true,state:'complete',supportedRoles:['read'],observedRoles:['read'],diagnostic:null};loaded.annotations[0].facts.push({kind:'coverage',ref:'coverage-intent',record:base});assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/);base.state='partial';base.diagnostic='write unsupported';assert.equal(normalize(loaded).records.coverage[0].state,'partial');base.supportedRoles=['read','write'];assert.equal(normalize(loaded).records.coverage[0].state,'partial');base.observedRoles=['read','write'];base.state='complete';base.diagnostic=null;assert.equal(normalize(loaded).records.coverage[0].state,'complete');support[0].available=false;support[0].diagnostic='unavailable';assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/);
+ const base={producerId:'native',language:'javascript',sourceSetId:'main',documentPath:'src/go.js',revisionId:'r1',requested:true,selected:true,state:'complete',supportedRoles:['read'],observedRoles:['read'],diagnostic:null};loaded.annotations[0].facts.push({kind:'coverage',ref:'coverage-intent',record:base});assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/);base.state='partial';base.diagnostic='write unsupported';assert.equal(normalize(loaded).records.coverage[0].state,'partial');base.supportedRoles=['read','write'];assert.equal(normalize(loaded).records.coverage[0].state,'partial');base.observedRoles=['read','write'];base.state='complete';base.diagnostic=null;assert.equal(normalize(loaded).records.coverage[0].state,'complete');support[0].available=false;support[0].diagnostic='unavailable';assert.equal(normalize(loaded).records.coverage[0].state,'complete');support[3].available=false;support[3].diagnostic='reference unavailable';assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/);
 });
 test('cross-namespace references and external relationship key cannot shadow valid maps',async t=>{
  const fact={kind:'typeRelationship',ref:'relation-fact',relationshipKind:'extends',source:internal(),target:{kind:'external',symbol:symbol()},provenanceRef:'pr'};
@@ -203,17 +207,19 @@ test('cross-namespace references and external relationship key cannot shadow val
 
 test('admitted other-source-set measured target needs an external boundary',async t=>{
  const fact={kind:'typeRelationship',ref:'cross-set',relationshipKind:'extends',source:internal(),target:internal('foreign'),provenanceRef:'pr'};
- const {s,loaded}=await semanticFixture(t,[fact],{pr:'typeRelationship'});
+ const {s}=await semanticFixture(t,[fact],{pr:'typeRelationship'});
  const foreign={...s.document,sourceSetId:'dependency',path:'src/foreign.js'};
- loaded.fixture.sourceSets.push({id:'dependency',rootId:'dependency-root',languages:['javascript'],dependencies:[]});
- const declaration={...structuredClone(loaded.native.declarations[0]),ref:'foreign',document:foreign};loaded.native.declarations.push(declaration);
- loaded.sources.set(JSON.stringify(['dependency','r1',foreign.path]),Buffer.from(s.source));
- loaded.revisions.set(JSON.stringify(['dependency','r1']),{...structuredClone(loaded.revisions.get(JSON.stringify(['main','r1']))),id:'r1',sourceSetId:'dependency',documents:[{...structuredClone(loaded.revisions.get(JSON.stringify(['main','r1'])).documents[0]),key:foreign}]});
+ s.fixture.sourceSets.push({id:'dependency',rootId:'dependency-root',languages:['javascript'],dependencies:[]});
+ s.fixture.revisions.push({...structuredClone(s.fixture.revisions[0]),sourceSetId:'dependency',documents:[{key:foreign,revisionId:'r1',sourceFile:'src/foreign.js'}]});
+ s.files['src/foreign.js']=s.source;
+ s.files['src/foreign.js.annotations.json']=JSON.stringify({formatVersion:1,document:foreign,revisionId:'r1',scenarios:[],facts:[]});
+ s.fixture.annotationFiles.push('src/foreign.js.annotations.json');
+ const native=JSON.parse(s.files['captures/native.json']);native.declarations.push({...structuredClone(native.declarations[0]),ref:'foreign',document:foreign});s.files['captures/native.json']=JSON.stringify(native);
+ await s.flush();const loaded=await loadFixture(s.root);assert.ok(loaded.revisions.has(JSON.stringify(['dependency','r1'])));
  assert.throws(()=>normalize(loaded),/NORMALIZE.TARGET.*sourceSetId/);
  loaded.annotations[0].facts.find(x=>x.ref==='cross-set').target={kind:'external',symbol:symbol('dependency#go')};
  assert.equal(normalize(loaded).records.typeRelationships[0].target.kind,'external');
 });
-
 test('UTF-16 and Unicode scalar producer offsets convert against astral CRLF source',async t=>{
  for(const convention of ['utf16','unicodeScalar']){
   const s=await specimen();t.after(s.cleanup);const prefix='// 😀\r\n',source=prefix+s.source;s.source=source;s.files['src/go.js']=source;
@@ -224,4 +230,62 @@ test('UTF-16 and Unicode scalar producer offsets convert against astral CRLF sou
   const out=normalize(await loadFixture(s.root));assert.deepEqual(out.records.declarations[0].nameRange,{start:shift+16,end:shift+18});
   const wrong=await loadFixture(s.root);wrong.native.declarations[0].nameRange.encoding=convention==='utf16'?'unicodeScalar':'utf16';assert.throws(()=>normalize(wrong),/NORMALIZE.ENCODING/);
  }
+});
+
+test('coverage intent reconciles all six states and unrelated unavailable families',async t=>{
+ const {loaded}=await loadedMeasured(t),doc=loaded.native.declarations[0].document;
+ const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:kind!=='invocation',diagnostic:kind==='invocation'?'unavailable':null}));
+ const intent={producerId:'native',document:doc,revisionId:'r1',requestedRoles:['read'],measurementSupport:support};loaded.fixture.coverageIntents=[intent];
+ const record={producerId:'native',language:'javascript',sourceSetId:'main',documentPath:doc.path,revisionId:'r1',requested:true,selected:true,state:'complete',supportedRoles:['read'],observedRoles:['read'],diagnostic:null};
+ loaded.annotations[0].facts.push({kind:'coverage',ref:'coverage-states',record});
+ assert.equal(normalize(loaded).records.coverage[0].state,'complete');
+ const verify=(state,requestedRoles,supportedRoles,observedRoles,valid=true)=>{
+  intent.requestedRoles=requestedRoles;record.state=state;record.requested=state!=='notRequested';record.selected=['failed','partial','complete'].includes(state);record.diagnostic=['notRequested','complete'].includes(state)?null:'no evidence';record.supportedRoles=supportedRoles;record.observedRoles=observedRoles;
+  if(valid)assert.equal(normalize(loaded).records.coverage[0].state,state);else assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/,state);
+ };
+ verify('complete',['read'],['read'],['read']);verify('partial',['read','write'],['read'],['read']);
+ verify('failed',['read'],['read'],[]);verify('omitted',['read'],['read'],[]);
+ verify('unsupported',['read'],[],[]);verify('notRequested',[],[],[]);
+ verify('notRequested',['read'],[],[],false);verify('omitted',['read'],[],[],false);
+ verify('unsupported',['read'],['read'],[],false);verify('complete',['read'],['read'],[],false);
+ verify('partial',['read'],['read'],['read'],false);
+ verify('complete',['read'],['read'],['read']);loaded.fixture.coverageIntents=[];assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/);
+ loaded.fixture.coverageIntents=[intent];support[3].available=false;support[3].diagnostic='reference unavailable';assert.throws(()=>normalize(loaded),/NORMALIZE.COVERAGE/);
+});
+test('source-derived native reference IDs produce a complete ambiguous join diagnostic at the unit seam',async t=>{
+ const {s,loaded}=await loadedMeasured(t);const source='export function go() { return go; }\n';s.files['src/go.js']=source;
+ const native=JSON.parse(s.files['captures/native.json']);native.declarations[0].range=span(0,source.length-1);native.references.push({...structuredClone(native.references[0]),ref:'second',range:span(source.indexOf('go',19),source.indexOf('go',19)+2),witnesses:[{field:'spelling',witness:{range:span(source.indexOf('go',19),source.indexOf('go',19)+2),text:'go'}}]});s.files['captures/native.json']=JSON.stringify(native);await s.flush();
+ const admitted=await loadFixture(s.root),out=normalize(admitted),first=out.identityMap.get('reference'),second=out.identityMap.get('second');assert.notEqual(first,second);
+ const a={document:s.document,revisionId:'r1',contentHash:hash(source),kind:'reference',range:span(16,18),ownerRef:'decl'};
+ const measuredAnchor={document:s.document,revisionId:'r1',contentHash:a.contentHash,kind:a.kind,range:{start:16,end:18}};
+ const index=buildAnchorIndex([{ref:'reference',id:first,ownerRef:'decl',anchor:measuredAnchor},{ref:'second',id:second,ownerRef:'decl',anchor:measuredAnchor}]);
+ const joined=joinAnchor(a,index,admitted);assert.deepEqual(joined,{anchor:measuredAnchor,status:'ambiguous',candidateIds:[first,second].sort(),diagnostic:'ambiguous'});
+});
+
+test('same-proof same-target duplicates collapse, conflicting non-target fields reject',async t=>{
+ const d={sourceSetId:'main',language:'javascript',path:'src/go.js'},a={document:d,revisionId:'r1',contentHash:hash('export function go() { return 1; }\n'),kind:'callee',range:span(16,18),ownerRef:'decl'};
+ const make=(ref,proof)=>({kind:'callBinding',ref,anchor:a,record:{resolution:'resolved',declaredTarget:internal(),candidates:[],dispatch:'direct',possibleDispatch:[],possibleDispatchComplete:false,provenanceId:proof}});
+ const {loaded}=await semanticFixture(t,[make('one','p1')],{p1:'semanticReference'});
+ loaded.annotations[0].facts.push(make('two','p1'));const out=normalize(loaded);assert.equal(out.records.callBindings.length,1);assert.equal(JSON.stringify(out.recordMap.get('one')),JSON.stringify(out.recordMap.get('two')));
+ loaded.annotations[0].facts.find(x=>x.ref==='two').record.dispatch='dynamic';assert.throws(()=>normalize(loaded),/NORMALIZE.BINDING_CONFLICT/);
+});
+test('immediate source owner and overload signatures determine nested keys and ordinals',async t=>{
+ const {loaded}=await loadedMeasured(t),n=loaded.native,parent=n.declarations[0];
+ const child={...structuredClone(parent),ref:'child',parentRef:'decl',name:'return',header:{...parent.header,name:'return'},range:span(22,30),nameRange:span(23,29),witnesses:['name','header.name'].map(field=>({field,witness:{range:span(23,29),text:'return'}}))};
+ const grandchild={...structuredClone(child),ref:'grandchild',parentRef:'child',range:span(23,29)};
+ n.declarations.push(child,grandchild);const good=normalize(loaded);assert.deepEqual(good.records.declarations.find(x=>x.syntaxId===good.identityMap.get('grandchild')).ancestors,[good.recordMap.get('decl').key,good.recordMap.get('child').key]);
+ grandchild.parentRef='decl';assert.throws(()=>normalize(loaded),/NORMALIZE.OWNER/);grandchild.parentRef='child';
+ const changed={...loaded,native:structuredClone(n)};changed.native.declarations[1].signature={parameterTypes:[],typeParameterCount:0,variadic:false};assert.notEqual(normalize(changed).identityMap.get('child'),good.identityMap.get('child'));
+ const repeat={...structuredClone(child),ref:'overload',parentRef:'decl',range:span(22,31)};n.declarations.pop();n.declarations.push(repeat);assert.throws(()=>normalize(loaded),/IDENTITY.ORDINAL|NORMALIZE.OWNER/);
+});
+
+test('equal-name overload ordinals follow measured source order, not native row order',async t=>{
+ const s=await specimen();t.after(s.cleanup);const source='function go() {}\nfunction go() {}\n';s.source=source;s.files['src/go.js']=source;
+ const make=(ref,start)=>({ref,nativeId:ref,document:s.document,revisionId:'r1',parentRef:null,kind:'function',name:'go',range:span(start,start+16),nameRange:span(start+9,start+11),header:{kind:'function',name:'go',modifiers:[],typeParameters:[],parameters:[],resultType:null,bases:[]},signature:null,witnesses:['name','header.name'].map(field=>({field,witness:{range:span(start+9,start+11),text:'go'}}))});
+ setNative(s,[make('later',17),make('earlier',0)]);await s.flush();const loaded=await loadFixture(s.root),first=normalize(loaded);
+ assert.equal(first.recordMap.get('earlier').key.ordinal,0);assert.equal(first.recordMap.get('later').key.ordinal,1);loaded.native.declarations.reverse();
+ const reverse=normalize(loaded);for(const ref of ['earlier','later'])assert.equal(reverse.identityMap.get(ref),first.identityMap.get(ref));
+ const changed={...loaded,native:structuredClone(loaded.native)};changed.native.declarations.find(x=>x.ref==='later').range=span(0,16);changed.native.declarations.find(x=>x.ref==='later').nameRange=span(9,11);changed.native.declarations.find(x=>x.ref==='later').witnesses=['name','header.name'].map(field=>({field,witness:{range:span(9,11),text:'go'}}));assert.throws(()=>normalize(changed),/IDENTITY.ORDINAL/);
+ const overloaded={...loaded,native:structuredClone(loaded.native)};const header=overloaded.native.declarations.find(x=>x.ref==='later');header.header.parameters=[{name:'go',type:'go',variadic:false}];header.signature={parameterTypes:['go'],typeParameterCount:0,variadic:false};header.witnesses.push(...['header.parameters[0].name','header.parameters[0].type','signature.parameterTypes[0]'].map(field=>({field,witness:{range:header.nameRange,text:'go'}})));
+ assert.notEqual(normalize(overloaded).identityMap.get('later'),first.identityMap.get('later'));
 });
