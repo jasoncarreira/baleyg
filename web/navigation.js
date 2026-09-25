@@ -120,7 +120,8 @@
       const data = await owner.request("/api/navigation", {method: "POST", body});
       if (!mayPublish()) return;
       if (!data || !window.BaleygIndexPin.equal(data.revision, revision)) {
-        display([notice("Navigation is stale. Refresh the indexed view and try again."), close]); return;
+        display([notice("Navigation is stale. Refresh the indexed view and try again."), close]);
+        owner.onStale?.("Navigation is stale. Refresh the indexed view and try again."); return;
       }
       if (!Array.isArray(data.targets)) throw new Error("Invalid navigation response.");
       const actions = [];
@@ -159,6 +160,7 @@
     } catch (error) {
       if (!mayPublish()) return;
       display([notice(`Navigation failed: ${text(error?.message || "Request unavailable.")}`), retry, close]);
+      if (error.status === 409) owner.onStale?.("Navigation is stale. Refresh the indexed view and try again.");
     }
   }
   function attachSource(container, {path, revision, startLine = 1, isCurrent} = {}) {

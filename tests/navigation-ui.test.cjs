@@ -14,7 +14,7 @@ const response = (targets=[target()], extras={}) => ({revision:{indexGeneration:
 const descendants = node => [node,...node.children.flatMap(descendants)];
 function harness({openSource = false} = {}) {
   let revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, session="one", request=async()=>response(), activeMenu=null;
-  const calls=[],menus=[],selected=[],classes=[],openedSources=[];
+  const calls=[],menus=[],selected=[],classes=[],openedSources=[],stale=[];
   const document={activeElement:null,listeners:{},addEventListener(type,fn){(this.listeners[type] ||= []).push(fn);}};
   function element(tagName) {
     const node={tagName,children:[],parentNode:null,attrs:{},className:"",textContent:"",listeners:{},scrollTop:27,scrollLeft:0,
@@ -59,7 +59,7 @@ function harness({openSource = false} = {}) {
     return {close:()=>record.close()};
   }
   nav.init({request:(url,options)=>{calls.push({url,options});return request(url,options);},currentRevision:()=>revision,currentSession:()=>session,
-    selectMethod:s=>selected.push(s),openClass:s=>classes.push(s),showMenu,
+    selectMethod:s=>selected.push(s),openClass:s=>classes.push(s),showMenu,onStale:message=>stale.push(message),
     ...(openSource ? {openSource:(symbol,revision)=>openedSources.push({symbol,revision})} : {})});
   const anchor=element("button");document.body.append(anchor);anchor.focus();
   function event(details={}){return {type:"contextmenu",target:anchor,currentTarget:anchor,clientX:120,clientY:80,preventDefault(){this.prevented=true;},stopPropagation(){this.stopped=true;},...details};}
@@ -71,7 +71,7 @@ function harness({openSource = false} = {}) {
     const toolbar=pre.parentNode.children[pre.parentNode.children.indexOf(pre)-1];
     return {pre,rows,binding,toolbar,button:toolbar.children[0],status:toolbar.children[1]};
   }
-  return {nav,document,window,element,anchor,event,pane,calls,menus,selected,classes,openedSources,showMenu,
+  return {nav,document,window,element,anchor,event,pane,calls,menus,selected,classes,openedSources,stale,showMenu,
     set request(fn){request=fn;},set revision(n){revision=n;},set session(s){session=s;},get latest(){return menus.at(-1);}};
 }
 const selector={path:"src/A.java",line:1};
@@ -379,4 +379,18 @@ test("navigation discards late response when generation changes but revision rep
   h.revision={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
   gate.resolve(response());await work;
   assert.equal(h.menus.length,1);assert.match(h.latest.actions[0].label,/Finding cached/);
+});
+
+test("source and member navigation send a complete pair and refresh on reused revision",async()=>{
+ const old={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ const next={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+ for(const selector of [{path:'src/A.java',line:4},{classId:'A',memberName:'run',startByte:10,endByte:60}]) {
+   const h=harness();h.request=async()=>response([target()],{revision:next});
+   await h.nav.open(h.event(),selector);
+   assert.equal(h.calls[0].url,'/api/navigation');
+   assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body.expectedRevision)),old);
+   assert.equal(h.stale.length,1);
+   assert.match(h.latest.actions[0].label,/stale/i);
+   assert.equal(h.selected.length+h.classes.length,0);
+ }
 });

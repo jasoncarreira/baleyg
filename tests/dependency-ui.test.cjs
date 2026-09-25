@@ -217,3 +217,27 @@ test("dependency catalog with reused revision and old generation is rejected",as
   assert.equal(h.run('dependencyCatalog'),null);
   assert.match(h.get('dependency-state').textContent,/another workspace revision/);
 });
+
+test("library status and definition pages reject reused numeric revisions, clear stale panels, and refresh status",async()=>{
+ const next={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+ for(const boundary of ['status','symbols']) {
+   const h=harness(),requests=[];
+   if(boundary==='symbols') await select(h);
+   h.run(`status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:'/same'}`);
+   h.context.fetch=async url=>{
+     requests.push(url);
+     if(url==='/api/status') return response({revision:next,workspaceRoot:'/same',stats:{}});
+     if(url.startsWith('/api/tree?')) return response({path:'',root:'/same',indexedWorkspace:'/same',revision:next,items:[],nextOffset:null});
+     if(url.startsWith('/api/dependencies/symbols?')) return response({...symbols(),workspaceRevision:next});
+     if(url==='/api/dependencies') return response(requests.includes('/api/status') ? {...catalog(),workspaceRevision:next} : {...catalog(),workspaceRevision:next});
+     throw Error(url);
+   };
+   if(boundary==='status') await h.run('refreshDependencies()');
+   else await h.run('loadDependencySymbols(0)');
+   await new Promise(setImmediate);
+   assert.ok(requests.includes('/api/status'),boundary);
+   assert.equal(h.run('status.revision.indexGeneration'),next.indexGeneration,boundary);
+   assert.equal(h.run('dependencyPackage'),null,boundary);
+   assert.equal(h.get('dependency-symbols').children.length,0,boundary);
+ }
+});

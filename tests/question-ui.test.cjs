@@ -392,3 +392,40 @@ test("source cache never reuses a same-revision snapshot from another generation
   assert.match(requests[0],/indexGeneration=12345678-1234-4123-8123-123456789abc/);
   assert.match(requests[1],/indexGeneration=87654321-4321-4321-8321-abcdef123456/);
 });
+
+const pairOld={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+const pairNew={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+const ok=data=>({ok:true,status:200,json:async()=>data});
+test("preview and live provider responses reject reused revisions and refresh authoritative status",async()=>{
+ for(const operation of ['preview','jev','acp']) {
+   const h=harness(),requests=[];
+   h.run(`status={revision:${JSON.stringify(pairOld)},workspaceRoot:'/same'};
+     packet={packetId:'p',revision:status.revision,request:{seed:'root'}};
+     focused={revision:status.revision,calls:[],nodes:[]};
+     jevStatus={enabled:true,budget:{remainingCents:10}};
+     acpStatus={enabled:true,status:{remainingAttempts:2}};syncFocusControls()`);
+   h.context.fetch=async(url,options)=>{
+     requests.push({url,body:options.body && JSON.parse(options.body)});
+     if(url==='/api/status') return ok({revision:pairNew,workspaceRoot:'/same',stats:{}});
+     if(url==='/api/tree?path=&offset=0&limit=200') return ok({path:'',root:'/same',indexedWorkspace:'/same',revision:pairNew,items:[],nextOffset:null});
+     if(url==='/api/dependencies') return ok({state:'disabled',workspaceRevision:pairNew,packages:[],warnings:[]});
+     if(url==='/api/jev/status') return ok({enabled:false});
+     if(url==='/api/acp/status') return ok({enabled:false});
+     if(operation==='preview') return ok({packet:{packetId:'new',revision:pairNew},view:{revision:pairNew,calls:[],nodes:[]}});
+     if(operation==='jev') return ok({view:{revision:pairNew,calls:[],nodes:[]}});
+     return ok({packetId:'p',revision:pairNew,source:'liveAcp',answer:{packetId:'p',summary:[],branches:[],limitations:[]}});
+   };
+   if(operation==='preview') {
+     h.get('question').value='What happened?';h.get('evidence-depth').value='1';h.get('max-visible').value='5';
+     await h.get('question-form').listeners.submit({preventDefault(){}});
+   } else await h.get(operation==='jev'?'run-jev':'explain-acp').listeners.click();
+   await new Promise(setImmediate);
+   assert.ok(requests.some(request=>request.url==='/api/status'),operation);
+   assert.equal(h.run('status.revision.indexGeneration'),pairNew.indexGeneration,operation);
+   assert.equal(h.run('packet'),null,operation);
+   assert.equal(h.run('focused'),null,operation);
+   assert.equal(h.get('answer').hidden,true,operation);
+   if(operation==='preview') assert.deepEqual(requests[0].body.expectedRevision,pairOld);
+   else assert.equal(requests[0].url,`/api/questions/p/${operation==='jev'?'jev-run':'acp-answer'}`);
+ }
+});

@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let token = "", epoch = 0, querySerial = 0, sourceSerial = 0, searchSerial = 0;
 let status = null, result = null, seed = null, views = [], annotations = [], editingNote = null;
-let statusSerial = 0, savedSerial = 0;
+let statusSerial = 0, savedSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let job = null, pollTimer = null;
 let packet = null, focused = null, questionSerial = 0;
 let jevStatus = null, jevStatusSerial = 0, jevRunning = false;
@@ -100,6 +100,8 @@ function clearSource() {
 }
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
 async function refreshStatus() {
+  statusRefreshDepth++;
+  try {
   const serial = ++statusSerial, session = epoch;
   let data = await api("/api/status");
   if (serial !== statusSerial || session !== epoch) return;
@@ -108,13 +110,19 @@ async function refreshStatus() {
   const browseChanged = !status || workspaceChanged || !IndexPin.equal(status.revision, nextPin);
   if (status && browseChanged) { clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); querySerial++; invalidateFocus("Index workspace or revision changed. Preview again."); clearSource(); }
   if (status && browseChanged) {
-    result = null; seed = null; searchSerial++; savedSerial++;
-    views = []; annotations = []; resetNote();
-    ["symbols", "views", "annotations"].forEach(id => $(id).replaceChildren());
+    result = null; seed = null; searchSerial++;
+    $("symbols").replaceChildren();
+    if (workspaceChanged) {
+      savedSerial++; views = []; annotations = []; resetNote();
+      $("views").replaceChildren(); $("annotations").replaceChildren();
+    } else {
+      renderViews(); renderNotes();
+    }
     $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
     renderResult();
   }
   if (browseChanged) clearDependencyCatalog();
+  if (browseChanged) pairRefreshObserved = null;
   status = {...data, revision:nextPin};
   data = status;
   window.BaleygShell?.updateWorkspace(status);
@@ -129,9 +137,27 @@ async function refreshStatus() {
   if (result && !IndexPin.equal(result.revision, status.revision)) stale("This view is from an older revision. Refresh status & view to update it.");
   // Optional catalog status must not block connecting to older daemons.
   void refreshDependencies();
+  } finally { statusRefreshDepth--; }
+}
+function unexpectedPair(message = "Index snapshot changed. Refresh status.") {
+  clearBrowse(message); clearSource(); sourceCache.clear(); querySerial++; searchSerial++;
+  result = null; seed = null; $("symbols").replaceChildren();
+  $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
+  invalidateFocus(message); renderResult(); clearDependencyCatalog();
+  $("search-state").textContent = message;
+  $("files-state").textContent = message;
+  $("dependency-state").textContent = message;
+  $("dependency-symbol-state").textContent = message;
+  stale(message);
+  const observed = status?.revision && `${status.workspaceRoot}:${IndexPin.key(status.revision)}`;
+  if (!statusRefreshDepth && !pairRefreshPending && observed !== pairRefreshObserved) {
+    pairRefreshObserved = observed;
+    pairRefreshPending = true;
+    void refreshStatus().catch(() => {}).finally(() => { pairRefreshPending = false; });
+  }
 }
 function requireCurrentPair(value) {
-  if (!IndexPin.equal(value?.revision, status?.revision)) { void refreshStatus().catch(() => {}); throw new Error("Index snapshot changed. Refresh status."); }
+  if (!IndexPin.equal(value?.revision, status?.revision)) { unexpectedPair(); throw new Error("Index snapshot changed. Refresh status."); }
   return value;
 }
 async function loadSaved() {
@@ -291,7 +317,7 @@ function callRow(call, view, ancestors, level, expandable) {
           const serial = querySerial, selection = questionSerial;
           const data = await api("/api/query", "POST", {seed: target.id, depth: 1, maxNodes: 40, maxCalls: 200, includeCallbacks: false, excludePaths: []});
           if (serial !== querySerial || selection !== questionSerial || !li.isConnected) return;
-          if (!IndexPin.equal(data.revision, view.revision) || (status && !IndexPin.equal(data.revision, status.revision))) { void refreshStatus().catch(() => {}); stale("Index changed. Refresh before expanding this branch."); return; }
+          if (!IndexPin.equal(data.revision, view.revision) || (status && !IndexPin.equal(data.revision, status.revision))) { unexpectedPair("Index changed. Refresh before expanding this branch."); return; }
           const path = new Set(ancestors); path.add(target.id);
           for (const child of data.calls.filter(c => c.caller === target.id)) branch.append(callRow(child, data, path, level + 1, true));
           if (!branch.children.length) branch.append(element("li", "No measured outgoing calls."));
@@ -456,7 +482,7 @@ form("question-form", async () => {
     evidenceDepth: Number($("evidence-depth").value), maxVisible: Number($("max-visible").value),
     allowDeeperDisplay: $("allow-deeper").checked, focusTerms: terms});
   if (serial !== questionSerial || queryAtStart !== querySerial || seed !== selectedSeed || !IndexPin.equal(status?.revision, revision)) return;
-  if (!IndexPin.equal(data.packet.revision, revision) || !IndexPin.equal(data.view.revision, revision)) { void refreshStatus().catch(() => {}); throw new Error("Preview revision changed. Refresh and try again."); }
+  if (!IndexPin.equal(data.packet.revision, revision) || !IndexPin.equal(data.view.revision, revision)) { unexpectedPair("Preview revision changed. Refresh and try again."); throw new Error("Preview revision changed. Refresh and try again."); }
   packet = data.packet; focused = data.view;
   $("focus-state").textContent = `Local preview—not Jev/ACP · deterministic term matching · revision ${IndexPin.label(revision)}. ${packet.warnings?.map(describe).join(" · ") || ""}`;
   renderResult();
@@ -491,7 +517,8 @@ $("import-jev").addEventListener("change", () => {
     try { data = JSON.parse(await file.text()); } catch { throw new Error("Choose a valid Jev response JSON file."); }
     if (epoch !== session || packet !== current || serial !== questionSerial) return;
     const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/jev-response`, "POST", data);
-    if (packet !== current || serial !== questionSerial || !IndexPin.equal(response.view.revision, status?.revision)) return;
+    if (packet !== current || serial !== questionSerial) return;
+    if (!IndexPin.equal(response.view.revision, status?.revision)) { unexpectedPair(); throw new Error("Imported Jev revision changed. Refresh status."); }
     clearSource(); focused = response.view;
     $("focus-state").textContent = "Imported Jev · user-supplied, unverified response. No live Jev/ACP call was made.";
     renderResult();
@@ -510,7 +537,8 @@ $("run-jev").addEventListener("click", () => perform(async () => {
   syncFocusControls();
   try {
     const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/jev-run`, "POST", {});
-    if (packet !== current || serial !== questionSerial || !IndexPin.equal(response.view.revision, status?.revision)) return;
+    if (packet !== current || serial !== questionSerial) return;
+    if (!IndexPin.equal(response.view.revision, status?.revision)) { unexpectedPair(); throw new Error("Jev revision changed. Refresh status."); }
     clearSource(); focused = response.view;
     $("focus-state").textContent = `Live Jev · provider selection, not proof of correctness or execution order · revision ${IndexPin.label(response.view.revision)} · ${response.latencyMs} ms.`;
     renderResult();
@@ -593,7 +621,13 @@ $("explain-acp").addEventListener("click", () => perform(async () => {
   try {
     const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/acp-answer`, "POST", {});
     if (!currentRequest()) return;
-    if (response.packetId !== current.packetId || response.answer?.packetId !== current.packetId || !IndexPin.equal(response.revision, status?.revision) || response.source !== "liveAcp")
+    if (!IndexPin.equal(response.revision, status?.revision)) {
+      unexpectedPair("ACP answer provenance does not match this packet. Refresh status.");
+      $("answer-state").textContent = "ACP answer provenance does not match this packet. Refresh status.";
+      $("error").textContent = $("answer-state").textContent; $("error").hidden = false;
+      throw new Error("ACP answer provenance does not match this packet. Refresh status.");
+    }
+    if (response.packetId !== current.packetId || response.answer?.packetId !== current.packetId || response.source !== "liveAcp")
       throw new Error("ACP answer provenance does not match this packet. Nothing displayed.");
     renderAnswer(response);
     $("answer-state").textContent = "";
@@ -653,7 +687,7 @@ async function loadFiles(reset = false) {
   await browseRequest(async () => {
     const data = await api(`/api/files?${IndexPin.query(revision)}&offset=${offset}&limit=200`);
     if (!current()) return;
-    if (!IndexPin.equal(data.revision, revision)) { void refreshStatus().catch(() => {}); throw new Error("File catalog revision does not match. Refresh status."); }
+    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(); throw new Error("File catalog revision does not match. Refresh status."); }
     const hadFiles = files.length > 0;
     const known = new Set(files.map(f => f.path));
     files.push(...data.items.filter(f => !known.has(f.path)));
@@ -713,7 +747,7 @@ async function toggleFile(file) {
   try {
     const data = await api(`/api/methods?${IndexPin.query(revision)}&path=${encodeURIComponent(file.path)}`);
     if (!current()) return;
-    if (!IndexPin.equal(data.revision, revision)) { void refreshStatus().catch(() => {}); throw new Error("Methods revision mismatch. Refresh status."); }
+    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(); throw new Error("Methods revision mismatch. Refresh status."); }
     state.items = data.items; state.truncated = data.truncated;
   } catch (error) {
     if (!current() || error.name === "AbortError") return;
@@ -741,7 +775,8 @@ async function loadSequence() {
   await browseRequest(async () => {
     const data = await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked});
     if (!current()) return;
-    if (!IndexPin.equal(data.revision, revision) || data.seed.id !== symbol.id) { void refreshStatus().catch(() => {}); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
+    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
+    if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     const options = {showDetails: !!$("all-steps").checked};
     if (window.BaleygShell) options.onSelect = step => {
@@ -906,7 +941,7 @@ async function loadDirectory(path, reset = false) {
     try {
       const data = await api(`/api/tree?path=${encodeURIComponent(path)}&offset=${offset}&limit=200`);
       if (!current()) return;
-      if (!IndexPin.equal(data.revision, status.revision)) { void refreshStatus().catch(() => {}); throw new Error("Index changed. Refresh status before browsing methods."); }
+      if (!IndexPin.equal(data.revision, status.revision)) { unexpectedPair(); throw new Error("Index changed. Refresh status before browsing methods."); }
       if (data.path !== path) throw new Error("Directory response does not match the requested path.");
       if (treeRoot !== null && treeRoot !== data.root) {
         clearBrowse("Browser root changed. Choose a method again.");
@@ -920,7 +955,7 @@ async function loadDirectory(path, reset = false) {
         const page = await api(`/api/tree?path=${encodeURIComponent(path)}&offset=${next}&limit=200`);
         if (!current()) return;
         if (page.root !== data.root || page.path !== path || !IndexPin.equal(page.revision, data.revision) || (page.nextOffset != null && page.nextOffset <= next))
-          { void refreshStatus().catch(() => {}); throw new Error("Directory changed while refreshing. Retry folder."); }
+          { unexpectedPair(); throw new Error("Directory changed while refreshing. Retry folder."); }
         data.items.push(...page.items); data.nextOffset = page.nextOffset; data.truncated ||= page.truncated;
       }
       // Keep per-file and child expansion state.
@@ -1213,7 +1248,7 @@ async function refreshDependencies() {
   try {
     const data = await api("/api/dependencies");
     if (!current()) return;
-    if (!IndexPin.equal(data.workspaceRevision, status.revision)) throw new Error("Library catalog belongs to another workspace revision. Refresh workspace status.");
+    if (!IndexPin.equal(data.workspaceRevision, status.revision)) { unexpectedPair(); throw new Error("Library catalog belongs to another workspace revision. Refresh workspace status."); }
     if (!["disabled", "loading", "ready", "failed"].includes(data.state)) throw new Error("Library catalog status unavailable.");
     const catalogChanged = dependencyCatalog?.catalogId !== data.catalogId;
     if (catalogChanged || data.state !== "ready") {
@@ -1227,7 +1262,7 @@ async function refreshDependencies() {
     for (const warning of data.warnings || []) $("dependency-warnings").append(element("li", warning, "warning"));
     renderDependencyPackages();
   } catch (error) {
-    if (!current() || error.name === "AbortError") return;
+    if ((!current() && !/Library catalog belongs/.test(error.message)) || error.name === "AbortError") return;
     clearDependencyCatalog();
     $("dependency-state").textContent = `Library catalog unavailable. ${error.message} Use Refresh library status to retry. Manual roots remain available below.`;
   }
@@ -1264,7 +1299,8 @@ async function loadDependencySymbols(offset = 0, query = dependencyQuery) {
   try {
     const data = await api(`/api/dependencies/symbols?catalogId=${encodeURIComponent(catalogId)}&packageId=${encodeURIComponent(pkg.id)}&q=${encodeURIComponent(query)}&offset=${offset}&limit=100`);
     if (!current()) return;
-    if (data.catalogId !== catalogId || !IndexPin.equal(data.workspaceRevision, status.revision) || data.items.some(item => item.packageId !== pkg.id)) throw new Error("Library definition provenance mismatch. Refresh library status.");
+    if (!IndexPin.equal(data.workspaceRevision, status.revision)) { unexpectedPair(); throw new Error("Library definition revision changed. Refresh workspace status."); }
+    if (data.catalogId !== catalogId || data.items.some(item => item.packageId !== pkg.id)) throw new Error("Library definition provenance mismatch. Refresh library status.");
     dependencyOffset = offset; dependencyNext = data.nextOffset; dependencyQuery = query;
     for (const symbol of data.items) {
       const li = element("li"), pick = externalButton(`${symbol.qualifiedName || symbol.name} · ${symbol.kind}`, () => {
@@ -1278,7 +1314,7 @@ async function loadDependencySymbols(offset = 0, query = dependencyQuery) {
     $("dependency-previous").disabled = offset === 0;
     $("dependency-next").disabled = data.nextOffset == null;
   } catch (error) {
-    if (!current() || error.name === "AbortError") return;
+    if ((!current() && !/Library definition revision/.test(error.message)) || error.name === "AbortError") return;
     $("dependency-symbol-state").textContent = `${error.message} Use Filter to retry or Refresh library status if the catalog changed.`;
   }
 }
@@ -1342,6 +1378,7 @@ function attachClassMenu(node, options) {
 }
 window.BaleygNavigation?.init({
   request: (path, options = {}) => api(path, options.method || "GET", options.body),
+  onStale: unexpectedPair,
   currentRevision: () => status?.revision,
   currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
   openClass: symbol => perform(() => openClasses({seed:symbol.id})),
@@ -1352,6 +1389,7 @@ window.BaleygNavigation?.init({
 function initClassView() {
   window.BaleygClasses?.init({
     request: (path, options = {}) => api(path, options.method || "GET", options.body),
+    onStale: unexpectedPair,
     currentRevision: () => status?.revision,
     currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
     onChange: () => { clearSource(); window.BaleygShell?.resetInspector(); },

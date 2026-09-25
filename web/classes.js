@@ -293,7 +293,10 @@
       if (path) params.set("path", path);
       const data = await api.request(`/api/classes?${params}`);
       if (ticket !== searchSerial || !valid(c)) return;
-      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) { state("Workspace revision changed. Search again.", "stale"); return; }
+      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) {
+        reset(); api.onStale?.("Workspace revision changed. Search again.");
+        state("Workspace revision changed. Search again.", "stale"); return;
+      }
       const items = data.items || [];
       for (const definition of items) {
         const button = el("button", undefined, "classes-result"); button.type = "button";
@@ -312,7 +315,10 @@
       state(`${unindexed ? "Index workspace to populate class declarations." : items.length ? "Choose a class to show its declared relationships." : "No matching classes. Try another name or index Java / Python files."}${data.truncated ? " Results are partial." : ""}`, unindexed ? "unindexed" : data.truncated ? "partial" : items.length ? "ready" : "empty");
       if (autoOpen && items.length) await loadDiagram(items[0].symbol.id, [], true);
     } catch (error) {
-      if (ticket === searchSerial && valid(c) && error.name !== "AbortError") state(error.message || "Class lookup failed. Try Search again.", "error");
+      if (ticket === searchSerial && valid(c) && error.name !== "AbortError") {
+        if (error.status === 409) { reset(); api.onStale?.("Workspace revision changed. Search again."); }
+        state(error.message || "Class lookup failed. Try Search again.", error.status === 409 ? "stale" : "error");
+      }
     }
   }
   async function loadDiagram(nextSeed, nextExpanded, fresh = false, focusId = null) {
@@ -333,7 +339,10 @@
     try {
       const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: true, includeUnmatched: !!ui.unmatched.checked}});
       if (ticket !== serial || !valid(c)) return;
-      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) { state("Workspace revision changed. Open the class again.", "stale"); return; }
+      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) {
+        reset(); api.onStale?.("Workspace revision changed. Open the class again.");
+        state("Workspace revision changed. Open the class again.", "stale"); return;
+      }
       if (fresh) { positions = new Map(); cards = new Map(); stage = null; showAll = false; membersOpen.clear(); ui.diagram.replaceChildren(); }
       ui.results.hidden = true; changeButton.setAttribute("aria-expanded", "false");
       seed = data.seed; expanded = expansion; diagram = data; snapshot = c; diagramGeneration++; displayTicket = ticket;
@@ -350,6 +359,7 @@
         } else {
           diagramGeneration++; diagram = null; snapshot = null; seed = null; expanded = [];
           stage = null; cards = new Map(); positions = new Map(); controls.hidden = true; ui.diagram.replaceChildren();
+          if (error.status === 409) api.onStale?.("Workspace revision changed. Refresh status and open the class again.");
           state(`${error.message || "Class diagram unavailable."} ${error.status === 409 ? "Workspace revision changed. Refresh status and open the class again." : "Try opening the class again."}`, error.status === 409 ? "stale" : "error");
         }
       }

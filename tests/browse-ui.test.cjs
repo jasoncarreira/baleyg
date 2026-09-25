@@ -629,3 +629,69 @@ test("late catalog with reused numeric revision cannot paint the new generation"
   old.resolve(response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:'old.js',methodCount:1}],nextOffset:null}));
   await pending;assert.equal(h.run('files.length'),0);
 });
+
+const oldPair = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
+const newPair = {indexGeneration:"87654321-4321-4321-8321-abcdef123456", indexRevision:1};
+test("same-workspace conflict refresh keeps persisted views and notes while invalidating the index", async () => {
+  const h = harness(), requests = [];
+  const savedView = {view:{id:"v",title:"Keep view",query:{seed:"root",depth:1,includeCallbacks:false}}};
+  const savedNote = {annotation:{id:"n",nodeId:"root",body:"Keep note"}};
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root';result={revision:status.revision,calls:[],nodes:[]}`);
+  h.context.fetch = async url => {
+    requests.push(url);
+    if (url === "/api/views") return response([savedView]);
+    if (url === "/api/annotations") return response([savedNote]);
+    if (url === "/api/status") return response({revision:newPair,workspaceRoot:"/same",stats:{}});
+    if (url === "/api/tree?path=&offset=0&limit=200") return response({...treePage("",[]),revision:newPair});
+    if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:newPair,catalogId:null,packages:[],warnings:[]});
+    return {ok:false,status:409,json:async()=>({error:{message:"Index changed"}})};
+  };
+  await h.run("loadSaved()");
+  assert.match(text(h.get("views")), /Keep view/);
+  assert.match(text(h.get("annotations")), /Keep note/);
+  await h.run("perform(() => api('/api/query','POST',{seed:'root'}))");
+  await new Promise(setImmediate);
+  assert.equal(h.run("status.revision.indexGeneration"),newPair.indexGeneration);
+  assert.equal(h.run("result"),null);
+  assert.match(text(h.get("views")),/Keep view/);
+  assert.equal(h.run("views[0].view.id"),"v");
+  assert.equal(h.run("annotations[0].annotation.body"),"Keep note");
+  assert.ok(requests.includes("/api/status"));
+});
+
+test("producer and browse boundaries use complete pairs and reject reused revision responses", async () => {
+  for (const operation of ["search", "query", "files", "methods", "sequence", "tree"]) {
+    const h=harness(), requests=[];
+    h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root'`);
+    h.context.fetch=async (url,opts) => {
+      requests.push({url,body:opts.body && JSON.parse(opts.body)});
+      if (url==="/api/status") return response({revision:newPair,workspaceRoot:"/same",stats:{}});
+      if (url.startsWith("/api/dependencies")) return response({state:"disabled",workspaceRevision:newPair,packages:[],warnings:[]});
+      if (url.startsWith("/api/tree") && requests.some(r=>r.url==="/api/status")) return response({...treePage("",[]),revision:newPair});
+      if (url.startsWith("/api/tree")) return response({...treePage("",[]),revision:newPair});
+      if (url==="/api/sequence") return response({...view("root"),revision:newPair});
+      if (url==="/api/query") return response({revision:newPair,calls:[],nodes:[],seed:"root"});
+      if (url==="/api/symbols?q=&limit=80") return response({revision:newPair,items:[]});
+      return response({revision:newPair,items:[],nextOffset:null});
+    };
+    const file={path:"src/a.js",methodCount:1};
+    if(operation==="search") await h.run(`perform(() => $('search-form').listeners.submit({preventDefault(){}}))`);
+    if(operation==="query") await h.run("perform(() => runQuery())");
+    if(operation==="files") await h.run("loadFiles(true)");
+    if(operation==="methods") await h.run(`toggleFile(${JSON.stringify(file)})`);
+    if(operation==="sequence") {h.run(`selectedMethod=${JSON.stringify(symbol("root"))}`);await h.run("loadSequence()");}
+    if(operation==="tree") await h.run(`loadDirectory('',true)`);
+    await new Promise(setImmediate);
+    const first=requests[0];
+    if (["files","methods"].includes(operation)) {
+      const query=new URL(first.url,"http://local").searchParams;
+      assert.equal(query.get("indexGeneration"),oldPair.indexGeneration,operation);
+      assert.equal(query.get("indexRevision"),"1",operation);
+    }
+    if(operation==="sequence") assert.deepEqual(first.body.expectedRevision,oldPair);
+    if (["search","query","tree"].includes(operation)) assert.doesNotMatch(first.url, /indexGeneration|indexRevision/);
+    assert.ok(requests.some(r=>r.url==="/api/status"),operation);
+    assert.equal(h.run("status.revision.indexGeneration"),newPair.indexGeneration,operation);
+    assert.equal(h.run("result"),null,operation);
+  }
+});

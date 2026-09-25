@@ -15,7 +15,7 @@ function definition(id) { return {symbol: {id, name: id, path: `src/${id}.java`,
 const node = id => ({id, label:id, kind:"class", expandable:true, class:definition(id)});
 function diagram(ids = ["A", "B"], revision = {indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}) { return {revision, seed: ids[0], nodes:ids.map(node), edges:ids.slice(1).map((id,i)=>({id:`e${i}`,owner:ids[0],target:id,typeName:id,kind:"field",matchKind:"syntaxCandidate",candidateIds:[id],path:"A.java",range})), warnings:[],truncated:false}; }
 function harness({navigation = false} = {}) {
-  const elements = new Map(), calls = [], reads = [], methods = [], changes = [], navigations = [];
+  const elements = new Map(), calls = [], reads = [], methods = [], changes = [], navigations = [], stale = [];
   let navigate = (event, selector, scope) => { navigations.push({event, selector, scope}); };
   const docListeners = {}, winListeners = {};
   let revision = {indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, session = "one";
@@ -51,8 +51,8 @@ function harness({navigation = false} = {}) {
   document.getElementById=id=>{if(!elements.has(id)){const item=element(id);elements.set(id,item);document.body.append(item);}return elements.get(id);};
   const window = {innerWidth:390,innerHeight:600,addEventListener(type,fn){(winListeners[type] ||= []).push(fn);}};
   vm.runInNewContext(pinSource + "\n" + source,{window,document,URLSearchParams,console});
-  window.BaleygClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true)});
-  return {controller:window.BaleygClasses,document,window,calls,reads,methods,changes,navigations,get:document.getElementById,
+  window.BaleygClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true),onStale:message=>stale.push(message)});
+  return {controller:window.BaleygClasses,document,window,calls,reads,methods,changes,navigations,stale,get:document.getElementById,
     setNavigate(fn){navigate=fn;},setRequest(fn){request=fn;},setRevision(value){revision=value;},setSession(value){session=value;},
     async event(type,target){for(const fn of docListeners[type]||[]) await fn({target});},
     menu(){return document.body.querySelector(".classes-context-menu");},
@@ -640,4 +640,27 @@ test("class results cannot cross generation with the same revision",async()=>{
   h.setRevision({indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1});
   gate.resolve(diagram());await work;
   assert.equal(h.card('A'),undefined);
+});
+
+test("class search, page, diagram, and expansion reject a reused revision and ask for status refresh",async()=>{
+ const old={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ const next={indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1};
+ for(const action of ['search','page','diagram','expansion']) {
+   const h=harness();
+   if(action==='expansion') await h.controller.open({seed:'A'});
+   h.setRequest((url,options)=>options ? diagram(['A'],next) : {revision:next,items:[definition('A')],nextOffset:1});
+   if(action==='search') await h.controller.open({});
+   if(action==='page') { h.setRequest((url,options)=>options ? diagram() : {revision:old,items:[definition('A')],nextOffset:100}); await h.controller.open({}); h.setRequest(()=>({revision:next,items:[],nextOffset:null})); await h.button(h.get('classes-results'),'More classes').fire('click'); }
+   if(action==='diagram') await h.controller.open({seed:'A'});
+   if(action==='expansion') {h.get('classes-unmatched').checked=true;await h.get('classes-unmatched').fire('change');}
+   const call=h.calls.at(-1);
+   if(call.options) assert.deepEqual(JSON.parse(JSON.stringify(call.options.body.expectedRevision)),old,action);
+   else {const params=new URL(call.url,'http://local').searchParams;
+     assert.equal(params.get('indexGeneration'),old.indexGeneration,action);
+     assert.equal(params.get('indexRevision'),'1',action);
+   }
+   assert.equal(h.stale.length,1,action);
+   assert.equal(h.card('A'),undefined,action);
+   assert.match(h.get('classes-state').textContent,/revision changed/i,action);
+ }
 });
