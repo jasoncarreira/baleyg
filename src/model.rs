@@ -76,6 +76,10 @@ pub enum SymbolKind {
     Function,
     Method,
     Class,
+    Type,
+    Constructor,
+    Implementation,
+    AnonymousFunction,
 }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -748,7 +752,7 @@ pub mod v1 {
         pub query: ViewQuery,
         pub pins: BTreeMap<String, Position>,
         pub hidden: Vec<String>,
-        pub anchors: BTreeMap<String, DurableAnchor>,
+        pub anchors: BTreeMap<SyntaxId, DurableAnchor>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]

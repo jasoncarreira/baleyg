@@ -180,6 +180,26 @@ fn all_record_families_have_exact_required_keys_and_explicit_nulls() {
 }
 
 #[test]
+fn browser_kinds_keep_legacy_names_and_distinguish_native_declarations() {
+    for (kind, name) in [
+        (model::SymbolKind::Module, "module"),
+        (model::SymbolKind::Function, "function"),
+        (model::SymbolKind::Method, "method"),
+        (model::SymbolKind::Class, "class"),
+        (model::SymbolKind::Type, "type"),
+        (model::SymbolKind::Constructor, "constructor"),
+        (model::SymbolKind::Implementation, "implementation"),
+        (model::SymbolKind::AnonymousFunction, "anonymousFunction"),
+    ] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!(name));
+        assert_eq!(
+            serde_json::from_value::<model::SymbolKind>(json!(name)).unwrap(),
+            kind
+        );
+    }
+}
+
+#[test]
 fn nullable_call_fields_are_independent_and_historical_payloads_remain_distinct() {
     let base = json!({"id":occ(),"ownerSyntaxId":sid(),"ordinal":0,"document":document(),"revisionId":"rev","range":range(),"calleeRange":null,"spelling":null,"regionIds":[],"provenanceId":"p"});
     for callee in [Value::Null, range()] {
@@ -197,7 +217,28 @@ fn nullable_call_fields_are_independent_and_historical_payloads_remain_distinct(
     assert!(serde_json::from_value::<SavedViewWrite>(old.clone()).is_ok());
     let mut modern = old.clone();
     modern["anchors"] = json!({sid():anchor()});
-    assert!(serde_json::from_value::<SavedViewDurable>(modern.clone()).is_ok());
+    let typed: SavedViewDurable = serde_json::from_value(modern.clone()).unwrap();
+    assert_eq!(typed.anchors.keys().next().unwrap().as_str(), sid());
+    assert_eq!(serde_json::to_value(&typed).unwrap(), modern);
+    for invalid in [
+        "legacy",
+        "occ:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sid:v1:ABCDEF0123456789ABCDEF0123456789",
+        "sid:v1:too-short",
+    ] {
+        let mut bad = modern.clone();
+        bad["anchors"] = json!({invalid:anchor()});
+        assert!(
+            serde_json::from_value::<SavedViewDurable>(bad).is_err(),
+            "{invalid}"
+        );
+    }
+    // Compatibility attachment keys are separate from typed declaration anchors.
+    let legacy_attachment = json!({"legacy": {"status":"missingAnchor"}});
+    assert!(
+        serde_json::from_value::<std::collections::BTreeMap<String, Attachment>>(legacy_attachment)
+            .is_ok()
+    );
     assert!(serde_json::from_value::<SavedViewWrite>(modern).is_err());
     let historical_note = json!({"id":"n","nodeId":"legacy","body":"preserved"});
     assert!(serde_json::from_value::<model::Annotation>(historical_note.clone()).is_ok());
