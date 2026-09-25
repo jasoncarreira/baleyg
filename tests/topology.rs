@@ -1349,3 +1349,356 @@ fn guard_drop_unlocks_even_when_fork_child_keeps_descriptor() {
     assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
     assert_eq!(status, 0);
 }
+
+type GcManifestEntry = (std::path::PathBuf, Option<Vec<u8>>, u64, i64, i64);
+fn gc_manifest(base: &Path) -> Vec<GcManifestEntry> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk(base: &Path, path: &Path, result: &mut Vec<GcManifestEntry>) {
+        if !path.exists() {
+            return;
+        }
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            let stat = fs::symlink_metadata(&entry).unwrap();
+            result.push((
+                entry.strip_prefix(base).unwrap().to_owned(),
+                stat.is_file().then(|| fs::read(&entry).unwrap()),
+                stat.len(),
+                stat.mtime(),
+                stat.mtime_nsec(),
+            ));
+            if stat.is_dir() {
+                walk(base, &entry, result);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    walk(base, base, &mut result);
+    result
+}
+
+#[test]
+fn gc_age_and_record_inventory_are_read_only() {
+    use baleyg::model::SavedView;
+    use baleyg::store::topology::{DurableRecords, classify_index_age, valid_record_id};
+    use std::os::unix::fs::MetadataExt;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let now = 1_800_000_000;
+    assert_eq!(
+        classify_index_age(now, Some(now - 2_591_999)),
+        ("unknown", "recent_open")
+    );
+    assert_eq!(
+        classify_index_age(now, Some(now - 2_592_000)),
+        ("eligible", "age_30_days")
+    );
+    assert_eq!(
+        classify_index_age(now, Some(now - 2_592_001)),
+        ("eligible", "age_30_days")
+    );
+    for age in [None, Some(0), Some(-1), Some(now + 1), Some(i64::MAX)] {
+        assert_eq!(classify_index_age(now, age), ("unknown", "age_unknown"));
+    }
+    for invalid in [
+        "",
+        "../outside",
+        "path-0",
+        "00000000-0000-0000-0000-000000000000",
+        "PATH-0000000000000000000000000000000000000000000000000000000000000000",
+    ] {
+        assert!(!valid_record_id(invalid));
+        assert!(roots.record_by_id(invalid).is_err());
+    }
+    let empty = roots.gc_report_at(now).unwrap();
+    assert!(empty.derived.is_empty() && empty.records.is_empty());
+    assert!(!roots.cache.exists() && !roots.data.exists());
+    let store = common::open_store(temp.path(), &work).unwrap();
+    drop(store);
+    let db_path = roots.index_db(&identity);
+    {
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 2_592_000],
+        )
+        .unwrap();
+    }
+    for (age, expected) in [
+        (now - 2_591_999, ("unknown", "recent_open")),
+        (now - 2_592_000, ("eligible", "age_30_days")),
+        (now - 2_592_001, ("eligible", "age_30_days")),
+        (0, ("unknown", "age_unknown")),
+        (now + 1, ("unknown", "age_unknown")),
+    ] {
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute("UPDATE index_metadata SET last_opened_at=?1", [age])
+            .unwrap();
+        drop(db);
+        let report = roots.gc_report_at(now).unwrap();
+        assert_eq!(
+            (report.derived[0].status, report.derived[0].reason),
+            expected
+        );
+    }
+    {
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        db.execute("UPDATE index_metadata SET last_opened_at='invalid'", [])
+            .unwrap();
+    }
+    assert_eq!(
+        roots.gc_report_at(now).unwrap().derived[0].reason,
+        "age_unknown"
+    );
+    {
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 2_592_000],
+        )
+        .unwrap();
+    }
+    let view: SavedView = serde_json::from_str(
+        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
+    )
+    .unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    records.put_view(&view).unwrap();
+    records.delete_view("view1").unwrap();
+    let record_db = roots.record_db(&identity);
+    let before = [db_path.as_path(), record_db.as_path()].map(|path| {
+        let stat = fs::metadata(path).unwrap();
+        (
+            fs::read(path).unwrap(),
+            stat.len(),
+            stat.mtime(),
+            stat.mtime_nsec(),
+        )
+    });
+    let manifest_before = gc_manifest(temp.path());
+    let report = roots.gc_report_at(now).unwrap();
+    assert_eq!(manifest_before, gc_manifest(temp.path()));
+    assert_eq!(
+        (report.derived[0].status, report.derived[0].reason),
+        ("eligible", "age_30_days")
+    );
+    assert_eq!(report.records.len(), 1);
+    assert_eq!(
+        (report.records[0].views, report.records[0].annotations),
+        (0, 0)
+    );
+    assert!(report.records[0].missing_known_paths.is_empty());
+    assert_eq!(
+        roots.record_by_id(&identity.record_id).unwrap().unwrap().id,
+        identity.record_id
+    );
+    let after = [db_path.as_path(), record_db.as_path()].map(|path| {
+        let stat = fs::metadata(path).unwrap();
+        (
+            fs::read(path).unwrap(),
+            stat.len(),
+            stat.mtime(),
+            stat.mtime_nsec(),
+        )
+    });
+    assert_eq!(before, after);
+    let held = UseGuard::acquire_existing(&roots.index_use_lock(&identity), false, false).unwrap();
+    assert_eq!(roots.gc_report_at(now).unwrap().derived[0].status, "busy");
+    drop(held);
+    fs::rename(&work, temp.path().join("moved")).unwrap();
+    let missing = roots.gc_report_at(now).unwrap();
+    assert_eq!(missing.derived[0].reason, "root_missing");
+    assert_eq!(
+        missing.records[0].missing_known_paths,
+        vec![identity.root.to_string_lossy()]
+    );
+    fs::create_dir(&work).unwrap();
+    assert_eq!(
+        roots.gc_report_at(now).unwrap().derived[0].reason,
+        "root_replaced"
+    );
+    let backup = db_path.with_file_name("index.backup");
+    fs::rename(&db_path, &backup).unwrap();
+    assert_eq!(
+        roots.gc_report_at(now).unwrap().derived[0].reason,
+        "metadata_unreadable"
+    );
+    fs::rename(&backup, &db_path).unwrap();
+    let lock = roots.index_use_lock(&identity);
+    let backup = lock.with_extension("backup");
+    fs::rename(&lock, &backup).unwrap();
+    std::os::unix::fs::symlink(&backup, &lock).unwrap();
+    assert_eq!(
+        roots.gc_report_at(now).unwrap().derived[0].reason,
+        "unsafe_use_lock"
+    );
+    fs::remove_file(&lock).unwrap();
+    fs::rename(&backup, &lock).unwrap();
+}
+
+#[test]
+fn gc_rejects_dangling_recovery_sidecars_without_writes() {
+    use baleyg::model::Annotation;
+    use baleyg::store::topology::DurableRecords;
+    use std::os::unix::fs::symlink;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    drop(common::open_store(temp.path(), &work).unwrap());
+    DurableRecords::new(&roots, &identity)
+        .put_annotation(&Annotation {
+            id: "note".into(),
+            node_id: "node".into(),
+            body: "saved".into(),
+        })
+        .unwrap();
+    for (db, is_record) in [
+        (roots.index_db(&identity), false),
+        (roots.record_db(&identity), true),
+    ] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = db.with_file_name(format!(
+                "{}{suffix}",
+                db.file_name().unwrap().to_string_lossy()
+            ));
+            symlink(temp.path().join("absent"), &sidecar).unwrap();
+            assert!(fs::symlink_metadata(&sidecar).is_ok());
+            assert!(!sidecar.exists(), "fixture must be a dangling link");
+            let before = gc_manifest(temp.path());
+            if is_record {
+                assert!(roots.record_by_id(&identity.record_id).is_err(), "{suffix}");
+                assert!(roots.gc_report_at(1_800_000_000).is_err(), "{suffix}");
+            } else {
+                let report = roots.gc_report_at(1_800_000_000).unwrap();
+                assert_eq!(
+                    (report.derived[0].status, report.derived[0].reason),
+                    ("unknown", "metadata_unreadable"),
+                    "{suffix}"
+                );
+            }
+            assert_eq!(
+                gc_manifest(temp.path()),
+                before,
+                "report wrote with {suffix}"
+            );
+            fs::remove_file(sidecar).unwrap();
+        }
+    }
+}
+
+#[test]
+fn gc_refuses_countable_records_with_missing_durable_columns() {
+    use baleyg::model::Annotation;
+    use baleyg::store::topology::DurableRecords;
+    let (temp, roots) = common::fixture();
+    for (n, table, column) in [
+        (0, "known_roots", "device"),
+        (1, "known_roots", "inode"),
+        (2, "views", "payload"),
+        (3, "annotations", "node_id"),
+        (4, "annotations", "payload"),
+    ] {
+        let work = temp.path().join(format!("record-{n}"));
+        fs::create_dir(&work).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        DurableRecords::new(&roots, &identity)
+            .put_annotation(&Annotation {
+                id: "note".into(),
+                node_id: "node".into(),
+                body: "saved".into(),
+            })
+            .unwrap();
+        let db = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
+        db.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+            .unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM annotations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(db);
+        assert!(
+            roots.record_by_id(&identity.record_id).is_err(),
+            "{table}.{column}"
+        );
+        assert!(
+            roots.gc_report_at(1_800_000_000).is_err(),
+            "{table}.{column}"
+        );
+    }
+}
+
+#[test]
+fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
+    use baleyg::model::Annotation;
+    use baleyg::store::topology::DurableRecords;
+    let (temp, roots) = common::fixture();
+    let mut identities = (0..3)
+        .map(|n| {
+            let work = temp.path().join(format!("sort-{n}"));
+            fs::create_dir(&work).unwrap();
+            WorkspaceIdentity::discover(Some(&work), &work).unwrap()
+        })
+        .collect::<Vec<_>>();
+    identities.sort_by(|a, b| b.root_key.cmp(&a.root_key));
+    let insertion_keys: Vec<_> = identities.iter().map(|id| id.root_key.clone()).collect();
+    let insertion_ids: Vec<_> = identities.iter().map(|id| id.record_id.clone()).collect();
+    for identity in &identities {
+        drop(common::open_store(temp.path(), &identity.root).unwrap());
+        DurableRecords::new(&roots, identity)
+            .put_annotation(&Annotation {
+                id: "note".into(),
+                node_id: "node".into(),
+                body: "saved".into(),
+            })
+            .unwrap();
+        let db = rusqlite::Connection::open(roots.record_db(identity)).unwrap();
+        for name in ["z", "m", "a"] {
+            db.execute(
+                "INSERT INTO known_roots(path,device,inode) VALUES(?1,'1','1')",
+                [temp
+                    .path()
+                    .join(format!("missing-{}-{name}", identity.record_id))
+                    .to_str()
+                    .unwrap()],
+            )
+            .unwrap();
+        }
+    }
+    let report = roots.gc_report_at(1_800_000_000).unwrap();
+    let mut expected_keys = insertion_keys.clone();
+    expected_keys.sort();
+    let mut expected_ids = insertion_ids.clone();
+    expected_ids.sort();
+    assert_eq!(
+        report
+            .derived
+            .iter()
+            .map(|entry| entry.root_key.clone())
+            .collect::<Vec<_>>(),
+        expected_keys
+    );
+    assert_eq!(
+        report
+            .records
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    for record in &report.records {
+        let mut expected = record.missing_known_paths.clone();
+        expected.sort();
+        assert_eq!(record.missing_known_paths, expected);
+        assert_eq!(record.missing_known_paths.len(), 3);
+        assert!(record.missing_known_paths[0].ends_with("-a"));
+    }
+}
