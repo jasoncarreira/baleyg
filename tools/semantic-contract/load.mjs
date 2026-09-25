@@ -3,6 +3,7 @@ import {resolve, relative, join, dirname} from 'node:path';
 import {validate} from './formats.mjs';
 import {parseJson} from './json.mjs';
 import {contentHash, sourceManifestHash} from './identity.mjs';
+import {toByteRange, verifyWitness} from './coordinates.mjs';
 
 function reject(id, field, message) {
   const error = new Error(`${id} ${field}: ${message}`);
@@ -194,8 +195,24 @@ export async function loadFixture(root) {
           documentKey(x.document)===documentKey(annotation.document));
         const source=sources.get(key([annotation.document.sourceSetId,fact.source.revisionId,annotation.document.path]));
         const name=declaration?.witnesses.find(x=>x.field==='name')?.witness;
-        if (!declaration || !source || !name || source.subarray(name.range.start,name.range.end).toString('utf8')!==name.text || name.text!==declaration.name)
-          reject('IDENTITY.SEMANTIC',fact.ref,'relationship source declaration not measured in captured source');
+        const encoding=fixture.producers.find(x=>x.id===native.producerId)?.positionEncoding;
+        if (!declaration || !source || !name || !encoding ||
+            declaration.range.encoding!==encoding || declaration.nameRange?.encoding!==encoding || name.range.encoding!==encoding)
+          reject('IDENTITY.SEMANTIC','fact.ref','relationship source declaration identity or encoding mismatch');
+        let declarationRange, nameRange, witnessRange;
+        try {
+          declarationRange=toByteRange(source,declaration.range);
+          nameRange=toByteRange(source,declaration.nameRange);
+          witnessRange=verifyWitness(source,name,{within:declarationRange});
+        } catch (error) {
+          const coordinateError=error.message?.startsWith('COORD.INVALID_RANGE');
+          if (!coordinateError && !error.message?.startsWith('WITNESS.')) throw error;
+          const failure=new Error(`IDENTITY.SEMANTIC fact.ref: ${error.message}`);
+          failure.assertion='IDENTITY.SEMANTIC'; failure.code=coordinateError?'invalidRange':'invalidRecord'; failure.field='fact.ref';
+          throw failure;
+        }
+        if (witnessRange.start!==nameRange.start || witnessRange.end!==nameRange.end || name.text!==declaration.name)
+          reject('IDENTITY.SEMANTIC','fact.ref','relationship source declaration name range or text mismatch');
       }
       const raw=semanticFacts.get(key([provenance.producerId,fact.ref]));
       if (!raw || key(raw.fact)!==key(fact)) reject('IDENTITY.SEMANTIC',fact.ref,'fact absent or contradicts raw capture');
