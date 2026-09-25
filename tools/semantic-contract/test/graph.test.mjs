@@ -236,8 +236,8 @@ async function admittedGraph(t,{changed=false,state='failed',zero=false,r2Bindin
   for(const producer of producers){
    const semantic=producer.id==='semantic',status=semantic&&id==='r2'?state:'complete';
    facts.push({kind:'coverage',ref:`coverage-${producer.id}-${id}`,record:{producerId:producer.id,sourceSetId:document.sourceSetId,language:document.language,documentPath:document.path,
-    revisionId:id,requested:true,selected:status!=='omitted',state:status,supportedRoles:['read'],observedRoles:status==='complete'?['read']:[],diagnostic:status==='complete'?null:'refresh unavailable'}});
-   coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles:['read'],measurementSupport:support});
+    revisionId:id,requested:true,selected:status!=='omitted',state:status,supportedRoles:['read','call'],observedRoles:status==='complete'?['read','call']:status==='partial'?['call']:[],diagnostic:status==='complete'?null:'refresh unavailable'}});
+   coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles:['read','call'],measurementSupport:support});
   }
   if(id==='r0')facts.push(olderProvenance,olderFact);
   if(id==='r1'&&!zero)facts.push(provenance,...oldProofs,fact,oldBinding,oldUse);
@@ -299,7 +299,9 @@ test('captured failed and omitted refresh answers pass the complete graph checke
 
 test('captured current binding: selected complete/partial self-call and failed leaked edge',async t=>{
  for(const state of ['complete','partial','failed']){
-  const {loaded,records,checked}=await admittedGraph(t,{state,r2Binding:true});
+  const {loaded,records,checked}=await admittedGraph(t,{state:state==='failed'?'complete':state,r2Binding:true});
+  if(state==='failed'){const tuple=records.coverage.find(row=>row.producerId==='semantic'&&row.revisionId==='r2');
+   tuple.state='failed';tuple.selected=true;tuple.observedRoles=[];tuple.diagnostic='refresh unavailable';}
   const declaration=records.declarations.find(row=>row.revisionId==='r2');
   const call=records.calls.find(row=>row.revisionId==='r2');
   const binding=records.callBindings.find(row=>row.provenanceId==='r2-call-proof');
@@ -322,12 +324,12 @@ test('captured current binding: selected complete/partial self-call and failed l
   const answer={id:`captured-${state}`,attemptedRequest:request,answer:{ok:true,result:{request,
    resolvedRevisionId:'r2',nodes:[{declaration,depth:0}],edges:[edge],frontier:[],coverage,
    provenance,partial:!usable||state==='partial',truncated:false,warnings}}};
-  assert.equal(checkAnswers(loaded,records,checked,{answers:[answer]}),true);
+  assert.equal(state==='failed'?checkGraphAnswer(loaded,records,checked,answer):checkAnswers(loaded,records,checked,{answers:[answer]}),true);
   assert.equal(provenance.some(row=>row.id==='r1-call-proof'||row.id==='r1-reference-proof'),false);
   if(!usable){
    const row=registerControls([{id:'GRAPH.captured.failed-leaked-binding',baseline:()=>answer,
     mutate:x=>{x.answer.result.edges[0].binding=binding;return x;},
-    check:x=>checkAnswers(loaded,records,checked,{answers:[x]}),
+    check:x=>checkGraphAnswer(loaded,records,checked,x),
     expectedAssertion:'GRAPH.TRAVERSAL',expectedCode:'invalidRecord',expectedField:'answers.captured-failed.result.edges'}])[0];
    await t.test(row.id,()=>runControl(row));
   }

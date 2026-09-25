@@ -17,8 +17,8 @@ function fail(assertion,field,message){const error=new Error(`${assertion} ${fie
 function failure(code,field){return {ok:false,error:{code,field,message:`${field} is not available for this graph request`}};}
 const limits=[['depth',2,0,5],['maxNodes',150,1,150],['maxCalls',500,0,500]];
 
-// This projection is deliberately independent of graph-traversal.mjs and of the
-// author's graph answer. The checked records, not a returned edge, choose bindings.
+// This source-derived projection does not trust the authored graph answer.
+// The checked records, not a returned edge, choose bindings.
 export function expectedGraph(loaded,records,checked,request){
  const effective={...request};
  for(const [name,defaultValue,min,max] of limits){

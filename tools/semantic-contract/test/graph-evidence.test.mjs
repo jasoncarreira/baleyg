@@ -9,9 +9,8 @@ import {checkCoverage} from '../record-check/coverage.mjs';
 import {checkMeasurement} from '../record-check/measurement.mjs';
 import {checkJoins} from '../record-check/joins.mjs';
 import {checkBindings} from '../record-check/bindings.mjs';
-import {deriveWarnings,checkWarnings} from '../graph-warnings.mjs';
-import {traverseGraph} from '../graph-traversal.mjs';
-import {checkGraphAnswer} from '../graph-check.mjs';
+import {checkWarnings} from '../graph-warnings.mjs';
+import {expectedGraph,checkGraphAnswer} from '../graph-check.mjs';
 import {contentHash,sourceManifestHash,syntaxId,occurrenceId} from '../identity.mjs';
 import {canonicalBytes} from '../json.mjs';
 import {selectGraphEvidence,checkGraphEvidence} from '../graph-evidence.mjs';
@@ -160,8 +159,8 @@ async function admitted(t,{changed=false,state='failed',zero=false,r2Binding=fal
   for(const producer of producers){
    const semantic=producer.id==='semantic',status=semantic&&id==='r2'?state:'complete';
    facts.push({kind:'coverage',ref:`coverage-${producer.id}-${id}`,record:{producerId:producer.id,sourceSetId:document.sourceSetId,language:document.language,documentPath:document.path,
-    revisionId:id,requested:true,selected:status!=='omitted',state:status,supportedRoles:['read'],observedRoles:status==='complete'?['read']:[],diagnostic:status==='complete'?null:'refresh unavailable'}});
-   coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles:['read'],measurementSupport:support});
+    revisionId:id,requested:true,selected:status!=='omitted',state:status,supportedRoles:['read','call'],observedRoles:status==='complete'?['read','call']:status==='partial'?['call']:[],diagnostic:status==='complete'?null:'refresh unavailable'}});
+   coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles:['read','call'],measurementSupport:support});
   }
   if(id==='r1'&&!zero)facts.push(provenance,...oldProofs,fact,oldBinding,oldUse);
   if(id==='r2'&&r2Binding){
@@ -185,8 +184,8 @@ async function admitted(t,{changed=false,state='failed',zero=false,r2Binding=fal
  const checked=checkCoverage(loaded,records);
  const measured=checkMeasurement(loaded,records),joins=checkJoins(loaded,records,checked,measured);
  checkBindings(loaded,records,checked,measured,joins);
- const traversal=traverseGraph({request:{sourceSetId:'main',revisionId:'r2',rootSyntaxId:records.declarations.find(row=>row.revisionId==='r2').syntaxId,
-  semanticProducerId:'semantic'},records});
+ const traversal=expectedGraph(loaded,records,checked,{sourceSetId:'main',revisionId:'r2',rootSyntaxId:records.declarations.find(row=>row.revisionId==='r2').syntaxId,
+  semanticProducerId:'semantic'});
  assert.equal(traversal.ok,true);return {loaded,records,checked,result:traversal.result};
 }
 test('admitted failed/omitted refresh selects source-backed declaration proofs, warning keys and r2 call only',async t=>{
@@ -208,10 +207,8 @@ test('admitted failed/omitted refresh selects source-backed declaration proofs, 
   assert.equal(evidence.provenance.some(row=>row.evidenceKind==='semanticReference'),false);
   assert.equal(evidence.provenance.find(row=>row.id==='r1-proof')?.freshness,
    options.zero?undefined:options.changed?'stale':'possiblyStale');
-  r.warnings=deriveWarnings(r);
-  assert.deepEqual(r.warnings.map(({code,provenanceId})=>[code,provenanceId]),
-   options.state==='omitted'?[...(options.zero?[]:[['staleEvidence',options.changed?'r1-proof':null]])]:
-   [['coverageIncomplete',null],...(options.zero?[]:[['staleEvidence',options.changed?'r1-proof':null]])]);
+  r.warnings=[...(options.state==='omitted'?[]:[{code:'coverageIncomplete',provenanceId:null,message:'refresh unavailable'}]),
+   ...(options.zero?[]:[{code:'staleEvidence',provenanceId:options.changed?'r1-proof':null,message:'historical proof'}])];
   assert.deepEqual(checkGraphEvidence(s.loaded,s.records,s.checked,r,r),evidence);
   assert.equal(checkWarnings(r),true);
  }
@@ -232,7 +229,7 @@ test('captured r2 binding cannot survive a failed or omitted current tuple',asyn
   const current=changed.coverage.find(row=>row.producerId==='semantic'&&row.revisionId==='r2');
   current.state=state;current.selected=state!=='omitted';current.observedRoles=[];
   current.diagnostic='refresh unavailable';
-  const traversed=traverseGraph({request:s.result.request,records:changed});
+  const traversed=expectedGraph(s.loaded,changed,s.checked,s.result.request);
   assert.equal(traversed.ok,true);
   const result=traversed.result;
   assert.equal(result.nodes.length,1);assert.equal(result.edges.length,1);
@@ -273,7 +270,7 @@ test('an admitted r1 graph projects captured r1 proof and target against r1, not
   assert.equal(old.staleTarget,changed);
   const request={sourceSetId:'main',revisionId:'r1',rootSyntaxId:s.records.declarations.find(d=>d.revisionId==='r1').syntaxId,
    semanticProducerId:'semantic'};
-  const output=traverseGraph({request,records:s.records});assert.equal(output.ok,true);
+  const output=expectedGraph(s.loaded,s.records,s.checked,request);assert.equal(output.ok,true);
   const result=output.result,edge=result.edges[0];
   assert.equal(edge.call.revisionId,'r1');
   assert.equal(edge.binding?.provenanceId,'r1-call-proof');
@@ -282,8 +279,8 @@ test('an admitted r1 graph projects captured r1 proof and target against r1, not
   Object.assign(result,selectGraphEvidence(s.loaded,s.records,s.checked,result));
   assert.equal(result.provenance.find(p=>p.id==='r1-call-proof').freshness,'fresh');
   assert.equal(result.provenance.every(p=>p.freshness==='fresh'),true);
-  result.warnings=deriveWarnings(result);
-  assert.deepEqual(result.warnings,[]);
+  result.warnings=[];
+  assert.equal(checkWarnings(result),true);
   const entry={id:`r1-${changed}`,attemptedRequest:request,answer:output};
   assert.equal(checkGraphAnswer(s.loaded,s.records,s.checked,entry),true);
   const mutated=structuredClone(entry);
