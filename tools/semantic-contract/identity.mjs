@@ -82,6 +82,11 @@ export function assignOccurrenceOrdinals(rows) {
   const groups=new Map(), result=new Map();
   for (const row of rows) {
     if (!['call','reference','control'].includes(row.kind)) throw new TypeError('IDENTITY.OCCURRENCE_KIND');
+    if (typeof row.revisionId !== 'string' || !row.revisionId ||
+        typeof row.ownerSyntaxId !== 'string' || !/^sid:v1:[0-9a-f]{32}$/.test(row.ownerSyntaxId) ||
+        !row.range || !Number.isSafeInteger(row.range.start) || !Number.isSafeInteger(row.range.end) ||
+        row.range.start < 0 || row.range.end <= row.range.start)
+      throw new TypeError('IDENTITY.OCCURRENCE invalid measured row');
     const key=canonicalBytes([row.revisionId,row.ownerSyntaxId,row.kind]).toString('hex');
     if (!groups.has(key)) groups.set(key,[]);
     groups.get(key).push(row);
