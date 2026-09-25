@@ -1648,3 +1648,71 @@ fn java_control_candidates_match_measured_graph_regions() {
         .collect();
     assert_eq!(measured, graph_regions);
 }
+
+#[test]
+fn python_capture_proves_only_source_member_tokens() {
+    use baleyg::{
+        indexer::{CaptureAdmission, NativeCandidateKind, capture_revision},
+        model::v1::Language,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = "def f():\n    obj.éclair()\n    obj.Ａ()\n    obj[key]()\n    (obj.foo if flag else obj.bar)()\n";
+    write(root, "a.py", source);
+    for input in ["toolchain.capture", "config.capture", "dependency.capture"] {
+        write(root, input, input);
+    }
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(root), root).unwrap();
+    let admission = CaptureAdmission {
+        source_set_id: identity.record_id,
+        root_id: identity.root_key,
+        languages: vec![Language::Python],
+        toolchain: root.join("toolchain.capture"),
+        config: root.join("config.capture"),
+        dependency: root.join("dependency.capture"),
+        dependency_source_sets: vec![],
+        producers: vec![],
+    };
+    let capture =
+        capture_revision(&IndexOptions::new(root.to_owned()), &admission, &cancel()).unwrap();
+    let doc = capture
+        .documents
+        .iter()
+        .find(|d| d.key.path.as_str() == "a.py")
+        .unwrap();
+    let calls: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == NativeCandidateKind::Invocation)
+        .collect();
+    assert_eq!(calls.len(), 4);
+    assert!(
+        calls
+            .iter()
+            .all(|w| w.stable_id.as_deref().unwrap().starts_with("occ:v1:"))
+    );
+    let member = calls
+        .iter()
+        .find(|w| source[w.start_byte..w.end_byte].starts_with("obj.éclair"))
+        .unwrap();
+    assert_eq!(
+        &source[member.token_start_byte..member.token_end_byte],
+        "éclair"
+    );
+    assert_eq!(member.spelling.as_deref(), Some("éclair"));
+    assert!(member.verified_member_token);
+    let fullwidth = calls
+        .iter()
+        .find(|w| source[w.start_byte..w.end_byte].starts_with("obj.Ａ"))
+        .unwrap();
+    assert_eq!(fullwidth.spelling.as_deref(), Some("Ａ"));
+    assert_eq!(
+        &source[fullwidth.token_start_byte..fullwidth.token_end_byte],
+        "Ａ"
+    );
+    for call in calls.iter().filter(|w| !w.verified_member_token) {
+        assert!(call.spelling.is_none() || !call.spelling.as_deref().unwrap().is_empty());
+    }
+    assert_eq!(calls.iter().filter(|w| w.verified_member_token).count(), 2);
+}
