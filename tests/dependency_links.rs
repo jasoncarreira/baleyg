@@ -1,10 +1,16 @@
+mod common;
+fn test_pin(n: u64) -> baleyg::model::IndexPin {
+    baleyg::model::IndexPin {
+        index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
+        index_revision: n,
+    }
+}
 use baleyg::{
     behavior::{Participant, SequenceStep, SequenceView, build_sequence},
     dependencies::{Catalog, CatalogSymbol, Package},
     dependency_links::annotate,
     indexer::{IndexOptions, index_workspace},
     model::*,
-    store::Store,
 };
 use std::{
     collections::HashMap,
@@ -24,13 +30,13 @@ fn fixture_named(source: &str, name: &str) -> (Graph, SequenceView) {
     )
     .unwrap();
     let seed = graph.nodes.iter().find(|n| n.name == name).unwrap();
-    let view = build_sequence(7, seed, &graph.files[0], &graph.calls, false).unwrap();
+    let view = build_sequence(test_pin(7), seed, &graph.files[0], &graph.calls, false).unwrap();
     (graph, view)
 }
 fn catalog() -> Catalog {
     Catalog {
         id: "catalog:fixture".into(),
-        workspace_revision: 7,
+        workspace_revision: test_pin(7),
         packages: vec![Package {
             id: "package:std".into(),
             ecosystem: "cargo".into(),
@@ -247,7 +253,7 @@ fn fluent_chain_children_are_visited_but_return_types_and_receivers_are_unknown(
 fn stale_revision_non_rust_wrong_source_and_oversized_source_do_nothing() {
     let source = "fn run() { std::fs::OpenOptions::new(); }";
     let mut stale = catalog();
-    stale.workspace_revision += 1;
+    stale.workspace_revision.index_revision += 1;
     unchanged(source, &stale);
     for change in 0..3 {
         let (mut graph, mut view) = fixture(source);
@@ -331,9 +337,17 @@ fn candidate_terminal_id_cannot_be_used_as_workspace_sequence_root() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let store = Store::open(state.path(), workspace.path()).unwrap();
+    let store = crate::common::open_store(state.path(), workspace.path()).unwrap();
     let revision = store
-        .publish(&graph, Some(0), &Arc::new(AtomicBool::new(false)))
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
     assert!(store.sequence_at(id, revision, false).unwrap().is_none());
     assert!(store.symbol(id).unwrap().is_none());

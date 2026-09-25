@@ -406,10 +406,21 @@ fn shared_use_cannot_remove_last_and_live_holder_blocks_exclusive() {
     assert!(path.exists());
     shared.verify().unwrap();
     drop(shared);
-    UseGuard::acquire(&path, true, true)
-        .unwrap()
-        .remove_last()
-        .unwrap();
+    // Parallel process fixtures may briefly inherit a test lock during spawn.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let exclusive = loop {
+        match UseGuard::acquire(&path, true, true) {
+            Ok(guard) => break guard,
+            Err(error)
+                if error.to_string().starts_with("storage_busy")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::yield_now()
+            }
+            Err(error) => panic!("exclusive lock remained busy after releasing holders: {error}"),
+        }
+    };
+    exclusive.remove_last().unwrap();
 }
 
 #[test]
@@ -1072,4 +1083,113 @@ fn durable_marker_change_refuses_real_operation() {
             .delete_annotation("n")
             .is_err()
     );
+}
+
+#[test]
+fn index_open_and_generation() {
+    let base = tempfile::tempdir().unwrap();
+    let work = root(base.path());
+    let state = base.path().join("state");
+    let store = common::open_store(&state, &work).unwrap();
+    let first = store.status().unwrap().revision;
+    assert_eq!(first.index_revision, 0);
+    assert_eq!(first.index_generation.get_version_num(), 4);
+    drop(store);
+    let reopened = common::open_store(&state, &work).unwrap();
+    assert_eq!(reopened.status().unwrap().revision, first);
+}
+#[test]
+fn index_delete_journal_no_wal() {
+    let base = tempfile::tempdir().unwrap();
+    let work = root(base.path());
+    let state = base.path().join("state");
+    let store = common::open_store(&state, &work).unwrap();
+    let index = fs::read_dir(state.join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db =
+        rusqlite::Connection::open_with_flags(&index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let journal: String = db
+        .pragma_query_value(None, "journal_mode", |r| r.get(0))
+        .unwrap();
+    assert_eq!(journal, "delete");
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    drop(db);
+    let bytes = fs::read(&index).unwrap();
+    assert_eq!((bytes[18], bytes[19]), (1, 1));
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!index.with_file_name(format!("index.db{suffix}")).exists());
+    }
+    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+}
+#[test]
+fn leader_records_open_age_and_follower_preserves_it() {
+    let base = tempfile::tempdir().unwrap();
+    let work = root(base.path());
+    let state = base.path().join("state");
+    let store = common::open_store(&state, &work).unwrap();
+    let index = fs::read_dir(state.join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let read_age = || -> i64 {
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .query_row("SELECT last_opened_at FROM index_metadata", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert!(read_age() > 0);
+    let baseline = store.status().unwrap().revision;
+    let leader = store.leader().unwrap();
+    let age = read_age();
+    assert!(age > 0);
+    drop(leader);
+    drop(store);
+    let follower = common::open_store(&state, &work).unwrap();
+    assert_eq!(read_age(), age);
+    assert_eq!(follower.status().unwrap().revision, baseline);
+    let leader = follower.leader().unwrap();
+    assert!(read_age() >= age);
+    assert_eq!(follower.status().unwrap().revision, baseline);
+    drop(leader);
+}
+
+#[test]
+fn guard_drop_unlocks_even_when_fork_child_keeps_descriptor() {
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let guard = roots.leader(&id).unwrap();
+    let mut pipe = [0; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        unsafe { libc::close(pipe[1]) };
+        let mut byte = 0u8;
+        unsafe { libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1) };
+        unsafe { libc::_exit(0) };
+    }
+    unsafe { libc::close(pipe[0]) };
+    drop(guard);
+    let exclusive = UseGuard::acquire_existing(&roots.index_use_lock(&id), true, true).unwrap();
+    drop(exclusive);
+    let next = roots.leader(&id).unwrap();
+    drop(next);
+    unsafe { libc::close(pipe[1]) };
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert_eq!(status, 0);
 }

@@ -1,5 +1,6 @@
 //! Synthetic executable fixtures only. No model, Jev, or network calls.
 #![cfg(unix)]
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -44,8 +45,18 @@ impl Fixture {
             .unwrap()
             .id
             .clone();
-        let store = Store::open(&dir.path().join("index"), &workspace).unwrap();
-        store.publish(&graph, Some(0), &cancel).unwrap();
+        let store = crate::common::open_store(&dir.path().join("index"), &workspace).unwrap();
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0,
+                },
+                &cancel,
+            )
+            .unwrap();
         let runner = dir.path().join("runner");
         let gate = if gated {
             for name in ["entered", "release"] {
@@ -110,7 +121,7 @@ impl Fixture {
             &self.app,
             "POST",
             "/api/questions/preview",
-            json!({"seed":self.seed,"question":"What is logged?","expectedRevision":1}),
+            json!({"seed":self.seed,"question":"What is logged?","expectedRevision":self.store.status().unwrap().revision}),
         )
         .await;
         assert_eq!(status, 200, "{body}");
@@ -124,7 +135,15 @@ impl Fixture {
     }
     fn advance(&self) {
         self.store
-            .publish(&self.graph, Some(1), &Arc::new(AtomicBool::new(false)))
+            .publish(
+                &self.graph,
+                &self.store.leader().unwrap(),
+                baleyg::model::IndexPin {
+                    index_generation: self.store.status().unwrap().revision.index_generation,
+                    index_revision: 1,
+                },
+                &Arc::new(AtomicBool::new(false)),
+            )
             .unwrap();
     }
 }
@@ -190,7 +209,7 @@ async fn success_is_labeled_and_allowance_is_separate_and_retained() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["packetId"], id);
     assert_eq!(body["answer"]["packetId"], id);
-    assert_eq!(body["revision"], 1);
+    assert_eq!(body["revision"], json!(f.store.status().unwrap().revision));
     assert_eq!(body["source"], "liveAcp");
     assert!(body["attemptId"].is_string());
     assert!(body["latencyMs"].is_number());

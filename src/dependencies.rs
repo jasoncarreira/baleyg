@@ -1,4 +1,5 @@
 //! Immutable, local declaration catalogs. Never merged with workspace graphs.
+use crate::model::IndexPin;
 use crate::model::SourceRange;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -48,7 +49,7 @@ pub struct CatalogSource {
 #[serde(rename_all = "camelCase")]
 pub struct Catalog {
     pub id: String,
-    pub workspace_revision: u64,
+    pub workspace_revision: IndexPin,
     pub packages: Vec<Package>,
     pub symbols: Vec<CatalogSymbol>,
     pub warnings: Vec<String>,
@@ -63,7 +64,7 @@ pub struct CatalogOptions {
 impl Catalog {
     pub fn build(
         workspace: &Path,
-        revision: u64,
+        revision: IndexPin,
         options: &CatalogOptions,
         cancel: &AtomicBool,
     ) -> anyhow::Result<Self> {

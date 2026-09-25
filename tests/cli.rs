@@ -3,11 +3,10 @@ use std::{fs, process::Command};
 use tempfile::TempDir;
 fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_baleyg"));
-    c.arg(sub)
-        .arg("--workspace")
-        .arg(root)
-        .arg("--state-dir")
-        .arg(state);
+    c.arg(sub).arg("--workspace").arg(root).env("HOME", state);
+    if sub == "serve" {
+        c.arg("--token-file").arg(state.join("token"));
+    }
     c
 }
 #[test]
@@ -223,4 +222,210 @@ fn acp_requires_complete_explicit_allowance_flags() {
         !state.exists(),
         "invalid opt-in must fail before state creation"
     );
+}
+
+#[test]
+fn fixed_locations_and_removed_flag() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}").unwrap();
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let first: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(first["revision"]["indexRevision"], 0);
+    let generation = first["revision"]["indexGeneration"].as_str().unwrap();
+    assert_eq!(
+        uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
+        4
+    );
+    let cache = home.join(if cfg!(target_os = "macos") {
+        "Library/Caches/dev.odin.baleyg"
+    } else {
+        ".cache/baleyg"
+    });
+    assert!(
+        cache.exists(),
+        "fixed cache missing under {}",
+        home.display()
+    );
+    assert!(!home.join("state/cache.db").exists());
+    assert!(!home.join("state/workspace.db").exists());
+    let removed = command(&root, &home, "status")
+        .arg("--state-dir")
+        .arg(home.join("override"))
+        .output()
+        .unwrap();
+    assert!(!removed.status.success());
+    assert!(String::from_utf8_lossy(&removed.stderr).contains("--state-dir"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&command(&root, &home, "status").output().unwrap().stdout)
+            .unwrap()["revision"],
+        first["revision"]
+    );
+}
+#[test]
+fn index_forwards_pair_and_reports_pair() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}").unwrap();
+    let before: Value =
+        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    let result = command(&root, &home, "index").output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let published: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        published["status"]["revision"],
+        published["publishedRevision"]
+    );
+    assert_eq!(
+        published["publishedRevision"]["indexGeneration"],
+        before["revision"]["indexGeneration"]
+    );
+    assert_eq!(published["publishedRevision"]["indexRevision"], 1);
+}
+#[test]
+fn export_path_refusals() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}").unwrap();
+    assert!(
+        command(&root, &home, "index")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let forbidden = root.join("graph.json");
+    let denied = command(&root, &home, "export")
+        .arg("--output")
+        .arg(&forbidden)
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(!forbidden.exists());
+    let valid = temp.path().join("graph.json");
+    assert!(
+        command(&root, &home, "export")
+            .arg("--output")
+            .arg(&valid)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(valid.exists());
+}
+#[test]
+fn current_commands_pair_matrix() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}").unwrap();
+    let index = command(&root, &home, "index").output().unwrap();
+    assert!(index.status.success());
+    let pin: Value =
+        serde_json::from_slice::<Value>(&index.stdout).unwrap()["publishedRevision"].clone();
+    let status: Value =
+        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    assert_eq!(status["revision"], pin);
+    let symbols: Value =
+        serde_json::from_slice(&command(&root, &home, "symbols").output().unwrap().stdout).unwrap();
+    assert_eq!(symbols["revision"], pin);
+    let seed = symbols["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "seed")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let query: Value = serde_json::from_slice(
+        &command(&root, &home, "query")
+            .arg("--seed")
+            .arg(seed)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(query["revision"], pin);
+}
+
+#[test]
+fn external_destinations_are_rejected_before_git_marker_creation() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    let token = root.join("token");
+    let serve = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("serve")
+        .arg("--workspace")
+        .arg(&root)
+        .arg("--token-file")
+        .arg(&token)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!serve.status.success());
+    assert!(!root.join(".git/baleyg/workspace-id").exists());
+    assert!(!token.exists());
+    let output = root.join("graph.json");
+    let export = command(&root, &home, "export")
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!export.status.success());
+    assert!(!output.exists());
+    assert!(!root.join(".git/baleyg/workspace-id").exists());
+}
+
+#[test]
+fn overlapping_git_workspace_refuses_before_marker_or_managed_entries() {
+    for fixed in ["cache", "data"] {
+        for sub in ["status", "index", "symbols", "query", "export", "serve"] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path().join("home");
+            let cache = home.join("Library/Caches/dev.odin.baleyg");
+            let data = home.join("Library/Application Support/dev.odin.baleyg");
+            let workspace = if fixed == "cache" { &cache } else { &data };
+            fs::create_dir_all(workspace.join(".git")).unwrap();
+            let mut cmd = command(workspace, &home, sub);
+            if sub == "query" {
+                cmd.arg("--seed").arg("a");
+            }
+            let output = cmd.output().unwrap();
+            assert!(!output.status.success(), "{fixed} {sub}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("workspace root overlaps fixed topology"),
+                "{fixed} {sub}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !workspace.join(".git/baleyg/workspace-id").exists(),
+                "{fixed} {sub}"
+            );
+            assert!(!cache.join("indexes").exists(), "{fixed} {sub}");
+            assert!(!data.join("workspaces").exists(), "{fixed} {sub}");
+            assert!(!home.join("token").exists(), "{fixed} {sub}");
+        }
+    }
 }

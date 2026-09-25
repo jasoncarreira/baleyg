@@ -41,7 +41,7 @@ pub struct IndexJob {
     pub id: String,
     pub state: String,
     pub progress: IndexProgress,
-    pub revision: Option<u64>,
+    pub revision: Option<IndexPin>,
     pub error: Option<Value>,
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -326,7 +326,7 @@ impl DaemonState {
         }
     }
     /// Presentation-only snapshot. The caller must use a matching cached workspace revision.
-    pub(crate) fn catalog_snapshot(&self, revision: u64) -> Option<Arc<Catalog>> {
+    pub(crate) fn catalog_snapshot(&self, revision: IndexPin) -> Option<Arc<Catalog>> {
         self.dependencies
             .lock()
             .unwrap()
@@ -373,6 +373,11 @@ impl IntoResponse for ApiError {
 }
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if e.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+            matches!(error, rusqlite::Error::SqliteFailure(info, _) if matches!(info.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+        })) {
+            return Self(StatusCode::CONFLICT, "storage_busy", "Storage is busy");
+        }
         if let Some(invalid) = e.downcast_ref::<crate::navigation::InvalidRequest>() {
             Self(
                 StatusCode::BAD_REQUEST,
@@ -388,6 +393,50 @@ impl From<anyhow::Error> for ApiError {
                 "The index revision changed",
             )
         } else {
+            let text = e.to_string();
+            for (prefix, status, code) in [
+                ("root_changed", StatusCode::CONFLICT, "root_changed"),
+                (
+                    "root_key_collision",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "root_key_collision",
+                ),
+                (
+                    "workspace_id_changed",
+                    StatusCode::CONFLICT,
+                    "workspace_id_changed",
+                ),
+                ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
+                (
+                    "incompatible_index",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "incompatible_index",
+                ),
+                (
+                    "incompatible_record",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "incompatible_record",
+                ),
+                (
+                    "incomplete_record",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "incomplete_record",
+                ),
+                (
+                    "recovery_required",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "recovery_required",
+                ),
+                (
+                    "unsafe_index",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unsafe_index",
+                ),
+            ] {
+                if text.starts_with(prefix) {
+                    return Self(status, code, "Storage is unavailable");
+                }
+            }
             Self(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -901,13 +950,14 @@ async fn rust_source_tree(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<RustTreeQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<crate::file_tree::Page>, ApiError> {
-    let Query(q) = query.map_err(|_| browse_invalid())?;
+    let Query(q) = query.map_err(|_| invalid())?;
     if !crate::file_tree::valid_path(&q.path)
         || !(1..=200).contains(&q.limit)
         || q.offset > crate::file_tree::SCAN_LIMIT
     {
         return Err(browse_invalid());
     }
+    let revision = db(s.clone(), |s| s.status()).await?.revision;
     tokio::task::spawn_blocking(move || {
         let root = s
             .rust_sources
@@ -922,7 +972,7 @@ async fn rust_source_tree(
             root: root.directory.root.to_string_lossy().into_owned(),
             indexed_workspace: String::new(),
             path: q.path,
-            revision: 0,
+            revision,
             items,
             next_offset,
             truncated,
@@ -941,7 +991,7 @@ async fn rust_source_file(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<RustFileQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<crate::rust_sources::Snapshot>, ApiError> {
-    let Query(q) = query.map_err(|_| browse_invalid())?;
+    let Query(q) = query.map_err(|_| invalid())?;
     if q.path.is_empty() || !crate::file_tree::valid_path(&q.path) || !q.path.ends_with(".rs") {
         return Err(browse_invalid());
     }
@@ -984,6 +1034,7 @@ async fn tree(
         return Err(browse_invalid());
     }
     tokio::task::spawn_blocking(move || {
+        s.store.verify_root()?;
         let (mut items, next_offset, truncated) = s
             .browser
             .list(&q.path, q.offset, q.limit)
@@ -1036,6 +1087,7 @@ async fn tree(
             };
             item.unindexed_reason = Some(reason.into());
         }
+        s.store.verify_root()?;
         Ok(Json(crate::file_tree::Page {
             root: s.browser.root.to_string_lossy().into_owned(),
             indexed_workspace,
@@ -1055,10 +1107,30 @@ async fn tree(
         )
     })?
 }
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PinQuery {
+    index_generation: Option<String>,
+    index_revision: Option<String>,
+}
+impl PinQuery {
+    fn pin(&self) -> Result<Option<IndexPin>, ApiError> {
+        match (&self.index_generation, &self.index_revision) {
+            (None, None) => Ok(None),
+            (Some(generation), Some(revision)) => {
+                let revision = revision.parse::<u64>().map_err(|_| invalid())?;
+                let value = json!({"indexGeneration":generation,"indexRevision":revision});
+                Ok(Some(serde_json::from_value(value).map_err(|_| invalid())?))
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FilesQuery {
-    revision: Option<u64>,
+    #[serde(flatten)]
+    pin: PinQuery,
     #[serde(default)]
     offset: usize,
     #[serde(default = "file_limit")]
@@ -1069,7 +1141,7 @@ fn file_limit() -> usize {
 }
 fn browse_invalid() -> ApiError {
     ApiError(
-        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::BAD_REQUEST,
         "invalid_request",
         "Invalid browse or sequence request",
     )
@@ -1082,8 +1154,9 @@ async fn files(
     if !(1..=200).contains(&q.limit) || q.offset > i64::MAX as usize {
         return Err(browse_invalid());
     }
+    let pin = q.pin.pin()?;
     Ok(Json(
-        db(s, move |s| s.files_at(q.revision, q.offset, q.limit)).await?,
+        db(s, move |s| s.files_at(pin, q.offset, q.limit)).await?,
     ))
 }
 async fn methods(
@@ -1100,8 +1173,9 @@ async fn methods(
     {
         return Err(browse_invalid());
     }
+    let pin = q.pin.pin()?;
     Ok(Json(
-        db(s, move |s| s.methods_at(&q.path, q.revision))
+        db(s, move |s| s.methods_at(&q.path, pin))
             .await?
             .ok_or_else(missing)?,
     ))
@@ -1110,7 +1184,7 @@ async fn methods(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SequenceRequest {
     seed: String,
-    expected_revision: u64,
+    expected_revision: IndexPin,
     #[serde(default)]
     show_all: bool,
 }
@@ -1158,7 +1232,8 @@ struct ClassesQuery {
     path: Option<String>,
     #[serde(default)]
     q: String,
-    revision: Option<u64>,
+    #[serde(flatten)]
+    pin: PinQuery,
     #[serde(default)]
     offset: usize,
     #[serde(default = "class_limit")]
@@ -1172,9 +1247,10 @@ async fn classes(
     query: Result<Query<ClassesQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<crate::class_diagram::ClassPage>, ApiError> {
     let Query(q) = query.map_err(|_| invalid())?;
+    let pin = q.pin.pin()?;
     Ok(Json(
         db(s, move |s| {
-            s.classes_at(q.path.as_deref(), &q.q, q.revision, q.offset, q.limit)
+            s.classes_at(q.path.as_deref(), &q.q, pin, q.offset, q.limit)
         })
         .await?,
     ))
@@ -1202,13 +1278,19 @@ async fn class_diagram(
     Ok(Json(db(s, move |s| s.class_diagram_at(&request)).await?))
 }
 
-async fn status(State(s): State<Arc<DaemonState>>) -> Result<Json<IndexStatus>, ApiError> {
+async fn status(
+    State(s): State<Arc<DaemonState>>,
+    uri: axum::http::Uri,
+) -> Result<Json<IndexStatus>, ApiError> {
+    if uri.query().is_some() {
+        return Err(invalid());
+    }
     Ok(Json(db(s, |s| s.status()).await?))
 }
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IndexRequest {
-    expected_revision: Option<u64>,
+    expected_revision: Option<IndexPin>,
 }
 fn now() -> String {
     SystemTime::now()
@@ -1224,7 +1306,11 @@ async fn start_index(
     let request: IndexRequest = if body.is_empty() {
         IndexRequest::default()
     } else {
-        serde_json::from_slice(&body).map_err(|_| invalid())?
+        let value: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+        if value.get("expectedRevision").is_some_and(Value::is_null) {
+            return Err(invalid());
+        }
+        serde_json::from_value(value).map_err(|_| invalid())?
     };
     let baseline = db(s.clone(), |s| s.status()).await?.revision;
     if request.expected_revision.is_some_and(|r| r != baseline) {
@@ -1234,6 +1320,22 @@ async fn start_index(
             "The index revision changed",
         ));
     }
+    {
+        let jobs = s.jobs.lock().unwrap();
+        if jobs
+            .current
+            .as_ref()
+            .and_then(|id| jobs.jobs.get(id))
+            .is_some_and(|j| j.finished_at.is_none())
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "job_active",
+                "An index job is already active",
+            ));
+        }
+    }
+    let leader = db(s.clone(), |s| s.leader()).await?;
     let cancel = Arc::new(AtomicBool::new(false));
     let job = IndexJob {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1283,7 +1385,9 @@ async fn start_index(
                     j.progress = p;
                 }
             })?;
-            worker.store.publish(&graph, Some(baseline), &worker_cancel)
+            worker
+                .store
+                .publish(&graph, &leader, baseline, &worker_cancel)
         })
         .await;
         let mut jobs = s.jobs.lock().unwrap();
@@ -1383,7 +1487,8 @@ async fn symbols(
 #[serde(deny_unknown_fields)]
 struct SymbolQuery {
     id: String,
-    revision: Option<u64>,
+    #[serde(flatten)]
+    pin: PinQuery,
 }
 async fn symbol(
     State(s): State<Arc<DaemonState>>,
@@ -1392,7 +1497,8 @@ async fn symbol(
     if q.id.is_empty() || q.id.len() > 8192 || q.id.contains('\0') {
         return Err(invalid());
     }
-    let (revision, symbol) = db(s, move |s| s.symbol_at(&q.id, q.revision))
+    let pin = q.pin.pin()?;
+    let (revision, symbol) = db(s, move |s| s.symbol_at(&q.id, pin))
         .await?
         .ok_or_else(missing)?;
     Ok(Json(json!({"revision":revision,"symbol":symbol})))
@@ -1401,7 +1507,8 @@ async fn symbol(
 #[serde(deny_unknown_fields)]
 struct SourceQuery {
     path: String,
-    revision: Option<u64>,
+    #[serde(flatten)]
+    pin: PinQuery,
 }
 async fn source(
     State(s): State<Arc<DaemonState>>,
@@ -1416,15 +1523,17 @@ async fn source(
     {
         return Err(invalid());
     }
-    let (revision, file) = db(s, move |s| s.source_at(&q.path, q.revision))
+    let pin = q.pin.pin()?;
+    let (revision, file) = db(s, move |s| s.source_at(&q.path, pin))
         .await?
         .ok_or_else(missing)?;
     Ok(Json(json!({"revision":revision,"file":file})))
 }
 async fn query(
     State(s): State<Arc<DaemonState>>,
-    Json(q): Json<ViewQuery>,
+    body: Result<Json<ViewQuery>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ViewResult>, ApiError> {
+    let Json(q) = body.map_err(|_| invalid())?;
     q.validate().map_err(|_| invalid())?;
     Ok(Json(
         db(s, move |s| s.query_view(&q))
@@ -1547,8 +1656,9 @@ async fn question_work<T: Send + 'static>(
 }
 async fn question_preview(
     State(s): State<Arc<DaemonState>>,
-    Json(request): Json<QuestionRequest>,
+    body: Result<Json<QuestionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<QuestionPreview>, ApiError> {
+    let Json(request) = body.map_err(|_| invalid())?;
     request.validate().map_err(|_| invalid())?;
     let worker = s.clone();
     let (result, cached, bytes) = question_work(move || {
@@ -1943,8 +2053,19 @@ mod live_tests {
             .unwrap()
             .id
             .clone();
-        let store = Store::open(&dir.path().join("state"), &workspace).unwrap();
-        store.publish(&graph, Some(0), &cancel).unwrap();
+        let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
+        crate::store::topology::assert_topology_fixture(&store, &dir.path().join("state"));
+        store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                crate::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0,
+                },
+                &cancel,
+            )
+            .unwrap();
         let provider = Arc::new(
             LiveJev::open(
                 &dir.path().join("budget"),
@@ -1980,7 +2101,7 @@ mod live_tests {
             .clone()
             .oneshot(request(
                 "/api/questions/preview",
-                json!({"seed":seed,"question":"logging", "expectedRevision":1}),
+                json!({"seed":seed,"question":"logging", "expectedRevision":store.status().unwrap().revision}),
             ))
             .await
             .unwrap();
@@ -1996,7 +2117,17 @@ mod live_tests {
             .await
             .unwrap();
         if change_snapshot {
-            store.publish(&graph, Some(1), &cancel).unwrap();
+            store
+                .publish(
+                    &graph,
+                    &store.leader().unwrap(),
+                    crate::model::IndexPin {
+                        index_generation: store.status().unwrap().revision.index_generation,
+                        index_revision: 1,
+                    },
+                    &cancel,
+                )
+                .unwrap();
         }
         release.notify_one();
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), run)
@@ -2029,7 +2160,10 @@ mod live_tests {
             let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["view"]["selectionSource"], "liveJev");
-            assert_eq!(body["view"]["revision"], 1);
+            assert_eq!(
+                body["view"]["revision"],
+                json!(store.status().unwrap().revision)
+            );
             assert!(body["view"]["calls"].as_array().unwrap().len() <= 5);
             assert!(body["attemptId"].as_str().is_some());
             if scenario == "rounded" {
@@ -2056,7 +2190,7 @@ mod live_tests {
 #[cfg(test)]
 mod dependency_lifecycle_tests {
     use super::*;
-    fn catalog(id: &str, revision: u64) -> Catalog {
+    fn catalog(id: &str, revision: IndexPin) -> Catalog {
         Catalog {
             id: id.into(),
             workspace_revision: revision,
@@ -2095,40 +2229,46 @@ mod dependency_lifecycle_tests {
     #[test]
     fn stale_generation_cancel_and_revision_never_publish() {
         let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(&temp.path().join("state"), temp.path()).unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+        crate::store::topology::assert_topology_fixture(&store, &temp.path().join("state"));
         let state = new_with_dependency_options(
             store.clone(),
-            IndexOptions::new(temp.path().into()),
+            IndexOptions::new(workspace.clone()),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             "127.0.0.1:7331".parse().unwrap(),
             None,
             None,
-            temp.path().into(),
+            workspace,
             vec![],
             Some(CatalogOptions::default()),
         )
         .unwrap();
         let active = AtomicBool::new(false);
+        let pin0 = store.status().unwrap().revision;
         state.dependencies.lock().unwrap().generation = 2;
-        state.publish_dependency_index(2, &active, Ok(catalog("new", 0)));
-        state.publish_dependency_index(1, &active, Ok(catalog("old", 0)));
+        state.publish_dependency_index(2, &active, Ok(catalog("new", pin0)));
+        state.publish_dependency_index(1, &active, Ok(catalog("old", pin0)));
         state.publish_dependency_index(1, &active, Err(anyhow::anyhow!("late failure")));
-        assert_eq!(state.catalog_snapshot(0).unwrap().id, "new");
-        state.publish_dependency_index(2, &AtomicBool::new(true), Ok(catalog("cancelled", 0)));
-        assert_eq!(state.catalog_snapshot(0).unwrap().id, "new");
+        assert_eq!(state.catalog_snapshot(pin0).unwrap().id, "new");
+        state.publish_dependency_index(2, &AtomicBool::new(true), Ok(catalog("cancelled", pin0)));
+        assert_eq!(state.catalog_snapshot(pin0).unwrap().id, "new");
         store
             .publish(
                 &Graph::default(),
-                Some(0),
+                &store.leader().unwrap(),
+                pin0,
                 &Arc::new(AtomicBool::new(false)),
             )
             .unwrap();
-        state.publish_dependency_index(2, &active, Ok(catalog("stale-revision", 0)));
-        assert!(state.catalog_snapshot(0).is_none());
+        let pin1 = store.status().unwrap().revision;
+        state.publish_dependency_index(2, &active, Ok(catalog("stale-revision", pin0)));
+        assert!(state.catalog_snapshot(pin0).is_none());
         assert_eq!(state.dependencies.lock().unwrap().state, "failed");
         state.cancel_active();
         let generation = state.dependencies.lock().unwrap().generation;
-        state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", 1)));
-        assert!(state.catalog_snapshot(1).is_none());
+        state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
+        assert!(state.catalog_snapshot(pin1).is_none());
     }
 }

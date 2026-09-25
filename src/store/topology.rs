@@ -132,7 +132,7 @@ impl TopologyRoots {
     pub fn record_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.record_dir(identity).join("workspace.db")
     }
-    fn reject_root_overlap(&self, identity: &WorkspaceIdentity) -> Result<()> {
+    pub fn reject_root_overlap(&self, identity: &WorkspaceIdentity) -> Result<()> {
         let cache = resolve_existing_ancestor(&self.cache)?;
         let data = resolve_existing_ancestor(&self.data)?;
         ensure!(
@@ -155,6 +155,19 @@ impl TopologyRoots {
     pub fn index_use(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
         self.prepare_index(identity)?;
         UseGuard::acquire(&self.index_use_lock(identity), false, false)
+    }
+    pub fn index_use_existing(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
+        identity.verify()?;
+        self.reject_root_overlap(identity)?;
+        for path in [
+            &self.cache,
+            &self.cache.join("indexes"),
+            &self.index_dir(identity),
+        ] {
+            private_dir(path)?;
+        }
+        UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
+            .context("incompatible_index: missing or unsafe use lock")
     }
     pub fn record_use(&self, identity: &WorkspaceIdentity, exclusive: bool) -> Result<UseGuard> {
         self.prepare_records(identity)?;
@@ -307,6 +320,10 @@ impl WorkspaceIdentity {
         cwd: &Path,
         before_sync: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
+        Self::discover_unattached(explicit, cwd)?.attach_marker_with_hook(before_sync)
+    }
+    /// Inspect identity without creating the Git marker, for external destination preflight.
+    pub fn discover_unattached(explicit: Option<&Path>, cwd: &Path) -> Result<Self> {
         let selected = if let Some(p) = explicit {
             p.to_owned()
         } else {
@@ -360,11 +377,7 @@ impl WorkspaceIdentity {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        let marker = git_dir
-            .as_ref()
-            .map(|p| marker_at(p, before_sync))
-            .transpose()?;
-        let record_id = marker.map_or_else(|| format!("path-{root_key}"), |id| id.to_string());
+        let record_id = format!("path-{root_key}");
         Ok(Self {
             root,
             root_key,
@@ -372,9 +385,34 @@ impl WorkspaceIdentity {
             device: m.dev(),
             inode: m.ino(),
             git_dir,
-            marker,
+            marker: None,
             root_handle,
         })
+    }
+    pub fn attach_marker(self) -> Result<Self> {
+        self.attach_marker_with_hook(|| Ok(()))
+    }
+    fn attach_marker_with_hook(mut self, before_sync: impl FnOnce() -> Result<()>) -> Result<Self> {
+        let current = metadata(&self.root).context("root_changed")?;
+        let captured = self.root_handle.metadata()?;
+        ensure!(
+            current.is_dir()
+                && !current.file_type().is_symlink()
+                && (current.dev(), current.ino()) == (self.device, self.inode)
+                && (captured.dev(), captured.ino()) == (self.device, self.inode),
+            "root_changed"
+        );
+        if let Some(git) = &self.git_dir {
+            ensure!(
+                resolve_git_dir(&self.root)?.as_deref() == Some(git),
+                "workspace_id_changed"
+            );
+            let marker = marker_at(git, before_sync)?;
+            self.record_id = marker.to_string();
+            self.marker = Some(marker);
+        }
+        self.verify()?;
+        Ok(self)
     }
     pub fn verify(&self) -> Result<()> {
         let m = fs::symlink_metadata(&self.root).context("root_changed")?;
@@ -668,6 +706,12 @@ impl UseGuard {
         sync_directory(self.path.parent().context("lock parent missing")?)
     }
 }
+impl Drop for UseGuard {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 #[derive(Debug)]
 pub struct LeaderGuard {
     use_guard: UseGuard,
@@ -676,9 +720,19 @@ pub struct LeaderGuard {
     pub incarnation: Uuid,
 }
 impl LeaderGuard {
+    pub fn belongs_to(&self, leader_path: &Path) -> Result<()> {
+        ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
+        self.verify()
+    }
     pub fn verify(&self) -> Result<()> {
         self.use_guard.verify()?;
         private_file(&self.path, &self.file)
+    }
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -930,4 +984,36 @@ impl<'a> DurableRecords<'a> {
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
         self.delete("annotations", id)
     }
+}
+
+#[cfg(test)]
+pub fn assert_topology_fixture(store: &crate::store::Store, state: &Path) {
+    let status = store.status().unwrap();
+    let identity = WorkspaceIdentity::discover(
+        Some(Path::new(&status.workspace_root)),
+        Path::new(&status.workspace_root),
+    )
+    .unwrap();
+    let roots = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
+    let index = roots.index_dir(&identity);
+    assert_eq!(index.parent().unwrap(), state.join("cache/indexes"));
+    for path in [&roots.cache, &roots.cache.join("indexes"), &index] {
+        private_dir(path).unwrap();
+    }
+    for path in [
+        roots.index_db(&identity),
+        roots.index_use_lock(&identity),
+        roots.leader_lock(&identity),
+    ] {
+        let file = open_file(&path, false).unwrap();
+        private_file(&path, &file).unwrap();
+    }
+    assert!(
+        !roots.record_db(&identity).exists(),
+        "fixture open must not eagerly create a durable record"
+    );
+    let shared =
+        UseGuard::acquire_existing(&roots.index_use_lock(&identity), false, false).unwrap();
+    assert!(UseGuard::acquire_existing(&roots.index_use_lock(&identity), true, true).is_err());
+    drop(shared);
 }

@@ -1,7 +1,7 @@
 //! Python-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
 use crate::behavior::{Participant, SequenceStep, SequenceView};
-use crate::model::{CallSite, Resolution, SourceFile, SourceRange, Symbol, SymbolKind};
+use crate::model::{CallSite, IndexPin, Resolution, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
@@ -718,7 +718,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
         identification: "Source expression only; type, descriptors and dispatch unresolved. Visual group, not object identity or a constructor claim.".into() }
 }
 pub fn build(
-    revision: u64,
+    revision: IndexPin,
     seed: &Symbol,
     file: &SourceFile,
     calls: &[CallSite],

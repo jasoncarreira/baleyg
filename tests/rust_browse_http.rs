@@ -1,4 +1,5 @@
 //! Rust file -> methods -> sequence on cached source, without executing the workspace.
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -7,7 +8,6 @@ use axum::{
 use baleyg::{
     http,
     indexer::{IndexOptions, index_workspace},
-    store::Store,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -76,8 +76,19 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             .iter()
             .any(|f| f.path == "helper.js" && f.language == "javascript")
     );
-    let store = Store::open(&temp.path().join("state"), &workspace).unwrap();
-    store.publish(&graph, Some(0), &cancel).unwrap();
+    let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &cancel,
+        )
+        .unwrap();
+    let pin = store.status().unwrap().revision;
     let app = http::router(
         http::new(
             store.clone(),
@@ -100,7 +111,10 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     let (code, methods) = request(
         &app,
         "GET",
-        "/api/methods?path=lib.rs&revision=1",
+        &format!(
+            "/api/methods?path=lib.rs&indexGeneration={}&indexRevision={}",
+            pin.index_generation, pin.index_revision
+        ),
         Value::Null,
     )
     .await;
@@ -118,7 +132,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
         &app,
         "POST",
         "/api/sequence",
-        json!({"seed":seed,"expectedRevision":1}),
+        json!({"seed":seed,"expectedRevision":pin}),
     )
     .await;
     assert_eq!(code, 200);
@@ -133,19 +147,32 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     let (code, source) = request(
         &app,
         "GET",
-        "/api/source?path=lib.rs&revision=1",
+        &format!(
+            "/api/source?path=lib.rs&indexGeneration={}&indexRevision={}",
+            pin.index_generation, pin.index_revision
+        ),
         Value::Null,
     )
     .await;
     assert_eq!(code, 200);
     assert_eq!(source["file"]["text"], text);
-    store.publish(&graph, Some(1), &cancel).unwrap();
+    store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 1,
+            },
+            &cancel,
+        )
+        .unwrap();
     assert_eq!(
         request(
             &app,
             "POST",
             "/api/sequence",
-            json!({"seed":seed,"expectedRevision":1})
+            json!({"seed":seed,"expectedRevision":pin})
         )
         .await
         .0,

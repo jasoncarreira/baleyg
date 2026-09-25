@@ -1,3 +1,9 @@
+fn test_pin(revision: u64) -> baleyg::model::IndexPin {
+    baleyg::model::IndexPin {
+        index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
+        index_revision: revision,
+    }
+}
 use baleyg::{
     behavior::{SequenceStep, SequenceView, build_sequence},
     indexer::{IndexOptions, index_workspace},
@@ -15,7 +21,7 @@ fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
     .unwrap();
     assert_eq!(graph.stats.parse_error_files, 0, "{:?}", graph.diagnostics);
     let seed = graph.nodes.iter().find(|n| n.name == name).unwrap();
-    let view = build_sequence(7, seed, &graph.files[0], &graph.calls, false).unwrap();
+    let view = build_sequence(test_pin(7), seed, &graph.files[0], &graph.calls, false).unwrap();
     (graph, view)
 }
 fn flatten(steps: &[SequenceStep]) -> Vec<&SequenceStep> {
@@ -67,9 +73,9 @@ fn evaluation_order_source_evidence_and_no_constructor_guess() {
     assert!(!view.participants.iter().any(|p| p.kind == "internal"));
     assert_eq!(
         view,
-        build_sequence(7, &view.seed, &graph.files[0], &graph.calls, true).unwrap()
+        build_sequence(test_pin(7), &view.seed, &graph.files[0], &graph.calls, true).unwrap()
     );
-    let missing = build_sequence(8, &view.seed, &graph.files[0], &[], true).unwrap();
+    let missing = build_sequence(test_pin(8), &view.seed, &graph.files[0], &[], true).unwrap();
     assert!(calls(&missing.steps).is_empty());
     assert!(
         missing
@@ -174,7 +180,7 @@ fn nested_definitions_class_execution_and_lambda_invocation_are_separate() {
         .iter()
         .find(|n| n.name.starts_with("<lambda@"))
         .unwrap();
-    let view = build_sequence(9, lambda, &graph.files[0], &graph.calls, true).unwrap();
+    let view = build_sequence(test_pin(9), lambda, &graph.files[0], &graph.calls, true).unwrap();
     assert_eq!(calls(&view.steps), ["lambda_call"]);
 }
 #[test]
@@ -349,7 +355,8 @@ fn class_annotations_remain_inside_class_execution_boundary() {
             .any(|s| s.label.contains("Class definition boundary"))
     );
     let nested = graph.nodes.iter().find(|n| n.name == "nested").unwrap();
-    let selected = build_sequence(8, nested, &graph.files[0], &graph.calls, true).unwrap();
+    let selected =
+        build_sequence(test_pin(8), nested, &graph.files[0], &graph.calls, true).unwrap();
     assert_eq!(calls(&selected.steps), ["nested_rhs"]);
 }
 
@@ -397,7 +404,8 @@ fn postponed_nested_async_factory_is_straight_and_body_stays_deferred() {
     assert!(definition.children.is_empty());
     assert!(definition.alternate.is_empty());
     let callback = graph.nodes.iter().find(|n| n.name == "_executor").unwrap();
-    let selected = build_sequence(8, callback, &graph.files[0], &graph.calls, false).unwrap();
+    let selected =
+        build_sequence(test_pin(8), callback, &graph.files[0], &graph.calls, false).unwrap();
     assert_eq!(calls(&selected.steps), ["callback"]);
     assert!(flatten(&selected.steps).iter().any(|s| s.kind == "await"));
     assert!(

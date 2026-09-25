@@ -461,8 +461,19 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let graph =
             index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
-        let store = Store::open(state.path(), work.path()).unwrap();
-        let revision = store.publish(&graph, Some(0), &cancel).unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        crate::store::topology::assert_topology_fixture(&store, state.path());
+        let revision = store
+            .publish(
+                &graph,
+                &store.leader().unwrap(),
+                crate::model::IndexPin {
+                    index_generation: store.status().unwrap().revision.index_generation,
+                    index_revision: 0,
+                },
+                &cancel,
+            )
+            .unwrap();
         let request: QuestionRequest = serde_json::from_value(json!({
             "seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id,
             "question":question,"expectedRevision":revision

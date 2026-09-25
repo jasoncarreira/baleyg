@@ -1,7 +1,7 @@
 //! Java syntax-only possible paths. No execution, class loading or provider calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
 use crate::behavior::{Participant, SequenceStep, SequenceView};
-use crate::model::{CallSite, SourceFile, SourceRange, Symbol, SymbolKind};
+use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
@@ -501,7 +501,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
         identification: "Source spelling only; types, overloads and virtual dispatch unresolved. Visual group, not runtime object identity or a claimed return type.".into() }
 }
 pub(crate) fn build(
-    revision: u64,
+    revision: IndexPin,
     seed: &Symbol,
     file: &SourceFile,
     calls: &[CallSite],

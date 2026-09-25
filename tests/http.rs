@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -12,7 +13,7 @@ fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let store = Store::open(&dir.path().join("state"), &workspace).unwrap();
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
     let state = http::new(
         store.clone(),
         IndexOptions::new(workspace),
@@ -143,6 +144,21 @@ async fn validation_and_limit() {
         call(&app, "POST", "/api/index", json!({"expectedRevision":9}))
             .await
             .0,
+        400
+    );
+    let stale = IndexPin {
+        index_generation: _store.status().unwrap().revision.index_generation,
+        index_revision: 9,
+    };
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/index",
+            json!({"expectedRevision":stale})
+        )
+        .await
+        .0,
         409
     );
     let req = Request::builder()
@@ -165,16 +181,42 @@ async fn source_is_snapshot_and_revision_checked() {
         text: "cached secret-free source".into(),
     });
     store
-        .publish(&graph, Some(0), &Arc::new(AtomicBool::new(false)))
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.status().unwrap().revision.index_generation,
+                index_revision: 0,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
-    let (code, body) = call(&app, "GET", "/api/source?path=a.js&revision=1", Value::Null).await;
+    let pin = store.status().unwrap().revision;
+    let (code, body) = call(
+        &app,
+        "GET",
+        &format!(
+            "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+            pin.index_generation, pin.index_revision
+        ),
+        Value::Null,
+    )
+    .await;
     assert_eq!(code, 200);
-    assert_eq!(body["revision"], 1);
+    assert_eq!(body["revision"], json!(pin));
     assert_eq!(body["file"]["text"], "cached secret-free source");
     assert_eq!(
-        call(&app, "GET", "/api/source?path=a.js&revision=0", Value::Null)
-            .await
-            .0,
+        call(
+            &app,
+            "GET",
+            &format!(
+                "/api/source?path=a.js&indexGeneration={}&indexRevision=0",
+                pin.index_generation
+            ),
+            Value::Null
+        )
+        .await
+        .0,
         409
     );
     assert_eq!(
@@ -202,10 +244,10 @@ async fn jobs_publish_and_cancel() {
     .await
     .unwrap();
     assert_eq!(completed["state"], "completed");
-    assert_eq!(store.status().unwrap().revision, 1);
+    assert_eq!(store.status().unwrap().revision.index_revision, 1);
     let (_, cancelled) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
     assert_eq!(cancelled["state"], "completed");
-    assert_eq!(store.status().unwrap().revision, 1);
+    assert_eq!(store.status().unwrap().revision.index_revision, 1);
     state.cancel_active();
 }
 #[test]
@@ -273,7 +315,7 @@ async fn active_job_cancellation_does_not_publish() {
     .await
     .unwrap();
     assert_eq!(terminal["state"], "cancelled");
-    assert_eq!(store.status().unwrap().revision, 0);
+    assert_eq!(store.status().unwrap().revision.index_revision, 0);
 }
 
 #[tokio::test]
