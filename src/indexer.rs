@@ -118,6 +118,7 @@ pub struct CapturedDocument {
     pub syntax: Vec<CapturedSyntaxNode>,
     pub native_candidates: Vec<CapturedNativeWitness>,
     pub semantic_positions: Vec<CapturedPosition>,
+    pub heritage: Vec<CapturedHeritageWitness>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,7 +134,7 @@ pub struct CapturedSyntaxNode {
     pub name_bytes: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NativeCandidateKind {
     Declaration,
     Occurrence,
@@ -155,16 +156,35 @@ pub struct CapturedNativeWitness {
     pub end_byte: usize,
     pub token_start_byte: usize,
     pub token_end_byte: usize,
+    pub stable_id: Option<String>,
+    pub ancestor_ids: Vec<String>,
+    pub spelling: Option<String>,
+    pub verified_member_token: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedHeritageWitness {
+    pub class_node_id: usize,
+    pub owner_id: usize,
+    pub subclass_name_start: usize,
+    pub subclass_name_end: usize,
+    pub base_start: usize,
+    pub base_end: usize,
+    pub base_bytes: Vec<u8>,
 }
 
 // These are AST candidates, not validated declarations/occurrences or graph facts.
 fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness> {
     let mut output = Vec::new();
     for node in nodes {
-        let declaration = is_declaration(&node.kind);
+        let declaration = is_declaration(&node.kind)
+            || matches!(
+                node.kind.as_str(),
+                "class" | "function_expression" | "generator_function" | "arrow_function"
+            );
         let invocation = matches!(
             node.kind.as_str(),
-            "call_expression" | "method_invocation" | "macro_invocation"
+            "call_expression" | "new_expression" | "method_invocation" | "macro_invocation"
         );
         let control = matches!(
             node.kind.as_str(),
@@ -173,6 +193,10 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 | "if_expression_statement"
                 | "else_clause"
                 | "for_statement"
+                | "for_in_statement"
+                | "do_statement"
+                | "switch_case"
+                | "switch_default"
                 | "for_expression"
                 | "while_statement"
                 | "while_expression"
@@ -185,13 +209,40 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 | "match_expression"
                 | "conditional_expression"
                 | "ternary_expression"
+                | "binary_expression"
+                | "statement_block"
+                | "expression_statement"
+                | "class_static_block"
         );
+        let graph_region = node.parent_id.is_some_and(|id| {
+            let parent = &nodes[id];
+            (matches!(parent.kind.as_str(), "if_statement" | "ternary_expression")
+                && matches!(
+                    node.field_name.as_deref(),
+                    Some("consequence" | "alternative")
+                ))
+                || (parent.kind == "binary_expression"
+                    && node.field_name.as_deref() == Some("right")
+                    && nodes.iter().any(|op| {
+                        op.parent_id == Some(id)
+                            && op.field_name.as_deref() == Some("operator")
+                            && matches!(op.source_bytes.as_slice(), b"&&" | b"||" | b"??")
+                    }))
+                || (parent.kind == "field_definition"
+                    && node.field_name.as_deref() == Some("value"))
+        });
         let occurrence = node.kind.contains("identifier");
-        if !declaration && !occurrence && !invocation && !control {
+        if !declaration && !occurrence && !invocation && !control && !graph_region {
             continue;
         }
         let mut owner = node.parent_id.unwrap_or(0);
-        while owner > 0 && !is_declaration(&nodes[owner].kind) {
+        while owner > 0
+            && !is_declaration(&nodes[owner].kind)
+            && !matches!(
+                nodes[owner].kind.as_str(),
+                "class" | "function_expression" | "generator_function" | "arrow_function"
+            )
+        {
             owner = nodes[owner].parent_id.unwrap_or(0);
         }
         let name_node = if declaration {
@@ -219,11 +270,13 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         } else {
             None
         };
-        // A typed declaration without a measured name is still present in
-        // syntax, but cannot supply an exact declaration witness. In particular,
-        // let_declaration and lexical_declaration own patterns/declarators rather
-        // than a direct name field.
-        if declaration && name_node.is_none() {
+        // Anonymous JavaScript function expressions and arrows are still measured
+        // declaration sites: their source header and parent give an exact key.
+        let anonymous = matches!(
+            node.kind.as_str(),
+            "function_expression" | "generator_function" | "arrow_function"
+        );
+        if declaration && name_node.is_none() && !anonymous {
             continue;
         }
         let token = name_node.unwrap_or(node);
@@ -243,6 +296,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         let prefix_len = header_end
             .saturating_sub(node.start_byte)
             .min(node.source_bytes.len());
+        let extra_region = graph_region && (declaration || invocation || occurrence);
         output.push(CapturedNativeWitness {
             node_id: node.id,
             parent_id: node.parent_id,
@@ -251,7 +305,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 NativeCandidateKind::Declaration
             } else if invocation {
                 NativeCandidateKind::Invocation
-            } else if control {
+            } else if control || graph_region {
                 NativeCandidateKind::ControlRegion
             } else {
                 NativeCandidateKind::Occurrence
@@ -268,9 +322,285 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
             end_byte: node.end_byte,
             token_start_byte: token.start_byte,
             token_end_byte: token.end_byte,
+            stable_id: None,
+            ancestor_ids: Vec::new(),
+            spelling: None,
+            verified_member_token: false,
         });
+        if extra_region {
+            let mut region = output.last().unwrap().clone();
+            region.candidate_kind = NativeCandidateKind::ControlRegion;
+            output.push(region);
+        }
     }
     output
+}
+
+// Only JavaScript candidates receive IDs here. Other languages have separate adapter waves.
+fn identify_javascript(document: &mut CapturedDocument, revision_id: &str) -> Result<()> {
+    use crate::model::v1::{Key, Kind, Language, Text};
+    use crate::semantic_identity::{self as identity, OccurrenceKind};
+    let nodes = &document.syntax;
+    let source_set = &document.key.source_set_id;
+    let path = &document.key.path;
+    let module = Key {
+        kind: Kind::Module,
+        name: None,
+        signature: None,
+        ordinal: crate::model::v1::UInt::new(0).unwrap(),
+    };
+    let module_id = identity::syntax_id(source_set, path, Language::Javascript, &[], &module)?;
+    let mut declarations: Vec<(usize, Key, u64, u64)> = Vec::new();
+    for witness in &document.native_candidates {
+        if witness.candidate_kind != NativeCandidateKind::Declaration {
+            continue;
+        }
+        let kind = match witness.node_kind.as_str() {
+            "class_declaration" | "class" => Kind::Type,
+            "method_definition" => Kind::Method,
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function" => Kind::Function,
+            _ => continue,
+        };
+        let anonymous = matches!(
+            witness.node_kind.as_str(),
+            "function_expression" | "generator_function" | "arrow_function"
+        ) && witness.token_start_byte == witness.start_byte
+            && witness.token_end_byte == witness.end_byte;
+        let name = if anonymous {
+            None
+        } else {
+            let Ok(name) = std::str::from_utf8(&witness.name_bytes) else {
+                continue;
+            };
+            if !nodes.iter().any(|n| {
+                n.parent_id == Some(witness.node_id)
+                    && n.start_byte == witness.token_start_byte
+                    && n.end_byte == witness.token_end_byte
+                    && matches!(
+                        n.kind.as_str(),
+                        "identifier" | "property_identifier" | "private_property_identifier"
+                    )
+            }) {
+                continue;
+            }
+            Some(Text::new(name.to_owned()).context("invalid JS declaration name")?)
+        };
+        declarations.push((
+            witness.node_id,
+            Key {
+                kind: if anonymous {
+                    Kind::AnonymousFunction
+                } else {
+                    kind
+                },
+                name,
+                signature: None,
+                ordinal: crate::model::v1::UInt::new(0).unwrap(),
+            },
+            witness.start_byte as u64,
+            witness.end_byte as u64,
+        ));
+    }
+    // Resolve each depth independently: sibling grouping sees the finalized
+    // immediate-parent key, never an ancestor placeholder ordinal.
+    let mut ids = HashMap::from([(0usize, module_id.as_str().to_owned())]);
+    let mut resolved: HashMap<usize, Key> = HashMap::new();
+    let mut collisions = identity::CollisionRegistry::default();
+    declarations.sort_by_key(|(id, _, _, _)| {
+        let mut depth = 0;
+        let mut parent = nodes[*id].parent_id;
+        while let Some(p) = parent {
+            depth += 1;
+            parent = nodes[p].parent_id;
+        }
+        (depth, nodes[*id].start_byte)
+    });
+    let mut offset = 0;
+    while offset < declarations.len() {
+        let depth = {
+            let mut d = 0;
+            let mut p = nodes[declarations[offset].0].parent_id;
+            while let Some(id) = p {
+                d += 1;
+                p = nodes[id].parent_id;
+            }
+            d
+        };
+        let mut end = offset + 1;
+        while end < declarations.len() {
+            let mut d = 0;
+            let mut p = nodes[declarations[end].0].parent_id;
+            while let Some(id) = p {
+                d += 1;
+                p = nodes[id].parent_id;
+            }
+            if d != depth {
+                break;
+            }
+            end += 1;
+        }
+        let entries: Vec<_> = declarations[offset..end]
+            .iter()
+            .map(|(id, key, start, finish)| {
+                let mut lineage = Vec::new();
+                let mut parent = nodes[*id].parent_id;
+                while let Some(p) = parent {
+                    if let Some(k) = resolved.get(&p) {
+                        lineage.push(k.clone());
+                    }
+                    parent = nodes[p].parent_id;
+                }
+                lineage.reverse();
+                let mut ancestors = vec![module.clone()];
+                ancestors.extend(lineage);
+                (ancestors, key.clone(), *start, *finish)
+            })
+            .collect();
+        let ordinals = identity::sibling_ordinals(&entries)?;
+        for ((entry, ordinal), (ancestors, _, _, _)) in
+            declarations[offset..end].iter().zip(ordinals).zip(entries)
+        {
+            let (node_id, key, _, _) = entry;
+            let mut key = key.clone();
+            key.ordinal = ordinal;
+            let dig =
+                identity::syntax_digest(source_set, path, Language::Javascript, &ancestors, &key)?;
+            let id = identity::syntax_id(source_set, path, Language::Javascript, &ancestors, &key)?;
+            collisions.syntax(&id, dig.input)?;
+            ids.insert(*node_id, id.as_str().to_owned());
+            resolved.insert(*node_id, key);
+        }
+        offset = end;
+    }
+    let mut occurrence_entries = Vec::new();
+    let mut occurrence_indices = Vec::new();
+    for (index, witness) in document.native_candidates.iter_mut().enumerate() {
+        let mut lineage = Vec::new();
+        let mut parent = witness.parent_id;
+        while let Some(id) = parent {
+            if let Some(sid) = ids.get(&id) {
+                lineage.push(sid.clone());
+            }
+            parent = nodes[id].parent_id;
+        }
+        lineage.reverse();
+        if lineage.is_empty() {
+            lineage.push(module_id.as_str().to_owned());
+        }
+        witness.ancestor_ids = lineage;
+        if witness.candidate_kind == NativeCandidateKind::Declaration {
+            witness.stable_id = ids.get(&witness.node_id).cloned();
+        } else if matches!(
+            witness.candidate_kind,
+            NativeCandidateKind::Invocation | NativeCandidateKind::ControlRegion
+        ) {
+            let owner =
+                crate::model::v1::SyntaxId::new(witness.ancestor_ids.last().unwrap().clone())
+                    .unwrap();
+            let kind = if witness.candidate_kind == NativeCandidateKind::Invocation {
+                OccurrenceKind::Call
+            } else {
+                OccurrenceKind::Control
+            };
+            occurrence_entries.push((
+                owner,
+                kind,
+                witness.start_byte as u64,
+                witness.end_byte as u64,
+            ));
+            occurrence_indices.push(index);
+        }
+        if witness.candidate_kind == NativeCandidateKind::Invocation {
+            let function = nodes.iter().find(|n| {
+                n.parent_id == Some(witness.node_id) && n.field_name.as_deref() == Some("function")
+            });
+            if let Some(function) = function {
+                // Optional chaining, subscripts and compound callees do not have a
+                // proved simple member token. The invocation span remains measurable.
+                let optional = nodes
+                    .iter()
+                    .any(|n| n.parent_id == Some(function.id) && n.kind == "optional_chain");
+                let property = (function.kind == "member_expression" && !optional)
+                    .then(|| {
+                        nodes.iter().find(|n| {
+                            n.parent_id == Some(function.id)
+                                && n.field_name.as_deref() == Some("property")
+                        })
+                    })
+                    .flatten();
+                if let Some(property) = property.filter(|n| {
+                    matches!(
+                        n.kind.as_str(),
+                        "property_identifier" | "private_property_identifier"
+                    ) && n.end_byte <= document.bytes.len()
+                }) {
+                    if let Ok(raw) =
+                        std::str::from_utf8(&document.bytes[property.start_byte..property.end_byte])
+                        && let Ok(decoded) = identity::lookup_key(Language::Javascript, raw)
+                    {
+                        witness.token_start_byte = property.start_byte;
+                        witness.token_end_byte = property.end_byte;
+                        witness.token_bytes = raw.as_bytes().to_vec();
+                        witness.name_bytes = witness.token_bytes.clone();
+                        witness.spelling = Some(decoded);
+                        witness.verified_member_token = true;
+                    }
+                } else if function.kind == "identifier" {
+                    witness.spelling = std::str::from_utf8(&function.source_bytes)
+                        .ok()
+                        .and_then(|s| identity::lookup_key(Language::Javascript, s).ok());
+                }
+            }
+        }
+    }
+    let ordinals = identity::occurrence_ordinals(&occurrence_entries)?;
+    let revision = Text::new(revision_id.to_owned()).context("invalid revision ID")?;
+    for (index, ordinal) in occurrence_indices.into_iter().zip(ordinals) {
+        let witness = &mut document.native_candidates[index];
+        let owner =
+            crate::model::v1::SyntaxId::new(witness.ancestor_ids.last().unwrap().clone()).unwrap();
+        let kind = if witness.candidate_kind == NativeCandidateKind::Invocation {
+            OccurrenceKind::Call
+        } else {
+            OccurrenceKind::Control
+        };
+        let dig = identity::occurrence_digest(&revision, &owner, kind, ordinal)?;
+        let id = identity::occurrence_id(&revision, &owner, kind, ordinal)?;
+        collisions.occurrence(&id, dig.input)?;
+        witness.stable_id = Some(id.as_str().to_owned());
+    }
+    for node in nodes
+        .iter()
+        .filter(|n| matches!(n.kind.as_str(), "class_declaration" | "class"))
+    {
+        let name = nodes
+            .iter()
+            .find(|n| n.parent_id == Some(node.id) && n.field_name.as_deref() == Some("name"));
+        let heritage = nodes
+            .iter()
+            .find(|n| n.parent_id == Some(node.id) && n.kind == "class_heritage");
+        if let (Some(name), Some(heritage)) = (name, heritage) {
+            let base = nodes
+                .iter()
+                .find(|n| n.parent_id == Some(heritage.id) && n.kind == "identifier");
+            if let Some(base) = base {
+                document.heritage.push(CapturedHeritageWitness {
+                    class_node_id: node.id,
+                    owner_id: node.parent_id.unwrap_or(0),
+                    subclass_name_start: name.start_byte,
+                    subclass_name_end: name.end_byte,
+                    base_start: base.start_byte,
+                    base_end: base.end_byte,
+                    base_bytes: base.source_bytes.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_declaration(kind: &str) -> bool {
@@ -412,6 +742,7 @@ fn capture_file(root: &Path, path: &Path, cap: u64) -> Result<Vec<u8>> {
 fn discover_capture_inputs(
     root: &Path,
     cancel: &CancelFlag,
+    skip_symlinks: bool,
 ) -> Result<Vec<(PathBuf, Option<crate::model::v1::Language>)>> {
     use crate::model::v1::Language;
     let mut paths = Vec::new();
@@ -449,6 +780,9 @@ fn discover_capture_inputs(
         let entry = entry.context("unsafe or unreadable source discovery")?;
         if entry.file_type().is_some_and(|t| t.is_symlink()) {
             let extension = entry.path().extension().and_then(|s| s.to_str());
+            if skip_symlinks {
+                continue;
+            }
             ensure!(
                 !matches!(extension, Some("rs" | "java" | "py" | "js" | "mjs" | "cjs")),
                 "unsafe symlink source: {}",
@@ -500,12 +834,78 @@ fn discover_capture_inputs(
         "Pipfile.lock",
     ] {
         let path = root.join(name);
-        if fs::symlink_metadata(&path).is_ok() && !paths.iter().any(|(p, _)| p == &path) {
+        if fs::symlink_metadata(&path).is_ok_and(|m| !skip_symlinks || m.is_file())
+            && !paths.iter().any(|(p, _)| p == &path)
+        {
             paths.push((path, None));
         }
     }
     paths.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(paths)
+}
+
+struct RevisionBasis<'a> {
+    source_set_id: &'a str,
+    root_id: &'a str,
+    manifest_bytes: &'a [u8],
+    languages: &'a [crate::model::v1::Language],
+    dependency_source_sets: &'a [String],
+    source_inputs: &'a [(String, Vec<u8>)],
+    toolchain_bytes: &'a [u8],
+    config_bytes: &'a [u8],
+    dependency_bytes: &'a [u8],
+    producers: &'a [CapturedProducer],
+}
+
+fn captured_revision_id(basis: RevisionBasis<'_>) -> Result<String> {
+    let RevisionBasis {
+        source_set_id,
+        root_id,
+        manifest_bytes,
+        languages,
+        dependency_source_sets,
+        source_inputs,
+        toolchain_bytes,
+        config_bytes,
+        dependency_bytes,
+        producers,
+    } = basis;
+    let languages_bytes = crate::semantic_identity::canonical_json(&languages)?;
+    let dependencies_bytes = crate::semantic_identity::canonical_json(&dependency_source_sets)?;
+    let source_bytes = serde_json::to_vec(source_inputs)?;
+    let producer_bytes = serde_json::to_vec(
+        &producers
+            .iter()
+            .map(|p| {
+                (
+                    &p.id,
+                    &p.tool_name,
+                    &p.version,
+                    &p.position_encoding,
+                    &p.executable_hash,
+                    &p.artifact_hash,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let mut revision = Sha256::new();
+    for part in [
+        b"baleyg-captured-revision-v1".as_slice(),
+        source_set_id.as_bytes(),
+        root_id.as_bytes(),
+        manifest_bytes,
+        &languages_bytes,
+        &dependencies_bytes,
+        &source_bytes,
+        toolchain_bytes,
+        config_bytes,
+        dependency_bytes,
+        &producer_bytes,
+    ] {
+        revision.update((part.len() as u64).to_be_bytes());
+        revision.update(part);
+    }
+    Ok(format!("rev:v1:{}", hex::encode(revision.finalize())))
 }
 
 pub fn capture_revision(
@@ -560,7 +960,7 @@ pub fn capture_revision_with_hook(
     let root = identity.root.clone();
     let mut documents = Vec::new();
     let mut source_inputs = Vec::new();
-    let paths = discover_capture_inputs(&root, cancel)?;
+    let paths = discover_capture_inputs(&root, cancel, false)?;
     let mut total = 0u64;
     let mut observed_inputs = Vec::new();
     for (path, language) in &paths {
@@ -593,6 +993,7 @@ pub fn capture_revision_with_hook(
                 native_candidates: native_candidates(&syntax),
                 syntax,
                 semantic_positions: Vec::new(),
+                heritage: Vec::new(),
             });
         } else {
             source_inputs.push((relative, bytes));
@@ -746,39 +1147,22 @@ pub fn capture_revision_with_hook(
     let dependency_hash = digest(&dependency_bytes);
     // Length-prefixed parts prevent boundary ambiguity; no machine path or graph
     // index pin participates in this immutable identity.
-    let mut revision = Sha256::new();
-    for part in [
-        b"baleyg-captured-revision-v1".as_slice(),
-        admission.source_set_id.as_bytes(),
-        admission.root_id.as_bytes(),
-        &manifest_bytes,
-        &crate::semantic_identity::canonical_json(&admission.languages)?,
-        &crate::semantic_identity::canonical_json(&admission.dependency_source_sets)?,
-        &serde_json::to_vec(&source_inputs)?,
-        &toolchain_bytes,
-        &config_bytes,
-        &dependency_bytes,
-        &serde_json::to_vec(
-            &producers
-                .iter()
-                .map(|p| {
-                    (
-                        &p.id,
-                        &p.tool_name,
-                        &p.version,
-                        &p.position_encoding,
-                        &p.executable_hash,
-                        &p.artifact_hash,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )?,
-    ] {
-        revision.update((part.len() as u64).to_be_bytes());
-        revision.update(part);
-    }
-    let revision_id = format!("rev:v1:{}", hex::encode(revision.finalize()));
+    let revision_id = captured_revision_id(RevisionBasis {
+        source_set_id: &admission.source_set_id,
+        root_id: &admission.root_id,
+        manifest_bytes: &manifest_bytes,
+        languages: &admission.languages,
+        dependency_source_sets: &admission.dependency_source_sets,
+        source_inputs: &source_inputs,
+        toolchain_bytes: &toolchain_bytes,
+        config_bytes: &config_bytes,
+        dependency_bytes: &dependency_bytes,
+        producers: &producers,
+    })?;
     for document in &mut documents {
+        if document.key.language == Language::Javascript {
+            identify_javascript(document, &revision_id)?;
+        }
         for position in &mut document.semantic_positions {
             position.revision_id = revision_id.clone();
         }
@@ -821,7 +1205,7 @@ pub fn capture_revision_with_hook(
         }
     }
     ensure!(
-        discover_capture_inputs(&root, cancel)? == paths,
+        discover_capture_inputs(&root, cancel, false)? == paths,
         "source set changed during capture"
     );
     identity.verify()?;
@@ -841,6 +1225,162 @@ pub fn capture_revision_with_hook(
         dependency_hash,
         producers,
         dependency_source_sets: admission.dependency_source_sets.clone(),
+    })
+}
+
+// Browser occurrences use a complete, admitted source-set snapshot. No single-file
+// hash is a revision, and absent optional metadata is captured as an empty basis.
+struct BrowserCapture {
+    revision_id: String,
+    observed: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn capture_browser_revision(
+    options: &IndexOptions,
+    root: &Path,
+    files: &[SourceFile],
+    cancel: &CancelFlag,
+) -> Result<BrowserCapture> {
+    use crate::model::v1::{DocumentKey, Language, Path as EvidencePath, Text};
+    let identity =
+        crate::store::topology::WorkspaceIdentity::discover_unattached(Some(root), root)?;
+    identity.verify()?;
+    let paths = discover_capture_inputs(root, cancel, true)?;
+    let mut observed = Vec::new();
+    let mut source_inputs = Vec::new();
+    let mut source_documents = Vec::new();
+    let mut languages = Vec::new();
+    let mut config = Vec::new();
+    let mut dependency = Vec::new();
+    for (path, language) in &paths {
+        check(cancel)?;
+        let relative = path
+            .strip_prefix(root)?
+            .to_str()
+            .context("non-UTF8 captured path")?
+            .replace('\\', "/");
+        let bytes = capture_file(root, path, options.max_file_bytes.min(256 * 1024 * 1024))?;
+        if let Some(language) = language {
+            let file = files
+                .iter()
+                .find(|f| f.path == relative)
+                .context("captured source missing from graph inventory")?;
+            ensure!(
+                file.hash == digest(&bytes) && file.text.as_bytes() == bytes,
+                "graph source changed during capture: {relative}"
+            );
+            if !languages.contains(language) {
+                languages.push(*language);
+            }
+            let key = DocumentKey {
+                source_set_id: Text::new(&identity.record_id).context("invalid source set")?,
+                language: *language,
+                path: EvidencePath::new(relative).context("invalid source path")?,
+            };
+            source_documents.push((key, digest(&bytes)));
+        } else {
+            let name = relative.as_str();
+            if matches!(
+                name,
+                "package.json"
+                    | "tsconfig.json"
+                    | "jsconfig.json"
+                    | "Cargo.toml"
+                    | "pom.xml"
+                    | "build.gradle"
+                    | "build.gradle.kts"
+                    | "settings.gradle"
+                    | "settings.gradle.kts"
+                    | "gradle.properties"
+                    | "pyproject.toml"
+            ) {
+                config.push((relative.clone(), bytes.clone()));
+            }
+            if matches!(
+                name,
+                "package-lock.json"
+                    | "yarn.lock"
+                    | "pnpm-lock.yaml"
+                    | "bun.lock"
+                    | "bun.lockb"
+                    | "Cargo.lock"
+                    | "uv.lock"
+                    | "poetry.lock"
+                    | "Pipfile.lock"
+                    | "requirements.txt"
+                    | "Pipfile"
+            ) {
+                dependency.push((relative.clone(), bytes.clone()));
+            }
+            source_inputs.push((relative, bytes.clone()));
+        }
+        observed.push((path.clone(), bytes));
+    }
+    ensure!(
+        source_documents.len() == files.len(),
+        "graph inventory differs from captured sources"
+    );
+    // Use the same language ordering as the explicit capture's canonical manifest.
+    fn order(language: Language) -> u8 {
+        match language {
+            Language::Java => 0,
+            Language::Rust => 1,
+            Language::Python => 2,
+            Language::Javascript => 3,
+        }
+    }
+    source_documents.sort_by(|a, b| {
+        (order(a.0.language), a.0.path.as_str().as_bytes())
+            .cmp(&(order(b.0.language), b.0.path.as_str().as_bytes()))
+    });
+    languages.sort_by_key(|l| order(*l));
+    let manifest: Vec<_> = source_documents
+        .iter()
+        .map(|(key, hash)| serde_json::json!({"document":key,"contentHash":hash}))
+        .collect();
+    let manifest_bytes = crate::semantic_identity::canonical_json(&manifest)?;
+    let executable_bytes = safe_read(&std::env::current_exe()?, 256 * 1024 * 1024)?;
+    let producer = CapturedProducer {
+        id: "N".into(),
+        tool_name: env!("CARGO_PKG_NAME").into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        position_encoding: "utf8".into(),
+        executable_hash: digest(&executable_bytes),
+        executable_bytes: executable_bytes.clone(),
+        artifact_hash: None,
+        artifact_bytes: None,
+    };
+    // Root metadata is captured in source_inputs too; these independently captured
+    // basis projections make the explicit absent-config case unambiguous.
+    let config_bytes = crate::semantic_identity::canonical_json(&config)?;
+    let dependency_bytes = crate::semantic_identity::canonical_json(&dependency)?;
+    let revision = captured_revision_id(RevisionBasis {
+        source_set_id: &identity.record_id,
+        root_id: &identity.root_key,
+        manifest_bytes: &manifest_bytes,
+        languages: &languages,
+        dependency_source_sets: &[],
+        source_inputs: &source_inputs,
+        toolchain_bytes: &executable_bytes,
+        config_bytes: &config_bytes,
+        dependency_bytes: &dependency_bytes,
+        producers: &[producer],
+    })?;
+    for (path, bytes) in &observed {
+        ensure!(
+            capture_file(root, path, options.max_file_bytes.min(256 * 1024 * 1024))? == *bytes,
+            "source changed during browser capture: {}",
+            path.display()
+        );
+    }
+    ensure!(
+        discover_capture_inputs(root, cancel, true)? == paths,
+        "source set changed during browser capture"
+    );
+    identity.verify()?;
+    Ok(BrowserCapture {
+        revision_id: revision,
+        observed,
     })
 }
 
@@ -1037,8 +1577,19 @@ pub fn index_workspace(
             Err(e) => diag(&mut g, None, "scip-unavailable", e.to_string()),
         }
     }
+    let browser_capture = if g.files.iter().any(|f| f.language == "javascript") {
+        Some(capture_browser_revision(
+            options,
+            &workspace_root,
+            &g.files,
+            cancel,
+        )?)
+    } else {
+        None
+    };
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
+    let mut semantic_nodes = HashMap::new();
     for i in 0..g.files.len() {
         check(cancel)?;
         // Temporarily move the text, rather than duplicate every source buffer.
@@ -1074,7 +1625,43 @@ pub fn index_workspace(
                 "Tree-sitter recovered from invalid JavaScript; results may be incomplete",
             );
         }
+        let source_set = crate::store::topology::WorkspaceIdentity::discover_unattached(
+            Some(&workspace_root),
+            &workspace_root,
+        )?
+        .record_id;
+        let key = crate::model::v1::DocumentKey {
+            source_set_id: crate::model::v1::Text::new(source_set).context("invalid source set")?,
+            language: crate::model::v1::Language::Javascript,
+            path: crate::model::v1::Path::new(file.path.clone()).context("invalid JS path")?,
+        };
+        let syntax = capture_syntax(crate::model::v1::Language::Javascript, file.text.as_bytes())?;
+        let mut native = CapturedDocument {
+            key,
+            bytes: file.text.as_bytes().to_vec(),
+            content_hash: file.hash.clone(),
+            byte_length: file.text.len() as u64,
+            native_candidates: native_candidates(&syntax),
+            syntax,
+            semantic_positions: Vec::new(),
+            heritage: Vec::new(),
+        };
+        identify_javascript(&mut native, &browser_capture.as_ref().unwrap().revision_id)?;
+        let native_ids: HashMap<_, _> = native
+            .native_candidates
+            .iter()
+            .filter_map(|w| {
+                w.stable_id.as_ref().map(|id| {
+                    (
+                        (w.start_byte, w.end_byte, w.candidate_kind.clone()),
+                        id.clone(),
+                    )
+                })
+            })
+            .collect();
         let mut ex = Extractor {
+            native_ids: &native_ids,
+            semantic_nodes: &mut semantic_nodes,
             g: &mut g,
             file: &file,
             doc: if tree.root_node().has_error() {
@@ -1091,7 +1678,20 @@ pub fn index_workspace(
             classes: HashMap::new(),
             cancel,
         };
-        let module = format!("module:{}", file.path);
+        let module = crate::semantic_identity::syntax_id(
+            &native.key.source_set_id,
+            &native.key.path,
+            crate::model::v1::Language::Javascript,
+            &[],
+            &crate::model::v1::Key {
+                kind: crate::model::v1::Kind::Module,
+                name: None,
+                signature: None,
+                ordinal: crate::model::v1::UInt::new(0).unwrap(),
+            },
+        )?
+        .as_str()
+        .to_owned();
         ex.g.nodes.push(Symbol {
             id: module.clone(),
             name: file.path.clone(),
@@ -1120,15 +1720,21 @@ pub fn index_workspace(
         if c.candidate_symbols.len() > 1 {
             c.resolution = Resolution::Ambiguous;
         } else if let Some(id) = c.candidate_symbols.first() {
+            let native = semantic_nodes.get(id).unwrap_or(id);
             if by_id
-                .get(id)
+                .get(native)
                 .is_some_and(|(k, a)| *k != SymbolKind::Module && !a)
             {
-                c.target = Some(id.clone());
+                c.target = Some(native.clone());
                 c.resolution = Resolution::Internal;
             } else if !by_id.contains_key(id) && id.ends_with("().") {
                 c.target = Some(id.clone());
                 c.resolution = Resolution::External;
+            }
+        }
+        for callback in &mut c.callback_arguments {
+            if let Some(native) = semantic_nodes.get(callback) {
+                *callback = native.clone();
             }
         }
         c.callback_arguments.retain(|id| {
@@ -1169,6 +1775,37 @@ pub fn index_workspace(
         total: g.files.len(),
     });
     check(cancel)?;
+    if let Some(browser_capture) = browser_capture {
+        let inventory: Vec<_> = browser_capture
+            .observed
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        for (path, bytes) in browser_capture.observed {
+            ensure!(
+                capture_file(
+                    &workspace_root,
+                    &path,
+                    options.max_file_bytes.min(256 * 1024 * 1024)
+                )? == bytes,
+                "source changed during graph extraction: {}",
+                path.display()
+            );
+        }
+        ensure!(
+            discover_capture_inputs(&workspace_root, cancel, true)?
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>()
+                == inventory,
+            "source set changed during graph extraction"
+        );
+        crate::store::topology::WorkspaceIdentity::discover_unattached(
+            Some(&workspace_root),
+            &workspace_root,
+        )?
+        .verify()?;
+    }
     Ok(g)
 }
 fn range(n: Node<'_>) -> SourceRange {
@@ -1204,6 +1841,8 @@ fn is_function(n: Node<'_>) -> bool {
 }
 struct Extractor<'a> {
     g: &'a mut Graph,
+    native_ids: &'a HashMap<(usize, usize, NativeCandidateKind), String>,
+    semantic_nodes: &'a mut HashMap<String, String>,
     file: &'a SourceFile,
     doc: Option<&'a scip::types::Document>,
     semantic: SemanticState,
@@ -1212,6 +1851,11 @@ struct Extractor<'a> {
     cancel: &'a CancelFlag,
 }
 impl Extractor<'_> {
+    fn native_id(&self, n: Node<'_>, kind: NativeCandidateKind) -> Option<String> {
+        self.native_ids
+            .get(&(n.start_byte(), n.end_byte(), kind))
+            .cloned()
+    }
     fn text(&self, n: Node<'_>) -> &str {
         &self.file.text[n.byte_range()]
     }
@@ -1283,17 +1927,17 @@ impl Extractor<'_> {
             }
             let ids = self.symbols(name, true);
             let semantic = ids.len() == 1 && !self.g.nodes.iter().any(|node| node.id == ids[0]);
-            let id = if semantic {
-                ids[0].clone()
-            } else {
-                format!(
-                    "syntax:{}:{}:{}:{}",
-                    self.file.path,
-                    self.file.hash,
-                    n.start_byte(),
-                    n.kind()
-                )
+            let Some(id) = self.native_id(n, NativeCandidateKind::Declaration) else {
+                // A declaration without an independently measured native name or
+                // anonymous-expression shape cannot claim a syntax identity.
+                for child in children(n) {
+                    self.declarations(child, &owner, depth + 1)?;
+                }
+                return Ok(());
             };
+            if semantic {
+                self.semantic_nodes.insert(ids[0].clone(), id.clone());
+            }
             let label = name.map(|v| self.text(v).to_owned()).unwrap_or_else(|| {
                 format!(
                     "<callback@{}:{}>",
@@ -1336,13 +1980,9 @@ impl Extractor<'_> {
         Ok(())
     }
     fn region(&mut self, n: Node<'_>, kind: &str, context: &[String], owner: &str) -> Vec<String> {
-        let id = format!(
-            "region:{}:{}:{}:{}",
-            self.file.path,
-            self.file.hash,
-            n.start_byte(),
-            kind
-        );
+        let Some(id) = self.native_id(n, NativeCandidateKind::ControlRegion) else {
+            return context.to_vec();
+        };
         self.g.regions.push(ControlRegion {
             id: id.clone(),
             kind: kind.into(),
@@ -1516,13 +2156,9 @@ impl Extractor<'_> {
                 }
             }
             self.g.calls.push(CallSite {
-                id: format!(
-                    "call:{}:{}:{}:{}",
-                    self.file.path,
-                    self.file.hash,
-                    n.start_byte(),
-                    n.end_byte()
-                ),
+                id: self
+                    .native_id(n, NativeCandidateKind::Invocation)
+                    .context("JavaScript graph call lacks native occurrence identity")?,
                 caller: caller.clone(),
                 callee_text: callee
                     .map(|v| self.text(v).to_owned())

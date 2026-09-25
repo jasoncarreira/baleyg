@@ -1154,3 +1154,288 @@ fn capture_accepts_authentic_scip_tool_name_without_conflating_producer_id() {
         baleyg::indexer::capture_revision(&capture_options(root), &admission, &cancel()).is_err()
     );
 }
+
+#[test]
+fn javascript_capture_ids_tokens_heritage_and_revision_local_occurrences() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "b.js",
+        "class Child extends Base { foo() { obj.foo(); obj[key](); obj?.foo(); } }\nfunction same() { obj.\\u{0066}oo(); }\nfunction same() { obj.foo(); }\n",
+    );
+    let admission = capture_admission(root);
+    let options = capture_options(root);
+    let first = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    let doc = &first.documents[0];
+    assert_eq!(doc.heritage.len(), 1);
+    let heritage = &doc.heritage[0];
+    assert_eq!(&doc.bytes[heritage.base_start..heritage.base_end], b"Base");
+    assert_eq!(
+        &doc.bytes[heritage.subclass_name_start..heritage.subclass_name_end],
+        b"Child"
+    );
+    let decl: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Declaration && w.name_bytes == b"same")
+        .collect();
+    assert_eq!(decl.len(), 2);
+    assert_ne!(decl[0].stable_id, decl[1].stable_id);
+    assert!(
+        decl.iter()
+            .all(|w| w.stable_id.as_deref().unwrap().starts_with("sid:v1:"))
+    );
+    let calls: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Invocation)
+        .collect();
+    assert!(calls.len() >= 5);
+    assert!(
+        calls
+            .iter()
+            .all(|w| w.stable_id.as_deref().unwrap().starts_with("occ:v1:")
+                && !w.ancestor_ids.is_empty())
+    );
+    assert!(calls.iter().any(|w| w.verified_member_token
+        && w.spelling.as_deref() == Some("foo")
+        && &doc.bytes[w.token_start_byte..w.token_end_byte] == b"foo"));
+    assert!(calls.iter().any(|w| !w.verified_member_token
+        && doc.bytes[w.start_byte..w.end_byte].starts_with(b"obj[key]")));
+    assert!(calls.iter().any(|w| !w.verified_member_token
+        && doc.bytes[w.start_byte..w.end_byte].starts_with(b"obj?.foo")));
+    assert!(calls.iter().any(|w| w.verified_member_token
+        && w.spelling.as_deref() == Some("foo")
+        && w.token_bytes == b"\\u{0066}oo"));
+    write(
+        root,
+        "b.js",
+        "class Child extends Base { foo() { obj.foo(); obj[key](); obj?.foo(); extra(); } }\nfunction same() { obj.foo(); }\nfunction same() { obj.foo(); }\n",
+    );
+    let second = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    assert_ne!(first.revision_id, second.revision_id);
+    let first_child = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.candidate_kind == K::Declaration && w.name_bytes == b"Child")
+        .unwrap();
+    let second_child = second.documents[0]
+        .native_candidates
+        .iter()
+        .find(|w| w.candidate_kind == K::Declaration && w.name_bytes == b"Child")
+        .unwrap();
+    assert_eq!(first_child.stable_id, second_child.stable_id);
+    let second_dupes: Vec<_> = second.documents[0]
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Declaration && w.name_bytes == b"same")
+        .collect();
+    assert_eq!(decl[0].stable_id, second_dupes[0].stable_id);
+    assert_eq!(decl[1].stable_id, second_dupes[1].stable_id);
+    assert_ne!(
+        calls[0].stable_id,
+        second.documents[0]
+            .native_candidates
+            .iter()
+            .find(|w| w.candidate_kind == K::Invocation)
+            .unwrap()
+            .stable_id
+    );
+}
+
+#[test]
+fn javascript_nested_duplicate_ordinals_inventory_and_graph_ids() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = "class Same { méthode() { new Thing(); obj.méthode(); } }\nclass Same { méthode() { obj.foo(); (obj.foo)(); obj?.foo(); obj[key](); } }\nfunction blocks() { const f = function named() {}; const g = function* () {}; const h = () => 1; for (const k in obj) { obj[k](); } do { work(); } while (flag); switch(x) { case 1: left(); break; default: right(); } return x && more(); }\n";
+    write(root, "b.js", source);
+    let admission = capture_admission(root);
+    let options = capture_options(root);
+    let first = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    let doc = &first.documents[0];
+    let classes: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.node_kind == "class_declaration" && w.stable_id.is_some())
+        .collect();
+    let methods: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.node_kind == "method_definition" && w.stable_id.is_some())
+        .collect();
+    assert_eq!((classes.len(), methods.len()), (2, 2));
+    assert_ne!(classes[0].stable_id, classes[1].stable_id);
+    assert_ne!(methods[0].stable_id, methods[1].stable_id);
+    assert_eq!(
+        methods[0].ancestor_ids.last(),
+        classes[0].stable_id.as_ref()
+    );
+    assert_eq!(
+        methods[1].ancestor_ids.last(),
+        classes[1].stable_id.as_ref()
+    );
+    for kind in [
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+    ] {
+        assert!(
+            doc.native_candidates.iter().any(|w| w.node_kind == kind
+                && w.candidate_kind == K::Declaration
+                && w.stable_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("sid:v1:"))),
+            "{kind}"
+        );
+    }
+    for kind in [
+        "new_expression",
+        "for_in_statement",
+        "do_statement",
+        "switch_case",
+        "switch_default",
+        "binary_expression",
+    ] {
+        assert!(
+            doc.native_candidates.iter().any(|w| w.node_kind == kind
+                && w.stable_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("occ:v1:"))),
+            "{kind}"
+        );
+    }
+    let calls: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == K::Invocation)
+        .collect();
+    assert!(calls.iter().any(|w| w.verified_member_token
+        && w.token_bytes == "méthode".as_bytes()
+        && &doc.bytes[w.token_start_byte..w.token_end_byte] == "méthode".as_bytes()));
+    for callee in ["(obj.foo)()", "obj?.foo()", "obj[key]()"] {
+        assert!(
+            calls.iter().any(|w| !w.verified_member_token
+                && doc.bytes[w.start_byte..w.end_byte].starts_with(callee.as_bytes())),
+            "{callee}"
+        );
+    }
+    let graph = run(&IndexOptions::new(root.to_owned()));
+    assert!(graph.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
+    assert!(graph.calls.iter().all(|c| c.id.starts_with("occ:v1:")));
+    assert!(graph.regions.iter().all(|r| r.id.starts_with("occ:v1:")));
+    let edited = source
+        .replace("new Thing();", "new Other();")
+        .replace("obj.foo();", "obj.bar();");
+    write(root, "b.js", &edited);
+    let second = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    let next: Vec<_> = second.documents[0]
+        .native_candidates
+        .iter()
+        .filter(|w| w.node_kind == "method_definition" && w.stable_id.is_some())
+        .collect();
+    assert_eq!(
+        methods.iter().map(|m| &m.stable_id).collect::<Vec<_>>(),
+        next.iter().map(|m| &m.stable_id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn named_class_expression_preserves_instance_initializer_owner() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "fields.js",
+        "function make() { if (ok) return class C { [fieldKey()] = build(); static eager = now(); [key()]() { body(); } }; }\n",
+    );
+    let admission = capture_admission(root);
+    let captured =
+        baleyg::indexer::capture_revision(&capture_options(root), &admission, &cancel()).unwrap();
+    let class = captured.documents[0]
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "class" && w.candidate_kind == K::Declaration)
+        .unwrap();
+    assert_eq!(class.name_bytes, b"C");
+    assert!(class.stable_id.as_deref().unwrap().starts_with("sid:v1:"));
+    let graph = run(&IndexOptions::new(root.to_owned()));
+    let owner = |callee: &str| {
+        let call = graph
+            .calls
+            .iter()
+            .find(|c| c.callee_text == callee)
+            .unwrap();
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.id == call.caller)
+            .unwrap()
+            .name
+            .as_str()
+    };
+    for callee in ["fieldKey", "now", "key"] {
+        assert_eq!(owner(callee), "make");
+    }
+    assert_eq!(owner("build"), "C");
+    let build = graph
+        .calls
+        .iter()
+        .find(|c| c.callee_text == "build")
+        .unwrap();
+    assert!(
+        graph
+            .regions
+            .iter()
+            .any(|r| r.kind == "instance-initializer"
+                && r.owner == build.caller
+                && build.regions.contains(&r.id))
+    );
+}
+
+#[test]
+fn browser_occurrences_follow_complete_source_and_basis_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "main.js", "function keep() { call(); }\n");
+    write(root, "sibling.js", "function sibling() {}\n");
+    let options = IndexOptions::new(root.to_owned());
+    let read = || {
+        let graph = run(&options);
+        let declaration = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "keep")
+            .unwrap()
+            .id
+            .clone();
+        let occurrence = graph
+            .calls
+            .iter()
+            .find(|c| c.callee_text == "call")
+            .unwrap()
+            .id
+            .clone();
+        (declaration, occurrence)
+    };
+    let first = read();
+    write(root, "sibling.js", "function sibling() { changed(); }\n");
+    let sibling = read();
+    assert_eq!(first.0, sibling.0);
+    assert_ne!(first.1, sibling.1);
+    write(root, "package.json", "{\"name\":\"one\"}");
+    let basis = read();
+    assert_eq!(sibling.0, basis.0);
+    assert_ne!(sibling.1, basis.1);
+    write(root, "package.json", "{\"name\":\"two\"}");
+    let changed_basis = read();
+    assert_eq!(basis.0, changed_basis.0);
+    assert_ne!(basis.1, changed_basis.1);
+    write(root, "main.js", "function keep() { call(); other(); }\n");
+    let body = read();
+    assert_eq!(changed_basis.0, body.0);
+    assert_ne!(changed_basis.1, body.1);
+}

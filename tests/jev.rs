@@ -17,6 +17,15 @@ fn packet_with(code: &str, question: &str) -> QuestionPacket {
     packet_with_links(code, question, false)
 }
 fn packet_with_links(code: &str, question: &str, synthetic_links: bool) -> QuestionPacket {
+    packets_with_questions(code, &[question], synthetic_links)
+        .pop()
+        .unwrap()
+}
+fn packets_with_questions(
+    code: &str,
+    questions: &[&str],
+    synthetic_links: bool,
+) -> Vec<QuestionPacket> {
     let work = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     #[cfg(unix)]
@@ -60,12 +69,17 @@ fn packet_with_links(code: &str, question: &str, synthetic_links: bool) -> Quest
             &cancel,
         )
         .unwrap();
-    let request: QuestionRequest = serde_json::from_value(json!({
-        "seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id,
-        "question":question,"expectedRevision":revision
-    }))
-    .unwrap();
-    prepare(&store, request).unwrap()
+    questions
+        .iter()
+        .map(|question| {
+            let request: QuestionRequest = serde_json::from_value(json!({
+                "seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id,
+                "question":question,"expectedRevision":revision
+            }))
+            .unwrap();
+            prepare(&store, request).unwrap()
+        })
+        .collect()
 }
 fn packet() -> QuestionPacket {
     packet_with(CODE, "How is the request checked?")
@@ -305,8 +319,31 @@ fn probability_sum_tolerance() {
 
 #[test]
 fn rejects_tampered_packets_and_answers_for_another_question_with_same_calls() {
-    let packet = packet();
-    let other = packet_with(CODE, "Where does the callback go?");
+    let different_root = packet_with(CODE, "How is the request checked?");
+    let [packet, other]: [QuestionPacket; 2] = packets_with_questions(
+        CODE,
+        &["How is the request checked?", "Where does the callback go?"],
+        false,
+    )
+    .try_into()
+    .unwrap();
+    let observable = |packet: &QuestionPacket| {
+        packet
+            .context
+            .calls
+            .iter()
+            .map(|call| {
+                (
+                    call.callee_text.clone(),
+                    call.path.clone(),
+                    call.range.clone(),
+                    call.ordinal,
+                    call.resolution,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(observable(&packet), observable(&different_root));
     assert_eq!(packet.context.calls, other.context.calls);
     assert_ne!(packet.packet_id, other.packet_id);
     let response = synthetic_response(&packet);
