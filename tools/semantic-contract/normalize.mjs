@@ -145,8 +145,8 @@ export function normalizeFixture(loaded){
   if(fact.kind==='coverage'){validate('Coverage',fact.record);const value=fact.record;const annotation=loaded.annotations.find(x=>x.facts.includes(fact));if(!same(annotation.document,{sourceSetId:value.sourceSetId,language:value.language,path:value.documentPath})||annotation.revisionId!==value.revisionId)fail('NORMALIZE.COVERAGE','record','annotation tuple mismatch');if(!loaded.fixture.producers.some(x=>x.id===value.producerId&&x.languages.includes(value.language))||!loaded.revisions.get(tuple(value.sourceSetId,value.revisionId))?.documents.some(x=>x.key.path===value.documentPath&&x.key.language===value.language))fail('NORMALIZE.COVERAGE','record','unadmitted coverage tuple');const applicable=applicableRoles(value.language),ordered=roles=>roles.every((role,i)=>applicable.includes(role)&&(i===0||applicable.indexOf(role)>applicable.indexOf(roles[i-1])));const selected=['failed','partial','complete'].includes(value.state),requested=value.state!=='notRequested';
    const intent=loaded.fixture.coverageIntents.find(x=>x.producerId===value.producerId&&x.revisionId===value.revisionId&&same(x.document,annotation.document));
    const roles=intent?.requestedRoles.filter(x=>applicable.includes(x))??[];
-   const family=role=>role==='definition'||role==='alias'?'declarationName':role==='call'?'callee':'reference';
-   const available=role=>intent?.measurementSupport.find(x=>x.kind===family(role))?.available!==false;
+   const families=role=>role==='call'?['reference','invocation','callee']:role==='definition'||role==='alias'?['reference','declarationName']:['reference'];
+   const available=role=>families(role).every(kind=>intent?.measurementSupport.find(x=>x.kind===kind)?.available!==false);
    const unsupported=roles.some(x=>!value.supportedRoles.includes(x)||!available(x));
    const missing=roles.some(x=>value.supportedRoles.includes(x)&&available(x)&&!value.observedRoles.includes(x));
    const effective=roles.filter(x=>value.supportedRoles.includes(x)&&available(x));
