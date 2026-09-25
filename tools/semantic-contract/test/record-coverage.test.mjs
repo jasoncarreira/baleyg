@@ -4,7 +4,7 @@ import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,dirname} from 'node:path';
 import {loadFixture} from '../load.mjs';
-import {checkCoverage} from '../record-check/coverage.mjs';
+import {checkCoverage,compareFreshnessComponents,assertFreshnessComponents} from '../record-check/coverage.mjs';
 import {contentHash,sourceManifestHash} from '../identity.mjs';
 import {canonicalBytes} from '../json.mjs';
 import {registerControls,runControl} from './mutations.mjs';
@@ -21,7 +21,7 @@ const plans=[
  {state:'failed',requestedRoles:['read'],supportedRoles:['read'],observedRoles:[],requested:true,selected:true,diagnostic:'capture failed'},
  {state:'notRequested',requestedRoles:[],supportedRoles:[],observedRoles:[],requested:false,selected:false,diagnostic:null}
 ];
-async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,requestedChange=null,language="javascript"}={}){
+async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,requestedChange=null,language="javascript",setId="main",captureValues={},secondSet=false,comparisonSet=setId}={}){
  const root=await mkdtemp(join(tmpdir(),'coverage-u1-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const files=new Map(),put=(name,data)=>files.set(name,typeof data==='string'?data:JSON.stringify(data));
  const natives='native-executable', sem1='semantic-one',sem2='semantic-two';
@@ -29,9 +29,14 @@ async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,request
  const captures=[];
  const add=(ref,kind,path,bytes)=>{put(path,bytes);captures.push({ref,kind,file:path,hash:hash(bytes)});};
  for(const [i,bytes] of [natives,sem1,sem2].entries())add(`executable-${i}`,'executable',`captures/executable-${i}`,bytes);
- for(const [kind,text] of [['toolchain','tool'],['config','config'],['dependency','deps']])add(kind,kind,`captures/${kind}`,text);
- const docs=[document('a.js',language),document('b.js',language)],source=language==='java'?{r1:['class A {}\n','class B {}\n'],r2:['class A { int a; }\n','class B {}\n']}:{r1:['function a() {}\n','function b() {}\n'],r2:[sameCallerBytes?'function a() {}\n':'function a() { return 1; }\n',sameCallerBytes?'function b() { return 2; }\n':'function b() {}\n']};
- const revisions=['r1','r2'].map(revisionId=>({id:revisionId,sourceSetId:'main',documents:docs.map((key,i)=>{const sourceFile=`sources/${revisionId}/${key.path}`;put(sourceFile,source[revisionId][i]);return {key,revisionId,sourceFile};}),toolchainHash:hash('tool'),configHash:hash('config'),dependencyHash:hash('deps')}));
+ for(const [kind,text] of [['toolchain','tool'],['config','config'],['dependency','deps']])add(kind,kind,`captures/${kind}`,captureValues[kind]??text);
+ const docs=[{sourceSetId:setId,language,path:'a.js'},{sourceSetId:setId,language,path:'b.js'}],source=language==='java'?{r1:['class A {}\n','class B {}\n'],r2:['class A { int a; }\n','class B {}\n']}:{r1:['function a() {}\n','function b() {}\n'],r2:[sameCallerBytes?'function a() {}\n':'function a() { return 1; }\n',sameCallerBytes?'function b() { return 2; }\n':'function b() {}\n']};
+ const revisions=['r1','r2'].map(revisionId=>({id:revisionId,sourceSetId:setId,documents:docs.map((key,i)=>{const sourceFile=`sources/${revisionId}/${key.path}`;put(sourceFile,source[revisionId][i]);return {key,revisionId,sourceFile};}),toolchainHash:hash(captureValues.toolchain??'tool'),configHash:hash(captureValues.config??'config'),dependencyHash:hash(captureValues.dependency??'deps')}));
+ if(secondSet){
+  const key={sourceSetId:'other',language,path:'a.js'},sourceFile='sources/other/r1/a.js';
+  put(sourceFile,source.r1[0]);
+  revisions.push({id:'r1',sourceSetId:'other',documents:[{key,revisionId:'r1',sourceFile}],toolchainHash:revisions[0].toolchainHash,configHash:revisions[0].configHash,dependencyHash:revisions[0].dependencyHash});
+ }
  const coverageIntents=[];const annotationFacts=new Map();
  let count=0;
  for(const revision of revisions)for(const doc of revision.documents){
@@ -55,26 +60,27 @@ async function specimen(t,{comparisonRevision="r2",sameCallerBytes=false,request
  const expectedProofs=[];
  for(const [producer,ref,id,fact] of rawFacts){
   const revision=revisions[0],doc=revision.documents[0].key;
-  const basis={producerId:producer.id,producerVersion:producer.version,producerHash:producer.executableHash,artifactHash:captures.find(x=>x.ref===`artifact-${producer.id}`).hash,language,sourceSetId:'main',revisionId:'r1',sourceManifestHash:sourceManifestHash(revision.documents.map((x,i)=>({document:x.key,contentHash:hash(source.r1[i])}))),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:['target']};
-  const proof={id,producerId:producer.id,document:doc,revisionId:'r1',contentHash:hash(source.r1[0]),evidenceKind:'declarationBinding',basis,freshness:comparisonRevision==='r1'?(requestedChange&&producer.id==='one'?'possiblyStale':'fresh'):sameCallerBytes?'possiblyStale':'stale'};
+  const basis={producerId:producer.id,producerVersion:producer.version,producerHash:producer.executableHash,artifactHash:captures.find(x=>x.ref===`artifact-${producer.id}`).hash,language,sourceSetId:setId,revisionId:'r1',sourceManifestHash:sourceManifestHash(revision.documents.map((x,i)=>({document:x.key,contentHash:hash(source.r1[i])}))),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:['target']};
+  const proof={id,producerId:producer.id,document:doc,revisionId:'r1',contentHash:hash(source.r1[0]),evidenceKind:'declarationBinding',basis,freshness:comparisonSet!==setId?'possiblyStale':comparisonRevision==='r1'?(requestedChange&&producer.id==='one'?'possiblyStale':'fresh'):sameCallerBytes?'possiblyStale':'stale'};
   historical.push({kind:'provenance',ref:`fact-${id}`,record:proof},fact);
   expectedProofs.push(proof);
  }
- for(const [name,facts] of annotationFacts){const [revisionId,path]=name.split('/').slice(1);put(name,{formatVersion:1,document:document(path.replace('.annotations.json',''),language),revisionId,scenarios:[],facts});}
+ for(const [name,facts] of annotationFacts){const parts=name.split('/'),revisionId=parts.at(-2),path=parts.at(-1);put(name,{formatVersion:1,document:{sourceSetId:parts.length===4?'other':setId,language,path:path.replace('.annotations.json','')},revisionId,scenarios:[],facts});}
  put('expected/answers.json',{formatVersion:1,answers:[]});put('expected/dispositions.json',{formatVersion:1,assertions:[],callableValueNegatives:[]});put('expected/anchors.json',{formatVersion:1,cases:[]});
  const requested=structuredClone(producers);
  if(requestedChange){
   if(requestedChange==='absent')requested.splice(1,1);
   if(requestedChange==='version')requested[1].version='2';
+   if(requestedChange==='kind')requested[1].kind='native';
   if(requestedChange==='hash')requested[1].executableHash=hash('different executable');
   if(requestedChange==='encoding')requested[1].positionEncoding='utf16';
   if(requestedChange==='languages')requested[1].languages=['javascript','python'];
  }
- const fixture={formatVersion:1,profile:'example',language,sourceSets:[{id:'main',rootId:'root',languages:[language],dependencies:[]}],producers,revisions,comparison:{sourceSetId:'main',revisionId:comparisonRevision,producers:requested},coverageIntents,nativeArtifact:'captures/native.json',semanticArtifacts:rawFacts.map(x=>`captures/${x[0].id}.json`),annotationFiles:[...annotationFacts.keys()],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ const fixture={formatVersion:1,profile:'example',language,sourceSets:[{id:setId,rootId:'root',languages:[language],dependencies:[]},...(secondSet?[{id:'other',rootId:'other-root',languages:[language],dependencies:[]}]:[])],producers,revisions,comparison:{sourceSetId:comparisonSet,revisionId:comparisonRevision,producers:requested},coverageIntents,nativeArtifact:'captures/native.json',semanticArtifacts:rawFacts.map(x=>`captures/${x[0].id}.json`),annotationFiles:[...annotationFacts.keys()],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  put('fixture.json',fixture);
  for(const [name,value] of files){await mkdir(dirname(join(root,name)),{recursive:true});await writeFile(join(root,name),value);}
  const loaded=await loadFixture(root);
- const records={formatVersion:1,comparison:structuredClone(fixture.comparison),producers:sort(structuredClone(producers)),sourceSets:sort(structuredClone(fixture.sourceSets)),revisions:sort(revisions.map(revision=>({...revision,documents:revision.documents.map((item,i)=>({key:item.key,revisionId:revision.id,contentHash:hash(source[revision.id][i]),byteLength:Buffer.byteLength(source[revision.id][i])}))}))),coverage:sort([...annotationFacts.values()].flatMap(facts=>facts.filter(x=>x.kind==='coverage').map(x=>x.record))),provenance:sort(expectedProofs),declarations:[],symbols:[],declarationBindings:[],typeRelationships:[],calls:[],controlRegions:[],references:[],referenceJoinDiagnostics:[],callBindings:[],durableAnchors:[],groupContinuities:[],anchorResults:[]};
+ const records={formatVersion:1,comparison:structuredClone(fixture.comparison),producers:sort(structuredClone(producers)),sourceSets:sort(structuredClone(fixture.sourceSets)),revisions:sort(revisions.map(revision=>({...revision,documents:revision.documents.map((item,i)=>({key:item.key,revisionId:revision.id,contentHash:hash(files.get(item.sourceFile)),byteLength:Buffer.byteLength(files.get(item.sourceFile))}))}))),coverage:sort([...annotationFacts.values()].flatMap(facts=>facts.filter(x=>x.kind==='coverage').map(x=>x.record))),provenance:sort(expectedProofs),declarations:[],symbols:[],declarationBindings:[],typeRelationships:[],calls:[],controlRegions:[],references:[],referenceJoinDiagnostics:[],callBindings:[],durableAnchors:[],groupContinuities:[],anchorResults:[]};
  return {loaded,records,fixture,source,docs,proofs:expectedProofs};
 }
 let admitted;
@@ -194,7 +200,7 @@ test('fresh caller and target staleness are independent, including missing curre
 });
 
 test('requested producer components do not fall back to captured identity',async t=>{
- for(const change of ['absent','version','hash','encoding','languages'])await t.test(change,async t=>{
+ for(const change of ['absent','version','hash','encoding','languages','kind'])await t.test(change,async t=>{
   const baseline=await specimen(t,{comparisonRevision:'r1',requestedChange:change});
   const C=checkCoverage(baseline.loaded,baseline.records);
   const proof=baseline.records.provenance.find(x=>x.producerId==='one');
@@ -487,4 +493,99 @@ test('changed and missing selected evidence bytes are stale, independent of comp
  assert.equal(row.state,'partial');assert.equal(proof.freshness,'fresh');
  const control=registerControls([{id:'U1.freshness-partial-fresh-not-possibly-stale',baseline:()=>b.records,check:x=>checkCoverage(b.loaded,x),mutate:x=>{x.provenance.find(y=>y.producerId==='one').freshness='possiblyStale';return x;},expectedAssertion:'FRESHNESS.STATE',expectedCode:'invalidRecord',expectedField:'freshness'}])[0];
  await t.test(control.id,()=>runControl(control));
+});
+
+// Component values come from independently admitted snapshots. Only the policy
+// input is projected one field at a time; no synthetic loaded fixture is passed
+// to checkCoverage.
+test('authenticated component comparison isolates each same-byte request change',async t=>{
+ const base=await specimen(t,{comparisonRevision:'r1'});
+ checkCoverage(base.loaded,base.records);
+ const proof=base.records.provenance.find(x=>x.producerId==='one');
+ const producer=base.loaded.fixture.producers.find(x=>x.id==='one');
+ const captured={documentHash:proof.contentHash,revisionId:proof.basis.revisionId,
+  sourceManifestHash:proof.basis.sourceManifestHash,toolchainHash:proof.basis.toolchainHash,
+  configHash:proof.basis.configHash,dependencyHash:proof.basis.dependencyHash,
+  sourceSetId:proof.basis.sourceSetId,producerId:producer.id,producerKind:producer.kind,producerVersion:producer.version,
+  producerHash:producer.executableHash,language:proof.document.language,
+  positionEncoding:producer.positionEncoding,producerLanguages:producer.languages};
+ assert.equal(compareFreshnessComponents(captured,structuredClone(captured)),'fresh');
+ const alternate={
+  revisionId:await specimen(t,{comparisonRevision:'r2',sameCallerBytes:true}),
+  sourceManifestHash:await specimen(t,{comparisonRevision:'r2',sameCallerBytes:true}),
+  toolchainHash:await specimen(t,{comparisonRevision:'r1',captureValues:{toolchain:'alternate tool'}}),
+  configHash:await specimen(t,{comparisonRevision:'r1',captureValues:{config:'alternate config'}}),
+  dependencyHash:await specimen(t,{comparisonRevision:'r1',captureValues:{dependency:'alternate dependency'}}),
+  sourceSetId:await specimen(t,{comparisonRevision:'r1',setId:'other'}),
+  producerId:base,producerKind:await specimen(t,{comparisonRevision:'r1',requestedChange:'kind'}),producerVersion:await specimen(t,{comparisonRevision:'r1',requestedChange:'version'}),
+  producerHash:await specimen(t,{comparisonRevision:'r1',requestedChange:'hash'}),
+  language:await specimen(t,{comparisonRevision:'r1',language:'java'}),
+  positionEncoding:await specimen(t,{comparisonRevision:'r1',requestedChange:'encoding'}),
+  producerLanguages:await specimen(t,{comparisonRevision:'r1',requestedChange:'languages'})};
+ const otherValue=(field,fixture)=>{
+  const snapshot=fixture.loaded.revisions.get(JSON.stringify([fixture.loaded.comparison.sourceSetId,fixture.loaded.comparison.revisionId]));
+  const requested=fixture.loaded.comparison.producers.find(x=>x.id==='one');
+  switch(field){
+   case 'revisionId':return snapshot.id;
+   case 'sourceManifestHash':return sourceManifestHash(snapshot.documents.map(x=>({document:x.key,contentHash:x.contentHash})));
+   case 'toolchainHash':case 'configHash':case 'dependencyHash':return snapshot[field];
+   case 'sourceSetId':return fixture.loaded.comparison.sourceSetId;
+   case 'producerId':return fixture.loaded.comparison.producers.find(x=>x.id==='two').id;
+   case 'producerKind':return requested.kind;
+   case 'producerVersion':return requested.version;
+   case 'producerHash':return requested.executableHash;
+   case 'language':return fixture.loaded.fixture.language;
+   case 'positionEncoding':return requested.positionEncoding;
+   case 'producerLanguages':return requested.languages;
+  }
+ };
+ for(const [field,fixture] of Object.entries(alternate)){
+  checkCoverage(fixture.loaded,fixture.records);
+  const changed=otherValue(field,fixture);
+  assert.notDeepEqual(changed,captured[field],field);
+  for(const [label,value] of [['changed',changed],['unavailable',null]])await t.test(`${field}-${label}`,async()=>{
+   const request={...structuredClone(captured),[field]:value};
+   assert.equal(request.documentHash,captured.documentHash);
+   assert.equal(compareFreshnessComponents(captured,request),'possiblyStale');
+   const control=registerControls([{id:`U1.component-${field}-${label}`,baseline:()=>({request,freshness:'possiblyStale'}),
+    check:x=>assertFreshnessComponents(captured,x.request,x.freshness),mutate:x=>{x.freshness='fresh';return x;},expectedAssertion:'FRESHNESS.STATE',expectedCode:'invalidRecord',expectedField:'freshness'}])[0];
+   await runControl(control);
+  });
+ }
+ const selected=base.loaded.revisions.get('["main","r1"]');
+ const r2=alternate.revisionId.loaded.revisions.get('["main","r2"]');
+ const changedBytes=await specimen(t,{comparisonRevision:'r2'});
+ checkCoverage(changedBytes.loaded,changedBytes.records);
+ const otherHash=changedBytes.loaded.revisions.get('["main","r2"]').documents[0].contentHash;
+ assert.notEqual(otherHash,captured.documentHash);
+ for(const [label,documentHash] of [['changed',otherHash],['missing',null]]){
+  const request={...captured,revisionId:r2.id,documentHash};
+  assert.equal(compareFreshnessComponents(captured,request),'stale',label);
+ }
+ assert.equal(selected.documents[0].contentHash,captured.documentHash);
+});
+
+test('integrated admitted r1/r2 snapshots with two source sets preserve independent coverage and proofs',async t=>{
+ const baseline=await specimen(t,{comparisonRevision:'r1',secondSet:true});
+ const C=checkCoverage(baseline.loaded,baseline.records);
+ assert.equal(C.sourceSets.size,2);
+ assert.equal(C.revisions.size,3);
+ assert.equal(C.coverageByTuple.size,15);
+ const proof=baseline.records.provenance.find(x=>x.producerId==='one');
+ assert.equal(proof.freshness,'fresh');
+ const promoted=structuredClone(baseline.records);
+ promoted.comparison.sourceSetId='other';
+ assert.throws(()=>checkCoverage(baseline.loaded,promoted),e=>e.assertion==='RECORDS.IDENTITY'&&e.field==='comparison');
+ const selectedOther=await specimen(t,{comparisonRevision:'r1',secondSet:true,comparisonSet:'other'});
+ assert.equal(checkCoverage(selectedOther.loaded,selectedOther.records).semanticProofsById.size,2);
+ assert.equal(selectedOther.records.provenance[0].freshness,'possiblyStale');
+ const falseFresh=structuredClone(selectedOther.records);falseFresh.provenance[0].freshness='fresh';
+ assert.throws(()=>checkCoverage(selectedOther.loaded,falseFresh),e=>e.assertion==='FRESHNESS.STATE'&&e.code==='invalidRecord'&&e.field==='freshness');
+ const shifted=await specimen(t,{setId:'other',comparisonRevision:'r1'});
+ assert.equal(checkCoverage(shifted.loaded,shifted.records).semanticProofsById.size,2);
+ const captured={documentHash:proof.contentHash,revisionId:proof.revisionId,sourceManifestHash:proof.basis.sourceManifestHash,
+  toolchainHash:proof.basis.toolchainHash,configHash:proof.basis.configHash,dependencyHash:proof.basis.dependencyHash,
+  sourceSetId:proof.document.sourceSetId,producerId:proof.producerId,producerKind:'semantic',producerVersion:proof.basis.producerVersion,
+  producerHash:proof.basis.producerHash,language:proof.document.language,positionEncoding:'utf8',producerLanguages:['javascript']};
+ assert.equal(assertFreshnessComponents(captured,{...captured,sourceSetId:shifted.fixture.comparison.sourceSetId},'possiblyStale'),'possiblyStale');
 });

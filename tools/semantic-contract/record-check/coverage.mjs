@@ -36,17 +36,43 @@ function capturedBasis(proof,loaded,proofRow){
  if(!proofRow||proofRow.hash!==basis.artifactHash||!equal((({freshness,...captured})=>captured)(proofRow.wrapper),(({freshness,...captured})=>captured)(proof)))fail('FRESHNESS.BASIS','provenance','proof does not match captured fact and wrapper');
  return producer;
 }
+// Compare authenticated capture values with the selected, admitted request. This policy
+// also accepts a null requested component when a requested value is unavailable.
+export function compareFreshnessComponents(captured,requested){
+ if(requested.documentHash===null||requested.documentHash!==captured.documentHash)return 'stale';
+ for(const field of ['revisionId','sourceManifestHash','toolchainHash','configHash','dependencyHash','sourceSetId','producerId','producerKind','producerVersion','producerHash','language','positionEncoding','producerLanguages']){
+  if(requested[field]===null||!equal(requested[field],captured[field]))return 'possiblyStale';
+ }
+ return 'fresh';
+}
+export function assertFreshnessComponents(captured,requested,claimed){
+ const actual=compareFreshnessComponents(captured,requested);
+ if(claimed!==actual)fail('FRESHNESS.STATE','freshness','incorrect freshness label');
+ return actual;
+}
 function freshness(proof,loaded,producer){
  const selected=loaded.revisions.get(snapshotKey(loaded.comparison.sourceSetId,loaded.comparison.revisionId));
  const wanted=selected?.documents.find(x=>x.key.path===proof.document.path&&x.key.language===proof.document.language);
- if(!wanted||wanted.contentHash!==proof.contentHash)return 'stale';
- if(producer.kind==='native')return loaded.comparison.sourceSetId===proof.document.sourceSetId&&loaded.comparison.revisionId===proof.revisionId?'fresh':'possiblyStale';
- const b=proof.basis,requested=loaded.comparison.producers.find(x=>x.id===b.producerId);
- if(!requested||requested.kind!=='semantic'||!equal(requested,producer)||!capture(loaded,'executable',requested.executableHash)||
-   loaded.comparison.sourceSetId!==b.sourceSetId||loaded.comparison.revisionId!==b.revisionId||
-   sourceManifestHash(selected.documents.map(x=>({document:x.key,contentHash:x.contentHash})))!==b.sourceManifestHash||
-   selected.toolchainHash!==b.toolchainHash||selected.configHash!==b.configHash||selected.dependencyHash!==b.dependencyHash)return 'possiblyStale';
- return 'fresh';
+ if(producer.kind==='native'){
+  if(!wanted||wanted.contentHash!==proof.contentHash)return 'stale';
+  return loaded.comparison.sourceSetId===proof.document.sourceSetId&&loaded.comparison.revisionId===proof.revisionId?'fresh':'possiblyStale';
+ }
+ const basis=proof.basis,requestedProducer=loaded.comparison.producers.find(x=>x.id===basis.producerId);
+ const captured={documentHash:proof.contentHash,revisionId:basis.revisionId,sourceManifestHash:basis.sourceManifestHash,
+  toolchainHash:basis.toolchainHash,configHash:basis.configHash,dependencyHash:basis.dependencyHash,
+  sourceSetId:basis.sourceSetId,producerId:producer.id,producerKind:producer.kind,producerVersion:producer.version,
+  producerHash:producer.executableHash,language:proof.document.language,positionEncoding:producer.positionEncoding,
+  producerLanguages:producer.languages};
+ const requested={documentHash:wanted?.contentHash??null,revisionId:selected?.id??null,
+  sourceManifestHash:selected?sourceManifestHash(selected.documents.map(x=>({document:x.key,contentHash:x.contentHash}))):null,
+  toolchainHash:selected?.toolchainHash??null,configHash:selected?.configHash??null,dependencyHash:selected?.dependencyHash??null,
+  sourceSetId:loaded.comparison.sourceSetId,producerId:requestedProducer?.id??null,producerKind:requestedProducer?.kind??null,
+  producerVersion:requestedProducer?.version??null,producerHash:requestedProducer?.executableHash??null,
+  language:requestedProducer?.languages.includes(proof.document.language)?proof.document.language:null,
+  positionEncoding:requestedProducer?.positionEncoding??null,producerLanguages:requestedProducer?.languages??null};
+ // A requested executable without matching captured bytes is unavailable, not fresh.
+ if(requestedProducer&&!capture(loaded,'executable',requestedProducer.executableHash))requested.producerHash=null;
+ return assertFreshnessComponents(captured,requested,proof.freshness);
 }
 function coverageState(row,intent){
  const requested=intent.requestedRoles,support=new Map(intent.measurementSupport.map(x=>[x.kind,x.available]));
