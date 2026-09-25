@@ -51,7 +51,7 @@ test('independent measured source baseline, ownership, candidates, and native pr
  assert.equal(result.nativeReferenceDescriptors[0].lookupKey,'target');
  assert.equal(result.recordByNativeRef.has('reference'),false);
 });
-test('measurement validates independently witnessed source without a Java-only kind ban',()=>{
+test('measured Java ordinary functions reject even with independent byte witnesses',()=>{
  const s=sample(),document={...doc,language:'java',path:'src/main.java'};
  const id=name=>syntax({sourceSet:'main',path:document.path,language:'java',ancestors:[],declaration:{kind:'function',name,signature:null,ordinal:0}});
  const call=occurrence({revisionId:'r1',ownerSyntaxId:id('main'),kind:'call',ordinal:0});
@@ -63,7 +63,7 @@ test('measurement validates independently witnessed source without a Java-only k
  s.records.declarations.sort(orderSyntax);
  s.records.calls[0].id=call;s.records.calls[0].ownerSyntaxId=id('main');s.records.calls[0].regionIds=[control];s.records.calls[0].provenanceId=`native:r1:${call}`;
  s.records.controlRegions[0].id=control;s.records.controlRegions[0].ownerSyntaxId=id('main');s.records.controlRegions[0].provenanceId=`native:r1:${control}`;
- assert.equal(checkMeasurement(s.loaded,s.records).recordByNativeRef.get('main').syntaxId,id('main'));
+ assert.throws(()=>checkMeasurement(s.loaded,s.records),e=>e.assertion==='MEASUREMENT.WITNESS'&&e.code==='invalidRecord'&&e.field==='kind');
 });
 async function admitSpec(spec){
  const root=await mkdtemp(join(tmpdir(),'measurement-u2-'));
@@ -215,6 +215,8 @@ for(const [language,spelling,expected] of [
 });
 test('Java method projection and non-Java signature exclusion',()=>{
  const s=lexical('java','go','go');assert.equal(checkMeasurement(s.loaded,s.records).recordByNativeRef.get('go').key.signature.typeParameterCount,0);
+ const forbidden=structuredClone(s);forbidden.loaded.native.declarations[0].kind='function';forbidden.loaded.native.declarations[0].header.kind='function';forbidden.loaded.native.declarations[0].signature=null;
+ assert.throws(()=>checkMeasurement(forbidden.loaded,forbidden.records),e=>e.assertion==='MEASUREMENT.WITNESS'&&e.code==='invalidRecord'&&e.field==='kind');
  s.loaded.native.declarations[0].signature.typeParameterCount=1;
  assert.throws(()=>checkMeasurement(s.loaded,s.records),e=>e.assertion==='MEASUREMENT.WITNESS'&&e.field==='signature');
  const js=lexical('javascript','go','go');js.loaded.native.declarations[0].signature={parameterTypes:[],typeParameterCount:0,variadic:false};
