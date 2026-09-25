@@ -393,7 +393,7 @@ fn rust_canonical_ancestors_and_lookup_keys_are_measured() {
         &source_set,
         &path,
         Language::Rust,
-        &[module.clone()],
+        std::slice::from_ref(&module),
         &key("café", 0),
     )
     .unwrap();
@@ -409,7 +409,7 @@ fn rust_canonical_ancestors_and_lookup_keys_are_measured() {
             &source_set,
             &path,
             Language::Rust,
-            &[nested_parent.clone()],
+            std::slice::from_ref(&nested_parent),
             &key("café", ordinal as u64),
         )
         .unwrap();
