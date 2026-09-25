@@ -577,3 +577,150 @@ fn shared_holder_child() {
         guard.verify().unwrap();
     }
 }
+use std::os::unix::fs::PermissionsExt;
+
+#[test]
+fn durable_first_save_empty_record_and_payloads() {
+    use baleyg::{
+        model::{Annotation, SavedView},
+        store::topology::DurableRecords,
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &id);
+    assert!(records.views().unwrap().is_empty());
+    assert!(records.annotations().unwrap().is_empty());
+    assert!(!records.delete_view("missing").unwrap());
+    assert!(!roots.data.exists(), "read-only access created data root");
+    let view: SavedView = serde_json::from_str(r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{"symbol":{"x":12.5,"y":9.25}}}"#).unwrap();
+    records.put_view(&view).unwrap();
+    let annotation = Annotation {
+        id: "note1".into(),
+        node_id: "symbol".into(),
+        body: "Original text".into(),
+    };
+    records.put_annotation(&annotation).unwrap();
+    assert_eq!(records.view("view1").unwrap(), Some(view.clone()));
+    assert_eq!(records.annotations().unwrap(), vec![annotation.clone()]);
+    assert!(records.delete_view("view1").unwrap());
+    assert!(records.delete_annotation("note1").unwrap());
+    assert!(records.views().unwrap().is_empty());
+    assert!(roots.record_db(&id).exists());
+    let db = rusqlite::Connection::open(roots.record_db(&id)).unwrap();
+    assert_eq!(
+        db.query_row("SELECT record_id FROM record_metadata", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        id.record_id
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM known_roots", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        tables,
+        ["annotations", "known_roots", "record_metadata", "views"]
+    );
+    assert!(
+        !roots
+            .record_db(&id)
+            .with_file_name("workspace.db-wal")
+            .exists()
+    );
+}
+
+#[test]
+fn durable_git_move_and_copy_share_payload_without_rewriting() {
+    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    common::private(&work.join(".git"));
+    let original = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let note = Annotation {
+        id: "note".into(),
+        node_id: "gone".into(),
+        body: "Persist verbatim".into(),
+    };
+    DurableRecords::new(&roots, &original)
+        .put_annotation(&note)
+        .unwrap();
+    let copied = temp.path().join("copy");
+    fs::create_dir(&copied).unwrap();
+    common::private(&copied.join(".git"));
+    fs::create_dir(copied.join(".git/baleyg")).unwrap();
+    fs::set_permissions(
+        copied.join(".git/baleyg"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::copy(
+        work.join(".git/baleyg/workspace-id"),
+        copied.join(".git/baleyg/workspace-id"),
+    )
+    .unwrap();
+    let copy = WorkspaceIdentity::discover(Some(&copied), &copied).unwrap();
+    assert_eq!(copy.record_id, original.record_id);
+    assert_eq!(
+        DurableRecords::new(&roots, &copy).annotations().unwrap(),
+        vec![note.clone()]
+    );
+    let moved = temp.path().join("moved");
+    fs::rename(&work, &moved).unwrap();
+    let moved_id = WorkspaceIdentity::discover(Some(&moved), &moved).unwrap();
+    DurableRecords::new(&roots, &moved_id)
+        .put_annotation(&note)
+        .unwrap();
+    assert_eq!(
+        DurableRecords::new(&roots, &copy).annotations().unwrap(),
+        vec![note]
+    );
+    assert!(
+        DurableRecords::new(&roots, &original)
+            .annotations()
+            .is_err()
+    );
+    let db = rusqlite::Connection::open(roots.record_db(&copy)).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM known_roots", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn durable_incomplete_and_incompatible_refused() {
+    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    roots.prepare_records(&id).unwrap();
+    common::private(&roots.record_dir(&id));
+    let note = Annotation {
+        id: "note".into(),
+        node_id: "node".into(),
+        body: "Body".into(),
+    };
+    assert!(
+        DurableRecords::new(&roots, &id)
+            .put_annotation(&note)
+            .is_err()
+    );
+    assert!(!roots.record_db(&id).exists());
+    let _lock = roots.record_use(&id, true).unwrap();
+    let db = rusqlite::Connection::open(roots.record_db(&id)).unwrap();
+    db.pragma_update(None, "user_version", 99).unwrap();
+    drop(db);
+    drop(_lock);
+    assert!(DurableRecords::new(&roots, &id).annotations().is_err());
+}
