@@ -129,10 +129,10 @@ impl Drop for StagedIndex {
         }
         if let (Ok(owned), Ok(named)) =
             (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+            && owned.dev() == named.dev()
+            && owned.ino() == named.ino()
         {
-            if owned.dev() == named.dev() && owned.ino() == named.ino() {
-                let _ = std::fs::remove_file(&self.path);
-            }
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
