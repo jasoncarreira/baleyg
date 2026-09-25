@@ -72,7 +72,7 @@ export const types = Object.freeze({
   TargetRef:union('kind',{internal:object({kind:literal('internal'),declarationRef:'Text',revisionId:'Text'}),external:object({kind:literal('external'),symbol:'SymbolKey'})}),
   TypeRelationshipFact:object({kind:literal('typeRelationship'),ref:'Text',relationshipKind:enumOf('extends','implements','overrides'),source:'TargetRef',target:'TargetRef',provenanceRef:'Text'}),
   InternalTargetRef:object({kind:literal('internal'),declarationRef:'Text',revisionId:'Text'}),
-  ReferenceEvidenceTemplate:object({site:enumOf('declaration','use'),roles:array('Role'),resolution:'Resolution',declaredTarget:nullable('TargetTemplate'),candidates:array('TargetTemplate'),provenanceId:'Text'}),
+  ReferenceEvidenceTemplate:object({site:enumOf('declaration','use'),roles:array('Role'),resolution:'Resolution',declaredTarget:nullable('TargetRef'),candidates:array('TargetRef'),provenanceId:'Text'}),
   ReferenceFact:object({kind:literal('reference'),ref:'Text',anchor:'AnchorSelector',record:'ReferenceEvidenceTemplate'}),
   DeclarationBindingFact:object({kind:literal('declarationBinding'),ref:'Text',anchor:'AnchorSelector',record:'DeclarationBindingEvidenceTemplate'}),
   CallBindingFact:object({kind:literal('callBinding'),ref:'Text',anchor:'AnchorSelector',record:'CallBindingEvidenceTemplate'}),
@@ -90,7 +90,7 @@ export const types = Object.freeze({
   AttemptedGraphRequest:object({sourceSetId:'Text',revisionId:'Text',rootSyntaxId:'SyntaxId',semanticProducerId:nullable('Text'),depth:'UInt',maxNodes:'UInt',maxCalls:'UInt'}),
   AnswerCase:object({id:'Text',attemptedRequest:'GraphRequestTemplate',answer:'GraphAnswerTemplate'}),
   AnswersInputV1:object({formatVersion:literal(1),answers:array('AnswerCase')}),
-  MaterializedAnswerCase:object({id:'Text',attemptedRequest:'GraphRequest',answer:'GraphAnswer'}),
+  MaterializedAnswerCase:object({id:'Text',attemptedRequest:'AttemptedGraphRequest',answer:'GraphAnswer'}),
   AnswersV1:object({formatVersion:literal(1),answers:array('MaterializedAnswerCase')}),
   JoinDisposition:object({kind:literal('join'),factRef:'Text',disposition:enumOf('exact','ambiguous','unmatched','unsupported')}),
   ResolutionDisposition:object({kind:literal('resolution'),factRef:'Text',disposition:enumOf('resolved','provenExternal','ambiguous','unresolved')}),
@@ -111,14 +111,14 @@ export const types = Object.freeze({
 // The only places where an authored answer may substitute an identity or a record.
 const identity = name => ({either:[name,'IdentityRef']});
 const record = name => ({either:[name,'RecordRef']});
-const templateTarget = union('kind', {internal:object({kind:literal('internal'),syntaxId:identity('SyntaxId'),document:'DocumentKey',revisionId:'Text'}),external:types.Target.union.variants.external});
+const templateTarget = union('kind', {internal:object({kind:literal('internal'),declarationRef:'Text',revisionId:'Text'}),external:types.Target.union.variants.external});
 export const schemas = Object.freeze({...types,
  TargetTemplate:templateTarget,
  DeclarationBindingTemplate:object({syntaxId:nullable(identity('SyntaxId')),symbols:array('SymbolKey'),join:'Join',provenanceId:'Text'}),
  DeclarationBindingEvidenceTemplate:object({symbols:array('SymbolKey'),provenanceId:'Text'}),
- CallBindingEvidenceTemplate:object({resolution:'Resolution',declaredTarget:nullable('TargetTemplate'),candidates:array('TargetTemplate'),dispatch:enumOf('direct','constructor','virtual','interface','dynamic','unknown'),possibleDispatch:array('TargetTemplate'),possibleDispatchComplete:literal(false),provenanceId:'Text'}),
- CallBindingTemplate:object({callId:nullable(identity('OccurrenceId')),join:'Join',resolution:'Resolution',declaredTarget:nullable('TargetTemplate'),candidates:array('TargetTemplate'),dispatch:enumOf('direct','constructor','virtual','interface','dynamic','unknown'),possibleDispatch:array('TargetTemplate'),possibleDispatchComplete:literal(false),staleTarget:nullable('boolean'),provenanceId:'Text'}),
- SymbolTemplate:object({key:'SymbolKey',displayName:nullable('Text'),declarations:array('TargetTemplate'),provenanceId:'Text'}),
+ CallBindingEvidenceTemplate:object({resolution:'Resolution',declaredTarget:nullable('TargetRef'),candidates:array('TargetRef'),dispatch:enumOf('direct','constructor','virtual','interface','dynamic','unknown'),possibleDispatch:array('TargetRef'),possibleDispatchComplete:literal(false),provenanceId:'Text'}),
+ CallBindingTemplate:object({callId:nullable(identity('OccurrenceId')),join:'Join',resolution:'Resolution',declaredTarget:nullable('TargetRef'),candidates:array('TargetRef'),dispatch:enumOf('direct','constructor','virtual','interface','dynamic','unknown'),possibleDispatch:array('TargetRef'),possibleDispatchComplete:literal(false),staleTarget:nullable('boolean'),provenanceId:'Text'}),
+ SymbolTemplate:object({key:'SymbolKey',displayName:nullable('Text'),declarations:array('TargetRef'),provenanceId:'Text'}),
  GraphRequestTemplate:object({...types.GraphRequest.object,rootSyntaxId:identity('SyntaxId')}),
  GraphNodeTemplate:object({declaration:record('Declaration'),depth:'UInt'}),
  GraphEdgeTemplate:object({call:record('Call'),from:identity('SyntaxId'),to:nullable(identity('SyntaxId')),binding:nullable(record('CallBinding')),visit:types.GraphEdge.object.visit,boundaryReason:types.GraphEdge.object.boundaryReason}),

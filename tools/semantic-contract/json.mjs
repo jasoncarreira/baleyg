@@ -1,11 +1,13 @@
 // The parser checks token spellings before JSON.parse can discard duplicate keys or -0.
 export function parseJson(input) {
-  const source = Buffer.isBuffer(input) || input instanceof Uint8Array
-    ? new TextDecoder('utf-8', {fatal:true}).decode(input) : input;
+  const bytes = Buffer.isBuffer(input) || input instanceof Uint8Array;
+  if (bytes && input[0] === 0xef && input[1] === 0xbb && input[2] === 0xbf) throw new SyntaxError('JSON.INTAKE leading BOM');
+  const source = bytes ? new TextDecoder('utf-8', {fatal:true, ignoreBOM:true}).decode(input) : input;
   if (typeof source !== 'string') throw new TypeError('JSON input must be UTF-8 bytes or text');
+  if (source.charCodeAt(0) === 0xfeff) throw new SyntaxError('JSON.INTAKE leading BOM');
   let i = 0;
   const error = message => { throw new SyntaxError(`JSON.INTAKE at offset ${i}: ${message}`); };
-  const space = () => { while (/\s/.test(source[i] ?? '') && i < source.length) i++; };
+  const space = () => { while (i < source.length && /[ \t\n\r]/.test(source[i])) i++; };
   function string() {
     const begin=i;
     if (source[i++] !== '"') error('expected string');
@@ -66,7 +68,14 @@ function encode(value) {
   if (typeof value === 'string') return encodeString(value);
   if (typeof value === 'boolean') return String(value);
   if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && !Object.is(value,-0)) return String(value);
-  if (Array.isArray(value)) return `[${value.map(encode).join(',')}]`;
+  if (Array.isArray(value)) {
+    const parts=[];
+    for (let i=0;i<value.length;i++) {
+      if (!Object.hasOwn(value,i)) throw new TypeError(`JSON.CANONICAL sparse array at [${i}]`);
+      parts.push(encode(value[i]));
+    }
+    return `[${parts.join(',')}]`;
+  }
   if (typeof value === 'object' && value && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
     const keys=Object.keys(value).sort((a,b) => Buffer.compare(Buffer.from(a),Buffer.from(b)));
     return `{${keys.map(key => `${encodeString(key)}:${encode(value[key])}`).join(',')}}`;

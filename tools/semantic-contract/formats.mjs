@@ -36,7 +36,10 @@ function walk(spec, value, path) {
   }
   if (Object.hasOwn(spec, 'literal')) { if (value !== spec.literal) fail(path, `expected ${JSON.stringify(spec.literal)}`); return; }
   if (spec.enum) { if (!spec.enum.includes(value)) fail(path, `expected one of ${spec.enum.join(', ')}`); return; }
-  if (spec.array) { if (!Array.isArray(value)) fail(path, 'expected array'); value.forEach((item, i) => walk(spec.array, item, `${path}[${i}]`)); return; }
+  if (spec.array) { if (!Array.isArray(value)) fail(path, 'expected array'); for (let i=0;i<value.length;i++) {
+    if (!Object.hasOwn(value,i)) fail(`${path}[${i}]`, 'sparse array element');
+    walk(spec.array, value[i], `${path}[${i}]`);
+  } return; }
   if (spec.union) {
     if (!plain(value)) fail(path, 'expected object');
     const tag = spec.union.tag;

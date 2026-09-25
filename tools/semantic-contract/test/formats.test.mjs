@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { schemas } from '../schema.mjs';
 import { validate } from '../formats.mjs';
 import { canonicalBytes, parseJson } from '../json.mjs';
-import { registerControls, runControl, schemaFieldControls } from './mutations.mjs';
+import { controls, registerControls, runControl, schemaFieldControls } from './mutations.mjs';
 
 function sample(spec, trail=[]) {
   if (typeof spec === 'string' && Object.hasOwn(schemas,spec)) {
@@ -82,4 +82,157 @@ test('CANONICAL.INTAKE: duplicate-safe strict Unicode and integer tokens',() => 
   assert.deepEqual({...parseJson('{"a":[0,true,null,"é"]}')},{a:[0,true,null,'é']});
   assert.equal(canonicalBytes({z:'\n\t\0"\\\u2028\u2029',a:[0,true,null]}).toString(),'{"a":[0,true,null],"z":"\\u000a\\u0009\\u0000\\"\\\\\u2028\u2029"}');
   for (const value of [-0,1.5,Number.MAX_SAFE_INTEGER+1,'\ud800',{x:undefined}]) assert.throws(() => canonicalBytes(value));
+});
+
+// A populated specimen reaches nested policies which empty-envelope checks cannot reach.
+function populated(spec, trail=[], alternatives=false) {
+  if (typeof spec === 'string' && Object.hasOwn(schemas,spec)) return populated(schemas[spec],[...trail,spec],alternatives);
+  if (typeof spec === 'string') return sample(spec);
+  if (spec.nullable) return populated(spec.nullable,trail,alternatives);
+  if (spec.either) return populated(spec.either[alternatives ? spec.either.length-1 : 0],trail,alternatives);
+  if (Object.hasOwn(spec,'literal')) return spec.literal;
+  if (spec.enum) return spec.enum[0];
+  if (spec.array) return [populated(spec.array,trail,alternatives)];
+  if (spec.union) return populated(Object.values(spec.union.variants)[alternatives ? Object.keys(spec.union.variants).length-1 : 0],trail,alternatives);
+  if (spec.object) return Object.fromEntries(Object.entries(spec.object).map(([field,child]) => [field,populated(child,trail,alternatives)]));
+  throw Error(`unknown schema ${String(spec)}`);
+}
+function checkShape(type, value, field) {
+  assert.throws(() => validate(type,value), error => {
+    assert.equal(error.assertion,'FORMAT.SHAPE');
+    assert.equal(error.code,'invalidRecord');
+    assert.equal(error.field,field);
+    return true;
+  });
+}
+function nestedPolicies(type, spec, value, path, root, seen=new Set()) {
+  if (typeof spec === 'string' && Object.hasOwn(schemas,spec)) {
+    if (seen.has(spec)) return;
+    nestedPolicies(type,schemas[spec],value,path,root,new Set([...seen,spec])); return;
+  }
+  if (typeof spec === 'string') return;
+  if (spec.nullable) { nestedPolicies(type,spec.nullable,value,path,root,seen); return; }
+  if (spec.either) return; // Slot alternatives are checked separately below.
+  if (spec.array) {
+    for (let i=0;i<value.length;i++) nestedPolicies(type,spec.array,value[i],`${path}[${i}]`,root,seen);
+    return;
+  }
+  if (spec.union) {
+    const variant=spec.union.variants[String(value[spec.union.tag])];
+    nestedPolicies(type,variant,value,path,root,seen); return;
+  }
+  if (!spec.object) return;
+  for (const [field,child] of Object.entries(spec.object)) {
+    const prefix=`${path}.${field}`;
+    const bad=structuredClone(root);
+    // Walk the precise path from the root, including populated array elements.
+    const steps=prefix.slice(type.length).match(/\.[^.[\]]+|\[\d+\]/g) ?? [];
+    let parent=bad;
+    for (const step of steps.slice(0,-1)) parent=parent[step.startsWith('[') ? Number(step.slice(1,-1)) : step.slice(1)];
+    delete parent[field]; checkShape(type,bad,prefix);
+    if (!child?.nullable) {
+      const wrong=structuredClone(root);
+      let changed=wrong;
+      for (const step of steps.slice(0,-1)) changed=changed[step.startsWith('[') ? Number(step.slice(1,-1)) : step.slice(1)];
+      changed[field]=typeof value[field]==='string' ? 123 : typeof value[field]==='number' ? 'wrong' : typeof value[field]==='boolean' ? 'wrong' : false;
+      checkShape(type,wrong,prefix);
+    }
+    nestedPolicies(type,child,value[field],prefix,root,seen);
+  }
+  const bad=structuredClone(root), steps=path.slice(type.length).match(/\.[^.[\]]+|\[\d+\]/g) ?? [];
+  let target=bad;
+  for (const step of steps) target=target[step.startsWith('[') ? Number(step.slice(1,-1)) : step.slice(1)];
+  target.unexpected=true; checkShape(type,bad,`${path}.unexpected`);
+}
+test('FORMAT.POPULATED: all named shapes reject nested omission and unknown keys', () => {
+  for (const [type,spec] of Object.entries(schemas)) {
+    const specimen=populated(type); validate(type,specimen);
+    nestedPolicies(type,spec,specimen,type,specimen);
+    // Exercise the non-null branch of nullable fields and an alternate union/typed-ref branch.
+    const alternate=populated(type,[],true);
+    if (type==='TypeRelationshipFact') alternate.source=populated('InternalTargetRef');
+    validate(type,alternate);
+    if (spec.object) for (const [field,child] of Object.entries(spec.object)) {
+      if (child?.nullable) {
+        const nullable=structuredClone(specimen); nullable[field]=null; validate(type,nullable);
+      }
+      if (child?.array) {
+        const sparse=structuredClone(specimen); sparse[field]=Array(1);
+        checkShape(type,sparse,`${type}.${field}[0]`);
+      }
+    }
+  }
+});
+test('FORMAT.TYPED_REFS: only declared identity and record slots accept their own refs', () => {
+  const identity={ref:'declaration-a'}, record={recordRef:'call-a'};
+  for (const [type,field,allowed,wrong] of [
+    ['GraphRequestTemplate','rootSyntaxId',identity,record],
+    ['GraphNodeTemplate','declaration',record,identity],
+    ['GraphEdgeTemplate','call',record,identity],
+    ['AnchorResultTemplate','targetId',identity,record]
+  ]) {
+    const base=populated(type);
+    validate(type,{...base,[field]:allowed});
+    checkShape(type,{...base,[field]:wrong},`${type}.${field}`);
+  }
+  const internal={kind:'internal',declarationRef:'declaration-a',revisionId:'revision-a'};
+  const external={kind:'external',symbol:populated('SymbolKey')};
+  for (const [type,field] of [['ReferenceEvidenceTemplate','declaredTarget'],['CallBindingEvidenceTemplate','declaredTarget']]) {
+    const base=populated(type);
+    for (const target of [internal,external]) validate(type,{...base,[field]:target,candidates:[target]});
+    checkShape(type,{...base,[field]:{...internal,document:populated('DocumentKey')}},`${type}.${field}.document`);
+    checkShape(type,{...base,[field]:{kind:'internal',syntaxId:sample('SyntaxId'),document:populated('DocumentKey'),revisionId:'revision-a'}},`${type}.${field}.declarationRef`);
+  }
+  validate('SymbolTemplate',{...populated('SymbolTemplate'),declarations:[internal,external]});
+  validate('CallBindingTemplate',{...populated('CallBindingTemplate'),possibleDispatch:[internal,external]});
+  validate('TargetTemplate',internal);
+  checkShape('Target',internal,'Target.syntaxId');
+  checkShape('TargetRef',{...internal,syntaxId:sample('SyntaxId')},'TargetRef.syntaxId');
+});
+test('FORMAT.ENVELOPES.POPULATED: authored and published request policy stays distinct', () => {
+  for (const type of ['FixtureV1','AnnotationFile','AnswerCase','AnswersInputV1','AnswersV1','ManifestV1','NormalizedRecordsV1','ReferenceJoinDiagnostic']) validate(type,populated(type));
+  const attempted={...populated('AttemptedGraphRequest'),depth:6,maxNodes:0,maxCalls:501};
+  const failureAnswer=populated('Failure');
+  validate('AnswersV1',{formatVersion:1,answers:[{id:'case',attemptedRequest:attempted,answer:failureAnswer}]});
+  validate('AnswersInputV1',{formatVersion:1,answers:[{id:'case',attemptedRequest:{...attempted,rootSyntaxId:{ref:'root'}},answer:failureAnswer}]});
+  checkShape('GraphRequest',attempted,'GraphRequest.request');
+  const success=populated('Success');
+  validate('AnswersV1',{formatVersion:1,answers:[{id:'case',attemptedRequest:populated('AttemptedGraphRequest'),answer:success}]});
+  checkShape('AnswersV1',{formatVersion:1,answers:[{id:'case',attemptedRequest:attempted,answer:{...success,result:{...success.result,request:attempted}}}]},'AnswersV1.answers[0].answer.result.request.request');
+  checkShape('ManifestV1',{...populated('ManifestV1'),records:{...populated('FileDigest'),path:'/absolute'}},'ManifestV1.records.path');
+  checkShape('DocumentKey',{...populated('DocumentKey'),path:'src/../a'},'DocumentKey.path');
+  checkShape('DocumentKey',{...populated('DocumentKey'),sourceSetId:'\ud800'},'DocumentKey.sourceSetId');
+});
+test('CANONICAL.INTAKE: only JSON whitespace, no BOM, no sparse arrays', () => {
+  for (const value of ['\ufeff{}','\u00a0{}','{\u2003}', '[1,\u00a0 2]']) assert.throws(() => parseJson(value),/JSON.INTAKE/);
+  assert.throws(() => parseJson(Buffer.from([0xef,0xbb,0xbf,0x7b,0x7d])),/BOM/);
+  assert.deepEqual({...parseJson(' \t\r\n{}')},{});
+  for (const value of [Array(1),[,2],{nested:[[1,,3]]}]) assert.throws(() => canonicalBytes(value),/sparse array/);
+  for (const value of [[1,2],{nested:[{x:'é'},true,null]}]) assert.deepEqual(JSON.parse(canonicalBytes(value).toString()),JSON.parse(JSON.stringify(value)));
+  checkShape('SourceManifestInput',[,populated('SourceManifestRow')],'SourceManifestInput[0]');
+});
+test('MUTATION.REGISTRY: baseline is checked before mutation and IDs remain enumerable',async () => {
+  const id='FORMAT.REGISTRY.local-one';
+  const row={id,baseline:() => ({value:1}),check:v => assert.equal(v.value,1),mutate:v => v,expectedAssertion:'FORMAT.SHAPE',expectedCode:'invalidRecord',expectedField:'value'};
+  registerControls([row]);
+  assert.ok(controls.some(control => control.id===id));
+  assert.throws(() => registerControls([{...row}]),/Duplicate control/);
+  assert.throws(() => registerControls([{...row,id:'FORMAT.REGISTRY.no-check',check:null}]),/requires baseline, check and mutate functions/);
+  const second={...row,id:'FORMAT.REGISTRY.local-two'};
+  registerControls([second]);
+  assert.ok(controls.some(control => control.id===second.id));
+  let mutated=false;
+  await assert.rejects(runControl({...row,id:'FORMAT.REGISTRY.bad-baseline',baseline:() => ({}),check:v => {assert.equal(v.value,1)},mutate:v => {mutated=true;return v}}),/undefined !== 1/);
+  assert.equal(mutated,false);
+});
+
+test('FORMAT.UNIONS.POPULATED: each nested union variant enforces closed fields', () => {
+  for (const [type,spec] of Object.entries(schemas)) {
+    if (!spec.union) continue;
+    for (const variant of Object.values(spec.union.variants)) {
+      const value=populated(variant);
+      validate(type,value);
+      nestedPolicies(type,variant,value,type,value);
+    }
+  }
 });
