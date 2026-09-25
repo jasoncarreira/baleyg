@@ -295,13 +295,13 @@ const shapeControls=registerControls([
 for(const row of shapeControls)test(row.id,async t=>runControl({...row,check:async value=>check(await specimen(t,value.change))}));
 
 const proofControls=registerControls([
- ['SYMBOL.FACT.evidenceKind',0,'semanticReference','SYMBOL.FACT'],
- ['DECLARATION_BINDING.PROOF.evidenceKind',1,'semanticReference','JOIN.TUPLE'],
+ ['SYMBOL.FACT.evidenceKind',0,'semanticReference','IDENTITY.SEMANTIC'],
+ ['DECLARATION_BINDING.PROOF.evidenceKind',1,'semanticReference','IDENTITY.SEMANTIC'],
  ['RELATIONSHIP.PROOF.evidenceKind',2,'declarationBinding','IDENTITY.SEMANTIC']
 ].map(([id,index,evidenceKind,expectedAssertion])=>({id,baseline:()=>({}),
  mutate:value=>({...value,change:{proofs:proofs=>{proofs[index].evidenceKind=evidenceKind;}}}),
  check:async()=>true,expectedAssertion,expectedCode:'invalidRecord',
- expectedField:expectedAssertion==='IDENTITY.SEMANTIC'?'extends':'provenanceId'})));
+ expectedField:expectedAssertion==='IDENTITY.SEMANTIC'?['symbol','binding','extends'][index]:'provenanceId'})));
 for(const row of proofControls)test(row.id,async t=>runControl({...row,check:async value=>check(await specimen(t,value.change))}));
 
 async function inheritanceSpecimen(t,variant='valid',language='rust',withFacts=true) {

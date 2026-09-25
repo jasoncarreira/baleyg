@@ -1,5 +1,6 @@
 import {validate} from './formats.mjs';
 import {contentHash} from './identity.mjs';
+import {canonicalBytes} from './json.mjs';
 
 const tuple = (sourceSetId,revisionId) => JSON.stringify([sourceSetId,revisionId]);
 const sameDocument=(a,b)=>a.sourceSetId===b.sourceSetId && a.language===b.language && a.path===b.path;
@@ -49,7 +50,9 @@ export function checkCapturedBasis(provenance,loaded) {
   for(let i=1;i<deps.length;i++) assert(Buffer.compare(Buffer.from(deps[i-1]),Buffer.from(deps[i]))<0,
     'BASIS.LOOKUP_DEPENDENCIES','lookupDependencies','keys must be sorted and unique');
   const proof=loaded.semanticProofs?.get(provenance.id);
-  assert(proof?.hash===basis.artifactHash && JSON.stringify(proof.wrapper)===JSON.stringify({...provenance,freshness:undefined}),
+  const withoutFreshness=({freshness,...captured})=>captured;
+  assert(proof?.hash===basis.artifactHash &&
+    canonicalBytes(withoutFreshness(proof.wrapper)).equals(canonicalBytes(withoutFreshness(provenance))),
     'BASIS.RAW_FACT','provenance','no matching captured semantic fact and original proof wrapper');
   return {producer,revision};
 }
