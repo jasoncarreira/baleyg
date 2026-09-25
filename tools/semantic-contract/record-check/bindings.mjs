@@ -135,9 +135,9 @@ export function checkBindings(loaded,records,C,M,J) {
    const distinct=[...new Map(claims.map(x=>[key(x),x])).values()];
    const contradiction=distinct.length>1;
    if(contradiction) {
-    if(group.callId===null||unique.some(x=>x.resolution!=='resolved'||x.declaredTarget?.kind!=='internal'||x.candidates.length)||
+    if(group.callId===null||unique.some(x=>!['resolved','external'].includes(x.resolution)||x.declaredTarget===null||x.candidates.length)||
        new Set(unique.map(x=>x.provenanceId)).size!==unique.length)
-     reject('BINDING.CONTRADICTION','declaredTarget','contradictory targets need distinct exact internal proofs');
+     reject('BINDING.CONTRADICTION','declaredTarget','contradictory targets need distinct exact target proofs');
     const union=distinct.sort(compare);
     for(const x of unique)Object.assign(x,{resolution:'ambiguous',declaredTarget:null,candidates:union,staleTarget:null});
    } else if(unique.some(x=>!same({...x,provenanceId:null},{...first,provenanceId:null})))
@@ -174,6 +174,6 @@ export function checkBindings(loaded,records,C,M,J) {
 }
 function groupHasContradiction(groups,member) {
  return [...groups.values()].some(group=>group.members.includes(member)&&
-  group.targetProofs.some(x=>x.declaredTarget?.kind==='internal'&&
-   group.targetProofs.some(y=>y.declaredTarget?.kind==='internal'&&!same(x.declaredTarget,y.declaredTarget))));
+  group.targetProofs.some(x=>x.declaredTarget!==null&&
+   group.targetProofs.some(y=>y.declaredTarget!==null&&!same(x.declaredTarget,y.declaredTarget))));
 }

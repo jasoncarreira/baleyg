@@ -9,6 +9,7 @@ import {checkCoverage} from '../record-check/coverage.mjs';
 import {checkMeasurement,orderedEnvelope} from '../record-check/measurement.mjs';
 import {checkJoins} from '../record-check/joins.mjs';
 import {checkBindings} from '../record-check/bindings.mjs';
+import {normalizeFixture} from '../normalize.mjs';
 import {registerControls,runControl} from './mutations.mjs';
 
 const source='function main() { target(); }\nfunction target() { return 1; }\nfunction other() { return 2; }\nfunction third() { return 3; }\n';
@@ -96,10 +97,10 @@ async function specimen(t,{claims=['target'],dispatch='direct',resolution='resol
   }
  }
  // Old evidence tracks both changed source bytes and unchanged bytes in a newer revision.
- const coverage=(producerId,rev,doc=document)=>({producerId,language:'javascript',sourceSetId:doc.sourceSetId,documentPath:doc.path,revisionId:rev,requested:true,selected:true,state:'complete',supportedRoles:['read'],observedRoles:['read'],diagnostic:null});
+ const coverage=(producerId,rev,doc=document)=>({producerId,language:'javascript',sourceSetId:doc.sourceSetId,documentPath:doc.path,revisionId:rev,requested:true,selected:true,state:status==='unsupported'?'partial':'complete',supportedRoles:['read','call'],observedRoles:status==='unsupported'?['read']:['read','call'],diagnostic:status==='unsupported'?'call measurement unavailable':null});
  const fixture={formatVersion:1,profile:'example',language:'javascript',sourceSets:[{id:'main',rootId:'root',languages:['javascript'],dependencies:[]},...(admittedTargets?[{id:'other',rootId:'other-root',languages:['javascript'],dependencies:[]}]:[])],producers:producersList,
   revisions:revisions.flatMap(rev=>[revision(rev,'main'),...(admittedTargets?[revision(rev,'other')]:[])]),comparison:{sourceSetId:'main',revisionId:revisions.at(-1),producers:producersList},
-  coverageIntents:revisions.flatMap(rev=>documents.flatMap(doc=>producersList.map(producer=>({producerId:producer.id,document:doc,revisionId:rev,requestedRoles:['read'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:status!=='unsupported'||kind!=='callee',diagnostic:status==='unsupported'&&kind==='callee'?'unsupported':null}))})))),
+  coverageIntents:revisions.flatMap(rev=>documents.flatMap(doc=>producersList.map(producer=>({producerId:producer.id,document:doc,revisionId:rev,requestedRoles:['read','call'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:status!=='unsupported'||kind!=='callee',diagnostic:status==='unsupported'&&kind==='callee'?'unsupported':null}))})))),
   nativeArtifact:'captures/native.json',semanticArtifacts:artifactPaths,annotationFiles:revisions.flatMap(rev=>documents.map(doc=>`${fileFor(doc,rev)}.annotations.json`)),answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  for(const rev of revisions)for(const doc of documents) {
   put(fileFor(doc,rev),textFor(doc,rev));
@@ -361,11 +362,42 @@ test('finite loaded binding controls run valid baseline before each one-property
  for(const row of rows)await runControl(row);
 });
 
+test('internal and external exact claims resolve to ambiguous Target[] with both proofs',async t=>{
+ const options={claims:['target','other'],raw:facts=>{
+  facts[1].fact.record.resolution='external';facts[1].fact.record.declaredTarget={kind:'external',symbol:external.symbol};
+ },output:rows=>{
+  const candidates=order([internal('target'),external]);
+  for(const row of rows){row.candidates=candidates;row.resolution='ambiguous';row.declaredTarget=null;row.staleTarget=null;}
+  rows.splice(0,rows.length,...order(rows));
+ }};
+ const s=await specimen(t,options),B=check(s);
+ const expected=order(['proof-0','proof-1'].map(provenanceId=>({
+  callId:callId('r1'),join:s.expectedJoin(s.facts[0].fact),resolution:'ambiguous',declaredTarget:null,
+  candidates:order([internal('target'),external]),dispatch:'direct',possibleDispatch:[],
+  possibleDispatchComplete:false,staleTarget:null,provenanceId
+ })));
+ assert.equal(canon(B.callBindings),canon(expected));
+ const compilation=normalizeFixture(s.loaded);
+ assert.equal(canon(compilation.records.callBindings),canon(expected));
+ for(const [factRef,proofId] of [['binding-0','proof-0'],['binding-1','proof-1']]){
+  assert.equal(compilation.recordMap.get(factRef).provenanceId,proofId);
+  assert.equal(compilation.recordMap.get(factRef).resolution,'ambiguous');
+  assert.equal(canon(compilation.recordMap.get(factRef).candidates),canon(order([internal('target'),external])));
+ }
+ assert.deepEqual([...B.groups.values()][0].provenanceIds,['proof-0','proof-1']);
+ assert.equal(canon([...B.groups.values()][0].targetProofs.map(({declaredTarget})=>declaredTarget)),
+  canon([internal('target'),external]));
+ for(const row of B.callBindings){assert.equal(row.resolution,'ambiguous');assert.equal(row.declaredTarget,null);assert.equal(row.candidates.length,2);}
+ const wrong=await specimen(t,{claims:['target','other'],raw:options.raw});
+ const checks=wrong.prechecks();
+ assert.throws(()=>checkBindings(wrong.loaded,wrong.records,checks.C,checks.M,checks.J),e=>
+  e.assertion==='BINDING.CONTRADICTION'&&e.code==='invalidRecord'&&e.field==='candidates');
+});
+
 test('admitted target claims reject wrong measured refs and inconsistent contributors',async t=>{
  for(const [label,option,assertion,field] of [
   ['missing-target',{raw:facts=>{facts[0].fact.record.declaredTarget.declarationRef='r1:missing';}},'BINDING.TARGET','declaredTarget'],
   ['revision-target',{raw:facts=>{facts[0].fact.record.declaredTarget.revisionId='r2';}},'BINDING.TARGET','declaredTarget'],
-  ['external-contradiction',{claims:['target','other'],raw:facts=>{facts[1].fact.record.resolution='external';facts[1].fact.record.declaredTarget={kind:'external',symbol:external.symbol};}},'BINDING.CONTRADICTION','declaredTarget'],
   ['non-target-dispatch',{claims:['target','other'],raw:facts=>{facts[1].fact.record.possibleDispatch=[{kind:'internal',declarationRef:'r1:third',revisionId:'r1'}];}},'BINDING.CONTRADICTION','callBindings']
  ]) {
   const s=await specimen(t,option),{C,M,J}=s.prechecks();

@@ -8,6 +8,8 @@ import {loadFixture} from '../load.mjs';
 import {checkMeasurement} from '../record-check/measurement.mjs';
 import {checkCoverage} from '../record-check/coverage.mjs';
 import {checkJoins} from '../record-check/joins.mjs';
+import {normalizeFixture} from '../normalize.mjs';
+import {applicableRoles} from '../lookup.mjs';
 import {registerControls,runControl} from './mutations.mjs';
 
 // Independently authored source offsets, digest inputs and expected normalized rows.
@@ -47,7 +49,7 @@ function makeFact(family,status,ref='fact') {
  const coordinates=(status==='exact'?exactSpans:unmatchedSpans)[family];
  return {kind:factType[family],ref,anchor:{document,revisionId:'r1',contentHash,kind:family,range:span(...coordinates),ownerRef:owned[family]},record:structuredClone(templates[factType[family]])};
 }
-async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,twoProducers=false,selectSecond=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false}={}) {
+async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,twoProducers=false,selectSecond=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false,ambiguousNative=false}={}) {
  const root=await mkdtemp(join(tmpdir(),'join-u3-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const fs=new Map(),put=(path,value)=>fs.set(path,typeof value==='string'?value:JSON.stringify(value));
  const shifted=emojiPrefix||encoding!=='utf8',offset=shifted?5:0,positionOffset=encoding==='utf16'?3:encoding==='unicodeScalar'?2:offset;
@@ -60,6 +62,11 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
  }
  if(control){measuredNative.controls.push({ref:'region',nativeId:null,document,revisionId:'r1',ownerRef:'main',parentRef:null,kind:'if',range:span(18+offset,26+offset),arm:null,witnesses:[]});measuredNative.calls[0].regionRefs=['region'];}
  if(declarationSite)measuredNative.references.push({ref:'declaration-ref',nativeId:null,document,revisionId:'r1',ownerRef:'target',range:span(49+offset,55+offset),spelling:'target',witnesses:[witness('spelling',49+offset,55+offset,'target')]});
+ if(ambiguousNative){
+  const child=declaration('nested-target','target',49+offset,59+offset,49+offset);
+  child.parentRef='target';child.kind='field';child.header={...header('target'),kind:'field'};
+  measuredNative.declarations.push(child);
+ }
  mutateNative?.(measuredNative);
  put('snapshots/src/main.js',sourceText);put('captures/native.json',measuredNative);
  for(const [name,value] of [['native','native-executable'],['semantic','semantic-executable'],['toolchain','toolchain'],['config','config'],['dependency','dependency']])put(`captures/${name}.txt`,value);
@@ -78,12 +85,15 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
  const proofFacts=proofs.map((record,i)=>({kind:'provenance',ref:`proof-fact-${i}`,record}));
  const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:!(status==='unsupported'&&kind===unsupportedFamily),diagnostic:status==='unsupported'&&kind===unsupportedFamily?'native family unavailable':null}));
  mutateSupport?.(support);
- const coverage=(producerId)=>({producerId,language:document.language,sourceSetId:document.sourceSetId,documentPath:document.path,revisionId:'r1',requested:true,selected:producerId!=='semantic-b'||selectSecond,state:producerId==='semantic-b'?(selectSecond?'partial':'omitted'):status==='unsupported'&&unsupportedFamily==='reference'?'partial':'complete',supportedRoles:['read'],observedRoles:producerId==='semantic-b'||status==='unsupported'&&unsupportedFamily==='reference'?[]:['read'],diagnostic:producerId==='semantic-b'?(selectSecond?'reference not observed':'producer not selected'):status==='unsupported'&&unsupportedFamily==='reference'?'reference unavailable':null});
+ const requestedRoles=[...new Set(['read',...authored.flatMap(fact=>fact.kind==='reference'?fact.record.roles:fact.kind==='callBinding'?['call']:[])])].filter(role=>applicableRoles(document.language).includes(role)).sort((a,b)=>applicableRoles(document.language).indexOf(a)-applicableRoles(document.language).indexOf(b));
+ const availableRole=role=>(role==='call'?['reference','invocation','callee']:role==='definition'||role==='alias'?['reference','declarationName']:['reference']).every(kind=>support.find(x=>x.kind===kind)?.available!==false);
+ const observedRoles=requestedRoles.filter(availableRole),missingRoles=observedRoles.length!==requestedRoles.length;
+ const coverage=(producerId)=>{const selected=producerId!=='semantic-b'||selectSecond;return {producerId,language:document.language,sourceSetId:document.sourceSetId,documentPath:document.path,revisionId:'r1',requested:true,selected,state:!selected?'omitted':missingRoles?'partial':'complete',supportedRoles:requestedRoles,observedRoles:selected?observedRoles:[],diagnostic:!selected?'producer not selected':missingRoles?'requested role unavailable':null};};
  put('snapshots/src/main.js.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios:[],facts:[...(twoProducers?['native','semantic','semantic-b']:['native','semantic']).map(id=>({kind:'coverage',ref:`coverage-${id}`,record:coverage(id)})),...proofFacts,...authored]});
  const selectedSemantic={...semanticProducer,positionEncoding:encoding};
  const unselectedSemantic={...semanticProducer,id:'semantic-b',executableHash:sha('semantic-b-executable'),positionEncoding:encoding};
  const producers=twoProducers?[nativeProducer,selectedSemantic,unselectedSemantic]:[nativeProducer,selectedSemantic];
- const fixture={formatVersion:1,profile:'example',language:'javascript',sourceSets:[{id:'main',rootId:'root',languages:['javascript'],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:[nativeProducer,selectedSemantic]},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles:['read'],measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:twoProducers?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ const fixture={formatVersion:1,profile:'example',language:'javascript',sourceSets:[{id:'main',rootId:'root',languages:['javascript'],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:[nativeProducer,selectedSemantic]},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles,measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:twoProducers?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  if(alternateTuples){
   const alternatives=[
    {document:{...document,path:'src/other.js'},revisionId:'r1',file:'snapshots/src/other.js',kind:'document'},
@@ -100,7 +110,7 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
    const annotation=`${alt.file}.annotations.json`;
    put(annotation,{formatVersion:1,document:alt.document,revisionId:alt.revisionId,scenarios:[],facts:rows});
    fixture.annotationFiles.push(annotation);
-   for(const producer of producers)fixture.coverageIntents.push({producerId:producer.id,document:alt.document,revisionId:alt.revisionId,requestedRoles:['read'],measurementSupport:structuredClone(support)});
+   for(const producer of producers)fixture.coverageIntents.push({producerId:producer.id,document:alt.document,revisionId:alt.revisionId,requestedRoles,measurementSupport:structuredClone(support)});
   }
   // The captured semantic proof's manifest includes both documents of r1/main.
  }
@@ -111,11 +121,24 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
  records.coverage=ordered(loaded.annotations.flatMap(annotation=>annotation.facts.filter(f=>f.kind==='coverage').map(f=>f.record)));
  const asDeclaration=(name,begin,end,nameStart)=>({syntaxId:syntax(name),document,revisionId:'r1',kind:'function',name,lookupKey:name,ancestors:[],key:{kind:'function',name,signature:null,ordinal:0},range:range(begin,end),nameRange:range(nameStart,nameStart+name.length),header:header(name),provenanceId:`native:r1:${syntax(name)}`});
  records.declarations=[asDeclaration('main',0+offset,39+offset,9+offset),asDeclaration('target',40+offset,60+offset,49+offset)].sort((a,b)=>Buffer.compare(Buffer.from(a.syntaxId),Buffer.from(b.syntaxId)));
+ if(ambiguousNative){
+  const childKey={kind:'field',name:'target',signature:null,ordinal:0};
+  const parentKey={kind:'function',name:'target',signature:null,ordinal:0};
+  const childId=`sid:v1:${domain('syntax',{sourceSet:'main',path:document.path,language:'javascript',ancestors:[parentKey],declaration:childKey})}`;
+  records.declarations.push({syntaxId:childId,document,revisionId:'r1',kind:'field',name:'target',lookupKey:'target',ancestors:[parentKey],key:childKey,range:range(49+offset,59+offset),nameRange:range(49+offset,55+offset),header:{...header('target'),kind:'field'},provenanceId:`native:r1:${childId}`});
+  records.declarations.sort((a,b)=>Buffer.compare(Buffer.from(a.syntaxId),Buffer.from(b.syntaxId)));
+ }
  records.calls=[{id:callId,ownerSyntaxId:mainId,ordinal:0,document,revisionId:'r1',range:range(18+offset,26+offset),calleeRange:range(18+offset,24+offset),spelling:'target',regionIds:control?[occurrence(mainId,'control',0)]:[],provenanceId:`native:r1:${callId}`}];
  if(control){const id=occurrence(mainId,'control',0);records.controlRegions=[{id,ownerSyntaxId:mainId,ordinal:0,document,revisionId:'r1',kind:'if',range:range(18+offset,26+offset),parentId:null,arm:null,provenanceId:`native:r1:${id}`}];}
  const coverageResult=checkCoverage(loaded,records);
  const measurement=checkMeasurement(loaded,records);
  const expectedJoin=authored.map(fact=>{const bytes=[fact.anchor.range.start,fact.anchor.range.end].map(n=>n-positionOffset+offset);const id=fact.anchor.kind==='reference'&&bytes[0]===28+offset?callbackId:declarationSite&&fact.anchor.kind==='reference'&&bytes[0]===49+offset?occurrence(targetId,'reference',0):{declarationName:targetId,callee:callId,invocation:callId,reference:refId}[fact.anchor.kind];return {anchor:{document,revisionId:'r1',contentHash:sourceHash,range:range(...bytes),kind:fact.anchor.kind},status,candidateIds:status==='exact'?[id]:[],diagnostic:status==='exact'?null:status==='unsupported'?'native family unavailable':'unmatched'};});
+ if(ambiguousNative){
+  const child=records.declarations.find(row=>row.kind==='field');
+  for(const row of expectedJoin)if(row.anchor.kind==='declarationName'&&row.status==='exact'){
+   row.status='ambiguous';row.candidateIds=[targetId,child.syntaxId].sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b)));row.diagnostic='ambiguous';
+  }
+ }
  for(const [i,fact] of authored.entries())if(fact.kind==='reference') {
   if(status==='exact'){const callback=fact.anchor.range.start===28+positionOffset,atDeclaration=declarationSite&&fact.anchor.range.start===49+positionOffset;const measuredRange=expectedJoin[i].anchor.range;const external={kind:'external',symbol:{scheme:'scip',symbol:'pkg external',scope:'global',document:null}};const resolution=fact.record.resolution;records.references.push({id:atDeclaration?occurrence(targetId,'reference',0):callback?callbackId:refId,ownerSyntaxId:atDeclaration?targetId:mainId,ordinal:callback?1:0,document,revisionId:'r1',range:measuredRange,spelling:callback?'callback':'target',lookupKey:callback?'callback':'target',site:fact.record.site,roles:fact.record.roles,resolution,declaredTarget:resolution==='resolved'?target:resolution==='external'?external:null,candidates:resolution==='ambiguous'?ordered([target,external]):[],provenanceId:fact.record.provenanceId});}
   else records.referenceJoinDiagnostics.push({factRef:fact.ref,provenanceId:fact.record.provenanceId,join:expectedJoin[i]});
@@ -265,6 +288,43 @@ test('valid external, ambiguous semantic resolution, unresolved and target cardi
  await control(t,{name:'wrong target',options:ambiguous,raw:f=>{f.record.candidates[0]={...declaredTarget,declarationRef:'missing'};},assertion:'REFERENCE.RESOLUTION',field:'declaredTarget'});
 });
 
+
+test('two distinct measured declaration identities at the same owner and anchor are ambiguous, not installed',async t=>{
+ const s=await specimen(t,{family:'declarationName',ambiguousNative:true});
+ const id=s.records.declarations.find(row=>row.kind==='field').syntaxId;
+ const expected=[targetId,id].sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b)));
+ const result=check(s),joined=result.joined.get('fact');
+ assert.equal(joined.join.status,'ambiguous');assert.deepEqual(joined.join.candidateIds,expected);
+ assert.equal(joined.join.diagnostic,'ambiguous');assert.equal(joined.installedId,null);assert.deepEqual(joined.nativeRefs,[]);
+ assert.deepEqual(result.recordByFactRef.get('fact'),joined.join);
+ const normalized=normalizeFixture(s.loaded).records.declarationBindings[0];
+ assert.deepEqual(normalized.join,joined.join);assert.equal(normalized.syntaxId,null);
+});
+
+test('contradictory exact reference targets retain both proofs and reject forged first-wins',async t=>{
+ const external={kind:'external',symbol:{scheme:'scip',symbol:'pkg external',scope:'global',document:null}};
+ const facts=[makeFact('reference','exact'),makeFact('reference','exact','fact2')];
+ facts[1].record.resolution='external';facts[1].record.declaredTarget=external;
+ const s=await specimen(t,{facts}),candidates=ordered([target,external]);
+ for(const row of s.records.references){row.resolution='ambiguous';row.declaredTarget=null;row.candidates=candidates;}
+ s.records.references=ordered(s.records.references);
+ const result=check(s);
+ assert.equal(result.expectedReferences.length,2);
+ assert.deepEqual(result.expectedReferences.map(row=>row.provenanceId).sort(),['proof','proof-fact2']);
+ for(const row of result.expectedReferences){assert.equal(row.resolution,'ambiguous');assert.equal(row.declaredTarget,null);assert.equal(canonical(row.candidates),canonical(candidates));}
+ assert.equal(canonical(result.recordByFactRef.get('fact').candidates),canonical(candidates));
+ assert.equal(canonical(result.recordByFactRef.get('fact2').candidates),canonical(candidates));
+ const compilation=normalizeFixture(s.loaded),normalized=compilation.records.references;
+ assert.equal(canonical(normalized),canonical(result.expectedReferences));
+ for(const [factRef,proofId] of [['fact','proof'],['fact2','proof-fact2']]){
+  assert.equal(compilation.recordMap.get(factRef).provenanceId,proofId);
+  assert.equal(compilation.recordMap.get(factRef).resolution,'ambiguous');
+  assert.equal(canonical(compilation.recordMap.get(factRef).candidates),canonical(candidates));
+ }
+ const wrong=structuredClone(s.records);wrong.references[0].resolution='resolved';wrong.references[0].declaredTarget=target;wrong.references[0].candidates=[];wrong.references=ordered(wrong.references);
+ assert.throws(()=>checkJoins(s.loaded,wrong,s.coverageResult,s.measurement),e=>e.assertion==='REFERENCE.SOURCE'&&e.code==='invalidRecord'&&e.field==='references');
+});
+
 test('identical repeated facts keep distinct proof contributors; conflicting facts reject',async t=>{
  const facts=[makeFact('reference','exact'),makeFact('reference','exact','fact2')];
  const s=await specimen(t,{facts}),result=check(s);
@@ -336,15 +396,16 @@ test('captured-but-unselected semantic producer cannot use valid proof, includin
      for(const field of ['fixture','sources','captures','native','semantic','facts','factTuples','proofs','proofTuples'])
       assert.equal(canonical(captured[field]),canonical(admitted[field]),`${status}: fixed ${field}`);
      for(const field of ['coverage','normalizedCoverage']){
-      assert.deepEqual(captured[field].map(x=>field==='coverage'?x.ref:x.producerId),admitted[field].map(x=>field==='coverage'?x.ref:x.producerId));
-      for(let i=0;i<captured[field].length;i++){
-       const current=field==='coverage'?captured[field][i].record:captured[field][i];
-       const previous=field==='coverage'?admitted[field][i].record:admitted[field][i];
+      assert.deepEqual(captured[field].map(x=>field==='coverage'?x.ref:x.producerId).sort(),admitted[field].map(x=>field==='coverage'?x.ref:x.producerId).sort());
+      for(const entry of captured[field]){
+       const current=field==='coverage'?entry.record:entry;
+       const previousEntry=admitted[field].find(x=>(field==='coverage'?x.ref:x.producerId)===(field==='coverage'?entry.ref:entry.producerId));
+       const previous=field==='coverage'?previousEntry.record:previousEntry;
        if(current.producerId==='semantic-b'){
-        const fixed=({selected:selection,state,diagnostic,...rest})=>rest;
+        const fixed=({selected:selection,state,diagnostic,observedRoles,...rest})=>rest;
         assert.equal(canonical(fixed(current)),canonical(fixed(previous)),`${status}: one selection claim and its policy projections`);
-        assert.deepEqual([previous.selected,previous.state,previous.diagnostic],[true,'partial','reference not observed']);
-        assert.deepEqual([current.selected,current.state,current.diagnostic],[false,'omitted','producer not selected']);
+        assert.deepEqual([previous.selected,previous.state,previous.diagnostic,previous.observedRoles],[true,'complete',null,['read','call']]);
+        assert.deepEqual([current.selected,current.state,current.diagnostic,current.observedRoles],[false,'omitted','producer not selected',[]]);
        }else assert.equal(canonical(current),canonical(previous),`${status}: other coverage unchanged`);
       }
      }

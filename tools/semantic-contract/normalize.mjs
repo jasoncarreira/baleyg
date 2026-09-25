@@ -55,8 +55,7 @@ function resolveTarget(ref,ids,decls,context=null){if(ref===null)return null;if(
 function distinctTargets(targets){if(new Set(targets.map(encode)).size!==targets.length)fail('NORMALIZE.TARGET','candidates','duplicate target');return [...targets].sort(compare);}
 function resolution(target,candidates,status){if(status==='resolved'&&target?.kind==='internal'&&!candidates.length)return;if(status==='external'&&target?.kind==='external'&&!candidates.length)return;if(status==='ambiguous'&&target===null&&distinctTargets(candidates).length>=2)return;if(status==='unresolved'&&target===null&&!candidates.length)return;fail('NORMALIZE.RESOLUTION','resolution','target cardinality differs');}
 
-// The unit seam accepts distinct measured candidates, but fixture compilation always
-// rejects duplicate owner/kind/range measurements before constructing this index.
+// Distinct measured identities can share an exact owner/family/range anchor.
 export function buildAnchorIndex(measurements){const index=new Map();for(const x of measurements){const k=encode([x.anchor,x.ownerRef]);if(!index.has(k))index.set(k,[]);index.get(k).push(x);}return index;}
 export function joinAnchor(selector,index,loaded,ids=new Map(),expectedEncoding=null){
  validate('AnchorSelector',selector);if(expectedEncoding!==null)encoding(selector.range,expectedEncoding,'anchor.range');
@@ -176,11 +175,25 @@ export function normalizeFixture(loaded){
    const k=encode([proof.producerId,join.status==='exact'?join.candidateIds[0]:join.anchor,join.anchor.document,join.anchor.revisionId]);if(!bindingGroups.has(k))bindingGroups.set(k,[]);bindingGroups.get(k).push({fact,value,proof});insert(recordMap,fact.ref,value);
   }
  }
- for(const group of referenceGroups.values()){const values=collapseFacts(group.map(x=>x.value));const first=values[0];if(values.some(x=>encode({...x,provenanceId:null})!==encode({...first,provenanceId:null})))fail('NORMALIZE.REFERENCE_CONFLICT','resolution','conflicting reference facts');records.references.push(...values);}
+ for(const group of referenceGroups.values()){
+  const values=collapseFacts(group.map(x=>x.value)),first=values[0];
+  const strip=({resolution,declaredTarget,candidates,provenanceId,...rest})=>rest;
+  if(values.some(x=>!same(strip(x),strip(first))))fail('NORMALIZE.REFERENCE_CONFLICT','resolution','contributor non-target claims differ');
+  const targets=[...new Map(values.map(x=>[encode(x.declaredTarget),x.declaredTarget])).values()];
+  const contradiction=targets.length>1;
+  if(contradiction&&values.some(x=>!['resolved','external'].includes(x.resolution)||x.declaredTarget===null||x.candidates.length)||
+   !contradiction&&values.some(x=>!same({...x,provenanceId:null},{...first,provenanceId:null})))
+   fail('NORMALIZE.REFERENCE_CONFLICT','resolution','incompatible duplicate semantic claims');
+  for(const x of values){
+   const value=contradiction?{...x,resolution:'ambiguous',declaredTarget:null,candidates:targets.sort(compare)}:x;
+   validate('Reference',value);records.references.push(value);
+   for(const entry of group)if(entry.value.provenanceId===x.provenanceId)recordMap.set(entry.fact.ref,value);
+  }
+ }
  for(const group of bindingGroups.values()){
   const items=collapseFacts(group.map(x=>x.value));if(items.length===1){records.callBindings.push(items[0]);continue;}
   const baseline=items[0],same=items.every(x=>x.callId===baseline.callId&&encode(x.join)===encode(baseline.join)&&x.dispatch===baseline.dispatch&&encode(x.possibleDispatch)===encode(baseline.possibleDispatch));
-  if(!same||items.some(x=>x.join.status!=='exact'||x.resolution!=='resolved'||x.declaredTarget?.kind!=='internal'))fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','incompatible duplicate facts');
+  if(!same||items.some(x=>x.join.status!=='exact'||!['resolved','external'].includes(x.resolution)||x.declaredTarget===null||x.candidates.length))fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','incompatible duplicate facts');
   const targets=distinctTargets([...new Map(items.map(x=>[encode(x.declaredTarget),x.declaredTarget])).values()]);if(targets.length<2){if(items.some(x=>encode({...x,provenanceId:null})!==encode({...baseline,provenanceId:null})))fail('NORMALIZE.BINDING_CONFLICT','declaredTarget','conflicting duplicate facts');records.callBindings.push(...items);continue;}
   for(const x of items){const value={...x,resolution:'ambiguous',declaredTarget:null,candidates:targets,staleTarget:null};validate('CallBinding',value);records.callBindings.push(value);for(const entry of group)if(entry.value.provenanceId===x.provenanceId)recordMap.set(entry.fact.ref,value);}
  }

@@ -101,8 +101,6 @@ export function checkJoins(loaded,records,coverage,measurement) {
    add('callee',row.calleeRange,row.ownerRef);
   } else if(native.references.includes(row))add('reference',row.range,row.ownerRef);
  }
- for(const candidates of measured.values())if(candidates.length>1)
-  reject('JOIN.CARDINALITY','anchor','duplicate native owner/family/range measurement');
  const verifiedProofs=new Map(records.provenance.map(x=>[x.id,x]));
  const nativeReferences=new Map(native.references.map(row=>[row.ref,row]));
  const facts=loaded.annotations.flatMap(annotation=>annotation.facts.filter(f=>['declarationBinding','callBinding','reference'].includes(f.kind)).map(f=>({fact:f,annotation})));
@@ -167,10 +165,30 @@ export function checkJoins(loaded,records,coverage,measurement) {
   const declarationSite=(measured.get(key([{...anchor,kind:'declarationName'},selector.ownerRef]))??[])
    .some(candidate=>declarations.has(candidate.ref)&&same(declarations.get(candidate.ref).document,row.document)&&declarations.get(candidate.ref).revisionId===row.revisionId);
   roles(value,row.document.language,callee,declarationSite);resolution(value);validate('Reference',value);
-  const group=key([proof.producerId,value.id]),prior=referenceClaims.get(group);
-  if(prior&&!same((({provenanceId,...claim})=>claim)(prior),(({provenanceId,...claim})=>claim)(value)))
-   reject('REFERENCE.SOURCE','references','conflicting facts for same producer/reference');
-  referenceClaims.set(group,value);expectedReferences.push(value);recordByFactRef.set(fact.ref,value);
+  const group=key([proof.producerId,value.id]);
+  if(!referenceClaims.has(group))referenceClaims.set(group,[]);
+  referenceClaims.get(group).push({factRef:fact.ref,value});
+ }
+ for(const entries of referenceClaims.values()) {
+  const baseline=entries[0].value;
+  const strip=({resolution,declaredTarget,candidates,provenanceId,...rest})=>rest;
+  if(entries.some(({value})=>!same(strip(value),strip(baseline))))
+   reject('REFERENCE.SOURCE','references','contributor non-target claims differ');
+  const claims=entries.map(({value})=>value.declaredTarget);
+  const distinct=[...new Map(claims.map(value=>[key(value),value])).values()];
+  const contradiction=distinct.length>1;
+  if(contradiction&&entries.some(({value})=>
+   !['resolved','external'].includes(value.resolution)||value.declaredTarget===null||value.candidates.length))
+   reject('REFERENCE.SOURCE','references','incompatible duplicate semantic claims');
+  if(!contradiction&&entries.some(({value})=>!same((({provenanceId,...rest})=>rest)(value),
+   (({provenanceId,...rest})=>rest)(baseline))))
+   reject('REFERENCE.SOURCE','references','incompatible duplicate semantic claims');
+  const candidates=contradiction?distinct.sort(compare):null;
+  for(const {factRef,value} of entries) {
+   const member=contradiction?{...value,resolution:'ambiguous',declaredTarget:null,candidates}:value;
+   validate('Reference',member);
+   expectedReferences.push(member);recordByFactRef.set(factRef,member);
+  }
  }
  // A diagnostic is the sole normalized trace of a non-exact reference. Exact
  // references have no diagnostic and cannot be created by a non-exact fact.
