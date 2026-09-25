@@ -1,14 +1,56 @@
 use serde_json::Value;
 use std::{fs, process::Command};
 use tempfile::TempDir;
+
+fn isolated_command(home: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    // ProjectDirs uses inherited XDG roots before HOME on Linux.
+    cmd.env("HOME", home)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME");
+    cmd
+}
+
 fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_baleyg"));
-    c.arg(sub).arg("--workspace").arg(root).env("HOME", state);
+    let mut c = isolated_command(state);
+    c.arg(sub).arg("--workspace").arg(root);
     if sub == "serve" {
         c.arg("--token-file").arg(state.join("token"));
     }
     c
 }
+
+#[test]
+fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+
+    let mut cmd = command(&workspace, &home, "status");
+    let overrides = cmd.get_envs().collect::<Vec<_>>();
+    for key in ["XDG_CACHE_HOME", "XDG_DATA_HOME"] {
+        assert!(
+            overrides
+                .iter()
+                .any(|(name, value)| *name == key && value.is_none()),
+            "{key} must be removed from the child environment"
+        );
+    }
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cache = home.join(if cfg!(target_os = "macos") {
+        "Library/Caches/dev.odin.baleyg"
+    } else {
+        ".cache/baleyg"
+    });
+    assert!(cache.exists());
+}
+
 #[test]
 fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     let temp = TempDir::new().unwrap();
@@ -374,13 +416,12 @@ fn external_destinations_are_rejected_before_git_marker_creation() {
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join(".git")).unwrap();
     let token = root.join("token");
-    let serve = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let serve = isolated_command(&home)
         .arg("serve")
         .arg("--workspace")
         .arg(&root)
         .arg("--token-file")
         .arg(&token)
-        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(!serve.status.success());
@@ -442,9 +483,8 @@ fn overlapping_git_workspace_refuses_before_marker_or_managed_entries() {
 fn gc_report_without_workspace_does_not_create_state() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
-    let output = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let output = isolated_command(&home)
         .args(["gc", "--report"])
-        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(
@@ -456,11 +496,7 @@ fn gc_report_without_workspace_does_not_create_state() {
     assert_eq!(inventory["derived"], serde_json::json!([]));
     assert_eq!(inventory["records"], serde_json::json!([]));
     assert!(!home.exists());
-    let denied = Command::new(env!("CARGO_BIN_EXE_baleyg"))
-        .arg("gc")
-        .env("HOME", &home)
-        .output()
-        .unwrap();
+    let denied = isolated_command(&home).arg("gc").output().unwrap();
     assert!(!denied.status.success());
     assert!(!home.exists());
     let root = temp.path().join("work");
@@ -472,9 +508,8 @@ fn gc_report_without_workspace_does_not_create_state() {
             .status
             .success()
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let output = isolated_command(&home)
         .args(["gc", "--report"])
-        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -506,9 +541,8 @@ fn gc_cli_reports_multiple_indexes_in_sorted_order() {
             String::from_utf8_lossy(&status.stderr)
         );
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let output = isolated_command(&home)
         .args(["gc", "--report"])
-        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(
@@ -556,8 +590,8 @@ fn forget_cli_requires_confirmation_and_preserves_unrelated_state() {
     records.put_view(&view).unwrap();
     let id = identity.record_id.as_str();
     let run = |which: &str, yes: bool| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
-        cmd.arg("forget").arg(which).env("HOME", &home);
+        let mut cmd = isolated_command(&home);
+        cmd.arg("forget").arg(which);
         if yes {
             cmd.arg("--yes");
         }
@@ -624,9 +658,8 @@ fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
     let lock_before = fs::read(&lock).unwrap();
     let unrelated = home.join("unrelated");
     fs::write(&unrelated, "keep").unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let result = isolated_command(&home)
         .args(["forget", &identity.record_id, "--yes"])
-        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(!result.status.success());
