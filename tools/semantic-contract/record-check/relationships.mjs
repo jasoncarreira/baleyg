@@ -63,6 +63,8 @@ export function checkRelationships(loaded,records,C,M,J) {
    if(fact.record.key.scope==='document' && !same(fact.record.key.document,proof.document))
     reject('SYMBOL.SCOPE','key','document-scoped symbol must match its captured document');
    const declarations=fact.record.declarations.map(ref=>resolve(ref,proof.document,'declarations','SYMBOL.TARGET'));
+   if(declarations.some(row=>row.kind==='internal' && (!same(row.document,proof.document)||row.revisionId!==proof.revisionId)))
+    reject('SYMBOL.TARGET','declarations','symbol target is outside its proven source snapshot');
    if(new Set(declarations.map(key)).size!==declarations.length)reject('SYMBOL.TARGET','declarations','duplicate explicit declaration target');
    const value={key:fact.record.key,displayName:fact.record.displayName,declarations,provenanceId:proof.id};
    const claim=key([proof.producerId,value.key]),prior=symbolClaims.get(claim);
@@ -92,35 +94,68 @@ export function checkRelationships(loaded,records,C,M,J) {
    if(!same(source.document,annotation.document) || source.revisionId!==annotation.revisionId)
     reject('RELATIONSHIP.SOURCE','source','relationship source must be in the proven source snapshot');
    const target=resolve(fact.target,proof.document,'target','RELATIONSHIP.TARGET');
+   if(target.kind==='internal' && (!same(target.document,proof.document) || target.revisionId!==proof.revisionId))
+    reject('RELATIONSHIP.TARGET','target','internal target is outside the proven relationship snapshot');
    const native=nativeDeclarations.get(fact.source.declarationRef);
    const typeSource=['type','implementation'].includes(native.kind);
    if(fact.relationshipKind==='overrides'?!['method','function'].includes(native.kind):!typeSource)
     reject('RELATIONSHIP.SOURCE','source','source declaration kind contradicts directed relationship');
-   if(target.kind==='internal') {
-    const base=nativeDeclarations.get(fact.target.declarationRef);
-    if(fact.relationshipKind==='overrides'?!['method','function'].includes(base.kind):!['type','implementation'].includes(base.kind))
-     reject('RELATIONSHIP.TARGET','target','target declaration kind contradicts relationship');
-    if(same(source,target))reject('RELATIONSHIP.TARGET','target','relationship cannot target itself');
-    if(fact.relationshipKind!=='overrides' && native.document.language!=='rust') {
-     const index=native.header.bases.indexOf(base.name);
-     if(index<0)reject('RELATIONSHIP.SOURCE','source','captured source base does not name the directed target');
-     if(['java','javascript'].includes(native.document.language)) {
-      const sourceBytes=loaded.sources.get(JSON.stringify([native.document.sourceSetId,native.revisionId,native.document.path]));
-      const witness=native.witnesses.find(x=>x.field===`header.bases[${index}]`)?.witness;
-      if(!sourceBytes || !witness)reject('RELATIONSHIP.SOURCE','source','missing captured source witness');
-      const nameEnd=toByteRange(sourceBytes,native.nameRange).end;
-      const baseStart=toByteRange(sourceBytes,witness.range).start;
-      if(!new RegExp(`\\b${fact.relationshipKind}\\b`).test(Buffer.from(sourceBytes).subarray(nameEnd,baseStart).toString('utf8')))
-       reject('RELATIONSHIP.KIND','kind','source keyword does not support relationship kind');
-     }
+   const capturedSource=row=>loaded.sources.get(JSON.stringify([row.document.sourceSetId,row.revisionId,row.document.path]));
+   function directedBase(row,baseName,kind) {
+    const bytes=capturedSource(row);
+    const index=row.header.bases.indexOf(baseName);
+    const witness=row.witnesses.find(x=>x.field===`header.bases[${index}]`)?.witness;
+    if(!bytes || index<0 || !witness)
+     reject('RELATIONSHIP.SOURCE','source','directed base lacks a measured source witness');
+    const name=toByteRange(bytes,row.nameRange),base=toByteRange(bytes,witness.range);
+    const between=(a,b)=>Buffer.from(bytes).subarray(a,b).toString('utf8');
+    let supported=false;
+    if(row.document.language==='rust') {
+     if(kind==='extends') supported=base.start>name.end && /^\s*:\s*$/.test(between(name.end,base.start)) && /\btrait\s*$/.test(between(toByteRange(bytes,row.range).start,name.start));
+     if(kind==='implements') supported=row.kind==='implementation' && base.end<name.start && /\bimpl\s*$/.test(between(toByteRange(bytes,row.range).start,base.start)) && /^\s+for\s+$/.test(between(base.end,name.start));
+    } else {
+     const syntax=between(name.end,base.start).replace(/\/\*[\s\S]*?\*\//g,' ').replace(/\/\/[^\n]*/g,' ');
+     supported=base.start>name.end && new RegExp(`\\b${kind}\\b`).test(syntax);
     }
-    if(fact.relationshipKind==='overrides') {
-     const owner=nativeDeclarations.get(native.parentRef),baseOwner=nativeDeclarations.get(base.parentRef);
-     if(native.name!==base.name || !owner || !baseOwner ||
-        owner.document.language!=='rust'&&!owner.header.bases.includes(baseOwner.name))
-      reject('RELATIONSHIP.SOURCE','source','captured overriding owner must name the base member owner');
-    }
+    if(!supported)reject('RELATIONSHIP.KIND','kind','source syntax does not support the directed relationship kind');
    }
+   if(fact.relationshipKind==='overrides') {
+    if(target.kind!=='internal')reject('RELATIONSHIP.TARGET','target','override requires a measured base member');
+    const base=nativeDeclarations.get(fact.target.declarationRef);
+    const owner=nativeDeclarations.get(native.parentRef),baseOwner=nativeDeclarations.get(base?.parentRef);
+    if(!base || !['method','function'].includes(base.kind) || !owner || !baseOwner ||
+       native.name!==base.name || !same(native.signature,base.signature) ||
+       !same(native.header.parameters,base.header.parameters) ||
+       !same(native.document,base.document) || native.revisionId!==base.revisionId)
+     reject('RELATIONSHIP.SOURCE','source','override must identify a matching measured base member');
+    const bytes=capturedSource(native);
+    const modifier=native.header.modifiers.findIndex(text=>text==='Override'||text==='override');
+    const marker=native.witnesses.find(x=>x.field===`header.modifiers[${modifier}]`)?.witness;
+    const location=bytes && marker && toByteRange(bytes,marker.range);
+    const prefix=location && Buffer.from(bytes).subarray(toByteRange(bytes,native.range).start,location.start).toString('utf8');
+    if(!location || location.end>toByteRange(bytes,native.nameRange).start ||
+       (native.document.language==='java' && !/@\s*$/.test(prefix)))
+     reject('RELATIONSHIP.SOURCE','source','override needs a captured override modifier before its member');
+    const sourceParameters=row=>{
+     const body=capturedSource(row);
+     const after=Buffer.from(body).subarray(toByteRange(body,row.nameRange).end,toByteRange(body,row.range).end).toString('utf8');
+     return /^\s*\(([^()]*)\)/.exec(after)?.[1].replace(/\s+/g,' ').trim()??null;
+    };
+    if(sourceParameters(native)===null || sourceParameters(native)!==sourceParameters(base))
+     reject('RELATIONSHIP.SOURCE','source','source parameter lists do not support a matching override');
+    directedBase(owner,baseOwner.name,'extends');
+   } else {
+    if(target.kind==='internal') {
+     const base=nativeDeclarations.get(fact.target.declarationRef);
+     if(!base || !['type','implementation'].includes(base.kind))
+      reject('RELATIONSHIP.TARGET','target','target declaration kind contradicts relationship');
+    }
+    const baseName=target.kind==='internal'?nativeDeclarations.get(fact.target.declarationRef).name:
+     /(?:^|[ /.:#])([\p{L}_$][\p{L}\p{N}_$]*)[#.]?$/u.exec(target.symbol.symbol)?.[1];
+    if(!baseName)reject('RELATIONSHIP.SOURCE','source','external key lacks a source-matchable base spelling');
+    directedBase(native,baseName,fact.relationshipKind);
+   }
+   if(target.kind==='internal' && same(source,target))reject('RELATIONSHIP.TARGET','target','relationship cannot target itself');
    const value={kind:fact.relationshipKind,source,target,provenanceId:proof.id};
    typeRelationships.push(value);recordByFactRef.set(fact.ref,value);
   }
