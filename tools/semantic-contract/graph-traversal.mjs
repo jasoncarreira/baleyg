@@ -65,17 +65,17 @@ export function traverseGraph({request,records,selectedCoverageIncomplete=false}
    const call=local[i],members=bindings.get(call.id)??[];
    const selected=members.find(binding=>documentKey(binding.join.anchor.document)===documentKey(call.document)&&
     binding.join.anchor.contentHash===proof.get(binding.provenanceId)?.contentHash)??null;
-   const p=selected&&proof.get(selected.provenanceId);
    const covered=effective.semanticProducerId!==null&&rowFor(effective.semanticProducerId,call.document);
-   const usable=covered?.selected&&['complete','partial'].includes(covered.state);
+   const binding=covered?.selected&&['complete','partial'].includes(covered.state)?selected:null;
+   const p=binding&&proof.get(binding.provenanceId);
    let reason='none';
-   if(!selected||!usable)reason='missingEvidence';
-   else if(p?.freshness!=='fresh'||(selected.declaredTarget?.kind==='internal'&&selected.staleTarget!==false))reason='stale';
-   else if(selected.resolution==='ambiguous')reason='ambiguous';
-   else if(selected.resolution==='unresolved')reason='unresolved';
-   else if(selected.resolution==='external')reason='external';
-   else if(!['direct','constructor'].includes(selected.dispatch))reason='dispatch';
-   const target=reason==='none'?selected.declaredTarget:null;
+   if(!binding)reason='missingEvidence';
+   else if(p?.freshness!=='fresh'||(binding.declaredTarget?.kind==='internal'&&binding.staleTarget!==false))reason='stale';
+   else if(binding.resolution==='ambiguous')reason='ambiguous';
+   else if(binding.resolution==='unresolved')reason='unresolved';
+   else if(binding.resolution==='external')reason='external';
+   else if(!['direct','constructor'].includes(binding.dispatch))reason='dispatch';
+   const target=reason==='none'?binding.declaredTarget:null;
    // A captured target can precede the pinned revision: staleTarget checks its bytes,
    // while stable syntax identity and document membership locate its current body.
    if(reason==='none'&&(!target||target.kind!=='internal'||
@@ -91,7 +91,7 @@ export function traverseGraph({request,records,selectedCoverageIncomplete=false}
      nodes.push({declaration:byId.get(to),depth:depth+1});
     }
    }
-   edges.push({call,from:declaration.syntaxId,to,binding:selected,visit,boundaryReason:reason});
+   edges.push({call,from:declaration.syntaxId,to,binding,visit,boundaryReason:reason});
   }
  }
  const truncated=frontier.length>0;
