@@ -404,7 +404,7 @@ fn synthetic_anchor_transitions_and_candidate_integrity() {
 
     let captured = &duplicate.expected.anchor;
     let duplicate_header = duplicate.descriptor.header.clone();
-    let rows = vec![(
+    let rows = [(
         captured.syntax_id.clone(),
         duplicate_header.clone(),
         vec![duplicate_header.clone(), duplicate_header.clone()],
