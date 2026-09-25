@@ -14,6 +14,7 @@ import {expectedGraph,checkGraphAnswer} from '../graph-check.mjs';
 import {contentHash,sourceManifestHash,syntaxId,occurrenceId} from '../identity.mjs';
 import {canonicalBytes} from '../json.mjs';
 import {selectGraphEvidence,checkGraphEvidence} from '../graph-evidence.mjs';
+import {graphProjection} from '../graph-projection.mjs';
 import {registerControls,runControl} from './mutations.mjs';
 
 const doc=path=>({sourceSetId:'main',language:'javascript',path});
@@ -54,6 +55,7 @@ function specimen({changed=false,previousState='complete',currentState='failed',
  add('r1','other-producer','declarationBinding',sid,D,'Q');
  if(currentState==='complete'||currentState==='partial')add('r2','current','declarationBinding');
  const records={coverage:coverageRows,provenance:proofs,declarationBindings,symbols,typeRelationships};
+ records.comparison={sourceSetId:'main',revisionId:'r2',producers:[]};records.revisions=revisions;records.declarations=[decl];records.producers=[];
  const loaded={native:{producerId:'N'},annotations,semanticProofs,
   revisionChronology:new Map([['main',revisions]])};
  const checked={checkUse:({producerId,document,revisionId,provenanceIds})=>{
@@ -63,6 +65,20 @@ function specimen({changed=false,previousState='complete',currentState='failed',
  const result={request:{sourceSetId:'main',revisionId:'r2',semanticProducerId:'P'},nodes:[{declaration:decl,depth:0}],edges:[{call,from:sid,to:null,binding:null,visit:'boundary',boundaryReason:'missingEvidence'}],frontier:[]};
  return {loaded,records,checked,result,add,D,F};
 }
+test('graph projection rejects incomplete records rather than silently reusing comparison labels',()=>{
+ const s=specimen(),request=s.result.request;
+ const invalid=[
+  ['comparison',{...s.records,comparison:null}],
+  ['revisions.documents',{...s.records,revisions:[{...s.records.revisions[0],documents:undefined},...s.records.revisions.slice(1)]}],
+  ['declarations',{...s.records,declarations:undefined}],
+  ['producers',{...s.records,producers:undefined}],
+  ['revisionId',s.records]
+ ];
+ for(const [field,records] of invalid){
+  const attempted=field==='revisionId'?{...request,revisionId:'absent'}:request;
+  assert.throws(()=>graphProjection(records,attempted),error=>error.assertion==='GRAPH.PROJECTION'&&error.code==='invalidRecord'&&error.field===field);
+ }
+});
 const select=s=>selectGraphEvidence(s.loaded,s.records,s.checked,s.result);
 test('failed refresh selects latest declaration proofs only, plus zero-fact coverage and r2 measured call',()=>{
  const s=specimen(),out=select(s);

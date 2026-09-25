@@ -5,11 +5,19 @@ import {sourceManifestHash} from './identity.mjs';
 const tuple=(set,revision)=>JSON.stringify([set,revision]);
 const documentKey=d=>JSON.stringify([d.sourceSetId,d.language,d.path]);
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+function missing(field){
+ const error=new Error(`GRAPH.PROJECTION ${field}: normalized graph records are incomplete`);
+ Object.assign(error,{assertion:'GRAPH.PROJECTION',code:'invalidRecord',field});
+ throw error;
+}
 
 export function graphProjection(records,request){
- if(!records.comparison||!records.revisions?.every(r=>Array.isArray(r.documents))||!records.declarations)
-  return {proof:row=>row,binding:row=>row};
+ if(!records?.comparison||!Array.isArray(records.comparison.producers))missing('comparison');
+ if(!Array.isArray(records.revisions)||!records.revisions.every(r=>Array.isArray(r.documents)))missing('revisions.documents');
+ if(!Array.isArray(records.declarations))missing('declarations');
+ if(!Array.isArray(records.producers))missing('producers');
  const requested=records.revisions.find(r=>r.sourceSetId===request.sourceSetId&&r.id===request.revisionId);
+ if(!requested)missing('revisionId');
  const captures=new Map(records.revisions.map(r=>[tuple(r.sourceSetId,r.id),r]));
  const declarations=new Set(records.declarations.filter(d=>d.revisionId===request.revisionId&&
   d.document.sourceSetId===request.sourceSetId).map(d=>JSON.stringify([d.syntaxId,documentKey(d.document)])));

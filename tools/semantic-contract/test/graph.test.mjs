@@ -30,6 +30,7 @@ function specimen({state='complete',old=false,changed=false}={}){
  const records={sourceSets:[{id:'main'}],revisions:[r0,r1,r2],producers:[{id:'N',kind:'native'},{id:'P',kind:'semantic'}],
   declarations,calls:[],callBindings:[],references:[],symbols:[],declarationBindings:[],typeRelationships:[],
   coverage:[coverage('N','r2','complete'),coverage('P','r2',state),coverage('P','r1','complete'),coverage('P','r0','complete')],provenance:nativeProofs};
+ records.comparison={sourceSetId:'main',revisionId:'r2',producers:records.producers};
  const loaded={native:{producerId:'N'},annotations:[],semanticProofs:new Map(),revisionChronology:new Map([['main',[r0,r1,r2]]])};
  const checked={checkUse:({producerId,revisionId,provenanceIds})=>{for(const id of provenanceIds)
   assert.ok(records.provenance.some(p=>p.id===id&&p.producerId===producerId&&p.revisionId===revisionId));}};
