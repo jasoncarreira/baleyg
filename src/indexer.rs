@@ -185,6 +185,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                     | "generator_function"
                     | "arrow_function"
                     | "lambda_expression"
+                    | "lambda"
                     | "compact_constructor_declaration"
             )
             || (node.kind == "class_body"
@@ -199,6 +200,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
             "call_expression"
                 | "new_expression"
                 | "method_invocation"
+                | "call"
                 | "macro_invocation"
                 | "object_creation_expression"
                 | "explicit_constructor_invocation"
@@ -209,6 +211,16 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 | "if_expression"
                 | "if_expression_statement"
                 | "else_clause"
+                | "elif_clause"
+                | "except_clause"
+                | "finally_clause"
+                | "with_statement"
+                | "match_statement"
+                | "boolean_operator"
+                | "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
                 | "for_statement"
                 | "for_in_statement"
                 | "do_statement"
@@ -225,7 +237,6 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                 | "loop_expression"
                 | "try_statement"
                 | "catch_clause"
-                | "finally_clause"
                 | "switch_statement"
                 | "switch_expression"
                 | "match_expression"
@@ -267,6 +278,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
                     | "generator_function"
                     | "arrow_function"
                     | "lambda_expression"
+                    | "lambda"
             )
         {
             owner = nodes[owner].parent_id.unwrap_or(0);
@@ -300,7 +312,11 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         // declaration sites: their source header and parent give an exact key.
         let anonymous = matches!(
             node.kind.as_str(),
-            "function_expression" | "generator_function" | "arrow_function" | "lambda_expression"
+            "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "lambda_expression"
+                | "lambda"
         ) || node.kind == "class_body"
             && node.parent_id.is_some_and(|parent| {
                 matches!(
@@ -1196,6 +1212,8 @@ pub fn capture_revision_with_hook(
             identify_javascript(document, &revision_id)?;
         } else if document.key.language == Language::Java {
             crate::indexer_java::identify_document(document, &revision_id)?;
+        } else if document.key.language == Language::Python {
+            crate::indexer_python::identify_document(document, &revision_id)?;
         }
         for position in &mut document.semantic_positions {
             position.revision_id = revision_id.clone();
@@ -1614,7 +1632,7 @@ pub fn index_workspace(
     let browser_capture = if g
         .files
         .iter()
-        .any(|f| matches!(f.language.as_str(), "javascript" | "java"))
+        .any(|f| matches!(f.language.as_str(), "javascript" | "java" | "python"))
     {
         Some(capture_browser_revision(
             options,
@@ -1650,7 +1668,21 @@ pub fn index_workspace(
                         &source_set,
                     )?
                 }
-                "python" => crate::indexer_python::extract(&mut g, &file, cancel)?,
+                "python" => {
+                    let source_set =
+                        crate::store::topology::WorkspaceIdentity::discover_unattached(
+                            Some(&workspace_root),
+                            &workspace_root,
+                        )?
+                        .record_id;
+                    crate::indexer_python::extract_with_identity(
+                        &mut g,
+                        &file,
+                        cancel,
+                        &browser_capture.as_ref().unwrap().revision_id,
+                        &source_set,
+                    )?
+                }
                 _ => unreachable!("source discovery returned an unsupported language"),
             }
             progress(IndexProgress {

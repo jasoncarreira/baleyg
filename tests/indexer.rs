@@ -1648,3 +1648,146 @@ fn java_control_candidates_match_measured_graph_regions() {
         .collect();
     assert_eq!(measured, graph_regions);
 }
+
+#[test]
+fn python_capture_proves_only_source_member_tokens() {
+    use baleyg::{
+        indexer::{CaptureAdmission, NativeCandidateKind, capture_revision},
+        model::v1::Language,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = "@decorate(factory())\nclass Child(base()):\n    def method(self, x=default()):\n        use(lambda y=lambda_default(): lambda_body())\ndef f(x=module_default()):\n    inside()\ndef f2(x=(lambda y=lambda_outer(): lambda_inner())):\n    pass\ndef f3():\n    obj.éclair()\n    obj.Ａ()\n    obj[key]()\n    (obj.foo if flag else obj.bar)()\n";
+    write(root, "a.py", source);
+    for input in ["toolchain.capture", "config.capture", "dependency.capture"] {
+        write(root, input, input);
+    }
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(root), root).unwrap();
+    let admission = CaptureAdmission {
+        source_set_id: identity.record_id,
+        root_id: identity.root_key,
+        languages: vec![Language::Python],
+        toolchain: root.join("toolchain.capture"),
+        config: root.join("config.capture"),
+        dependency: root.join("dependency.capture"),
+        dependency_source_sets: vec![],
+        producers: vec![],
+    };
+    let capture =
+        capture_revision(&IndexOptions::new(root.to_owned()), &admission, &cancel()).unwrap();
+    let doc = capture
+        .documents
+        .iter()
+        .find(|d| d.key.path.as_str() == "a.py")
+        .unwrap();
+    let calls: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.candidate_kind == NativeCandidateKind::Invocation)
+        .collect();
+    assert!(calls.len() >= 4);
+    let graph = run(&IndexOptions::new(root.to_owned()));
+    for callee in [
+        "factory",
+        "base",
+        "default",
+        "module_default",
+        "lambda_default",
+        "lambda_outer",
+        "lambda_inner",
+        "lambda_body",
+        "inside",
+    ] {
+        let call = graph
+            .calls
+            .iter()
+            .find(|call| call.callee_text == callee)
+            .unwrap();
+        let captured = calls
+            .iter()
+            .find(|w| w.start_byte == call.range.start_byte && w.end_byte == call.range.end_byte)
+            .unwrap();
+        assert_eq!(captured.ancestor_ids.last(), Some(&call.caller), "{callee}");
+        let ordinal = calls
+            .iter()
+            .filter(|w| {
+                w.ancestor_ids.last() == Some(&call.caller)
+                    && (w.start_byte, w.end_byte) < (captured.start_byte, captured.end_byte)
+            })
+            .count() as u64;
+        let expected = baleyg::semantic_identity::occurrence_id(
+            &baleyg::model::v1::Text::new(capture.revision_id.clone()).unwrap(),
+            &baleyg::model::v1::SyntaxId::new(call.caller.clone()).unwrap(),
+            baleyg::semantic_identity::OccurrenceKind::Call,
+            baleyg::model::v1::UInt::new(ordinal).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            captured.stable_id.as_deref(),
+            Some(expected.as_str()),
+            "{callee}"
+        );
+    }
+    for node in graph
+        .nodes
+        .iter()
+        .filter(|n| n.name.starts_with("<lambda@"))
+    {
+        let captured = doc
+            .native_candidates
+            .iter()
+            .find(|w| {
+                w.candidate_kind == NativeCandidateKind::Declaration
+                    && w.start_byte == node.range.start_byte
+                    && w.end_byte == node.range.end_byte
+            })
+            .unwrap();
+        assert_eq!(captured.stable_id.as_deref(), Some(node.id.as_str()));
+        assert_eq!(captured.ancestor_ids.last(), node.parent.as_ref());
+    }
+    let module = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == baleyg::model::SymbolKind::Module && n.path == "a.py")
+        .unwrap();
+    for callee in ["factory", "base", "module_default", "lambda_outer"] {
+        assert_eq!(
+            graph
+                .calls
+                .iter()
+                .find(|c| c.callee_text == callee)
+                .unwrap()
+                .caller,
+            module.id
+        );
+    }
+    assert!(
+        calls
+            .iter()
+            .all(|w| w.stable_id.as_deref().unwrap().starts_with("occ:v1:"))
+    );
+    let member = calls
+        .iter()
+        .find(|w| source[w.start_byte..w.end_byte].starts_with("obj.éclair"))
+        .unwrap();
+    assert_eq!(
+        &source[member.token_start_byte..member.token_end_byte],
+        "éclair"
+    );
+    assert_eq!(member.spelling.as_deref(), Some("éclair"));
+    assert!(member.verified_member_token);
+    let fullwidth = calls
+        .iter()
+        .find(|w| source[w.start_byte..w.end_byte].starts_with("obj.Ａ"))
+        .unwrap();
+    assert_eq!(fullwidth.spelling.as_deref(), Some("Ａ"));
+    assert_eq!(
+        &source[fullwidth.token_start_byte..fullwidth.token_end_byte],
+        "Ａ"
+    );
+    for call in calls.iter().filter(|w| !w.verified_member_token) {
+        assert!(call.spelling.is_none() || !call.spelling.as_deref().unwrap().is_empty());
+    }
+    assert_eq!(calls.iter().filter(|w| w.verified_member_token).count(), 2);
+}

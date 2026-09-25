@@ -134,3 +134,50 @@ fn recovery_annotations_and_cancellation_are_explicit() {
             .any(|d| d.code == "python-lexical-only")
     );
 }
+
+#[test]
+fn stable_python_identity_and_lexical_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sample.py");
+    let before = "class Café:\n    def method(self):\n        obj.foo()\n        obj[key]()\n        if gate():\n            pass\ndef Ａ():\n    pass\ndef A():\n    pass\n";
+    fs::write(&path, before).unwrap();
+    let options = IndexOptions::new(dir.path().to_owned());
+    let first = run(&options);
+    assert!(first.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
+    assert!(first.calls.iter().all(|c| c.id.starts_with("occ:v1:")));
+    assert!(first.regions.iter().all(|r| r.id.starts_with("occ:v1:")));
+    assert_ne!(
+        first.nodes.iter().find(|n| n.name == "Ａ").unwrap().id,
+        first.nodes.iter().find(|n| n.name == "A").unwrap().id
+    );
+    let method = first.nodes.iter().find(|n| n.name == "method").unwrap();
+    assert_eq!(method.kind, SymbolKind::Method);
+    let second_source = before.replace(
+        "            pass",
+        "            work()
+            pass",
+    );
+    fs::write(&path, &second_source).unwrap();
+    let second = run(&options);
+    assert_eq!(
+        method.id,
+        second.nodes.iter().find(|n| n.name == "method").unwrap().id
+    );
+    assert_ne!(first.calls[0].id, second.calls[0].id);
+    let repeated = "def f(): pass\ndef f(): pass\n";
+    fs::write(&path, repeated).unwrap();
+    let duplicates = run(&options);
+    let mut duplicates_by_source: Vec<_> =
+        duplicates.nodes.iter().filter(|n| n.name == "f").collect();
+    duplicates_by_source.sort_by_key(|n| n.range.start_byte);
+    assert_eq!(duplicates_by_source.len(), 2);
+    assert_ne!(duplicates_by_source[0].id, duplicates_by_source[1].id);
+    fs::write(&path, format!("def f(): pass\n{repeated}")).unwrap();
+    let shifted = run(&options);
+    let mut shifted_by_source: Vec<_> = shifted.nodes.iter().filter(|n| n.name == "f").collect();
+    shifted_by_source.sort_by_key(|n| n.range.start_byte);
+    assert_eq!(shifted_by_source.len(), 3);
+    assert_eq!(duplicates_by_source[0].id, shifted_by_source[0].id);
+    assert_eq!(duplicates_by_source[1].id, shifted_by_source[1].id);
+    assert_ne!(duplicates_by_source[1].id, shifted_by_source[2].id);
+}
