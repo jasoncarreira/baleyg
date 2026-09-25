@@ -97,7 +97,14 @@ pub fn digest<T: Serialize>(domain: &[u8], value: &T) -> Result<CanonicalDigest>
 fn validate_key(key: &Key, language: Language) -> Result<()> {
     let named = key.name.is_some();
     ensure!(
-        named == !matches!(key.kind, v1::Kind::Module | v1::Kind::AnonymousFunction),
+        if named {
+            !matches!(key.kind, v1::Kind::Module | v1::Kind::AnonymousFunction)
+        } else {
+            matches!(
+                key.kind,
+                v1::Kind::Module | v1::Kind::Type | v1::Kind::AnonymousFunction
+            )
+        },
         "key name disagrees with kind"
     );
     ensure!(
@@ -198,8 +205,14 @@ pub fn occurrence_id(
 
 pub fn header_digest(header: &Header) -> Result<CanonicalDigest> {
     ensure!(
-        header.name.is_some()
-            == !matches!(header.kind, v1::Kind::Module | v1::Kind::AnonymousFunction),
+        if header.name.is_some() {
+            !matches!(header.kind, v1::Kind::Module | v1::Kind::AnonymousFunction)
+        } else {
+            matches!(
+                header.kind,
+                v1::Kind::Module | v1::Kind::Type | v1::Kind::AnonymousFunction
+            )
+        },
         "header name disagrees with kind"
     );
     digest(HEADER, header)

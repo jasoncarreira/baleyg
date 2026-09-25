@@ -1540,6 +1540,16 @@ fn java_anonymous_type_and_lambda_have_distinct_canonical_kinds() {
         .as_str()
         .to_owned()
     };
+    assert!(
+        syntax_id(
+            &doc.key.source_set_id,
+            &doc.key.path,
+            Language::Java,
+            &ancestors,
+            &key(Kind::Type, None, None),
+        )
+        .is_ok()
+    );
     let anonymous = doc
         .native_candidates
         .iter()
@@ -1559,6 +1569,30 @@ fn java_anonymous_type_and_lambda_have_distinct_canonical_kinds() {
         Some(id(Kind::AnonymousFunction).as_str())
     );
     assert_ne!(anonymous.stable_id, lambda.stable_id);
+    // A named type remains a separate canonical key; other declaration kinds
+    // cannot borrow the anonymous-type exception.
+    assert_ne!(
+        id(Kind::Type),
+        syntax_id(
+            &doc.key.source_set_id,
+            &doc.key.path,
+            Language::Java,
+            &ancestors,
+            &key(Kind::Type, Some("Named"), None),
+        )
+        .unwrap()
+        .as_str()
+    );
+    assert!(
+        syntax_id(
+            &doc.key.source_set_id,
+            &doc.key.path,
+            Language::Java,
+            &ancestors,
+            &key(Kind::Method, None, None),
+        )
+        .is_err()
+    );
 }
 
 #[test]
