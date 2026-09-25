@@ -418,6 +418,13 @@ test('a controlled digest collision rejects full descriptors before map insertio
  assert.throws(()=>checkMeasurement(one.loaded,one.records,{handleDigest:colliding}),e=>e.assertion==='ID.SOURCE'&&e.code==='invalidRecord'&&e.field==='id');
  assert.equal(checkMeasurement(s.loaded,s.records).identityByRef.get('main'),s.ids.main);
 });
+test('measured IDs require the full lowercase digest before truncation',()=>{
+ const s=sample();
+ for(const invalid of ['0'.repeat(32),'A'.repeat(64),'0'.repeat(65),null])
+  assert.throws(()=>checkMeasurement(s.loaded,s.records,{handleDigest:()=>invalid}),
+   e=>e.assertion==='ID.SOURCE'&&e.code==='invalidRecord'&&e.field==='id');
+ assert.equal(checkMeasurement(s.loaded,s.records).identityByRef.get('main'),s.ids.main);
+});
 function secondCallAndControl(){
  const s=sample(),text=source.replace('target();','target(); target();'),data=Buffer.from(text),delta=10;
  s.loaded.sources.set(JSON.stringify(['main','r1',doc.path]),data);s.loaded.revisions.get(JSON.stringify(['main','r1'])).documents[0].contentHash=sha(data);

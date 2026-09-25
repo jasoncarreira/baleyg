@@ -120,4 +120,7 @@ test('IDENTITY.OCCURRENCE_ORDINAL owner and kind isolate measured namespaces',()
   assert.equal(ordinals.get(a),1); assert.equal(ordinals.get(b),0);
   assert.equal(ordinals.get(c),0); assert.equal(ordinals.get(d),0);
   assert.throws(()=>assignOccurrenceOrdinals([a,{...a}]),/duplicate native range/);
+  for (const bad of [{...a,range:{start:5,end:5}},{...a,range:{start:-1,end:1}},
+    {...a,revisionId:''},{...a,ownerSyntaxId:'native-id'}])
+    assert.throws(()=>assignOccurrenceOrdinals([bad]),/IDENTITY.OCCURRENCE/);
 });

@@ -90,7 +90,9 @@ function spell(language,text) {
 export function checkMeasurement(loaded,records,{handleDigest=hash}={}) {
  const handles=new Map();
  function handle(domain,input){
-  const id=`${domain==='syntax'?'sid':'occ'}:v1:${handleDigest(domain,input).slice(0,32)}`;
+  const value=handleDigest(domain,input);
+  if(typeof value!=='string'||!/^[0-9a-f]{64}$/.test(value))reject('ID.SOURCE','id','digest must be a full lowercase SHA-256 hash');
+  const id=`${domain==='syntax'?'sid':'occ'}:v1:${value.slice(0,32)}`;
   const descriptor=hex(input),prior=handles.get(id);
   if(prior!==undefined&&prior!==descriptor)reject('ID.SOURCE','id','distinct canonical descriptors collide');
   handles.set(id,descriptor);return id;
