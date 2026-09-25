@@ -97,7 +97,7 @@ Freshness is independent from coverage and is evaluated only after captured-basi
 A failed refresh creates a `failed` coverage row and retains the old provenance as labelled historical evidence. It never relabels the old basis fresh and never binds old evidence to another revision's occurrences.
 
 <a id="historical-evidence-scope"></a>
-**Historical evidence scope (clarification, 2026-09-25).** This adds no field and no output record. `GraphResult` returns no `Symbol`, `DeclarationBinding` or `TypeRelationship` records. Retained declaration facts only determine which existing `Provenance` and `Coverage` rows an answer returns; the facts are never applied to the answer. Stable syntax IDs are the only cross-revision link.
+**Historical evidence scope (clarification, 2026-09-25).** This adds no field and no output record. `GraphResult` returns no `Symbol`, `DeclarationBinding` or `TypeRelationship` records. Retained declaration facts only select which existing `Provenance` rows an answer returns; the latest eligible earlier producer/document tuple supplies its captured `Coverage` row whether or not a fact names the returned declaration. The facts are never applied to the answer. Stable syntax IDs are the only cross-revision link.
 
 Take a returned `GraphNode.declaration` with syntax ID `S` in document `D`, an answer at revision `r2`, and a selected producer `P` whose `r2` tuple for `D` is `failed` or `omitted`. Let `r1` be the latest earlier revision at which `P`'s tuple for `D` is `complete` or `partial`; if none exists, nothing historical is returned. The answer returns:
 - the provenance of **every** `P` fact captured at `r1` whose provenance document is `D` and which names `S`, meaning a `DeclarationBinding.syntaxId`, an internal `Symbol.declarations` target, or a `TypeRelationship.source`. A fact whose evidence document is not `D` is excluded even if it targets `S`;
@@ -130,7 +130,7 @@ Hand-checks:
 | Caller bytes unchanged; dependency, config, or producer changes | Coverage is unchanged. | Each independently makes semantic evidence `possiblyStale`. |
 | Missing basis | Semantic artifact is malformed and atomically rejected; absence may be exposed as failed/missing coverage. | It cannot be called fresh. |
 | Fresh caller, changed target bytes | Caller may be fresh. | Internal binding has `staleTarget=true`; boundary, no expansion. |
-| Refresh fails | New tuple row is `failed`, diagnostic required. | Old basis remains historical with its old label; never promoted. Only provenance and coverage of declaration-keyed facts for returned declarations may appear in the new answer ([scope](#historical-evidence-scope)); no old call binding does. |
+| Refresh fails | New tuple row is `failed`, diagnostic required. | Old basis remains historical with its old label; never promoted. Only provenance of declaration-keyed facts for returned declarations may appear in the new answer, plus the latest eligible earlier coverage row for each returned declaration's document even without a matching fact ([scope](#historical-evidence-scope)); no old call binding does. |
 
 ## Records and bindings
 
