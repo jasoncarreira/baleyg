@@ -5,6 +5,8 @@ import {tmpdir} from 'node:os';
 import {join,dirname} from 'node:path';
 import {contentHash} from '../identity.mjs';
 import {loadFixture,discoverFixtures} from '../load.mjs';
+import {sourceWitness} from './helpers.mjs';
+import {registerControls,runControl} from './mutations.mjs';
 
 const hash=x=>contentHash(Buffer.from(x));
 async function specimen() {
@@ -121,3 +123,92 @@ test('IDENTITY.COVERAGE excludes Java alias but admits Java definition and JS al
  await s.flush();await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.COVERAGE',field:'requestedRoles'});
  intent.requestedRoles=['definition'];await s.flush();assert.equal((await loadFixture(s.root)).fixture.coverageIntents[0].requestedRoles[0],'definition');
 });
+
+// The three producers declare different coordinate systems for the same captured bytes.
+async function relationshipSpecimen(encoding,{duplicate=false,secondDocument=false}={}) {
+  const s=await specimen();
+  s.source='// 😀\nclass Child extends Parent {}\nclass Parent {}\n'+(duplicate?'class Child {}\n':'');
+  if(secondDocument) {
+    s.files['src/other.js']=s.source;
+    s.fixture.revisions[0].documents.push({key:{...s.document,path:'src/other.js'},revisionId:'r1',sourceFile:'src/other.js'});
+  }
+  s.files['src/go.js']=s.source;
+  s.fixture.producers[0].positionEncoding=encoding;
+  s.fixture.comparison.producers[0].positionEncoding=encoding;
+  const child=sourceWitness(s.source,'Child',{encoding});
+  const declarationRange={encoding,start:sourceWitness(s.source,'class Child',{encoding}).range.start,
+    end:sourceWitness(s.source,'{}',{encoding}).range.end};
+  const declaration={ref:'child',nativeId:null,document:s.document,revisionId:'r1',parentRef:null,
+    kind:'type',name:'Child',range:declarationRange,nameRange:child.range,
+    header:{kind:'type',name:'Child',modifiers:[],typeParameters:[],parameters:[],resultType:null,bases:['Parent']},
+    signature:null,witnesses:[{field:'name',witness:child},{field:'header.name',witness:child},
+      {field:'header.bases[0]',witness:sourceWitness(s.source,'Parent',{encoding})}]};
+  const fact={kind:'typeRelationship',ref:'relationship',relationshipKind:'extends',
+    source:{kind:'internal',declarationRef:'child',revisionId:'r1'},
+    target:{kind:'external',symbol:{scheme:'scip',symbol:'Parent',scope:'global',document:null}},
+    provenanceRef:'relationship-proof'};
+  await s.flush();
+  const admitted=await loadFixture(s.root);
+  const revision=s.fixture.revisions[0], producer=s.fixture.producers[1];
+  const basis={producerId:'semantic',producerVersion:producer.version,producerHash:producer.executableHash,
+    artifactHash:null,language:'javascript',sourceSetId:'main',revisionId:'r1',
+    sourceManifestHash:admitted.sourceManifestHash(admitted.selected),toolchainHash:revision.toolchainHash,
+    configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
+  const proof={kind:'provenance',ref:'proof-fact',record:{id:'relationship-proof',producerId:'semantic',
+    document:s.document,revisionId:'r1',contentHash:hash(s.source),evidenceKind:'typeRelationship',basis,freshness:'fresh'}};
+  async function check(value) {
+    s.files['captures/native.json']=JSON.stringify({formatVersion:1,producerId:'native',declarations:[value.declaration],calls:[],controls:[],references:[]});
+    const artifact=JSON.stringify({formatVersion:1,producerId:'semantic',facts:[value.fact]});
+    s.files['captures/fact.json']=artifact;
+    s.fixture.captures.find(x=>x.ref==='fact').hash=hash(artifact);
+    proof.record.basis.artifactHash=hash(artifact);
+    s.files['src/go.js.annotations.json']=JSON.stringify({formatVersion:1,document:s.document,
+      revisionId:'r1',scenarios:[],facts:[proof,value.fact]});
+    await s.flush();
+    return loadFixture(s.root);
+  }
+  return {s,value:{declaration,fact},check};
+}
+
+for (const encoding of ['utf8','utf16','unicodeScalar']) {
+  test(`IDENTITY.SEMANTIC admits source-derived ${encoding} relationship`,async t=>{
+    const {s,value,check}=await relationshipSpecimen(encoding);t.after(s.cleanup);
+    assert.deepEqual(value.declaration.nameRange,{
+      utf8:{encoding,start:14,end:19},utf16:{encoding,start:12,end:17},
+      unicodeScalar:{encoding,start:11,end:16}
+    }[encoding]);
+    const loaded=await check(value);
+    assert.equal(loaded.semanticProofs.get('relationship-proof').factKind,'typeRelationship');
+    assert.equal(loaded.native.declarations[0].name,'Child');
+  });
+}
+
+const relationshipMutations=[
+  ['utf8-split-scalar','utf8',v=>{v.declaration.nameRange.start=5;},'invalidRange'],
+  ['utf16-split-surrogate','utf16',v=>{v.declaration.nameRange.start=4;},'invalidRange'],
+  ['scalar-out-of-bounds','unicodeScalar',v=>{v.declaration.nameRange.end=100;},'invalidRange'],
+  ['declaration-boundary','utf16',v=>{v.declaration.range.start=4;},'invalidRange'],
+  ['reversed-name-range','utf8',v=>{v.declaration.nameRange.end=13;},'invalidRange'],
+  ['witness-split-scalar','utf8',v=>{v.declaration.witnesses[0].witness.range.start=5;},'invalidRange'],
+  ['witness-out-of-bounds','utf16',v=>{v.declaration.witnesses[0].witness.range.end=100;},'invalidRange'],
+  ['witness-outside-declaration','utf8',v=>{v.declaration.witnesses[0].witness.range={encoding:'utf8',start:60,end:65};},'invalidRecord'],
+  ['changed-witness-text','utf8',v=>{v.declaration.witnesses[0].witness.text='Other';},'invalidRecord'],
+  ['witness-encoding-disagreement','unicodeScalar',v=>{v.declaration.witnesses[0].witness.range.encoding='utf8';},'invalidRecord'],
+  ['name-range-disagreement','utf16',v=>{v.declaration.nameRange.encoding='utf8';},'invalidRecord'],
+  ['different-same-spelled-declaration','utf8',v=>{
+    v.declaration.witnesses[0].witness.range={encoding:'utf8',start:60,end:65};
+  },'invalidRecord'],
+  ['source-ref-mismatch','utf8',v=>{v.fact.source.declarationRef='other';},'invalidRecord'],
+  ['source-revision-mismatch','utf8',v=>{v.fact.source.revisionId='r2';},'invalidRecord'],
+  ['source-document-mismatch','utf8',v=>{v.declaration.document.path='src/other.js';},'invalidRecord'],
+];
+for(const [id,encoding,mutate,expectedCode] of relationshipMutations) {
+  test(`IDENTITY.SEMANTIC relationship ${id}`,async t=>{
+    const {s,value,check}=await relationshipSpecimen(encoding,{duplicate:['different-same-spelled-declaration','witness-outside-declaration'].includes(id),
+      secondDocument:id==='source-document-mismatch'});t.after(s.cleanup);
+    const row=registerControls([{id:`F1.${id}`,baseline:()=>value,check,
+      mutate:v=>{mutate(v);return v;},expectedAssertion:'IDENTITY.SEMANTIC',
+      expectedCode,expectedField:'fact.ref'}])[0];
+    await runControl(row);
+  });
+}
