@@ -64,6 +64,33 @@ test('RELATIONSHIP_FORMAT: explicit and independent relationshipKind for all thr
   const missing={...relationship}; delete missing.relationshipKind; failure('TypeRelationshipFact',missing,'TypeRelationshipFact.relationshipKind');
   assert.throws(() => parseJson('{"kind":"typeRelationship","relationshipKind":"extends","relationshipKind":"overrides"}'),/duplicate key relationshipKind/);
 });
+test('RELATIONSHIP_FORMAT.NESTED: captured relationship facts enforce source and closed enum',async () => {
+  const relationship=populated('TypeRelationshipFact');
+  const rows=[];
+  for (const [type,make,field] of [
+    ['Fact',fact => fact,'Fact'],
+    ['AnnotationFile',fact => ({...sample('AnnotationFile'),facts:[fact]}),'AnnotationFile.facts[0]'],
+    ['SemanticCapture',fact => ({...sample('SemanticCapture'),facts:[fact]}),'SemanticCapture.facts[0]']
+  ]) {
+    for (const relationshipKind of ['extends','implements','overrides']) validate(type,make({...relationship,relationshipKind}));
+    const baseline=() => make(structuredClone(relationship));
+    const cases=[
+      ['missing',fact => { delete fact.relationshipKind; },`${field}.relationshipKind`],
+      ['unknown',fact => { fact.relationshipKind='inherits'; },`${field}.relationshipKind`],
+      ['legacy',fact => { fact.relationship='extends'; },`${field}.relationship`],
+      ['nestedLegacy',fact => { fact.target.relationshipKind='extends'; },`${field}.target.relationshipKind`],
+      ['nestedConflict',fact => { fact.target.kind='overrides'; },`${field}.target.kind`],
+      ['externalSource',fact => { fact.source={kind:'external',symbol:sample('SymbolKey')}; },`${field}.source.kind`]
+    ];
+    for (const [name,change,expectedField] of cases) rows.push({
+      id:`RELATIONSHIP_FORMAT.${type}.${name}`,baseline,check:value => validate(type,value),
+      mutate:value => { const fact=type==='Fact' ? value : value.facts[0]; change(fact); return value; },
+      expectedAssertion:'FORMAT.SHAPE',expectedCode:'invalidRecord',expectedField
+    });
+  }
+  registerControls(rows);
+  for (const row of rows) await runControl(row);
+});
 test('FORMAT.ENVELOPES: comparison, diagnostics, requested limits and exclusive answers',() => {
   const fixture=sample('FixtureV1'); validate('FixtureV1',fixture);
   for (const field of ['comparison','coverageIntents','anchorCasesFile']) { const v={...fixture}; delete v[field]; failure('FixtureV1',v,`FixtureV1.${field}`); }
