@@ -36,6 +36,15 @@ fn fixture() -> (tempfile::TempDir, CapturedRevision, Evidence) {
     for name in ["toolchain.capture", "config.capture", "dependency.capture"] {
         fs::write(root.join(name), name).unwrap();
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            root.join("toolchain.capture"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
     let identity =
         baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(root), root).unwrap();
     let mut index = scip::types::Index::new();
@@ -63,7 +72,7 @@ fn fixture() -> (tempfile::TempDir, CapturedRevision, Evidence) {
             tool_name: "scip-test".into(),
             version: "1".into(),
             position_encoding: "utf8".into(),
-            executable: std::env::current_exe().unwrap(),
+            executable: root.join("toolchain.capture"),
             artifact: Some(root.join("semantic.artifact")),
         }],
     };
@@ -158,11 +167,11 @@ fn fixture() -> (tempfile::TempDir, CapturedRevision, Evidence) {
 #[test]
 fn producer() {
     let (_d, capture, evidence) = fixture();
-    assert!(
-        validate_evidence(&capture, &evidence, &capture).is_ok(),
-        "{:?}",
-        validate_evidence(&capture, &evidence, &capture)
-    );
+    assert!(validate_capture(&capture, &evidence).is_ok());
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
     let mut bad = evidence.clone();
     bad.producers[0].executable_hash = hash(b"forged");
     assert!(matches!(
@@ -233,11 +242,11 @@ fn document() {
 #[test]
 fn coverage() {
     let (_d, capture, evidence) = fixture();
-    assert!(
-        validate_evidence(&capture, &evidence, &capture).is_ok(),
-        "{:?}",
-        validate_evidence(&capture, &evidence, &capture)
-    );
+    assert!(validate_capture(&capture, &evidence).is_ok());
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
     let mut partial = evidence.clone();
     let selected = partial
         .coverage
@@ -246,7 +255,7 @@ fn coverage() {
         .unwrap();
     selected.selected = true;
     selected.state = CoverageState::Partial;
-    assert!(validate_evidence(&capture, &partial, &capture).is_ok());
+    assert!(validate_capture(&capture, &partial).is_ok());
     let mut bad = partial.clone();
     let failed = bad
         .coverage
@@ -276,5 +285,139 @@ fn coverage() {
     assert!(matches!(
         validate_evidence(&capture, &bad, &capture),
         Err(EvidenceError::Coverage(_))
+    ));
+}
+
+#[test]
+fn capture_only_cannot_publish_full_evidence() {
+    let (_dir, capture, evidence) = fixture();
+    assert_eq!(validate_capture(&capture, &evidence), Ok(()));
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
+}
+
+#[test]
+fn coverage_six_states_and_role_admission() {
+    let (_dir, capture, evidence) = fixture();
+    for (state, requested, selected, diagnostic) in [
+        (CoverageState::NotRequested, false, false, false),
+        (CoverageState::Omitted, true, false, true),
+        (CoverageState::Unsupported, true, false, true),
+        (CoverageState::Failed, true, true, true),
+        (CoverageState::Partial, true, true, true),
+        (CoverageState::Complete, true, true, false),
+    ] {
+        let mut valid = evidence.clone();
+        let row = &mut valid.coverage[0];
+        row.state = state;
+        row.requested = requested;
+        row.selected = selected;
+        row.diagnostic = diagnostic.then(|| text("reason"));
+        row.supported_roles = vec![Role::Definition, Role::Read];
+        row.observed_roles = vec![Role::Read];
+        assert_eq!(validate_capture(&capture, &valid), Ok(()), "{state:?}");
+        let mut wrong_tuple = valid.clone();
+        wrong_tuple.coverage[0].selected = !selected;
+        assert!(
+            matches!(
+                validate_capture(&capture, &wrong_tuple),
+                Err(EvidenceError::Coverage(_))
+            ),
+            "{state:?}"
+        );
+        let mut wrong_diagnostic = valid.clone();
+        wrong_diagnostic.coverage[0].diagnostic = (!diagnostic).then(|| text("reason"));
+        assert!(
+            matches!(
+                validate_capture(&capture, &wrong_diagnostic),
+                Err(EvidenceError::Coverage(_))
+            ),
+            "{state:?}"
+        );
+    }
+    let mut bad = evidence.clone();
+    bad.coverage[0].supported_roles = vec![Role::Read, Role::Definition];
+    assert!(matches!(
+        validate_capture(&capture, &bad),
+        Err(EvidenceError::Coverage(_))
+    ));
+    bad.coverage[0].supported_roles = vec![Role::Read, Role::Read];
+    assert!(matches!(
+        validate_capture(&capture, &bad),
+        Err(EvidenceError::Coverage(_))
+    ));
+    bad.coverage[0].supported_roles = vec![Role::Definition, Role::Read];
+    bad.coverage[0].observed_roles = vec![Role::Read, Role::Definition];
+    assert!(matches!(
+        validate_capture(&capture, &bad),
+        Err(EvidenceError::Coverage(_))
+    ));
+    bad.coverage[0].observed_roles = vec![Role::Write];
+    assert!(matches!(
+        validate_capture(&capture, &bad),
+        Err(EvidenceError::Coverage(_))
+    ));
+    let java = evidence
+        .coverage
+        .iter()
+        .position(|row| row.language == Language::Java)
+        .unwrap();
+    for observed in [false, true] {
+        let mut bad = evidence.clone();
+        bad.coverage[java].supported_roles = vec![Role::Alias];
+        if observed {
+            bad.coverage[java].observed_roles = vec![Role::Alias];
+        }
+        assert!(matches!(
+            validate_capture(&capture, &bad),
+            Err(EvidenceError::Coverage(_))
+        ));
+    }
+    let rust = evidence
+        .coverage
+        .iter()
+        .position(|row| row.language == Language::Rust)
+        .unwrap();
+    let mut valid = evidence.clone();
+    valid.coverage[rust].supported_roles = vec![Role::Alias];
+    valid.coverage[rust].observed_roles = vec![Role::Alias];
+    assert_eq!(validate_capture(&capture, &valid), Ok(()));
+}
+
+#[test]
+fn captured_root_document_hash_and_manifest_are_immutable() {
+    let (_dir, capture, evidence) = fixture();
+    assert_eq!(validate_capture(&capture, &evidence), Ok(()));
+    let mut forged = evidence.clone();
+    forged.context.source_set.root_id = text("forged-root");
+    assert!(matches!(
+        validate_capture(&capture, &forged),
+        Err(EvidenceError::SourceSet(_))
+    ));
+    let mut forged = capture.clone();
+    forged.root_id = "forged-root".into();
+    assert!(matches!(
+        validate_capture(&forged, &evidence),
+        Err(EvidenceError::SourceSet(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.context.revision.documents[0].content_hash = hash(b"different source bytes");
+    assert!(matches!(
+        validate_capture(&capture, &wrong),
+        Err(EvidenceError::Document(_))
+    ));
+    let mut changed = capture.clone();
+    changed.documents[0].bytes.push(b'!');
+    assert!(matches!(
+        validate_capture(&changed, &evidence),
+        Err(EvidenceError::Document(_) | EvidenceError::Revision(_))
+    ));
+    let mut changed = capture.clone();
+    changed.manifest_bytes.push(b' ');
+    assert!(matches!(
+        validate_capture(&changed, &evidence),
+        Err(EvidenceError::Revision(_))
     ));
 }

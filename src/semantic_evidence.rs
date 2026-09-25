@@ -268,6 +268,11 @@ pub fn validate_capture(
                     .collect::<Vec<_>>(),
             )
             || coverage
+                .supported_roles
+                .iter()
+                .chain(&coverage.observed_roles)
+                .any(|r| coverage.language == Language::Java && *r == Role::Alias)
+            || coverage
                 .observed_roles
                 .iter()
                 .any(|r| !coverage.supported_roles.contains(r))
@@ -344,5 +349,7 @@ pub fn validate_evidence(
             "fact families require later validator phases",
         ));
     }
-    Ok(evidence.clone())
+    Err(EvidenceError::NotYetValidated(
+        "native syntax, provenance, basis and semantic facts require later validator phases",
+    ))
 }
