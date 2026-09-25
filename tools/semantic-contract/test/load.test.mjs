@@ -40,7 +40,9 @@ test('IDENTITY.ADMISSION verifies source-derived snapshot and independent produc
 test('IDENTITY.DIGEST rejects changed capture and unlisted snapshot file',async t=>{
   const s=await specimen(); t.after(s.cleanup);
   await writeFile(join(s.root,'captures/config.txt'),'changed');
-  await assert.rejects(loadFixture(s.root),/IDENTITY.DIGEST/);
+  await assert.rejects(loadFixture(s.root),error=>error.assertion==='IDENTITY.DIGEST'&&
+    error.message.includes(`expected ${s.fixture.captures.find(c=>c.ref==='config').hash}`)&&
+    error.message.includes(`actual ${hash('changed')}`));
   await s.flush();await writeFile(join(s.root,'src/unlisted.js'),'x');
   await assert.rejects(loadFixture(s.root),/IDENTITY.INVENTORY/);
   await rm(join(s.root,'src/unlisted.js'));await writeFile(join(s.root,'root-unlisted.js'),'x');

@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {generateFixture,checkPublication,compileFixture} from '../publish.mjs';
 import {parseArgs,main} from '../cli.mjs';
+import {contentHash} from '../identity.mjs';
 import {registerControls,runControl} from './mutations.mjs';
 
 const example=fileURLToPath(new URL('../../../tests/fixtures/semantic-evidence/v1/example/',import.meta.url));
@@ -132,7 +133,8 @@ test('publication: published hash changes fail exact hash assertion without writ
   const file=join(root,'generated',manifest.counts.path);
   await writeFile(file,'{}');
   const before=await tree(root);
-  await assert.rejects(()=>checkPublication(root),error=>rejects(error,'PUBLICATION.HASH','counts'));
+  await assert.rejects(()=>checkPublication(root),error=>rejects(error,'PUBLICATION.HASH','counts')&&
+   error.message.includes(`expected ${manifest.counts.hash}`)&&error.message.includes(`actual ${contentHash(Buffer.from('{}'))}`));
   assert.deepEqual(await tree(root),before);
  } finally {await cleanup();}
 });

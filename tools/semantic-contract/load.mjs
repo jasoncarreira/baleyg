@@ -141,7 +141,8 @@ export async function loadFixture(root) {
   const selectedIndex=revisionChronology.get(fixture.comparison.sourceSetId).indexOf(selected);
   for (const capture of fixture.captures) {
     const bytes=await confinedFile(root,capture.file);
-    if (contentHash(bytes)!==capture.hash) reject('IDENTITY.DIGEST',capture.file,'captured bytes differ');
+    const actualHash=contentHash(bytes);
+    if (actualHash!==capture.hash) reject('IDENTITY.DIGEST',capture.file,`captured bytes differ: expected ${capture.hash}, actual ${actualHash}`);
     captures.set(capture.ref,capture); captureBytes.set(capture.ref,bytes);
   }
   const matching=(kind,hash) => fixture.captures.some(x=>x.kind===kind && x.hash===hash);

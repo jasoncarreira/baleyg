@@ -74,7 +74,8 @@ async function readPublished(root,expected) {
   const file=join(root,'generated',descriptor.path);
   let bytes;
   try {bytes=await readFile(file);} catch(error) {fail('PUBLICATION.FILE',name,`published file missing: ${error.message}`);}
-  if(contentHash(bytes)!==descriptor.hash)fail('PUBLICATION.HASH',name,'published byte hash differs');
+  const actualHash=contentHash(bytes);
+  if(actualHash!==descriptor.hash)fail('PUBLICATION.HASH',name,`published byte hash differs: expected ${descriptor.hash}, actual ${actualHash}`);
  }
  if(!manifestBytes.equals(canonicalBytes(expected)))fail('PUBLICATION.MANIFEST','manifest','published manifest bytes differ from admitted inputs');
  return manifest;
