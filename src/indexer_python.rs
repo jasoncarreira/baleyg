@@ -10,6 +10,8 @@ use tree_sitter::Node;
 struct PythonIds {
     module: String,
     ids: HashMap<(usize, usize, &'static str), String>,
+    occurrence_owners: HashMap<(usize, usize, &'static str), String>,
+    owner_paths: HashMap<String, Vec<String>>,
 }
 
 fn declaration(n: Node<'_>, bytes: &[u8]) -> Result<Option<Key>> {
@@ -79,7 +81,6 @@ impl PythonIds {
             if matches!(n.kind(), "type" | "type_parameter" | "type_alias_statement") {
                 return Ok(());
             }
-            let mut parents = parents;
             if let Some(key) = declaration(n, bytes)? {
                 let mut key = key;
                 if key.kind == Kind::Function
@@ -88,7 +89,21 @@ impl PythonIds {
                     key.kind = Kind::Method;
                 }
                 out.push((n.start_byte(), n.end_byte(), key, parents.clone()));
-                parents.push(out.len() - 1);
+                let declaration_index = out.len() - 1;
+                let body = n.child_by_field_name("body");
+                let mut cursor = n.walk();
+                for child in n.named_children(&mut cursor) {
+                    // Defaults, decorators and bases are evaluated by the enclosing owner.
+                    let child_parents = if Some(child) == body {
+                        let mut nested = parents.clone();
+                        nested.push(declaration_index);
+                        nested
+                    } else {
+                        parents.clone()
+                    };
+                    collect(child, bytes, child_parents, out)?;
+                }
+                return Ok(());
             }
             let mut cursor = n.walk();
             for child in n.named_children(&mut cursor) {
@@ -101,6 +116,7 @@ impl PythonIds {
         let mut keys = HashMap::<usize, Key>::new();
         let mut owner_ids = HashMap::<usize, String>::new();
         let mut collisions = identity::CollisionRegistry::default();
+        let mut owner_paths = HashMap::from([(module.clone(), vec![module.clone()])]);
         for depth in 0..=declarations.iter().map(|d| d.3.len()).max().unwrap_or(0) {
             let indexes: Vec<_> = (0..declarations.len())
                 .filter(|&i| declarations[i].3.len() == depth)
@@ -129,6 +145,13 @@ impl PythonIds {
                     identity::syntax_id(&source_set, &path, Language::Python, &ancestors, &key)?;
                 collisions.syntax(&id, digest.input)?;
                 ids.insert((*start, *end, "syntax"), id.as_str().to_owned());
+                owner_paths.insert(
+                    id.as_str().to_owned(),
+                    std::iter::once(module.clone())
+                        .chain(parents.iter().map(|p| owner_ids[p].clone()))
+                        .chain(std::iter::once(id.as_str().to_owned()))
+                        .collect(),
+                );
                 owner_ids.insert(i, id.as_str().to_owned());
                 keys.insert(i, key);
             }
@@ -144,13 +167,11 @@ impl PythonIds {
             if matches!(n.kind(), "type" | "type_parameter" | "type_alias_statement") {
                 return;
             }
-            let owner = declarations
+            let declaration_owner = declarations
                 .iter()
                 .enumerate()
                 .find(|(_, d)| d.0 == n.start_byte() && d.1 == n.end_byte())
-                .and_then(|(i, _)| owner_ids.get(&i))
-                .cloned()
-                .unwrap_or(owner);
+                .and_then(|(i, _)| owner_ids.get(&i));
             if region(n) {
                 out.push((
                     n.start_byte(),
@@ -169,9 +190,15 @@ impl PythonIds {
                     OccurrenceKind::Call,
                 ));
             }
+            let body = declaration_owner.and_then(|_| n.child_by_field_name("body"));
             let mut cursor = n.walk();
             for child in n.named_children(&mut cursor) {
-                visit(child, declarations, owner_ids, owner.clone(), out);
+                let child_owner = if Some(child) == body {
+                    declaration_owner.cloned().unwrap_or_else(|| owner.clone())
+                } else {
+                    owner.clone()
+                };
+                visit(child, declarations, owner_ids, child_owner, out);
             }
         }
         visit(
@@ -193,17 +220,24 @@ impl PythonIds {
             })
             .collect();
         let revision = Text::new(revision.to_owned()).context("invalid Python revision")?;
+        let mut occurrence_owners = HashMap::new();
         for ((start, end, prefix, owner, kind), ordinal) in occurrences
             .into_iter()
             .zip(identity::occurrence_ordinals(&entries)?)
         {
+            occurrence_owners.insert((start, end, prefix), owner.clone());
             let owner = v1::SyntaxId::new(owner).unwrap();
             let digest = identity::occurrence_digest(&revision, &owner, kind, ordinal)?;
             let id = identity::occurrence_id(&revision, &owner, kind, ordinal)?;
             collisions.occurrence(&id, digest.input)?;
             ids.insert((start, end, prefix), id.as_str().to_owned());
         }
-        Ok(Self { module, ids })
+        Ok(Self {
+            module,
+            ids,
+            occurrence_owners,
+            owner_paths,
+        })
     }
 }
 
@@ -243,21 +277,20 @@ pub(crate) fn identify_document(
             .ids
             .get(&(witness.start_byte, witness.end_byte, prefix))
             .cloned();
-        let mut ancestors: Vec<_> = ids
-            .ids
-            .iter()
-            .filter(|((start, end, kind), _)| {
-                *kind == "syntax"
-                    && *start <= witness.start_byte
-                    && witness.end_byte <= *end
-                    && (*start, *end) != (witness.start_byte, witness.end_byte)
-            })
-            .map(|((start, end, _), id)| (*start, *end, id.clone()))
-            .collect();
-        ancestors.sort_by_key(|(start, end, _)| (*start, usize::MAX - *end));
-        witness.ancestor_ids = std::iter::once(ids.module.clone())
-            .chain(ancestors.into_iter().map(|(_, _, id)| id))
-            .collect();
+        witness.ancestor_ids = if prefix == "syntax" {
+            witness
+                .stable_id
+                .as_ref()
+                .and_then(|id| ids.owner_paths.get(id))
+                .map(|path| path[..path.len() - 1].to_vec())
+                .unwrap_or_else(|| vec![ids.module.clone()])
+        } else {
+            ids.occurrence_owners
+                .get(&(witness.start_byte, witness.end_byte, prefix))
+                .and_then(|owner| ids.owner_paths.get(owner))
+                .cloned()
+                .unwrap_or_else(|| vec![ids.module.clone()])
+        };
         if witness.candidate_kind == NativeCandidateKind::Invocation
             && witness.node_kind == "call"
             && let Some(node) = find_call(tree.root_node(), witness.start_byte, witness.end_byte)

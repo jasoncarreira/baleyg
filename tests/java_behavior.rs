@@ -11,6 +11,9 @@ use baleyg::{
 };
 use std::sync::{Arc, atomic::AtomicBool};
 fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
+    fixture_with_body(source, name, None)
+}
+fn fixture_with_body(source: &str, name: &str, body: Option<&str>) -> (Graph, SequenceView) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("Fixture.java"), source).unwrap();
     let graph = index_workspace(
@@ -22,7 +25,12 @@ fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
     let seed = graph
         .nodes
         .iter()
-        .find(|n| n.name == name && matches!(n.kind, SymbolKind::Function | SymbolKind::Method))
+        .find(|n| {
+            n.name == name
+                && matches!(n.kind, SymbolKind::Function | SymbolKind::Method)
+                && body
+                    .is_none_or(|body| source[n.range.start_byte..n.range.end_byte].contains(body))
+        })
         .unwrap_or_else(|| panic!("missing {name}: {:?}", graph.nodes));
     let view = build_sequence(test_pin(7), seed, &graph.files[0], &graph.calls, false).unwrap();
     (graph, view)
@@ -189,9 +197,10 @@ fn signatures_and_annotation_defaults_have_no_invocation_body() {
 }
 #[test]
 fn explicit_and_compact_constructors_are_navigable() {
-    let (_, view) = fixture(
+    let (_, view) = fixture_with_body(
         "class Fixture { Fixture() { this(first()); after(); } Fixture(Object x) { super(); } }",
         "Fixture",
+        Some("this(first());"),
     );
     assert_eq!(calls(&view.steps), ["first", "this", "after"]);
     let (_, view) = fixture("record Pair(String x) { Pair { validate(x); } }", "Pair");
