@@ -403,11 +403,19 @@ fn overlapping_git_workspace_refuses_before_marker_or_managed_entries() {
         for sub in ["status", "index", "symbols", "query", "export", "serve"] {
             let temp = TempDir::new().unwrap();
             let home = temp.path().join("home");
-            let cache = home.join("Library/Caches/dev.odin.baleyg");
-            let data = home.join("Library/Application Support/dev.odin.baleyg");
+            let (cache, data) = if cfg!(target_os = "macos") {
+                (
+                    home.join("Library/Caches/dev.odin.baleyg"),
+                    home.join("Library/Application Support/dev.odin.baleyg"),
+                )
+            } else {
+                (home.join(".cache/baleyg"), home.join(".local/share/baleyg"))
+            };
             let workspace = if fixed == "cache" { &cache } else { &data };
             fs::create_dir_all(workspace.join(".git")).unwrap();
             let mut cmd = command(workspace, &home, sub);
+            cmd.env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("XDG_DATA_HOME", home.join(".local/share"));
             if sub == "query" {
                 cmd.arg("--seed").arg("a");
             }
