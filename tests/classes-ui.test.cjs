@@ -191,6 +191,20 @@ test("failed expansion restores the prior view controls and can be retried",asyn
  h.setRequest(async()=>diagram(["A","B","C"]));await related(h,"A",["B"]);
  assert.deepEqual(Array.from(h.calls.at(-1).options.body.expanded),["B"]);assert.ok(h.card("B"));assert.equal(h.card("C"),undefined);
 });
+test("failed lookup restores visible diagram actions after superseding a pending diagram refresh",async()=>{
+ const h=harness();await h.controller.open({seed:"A"});const card=h.card("A"), pending=deferred();
+ h.setRequest((url,options)=>options ? pending.promise : Promise.reject(Object.assign(Error("Storage is busy"),{status:409,code:"storage_busy"})));
+ const refreshing=h.get("classes-unmatched").fire("change");
+ await h.get("classes-search").fire("click");
+ assert.equal(h.card("A"),card);assert.equal(h.get("classes-state").dataset.state,"error");
+ assert.equal(h.stale.length,0);
+ await h.button(card,"execute()").fire("click");assert.equal(h.methods.length,1);
+ pending.resolve(diagram(["A","B","C"]));await refreshing;
+ assert.equal(h.card("A"),card);assert.equal(h.card("C"),undefined);
+ await h.button(card,"execute()").fire("click");assert.equal(h.methods.length,2);
+ assert.equal(h.stale.length,0);
+});
+
 test("class search keeps its prior diagram and controls through storage_busy, then clears on revision_conflict",async()=>{
  const h=harness();await h.controller.open({seed:"A"});
  const card=h.card("A"), control=h.button(h.document.body,"Show all returned classes"), pending=deferred();

@@ -278,6 +278,9 @@
   }
   async function lookup({path = "", q = "", offset = 0, autoOpen = false} = {}) {
     const c = context(), ticket = ++searchSerial;
+    // Lookup supersedes a pending diagram request. Restore the visible diagram's
+    // action ticket; the old response is still rejected by searchSerial.
+    if (diagram && snapshot && valid(snapshot)) displayTicket = serial;
     if (api.onChange) api.onChange();
     ui.diagram.setAttribute("aria-busy", "false");
     // Keep the current diagram and its callbacks usable while lookup is pending.
