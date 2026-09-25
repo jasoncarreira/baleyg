@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {fileURLToPath} from 'node:url';
 import {join} from 'node:path';
+import {readFileSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
 import {loadFixture} from '../load.mjs';
 import {normalizeFixture} from '../normalize.mjs';
 import {materializeAnswers} from '../answers.mjs';
@@ -25,6 +27,27 @@ const joins=checkJoins(fixture,records,coverage,measurement);
 checkRelationships(fixture,records,coverage,measurement,joins);
 checkBindings(fixture,records,coverage,measurement,joins);
 const answer=id=>answers.answers.find(row=>row.id===id);
+
+// anchors.js is intentionally a classic script: sibling function declarations
+// may share a name there, but exporting those siblings from an ES module is invalid.
+test('example anchor snapshots parse as native JavaScript scripts; duplicate exports fail',()=>{
+ for(const revision of ['r0','r1','r2']) {
+  const file=join(root,'snapshots',revision,'src','anchors.js');
+  const source=readFileSync(file,'utf8');
+  const check=spawnSync(process.execPath,['--check',file],{encoding:'utf8'});
+  assert.equal(check.status,0,`${revision}: ${check.stderr}`);
+  const script=spawnSync(process.execPath,['--check','--input-type=commonjs'],{input:source,encoding:'utf8'});
+  assert.equal(script.status,0,`${revision} script: ${script.stderr}`);
+  assert.match(source,/^function anchor\(\)/m);
+  assert.equal(source.includes('export '),false);
+ }
+ const source=readFileSync(join(root,'snapshots','r2','src','anchors.js'),'utf8');
+ const invalidModule=source.replace(/^function anchor\(\)/gm,'export function anchor()');
+ assert.notEqual(invalidModule,source);
+ const regression=spawnSync(process.execPath,['--check','--input-type=module'],{input:invalidModule,encoding:'utf8'});
+ assert.notEqual(regression.status,0);
+ assert.match(regression.stderr,/Identifier 'anchor' has already been declared/);
+});
 
 // Expected IDs and bytes are independently pinned from the literal source and
 // #22 domain-separated canonical digest, not copied from a checker result.
