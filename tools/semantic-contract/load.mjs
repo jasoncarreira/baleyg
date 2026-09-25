@@ -1,5 +1,5 @@
 import {readFile, readdir, realpath, lstat} from 'node:fs/promises';
-import {resolve, relative, join, dirname} from 'node:path';
+import {resolve, relative, join} from 'node:path';
 import {validate} from './formats.mjs';
 import {parseJson} from './json.mjs';
 import {contentHash, sourceManifestHash} from './identity.mjs';
@@ -27,7 +27,9 @@ export async function confinedFile(root, path) {
   let cursor=physical;
   for (const part of path.split('/')) {
     cursor=join(cursor,part);
-    const info=await lstat(cursor);
+    let info;
+    try { info=await lstat(cursor); }
+    catch (error) { if (error.code==='ENOENT') reject('IDENTITY.INVENTORY',path,'declared input missing'); throw error; }
     if (info.isSymbolicLink() || (cursor===target && !info.isFile())) reject('IDENTITY.PATH',path,'symlink or non-file');
   }
   if (await realpath(target)!==target) reject('IDENTITY.PATH',path,'escaped fixture');
@@ -50,28 +52,19 @@ function unique(rows,selector,field) {
 async function inventory(root,paths) {
   unique(paths,x=>x,'files');
   const listed=new Set(paths);
-  const directories=new Set(paths.map(x=>dirname(x)).filter(x=>x!=='.'));  
-  {
-    for (const entry of await readdir(root,{withFileTypes:true})) {
-      if (entry.name==='fixture.json' || entry.isDirectory()) continue;
-      if (entry.isSymbolicLink() || (!listed.has(entry.name) && entry.name!=='.DS_Store' && entry.name!=='README.md'))
-        reject('IDENTITY.INVENTORY',entry.name,'unlisted root snapshot file or symlink');
+  // Generated publication is not an input. All other fixture directories are closed.
+  async function walk(folder='') {
+    for (const entry of await readdir(resolve(root,folder),{withFileTypes:true})) {
+      const path=folder?`${folder}/${entry.name}`:entry.name;
+      if (!folder && (path==='fixture.json' || path==='.DS_Store' || path==='README.md')) continue;
+      if (!folder && path==='generated' && entry.isDirectory()) continue;
+      if (entry.isSymbolicLink()) reject('IDENTITY.INVENTORY',path,'symlink');
+      if (entry.isDirectory()) await walk(path);
+      else if (!entry.isFile() || !listed.has(path)) reject('IDENTITY.INVENTORY',path,'unlisted fixture input');
     }
   }
-  for (const dir of directories) {
-    // Walk only declared snapshot directories, never the whole fixture root.
-    const sample=paths.find(x=>dirname(x)===dir);
-    await confinedFile(root,sample);
-    async function walk(folder) {
-      for (const entry of await readdir(resolve(root,folder),{withFileTypes:true})) {
-        const path=folder==='.'?entry.name:`${folder}/${entry.name}`;
-        if (entry.isSymbolicLink()) reject('IDENTITY.INVENTORY',path,'symlink');
-        if (entry.isDirectory()) await walk(path);
-        else if (!entry.isFile() || !listed.has(path)) reject('IDENTITY.INVENTORY',path,'unlisted snapshot file');
-      }
-    }
-    await walk(dir);
-  }
+  await walk();
+  for (const path of listed) await confinedFile(root,path);
 }
 
 export async function loadFixture(root) {
@@ -83,7 +76,7 @@ export async function loadFixture(root) {
   unique(fixture.revisions,x=>key([x.sourceSetId,x.id]),'revisions');
   unique(fixture.captures,x=>x.ref,'captures.ref');
   unique(fixture.captures,x=>x.file,'captures.file');
-  const sources=new Map(), sourceFiles=[], revisions=new Map(), captureBytes=new Map(), captures=new Map();
+  const sources=new Map(), sourceFiles=[], revisions=new Map(), revisionChronology=new Map(), captureBytes=new Map(), captures=new Map();
   for (const set of fixture.sourceSets) {
     if (!set.languages.length || !set.languages.includes(fixture.language)) reject('IDENTITY.SOURCE_SET','languages','fixture language not admitted');
     unique(set.languages,x=>x,'sourceSets.languages');
@@ -98,6 +91,10 @@ export async function loadFixture(root) {
   unique(fixture.semanticArtifacts,x=>x,'semanticArtifacts');
   unique(fixture.annotationFiles,x=>x,'annotationFiles');
   unique([fixture.nativeArtifact,fixture.answersFile,fixture.dispositionsFile,fixture.anchorCasesFile,...fixture.annotationFiles,...fixture.semanticArtifacts],x=>x,'inputFiles');
+  for (const path of [...fixture.revisions.flatMap(x=>x.documents.map(d=>d.sourceFile)),...fixture.captures.map(x=>x.file),
+    fixture.nativeArtifact,...fixture.annotationFiles,fixture.answersFile,fixture.dispositionsFile,fixture.anchorCasesFile])
+    if (path==='fixture.json' || path==='generated' || path.startsWith('generated/'))
+      reject('IDENTITY.INVENTORY',path,'publication and descriptor bytes cannot be declared as inputs');
   const intents=new Set();
   for (const intent of fixture.coverageIntents) {
     const id=key([intent.producerId,documentKey(intent.document),intent.revisionId]);
@@ -135,9 +132,13 @@ export async function loadFixture(root) {
     }
     const complete={...revision,documents};
     revisions.set(key([revision.sourceSetId,revision.id]),complete);
+    if (!revisionChronology.has(revision.sourceSetId)) revisionChronology.set(revision.sourceSetId,[]);
+    revisionChronology.get(revision.sourceSetId).push(complete);
   }
   const selected=revisions.get(key([fixture.comparison.sourceSetId,fixture.comparison.revisionId]));
   if (!selected) reject('IDENTITY.COMPARISON','comparison','snapshot not admitted');
+  // Fixture order is authored chronology within each source set. IDs are opaque.
+  const selectedIndex=revisionChronology.get(fixture.comparison.sourceSetId).indexOf(selected);
   for (const capture of fixture.captures) {
     const bytes=await confinedFile(root,capture.file);
     if (contentHash(bytes)!==capture.hash) reject('IDENTITY.DIGEST',capture.file,'captured bytes differ');
@@ -188,8 +189,13 @@ export async function loadFixture(root) {
       if (fact.kind==='coverage' || fact.kind==='provenance') continue;
       const proofId=fact.kind==='typeRelationship'?fact.provenanceRef:fact.record.provenanceId;
       const provenance=proofById.get(proofId);
-      if (!provenance || (fact.kind==='typeRelationship' && provenance.evidenceKind!=='typeRelationship') || provenance.evidenceKind==='measuredSyntax')
-        reject('IDENTITY.SEMANTIC',fact.ref,'missing or wrong-kind semantic provenance');
+      const evidenceKind={declarationBinding:'declarationBinding',symbol:'declarationBinding',reference:'semanticReference',
+        callBinding:'semanticReference',typeRelationship:'typeRelationship'}[fact.kind];
+      if (!provenance || provenance.evidenceKind!==evidenceKind ||
+          provenance.producerId!==provenance.basis?.producerId ||
+          provenance.contentHash!==revisions.get(key([annotation.document.sourceSetId,annotation.revisionId]))
+            ?.documents.find(x=>documentKey(x.key)===documentKey(annotation.document))?.contentHash)
+        reject('IDENTITY.SEMANTIC',fact.ref,'missing, wrong-kind, or mismatched semantic provenance');
       if (fact.kind==='typeRelationship' && fact.source.kind==='internal') {
         const declaration=native.declarations.find(x=>x.ref===fact.source.declarationRef && x.revisionId===fact.source.revisionId &&
           documentKey(x.document)===documentKey(annotation.document));
@@ -231,7 +237,7 @@ export async function loadFixture(root) {
   const dispositions=(await jsonFile(root,fixture.dispositionsFile,'DispositionsV1')).value;
   const anchors=(await jsonFile(root,fixture.anchorCasesFile,'AnchorCasesV1')).value;
   await inventory(root,[...new Set(sourceFiles),...fixture.captures.map(x=>x.file),fixture.nativeArtifact,...fixture.annotationFiles,fixture.answersFile,fixture.dispositionsFile,fixture.anchorCasesFile]);
-  return {root,fixture,comparison:fixture.comparison,selected,revisions,sources,captures,captureBytes,semanticBytes,semanticProofs,native,annotations,answers,dispositions,anchors,
+  return {root,fixture,comparison:fixture.comparison,selected,selectedIndex,revisions,revisionChronology,sources,captures,captureBytes,semanticBytes,semanticProofs,native,annotations,answers,dispositions,anchors,
     sourceManifestHash: revision => sourceManifestHash(revision.documents.map(x=>({document:x.key,contentHash:x.contentHash})))};
 }
 
