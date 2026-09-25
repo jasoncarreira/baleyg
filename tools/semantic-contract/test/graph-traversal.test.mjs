@@ -123,8 +123,11 @@ test('fresh r2 caller expands stable r1 internal target only when target bytes m
  assert.equal(s.run().result.edges[0].boundaryReason,'stale');
 });
 
-function decisionCheck(answer,{assertion,field,expected,select}){
- const actual=select(answer.result);
+// Control expectations are authored constants; each check re-runs production on the
+// current source specimen, including the one-member mutation made by runControl.
+function decisionCheck(input,{assertion,field,expected,select}){
+ const answer=traverseGraph(input);
+ const actual=answer.ok?select(answer.result):undefined;
  if(!Object.is(actual,expected)){
   const error=new Error(`${assertion} ${field}: expected ${String(expected)}, got ${String(actual)}`);
   Object.assign(error,{assertion,code:'invalidRecord',field});throw error;
@@ -132,17 +135,17 @@ function decisionCheck(answer,{assertion,field,expected,select}){
  return true;
 }
 const controls=registerControls([
- {id:'GRAPH.nodeLimit.to',baseline:()=>{const s=specimen({request:{maxNodes:1}});s.add('A','B');return s.run();},
-  mutate:answer=>{answer.result.edges[0].to=sid(2);return answer;},
-  check:answer=>decisionCheck(answer,{assertion:'GRAPH.NODE_LIMIT',field:'edges[0].to',expected:null,select:r=>r.edges[0].to}),
+ {id:'GRAPH.nodeLimit.to',baseline:()=>{const s=specimen({request:{maxNodes:1}});s.add('A','B');return {records:s.records,request:s.request};},
+  mutate:input=>{input.request.maxNodes=2;return input;},
+  check:input=>decisionCheck(input,{assertion:'GRAPH.NODE_LIMIT',field:'edges[0].to',expected:null,select:r=>r.edges[0]?.to}),
   expectedAssertion:'GRAPH.NODE_LIMIT',expectedCode:'invalidRecord',expectedField:'edges[0].to'},
  {id:'GRAPH.failedRefresh.reason',baseline:()=>{const s=specimen();s.add('A','B',{revision:'r1',callRevision:'r1'});
    s.records.calls.push({id:oid(101),ownerSyntaxId:s.ids.A,ordinal:0,document:doc,revisionId:'r2',range:{start:0,end:5}});
-   s.records.coverage[0].state='failed';return s.run();},
-  mutate:answer=>{answer.result.edges[0].boundaryReason='none';return answer;},
-  check:answer=>decisionCheck(answer,{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].boundaryReason',expected:'missingEvidence',select:r=>r.edges[0].boundaryReason}),
+   s.records.coverage[0].state='failed';return {records:s.records,request:s.request};},
+  mutate:input=>{input.records.calls[1].revisionId='r1';return input;},
+  check:input=>decisionCheck(input,{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].boundaryReason',expected:'missingEvidence',select:r=>r.edges[0]?.boundaryReason}),
   expectedAssertion:'GRAPH.FAILED_REFRESH',expectedCode:'invalidRecord',expectedField:'edges[0].boundaryReason'}
 ]);
-for(const row of controls)test(`baseline → single mutation → exact assertion: ${row.id}`,async()=>{
+for(const row of controls)test(`source baseline → single mutation → production check: ${row.id}`,async()=>{
  assert.equal(await runControl(row),row.id);
 });
