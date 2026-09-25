@@ -2,7 +2,7 @@ import {validate} from './formats.mjs';
 import {contentHash} from './identity.mjs';
 
 const tuple = (sourceSetId,revisionId) => JSON.stringify([sourceSetId,revisionId]);
-const docKey = (sourceSetId,revisionId,path) => JSON.stringify([sourceSetId,revisionId,path]);
+const sameDocument=(a,b)=>a.sourceSetId===b.sourceSetId && a.language===b.language && a.path===b.path;
 function assert(condition,id,field,message) {
   if (condition) return;
   const error=new Error(`${id} ${field}: ${message}`);
@@ -12,7 +12,7 @@ function assert(condition,id,field,message) {
 function capturedDocument(provenance,loaded) {
   const {sourceSetId,path}=provenance.document;
   const revision=loaded.revisions.get(tuple(sourceSetId,provenance.revisionId));
-  const document=revision?.documents.find(x=>x.key.path===path && x.key.language===provenance.document.language);
+  const document=revision?.documents.find(x=>sameDocument(x.key,provenance.document));
   assert(document,'BASIS.DOCUMENT','document','captured document not admitted');
   assert(document.contentHash===provenance.contentHash,'BASIS.CONTENT_HASH','contentHash','captured content differs');
   return {revision,document};
@@ -44,21 +44,28 @@ export function checkCapturedBasis(provenance,loaded) {
   assert(loaded.semanticBytes.some(({bytes,value})=>value.producerId===producer.id && contentHash(bytes)===basis.artifactHash),
     'BASIS.ARTIFACTHASH','artifactHash','semantic artifact bytes differ');
   const deps=basis.lookupDependencies;
+  assert(deps.every(x=>! /^(?:sid|occ):v1:[a-f0-9]{32}$/.test(x)),
+    'BASIS.LOOKUP_DEPENDENCIES','lookupDependencies','lookup keys cannot be stable IDs');
   for(let i=1;i<deps.length;i++) assert(Buffer.compare(Buffer.from(deps[i-1]),Buffer.from(deps[i]))<0,
     'BASIS.LOOKUP_DEPENDENCIES','lookupDependencies','keys must be sorted and unique');
+  const artifact=loaded.semanticBytes.find(({bytes,value})=>value.producerId===producer.id && contentHash(bytes)===basis.artifactHash);
+  const raw=artifact?.value.facts.find(x=>x.kind==='provenance' && x.record.id===provenance.id);
+  const comparable=x=>{const copy=structuredClone(x);delete copy.freshness;if(copy.basis)delete copy.basis.artifactHash;return JSON.stringify(copy);};
+  assert(raw && comparable(raw.record)===comparable(provenance), 'BASIS.RAW_FACT','provenance','captured semantic provenance absent or changed');
   return {producer,revision};
 }
 
 export function expectedFreshness(provenance,loaded) {
   const {producer}=checkCapturedBasis(provenance,loaded);
   const selected=loaded.selected;
-  const wanted=selected.documents.find(x=>x.key.path===provenance.document.path && x.key.language===provenance.document.language && x.key.sourceSetId===provenance.document.sourceSetId);
+  const wanted=selected.documents.find(x=>x.key.path===provenance.document.path && x.key.language===provenance.document.language);
   if (!wanted || wanted.contentHash!==provenance.contentHash) return 'stale';
-  if (producer.kind==='native') return selected.id===provenance.revisionId ? 'fresh' : 'possiblyStale';
+  if (producer.kind==='native') return selected.id===provenance.revisionId && loaded.comparison.sourceSetId===provenance.document.sourceSetId ? 'fresh' : 'possiblyStale';
   const basis=provenance.basis;
   const requested=loaded.comparison.producers.find(x=>x.id===basis.producerId);
   if (!requested || requested.kind!=='semantic' || !requested.languages.includes(basis.language) ||
       requested.version!==basis.producerVersion || requested.executableHash!==basis.producerHash ||
+      requested.positionEncoding!==producer.positionEncoding || JSON.stringify(requested.languages)!==JSON.stringify(producer.languages) ||
       !captureExists(loaded,'executable',requested.executableHash) ||
       loaded.comparison.sourceSetId!==basis.sourceSetId || loaded.comparison.revisionId!==basis.revisionId ||
       loaded.sourceManifestHash(selected)!==basis.sourceManifestHash ||
@@ -72,19 +79,26 @@ export function checkFreshness(provenance,loaded) {
   return expected;
 }
 
-export function expectedStaleTarget(binding,provenance,loaded) {
+// Declaration presence is supplied by the verified normalization layer. Keys are
+// logical tuples, not serialized DocumentKey objects or object insertion order.
+export function expectedStaleTarget(binding,provenance,loaded,declarations) {
   validate('CallBinding',binding);
   checkCapturedBasis(provenance,loaded);
   assert(binding.provenanceId===provenance.id,'TARGET_STALENESS.PROVENANCE','provenanceId','binding proof differs');
   const target=binding.declaredTarget;
   if (!target || target.kind!=='internal') return null;
-  const captured=loaded.revisions.get(tuple(target.document.sourceSetId,target.revisionId))?.documents.find(x=>JSON.stringify(x.key)===JSON.stringify(target.document));
-  assert(captured,'TARGET_STALENESS.CAPTURED','declaredTarget','target not present in captured snapshot');
-  const requested=loaded.selected.documents.find(x=>JSON.stringify(x.key)===JSON.stringify(target.document));
-  return !requested || requested.contentHash!==captured.contentHash;
+  assert(declarations instanceof Map,'TARGET_STALENESS.DECLARATIONS','declarations','verified declaration map required');
+  const captured=loaded.revisions.get(tuple(target.document.sourceSetId,target.revisionId))?.documents.find(x=>sameDocument(x.key,target.document));
+  const capturedDeclaration=declarations.get(tuple(target.document.sourceSetId,target.revisionId))?.get(target.syntaxId);
+  assert(captured && capturedDeclaration && sameDocument(capturedDeclaration,target.document),
+    'TARGET_STALENESS.CAPTURED','declaredTarget','target declaration not present in captured snapshot');
+  const requested=loaded.selected.documents.find(x=>x.key.path===target.document.path && x.key.language===target.document.language);
+  const requestedDeclaration=declarations.get(tuple(loaded.comparison.sourceSetId,loaded.comparison.revisionId))?.get(target.syntaxId);
+  return !requested || requested.contentHash!==captured.contentHash ||
+    !requestedDeclaration || !sameDocument(requestedDeclaration,requested.key);
 }
-export function checkStaleTarget(binding,provenance,loaded) {
-  const expected=expectedStaleTarget(binding,provenance,loaded);
+export function checkStaleTarget(binding,provenance,loaded,declarations) {
+  const expected=expectedStaleTarget(binding,provenance,loaded,declarations);
   assert(binding.staleTarget===expected,'TARGET_STALENESS.LABEL','staleTarget',`expected ${expected}`);
   return expected;
 }

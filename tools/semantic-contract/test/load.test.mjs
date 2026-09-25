@@ -41,6 +41,8 @@ test('IDENTITY.DIGEST rejects changed capture and unlisted snapshot file',async 
   await assert.rejects(loadFixture(s.root),/IDENTITY.DIGEST/);
   await s.flush();await writeFile(join(s.root,'src/unlisted.js'),'x');
   await assert.rejects(loadFixture(s.root),/IDENTITY.INVENTORY/);
+  await rm(join(s.root,'src/unlisted.js'));await writeFile(join(s.root,'root-unlisted.js'),'x');
+  await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY'});
 });
 test('IDENTITY.PATH rejects symlink source and traversal',async t=>{
   const s=await specimen();t.after(s.cleanup);
@@ -52,10 +54,10 @@ test('IDENTITY.PATH rejects symlink source and traversal',async t=>{
 });
 test('DISCOVERY.JAVASCRIPT_COEXISTENCE does not conflate example and corpus',async t=>{
   const root=await mkdtemp(join(tmpdir(),'discover-'));t.after(()=>rm(root,{recursive:true,force:true}));
-  for(const [path,profile] of [['example/javascript','example'],['javascript/corpus','corpus']]){
+  for(const [path,profile] of [['example','example'],['javascript','corpus']]){
     await mkdir(join(root,path),{recursive:true});await writeFile(join(root,path,'fixture.json'),JSON.stringify({formatVersion:1,profile,language:'javascript',sourceSets:[],producers:[],revisions:[],comparison:{sourceSetId:'x',revisionId:'r',producers:[]},coverageIntents:[],nativeArtifact:'x',semanticArtifacts:[],annotationFiles:[],answersFile:'x',dispositionsFile:'x',anchorCasesFile:'x',captures:[]}));
   }
-  assert.deepEqual((await discoverFixtures(root)).map(x=>x.slice(root.length+1)),['example/javascript','javascript/corpus']);
+  assert.deepEqual((await discoverFixtures(root)).map(x=>x.slice(root.length+1)),['example','javascript']);
 });
 
 test('IDENTITY.UTF8 rejects malformed authored JSON without replacement decoding',async t=>{
@@ -65,4 +67,43 @@ test('IDENTITY.UTF8 rejects malformed authored JSON without replacement decoding
  s.fixture.captures.find(x=>x.ref==='fact').hash=contentHash(Buffer.from([0x7b,0xff,0x7d]));
  s.files['fixture.json']=JSON.stringify(s.fixture);await writeFile(join(s.root,'fixture.json'),s.files['fixture.json']);
  await assert.rejects(loadFixture(s.root),/UTF-8|utf-8|encoded data/i);
+});
+
+test('IDENTITY.COVERAGE rejects dangling tuples and incomplete support while retaining valid intent',async t=>{
+ const s=await specimen();t.after(s.cleanup);
+ const intent={producerId:'semantic',document:s.document,revisionId:'r1',requestedRoles:['read'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}))};
+ s.fixture.coverageIntents=[intent];await s.flush();assert.equal((await loadFixture(s.root)).fixture.coverageIntents.length,1);
+ const mutations=[
+  [x=>x.producerId='missing','IDENTITY.COVERAGE'],[x=>x.revisionId='missing','IDENTITY.COVERAGE'],
+  [x=>x.document={...x.document,path:'missing.js'},'IDENTITY.COVERAGE'],
+  [x=>x.requestedRoles=['read','read'],'IDENTITY.DUPLICATE'],
+  [x=>x.measurementSupport.pop(),'IDENTITY.COVERAGE'],
+  [x=>x.measurementSupport[1].kind='reference','IDENTITY.DUPLICATE'],
+  [x=>x.measurementSupport[0].diagnostic='failed','IDENTITY.COVERAGE']];
+ for(const [mutate,code] of mutations){const copy=structuredClone(intent);mutate(copy);s.fixture.coverageIntents=[copy];await s.flush();await assert.rejects(loadFixture(s.root),{assertion:code});}
+ s.fixture.coverageIntents=[intent,intent];await s.flush();await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.COVERAGE'});
+});
+test('IDENTITY.SOURCE_SET and producer descriptors require supported unique admissions',async t=>{
+ const s=await specimen();t.after(s.cleanup);
+ for(const [mutate,assertion] of [
+  [()=>s.fixture.sourceSets[0].dependencies=['absent'],'IDENTITY.SOURCE_SET'],
+  [()=>s.fixture.sourceSets[0].dependencies=['main','main'],'IDENTITY.DUPLICATE'],
+  [()=>s.fixture.sourceSets[0].languages=['javascript','javascript'],'IDENTITY.DUPLICATE'],
+  [()=>s.fixture.producers[1].languages=['rust'],'IDENTITY.PRODUCER'],
+  [()=>s.fixture.comparison.producers[1].languages=['javascript','javascript'],'IDENTITY.DUPLICATE']]){
+  const original=structuredClone(s.fixture);mutate();await s.flush();await assert.rejects(loadFixture(s.root),{assertion});Object.assign(s.fixture,original);
+ }
+});
+test('IDENTITY.INVENTORY rejects unlisted root files, duplicate annotation and root symlink',async t=>{
+ const s=await specimen();t.after(s.cleanup);
+ s.fixture.annotationFiles.push(s.fixture.annotationFiles[0]);await s.flush();await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.DUPLICATE'});
+ s.fixture.annotationFiles.pop();s.fixture.revisions[0].documents[0].sourceFile='go.js';s.fixture.annotationFiles=['go.js.annotations.json'];s.files['go.js']=s.source;s.files['go.js.annotations.json']=JSON.stringify({formatVersion:1,document:s.document,revisionId:'r1',scenarios:[],facts:[]});delete s.files['src/go.js'];delete s.files['src/go.js.annotations.json'];await rm(join(s.root,'src'),{recursive:true});await s.flush();await writeFile(join(s.root,'unexpected.js'),'x');await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY'});
+ await rm(join(s.root,'unexpected.js'));await symlink('/etc/passwd',join(s.root,'unexpected.js'));await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY'});
+});
+test('DISCOVERY.PROFILE rejects forged descriptors and nested fixture routing',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'discover-negative-'));t.after(()=>rm(root,{recursive:true,force:true}));
+ await mkdir(join(root,'example'),{recursive:true});
+ const s=await specimen();t.after(s.cleanup);await writeFile(join(root,'example','fixture.json'),JSON.stringify({...s.fixture,profile:'corpus'}));
+ await assert.rejects(discoverFixtures(root),{assertion:'DISCOVERY.PROFILE'});
+ await rm(join(root,'example','fixture.json'));await mkdir(join(root,'example','javascript'));await assert.rejects(discoverFixtures(root),{assertion:'DISCOVERY.PROFILE'});
 });
