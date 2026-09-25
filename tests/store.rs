@@ -437,7 +437,10 @@ fn cancellation_during_transaction_rolls_back() {
     db.busy_timeout(std::time::Duration::ZERO).unwrap();
     let worker =
         std::thread::spawn(move || worker_store.publish(&large, &leader, expected, &worker_flag));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // A competing BEGIN IMMEDIATE is the only observation available without a
+    // production hook. Do not spin on it: a zero-timeout contender can otherwise
+    // keep taking the writer slot before the publisher gets to its transaction.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match db.execute_batch("BEGIN IMMEDIATE") {
             Ok(()) => {
@@ -450,11 +453,17 @@ fn cancellation_during_transaction_rolls_back() {
             }
             Err(error) => panic!("unexpected SQLite error: {error}"),
         }
+        if worker.is_finished() {
+            panic!(
+                "publisher finished without an observed write transaction: {:?}",
+                worker.join().unwrap()
+            );
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "publisher never acquired write transaction"
         );
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     flag.store(true, std::sync::atomic::Ordering::Release);
     assert!(
