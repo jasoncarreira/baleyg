@@ -269,7 +269,18 @@ test("graph projection rejects incomplete records rather than silently reusing c
     request = s.result.request;
   const invalid = [
     ["comparison", { ...s.records, comparison: null }],
+    [
+      "revisions.documents",
+      {
+        ...s.records,
+        revisions: [
+          { ...s.records.revisions[0], documents: undefined },
+          ...s.records.revisions.slice(1),
+        ],
+      },
+    ],
     ["declarations", { ...s.records, declarations: undefined }],
+    ["producers", { ...s.records, producers: undefined }],
     ["provenance", { ...s.records, provenance: undefined }],
     ["revisionId", s.records],
   ];
@@ -1239,4 +1250,37 @@ test("a contradictory ambiguous binding group returns every member's proof on it
   const ids = select(s).provenance.map((x) => x.id);
   assert.ok(ids.includes("proof:call-a"), "edge member proof");
   assert.ok(ids.includes("proof:call-b"), "other contradictory member proof");
+});
+
+test("real fixture projection at a non-comparison revision fails closed on incomplete records", async () => {
+  const loaded = await loadFixture(
+    new URL(
+      "../../../tests/fixtures/semantic-evidence/v1/example/",
+      import.meta.url,
+    ).pathname,
+  );
+  const { records } = normalizeFixture(loaded);
+  const request = {
+    sourceSetId: records.comparison.sourceSetId,
+    revisionId: "r1",
+  };
+  assert.notEqual(records.comparison.revisionId, request.revisionId);
+  graphProjection(loaded, records, request);
+  const cases = [
+    ["revisions.documents", { ...records, revisions: undefined }],
+    ["producers", { ...records, producers: undefined }],
+    [
+      "revisionId",
+      {
+        ...records,
+        revisions: records.revisions.filter((r) => r.id !== request.revisionId),
+      },
+    ],
+  ];
+  for (const [field, broken] of cases)
+    assert.throws(() => graphProjection(loaded, broken, request), {
+      assertion: "GRAPH.PROJECTION",
+      code: "invalidRecord",
+      field,
+    });
 });

@@ -197,6 +197,32 @@ test("publication: failed compile or bundle write preserves prior valid manifest
   }
 });
 
+test("publication: concurrent identical generations both succeed on one immutable bundle", async () => {
+  const { root, cleanup } = await copyFixture();
+  try {
+    await generateFixture(root);
+    await addWhitespace(root);
+    const results = await Promise.allSettled([
+      generateFixture(root),
+      generateFixture(root),
+    ]);
+    assert.deepEqual(
+      results.map((x) => x.status),
+      ["fulfilled", "fulfilled"],
+      results.map((x) => x.reason?.message).join("; "),
+    );
+    const manifest = results[0].value;
+    assert.deepEqual(results[1].value, manifest);
+    assert.deepEqual(await checkPublication(root), manifest);
+    assert.deepEqual((await readdir(join(root, "generated"))).sort(), [
+      "bundles",
+      "manifest.json",
+    ]);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("publication: conflicting existing immutable bundle is rejected without replacement", async () => {
   const { root, cleanup } = await copyFixture();
   try {

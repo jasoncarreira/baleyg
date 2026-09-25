@@ -34,7 +34,7 @@ function capturedDocument(provenance, loaded) {
     document.contentHash === provenance.contentHash,
     "BASIS.CONTENT_HASH",
     "contentHash",
-    "captured content differs",
+    `captured content differs: expected ${document.contentHash}, actual ${provenance.contentHash}`,
   );
   return { revision, document };
 }

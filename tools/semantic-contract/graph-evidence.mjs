@@ -249,7 +249,7 @@ export function selectGraphEvidence(loaded, records, checked, result) {
               fail(
                 "GRAPH.HISTORY",
                 "provenance",
-                "historical proof bytes or requested freshness differ",
+                `historical proof bytes or requested freshness differ${capturedDocument?.contentHash !== proof.contentHash ? `: expected contentHash ${capturedDocument?.contentHash}, actual ${proof.contentHash}` : ""}`,
               );
           }
           addProof(proofId, producerId, document, selectedRevision);

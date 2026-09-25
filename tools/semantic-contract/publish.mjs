@@ -219,7 +219,13 @@ export async function generateFixture(root, { check = false } = {}) {
         await writeFile(join(staged, `${name}.json`), built.bytes[name], {
           flag: "wx",
         });
-      await rename(staged, final);
+      try {
+        await rename(staged, final);
+      } catch (error) {
+        // A concurrent generation installed this content-addressed bundle first.
+        if (error.code !== "ENOTEMPTY" && error.code !== "EEXIST") throw error;
+        await verifyBundle(final, built);
+      }
     }
     const manifestFile = join(temporary, "manifest.json");
     await writeFile(manifestFile, canonicalBytes(built.manifest), {

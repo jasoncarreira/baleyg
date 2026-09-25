@@ -17,9 +17,23 @@ function missing(field) {
 }
 
 export function graphProjection(loaded, records, request) {
-  if (!records?.comparison) missing("comparison");
+  if (!records?.comparison || !Array.isArray(records.comparison.producers))
+    missing("comparison");
+  if (
+    !Array.isArray(records.revisions) ||
+    !records.revisions.every((r) => Array.isArray(r.documents))
+  )
+    missing("revisions.documents");
   if (!Array.isArray(records.declarations)) missing("declarations");
+  if (!Array.isArray(records.producers)) missing("producers");
   if (!Array.isArray(records.provenance)) missing("provenance");
+  if (
+    !records.revisions.some(
+      (r) =>
+        r.sourceSetId === request.sourceSetId && r.id === request.revisionId,
+    )
+  )
+    missing("revisionId");
   // Normalized labels already use these rules against the comparison revision.
   if (
     records.comparison.sourceSetId === request.sourceSetId &&

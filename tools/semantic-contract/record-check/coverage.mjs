@@ -175,7 +175,7 @@ function capturedBasis(proof, loaded, proofRow) {
     fail(
       "FRESHNESS.BASIS",
       "provenance",
-      "proof does not match captured fact and wrapper",
+      `proof does not match captured fact and wrapper${proofRow?.hash !== basis.artifactHash ? `: expected artifactHash ${proofRow?.hash}, actual ${basis.artifactHash}` : ""}`,
     );
   return producer;
 }

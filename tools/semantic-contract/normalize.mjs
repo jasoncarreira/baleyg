@@ -980,7 +980,11 @@ export function normalizeFixture(loaded) {
         fact.anchor.revisionId !== proof.revisionId ||
         fact.anchor.contentHash !== proof.contentHash)
     )
-      fail("NORMALIZE.FACT_TUPLE", "anchor", "anchor/proof tuple mismatch");
+      fail(
+        "NORMALIZE.FACT_TUPLE",
+        "anchor",
+        `anchor/proof tuple mismatch${proof.contentHash !== fact.anchor.contentHash ? `: expected contentHash ${proof.contentHash}, actual ${fact.anchor.contentHash}` : ""}`,
+      );
     if (fact.kind === "symbol") {
       symbolKey(fact.record.key);
       const value = {

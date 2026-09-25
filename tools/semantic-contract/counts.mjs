@@ -88,7 +88,7 @@ function proofFor(loaded, records, fact, annotation) {
     fail(
       "COUNT.PROOF",
       "provenanceId",
-      "fact is not authenticated by the captured semantic artifact and source tuple",
+      `fact is not authenticated by the captured semantic artifact and source tuple${documentOf(loaded, annotation)?.contentHash !== proof?.contentHash ? `: expected contentHash ${documentOf(loaded, annotation)?.contentHash}, actual ${proof?.contentHash}` : ""}`,
     );
   return proof;
 }
@@ -113,7 +113,11 @@ function anchored(loaded, measurement, anchor) {
   const document = documentOf(loaded, anchor);
   const range = span(loaded, anchor);
   if (!document || anchor.contentHash !== document.contentHash)
-    fail("COUNT.SCENARIO", "anchors", "anchor differs from source bytes");
+    fail(
+      "COUNT.SCENARIO",
+      "anchors",
+      `anchor differs from source bytes: expected ${document?.contentHash ?? "a captured document"}, actual ${anchor.contentHash}`,
+    );
   return measurement.candidateRows.filter(
     (x) =>
       same(x.anchor.document, anchor.document) &&
