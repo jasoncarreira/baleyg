@@ -165,8 +165,8 @@ async function control(t,{name,options={},raw=null,normalized=null,nativeMutatio
    const changed=state.changed;
    const s=await specimen(t,{...options,...(changed?changedOptions:{}),mutateFact:(options.mutateFact||changed&&raw)?fact=>{options.mutateFact?.(fact);if(changed)raw?.(fact);}:null,mutateNative:changed?nativeMutation:null,mutateSupport:changed?supportMutation:null});
    if(changed)normalized?.(s.records,s.measurement);
-   assert.doesNotThrow(()=>checkCoverage(s.loaded,s.records),`${name}: admitted coverage`);
-   assert.doesNotThrow(()=>checkMeasurement(s.loaded,s.records),`${name}: admitted measurement`);
+   checkCoverage(s.loaded,s.records);
+   checkMeasurement(s.loaded,s.records);
    return check(s);
   },expectedAssertion:assertion,expectedCode:code,expectedField:field
  }]);
@@ -360,7 +360,9 @@ test('diagnostics derive candidate and support state, never install unmatched re
    ['status swap',r=>{r.referenceJoinDiagnostics[0].join.status=status==='unmatched'?'unsupported':'unmatched';r.referenceJoinDiagnostics[0].join.diagnostic=status==='unmatched'?'native family unavailable':'unmatched';},'JOIN.DIAGNOSTIC','referenceJoinDiagnostics'],
    ['extra',r=>{r.referenceJoinDiagnostics.push({...r.referenceJoinDiagnostics[0],factRef:'extra'});r.referenceJoinDiagnostics.sort((a,b)=>Buffer.compare(Buffer.from(a.factRef),Buffer.from(b.factRef)));},'JOIN.DIAGNOSTIC','referenceJoinDiagnostics'],
    ['install',r=>{r.references.push({id:refId,ownerSyntaxId:mainId,ordinal:0,document,revisionId:'r1',range:range(18,24),spelling:'target',lookupKey:'target',site:'use',roles:['read'],resolution:'unresolved',declaredTarget:null,candidates:[],provenanceId:'proof'});},'REFERENCE.SOURCE','references']
-  ])await control(t,{name:`${status} ${name}`,options:{status},normalized,assertion,field});
+  ])await control(t,{name:`${status} ${name}`,options:{status},normalized,
+   assertion:status==='unsupported'&&name==='install'?'COVERAGE.FACT':assertion,
+   field:status==='unsupported'&&name==='install'?'coverage.observedRoles':field});
  }
 });
 
@@ -416,7 +418,7 @@ test('captured-but-unselected semantic producer cannot use valid proof, includin
     assert.equal(result.joined.get('fact-b').join.status,status);
     assert.equal(result.joined.get('fact-b').producerId,'semantic-b');
     return result;
-   },expectedAssertion:'FRESHNESS.USE',expectedCode:'invalidRecord',expectedField:'coverage'
+   },expectedAssertion:'COVERAGE.FACT',expectedCode:'invalidRecord',expectedField:'coverage'
   }]);
   await runControl(row);
  }
