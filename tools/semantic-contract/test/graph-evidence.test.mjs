@@ -90,13 +90,8 @@ function evidenceControl(id,s,mutate,assertion,field){
 test('all graph evidence negatives use exact checker controls',async t=>{
  const s=specimen(),old=s.add('r1','oldCall','callBinding');
  const historical={callId:s.result.edges[0].call.id,provenanceId:old,join:{anchor:{revisionId:'r1',document:s.D}}};
- const current=specimen({currentState:'complete'}),currentProof=current.add('r2','call','callBinding');
- const binding={callId:current.result.edges[0].call.id,provenanceId:currentProof,
-  join:{anchor:{revisionId:'r2',document:current.D}}};
  const rows=registerControls([
   evidenceControl('GRAPH.oldR1Call',s,x=>{x.result.edges[0].binding=historical;return x;},'GRAPH.OCCURRENCE','edges.binding'),
-  evidenceControl('GRAPH.failedR2Binding',s,x=>{x.result.edges[0].binding={...binding,callId:x.result.edges[0].call.id};return x;},'GRAPH.OCCURRENCE','edges.binding'),
-  evidenceControl('GRAPH.omittedR2Binding',specimen({currentState:'omitted'}),x=>{x.result.edges[0].binding={...binding,callId:x.result.edges[0].call.id};return x;},'GRAPH.OCCURRENCE','edges.binding'),
   evidenceControl('GRAPH.unlinkedProof',s,x=>{x.loaded.semanticProofs.delete('proof:binding');return x;},'GRAPH.HISTORY','provenance'),
   evidenceControl('GRAPH.relabelProof',s,x=>{x.records.provenance.find(row=>row.id==='proof:binding').revisionId='r2';return x;},'GRAPH.HISTORY','provenance'),
   evidenceControl('GRAPH.coverageMissing',s,x=>{x.actual.coverage.shift();return x;},'GRAPH.COVERAGE','coverage'),
@@ -111,7 +106,7 @@ test('all graph evidence negatives use exact checker controls',async t=>{
 
 // A closed two-snapshot capture: the semantic symbol is authored against r1 bytes.
 // Expected output below is deliberately not derived from the selected graph rows.
-async function admitted(t,{changed=false,state='failed',zero=false}={}){
+async function admitted(t,{changed=false,state='failed',zero=false,r2Binding=false}={}){
  const root=await mkdtemp(join(tmpdir(),'graph-history-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const files=new Map(),put=(path,value)=>files.set(path,typeof value==='string'?value:JSON.stringify(value));
  const hash=text=>contentHash(Buffer.from(text));
@@ -145,7 +140,9 @@ async function admitted(t,{changed=false,state='failed',zero=false}={}){
  const oldUse={kind:'reference',ref:'r1-use',anchor:{document,revisionId:'r1',contentHash:hash(source),
   kind:'reference',range:span(callee,callee+2),ownerRef:'dr1'},record:{site:'use',roles:['read','call'],
   resolution:'resolved',declaredTarget:{kind:'internal',declarationRef:'dr1',revisionId:'r1'},candidates:[],provenanceId:'r1-reference-proof'}};
- const raw={formatVersion:1,producerId:'semantic',facts:zero?[]:[fact,oldBinding,oldUse]};
+ const currentBinding={...oldBinding,ref:'r2-binding',anchor:{...oldBinding.anchor,revisionId:'r2',contentHash:hash(r2),ownerRef:'dr2'},
+  record:{...oldBinding.record,declaredTarget:{kind:'internal',declarationRef:'dr2',revisionId:'r2'},provenanceId:'r2-call-proof'}};
+ const raw={formatVersion:1,producerId:'semantic',facts:[...(zero?[]:[fact,oldBinding,oldUse]),...(r2Binding?[currentBinding]:[])]};
  capture('semantic-artifact','semanticArtifact','captures/semantic.json',JSON.stringify(raw));
  const basis={producerId:'semantic',producerVersion:'1',producerHash:producers[1].executableHash,
   artifactHash:captures.at(-1).hash,language:'javascript',sourceSetId:'main',revisionId:'r1',
@@ -166,6 +163,11 @@ async function admitted(t,{changed=false,state='failed',zero=false}={}){
    coverageIntents.push({producerId:producer.id,document,revisionId:id,requestedRoles:['read'],measurementSupport:support});
   }
   if(id==='r1'&&!zero)facts.push(provenance,...oldProofs,fact,oldBinding,oldUse);
+  if(id==='r2'&&r2Binding){
+   const currentBasis={...basis,revisionId:'r2',sourceManifestHash:sourceManifestHash([{document,contentHash:hash(r2)}])};
+   facts.push({kind:'provenance',ref:'r2-call-envelope',record:{id:'r2-call-proof',producerId:'semantic',document,revisionId:'r2',
+    contentHash:hash(r2),evidenceKind:'semanticReference',basis:currentBasis,freshness:'fresh'}},currentBinding);
+  }
   put(`sources/${id}/go.js.annotations.json`,{formatVersion:1,document,revisionId:id,scenarios:[],facts});
  }
  put('expected/answers.json',{formatVersion:1,answers:[]});put('expected/dispositions.json',{formatVersion:1,assertions:[],callableValueNegatives:[]});
@@ -211,13 +213,29 @@ test('admitted failed/omitted refresh selects source-backed declaration proofs, 
    [['coverageIncomplete',null],...(options.zero?[]:[['staleEvidence',options.changed?'r1-proof':null]])]);
   assert.deepEqual(checkGraphEvidence(s.loaded,s.records,s.checked,r,r),evidence);
   assert.equal(checkWarnings(r),true);
-  if(!options.zero){
-   const control=registerControls([{id:`GRAPH.sourceFailedBinding.${options.state??'failed'}.${options.changed?'changed':'same'}`,
-    baseline:()=>r,mutate:answer=>{answer.edges[0].binding={callId:answer.edges[0].call.id,
-     provenanceId:'r1-proof',join:{anchor:{document:answer.edges[0].call.document,revisionId:'r2'}}};return answer;},
-    check:answer=>checkGraphEvidence(s.loaded,s.records,s.checked,answer,answer),
-    expectedAssertion:'GRAPH.OCCURRENCE',expectedCode:'invalidRecord',expectedField:'edges.binding'}])[0];
-   await t.test(control.id,()=>runControl(control));
-  }
+ }
+});
+
+test('captured r2 binding cannot survive a failed or omitted current tuple',async t=>{
+ for(const state of ['failed','omitted']){
+  // Authenticate the r2 fact, proof and exact call join while coverage is complete.
+  const s=await admitted(t,{state:'complete',r2Binding:true});
+  const edge=s.result.edges[0];
+  assert.equal(edge.binding.provenanceId,'r2-call-proof');
+  assert.equal(edge.binding.callId,edge.call.id);
+  assert.equal(edge.binding.join.anchor.revisionId,'r2');
+  assert.equal(s.loaded.semanticProofs.get('r2-call-proof').factRef,'r2-binding');
+  const initial=select(s);
+  assert.deepEqual(checkGraphEvidence(s.loaded,s.records,s.checked,{...s.result,...initial},s.result),initial);
+  const row=registerControls([{id:`GRAPH.capturedR2Binding.${state}`,
+   baseline:()=>({records:s.records,result:s.result}),
+   // Change only the returned tuple; keep the authenticated call, join and proof intact.
+   mutate:x=>{const current=x.records.coverage.find(row=>row.producerId==='semantic'&&row.revisionId==='r2');
+    current.state=state;current.selected=state!=='omitted';current.observedRoles=[];
+    current.diagnostic='refresh unavailable';return x;},
+   check:x=>{const evidence=selectGraphEvidence(s.loaded,x.records,s.checked,x.result);
+    return checkGraphEvidence(s.loaded,x.records,s.checked,{...x.result,...evidence},x.result);},
+   expectedAssertion:'GRAPH.OCCURRENCE',expectedCode:'invalidRecord',expectedField:'edges.binding'}])[0];
+  await t.test(row.id,()=>runControl(row));
  }
 });
