@@ -7,7 +7,6 @@ import {writeFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {checkCapturedBasis,checkFreshness,checkStaleTarget,expectedFreshness,expectedStaleTarget} from '../check-freshness.mjs';
 const hash=x=>contentHash(Buffer.from(x));
-const targetKey={kind:'variable',name:'target',signature:null,ordinal:0};
 function addTargetDeclaration(s,document,revisionId,sourceFile){
  const artifact=JSON.parse(s.files['captures/native.json']);
  const bytes=s.files[sourceFile];const start=bytes.indexOf('target');
@@ -22,7 +21,12 @@ function verifiedDeclarations(loaded){
   assert.ok(source,'declaration source missing');
   assert.equal(source.subarray(row.nameRange.start,row.nameRange.end).toString(),row.name);
   assert.equal(row.witnesses.find(x=>x.field==='name')?.witness.text,row.name);
-  const id=syntaxId({sourceSet:row.document.sourceSetId,path:row.document.path,language:row.document.language,ancestors:[],declaration:targetKey});
+  assert.equal(row.header.kind,row.kind);assert.equal(row.header.name,row.name);
+  assert.equal(row.parentRef,null,'top-level declaration fixture');
+  const siblings=loaded.native.declarations.filter(x=>x.document.path===row.document.path && x.revisionId===row.revisionId && x.document.sourceSetId===row.document.sourceSetId && x.parentRef===null && x.kind===row.kind && x.name===row.name && JSON.stringify(x.signature)===JSON.stringify(row.signature));
+  siblings.sort((a,b)=>a.range.start-b.range.start || a.range.end-b.range.end);
+  const ordinal=siblings.findIndex(x=>x.ref===row.ref);assert.ok(ordinal>=0);
+  const id=syntaxId({sourceSet:row.document.sourceSetId,path:row.document.path,language:row.document.language,ancestors:[],declaration:{kind:row.kind,name:row.name,signature:row.signature,ordinal}});
   const tuple=JSON.stringify([row.document.sourceSetId,row.revisionId]);
   if(!rows.has(tuple))rows.set(tuple,new Map());
   rows.get(tuple).set(id,row.document);
@@ -156,28 +160,46 @@ test('TARGET_STALENESS uses source-verified captured and requested declarations'
  addTargetDeclaration(s,target,'r2','r2/target.js');await s.flush();
  const selected=await loadFixture(s.root),both=verifiedDeclarations(selected);
  assert.equal(expectedStaleTarget(binding,proof,selected,both),false);
- const withoutRequested=new Map(both);withoutRequested.set(JSON.stringify(['main','r2']),new Map());
- assert.equal(expectedStaleTarget(binding,proof,selected,withoutRequested),true);
- assert.throws(()=>checkStaleTarget(binding,proof,selected,withoutRequested),{assertion:'TARGET_STALENESS.LABEL'});
+ const native=JSON.parse(s.files['captures/native.json']);native.declarations=native.declarations.filter(x=>x.ref!=='target-r2');s.files['captures/native.json']=JSON.stringify(native);await s.flush();
+ const absent=await loadFixture(s.root);assert.equal(absent.selected.documents.find(x=>x.key.path===target.path).contentHash,selected.selected.documents.find(x=>x.key.path===target.path).contentHash);
+ assert.equal(expectedStaleTarget(binding,proof,absent,verifiedDeclarations(absent)),true);
+ assert.throws(()=>checkStaleTarget(binding,proof,absent,verifiedDeclarations(absent)),{assertion:'TARGET_STALENESS.LABEL'});
+ addTargetDeclaration(s,target,'r2','r2/target.js');await s.flush();
  const withoutCaptured=new Map(both);withoutCaptured.set(JSON.stringify(['main','r1']),new Map());
  assert.throws(()=>expectedStaleTarget(binding,proof,selected,withoutCaptured),{assertion:'TARGET_STALENESS.CAPTURED'});
- s.fixture.revisions[1].documents.pop();const native=JSON.parse(s.files['captures/native.json']);native.declarations=native.declarations.filter(x=>x.revisionId!=='r2');s.files['captures/native.json']=JSON.stringify(native);delete s.files['r2/target.js'];await rm(join(s.root,'r2/target.js'));await s.flush();
+ s.fixture.revisions[1].documents.pop();const nativeMissing=JSON.parse(s.files['captures/native.json']);nativeMissing.declarations=nativeMissing.declarations.filter(x=>x.revisionId!=='r2');s.files['captures/native.json']=JSON.stringify(nativeMissing);delete s.files['r2/target.js'];await rm(join(s.root,'r2/target.js'));await s.flush();
  const missing=await loadFixture(s.root);assert.equal(expectedStaleTarget(binding,proof,missing,verifiedDeclarations(missing)),true);
  s.fixture.revisions[1].documents.push({key:target,revisionId:'r2',sourceFile:'r2/target.js'});
  s.files['r2/target.js']='export const target = 2;\n';addTargetDeclaration(s,target,'r2','r2/target.js');await s.flush();
  const changed=await loadFixture(s.root);assert.equal(expectedStaleTarget(binding,proof,changed,verifiedDeclarations(changed)),true);
 });
 
-test('BASIS.RAW_RELATIONSHIP verifies top-level provenanceRef and fact direction',async t=>{
+test('BASIS.RAW_RELATIONSHIP binds a separate relationship proof to the captured source',async t=>{
  const {s,base}=await prepared(t);
- const source={kind:'internal',declarationRef:'derived-source',revisionId:'r1'};
+ const native=JSON.parse(s.files['captures/native.json']);
+ const start=s.source.indexOf('go');
+ native.declarations.push({ref:'go-declaration',nativeId:null,document:s.document,revisionId:'r1',parentRef:null,kind:'function',name:'go',range:{encoding:'utf8',start:0,end:Buffer.byteLength(s.source)},nameRange:{encoding:'utf8',start,end:start+2},header:{kind:'function',name:'go',modifiers:[],typeParameters:[],parameters:[],resultType:null,bases:[]},signature:null,witnesses:[{field:'name',witness:{range:{encoding:'utf8',start,end:start+2},text:'go'}}]});
+ s.files['captures/native.json']=JSON.stringify(native);
+ const source={kind:'internal',declarationRef:'go-declaration',revisionId:'r1'};
  const target={kind:'external',symbol:{scheme:'scip',symbol:'example/base',scope:'global',document:null}};
- const relationship={kind:'typeRelationship',ref:'relationship1',relationshipKind:'extends',source,target,provenanceRef:base.id};
+ const relationship={kind:'typeRelationship',ref:'relationship1',relationshipKind:'extends',source,target,provenanceRef:'relationship-proof'};
  const raw=JSON.parse(s.files['captures/fact.json']);raw.facts.push(relationship);
- s.files['captures/fact.json']=JSON.stringify(raw);s.fixture.captures.find(x=>x.ref==='fact').hash=hash(s.files['captures/fact.json']);
- const annotation=JSON.parse(s.files['src/go.js.annotations.json']);annotation.facts[0].record.basis.artifactHash=s.fixture.captures.find(x=>x.ref==='fact').hash;
- annotation.facts.push(relationship);s.files['src/go.js.annotations.json']=JSON.stringify(annotation);await s.flush();await loadFixture(s.root);
- annotation.facts.at(-1).source={...source,declarationRef:'wrong-direction'}; // A different direction cannot borrow the raw proof.
+ s.files['captures/fact.json']=JSON.stringify(raw);const artifactHash=hash(s.files['captures/fact.json']);s.fixture.captures.find(x=>x.ref==='fact').hash=artifactHash;
+ const annotation=JSON.parse(s.files['src/go.js.annotations.json']);annotation.facts[0].record.basis.artifactHash=artifactHash;
+ const relationshipProof={...structuredClone(annotation.facts[0].record),id:'relationship-proof',evidenceKind:'typeRelationship'};
+ annotation.facts.push({kind:'provenance',ref:'relationship-provenance',record:relationshipProof},relationship);
+ s.files['src/go.js.annotations.json']=JSON.stringify(annotation);await s.flush();const loaded=await loadFixture(s.root);
+ assert.equal(checkCapturedBasis(relationshipProof,loaded).producer.kind,'semantic');
+ const altered={...relationshipProof,contentHash:'0'.repeat(64)};
+ assert.throws(()=>checkCapturedBasis(altered,loaded),{assertion:'BASIS.CONTENT_HASH'});
+ const sameId={...relationshipProof,evidenceKind:'semanticReference'};
+ assert.throws(()=>checkCapturedBasis(sameId,loaded),{assertion:'BASIS.RAW_FACT'});
+ annotation.facts.at(-1).source={...source,declarationRef:'wrong-direction'};
+ s.files['src/go.js.annotations.json']=JSON.stringify(annotation);await s.flush();await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.SEMANTIC'});
+ annotation.facts[annotation.facts.length-1]=relationship;
+ annotation.facts.at(-2).record={...relationshipProof,evidenceKind:'semanticReference'};
+ s.files['src/go.js.annotations.json']=JSON.stringify(annotation);await s.flush();await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.SEMANTIC'});
+ annotation.facts.at(-2).record=relationshipProof;annotation.facts[annotation.facts.length-1]={...relationship,provenanceRef:base.id};
  s.files['src/go.js.annotations.json']=JSON.stringify(annotation);await s.flush();await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.SEMANTIC'});
 });
 test('IDENTITY.SEMANTIC rejects normalized provenance in raw capture',async t=>{
@@ -200,9 +222,12 @@ test('FRESHNESS.COVERAGE keeps partial fresh, complete stale and failed refresh 
  s.files['r2/go.js']='export function go() { return 2; }\n';s.fixture.comparison.revisionId='r2';await s.flush();
  loaded=await loadFixture(s.root);assert.ok(loaded.fixture.coverageIntents[0].measurementSupport.every(x=>x.available));
  assert.equal(checkFreshness({...base,freshness:'stale'},loaded),'stale');
- for(const entry of intent.measurementSupport){entry.available=false;entry.diagnostic='refresh failed';}
- await s.flush();loaded=await loadFixture(s.root);
- assert.ok(loaded.fixture.coverageIntents[0].measurementSupport.every(x=>!x.available));
+ const refresh={...structuredClone(intent),revisionId:'r2',measurementSupport:intent.measurementSupport.map(x=>({...x,available:false,diagnostic:'refresh failed'}))};
+ s.fixture.coverageIntents.push(refresh);await s.flush();loaded=await loadFixture(s.root);
+ assert.equal(loaded.fixture.coverageIntents[0].revisionId,'r1');
+ assert.ok(loaded.fixture.coverageIntents[0].measurementSupport.every(x=>x.available));
+ const failed=loaded.fixture.coverageIntents.find(x=>x.revisionId==='r2');
+ assert.ok(failed && failed.measurementSupport.every(x=>!x.available && x.diagnostic==='refresh failed'));
  assert.equal(checkFreshness({...base,freshness:'stale'},loaded),'stale');
  assert.throws(()=>checkFreshness(base,loaded),{assertion:'FRESHNESS.LABEL'});
 });

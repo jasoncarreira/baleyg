@@ -48,7 +48,9 @@ export function checkCapturedBasis(provenance,loaded) {
     'BASIS.LOOKUP_DEPENDENCIES','lookupDependencies','lookup keys cannot be stable IDs');
   for(let i=1;i<deps.length;i++) assert(Buffer.compare(Buffer.from(deps[i-1]),Buffer.from(deps[i]))<0,
     'BASIS.LOOKUP_DEPENDENCIES','lookupDependencies','keys must be sorted and unique');
-  assert(loaded.semanticProofs?.get(provenance.id)?.hash===basis.artifactHash, 'BASIS.RAW_FACT','provenance','no matching captured semantic fact for proof');
+  const proof=loaded.semanticProofs?.get(provenance.id);
+  assert(proof?.hash===basis.artifactHash && JSON.stringify(proof.wrapper)===JSON.stringify({...provenance,freshness:undefined}),
+    'BASIS.RAW_FACT','provenance','no matching captured semantic fact and original proof wrapper');
   return {producer,revision};
 }
 

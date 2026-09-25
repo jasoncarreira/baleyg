@@ -187,7 +187,16 @@ export async function loadFixture(root) {
       if (fact.kind==='coverage' || fact.kind==='provenance') continue;
       const proofId=fact.kind==='typeRelationship'?fact.provenanceRef:fact.record.provenanceId;
       const provenance=proofById.get(proofId);
-      if (!provenance || provenance.evidenceKind==='measuredSyntax') reject('IDENTITY.SEMANTIC',fact.ref,'missing semantic provenance');
+      if (!provenance || (fact.kind==='typeRelationship' && provenance.evidenceKind!=='typeRelationship') || provenance.evidenceKind==='measuredSyntax')
+        reject('IDENTITY.SEMANTIC',fact.ref,'missing or wrong-kind semantic provenance');
+      if (fact.kind==='typeRelationship' && fact.source.kind==='internal') {
+        const declaration=native.declarations.find(x=>x.ref===fact.source.declarationRef && x.revisionId===fact.source.revisionId &&
+          documentKey(x.document)===documentKey(annotation.document));
+        const source=sources.get(key([annotation.document.sourceSetId,fact.source.revisionId,annotation.document.path]));
+        const name=declaration?.witnesses.find(x=>x.field==='name')?.witness;
+        if (!declaration || !source || !name || source.subarray(name.range.start,name.range.end).toString('utf8')!==name.text || name.text!==declaration.name)
+          reject('IDENTITY.SEMANTIC',fact.ref,'relationship source declaration not measured in captured source');
+      }
       const raw=semanticFacts.get(key([provenance.producerId,fact.ref]));
       if (!raw || key(raw.fact)!==key(fact)) reject('IDENTITY.SEMANTIC',fact.ref,'fact absent or contradicts raw capture');
       if (provenance.basis?.artifactHash!==raw.hash || documentKey(provenance.document)!==documentKey(annotation.document) ||
@@ -195,8 +204,10 @@ export async function loadFixture(root) {
           (fact.anchor && (documentKey(fact.anchor.document)!==documentKey(annotation.document) || fact.anchor.revisionId!==annotation.revisionId)))
         reject('IDENTITY.SEMANTIC',fact.ref,'capture basis/document mismatch');
       const existing=semanticProofs.get(provenance.id);
-      if (existing && existing.hash!==raw.hash) reject('IDENTITY.SEMANTIC',fact.ref,'proof spans different captures');
-      semanticProofs.set(provenance.id,raw);
+      if (existing && (existing.hash!==raw.hash || existing.factRef!==fact.ref || existing.factKind!==fact.kind ||
+          key(existing.wrapper)!==key({...provenance,freshness:undefined})))
+        reject('IDENTITY.SEMANTIC',fact.ref,'proof spans different captured facts or wrappers');
+      semanticProofs.set(provenance.id,{...raw,factRef:fact.ref,factKind:fact.kind,wrapper:structuredClone({...provenance,freshness:undefined})});
     }
   }
   const answers=(await jsonFile(root,fixture.answersFile,'AnswersInputV1')).value;
