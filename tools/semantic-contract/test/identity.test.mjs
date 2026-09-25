@@ -60,7 +60,7 @@ test('IDENTITY.COLLISION retained revisions and distinct full hashes sharing a p
   assert.throws(()=>syntaxId({...input,lookupKey:'normalized'}),/unknown field/);
 });
 test('IDENTITY.ORDINAL immutable document, parent, exact name and signature scopes',()=>{
-  const common={sourceSetId:'core',documentPath:'a.rs',revisionId:'r1',container:[],kind:'function',name:'x',signature:null};
+  const common={sourceSetId:'core',language:'rust',documentPath:'a.rs',revisionId:'r1',container:[],kind:'function',name:'x',signature:null};
   const a={...common,range:{start:8,end:9},nativeId:'node-1'};
   const b={...common,range:{start:2,end:3},nativeId:'node-2'};
   const different=[
@@ -74,6 +74,13 @@ test('IDENTITY.ORDINAL immutable document, parent, exact name and signature scop
   assert.equal(ordinals.get(b),0);assert.equal(ordinals.get(a),1);
   for(const row of different) assert.equal(ordinals.get(row),0);
   assert.throws(()=>assignOrdinals([a,{...a,lookupKey:'different',nativeId:'other'}]),/IDENTITY.ORDINAL/);
+  const javascript={...a,language:'javascript',nativeId:'other-language'};
+  const documents=assignOrdinals([a,javascript]);
+  assert.equal(documents.get(a),0);
+  assert.equal(documents.get(javascript),0);
+  assert.throws(()=>assignOrdinals([a,{...a,nativeId:'same-language'}]),/duplicate native range/);
+  assert.throws(()=>assignOrdinals([{...a,language:undefined}]),/FORMAT.SHAPE Language/);
+  assert.throws(()=>assignOrdinals([{...a,language:'unknown'}]),/FORMAT.SHAPE Language/);
   assert.throws(()=>assignOrdinals([{container:[],kind:'function',name:'x',signature:null,range:{start:0,end:1}}]),/invalid snapshot/);
   const top={sourceSet:'core',path:'a.rs',language:'rust',ancestors:[],declaration:{kind:'function',name:'x',signature:null,ordinal:0}};
   assert.equal(syntaxId(top),syntaxId({...top,ancestors:[]}));
