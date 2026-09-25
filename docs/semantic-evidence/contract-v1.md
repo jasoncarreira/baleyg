@@ -96,6 +96,16 @@ Freshness is independent from coverage and is evaluated only after captured-basi
 
 A failed refresh creates a `failed` coverage row and retains the old provenance as labelled historical evidence. It never relabels the old basis fresh and never binds old evidence to another revision's occurrences.
 
+<a id="historical-evidence-scope"></a>
+**Historical evidence scope (clarification, 2026-09-25).** This adds no field. Stable syntax IDs are the only cross-revision link. For a returned `GraphNode.declaration` with syntax ID `S` in document `D` of the requested source set, an answer at revision `r2` returns the selected producer's latest retained proof captured at an earlier revision `r1`, but only when all of the following hold:
+- the proof is a `Symbol`, `DeclarationBinding` or `TypeRelationship` that names `S` (`DeclarationBinding.syntaxId`, an internal `Symbol.declarations` target, or a relationship `source`);
+- the selected producer's `r2` tuple for `D` is `failed` or `omitted`;
+- the proof is labelled with its captured revision and a freshness derived by the rules above. That is `possiblyStale` when `D`'s bytes are unchanged. It is `stale` when they changed, and the overlay is then withheld.
+
+Such a proof contributes only returned provenance, its captured tuple's coverage, and warnings-v1 keys. It never supplies an `r2` answer's `GraphEdge.binding`, `to`, admission or traversal.
+
+Occurrence-keyed evidence never crosses revisions, because occurrence IDs include `revisionId`. This covers `CallBinding`, `Reference`, and their joins. After a failed `r2` refresh, `r2` calls have no selected-producer binding and remain boundaries. Include no historical proof for undisplayed declarations, other documents, other producers, or anything older than the latest retained proof per `(producer, S)`. A proof selected merely because it exists, or one that selects itself, is invalid.
+
 `CallBinding.staleTarget` is null when there is no internal declared target; true when that target is missing or its captured target document bytes differ from the requested snapshot; false when it exists with matching bytes. Thus a caller can be fresh while the target is stale. `possiblyStale`, `stale`, or `staleTarget=true` forbids expansion.
 
 Hand-checks:
@@ -108,7 +118,7 @@ Hand-checks:
 | Caller bytes unchanged; dependency, config, or producer changes | Coverage is unchanged. | Each independently makes semantic evidence `possiblyStale`. |
 | Missing basis | Semantic artifact is malformed and atomically rejected; absence may be exposed as failed/missing coverage. | It cannot be called fresh. |
 | Fresh caller, changed target bytes | Caller may be fresh. | Internal binding has `staleTarget=true`; boundary, no expansion. |
-| Refresh fails | New tuple row is `failed`, diagnostic required. | Old basis remains historical with its old label; never promoted. |
+| Refresh fails | New tuple row is `failed`, diagnostic required. | Old basis remains historical with its old label; never promoted. Only declaration-keyed proofs for returned declarations may appear in the new answer ([scope](#historical-evidence-scope)); no old call binding does. |
 
 ## Records and bindings
 
