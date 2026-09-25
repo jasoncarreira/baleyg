@@ -1,4 +1,5 @@
 //! SQLite snapshots and durable user data. Connections are never shared between threads.
+pub mod topology;
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
