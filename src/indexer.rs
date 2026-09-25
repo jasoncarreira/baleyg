@@ -116,6 +116,8 @@ pub struct CapturedDocument {
     pub content_hash: String,
     pub byte_length: u64,
     pub syntax: Vec<CapturedSyntaxNode>,
+    pub native_candidates: Vec<CapturedNativeWitness>,
+    pub semantic_positions: Vec<CapturedPosition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +128,89 @@ pub struct CapturedSyntaxNode {
     pub start_byte: usize,
     pub end_byte: usize,
     pub source_bytes: Vec<u8>,
+    pub field_name: Option<String>,
+    pub candidate_kind: Option<String>,
+    pub name_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeCandidateKind {
+    Declaration,
+    Occurrence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedNativeWitness {
+    pub node_id: usize,
+    pub parent_id: Option<usize>,
+    pub owner_id: usize,
+    pub candidate_kind: NativeCandidateKind,
+    pub node_kind: String,
+    pub name_bytes: Vec<u8>,
+    pub header_bytes: Vec<u8>,
+    pub token_bytes: Vec<u8>,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+// These are AST candidates, not validated declarations/occurrences or graph facts.
+fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness> {
+    let mut output = Vec::new();
+    for node in nodes {
+        let declaration = node.kind.contains("declaration")
+            || node.kind.contains("definition")
+            || node.kind == "function_item"
+            || node.kind == "method_definition";
+        let occurrence = node.kind.contains("identifier");
+        if !declaration && !occurrence {
+            continue;
+        }
+        let mut owner = node.parent_id.unwrap_or(0);
+        while owner > 0 {
+            let ancestor = &nodes[owner];
+            if ancestor.kind.contains("declaration")
+                || ancestor.kind.contains("definition")
+                || ancestor.kind == "function_item"
+                || ancestor.kind == "method_definition"
+            {
+                break;
+            }
+            owner = ancestor.parent_id.unwrap_or(0);
+        }
+        let name = if declaration {
+            nodes
+                .iter()
+                .find(|candidate| {
+                    candidate.parent_id == Some(node.id)
+                        && candidate.field_name.as_deref() == Some("name")
+                })
+                .map(|candidate| candidate.source_bytes.clone())
+                .unwrap_or_default()
+        } else {
+            node.source_bytes.clone()
+        };
+        output.push(CapturedNativeWitness {
+            node_id: node.id,
+            parent_id: node.parent_id,
+            owner_id: owner,
+            candidate_kind: if declaration {
+                NativeCandidateKind::Declaration
+            } else {
+                NativeCandidateKind::Occurrence
+            },
+            node_kind: node.kind.clone(),
+            name_bytes: name,
+            header_bytes: if declaration {
+                node.source_bytes.clone()
+            } else {
+                Vec::new()
+            },
+            token_bytes: node.source_bytes.clone(),
+            start_byte: node.start_byte,
+            end_byte: node.end_byte,
+        });
+    }
+    output
 }
 
 fn capture_syntax(
@@ -145,8 +230,8 @@ fn capture_syntax(
         .parse(bytes, None)
         .context("native AST parse failed")?;
     let mut nodes = Vec::new();
-    let mut pending = vec![(tree.root_node(), None)];
-    while let Some((node, parent_id)) = pending.pop() {
+    let mut pending = vec![(tree.root_node(), None, None)];
+    while let Some((node, parent_id, field_name)) = pending.pop() {
         ensure!(nodes.len() < 1_000_000, "AST exceeds node limit");
         let id = nodes.len();
         nodes.push(CapturedSyntaxNode {
@@ -156,11 +241,18 @@ fn capture_syntax(
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
             source_bytes: bytes[node.byte_range()].to_vec(),
+            field_name,
+            candidate_kind: node.is_named().then(|| node.kind().to_owned()),
+            name_bytes: node.is_named().then(|| bytes[node.byte_range()].to_vec()),
         });
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            pending.push((child, Some(id)));
+        let children: Vec<_> = node.children(&mut cursor).enumerate().collect();
+        for (index, child) in children.into_iter().rev() {
+            pending.push((
+                child,
+                Some(id),
+                node.field_name_for_child(index as u32).map(str::to_owned),
+            ));
         }
     }
     Ok(nodes)
@@ -194,6 +286,7 @@ pub struct CaptureAdmission {
     pub toolchain: PathBuf,
     pub config: PathBuf,
     pub dependency: PathBuf,
+    pub dependency_source_sets: Vec<String>,
     pub producers: Vec<ProducerInput>,
 }
 
@@ -212,6 +305,7 @@ pub struct CapturedRevision {
     pub config_hash: String,
     pub dependency_hash: String,
     pub producers: Vec<CapturedProducer>,
+    pub dependency_source_sets: Vec<String>,
 }
 
 // A semantic adapter keeps the producer's original coordinate and encoding;
@@ -223,6 +317,8 @@ pub struct CapturedPosition {
     pub revision_id: String,
     pub position_encoding: String,
     pub coordinates: Vec<u64>,
+    pub symbol: String,
+    pub roles: u32,
     pub artifact_hash: String,
 }
 
@@ -245,47 +341,52 @@ fn capture_file(root: &Path, path: &Path, cap: u64) -> Result<Vec<u8>> {
     Ok(first)
 }
 
-pub fn capture_revision(
-    options: &IndexOptions,
-    admission: &CaptureAdmission,
+fn discover_capture_inputs(
+    root: &Path,
     cancel: &CancelFlag,
-) -> Result<CapturedRevision> {
-    use crate::model::v1::{DocumentKey, Language, Path as EvidencePath, Text};
-    check(cancel)?;
-    ensure!(
-        !admission.source_set_id.is_empty() && !admission.root_id.is_empty(),
-        "missing logical admission identity"
-    );
-    ensure!(
-        !admission.languages.is_empty(),
-        "missing admitted languages"
-    );
-    ensure!(
-        !fs::symlink_metadata(&options.workspace_root)?
-            .file_type()
-            .is_symlink(),
-        "workspace root is a symlink"
-    );
-    let root = fs::canonicalize(&options.workspace_root)?;
-    let mut documents = Vec::new();
-    let mut source_inputs = Vec::new();
+) -> Result<Vec<(PathBuf, Option<crate::model::v1::Language>)>> {
+    use crate::model::v1::Language;
     let mut paths = Vec::new();
-    let mut walk = ignore::WalkBuilder::new(&root);
+    let mut walk = ignore::WalkBuilder::new(root);
     walk.require_git(false)
         .follow_links(false)
         .hidden(true)
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !matches!(
-                    e.file_name().to_str(),
-                    Some(
-                        ".git" | "node_modules" | ".venv" | ".baleyg" | "target" | "dist" | "build"
-                    )
-                )
+        .filter_entry({
+            let root = root.to_owned();
+            move |e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+                match e.file_name().to_str() {
+                    Some(".git" | "node_modules" | ".venv" | ".baleyg") => false,
+                    Some("target" | "dist" | "build") => {
+                        e.path().strip_prefix(&root).ok().is_some_and(|r| {
+                            let parts: Vec<_> = r.components().collect();
+                            parts.windows(3).any(|p| {
+                                p[0].as_os_str() == "src"
+                                    && matches!(
+                                        p[1].as_os_str().to_str(),
+                                        Some("main" | "test" | "testFixtures")
+                                    )
+                                    && p[2].as_os_str() == "java"
+                            })
+                        })
+                    }
+                    _ => true,
+                }
+            }
         });
     for entry in walk.build() {
         check(cancel)?;
         let entry = entry.context("unsafe or unreadable source discovery")?;
+        if entry.file_type().is_some_and(|t| t.is_symlink()) {
+            let extension = entry.path().extension().and_then(|s| s.to_str());
+            ensure!(
+                !matches!(extension, Some("rs" | "java" | "py" | "js" | "mjs" | "cjs")),
+                "unsafe symlink source: {}",
+                entry.path().display()
+            );
+        }
         if entry.file_type().is_some_and(|t| t.is_file()) {
             let path = entry.into_path();
             let name = path.file_name().and_then(|s| s.to_str());
@@ -336,36 +437,82 @@ pub fn capture_revision(
         }
     }
     paths.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(paths)
+}
+
+pub fn capture_revision(
+    options: &IndexOptions,
+    admission: &CaptureAdmission,
+    cancel: &CancelFlag,
+) -> Result<CapturedRevision> {
+    use crate::model::v1::{DocumentKey, Language, Path as EvidencePath, Text};
+    check(cancel)?;
+    let identity = crate::store::topology::WorkspaceIdentity::discover_unattached(
+        Some(&options.workspace_root),
+        &options.workspace_root,
+    )?;
+    identity.verify()?;
+    ensure!(
+        admission.source_set_id == identity.record_id && admission.root_id == identity.root_key,
+        "unadmitted workspace identity"
+    );
+    // No external source-set registry is available at this boundary. Do not
+    // admit a caller-asserted dependency, including a self-reference.
+    ensure!(
+        admission.dependency_source_sets.is_empty(),
+        "dependency source set is not independently admitted"
+    );
+    ensure!(
+        !admission.languages.is_empty()
+            && admission
+                .languages
+                .iter()
+                .enumerate()
+                .all(|(i, lang)| !admission.languages[..i].contains(lang)),
+        "missing or duplicate admitted languages"
+    );
+    ensure!(
+        !fs::symlink_metadata(&options.workspace_root)?
+            .file_type()
+            .is_symlink(),
+        "workspace root is a symlink"
+    );
+    let root = identity.root.clone();
+    let mut documents = Vec::new();
+    let mut source_inputs = Vec::new();
+    let paths = discover_capture_inputs(&root, cancel)?;
     let mut total = 0u64;
     let mut observed_inputs = Vec::new();
-    for (path, language) in paths {
+    for (path, language) in &paths {
         check(cancel)?;
         let relative = path
             .strip_prefix(&root)?
             .to_str()
             .context("non-UTF8 capture path")?
             .replace('\\', "/");
-        let bytes = capture_file(&root, &path, options.max_file_bytes.min(256 * 1024 * 1024))?;
+        let bytes = capture_file(&root, path, options.max_file_bytes.min(256 * 1024 * 1024))?;
         total += bytes.len() as u64;
         ensure!(total <= 256 * 1024 * 1024, "capture exceeds 256 MiB");
         observed_inputs.push((path, bytes.clone()));
         if let Some(language) = language {
             ensure!(
-                admission.languages.contains(&language),
+                admission.languages.contains(language),
                 "source language not admitted: {relative}"
             );
             let key = DocumentKey {
                 source_set_id: Text::new(&admission.source_set_id).context("invalid source set")?,
-                language,
+                language: *language,
                 path: EvidencePath::new(relative).context("invalid source path")?,
             };
-            let syntax = capture_syntax(language, &bytes)?;
+            let syntax = capture_syntax(*language, &bytes)?;
             documents.push(CapturedDocument {
                 key,
                 content_hash: digest(&bytes),
                 byte_length: bytes.len() as u64,
                 bytes,
+                native_candidates: native_candidates(&syntax),
                 syntax,
+                semantic_positions: Vec::new(),
             });
         } else {
             source_inputs.push((relative, bytes));
@@ -395,46 +542,119 @@ pub fn capture_revision(
         .iter()
         .map(|d| serde_json::json!({"document":d.key,"contentHash":d.content_hash}))
         .collect();
-    let manifest_bytes = serde_json::to_vec(&manifest)?;
+    let manifest_bytes = crate::semantic_identity::canonical_json(&manifest)?;
     let toolchain_bytes = capture_file(&root, &admission.toolchain, 16 * 1024 * 1024)?;
     let config_bytes = capture_file(&root, &admission.config, 16 * 1024 * 1024)?;
     let dependency_bytes = capture_file(&root, &admission.dependency, 16 * 1024 * 1024)?;
     let mut producers = Vec::new();
-    for input in &admission.producers {
+    let native_bytes = safe_read(&std::env::current_exe()?, 256 * 1024 * 1024)?;
+    producers.push(CapturedProducer {
+        id: "N".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        position_encoding: "utf8".into(),
+        executable_hash: digest(&native_bytes),
+        executable_bytes: native_bytes,
+        artifact_hash: None,
+        artifact_bytes: None,
+    });
+    // A prebuilt SCIP index does not attest which process generated it. Only
+    // capture the configured artifact and an explicitly supplied, readable
+    // executable; metadata is checked, not treated as an execution receipt.
+    if let Some(scip_path) = &options.scip_path {
+        let input = admission
+            .producers
+            .iter()
+            .find(|p| p.id == "S")
+            .context("semantic executable admission missing")?;
         ensure!(
-            !input.id.is_empty() && !input.version.is_empty(),
-            "missing producer identity/version"
+            admission.producers.len() == 1 && input.artifact.as_ref() == Some(scip_path),
+            "semantic artifact differs from indexed artifact"
         );
         ensure!(
-            matches!(
-                input.position_encoding.as_str(),
-                "utf8" | "utf16" | "unicodeScalar"
-            ),
+            !input.version.is_empty() && !input.position_encoding.is_empty(),
+            "missing semantic producer metadata"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            ensure!(
+                fs::symlink_metadata(&input.executable)?
+                    .permissions()
+                    .mode()
+                    & 0o111
+                    != 0,
+                "semantic producer path is not executable"
+            );
+        }
+        let executable_bytes = safe_read(&input.executable, 256 * 1024 * 1024)?;
+        let artifact_bytes = safe_read(scip_path, 256 * 1024 * 1024)?;
+        let index = scip::types::Index::parse_from_bytes(&artifact_bytes)?;
+        let tool = index
+            .metadata
+            .as_ref()
+            .and_then(|m| m.tool_info.as_ref())
+            .context("SCIP producer metadata missing")?;
+        ensure!(
+            tool.name == input.id && tool.version == input.version,
+            "SCIP producer metadata does not match admitted producer"
+        );
+        ensure!(
+            input.position_encoding == "utf8"
+                || input.position_encoding == "utf16"
+                || input.position_encoding == "unicodeScalar",
             "unsupported position encoding"
         );
-        ensure!(
-            !producers
+        let artifact_hash = digest(&artifact_bytes);
+        for doc in &mut documents {
+            for original in index
+                .documents
                 .iter()
-                .any(|p: &CapturedProducer| p.id == input.id),
-            "duplicate producer"
-        );
-        let executable_bytes = capture_file(&root, &input.executable, 256 * 1024 * 1024)?;
-        let artifact_bytes = input
-            .artifact
-            .as_ref()
-            .map(|p| capture_file(&root, p, 256 * 1024 * 1024))
-            .transpose()?;
+                .filter(|d| d.relative_path == doc.key.path.as_str())
+            {
+                for occurrence in &original.occurrences {
+                    let original_range: Vec<i32> = match &occurrence.typed_range {
+                        Some(scip::types::occurrence::Typed_range::SingleLineRange(r)) => {
+                            vec![r.line, r.start_character, r.end_character]
+                        }
+                        Some(scip::types::occurrence::Typed_range::MultiLineRange(r)) => {
+                            vec![r.start_line, r.start_character, r.end_line, r.end_character]
+                        }
+                        None => occurrence.range.clone(),
+                        Some(_) => anyhow::bail!("unsupported SCIP typed range"),
+                    };
+                    ensure!(
+                        matches!(original_range.len(), 3 | 4)
+                            && original_range.iter().all(|v| *v >= 0),
+                        "invalid SCIP range"
+                    );
+                    doc.semantic_positions.push(CapturedPosition {
+                        producer_id: input.id.clone(),
+                        document: doc.key.clone(),
+                        revision_id: String::new(),
+                        position_encoding: input.position_encoding.clone(),
+                        coordinates: original_range.iter().map(|v| *v as u64).collect(),
+                        symbol: occurrence.symbol.clone(),
+                        roles: occurrence.symbol_roles as u32,
+                        artifact_hash: artifact_hash.clone(),
+                    });
+                }
+            }
+        }
         producers.push(CapturedProducer {
             id: input.id.clone(),
             version: input.version.clone(),
             position_encoding: input.position_encoding.clone(),
             executable_hash: digest(&executable_bytes),
             executable_bytes,
-            artifact_hash: artifact_bytes.as_ref().map(|b| digest(b)),
-            artifact_bytes,
+            artifact_hash: Some(artifact_hash),
+            artifact_bytes: Some(artifact_bytes),
         });
+    } else {
+        ensure!(
+            admission.producers.is_empty(),
+            "semantic producer supplied without indexed artifact"
+        );
     }
-    producers.sort_by(|a, b| a.id.cmp(&b.id));
     let toolchain_hash = digest(&toolchain_bytes);
     let config_hash = digest(&config_bytes);
     let dependency_hash = digest(&dependency_bytes);
@@ -446,6 +666,8 @@ pub fn capture_revision(
         admission.source_set_id.as_bytes(),
         admission.root_id.as_bytes(),
         &manifest_bytes,
+        &crate::semantic_identity::canonical_json(&admission.languages)?,
+        &crate::semantic_identity::canonical_json(&admission.dependency_source_sets)?,
         &serde_json::to_vec(&source_inputs)?,
         &toolchain_bytes,
         &config_bytes,
@@ -468,19 +690,58 @@ pub fn capture_revision(
         revision.update((part.len() as u64).to_be_bytes());
         revision.update(part);
     }
+    let revision_id = format!("rev:v1:{}", hex::encode(revision.finalize()));
+    for document in &mut documents {
+        for position in &mut document.semantic_positions {
+            position.revision_id = revision_id.clone();
+        }
+    }
     for (path, bytes) in observed_inputs {
         check(cancel)?;
         ensure!(
-            capture_file(&root, &path, options.max_file_bytes.min(256 * 1024 * 1024))? == bytes,
+            capture_file(&root, path, options.max_file_bytes.min(256 * 1024 * 1024))? == bytes,
             "source changed during capture: {}",
             path.display()
         );
     }
+    ensure!(
+        capture_file(&root, &admission.toolchain, 16 * 1024 * 1024)? == toolchain_bytes
+            && capture_file(&root, &admission.config, 16 * 1024 * 1024)? == config_bytes
+            && capture_file(&root, &admission.dependency, 16 * 1024 * 1024)? == dependency_bytes,
+        "basis inputs changed during capture"
+    );
+    for producer in &producers {
+        if producer.id == "N" {
+            ensure!(
+                safe_read(&std::env::current_exe()?, 256 * 1024 * 1024)?
+                    == producer.executable_bytes,
+                "native executable changed during capture"
+            );
+        } else {
+            let input = &admission.producers[0];
+            ensure!(
+                safe_read(&input.executable, 256 * 1024 * 1024)? == producer.executable_bytes
+                    && safe_read(
+                        options.scip_path.as_ref().context("missing SCIP path")?,
+                        256 * 1024 * 1024
+                    )? == *producer
+                        .artifact_bytes
+                        .as_ref()
+                        .context("missing SCIP artifact")?,
+                "semantic producer inputs changed during capture"
+            );
+        }
+    }
+    ensure!(
+        discover_capture_inputs(&root, cancel)? == paths,
+        "source set changed during capture"
+    );
+    identity.verify()?;
     check(cancel)?;
     Ok(CapturedRevision {
         source_set_id: admission.source_set_id.clone(),
         root_id: admission.root_id.clone(),
-        revision_id: format!("rev:v1:{}", hex::encode(revision.finalize())),
+        revision_id,
         documents,
         manifest_bytes,
         source_inputs,
@@ -491,6 +752,7 @@ pub fn capture_revision(
         config_hash,
         dependency_hash,
         producers,
+        dependency_source_sets: admission.dependency_source_sets.clone(),
     })
 }
 
