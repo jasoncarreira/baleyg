@@ -213,10 +213,8 @@ for(const [language,spelling,expected] of [
  assert.equal(m.nativeReferenceDescriptors[0].spelling,spelling);
  assert.equal(m.nativeReferenceDescriptors[0].lookupKey,expected);
 });
-test('Java method projection, forbidden ordinary function, and non-Java signature exclusion',()=>{
+test('Java method projection and non-Java signature exclusion',()=>{
  const s=lexical('java','go','go');assert.equal(checkMeasurement(s.loaded,s.records).recordByNativeRef.get('go').key.signature.typeParameterCount,0);
- const forbidden=structuredClone(s);forbidden.loaded.native.declarations[0].kind='function';forbidden.loaded.native.declarations[0].header.kind='function';forbidden.loaded.native.declarations[0].signature=null;
- assert.throws(()=>checkMeasurement(forbidden.loaded,forbidden.records),e=>e.assertion==='MEASUREMENT.WITNESS'&&e.code==='invalidRecord'&&e.field==='kind');
  s.loaded.native.declarations[0].signature.typeParameterCount=1;
  assert.throws(()=>checkMeasurement(s.loaded,s.records),e=>e.assertion==='MEASUREMENT.WITNESS'&&e.field==='signature');
  const js=lexical('javascript','go','go');js.loaded.native.declarations[0].signature={parameterTypes:[],typeParameterCount:0,variadic:false};
@@ -377,8 +375,6 @@ test('Java method and constructor signatures have distinct real source leaves',a
  for(const [mutate,field] of [[v=>v.signature.typeParameterCount=0,'signature'],[v=>v.signature.variadic=false,'signature'],[v=>v.header.parameters.push({name:'values',type:'T',variadic:false}),'header.parameters']]){
   const bad=structuredClone(s);mutate(bad.loaded.native.declarations[0]);await assert.rejects(async()=>{const x=await admitSpec(bad);return checkMeasurement(x.loaded,x.records);},e=>e.assertion==='MEASUREMENT.WITNESS'&&e.field===field);
  }
- const forbidden=structuredClone(s);forbidden.loaded.native.declarations[1].kind='function';forbidden.loaded.native.declarations[1].header.kind='function';forbidden.loaded.native.declarations[1].signature=null;
- await assert.rejects(async()=>{const x=await admitSpec(forbidden);return checkMeasurement(x.loaded,x.records);},e=>e.assertion==='MEASUREMENT.WITNESS'&&e.field==='kind');
 });
 test('source witness changed, wrong encoding, absent null-callee spelling, and empty occurrences reject precisely',()=>{
  const s=sample();

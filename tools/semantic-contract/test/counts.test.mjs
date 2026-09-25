@@ -50,7 +50,7 @@ function makeFact(family,status,ref='fact') {
  const coordinates=(status==='exact'?exactSpans:unmatchedSpans)[family];
  return {kind:factType[family],ref,anchor:{document,revisionId:'r1',contentHash,kind:family,range:span(...coordinates),ownerRef:owned[family]},record:structuredClone(templates[factType[family]])};
 }
-async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,twoProducers=false,selectSecond=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false,normalized=false,sourceOverride=null,mutateSecond=null,secondEncoding=null,documentOverride=null,profile='example',scenarios=[],dispositions=null,mutateCoverage=null,requestedRoles=['read'],includeSecondInComparison=false}={}) {
+async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,twoProducers=false,selectSecond=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false,normalized=false,sourceOverride=null,mutateSecond=null,secondEncoding=null,documentOverride=null,profile='example',scenarios=[],dispositions=null,mutateCoverage=null,requestedRoles=['read'],includeSecondInComparison=false,comparisonSemanticVersion=null}={}) {
  const document=documentOverride??baseDocument;
  const parent=await mkdtemp(join(tmpdir(),'count-u5-')),root=join(parent,'example');await mkdir(root);t.after(()=>rm(parent,{recursive:true,force:true}));
  const fs=new Map(),put=(path,value)=>fs.set(path,typeof value==='string'?value:JSON.stringify(value));
@@ -89,15 +89,31 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
   const evidenceKind=fact.kind==='typeRelationship'?'typeRelationship':fact.kind==='declarationBinding'?'declarationBinding':'semanticReference';
   return fact.ref==='fact-b'?{...proof,evidenceKind,id:'proof-b',producerId:'semantic-b',basis:{...basis,producerId:'semantic-b',producerHash:sha('semantic-b-executable'),artifactHash:sha(fs.get('captures/semantic-b.json'))},freshness:'possiblyStale'}:{...proof,evidenceKind,id:fact.provenanceRef??fact.record.provenanceId};
  });
+ if(comparisonSemanticVersion!==null)for(const proof of proofs)if(proof.producerId==='semantic')proof.freshness='possiblyStale';
  const proofFacts=proofs.map((record,i)=>({kind:'provenance',ref:`proof-fact-${i}`,record}));
  const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:!(status==='unsupported'&&kind===unsupportedFamily),diagnostic:status==='unsupported'&&kind===unsupportedFamily?'native family unavailable':null}));
  mutateSupport?.(support);
- const coverage=(producerId)=>({producerId,language:document.language,sourceSetId:document.sourceSetId,documentPath:document.path,revisionId:'r1',requested:true,selected:producerId!=='semantic-b'||selectSecond,state:producerId==='semantic-b'?(selectSecond?'partial':'omitted'):status==='unsupported'&&unsupportedFamily==='reference'?'partial':'complete',supportedRoles:['read'],observedRoles:producerId==='semantic-b'||status==='unsupported'&&unsupportedFamily==='reference'?[]:['read'],diagnostic:producerId==='semantic-b'?(selectSecond?'reference not observed':'producer not selected'):status==='unsupported'&&unsupportedFamily==='reference'?'reference unavailable':null});
+ const roleOrder=['definition','read','write','call','type','import','alias'];
+ const orderedRoles=values=>[...new Set(values)].sort((a,b)=>roleOrder.indexOf(a)-roleOrder.indexOf(b));
+ const rolesFor=producerId=>authored.filter(fact=>producerId==='semantic-b'?fact.ref==='fact-b':fact.ref!=='fact-b').flatMap(fact=>{
+  if(fact.kind==='reference'&&status==='exact'&&support.find(x=>x.kind==='reference').available)return fact.record.roles;
+  if(fact.kind==='callBinding'&&status==='exact'&&support.find(x=>x.kind===fact.anchor.kind).available)return ['call'];
+  return [];
+ });
+ const coverage=(producerId)=>{
+  const selected=producerId!=='semantic-b'||selectSecond;
+  const roles=producerId==='native'?[]:rolesFor(producerId);
+  const observed=selected?orderedRoles([...(support.find(x=>x.kind==='reference').available?['read']:[]),...roles]):[];
+  const incomplete=status==='unsupported'&&unsupportedFamily==='reference';
+  return {producerId,language:document.language,sourceSetId:document.sourceSetId,documentPath:document.path,revisionId:'r1',requested:true,selected,
+   state:!selected?'omitted':incomplete?'partial':'complete',supportedRoles:orderedRoles(['read',...roles]),observedRoles:observed,
+   diagnostic:!selected?'producer not selected':incomplete?'reference unavailable':null};
+ };
  put('snapshots/src/main.js.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios,facts:[...(twoProducers?['native','semantic','semantic-b']:['native','semantic']).map(id=>({kind:'coverage',ref:`coverage-${id}`,record:mutateCoverage?.(coverage(id))??coverage(id)})),...proofFacts,...authored]});
  const selectedSemantic={...semanticProducer,positionEncoding:encoding};
  const unselectedSemantic={...semanticProducer,id:'semantic-b',executableHash:sha('semantic-b-executable'),positionEncoding:secondEncoding??encoding};
  const producers=(twoProducers?[nativeProducer,selectedSemantic,unselectedSemantic]:[nativeProducer,selectedSemantic]).map(p=>({...p,languages:[document.language]}));
- const fixture={formatVersion:1,profile,language:document.language,sourceSets:[{id:'main',rootId:'root',languages:[document.language],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:includeSecondInComparison?producers:producers.slice(0,2)},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles,measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:twoProducers?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ const fixture={formatVersion:1,profile,language:document.language,sourceSets:[{id:'main',rootId:'root',languages:[document.language],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:(includeSecondInComparison?producers:producers.slice(0,2)).map(producer=>comparisonSemanticVersion!==null&&producer.id==='semantic'?{...producer,version:comparisonSemanticVersion}:producer)},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles:orderedRoles([...requestedRoles,...(producer.id==='native'?[]:rolesFor(producer.id))]),measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:twoProducers?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  if(alternateTuples){
   const alternatives=[
    {document:{...document,path:'src/other.js'},revisionId:'r1',file:'snapshots/src/other.js',kind:'document'},
@@ -335,7 +351,7 @@ test('unicode coordinates require source bytes; ASCII anchors cannot be relabell
 test('coverageFreshness requires an authenticated partial tuple, not a relabelled scenario',async t=>{
  const s=await specimen(t);
  const intent=s.loaded.fixture.coverageIntents.find(x=>x.producerId==='semantic');
- intent.requestedRoles=['read','write'];
+ intent.requestedRoles=['read','write','call'];
  const row=s.loaded.annotations[0].facts.find(x=>x.kind==='coverage'&&x.record.producerId==='semantic').record;
  row.state='partial';row.diagnostic='write not observed';
  const stored=s.records.coverage.find(x=>x.producerId==='semantic');
@@ -599,7 +615,9 @@ async function generatedCorpus(t,{duplicateProducer=false,omitRole=null,noOverlo
   dispositions:{formatVersion:1,assertions,callableValueNegatives:negatives},
   mutateNative:rows=>{rows.declarations=decls;rows.calls=calls;rows.references=refs;rows.controls=[];},
   mutateSupport:support=>{support.find(x=>x.kind==='invocation').available=false;support.find(x=>x.kind==='invocation').diagnostic='invocation unavailable';},
-  requestedRoles:['read','write','type'],mutateCoverage:row=>({...row,state:'partial',supportedRoles:['read','write','type'],observedRoles:['read','write'],diagnostic:'type not observed'})});
+  requestedRoles:['definition','read','write','call','type','import'],comparisonSemanticVersion:'2',
+  mutateCoverage:row=>({...row,state:row.selected?'complete':'omitted',supportedRoles:['definition','read','write','call','type','import'],
+   observedRoles:row.selected?['definition','read','write','call','type','import']:[],diagnostic:row.selected?null:'producer not selected'})});
  return s;
 }
 
