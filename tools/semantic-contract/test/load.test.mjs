@@ -124,6 +124,58 @@ test('IDENTITY.COVERAGE excludes Java alias but admits Java definition and JS al
  intent.requestedRoles=['definition'];await s.flush();assert.equal((await loadFixture(s.root)).fixture.coverageIntents[0].requestedRoles[0],'definition');
 });
 
+test('IDENTITY.CHRONOLOGY retains opaque, per-source-set authored order',async t=>{
+ const s=await specimen();t.after(s.cleanup);
+ const revisions=s.fixture.revisions;
+ const revision=(id,set='main',path='src/go.js')=>({...structuredClone(revisions[0]),id,sourceSetId:set,
+   documents:[{key:{...s.document,sourceSetId:set,path},revisionId:id,sourceFile:`snapshots/${set}/${id}.js`}]});
+ const foreign={id:'foreign',rootId:'foreign-root',languages:['javascript'],dependencies:[]};
+ s.fixture.sourceSets.push(foreign);
+ s.fixture.revisions=[revision('z-old'),revision('x-first','foreign','src/other.js'),revision('a-middle'),revision('b-new'),revision('w-second','foreign','src/other.js')];
+ for(const item of s.fixture.revisions)s.files[item.documents[0].sourceFile]=s.source;
+ // This specimen tests chronology without optional annotations.
+ s.fixture.annotationFiles=[];
+ delete s.files['src/go.js.annotations.json'];delete s.files['src/go.js'];
+ s.fixture.comparison.revisionId='b-new';
+ await rm(join(s.root,'src'),{recursive:true});await s.flush();
+ const loaded=await loadFixture(s.root);
+ assert.deepEqual(loaded.revisionChronology.get('main').map(x=>x.id),['z-old','a-middle','b-new']);
+ assert.deepEqual(loaded.revisionChronology.get('foreign').map(x=>x.id),['x-first','w-second']);
+ assert.equal(loaded.selectedIndex,2);
+ s.fixture.revisions=[s.fixture.revisions[3],...s.fixture.revisions.slice(0,3),s.fixture.revisions[4]];
+ await s.flush();assert.equal((await loadFixture(s.root)).selectedIndex,0);
+ s.fixture.comparison.revisionId='absent';await s.flush();
+ await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.COMPARISON',field:'comparison'});
+});
+
+test('IDENTITY.INVENTORY closes unknown nested inputs while excluding generated bundles',async t=>{
+ const s=await specimen();t.after(s.cleanup);
+ await mkdir(join(s.root,'other','nested'),{recursive:true});
+ await writeFile(join(s.root,'other','nested','rogue.js'),'unlisted');
+ await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY',field:'other/nested/rogue.js'});
+ await rm(join(s.root,'other'),{recursive:true});
+ await mkdir(join(s.root,'generated','bundles'),{recursive:true});
+ await writeFile(join(s.root,'generated','bundles','published.json'),'published');
+ assert.equal((await loadFixture(s.root)).sources.size,1);
+ await rm(join(s.root,s.fixture.answersFile));
+ await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY',field:s.fixture.answersFile});
+ s.fixture.answersFile='generated/answers.json';await s.flush();
+ await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY',field:'generated/answers.json'});
+});
+
+test('IDENTITY.SEMANTIC rejects a proof claiming another captured producer or source bytes',async t=>{
+ const {s,value,check}=await relationshipSpecimen('utf8');t.after(s.cleanup);
+ await check(value);
+ const annotation=JSON.parse(s.files['src/go.js.annotations.json']);
+ annotation.facts[0].record.producerId='native';
+ s.files['src/go.js.annotations.json']=JSON.stringify(annotation);await s.flush();
+ await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.SEMANTIC',field:'relationship'});
+ annotation.facts[0].record.producerId='semantic';
+ annotation.facts[0].record.contentHash=hash('forged bytes');
+ s.files['src/go.js.annotations.json']=JSON.stringify(annotation);await s.flush();
+ await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.SEMANTIC',field:'relationship'});
+});
+
 // The three producers declare different coordinate systems for the same captured bytes.
 async function relationshipSpecimen(encoding,{duplicate=false,secondDocument=false}={}) {
   const s=await specimen();
