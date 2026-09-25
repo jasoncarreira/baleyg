@@ -148,9 +148,7 @@ impl RustIds {
                 .iter()
                 .map(|&i| {
                     let (start, end, key, parents) = &decl[i];
-                    let ancestors = std::iter::once(module_key.clone())
-                        .chain(parents.iter().map(|p| keys[p].clone()))
-                        .collect();
+                    let ancestors = parents.iter().map(|p| keys[p].clone()).collect();
                     (ancestors, key.clone(), *start as u64, *end as u64)
                 })
                 .collect();
@@ -158,9 +156,7 @@ impl RustIds {
                 let (start, end, key, parents) = &decl[i];
                 let mut key = key.clone();
                 key.ordinal = ordinal;
-                let ancestors: Vec<_> = std::iter::once(module_key.clone())
-                    .chain(parents.iter().map(|p| keys[p].clone()))
-                    .collect();
+                let ancestors: Vec<_> = parents.iter().map(|p| keys[p].clone()).collect();
                 let digest =
                     identity::syntax_digest(&source_set, &path, Language::Rust, &ancestors, &key)?;
                 let id = identity::syntax_id(&source_set, &path, Language::Rust, &ancestors, &key)?;
@@ -313,6 +309,14 @@ pub(crate) fn identify_document(
                 .cloned()
                 .unwrap_or_else(|| vec![ids.module.clone()])
         };
+        if witness.candidate_kind == NativeCandidateKind::Declaration
+            && witness.node_kind != "impl_item"
+            && let Ok(raw) = std::str::from_utf8(&witness.name_bytes)
+        {
+            // Exact name bytes stay unchanged for syntax IDs; this is only a
+            // language-decoded lexical lookup key.
+            witness.lookup_key = identity::lookup_key(Language::Rust, raw).ok();
+        }
         if witness.candidate_kind == NativeCandidateKind::Invocation
             && let Some(node) =
                 find_invocation(tree.root_node(), witness.start_byte, witness.end_byte)
@@ -322,6 +326,7 @@ pub(crate) fn identify_document(
             witness.token_end_byte = end;
             witness.token_bytes = document.bytes[start..end].to_vec();
             witness.name_bytes = witness.token_bytes.clone();
+            witness.lookup_key = identity::lookup_key(Language::Rust, &spelling).ok();
             witness.spelling = Some(spelling);
             witness.verified_member_token = true;
         }

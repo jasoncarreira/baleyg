@@ -337,3 +337,103 @@ fn rust_declarations_keep_ids_across_body_edits_and_exact_names() {
         2
     );
 }
+
+#[test]
+fn rust_canonical_ancestors_and_lookup_keys_are_measured() {
+    use baleyg::{
+        indexer::NativeCandidateKind,
+        model::v1::{Key, Kind, Language, Path, Text, UInt},
+        semantic_identity,
+    };
+    let d = tempfile::tempdir().unwrap();
+    let source = "fn café() {} fn cafe\u{301}() {} fn r#type() {} mod inner { fn café() {} fn café() {} } fn run() { obj.r#type(); }";
+    fs::write(d.path().join("lib.rs"), source).unwrap();
+    let snapshot = captured(d.path());
+    let doc = &snapshot.documents[0];
+    let source_set = Text::new(snapshot.source_set_id.clone()).unwrap();
+    let path = Path::new("lib.rs".to_owned()).unwrap();
+    let key = |name: &str, ordinal: u64| Key {
+        kind: Kind::Function,
+        name: Some(Text::new(name.to_owned()).unwrap()),
+        signature: None,
+        ordinal: UInt::new(ordinal).unwrap(),
+    };
+    let declarations: Vec<_> = doc
+        .native_candidates
+        .iter()
+        .filter(|w| {
+            w.candidate_kind == NativeCandidateKind::Declaration && w.node_kind == "function_item"
+        })
+        .collect();
+    let named = |name: &str| {
+        declarations
+            .iter()
+            .filter(|w| w.name_bytes == name.as_bytes())
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let nfc = named("café");
+    let nfd = named("cafe\u{301}");
+    assert_eq!(nfc.len(), 3);
+    assert_eq!(nfd.len(), 1);
+    assert_eq!(nfc[0].lookup_key.as_deref(), Some("café"));
+    assert_eq!(nfd[0].lookup_key.as_deref(), Some("café"));
+    assert_ne!(nfc[0].stable_id, nfd[0].stable_id);
+    let top =
+        semantic_identity::syntax_id(&source_set, &path, Language::Rust, &[], &key("café", 0))
+            .unwrap();
+    assert_eq!(nfc[0].stable_id.as_deref(), Some(top.as_str()));
+    let module = Key {
+        kind: Kind::Module,
+        name: None,
+        signature: None,
+        ordinal: UInt::new(0).unwrap(),
+    };
+    let synthetic = semantic_identity::syntax_id(
+        &source_set,
+        &path,
+        Language::Rust,
+        &[module.clone()],
+        &key("café", 0),
+    )
+    .unwrap();
+    assert_ne!(top, synthetic);
+    let nested_parent = Key {
+        kind: Kind::Type,
+        name: Some(Text::new("inner".to_owned()).unwrap()),
+        signature: None,
+        ordinal: UInt::new(0).unwrap(),
+    };
+    for (ordinal, declaration) in nfc[1..].iter().enumerate() {
+        let expected = semantic_identity::syntax_id(
+            &source_set,
+            &path,
+            Language::Rust,
+            &[nested_parent.clone()],
+            &key("café", ordinal as u64),
+        )
+        .unwrap();
+        assert_eq!(declaration.stable_id.as_deref(), Some(expected.as_str()));
+        assert_ne!(declaration.stable_id.as_deref(), Some(synthetic.as_str()));
+    }
+    let digest =
+        semantic_identity::syntax_digest(&source_set, &path, Language::Rust, &[], &key("café", 0))
+            .unwrap();
+    assert!(
+        std::str::from_utf8(&digest.input)
+            .unwrap()
+            .contains("\"ancestors\":[]")
+    );
+    assert_eq!(top.as_str(), format!("sid:v1:{}", &digest.sha256[..32]));
+    let raw = named("r#type");
+    assert_eq!(raw[0].lookup_key.as_deref(), Some("type"));
+    let member = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.candidate_kind == NativeCandidateKind::Invocation && w.verified_member_token)
+        .unwrap();
+    assert_eq!(member.token_bytes, b"r#type");
+    assert_eq!(member.spelling.as_deref(), Some("type"));
+    assert_eq!(member.lookup_key.as_deref(), Some("type"));
+    assert!(member.stable_id.as_deref().unwrap().starts_with("occ:v1:"));
+}

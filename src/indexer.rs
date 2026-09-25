@@ -159,6 +159,7 @@ pub struct CapturedNativeWitness {
     pub stable_id: Option<String>,
     pub ancestor_ids: Vec<String>,
     pub spelling: Option<String>,
+    pub lookup_key: Option<String>,
     pub verified_member_token: bool,
 }
 
@@ -394,6 +395,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
             stable_id: None,
             ancestor_ids: Vec::new(),
             spelling: None,
+            lookup_key: None,
             verified_member_token: false,
         });
         if extra_region {
