@@ -23,7 +23,7 @@ fn fixture() -> (tempfile::TempDir, CapturedRevision, Evidence) {
     fs::create_dir_all(root.join("rust/src")).unwrap();
     fs::write(
         root.join("java/src/A.java"),
-        "class Child extends Base { void foo() { if (true) { é(); } } }
+        "public class Child extends Base { public <T> void foo(int x) { if (true) { é(); } } public <T> void foo(int y) {} }
 ",
     )
     .unwrap();
@@ -473,8 +473,16 @@ fn native_provenance_is_bound_to_each_captured_document() {
         .map(|index| native_file(&capture, &evidence, index))
         .collect();
     assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
     let mut bad = evidence.clone();
     bad.native_files[0].provenance.content_hash = hash(b"not the document");
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Native(_))
+    ));
     assert!(matches!(
         validate_native(&capture, &bad),
         Err(EvidenceError::Native(_))
@@ -489,6 +497,12 @@ fn native_provenance_is_bound_to_each_captured_document() {
     bad.native_files.push(bad.native_files[0].clone());
     assert!(matches!(
         validate_native(&capture, &bad),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut missing = evidence.clone();
+    missing.native_files.pop();
+    assert!(matches!(
+        validate_native(&capture, &missing),
         Err(EvidenceError::Native(_))
     ));
     let mut forged_capture = capture.clone();
@@ -540,7 +554,7 @@ fn native_declaration_uses_real_ast_name_and_identity() {
         header: Header {
             kind: Kind::Type,
             name: Some(name),
-            modifiers: vec![],
+            modifiers: vec![text("public")],
             type_parameters: vec![],
             parameters: vec![],
             result_type: None,
@@ -552,6 +566,12 @@ fn native_declaration_uses_real_ast_name_and_identity() {
         .native_files
         .push(native_file(&capture, &evidence, index));
     evidence.native_files[0].declarations.push(row);
+    evidence.native_files.extend(
+        (0..capture.documents.len())
+            .filter(|i| *i != index)
+            .map(|i| native_file(&capture, &evidence, i))
+            .collect::<Vec<_>>(),
+    );
     assert_eq!(validate_native(&capture, &evidence), Ok(()));
     let mut wrong = evidence.clone();
     wrong.native_files[0].declarations[0].key.ordinal = UInt::new(1).unwrap();
@@ -563,6 +583,24 @@ fn native_declaration_uses_real_ast_name_and_identity() {
     wrong.native_files[0].declarations[0].name_range = Some(span(1, 2));
     assert!(matches!(
         validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong_capture = capture.clone();
+    let java = &mut wrong_capture.documents[index];
+    java.heritage[0].base_bytes = b"Forged".to_vec();
+    assert!(matches!(
+        validate_native(&wrong_capture, &evidence),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong_capture = capture.clone();
+    let class = wrong_capture.documents[index]
+        .native_candidates
+        .iter_mut()
+        .find(|w| w.node_kind == "class_declaration")
+        .unwrap();
+    class.header_bytes = b"Forged".to_vec();
+    assert!(matches!(
+        validate_native(&wrong_capture, &evidence),
         Err(EvidenceError::Native(_))
     ));
     let mut wrong = evidence.clone();
@@ -632,8 +670,8 @@ fn native_call_ordinal_owner_and_member_span_are_source_checked() {
             ],
             Kind::Method,
             Some(Signature {
-                parameter_types: vec![],
-                type_parameter_count: UInt::new(0).unwrap(),
+                parameter_types: vec![text("int")],
+                type_parameter_count: UInt::new(1).unwrap(),
                 variadic: false,
             }),
         ),
@@ -658,10 +696,22 @@ fn native_call_ordinal_owner_and_member_span_are_source_checked() {
             header: Header {
                 kind,
                 name: Some(name),
-                modifiers: vec![],
-                type_parameters: vec![],
-                parameters: vec![],
-                result_type: None,
+                modifiers: vec![text("public")],
+                type_parameters: if kind == Kind::Method {
+                    vec![text("T")]
+                } else {
+                    vec![]
+                },
+                parameters: if kind == Kind::Method {
+                    vec![Parameter {
+                        name: Some(text("x")),
+                        r#type: Some(text("int")),
+                        variadic: false,
+                    }]
+                } else {
+                    vec![]
+                },
+                result_type: (kind == Kind::Method).then(|| text("void")),
                 bases: if kind == Kind::Type {
                     vec![text("Base")]
                 } else {
@@ -706,12 +756,69 @@ fn native_call_ordinal_owner_and_member_span_are_source_checked() {
     file.calls[0].region_ids.push(control.id.clone());
     file.control_regions.push(control);
     evidence.native_files.push(file);
+    evidence.native_files.extend(
+        (0..capture.documents.len())
+            .filter(|i| *i != index)
+            .map(|i| native_file(&capture, &evidence, i))
+            .collect::<Vec<_>>(),
+    );
     assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    let sibling = doc
+        .native_candidates
+        .iter()
+        .filter(|w| w.node_kind == "method_declaration" && w.stable_id.is_some())
+        .nth(1)
+        .unwrap();
+    let mut with_sibling = evidence.clone();
+    let mut row = with_sibling.native_files[0].declarations[1].clone();
+    row.syntax_id = SyntaxId::new(sibling.stable_id.clone().unwrap()).unwrap();
+    row.range = span(sibling.start_byte, sibling.end_byte);
+    row.name_range = Some(span(sibling.token_start_byte, sibling.token_end_byte));
+    row.key.ordinal = UInt::new(1).unwrap();
+    row.header.parameters[0].name = Some(text("y"));
+    with_sibling.native_files[0].declarations.push(row);
+    assert_eq!(validate_native(&capture, &with_sibling), Ok(()));
+    with_sibling.native_files[0].declarations[2].key.ordinal = UInt::new(0).unwrap();
+    assert!(matches!(
+        validate_native(&capture, &with_sibling),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].control_regions[0].arm = Some(text("fabricated"));
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
     let mut wrong = evidence.clone();
     let own_id = wrong.native_files[0].control_regions[0].id.clone();
     wrong.native_files[0].control_regions[0].parent_id = Some(own_id);
     assert!(matches!(
         validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    for mutation in 0..4 {
+        let mut wrong = evidence.clone();
+        let header = &mut wrong.native_files[0].declarations[1].header;
+        match mutation {
+            0 => header.modifiers.clear(),
+            1 => header.type_parameters.clear(),
+            2 => header.parameters[0].r#type = Some(text("long")),
+            _ => header.result_type = None,
+        }
+        assert!(matches!(
+            validate_native(&capture, &wrong),
+            Err(EvidenceError::Native(_))
+        ));
+    }
+    let mut wrong_capture = capture.clone();
+    let invocation = wrong_capture.documents[index]
+        .native_candidates
+        .iter_mut()
+        .find(|w| w.node_kind == "method_invocation" && w.stable_id.is_some())
+        .unwrap();
+    invocation.ancestor_ids.pop();
+    assert!(matches!(
+        validate_native(&wrong_capture, &evidence),
         Err(EvidenceError::Native(_))
     ));
     let mut wrong = evidence.clone();
@@ -728,6 +835,24 @@ fn native_call_ordinal_owner_and_member_span_are_source_checked() {
     ));
     let mut wrong = evidence.clone();
     wrong.native_files[0].calls[0].callee_range = Some(span(0, 1));
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].declarations[1].ancestors.clear();
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.native_files[0].declarations[1]
+        .key
+        .signature
+        .as_mut()
+        .unwrap()
+        .parameter_types
+        .clear();
     assert!(matches!(
         validate_native(&capture, &wrong),
         Err(EvidenceError::Native(_))

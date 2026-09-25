@@ -368,6 +368,149 @@ fn measured<'a>(
     {
         return Err(native_error("candidate differs from captured AST or bytes"));
     }
+    let name = bytes
+        .get(witness.token_start_byte..witness.token_end_byte)
+        .ok_or_else(|| native_error("invalid candidate token"))?;
+    if witness.name_bytes != name && !witness.verified_member_token {
+        return Err(native_error("candidate name differs from source token"));
+    }
+    if witness.candidate_kind == NativeCandidateKind::Declaration {
+        let header_end = doc
+            .syntax
+            .iter()
+            .filter(|child| {
+                child.parent_id == Some(node.id)
+                    && matches!(child.field_name.as_deref(), Some("body" | "value"))
+            })
+            .map(|child| child.start_byte)
+            .min()
+            .unwrap_or(witness.token_end_byte);
+        let end = header_end
+            .saturating_sub(node.start_byte)
+            .min(node.source_bytes.len());
+        if witness.header_bytes != node.source_bytes[..end]
+            || witness.name_bytes != name
+            || !doc.syntax.iter().any(|child| {
+                child.parent_id == Some(node.id)
+                    && child.start_byte == witness.token_start_byte
+                    && child.end_byte == witness.token_end_byte
+            }) && (witness.token_start_byte != witness.start_byte
+                || witness.token_end_byte != witness.end_byte)
+        {
+            return Err(native_error(
+                "declaration witness differs from measured header or name",
+            ));
+        }
+    } else if !witness.header_bytes.is_empty() {
+        return Err(native_error("non-declaration witness has header bytes"));
+    }
+    if doc.key.language == Language::Java {
+        let expected = if matches!(
+            node.kind.as_str(),
+            "method_invocation" | "object_creation_expression" | "explicit_constructor_invocation"
+        ) {
+            NativeCandidateKind::Invocation
+        } else if matches!(
+            node.kind.as_str(),
+            "if_statement"
+                | "while_statement"
+                | "do_statement"
+                | "for_statement"
+                | "enhanced_for_statement"
+                | "switch_expression"
+                | "switch_block_statement_group"
+                | "switch_rule"
+                | "try_statement"
+                | "try_with_resources_statement"
+                | "catch_clause"
+                | "finally_clause"
+                | "synchronized_statement"
+                | "ternary_expression"
+        ) {
+            NativeCandidateKind::ControlRegion
+        } else if matches!(
+            node.kind.as_str(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+                | "method_declaration"
+                | "annotation_type_element_declaration"
+                | "constructor_declaration"
+                | "compact_constructor_declaration"
+                | "lambda_expression"
+        ) {
+            NativeCandidateKind::Declaration
+        } else {
+            NativeCandidateKind::Occurrence
+        };
+        if witness.stable_id.is_some() && witness.candidate_kind != expected {
+            return Err(native_error("Java candidate kind differs from AST kind"));
+        }
+    }
+    if witness.candidate_kind == NativeCandidateKind::Invocation {
+        let expected = match doc.key.language {
+            Language::Java if node.kind == "method_invocation" && witness.verified_member_token => {
+                doc.syntax.iter().find(|candidate| {
+                    candidate.parent_id == Some(node.id)
+                        && candidate.field_name.as_deref() == Some("name")
+                        && candidate.start_byte == witness.token_start_byte
+                        && candidate.end_byte == witness.token_end_byte
+                })
+            }
+            _ => None,
+        };
+        if doc.key.language == Language::Java && witness.verified_member_token && expected.is_none()
+        {
+            return Err(native_error(
+                "member token is not the invocation name field",
+            ));
+        }
+        if let Some(member) = expected {
+            let decoded = std::str::from_utf8(&member.source_bytes)
+                .ok()
+                .and_then(|s| crate::semantic_identity::lookup_key(doc.key.language, s).ok());
+            if witness.spelling.as_deref() != decoded.as_deref()
+                || witness.name_bytes != member.source_bytes
+            {
+                return Err(native_error("member spelling differs from AST token"));
+            }
+        }
+    } else if witness.verified_member_token || witness.spelling.is_some() {
+        return Err(native_error("non-invocation has member-token metadata"));
+    }
+    let mut owner = node.parent_id.unwrap_or(0);
+    while owner > 0 {
+        let kind = doc.syntax[owner].kind.as_str();
+        if kind.contains("declaration")
+            || kind.contains("definition")
+            || matches!(
+                kind,
+                "function_item"
+                    | "method_definition"
+                    | "class"
+                    | "function_expression"
+                    | "generator_function"
+                    | "arrow_function"
+                    | "lambda_expression"
+                    | "lambda"
+                    | "closure_expression"
+                    | "impl_item"
+                    | "trait_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "union_item"
+                    | "mod_item"
+            )
+        {
+            break;
+        }
+        owner = doc.syntax[owner].parent_id.unwrap_or(0);
+    }
+    if witness.owner_id != owner {
+        return Err(native_error("candidate owner differs from AST"));
+    }
     let whole = bytes
         .get(witness.start_byte..witness.end_byte)
         .ok_or_else(|| native_error("invalid AST range"))?;
@@ -378,6 +521,154 @@ fn measured<'a>(
     std::str::from_utf8(token).map_err(|_| native_error("non-scalar token range"))?;
     Ok((whole, token))
 }
+fn java_header(
+    doc: &CapturedDocument,
+    witness: &CapturedNativeWitness,
+) -> Result<(Key, Header), EvidenceError> {
+    let node = &doc.syntax[witness.node_id];
+    let children = |parent: usize| {
+        doc.syntax
+            .iter()
+            .filter(move |n| n.parent_id == Some(parent))
+    };
+    let field = |parent: usize, label: &str| {
+        children(parent).find(|n| n.field_name.as_deref() == Some(label))
+    };
+    let text = |node: &crate::indexer::CapturedSyntaxNode| {
+        std::str::from_utf8(&node.source_bytes)
+            .ok()
+            .and_then(|s| Text::new(s.to_owned()))
+            .ok_or_else(|| native_error("invalid Java header token"))
+    };
+    let kind = match node.kind.as_str() {
+        "class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration" => Kind::Type,
+        "method_declaration" | "annotation_type_element_declaration" => Kind::Method,
+        "constructor_declaration" | "compact_constructor_declaration" => Kind::Constructor,
+        "lambda_expression" => Kind::AnonymousFunction,
+        _ => return Err(native_error("unsupported Java declaration kind")),
+    };
+    let name = field(node.id, "name").map(&text).transpose()?;
+    let modifiers = children(node.id)
+        .find(|n| n.kind == "modifiers")
+        .map(|n| {
+            children(n.id)
+                .filter(|part| part.kind != "annotation" && part.kind != "marker_annotation")
+                .map(&text)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let type_parameters = field(node.id, "type_parameters")
+        .map(|n| {
+            children(n.id)
+                .filter(|part| part.kind == "type_parameter")
+                .map(&text)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let parameters = field(node.id, "parameters")
+        .map(|n| {
+            children(n.id)
+                .filter(|part| {
+                    matches!(
+                        part.kind.as_str(),
+                        "formal_parameter" | "spread_parameter" | "receiver_parameter"
+                    )
+                })
+                .map(|part| {
+                    Ok(Parameter {
+                        name: field(part.id, "name").map(&text).transpose()?,
+                        r#type: field(part.id, "type").map(&text).transpose()?,
+                        variadic: part.kind == "spread_parameter",
+                    })
+                })
+                .collect::<Result<Vec<_>, EvidenceError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let signature = matches!(kind, Kind::Method | Kind::Constructor).then(|| Signature {
+        parameter_types: parameters.iter().filter_map(|p| p.r#type.clone()).collect(),
+        type_parameter_count: UInt::new(type_parameters.len() as u64).unwrap(),
+        variadic: parameters.last().is_some_and(|p| p.variadic),
+    });
+    let bases = doc
+        .heritage
+        .iter()
+        .filter(|h| h.class_node_id == node.id)
+        .map(|h| {
+            std::str::from_utf8(
+                doc.bytes
+                    .get(h.base_start..h.base_end)
+                    .ok_or_else(|| native_error("invalid heritage range"))?,
+            )
+            .ok()
+            .and_then(|s| Text::new(s.to_owned()))
+            .ok_or_else(|| native_error("invalid heritage token"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let key = Key {
+        kind,
+        name: name.clone(),
+        signature,
+        ordinal: UInt::new(0).unwrap(),
+    };
+    let header = Header {
+        kind,
+        name,
+        modifiers,
+        type_parameters,
+        parameters,
+        result_type: field(node.id, "type").map(&text).transpose()?,
+        bases,
+    };
+    Ok((key, header))
+}
+
+fn measured_lineage(
+    doc: &CapturedDocument,
+    witness: &CapturedNativeWitness,
+    file: &NativeFileEvidence,
+) -> Result<Vec<String>, EvidenceError> {
+    let module = crate::semantic_identity::syntax_id(
+        &doc.key.source_set_id,
+        &doc.key.path,
+        doc.key.language,
+        &[],
+        &Key {
+            kind: Kind::Module,
+            name: None,
+            signature: None,
+            ordinal: UInt::new(0).unwrap(),
+        },
+    )
+    .map_err(|_| native_error("invalid module identity"))?;
+    let mut ids = vec![module.as_str().to_owned()];
+    let mut parents = Vec::new();
+    let mut parent = doc.syntax[witness.node_id].parent_id;
+    while let Some(node_id) = parent {
+        if let Some(candidate) = doc.native_candidates.iter().find(|candidate| {
+            candidate.node_id == node_id
+                && candidate.candidate_kind == NativeCandidateKind::Declaration
+                && candidate.stable_id.is_some()
+        }) {
+            let row = file
+                .declarations
+                .iter()
+                .find(|row| candidate.stable_id.as_deref() == Some(row.syntax_id.as_str()))
+                .ok_or_else(|| native_error("actual enclosing declaration is absent"))?;
+            parents.push(row.syntax_id.as_str().to_owned());
+        }
+        parent = doc.syntax[node_id].parent_id;
+    }
+    ids.extend(parents.into_iter().rev());
+    Ok(ids)
+}
+
 fn same_range(range: &Range, start: usize, end: usize) -> bool {
     range.start.get() == start as u64 && range.end.get() == end as u64
 }
@@ -448,6 +739,11 @@ pub fn validate_native(
                 return Err(native_error("declaration not uniquely captured"));
             }
             let witness = matches[0];
+            if witness.ancestor_ids != measured_lineage(doc, witness, file)? {
+                return Err(native_error(
+                    "declaration ancestor IDs differ from AST chain",
+                ));
+            }
             let named = witness.token_start_byte != witness.start_byte
                 || witness.token_end_byte != witness.end_byte;
             if !seen_ids.insert(row.syntax_id.as_str().to_owned())
@@ -491,14 +787,120 @@ pub fn validate_native(
                     "declaration ID, token, header or lookup mismatch",
                 ));
             }
+            if doc.key.language == Language::Java {
+                let (measured_key, measured_header) = java_header(doc, witness)?;
+                let node = &doc.syntax[witness.node_id];
+                let parent_declaration = |candidate: &CapturedNativeWitness| {
+                    let mut parent = doc.syntax[candidate.node_id].parent_id;
+                    while let Some(id) = parent {
+                        if let Some(found) = witnesses.iter().find(|w| {
+                            w.candidate_kind == NativeCandidateKind::Declaration
+                                && w.node_id == id
+                                && w.stable_id.is_some()
+                        }) {
+                            return Some(found.node_id);
+                        }
+                        parent = doc.syntax[id].parent_id;
+                    }
+                    None
+                };
+                let mut ancestor_nodes = Vec::new();
+                let mut parent = parent_declaration(witness);
+                while let Some(id) = parent {
+                    ancestor_nodes.push(id);
+                    let enclosing = witnesses
+                        .iter()
+                        .find(|w| {
+                            w.node_id == id && w.candidate_kind == NativeCandidateKind::Declaration
+                        })
+                        .ok_or_else(|| native_error("missing ancestor witness"))?;
+                    parent = parent_declaration(enclosing);
+                }
+                ancestor_nodes.reverse();
+                let module = Key {
+                    kind: Kind::Module,
+                    name: None,
+                    signature: None,
+                    ordinal: UInt::new(0).unwrap(),
+                };
+                let mut measured_ancestors = vec![module];
+                for id in ancestor_nodes {
+                    let ancestor = file
+                        .declarations
+                        .iter()
+                        .find(|d| {
+                            witnesses.iter().any(|w| {
+                                w.node_id == id
+                                    && w.stable_id.as_deref() == Some(d.syntax_id.as_str())
+                            })
+                        })
+                        .ok_or_else(|| native_error("missing actual ancestor declaration"))?;
+                    measured_ancestors.push(ancestor.key.clone());
+                }
+                let siblings = witnesses
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.candidate_kind == NativeCandidateKind::Declaration
+                            && candidate.stable_id.is_some()
+                            && parent_declaration(candidate) == parent_declaration(witness)
+                    })
+                    .filter_map(|candidate| {
+                        let (key, _) = java_header(doc, candidate).ok()?;
+                        (key.kind == measured_key.kind
+                            && key.name == measured_key.name
+                            && key.signature == measured_key.signature)
+                            .then_some(candidate)
+                    })
+                    .collect::<Vec<_>>();
+                let earlier = siblings
+                    .iter()
+                    .filter(|candidate| {
+                        (candidate.start_byte, candidate.end_byte)
+                            < (witness.start_byte, witness.end_byte)
+                    })
+                    .count();
+                if row.ancestors != measured_ancestors
+                    || row.key.ordinal.get() != earlier as u64
+                    || node.kind != witness.node_kind
+                    || row.key.kind != measured_key.kind
+                    || row.key.name != measured_key.name
+                    || row.key.signature != measured_key.signature
+                    || row.header != measured_header
+                {
+                    return Err(native_error("Java key or complete header differs from AST"));
+                }
+            }
             if row.kind == Kind::Type {
                 let measured_bases: Vec<_> = doc
                     .heritage
                     .iter()
                     .filter(|h| h.class_node_id == witness.node_id)
-                    .map(|h| std::str::from_utf8(&h.base_bytes))
-                    .collect::<Result<_, _>>()
-                    .map_err(|_| native_error("invalid heritage bytes"))?;
+                    .map(|h| {
+                        let base = doc
+                            .bytes
+                            .get(h.base_start..h.base_end)
+                            .ok_or_else(|| native_error("heritage range outside source"))?;
+                        let class = doc
+                            .syntax
+                            .get(h.class_node_id)
+                            .ok_or_else(|| native_error("heritage class missing"))?;
+                        if class.id != witness.node_id
+                            || h.owner_id != class.id && h.owner_id != class.parent_id.unwrap_or(0)
+                            || doc.bytes.get(h.subclass_name_start..h.subclass_name_end)
+                                != Some(witness.name_bytes.as_slice())
+                            || base != h.base_bytes
+                            || !doc.syntax.iter().any(|n| {
+                                n.start_byte == h.base_start
+                                    && n.end_byte == h.base_end
+                                    && n.source_bytes == base
+                            })
+                        {
+                            return Err(native_error("heritage witness differs from source"));
+                        }
+                        std::str::from_utf8(base)
+                            .map_err(|_| native_error("invalid heritage bytes"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 if row
                     .header
                     .bases
@@ -540,6 +942,9 @@ pub fn validate_native(
                 return Err(native_error("call not uniquely captured"));
             }
             let w = matches[0];
+            if w.ancestor_ids != measured_lineage(doc, w, file)? {
+                return Err(native_error("call owner chain differs from AST"));
+            }
             if !seen_ids.insert(call.id.as_str().to_owned())
                 || call.document != doc.key
                 || call.revision_id != revision.id
@@ -579,6 +984,9 @@ pub fn validate_native(
                 return Err(native_error("region not uniquely captured"));
             }
             let w = matches[0];
+            if w.ancestor_ids != measured_lineage(doc, w, file)? {
+                return Err(native_error("region owner chain differs from AST"));
+            }
             if !seen_ids.insert(region.id.as_str().to_owned())
                 || region.document != doc.key
                 || region.revision_id != revision.id
@@ -591,6 +999,29 @@ pub fn validate_native(
                     && !module_owner(doc, &region.owner_syntax_id)
             {
                 return Err(native_error("region owner, kind or range mismatch"));
+            }
+            let node = &doc.syntax[w.node_id];
+            let actual_arm = node.field_name.as_deref().and_then(|field| {
+                matches!(field, "consequence" | "alternative" | "right" | "value").then_some(field)
+            });
+            if region.arm.as_ref().map(Text::as_str) != actual_arm {
+                return Err(native_error("region arm differs from AST field"));
+            }
+            let mut ancestor_node = node.parent_id;
+            let mut measured_parent = None;
+            while let Some(id) = ancestor_node {
+                if let Some(parent_witness) = witnesses.iter().find(|candidate| {
+                    candidate.node_id == id
+                        && candidate.candidate_kind == NativeCandidateKind::ControlRegion
+                        && candidate.ancestor_ids.last() == w.ancestor_ids.last()
+                }) {
+                    measured_parent = parent_witness.stable_id.as_deref();
+                    break;
+                }
+                ancestor_node = doc.syntax[id].parent_id;
+            }
+            if region.parent_id.as_ref().map(OccurrenceId::as_str) != measured_parent {
+                return Err(native_error("region parent differs from AST ancestry"));
             }
             if let Some(parent) = &region.parent_id {
                 let ancestor = file
@@ -663,6 +1094,22 @@ pub fn validate_native(
             }
         }
     }
+    for document in &capture.documents {
+        let selected = evidence.coverage.iter().any(|coverage| {
+            coverage.producer_id == producer.id
+                && coverage.language == document.key.language
+                && coverage.document_path == document.key.path
+                && coverage.state == CoverageState::Complete
+        });
+        if selected
+            && !seen_files.contains(&(
+                language_order(document.key.language),
+                document.key.path.as_str(),
+            ))
+        {
+            return Err(native_error("selected complete native document is missing"));
+        }
+    }
     Ok(())
 }
 fn module_owner(doc: &CapturedDocument, id: &SyntaxId) -> bool {
@@ -690,6 +1137,11 @@ pub fn validate_evidence(
     if capture != requested_snapshot {
         return Err(EvidenceError::Revision(
             "snapshot comparison awaits basis validation",
+        ));
+    }
+    if evidence.native_files.is_empty() {
+        return Err(EvidenceError::NotYetValidated(
+            "native syntax and later phases not supplied",
         ));
     }
     validate_native(capture, evidence)?;
