@@ -1163,6 +1163,7 @@ pub fn valid_record_id(id: &str) -> bool {
 #[derive(Debug)]
 enum RecordIssue {
     RecoverySidecar,
+    UnsafeDirectory,
     Incompatible(&'static str),
     Incomplete(&'static str),
 }
@@ -1170,6 +1171,7 @@ impl std::fmt::Display for RecordIssue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RecoverySidecar => f.write_str("recovery sidecar present"),
+            Self::UnsafeDirectory => f.write_str("unsafe record directory"),
             Self::Incompatible(detail) => write!(f, "incompatible_record: {detail}"),
             Self::Incomplete(detail) => write!(f, "incomplete_record: {detail}"),
         }
@@ -1292,7 +1294,18 @@ fn validate_record_schema(db: &rusqlite::Connection) -> Result<()> {
 
 fn inspect_record(dir: &Path, id: &str) -> Result<(RecordReport, Vec<String>)> {
     private_dir(dir)?;
-    let db = readonly_db(&dir.join("workspace.db"))?;
+    let db = readonly_db(&dir.join("workspace.db")).map_err(|error| {
+        // This stage runs only after private_dir(dir) succeeds. A missing DB is
+        // incomplete; an unsafe directory must never trigger a child path probe.
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        {
+            anyhow::Error::new(RecordIssue::Incomplete("missing database"))
+        } else {
+            error
+        }
+    })?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != 1 {
         return Err(RecordIssue::Incompatible("schema version").into());
@@ -1457,7 +1470,11 @@ impl TopologyRoots {
                     }
                     Err(_) => GcRecordReport::unavailable(name, "unknown", "unsafe_use_lock"),
                     Ok(guard) => {
-                        let result = inspect_record(&entry.path(), &name);
+                        let result = if private_dir(&entry.path()).is_ok() {
+                            inspect_record(&entry.path(), &name)
+                        } else {
+                            Err(RecordIssue::UnsafeDirectory.into())
+                        };
                         if guard.verify().is_err() {
                             GcRecordReport::unavailable(name, "unknown", "unsafe_use_lock")
                         } else {
@@ -1466,17 +1483,11 @@ impl TopologyRoots {
                                 Err(e) => {
                                     let reason = match e.downcast_ref::<RecordIssue>() {
                                         Some(RecordIssue::RecoverySidecar) => "recovery_sidecar",
+                                        Some(RecordIssue::UnsafeDirectory) => {
+                                            "unsafe_record_directory"
+                                        }
                                         Some(RecordIssue::Incompatible(_)) => "incompatible_record",
                                         Some(RecordIssue::Incomplete(_)) => "incomplete_record",
-                                        None if fs::symlink_metadata(
-                                            entry.path().join("workspace.db"),
-                                        )
-                                        .is_err_and(|error| {
-                                            error.kind() == std::io::ErrorKind::NotFound
-                                        }) =>
-                                        {
-                                            "incomplete_record"
-                                        }
                                         None => "metadata_unreadable",
                                     };
                                     GcRecordReport::unavailable(name, "unknown", reason)

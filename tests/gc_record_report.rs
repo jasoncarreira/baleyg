@@ -256,3 +256,78 @@ fn hostile_path_text_and_non_utf8_entries_cannot_spoof_status_or_abort_inventory
         "forget inventory must remain strict"
     );
 }
+
+#[test]
+fn symlink_record_directory_never_probes_outside_with_or_without_database() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let (temp, roots) = common::fixture();
+    let work = temp.path().join("valid-work");
+    let linked_work = temp.path().join("linked-work");
+    fs::create_dir(&work).unwrap();
+    fs::create_dir(&linked_work).unwrap();
+    let valid = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let linked = WorkspaceIdentity::discover(Some(&linked_work), &linked_work).unwrap();
+    annotation(&roots, &valid);
+    let outside = temp.path().join("outside-private");
+    common::private(&outside);
+    symlink(&outside, roots.record_dir(&linked)).unwrap();
+    drop(UseGuard::acquire(&roots.record_use_lock(&linked), false, false).unwrap());
+    let assert_report = || {
+        let before = snapshot(&roots.data);
+        let report = roots.gc_report_at(1_800_000_000).unwrap();
+        assert_eq!(before, snapshot(&roots.data));
+        assert_eq!(report.records.len(), 2);
+        let unsafe_row = report
+            .records
+            .iter()
+            .find(|r| r.id == linked.record_id)
+            .unwrap();
+        assert_eq!(
+            (unsafe_row.status, unsafe_row.reason),
+            ("unknown", "unsafe_record_directory")
+        );
+        assert!(unsafe_row.views.is_none());
+        assert_eq!(
+            report
+                .records
+                .iter()
+                .find(|r| r.id == valid.record_id)
+                .unwrap()
+                .status,
+            "valid"
+        );
+        assert!(roots.record_by_id(&linked.record_id).is_err());
+    };
+    assert_report();
+    assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+    // An unreadable outside DB would expose any attempt to open the symlink target.
+    let outside_db = outside.join("workspace.db");
+    fs::write(&outside_db, b"do not read outside managed tree").unwrap();
+    fs::set_permissions(&outside_db, fs::Permissions::from_mode(0o000)).unwrap();
+    let before = fs::metadata(&outside_db).unwrap();
+    assert_report();
+    let after = fs::metadata(&outside_db).unwrap();
+    assert_eq!(
+        (
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+            before.atime(),
+            before.atime_nsec()
+        ),
+        (
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.atime(),
+            after.atime_nsec()
+        )
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    fs::set_permissions(&outside_db, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        fs::read(&outside_db).unwrap(),
+        b"do not read outside managed tree"
+    );
+}
