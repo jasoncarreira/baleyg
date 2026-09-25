@@ -132,12 +132,23 @@ impl TopologyRoots {
     pub fn record_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.record_dir(identity).join("workspace.db")
     }
+    fn reject_root_overlap(&self, identity: &WorkspaceIdentity) -> Result<()> {
+        let cache = resolve_existing_ancestor(&self.cache)?;
+        let data = resolve_existing_ancestor(&self.data)?;
+        ensure!(
+            !overlaps(&identity.root, &cache) && !overlaps(&identity.root, &data),
+            "workspace root overlaps fixed topology"
+        );
+        Ok(())
+    }
     pub fn prepare_index(&self, identity: &WorkspaceIdentity) -> Result<()> {
+        self.reject_root_overlap(identity)?;
         managed_tree(&self.cache)?;
         make_private(&self.cache.join("indexes"))?;
         make_private(&self.index_dir(identity))
     }
-    pub fn prepare_records(&self) -> Result<()> {
+    pub fn prepare_records(&self, identity: &WorkspaceIdentity) -> Result<()> {
+        self.reject_root_overlap(identity)?;
         managed_tree(&self.data)?;
         make_private(&self.data.join("workspaces"))
     }
@@ -146,11 +157,11 @@ impl TopologyRoots {
         UseGuard::acquire(&self.index_use_lock(identity), false, false)
     }
     pub fn record_use(&self, identity: &WorkspaceIdentity, exclusive: bool) -> Result<UseGuard> {
-        self.prepare_records()?;
+        self.prepare_records(identity)?;
         UseGuard::acquire(&self.record_use_lock(identity), exclusive, exclusive)
     }
     pub fn leader(&self, identity: &WorkspaceIdentity) -> Result<LeaderGuard> {
-        self.leader_with_hooks(identity, || Ok(()), || Ok(()))
+        self.leader_with_lock_hook(identity, || Ok(()), || Ok(()), || Ok(()))
     }
     /// Fixture hook: pause after locking or fail just before syncing; never used by production callers.
     pub fn leader_with_hooks(
@@ -159,10 +170,41 @@ impl TopologyRoots {
         before_write: impl FnOnce() -> Result<()>,
         before_sync: impl FnOnce() -> Result<()>,
     ) -> Result<LeaderGuard> {
+        self.leader_with_lock_hook(identity, || Ok(()), before_write, before_sync)
+    }
+    /// Fixture barrier after opening the leader inode, before taking its lock.
+    pub fn leader_with_lock_hook(
+        &self,
+        identity: &WorkspaceIdentity,
+        after_open: impl FnOnce() -> Result<()>,
+        before_write: impl FnOnce() -> Result<()>,
+        before_sync: impl FnOnce() -> Result<()>,
+    ) -> Result<LeaderGuard> {
         let use_guard = self.index_use(identity)?;
         let path = self.leader_lock(identity);
-        let mut file = open_file(&path, true)?;
-        lock_verified(&file, &path, libc::LOCK_EX | libc::LOCK_NB)?;
+        let mut hook = Some(after_open);
+        let mut file = None;
+        for _ in 0..20 {
+            let candidate = open_file(&path, true)?;
+            if let Some(after_open) = hook.take() {
+                after_open()?;
+            }
+            let status =
+                unsafe { libc::flock(candidate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if status != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    bail!("storage_busy: {}", path.display());
+                }
+                return Err(e.into());
+            }
+            if private_file(&path, &candidate).is_ok() {
+                file = Some(candidate);
+                break;
+            }
+            // Drop the old descriptor and lock before opening the replacement pathname.
+        }
+        let mut file = file.context("leader lock pathname changed repeatedly")?;
         before_write()?;
         let incarnation = Uuid::new_v4();
         use std::io::{Seek, SeekFrom};
@@ -257,6 +299,14 @@ pub struct WorkspaceIdentity {
 }
 impl WorkspaceIdentity {
     pub fn discover(explicit: Option<&Path>, cwd: &Path) -> Result<Self> {
+        Self::discover_with_marker_sync_hook(explicit, cwd, || Ok(()))
+    }
+    /// Fixture hook to inject a failure immediately before marker descriptor fsync.
+    pub fn discover_with_marker_sync_hook(
+        explicit: Option<&Path>,
+        cwd: &Path,
+        before_sync: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         let selected = if let Some(p) = explicit {
             p.to_owned()
         } else {
@@ -310,7 +360,10 @@ impl WorkspaceIdentity {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        let marker = git_dir.as_ref().map(|p| marker_at(p)).transpose()?;
+        let marker = git_dir
+            .as_ref()
+            .map(|p| marker_at(p, before_sync))
+            .transpose()?;
         let record_id = marker.map_or_else(|| format!("path-{root_key}"), |id| id.to_string());
         Ok(Self {
             root,
@@ -428,7 +481,7 @@ fn parse_git_pointer(path: &Path) -> Result<PathBuf> {
     ensure!(m.is_dir() && m.uid() == owner(), "unsafe Git directory");
     Ok(normalized)
 }
-fn read_marker(path: &Path) -> Result<Uuid> {
+fn read_marker_file(path: &Path) -> Result<(Uuid, File)> {
     let f = open_file(path, false)?;
     let mut data = Vec::new();
     (&f).take(37).read_to_end(&mut data)?;
@@ -439,15 +492,17 @@ fn read_marker(path: &Path) -> Result<Uuid> {
         !id.is_nil() && id.get_version_num() == 4 && id.to_string() == text,
         "invalid workspace-id marker"
     );
-    Ok(id)
+    Ok((id, f))
 }
-fn read_marker_during_creation(path: &Path) -> Result<Uuid> {
+fn read_marker(path: &Path) -> Result<Uuid> {
+    Ok(read_marker_file(path)?.0)
+}
+fn read_marker_during_creation(path: &Path) -> Result<(Uuid, File)> {
     for attempt in 0..20 {
-        let result = read_marker(path);
+        let result = read_marker_file(path);
         if result.is_ok() || attempt == 19 {
             return result;
         }
-        // Only a short, otherwise-safe marker can be an in-progress exclusive creation.
         match fs::symlink_metadata(path) {
             Ok(m)
                 if m.is_file()
@@ -464,7 +519,20 @@ fn read_marker_during_creation(path: &Path) -> Result<Uuid> {
     }
     unreachable!()
 }
-fn marker_at(git: &Path) -> Result<Uuid> {
+fn durable_marker(
+    path: &Path,
+    baleyg: &Path,
+    git: &Path,
+    file: &File,
+    before_sync: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    private_file(path, file).context("workspace_id_not_durable")?;
+    before_sync().context("workspace_id_not_durable")?;
+    file.sync_all().context("workspace_id_not_durable")?;
+    sync_directory(baleyg).context("workspace_id_not_durable")?;
+    sync_directory(git).context("workspace_id_not_durable")
+}
+fn marker_at(git: &Path, before_sync: impl FnOnce() -> Result<()>) -> Result<Uuid> {
     ensure!(
         metadata(git)?.uid() == owner() && metadata(git)?.is_dir(),
         "unsafe Git directory"
@@ -473,9 +541,8 @@ fn marker_at(git: &Path) -> Result<Uuid> {
     make_private(&baleyg)?;
     let path = baleyg.join("workspace-id");
     match read_marker_during_creation(&path) {
-        Ok(id) => {
-            sync_directory(&baleyg)?;
-            sync_directory(git)?;
+        Ok((id, file)) => {
+            durable_marker(&path, &baleyg, git, &file, before_sync)?;
             Ok(id)
         }
         Err(e)
@@ -493,17 +560,14 @@ fn marker_at(git: &Path) -> Result<Uuid> {
                 Ok(mut f) => {
                     private_file(&path, &f)?;
                     f.write_all(id.to_string().as_bytes())?;
-                    f.sync_all().context("workspace_id_not_durable")?;
-                    sync_directory(&baleyg).context("workspace_id_not_durable")?;
-                    sync_directory(git).context("workspace_id_not_durable")?;
+                    durable_marker(&path, &baleyg, git, &f, before_sync)?;
                     Ok(id)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     for _ in 0..20 {
                         match read_marker_during_creation(&path) {
-                            Ok(id) => {
-                                sync_directory(&baleyg).context("workspace_id_not_durable")?;
-                                sync_directory(git).context("workspace_id_not_durable")?;
+                            Ok((id, file)) => {
+                                durable_marker(&path, &baleyg, git, &file, before_sync)?;
                                 return Ok(id);
                             }
                             Err(_) => std::thread::sleep(Duration::from_millis(5)),
@@ -517,31 +581,34 @@ fn marker_at(git: &Path) -> Result<Uuid> {
         Err(e) => Err(e),
     }
 }
-fn lock_verified(file: &File, path: &Path, flags: i32) -> Result<()> {
-    let status = unsafe { libc::flock(file.as_raw_fd(), flags) };
-    if status != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            bail!("storage_busy: {}", path.display());
-        }
-        return Err(e.into());
-    }
-    private_file(path, file).context("lock identity changed after acquisition")
-}
 #[derive(Debug)]
 pub struct UseGuard {
     file: File,
     path: PathBuf,
+    exclusive: bool,
 }
 impl UseGuard {
     pub fn acquire(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Self> {
+        Self::acquire_with_hook(path, exclusive, nonblocking, || Ok(()))
+    }
+    /// Fixture barrier after the first inode is opened, before flock.
+    pub fn acquire_with_hook(
+        path: &Path,
+        exclusive: bool,
+        nonblocking: bool,
+        after_open: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         let flags = (if exclusive {
             libc::LOCK_EX
         } else {
             libc::LOCK_SH
         }) | (if nonblocking { libc::LOCK_NB } else { 0 });
+        let mut hook = Some(after_open);
         for _ in 0..20 {
             let file = open_file(path, true)?;
+            if let Some(after_open) = hook.take() {
+                after_open()?;
+            }
             let status = unsafe { libc::flock(file.as_raw_fd(), flags) };
             if status != 0 {
                 let e = std::io::Error::last_os_error();
@@ -558,6 +625,7 @@ impl UseGuard {
                     return Ok(Self {
                         file,
                         path: path.to_owned(),
+                        exclusive,
                     });
                 }
             } else if !named
@@ -574,6 +642,7 @@ impl UseGuard {
         private_file(&self.path, &self.file)
     }
     pub fn remove_last(self) -> Result<()> {
+        ensure!(self.exclusive, "exclusive use lock required for removal");
         self.verify()?;
         fs::remove_file(&self.path)?;
         sync_directory(self.path.parent().context("lock parent missing")?)

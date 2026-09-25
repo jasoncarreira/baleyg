@@ -327,3 +327,253 @@ fn external_write_destinations() {
             .is_err()
     );
 }
+
+#[test]
+fn marker_sync_faults_refuse_creator_and_adopter() {
+    let (temp, _) = common::fixture();
+    let work = root(temp.path());
+    common::private(&work.join(".git"));
+    let fail = || anyhow::bail!("injected marker descriptor sync failure");
+    let error =
+        WorkspaceIdentity::discover_with_marker_sync_hook(Some(&work), &work, fail).unwrap_err();
+    assert!(error.to_string().contains("workspace_id_not_durable"));
+    let marker = work.join(".git/baleyg/workspace-id");
+    assert_eq!(fs::read(&marker).unwrap().len(), 36);
+    let error =
+        WorkspaceIdentity::discover_with_marker_sync_hook(Some(&work), &work, fail).unwrap_err();
+    assert!(error.to_string().contains("workspace_id_not_durable"));
+    WorkspaceIdentity::discover(Some(&work), &work)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn roots_overlapping_fixed_locations_are_refused_before_creation() {
+    let (temp, roots) = common::fixture();
+    fs::create_dir(&roots.cache).unwrap();
+    fs::create_dir(&roots.data).unwrap();
+    let alias = temp.path().join("cache-alias");
+    std::os::unix::fs::symlink(&roots.cache, &alias).unwrap();
+    let nested = roots.cache.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let alias_nested = alias.join("nested");
+    for candidate in [&roots.cache, &roots.data, temp.path(), &alias_nested] {
+        let identity = WorkspaceIdentity::discover(Some(candidate), candidate).unwrap();
+        assert!(
+            roots
+                .prepare_index(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+        assert!(
+            roots
+                .prepare_records(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+        assert!(!roots.cache.join("indexes").exists());
+        assert!(!roots.data.join("workspaces").exists());
+    }
+    let id = WorkspaceIdentity::discover(Some(&nested), &nested).unwrap();
+    assert!(roots.prepare_index(&id).is_err());
+    assert!(!roots.cache.join("indexes").exists());
+}
+
+#[test]
+fn shared_use_cannot_remove_last_and_live_holder_blocks_exclusive() {
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let shared = roots.index_use(&identity).unwrap();
+    let path = roots.index_use_lock(&identity);
+    assert!(
+        UseGuard::acquire(&path, false, false)
+            .unwrap()
+            .remove_last()
+            .unwrap_err()
+            .to_string()
+            .contains("exclusive")
+    );
+    assert!(
+        UseGuard::acquire(&path, true, true)
+            .unwrap_err()
+            .to_string()
+            .contains("storage_busy")
+    );
+    assert!(path.exists());
+    shared.verify().unwrap();
+    drop(shared);
+    UseGuard::acquire(&path, true, true)
+        .unwrap()
+        .remove_last()
+        .unwrap();
+}
+
+#[test]
+fn stale_inode_waiters_reopen_before_success() {
+    use std::io::{BufRead, BufReader};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    roots.prepare_index(&identity).unwrap();
+    let path = roots.index_use_lock(&identity);
+    let original = UseGuard::acquire(&path, true, true).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("stale_use_child")
+        .arg("--nocapture")
+        .env("TOPOLOGY_STALE_USE", &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line.contains("OLD_OPEN") {
+            break;
+        }
+    }
+    original.remove_last().unwrap();
+    let replacement = UseGuard::acquire(&path, true, true).unwrap();
+    child.stdin.take().unwrap().write_all(&[1]).unwrap();
+    // The child first locks the unlinked inode, then must wait for the new one.
+    assert!(child.try_wait().unwrap().is_none());
+    drop(replacement);
+    assert!(child.wait().unwrap().success());
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert!(rest.contains("NEW_INODE_VERIFIED"), "{rest}");
+
+    // The leader opens its old inode while paused. Replace it before flock.
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("stale_leader_child")
+        .arg("--nocapture")
+        .env("TOPOLOGY_STALE_LEADER", temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        line.clear();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line.contains("LEADER_OLD_OPEN") {
+            break;
+        }
+    }
+    let leader_path = roots.leader_lock(&identity);
+    fs::remove_file(&leader_path).unwrap();
+    fs::write(&leader_path, "").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&leader_path, fs::Permissions::from_mode(0o600)).unwrap();
+    child.stdin.take().unwrap().write_all(&[1]).unwrap();
+    assert!(child.wait().unwrap().success());
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert!(rest.contains("LEADER_NEW_VERIFIED"), "{rest}");
+}
+
+#[test]
+fn stale_use_child() {
+    if let Some(path) = std::env::var_os("TOPOLOGY_STALE_USE") {
+        let path = Path::new(&path);
+        let guard = UseGuard::acquire_with_hook(path, false, false, || {
+            println!("OLD_OPEN");
+            std::io::stdout().flush()?;
+            let mut byte = [0];
+            std::io::stdin().read_exact(&mut byte)?;
+            Ok(())
+        })
+        .unwrap();
+        guard.verify().unwrap();
+        println!("NEW_INODE_VERIFIED");
+    }
+}
+#[test]
+fn stale_leader_child() {
+    if let Some(path) = std::env::var_os("TOPOLOGY_STALE_LEADER") {
+        let base = Path::new(&path);
+        let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+            base.join("cache"),
+            base.join("data"),
+        );
+        let work = base.join("work");
+        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        let guard = roots
+            .leader_with_lock_hook(
+                &identity,
+                || {
+                    println!("LEADER_OLD_OPEN");
+                    std::io::stdout().flush()?;
+                    let mut byte = [0];
+                    std::io::stdin().read_exact(&mut byte)?;
+                    Ok(())
+                },
+                || Ok(()),
+                || Ok(()),
+            )
+            .unwrap();
+        guard.verify().unwrap();
+        println!("LEADER_NEW_VERIFIED");
+    }
+}
+
+#[test]
+fn exclusive_deletion_waits_for_shared_process() {
+    use std::io::{BufRead, BufReader};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    roots.prepare_index(&id).unwrap();
+    let path = roots.index_use_lock(&id);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("shared_holder_child")
+        .arg("--nocapture")
+        .env("TOPOLOGY_SHARED_HOLDER", &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line.contains("SHARED_HELD") {
+            break;
+        }
+    }
+    assert!(
+        UseGuard::acquire(&path, true, true)
+            .unwrap_err()
+            .to_string()
+            .contains("storage_busy")
+    );
+    assert!(path.exists());
+    child.stdin.take().unwrap().write_all(&[1]).unwrap();
+    assert!(child.wait().unwrap().success());
+    UseGuard::acquire(&path, true, true)
+        .unwrap()
+        .remove_last()
+        .unwrap();
+    assert!(!path.exists());
+}
+#[test]
+fn shared_holder_child() {
+    if let Some(path) = std::env::var_os("TOPOLOGY_SHARED_HOLDER") {
+        let guard = UseGuard::acquire(Path::new(&path), false, false).unwrap();
+        println!("SHARED_HELD");
+        std::io::stdout().flush().unwrap();
+        let mut byte = [0];
+        std::io::stdin().read_exact(&mut byte).unwrap();
+        guard.verify().unwrap();
+    }
+}
