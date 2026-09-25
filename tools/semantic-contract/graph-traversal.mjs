@@ -1,3 +1,5 @@
+import {graphProjection} from './graph-projection.mjs';
+
 // Structural graph decisions only. Evidence selection and warning completeness are separate checks.
 const order=(a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b));
 const documentKey=d=>JSON.stringify([d.sourceSetId,d.language,d.path]);
@@ -26,7 +28,8 @@ export function traverseGraph({request,records,selectedCoverageIncomplete=false}
  if(!root)return failure('rootMissing','rootSyntaxId','Root is absent from the pinned revision');
  if(effective.semanticProducerId!==null&&!records.producers.some(p=>p.id===effective.semanticProducerId&&p.kind==='semantic'))
   return failure('producerUnavailable','semanticProducerId','Semantic producer is unavailable');
- const proof=new Map(records.provenance.map(row=>[row.id,row]));
+ const projection=graphProjection(records,effective);
+ const proof=new Map(records.provenance.map(row=>[row.id,projection.proof(row)]));
  const coverage=new Map(records.coverage.map(row=>[JSON.stringify([row.producerId,row.sourceSetId,row.language,row.documentPath,row.revisionId]),row]));
  const rowFor=(producerId,document)=>coverage.get(JSON.stringify([producerId,document.sourceSetId,document.language,document.path,effective.revisionId]));
  const calls=new Map();
@@ -66,7 +69,7 @@ export function traverseGraph({request,records,selectedCoverageIncomplete=false}
    const selected=members.find(binding=>documentKey(binding.join.anchor.document)===documentKey(call.document)&&
     binding.join.anchor.contentHash===proof.get(binding.provenanceId)?.contentHash)??null;
    const covered=effective.semanticProducerId!==null&&rowFor(effective.semanticProducerId,call.document);
-   const binding=covered?.selected&&['complete','partial'].includes(covered.state)?selected:null;
+   const binding=covered?.selected&&['complete','partial'].includes(covered.state)&&selected?projection.binding(selected):null;
    const p=binding&&proof.get(binding.provenanceId);
    let reason='none';
    if(!binding)reason='missingEvidence';

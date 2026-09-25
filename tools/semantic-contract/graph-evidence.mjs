@@ -1,4 +1,5 @@
 import {canonicalBytes} from './json.mjs';
+import {graphProjection} from './graph-projection.mjs';
 
 const key = value => JSON.stringify(value);
 const docKey = document => key([document.sourceSetId,document.language,document.path]);
@@ -25,6 +26,7 @@ export function selectGraphEvidence(loaded,records,checked,result) {
  const nativeId=loaded.native.producerId;
  const coverageByTuple=new Map(records.coverage.map(row=>[tupleKey(row.producerId,documentFor(row),row.revisionId),row]));
  const proofById=new Map(records.provenance.map(row=>[row.id,row]));
+ const projection=graphProjection(records,result.request);
  const coverage=new Map(),provenance=new Map(),documents=new Map(),returned=new Map();
  const addDocument=document=>documents.set(docKey(document),document);
  for(const node of result.nodes){const declaration=node.declaration;addDocument(declaration.document);
@@ -41,7 +43,7 @@ export function selectGraphEvidence(loaded,records,checked,result) {
   if(!proof||proof.producerId!==producer||docKey(proof.document)!==docKey(document)||proof.revisionId!==revision)
    fail('GRAPH.PROVENANCE','provenance',`unmatched proof ${id}`);
   checked.checkUse({producerId:producer,document,revisionId:revision,provenanceIds:[id]});
-  provenance.set(id,proof);
+  provenance.set(id,projection.proof(proof));
  }
  for(const document of documents.values()){
   addCoverage(nativeId,document,revisionId);
@@ -97,7 +99,7 @@ export function selectGraphEvidence(loaded,records,checked,result) {
       const capturedDocument=chronology.find(snapshot=>snapshot.id===selectedRevision)?.documents.find(row=>docKey(row.key)===documentKey);
       const requestedDocument=chronology[position].documents.find(row=>docKey(row.key)===documentKey);
       const expectedFreshness=requestedDocument?.contentHash===capturedDocument?.contentHash?'possiblyStale':'stale';
-      if(!capturedDocument||proof.contentHash!==capturedDocument.contentHash||proof.freshness!==expectedFreshness)
+      if(!capturedDocument||proof.contentHash!==capturedDocument.contentHash||projection.proof(proof).freshness!==expectedFreshness)
        fail('GRAPH.HISTORY','provenance','historical proof bytes or requested freshness differ');
      }
      addProof(proofId,producerId,document,selectedRevision);

@@ -11,6 +11,7 @@ import {checkJoins} from '../record-check/joins.mjs';
 import {checkBindings} from '../record-check/bindings.mjs';
 import {deriveWarnings,checkWarnings} from '../graph-warnings.mjs';
 import {traverseGraph} from '../graph-traversal.mjs';
+import {checkGraphAnswer} from '../graph-check.mjs';
 import {contentHash,sourceManifestHash,syntaxId,occurrenceId} from '../identity.mjs';
 import {canonicalBytes} from '../json.mjs';
 import {selectGraphEvidence,checkGraphEvidence} from '../graph-evidence.mjs';
@@ -260,5 +261,45 @@ test('captured r2 binding cannot survive a failed or omitted current tuple',asyn
     return checkGraphEvidence(s.loaded,x.records,s.checked,{...x.result,...evidence},x.result);},
    expectedAssertion:'GRAPH.OCCURRENCE',expectedCode:'invalidRecord',expectedField:'edges.binding'}])[0];
   await t.test(row.id,()=>runControl(row));
+ }
+});
+
+test('an admitted r1 graph projects captured r1 proof and target against r1, not comparison r2',async t=>{
+ for(const changed of [false,true]){
+  const s=await admitted(t,{changed,state:'failed'});
+  const old=s.records.callBindings.find(b=>b.provenanceId==='r1-call-proof');
+  const normalized=s.records.provenance.find(p=>p.id==='r1-call-proof');
+  assert.equal(normalized.freshness,changed?'stale':'possiblyStale');
+  assert.equal(old.staleTarget,changed);
+  const request={sourceSetId:'main',revisionId:'r1',rootSyntaxId:s.records.declarations.find(d=>d.revisionId==='r1').syntaxId,
+   semanticProducerId:'semantic'};
+  const output=traverseGraph({request,records:s.records});assert.equal(output.ok,true);
+  const result=output.result,edge=result.edges[0];
+  assert.equal(edge.call.revisionId,'r1');
+  assert.equal(edge.binding?.provenanceId,'r1-call-proof');
+  assert.equal(edge.binding.staleTarget,false);
+  assert.equal(edge.boundaryReason,'none');assert.equal(edge.visit,'seen');assert.equal(edge.to,request.rootSyntaxId);
+  Object.assign(result,selectGraphEvidence(s.loaded,s.records,s.checked,result));
+  assert.equal(result.provenance.find(p=>p.id==='r1-call-proof').freshness,'fresh');
+  assert.equal(result.provenance.every(p=>p.freshness==='fresh'),true);
+  result.warnings=deriveWarnings(result);
+  assert.deepEqual(result.warnings,[]);
+  const entry={id:`r1-${changed}`,attemptedRequest:request,answer:output};
+  assert.equal(checkGraphAnswer(s.loaded,s.records,s.checked,entry),true);
+  const mutated=structuredClone(entry);
+  mutated.answer.result.provenance.find(p=>p.id==='r1-call-proof').freshness=normalized.freshness;
+  assert.throws(()=>checkGraphAnswer(s.loaded,s.records,s.checked,mutated),e=>e.assertion==='GRAPH.PROVENANCE'&&e.field==='provenance');
+  const wrongTarget=structuredClone(entry);
+  wrongTarget.answer.result.edges[0].binding.staleTarget=true;
+  assert.throws(()=>checkGraphAnswer(s.loaded,s.records,s.checked,wrongTarget),e=>e.assertion==='GRAPH.TRAVERSAL'&&e.field===`answers.${entry.id}.result.edges`);
+  const badWarning=structuredClone(entry);
+  badWarning.answer.result.warnings.push({code:'staleEvidence',provenanceId:null,message:'stale'});
+  assert.throws(()=>checkGraphAnswer(s.loaded,s.records,s.checked,badWarning),e=>e.assertion==='WARNING.KEYS'&&e.field==='warnings');
+  // The identical fixture still exposes historical, not promoted occurrence facts at r2.
+  assert.equal(s.result.edges[0].binding,null);
+  assert.equal(s.result.edges[0].boundaryReason,'missingEvidence');
+  const r2Evidence=select(s);
+  assert.equal(r2Evidence.provenance.find(p=>p.id==='r1-proof').freshness,changed?'stale':'possiblyStale');
+  assert.equal(r2Evidence.provenance.some(p=>p.id==='r1-call-proof'),false);
  }
 });

@@ -181,7 +181,7 @@ const controls=registerControls([
   mutate:input=>{const clause='to,binding,visit,boundaryReason:reason';
    assert.equal(input.source.split(clause).length,2,'production edge emission must have one mutation site');
    input.source=input.source.replace(clause,'to,binding:selected,visit,boundaryReason:reason');return input;},
-  check:async input=>{const module=await import(`data:text/javascript;base64,${Buffer.from(input.source).toString('base64')}`);
+  check:async input=>{const module=await import(`data:text/javascript;base64,${Buffer.from(input.source.replace("./graph-projection.mjs",new URL("../graph-projection.mjs",import.meta.url).href)).toString('base64')}`);
    return decisionCheck({records:input.records,request:input.request},{assertion:'GRAPH.R2_BINDING',field:'edges[0].binding',expected:null,
     callId:oid(1),traversal:module.traverseGraph,select:r=>{
      assert.equal(r.edges[0].boundaryReason,'missingEvidence','mutation must retain the reason');
@@ -199,7 +199,7 @@ const controls=registerControls([
   mutate:input=>{const clause='bindings.get(call.id)??[]';
    assert.equal(input.source.split(clause).length,2,'production binding lookup must have one mutation site');
    input.source=input.source.replace(clause,'bindings.get(call.id)??records.callBindings');return input;},
-  check:async input=>{const module=await import(`data:text/javascript;base64,${Buffer.from(input.source).toString('base64')}`);
+  check:async input=>{const module=await import(`data:text/javascript;base64,${Buffer.from(input.source.replace("./graph-projection.mjs",new URL("../graph-projection.mjs",import.meta.url).href)).toString('base64')}`);
    return decisionCheck({records:input.records,request:input.request},{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].binding',expected:null,
     callId:oid(101),traversal:module.traverseGraph,select:r=>{const edge=r.edges[0];
      if(edge.binding){assert.equal(edge.binding.callId,oid(1),'only the old r1 binding is present');

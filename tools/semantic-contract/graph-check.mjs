@@ -1,4 +1,5 @@
 import {canonicalBytes} from './json.mjs';
+import {graphProjection} from './graph-projection.mjs';
 import {selectGraphEvidence,checkGraphEvidence} from './graph-evidence.mjs';
 import {checkWarnings} from './graph-warnings.mjs';
 import {checkCoverage} from './record-check/coverage.mjs';
@@ -37,7 +38,8 @@ export function expectedGraph(loaded,records,checked,request){
  if(effective.semanticProducerId!==null&&!records.producers.some(p=>p.id===effective.semanticProducerId&&p.kind==='semantic'))
   return failure('producerUnavailable','semanticProducerId');
  const coverage=new Map(records.coverage.map(row=>[tuple(row.producerId,{sourceSetId:row.sourceSetId,language:row.language,path:row.documentPath},row.revisionId),row]));
- const proofs=new Map(records.provenance.map(row=>[row.id,row]));
+ const projection=graphProjection(records,effective);
+ const proofs=new Map(records.provenance.map(row=>[row.id,projection.proof(row)]));
  const calls=new Map();
  for(const call of records.calls){
   if(call.revisionId!==effective.revisionId||call.document.sourceSetId!==effective.sourceSetId||!byId.has(call.ownerSyntaxId))continue;
@@ -72,9 +74,10 @@ export function expectedGraph(loaded,records,checked,request){
    const usable=row?.selected&&['complete','partial'].includes(row.state);
    // A failed/omitted row with a physically present fresh proof still cannot
    // authorize an occurrence. Its binding must not appear in GraphResult.
-   const binding=usable?(bindings.get(call.id)??[]).find(b=>
+   const selected=usable?(bindings.get(call.id)??[]).find(b=>
     documentKey(b.join.anchor.document)===documentKey(call.document)&&
     b.join.anchor.contentHash===proofs.get(b.provenanceId)?.contentHash)??null:null;
+   const binding=selected===null?null:projection.binding(selected);
    const proof=binding===null?null:proofs.get(binding.provenanceId);
    let reason='none';
    if(binding===null)reason='missingEvidence';
