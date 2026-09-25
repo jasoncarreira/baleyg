@@ -598,6 +598,26 @@ impl UseGuard {
         nonblocking: bool,
         after_open: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
+        Self::acquire_mode(path, exclusive, nonblocking, true, after_open)
+    }
+    pub fn acquire_existing_with_hook(
+        path: &Path,
+        exclusive: bool,
+        nonblocking: bool,
+        after_open: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
+        Self::acquire_mode(path, exclusive, nonblocking, false, after_open)
+    }
+    pub fn acquire_existing(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Self> {
+        Self::acquire_existing_with_hook(path, exclusive, nonblocking, || Ok(()))
+    }
+    fn acquire_mode(
+        path: &Path,
+        exclusive: bool,
+        nonblocking: bool,
+        create: bool,
+        after_open: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         let flags = (if exclusive {
             libc::LOCK_EX
         } else {
@@ -605,7 +625,7 @@ impl UseGuard {
         }) | (if nonblocking { libc::LOCK_NB } else { 0 });
         let mut hook = Some(after_open);
         for _ in 0..20 {
-            let file = open_file(path, true)?;
+            let file = open_file(path, create)?;
             if let Some(after_open) = hook.take() {
                 after_open()?;
             }
@@ -659,5 +679,255 @@ impl LeaderGuard {
     pub fn verify(&self) -> Result<()> {
         self.use_guard.verify()?;
         private_file(&self.path, &self.file)
+    }
+}
+
+/// Lazy, versioned durable payloads. The legacy `Store::open` is replaced by the
+/// topology cutover; this engine is independently usable until that cutover.
+pub struct DurableRecords<'a> {
+    roots: &'a TopologyRoots,
+    identity: &'a WorkspaceIdentity,
+}
+
+const RECORD_SCHEMA: &str = "
+CREATE TABLE record_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=1), record_id TEXT NOT NULL, initialized INTEGER NOT NULL CHECK(initialized=1));
+CREATE TABLE known_roots(path TEXT PRIMARY KEY, device TEXT NOT NULL, inode TEXT NOT NULL);
+CREATE TABLE views(id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+CREATE TABLE annotations(id TEXT PRIMARY KEY,node_id TEXT NOT NULL,payload TEXT NOT NULL);
+";
+
+impl<'a> DurableRecords<'a> {
+    pub fn new(roots: &'a TopologyRoots, identity: &'a WorkspaceIdentity) -> Self {
+        Self { roots, identity }
+    }
+    fn existing(&self) -> Result<bool> {
+        self.identity.verify()?;
+        self.roots.reject_root_overlap(self.identity)?;
+        for parent in [&self.roots.data, &self.roots.data.join("workspaces")] {
+            match fs::symlink_metadata(parent) {
+                Ok(_) => private_dir(parent)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        match fs::symlink_metadata(self.roots.record_dir(self.identity)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+            Ok(_) => {
+                private_dir(&self.roots.data)?;
+                private_dir(&self.roots.data.join("workspaces"))?;
+                private_dir(&self.roots.record_dir(self.identity))?;
+                Ok(true)
+            }
+        }
+    }
+    fn lock_existing(&self) -> Result<UseGuard> {
+        UseGuard::acquire_existing(&self.roots.record_use_lock(self.identity), false, false)
+            .context("incomplete_record: missing or unsafe use lock")
+    }
+    fn db(&self, writable: bool) -> Result<rusqlite::Connection> {
+        use rusqlite::{Connection, OpenFlags};
+        let path = self.roots.record_db(self.identity);
+        ensure!(path.exists(), "incomplete_record: missing database");
+        let file = open_file(&path, false)?;
+        private_file(&path, &file)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = path.with_file_name(format!("workspace.db{suffix}"));
+            match fs::symlink_metadata(&sidecar) {
+                Ok(_) => bail!("incomplete_record: recovery required"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let flags = if writable {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let db = Connection::open_with_flags(&path, flags)?;
+        private_file(&path, &file).context("incomplete_record: database changed")?;
+        db.busy_timeout(Duration::ZERO)?;
+        db.pragma_update(None, "temp_store", "MEMORY")?;
+        if writable {
+            db.pragma_update(None, "synchronous", "FULL")?;
+        } else {
+            db.pragma_update(None, "query_only", "ON")?;
+        }
+        let journal: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+        ensure!(journal == "delete", "incompatible_record: journal mode");
+        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        ensure!(version != 0, "incomplete_record: schema not committed");
+        ensure!(version == 1, "incompatible_record: schema version");
+        let row: (i64, String, i64) = db.query_row("SELECT schema_version,record_id,initialized FROM record_metadata WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("incomplete_record: metadata")?;
+        ensure!(
+            row == (1, self.identity.record_id.clone(), 1),
+            "incomplete_record: metadata mismatch"
+        );
+        db.prepare("SELECT path,device,inode FROM known_roots")?;
+        db.prepare("SELECT id,payload FROM views")?;
+        db.prepare("SELECT id,node_id,payload FROM annotations")?;
+        self.identity.verify()?;
+        Ok(db)
+    }
+    fn save(&self, table: &str, id: &str, node: Option<&str>, payload: String) -> Result<()> {
+        self.save_with_first_save_hook(table, id, node, payload, |_| Ok(()))
+    }
+    fn save_with_first_save_hook(
+        &self,
+        table: &str,
+        id: &str,
+        node: Option<&str>,
+        payload: String,
+        mut hook: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        use rusqlite::{Connection, TransactionBehavior};
+        let exists = self.existing()?;
+        if !exists {
+            self.roots.prepare_records(self.identity)?;
+            let guard = self.roots.record_use(self.identity, true)?;
+            self.identity.verify()?;
+            // Another process may have completed creation before the lock was acquired.
+            if self.roots.record_dir(self.identity).exists() {
+                drop(guard);
+                return self.save(table, id, node, payload);
+            }
+            make_private(&self.roots.record_dir(self.identity))?;
+            let path = self.roots.record_db(self.identity);
+            let _file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            let mut db = Connection::open(&path)?;
+            db.busy_timeout(Duration::ZERO)?;
+            db.pragma_update(None, "journal_mode", "DELETE")?;
+            db.pragma_update(None, "synchronous", "FULL")?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(RECORD_SCHEMA)?;
+            tx.pragma_update(None, "user_version", 1)?;
+            tx.execute(
+                "INSERT INTO record_metadata VALUES(1,1,?1,1)",
+                [&self.identity.record_id],
+            )?;
+            Self::write_item(&tx, table, id, node, &payload)?;
+            self.write_root(&tx)?;
+            self.identity.verify()?;
+            guard.verify()?;
+            hook("before_commit")?;
+            tx.commit()?;
+            drop(db);
+            hook("before_sync")?;
+            open_file(&path, false)?.sync_all()?;
+            sync_directory(&self.roots.record_dir(self.identity))?;
+            sync_directory(&self.roots.data.join("workspaces"))?;
+            sync_directory(&self.roots.data)?;
+            return Ok(());
+        }
+        let guard = self.lock_existing()?;
+        let mut db = self.db(true)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::write_item(&tx, table, id, node, &payload)?;
+        self.write_root(&tx)?;
+        self.identity.verify()?;
+        guard.verify()?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn write_item(
+        db: &rusqlite::Transaction<'_>,
+        table: &str,
+        id: &str,
+        node: Option<&str>,
+        payload: &str,
+    ) -> Result<()> {
+        use rusqlite::params;
+        if table == "views" {
+            db.execute("INSERT INTO views VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![id,payload])?;
+        } else {
+            db.execute("INSERT INTO annotations VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET node_id=excluded.node_id,payload=excluded.payload", params![id,node,payload])?;
+        }
+        Ok(())
+    }
+    fn write_root(&self, db: &rusqlite::Transaction<'_>) -> Result<()> {
+        db.execute("INSERT INTO known_roots VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET device=excluded.device,inode=excluded.inode", rusqlite::params![self.identity.root.to_str().context("non-UTF8 root")?,self.identity.device.to_string(),self.identity.inode.to_string()])?;
+        Ok(())
+    }
+    fn list<T: serde::de::DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>> {
+        if !self.existing()? {
+            return Ok(vec![]);
+        }
+        let guard = self.lock_existing()?;
+        let mut db = self.db(false)?;
+        let tx = db.transaction()?;
+        let values = tx
+            .prepare(sql)?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let result = values
+            .iter()
+            .map(|value| serde_json::from_str(value).map_err(Into::into))
+            .collect();
+        self.identity.verify()?;
+        guard.verify()?;
+        result
+    }
+    pub fn views(&self) -> Result<Vec<crate::model::SavedView>> {
+        self.list("SELECT payload FROM views ORDER BY id")
+    }
+    pub fn annotations(&self) -> Result<Vec<crate::model::Annotation>> {
+        self.list("SELECT payload FROM annotations ORDER BY id")
+    }
+    pub fn view(&self, id: &str) -> Result<Option<crate::model::SavedView>> {
+        Ok(self.views()?.into_iter().find(|v| v.id == id))
+    }
+    pub fn annotation(&self, id: &str) -> Result<Option<crate::model::Annotation>> {
+        Ok(self.annotations()?.into_iter().find(|a| a.id == id))
+    }
+    pub fn put_view(&self, view: &crate::model::SavedView) -> Result<()> {
+        view.validate()?;
+        self.save("views", &view.id, None, serde_json::to_string(view)?)
+    }
+    pub fn put_annotation(&self, annotation: &crate::model::Annotation) -> Result<()> {
+        self.put_annotation_with_first_save_hook(annotation, |_| Ok(()))
+    }
+    /// Fixture fault at the first record's commit or post-commit sync boundary.
+    pub fn put_annotation_with_first_save_hook(
+        &self,
+        annotation: &crate::model::Annotation,
+        hook: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        annotation.validate()?;
+        self.save_with_first_save_hook(
+            "annotations",
+            &annotation.id,
+            Some(&annotation.node_id),
+            serde_json::to_string(annotation)?,
+            hook,
+        )
+    }
+    fn delete(&self, table: &str, id: &str) -> Result<bool> {
+        if !self.existing()? {
+            return Ok(false);
+        }
+        let guard = self.lock_existing()?;
+        let mut db = self.db(true)?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = if table == "views" {
+            tx.execute("DELETE FROM views WHERE id=?1", [id])?
+        } else {
+            tx.execute("DELETE FROM annotations WHERE id=?1", [id])?
+        };
+        self.identity.verify()?;
+        guard.verify()?;
+        tx.commit()?;
+        Ok(changed != 0)
+    }
+    pub fn delete_view(&self, id: &str) -> Result<bool> {
+        self.delete("views", id)
+    }
+    pub fn delete_annotation(&self, id: &str) -> Result<bool> {
+        self.delete("annotations", id)
     }
 }
