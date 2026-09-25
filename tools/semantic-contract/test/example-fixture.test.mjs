@@ -11,6 +11,7 @@ import {checkMeasurement} from '../record-check/measurement.mjs';
 import {checkJoins} from '../record-check/joins.mjs';
 import {checkRelationships} from '../record-check/relationships.mjs';
 import {checkBindings} from '../record-check/bindings.mjs';
+import {compareEnvelope,checkEnvelopeOrder,orderedEnvelope} from '../record-check/measurement.mjs';
 import {registerControls,runControl} from './mutations.mjs';
 
 const root=fileURLToPath(new URL('../../../tests/fixtures/semantic-evidence/v1/example/',import.meta.url));
@@ -61,6 +62,26 @@ test('six authored anchor branches retain actual source declarations',()=>{
   ['duplicate-unknown','unprovenContinuity'],['duplicate-changed','groupChanged'],
   ['missing','missing'],['header-mismatch','headerMismatch']]);
  assert.equal(records.durableAnchors.length,6);
+});
+
+test('durable anchor order uses captured revision and document without collapsing duplicates',()=>{
+ const captured=records.durableAnchors[0];
+ const older={...captured,capturedRevisionId:'r0'};
+ const earlierDocument={...captured,document:{...captured.document,path:'src/aaa.js'}};
+ assert.equal(compareEnvelope(older,captured)<0,true);
+ assert.equal(compareEnvelope(captured,older)>0,true);
+ assert.equal(compareEnvelope(earlierDocument,captured)<0,true);
+ assert.deepEqual(orderedEnvelope('durableAnchors',[captured,older]),[older,captured]);
+ assert.doesNotThrow(()=>checkEnvelopeOrder('durableAnchors',[older,captured]));
+ assert.throws(()=>checkEnvelopeOrder('durableAnchors',[captured,older]),{
+  assertion:'RECORDS.ORDER',code:'invalidRecord',field:'durableAnchors'
+ });
+ assert.throws(()=>orderedEnvelope('durableAnchors',[captured,captured],{collapseIdentical:true}),{
+  assertion:'RECORDS.MEMBERSHIP',code:'invalidRecord',field:'durableAnchors'
+ });
+ const declaration=records.declarations.find(row=>row.revisionId==='r1'&&row.name==='same');
+ const newer=records.declarations.find(row=>row.revisionId==='r2'&&row.name==='same');
+ assert.equal(compareEnvelope(declaration,newer)<0,true);
 });
 
 function control(id,mutate,expectedAssertion,expectedField){

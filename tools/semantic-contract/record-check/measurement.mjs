@@ -64,6 +64,7 @@ export const measuredHeaderHash = header => hash('header',header);
 export const measuredSiblingGroupHash = headers => hash('sibling-group',{headers});
 // Storage ordering is not traversal order. Do not sort the measured source rows.
 export function compareEnvelope(a,b) {
+ if(a.capturedRevisionId && b.capturedRevisionId) return ascii(a.capturedRevisionId,b.capturedRevisionId)||cmp(a.document,b.document)||cmp(a,b);
  if(a.syntaxId && b.syntaxId) return ascii(a.syntaxId,b.syntaxId)||ascii(a.revisionId,b.revisionId)||cmp(a.document,b.document);
  if(a.id && b.id) return ascii(a.id,b.id)||cmp(a,b);
  return cmp(a,b);
