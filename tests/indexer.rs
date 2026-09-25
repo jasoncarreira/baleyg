@@ -548,7 +548,7 @@ fn capture_admission(root: &Path) -> baleyg::indexer::CaptureAdmission {
     let mut index = scip::types::Index::new();
     let mut meta = scip::types::Metadata::new();
     let mut tool = scip::types::ToolInfo::new();
-    tool.name = "S".into();
+    tool.name = "scip-typescript".into();
     tool.version = "semantic-1".into();
     meta.tool_info = protobuf::MessageField::some(tool);
     index.metadata = protobuf::MessageField::some(meta);
@@ -574,6 +574,7 @@ fn capture_admission(root: &Path) -> baleyg::indexer::CaptureAdmission {
         dependency_source_sets: vec![],
         producers: vec![baleyg::indexer::ProducerInput {
             id: "S".into(),
+            tool_name: "scip-typescript".into(),
             version: "semantic-1".into(),
             position_encoding: "utf16".into(),
             executable: std::env::current_exe().unwrap(),
@@ -886,5 +887,190 @@ fn capture_does_not_claim_graph_or_semantic_completeness() {
             .stats
             .semantic_state,
         SemanticState::Unavailable
+    );
+}
+
+#[test]
+fn capture_native_witnesses_preserve_token_header_and_typed_regions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.rs",
+        "fn greet() { if ready() { target(); } }
+",
+    );
+    write(
+        root,
+        "b.js",
+        "function greet() { if (ready()) target(); }
+",
+    );
+    let admission = capture_admission(root);
+    let options = capture_options(root);
+    let first = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    for document in &first.documents {
+        let name = document
+            .native_candidates
+            .iter()
+            .find(|w| {
+                w.candidate_kind == baleyg::indexer::NativeCandidateKind::Declaration
+                    && w.name_bytes == b"greet"
+            })
+            .unwrap();
+        assert_eq!(
+            &document.bytes[name.token_start_byte..name.token_end_byte],
+            b"greet"
+        );
+        assert_eq!(name.token_bytes, b"greet");
+        assert!(
+            !name
+                .header_bytes
+                .windows(6)
+                .any(|window| window == b"target")
+        );
+        for kind in [
+            baleyg::indexer::NativeCandidateKind::Invocation,
+            baleyg::indexer::NativeCandidateKind::ControlRegion,
+        ] {
+            let witnesses: Vec<_> = document
+                .native_candidates
+                .iter()
+                .filter(|w| w.candidate_kind == kind)
+                .collect();
+            assert!(
+                !witnesses.is_empty(),
+                "missing {kind:?} in {}",
+                document.key.path.as_str()
+            );
+            for witness in witnesses {
+                assert!(witness.start_byte < witness.end_byte);
+                assert!(witness.token_start_byte >= witness.start_byte);
+                assert!(witness.token_end_byte <= witness.end_byte);
+                assert!(witness.owner_id < document.syntax.len());
+            }
+        }
+    }
+    write(
+        root,
+        "a.rs",
+        "fn greet() { if ready() { changed(); } }
+",
+    );
+    write(
+        root,
+        "b.js",
+        "function greet() { if (ready()) changed(); }
+",
+    );
+    let second = baleyg::indexer::capture_revision(&options, &admission, &cancel()).unwrap();
+    assert_ne!(first.revision_id, second.revision_id);
+    for (before, after) in first.documents.iter().zip(second.documents.iter()) {
+        let header = |doc: &baleyg::indexer::CapturedDocument| {
+            doc.native_candidates
+                .iter()
+                .find(|w| {
+                    w.candidate_kind == baleyg::indexer::NativeCandidateKind::Declaration
+                        && w.name_bytes == b"greet"
+                })
+                .unwrap()
+                .header_bytes
+                .clone()
+        };
+        assert_eq!(header(before), header(after));
+    }
+}
+
+#[test]
+fn capture_rejects_mid_acquisition_source_set_and_required_read_changes() {
+    for change in ["remove", "add", "content", "ignore"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "a.rs",
+            "fn a() {}
+",
+        );
+        write(
+            root,
+            "b.rs",
+            "fn b() {}
+",
+        );
+        let admission = capture_admission(root);
+        let options = capture_options(root);
+        let result =
+            baleyg::indexer::capture_revision_with_hook(&options, &admission, &cancel(), || {
+                match change {
+                    "remove" => fs::remove_file(root.join("b.rs")).unwrap(),
+                    "add" => write(
+                        root,
+                        "c.rs",
+                        "fn c() {}
+",
+                    ),
+                    "content" => write(
+                        root,
+                        "b.rs",
+                        "fn changed() {}
+",
+                    ),
+                    "ignore" => write(
+                        root,
+                        ".gitignore",
+                        "b.rs
+",
+                    ),
+                    _ => unreachable!(),
+                }
+            });
+        assert!(result.is_err(), "accepted mid-acquisition {change}");
+    }
+}
+
+#[test]
+fn capture_accepts_authentic_scip_tool_name_without_conflating_producer_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "z.js", "const z = '😀';");
+    let mut admission = capture_admission(root);
+    admission.producers[0].id = "semantic:ts".into();
+    let artifact = root.join("semantic.artifact");
+    let mut index = scip::types::Index::parse_from_bytes(&fs::read(&artifact).unwrap()).unwrap();
+    index
+        .metadata
+        .as_mut()
+        .unwrap()
+        .tool_info
+        .as_mut()
+        .unwrap()
+        .name = "scip-typescript".into();
+    fs::write(&artifact, index.write_to_bytes().unwrap()).unwrap();
+    let captured =
+        baleyg::indexer::capture_revision(&capture_options(root), &admission, &cancel()).unwrap();
+    assert_eq!(captured.producers[1].id, "semantic:ts");
+    assert_eq!(captured.producers[1].tool_name, "scip-typescript");
+    let mut mismatched = admission.clone();
+    mismatched.producers[0].tool_name = "scip-python".into();
+    assert!(
+        baleyg::indexer::capture_revision(&capture_options(root), &mismatched, &cancel()).is_err()
+    );
+    assert_eq!(
+        captured.documents[0].semantic_positions[0].producer_id,
+        "semantic:ts"
+    );
+    index
+        .metadata
+        .as_mut()
+        .unwrap()
+        .tool_info
+        .as_mut()
+        .unwrap()
+        .name
+        .clear();
+    fs::write(&artifact, index.write_to_bytes().unwrap()).unwrap();
+    assert!(
+        baleyg::indexer::capture_revision(&capture_options(root), &admission, &cancel()).is_err()
     );
 }

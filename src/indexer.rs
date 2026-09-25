@@ -137,6 +137,8 @@ pub struct CapturedSyntaxNode {
 pub enum NativeCandidateKind {
     Declaration,
     Occurrence,
+    Invocation,
+    ControlRegion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,66 +153,123 @@ pub struct CapturedNativeWitness {
     pub token_bytes: Vec<u8>,
     pub start_byte: usize,
     pub end_byte: usize,
+    pub token_start_byte: usize,
+    pub token_end_byte: usize,
 }
 
 // These are AST candidates, not validated declarations/occurrences or graph facts.
 fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness> {
     let mut output = Vec::new();
     for node in nodes {
-        let declaration = node.kind.contains("declaration")
-            || node.kind.contains("definition")
-            || node.kind == "function_item"
-            || node.kind == "method_definition";
+        let declaration = is_declaration(&node.kind);
+        let invocation = matches!(
+            node.kind.as_str(),
+            "call_expression" | "method_invocation" | "macro_invocation"
+        );
+        let control = matches!(
+            node.kind.as_str(),
+            "if_statement"
+                | "if_expression"
+                | "if_expression_statement"
+                | "else_clause"
+                | "for_statement"
+                | "for_expression"
+                | "while_statement"
+                | "while_expression"
+                | "loop_expression"
+                | "try_statement"
+                | "catch_clause"
+                | "finally_clause"
+                | "switch_statement"
+                | "switch_expression"
+                | "match_expression"
+                | "conditional_expression"
+                | "ternary_expression"
+        );
         let occurrence = node.kind.contains("identifier");
-        if !declaration && !occurrence {
+        if !declaration && !occurrence && !invocation && !control {
             continue;
         }
         let mut owner = node.parent_id.unwrap_or(0);
-        while owner > 0 {
-            let ancestor = &nodes[owner];
-            if ancestor.kind.contains("declaration")
-                || ancestor.kind.contains("definition")
-                || ancestor.kind == "function_item"
-                || ancestor.kind == "method_definition"
-            {
-                break;
-            }
-            owner = ancestor.parent_id.unwrap_or(0);
+        while owner > 0 && !is_declaration(&nodes[owner].kind) {
+            owner = nodes[owner].parent_id.unwrap_or(0);
         }
-        let name = if declaration {
+        let name_node = if declaration {
             nodes
                 .iter()
                 .find(|candidate| {
                     candidate.parent_id == Some(node.id)
-                        && candidate.field_name.as_deref() == Some("name")
+                        && matches!(candidate.field_name.as_deref(), Some("name" | "declarator"))
                 })
-                .map(|candidate| candidate.source_bytes.clone())
-                .unwrap_or_default()
+                .and_then(|candidate| {
+                    if candidate.field_name.as_deref() == Some("declarator") {
+                        nodes.iter().find(|child| {
+                            child.parent_id == Some(candidate.id)
+                                && child.field_name.as_deref() == Some("name")
+                        })
+                    } else {
+                        Some(candidate)
+                    }
+                })
+        } else if invocation {
+            nodes.iter().find(|candidate| {
+                candidate.parent_id == Some(node.id)
+                    && matches!(candidate.field_name.as_deref(), Some("function" | "name"))
+            })
         } else {
-            node.source_bytes.clone()
+            None
         };
+        let token = name_node.unwrap_or(node);
+        let header_end = if declaration {
+            nodes
+                .iter()
+                .filter(|child| {
+                    child.parent_id == Some(node.id)
+                        && matches!(child.field_name.as_deref(), Some("body"))
+                })
+                .map(|child| child.start_byte)
+                .min()
+                .unwrap_or(node.end_byte)
+        } else {
+            node.start_byte
+        };
+        let prefix_len = header_end
+            .saturating_sub(node.start_byte)
+            .min(node.source_bytes.len());
         output.push(CapturedNativeWitness {
             node_id: node.id,
             parent_id: node.parent_id,
             owner_id: owner,
             candidate_kind: if declaration {
                 NativeCandidateKind::Declaration
+            } else if invocation {
+                NativeCandidateKind::Invocation
+            } else if control {
+                NativeCandidateKind::ControlRegion
             } else {
                 NativeCandidateKind::Occurrence
             },
             node_kind: node.kind.clone(),
-            name_bytes: name,
+            name_bytes: token.source_bytes.clone(),
             header_bytes: if declaration {
-                node.source_bytes.clone()
+                node.source_bytes[..prefix_len].to_vec()
             } else {
                 Vec::new()
             },
-            token_bytes: node.source_bytes.clone(),
+            token_bytes: token.source_bytes.clone(),
             start_byte: node.start_byte,
             end_byte: node.end_byte,
+            token_start_byte: token.start_byte,
+            token_end_byte: token.end_byte,
         });
     }
     output
+}
+
+fn is_declaration(kind: &str) -> bool {
+    kind.contains("declaration")
+        || kind.contains("definition")
+        || matches!(kind, "function_item" | "method_definition")
 }
 
 fn capture_syntax(
@@ -261,6 +320,7 @@ fn capture_syntax(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapturedProducer {
     pub id: String,
+    pub tool_name: String,
     pub version: String,
     pub position_encoding: String,
     pub executable_bytes: Vec<u8>,
@@ -272,6 +332,7 @@ pub struct CapturedProducer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProducerInput {
     pub id: String,
+    pub tool_name: String,
     pub version: String,
     pub position_encoding: String,
     pub executable: PathBuf,
@@ -445,6 +506,18 @@ pub fn capture_revision(
     admission: &CaptureAdmission,
     cancel: &CancelFlag,
 ) -> Result<CapturedRevision> {
+    capture_revision_with_hook(options, admission, cancel, || {})
+}
+
+/// The hook runs after the first source inventory and before its verification.
+/// This makes acquisition races reproducible without changing normal capture.
+#[doc(hidden)]
+pub fn capture_revision_with_hook(
+    options: &IndexOptions,
+    admission: &CaptureAdmission,
+    cancel: &CancelFlag,
+    before_verification: impl FnOnce(),
+) -> Result<CapturedRevision> {
     use crate::model::v1::{DocumentKey, Language, Path as EvidencePath, Text};
     check(cancel)?;
     let identity = crate::store::topology::WorkspaceIdentity::discover_unattached(
@@ -550,6 +623,7 @@ pub fn capture_revision(
     let native_bytes = safe_read(&std::env::current_exe()?, 256 * 1024 * 1024)?;
     producers.push(CapturedProducer {
         id: "N".into(),
+        tool_name: env!("CARGO_PKG_NAME").into(),
         version: env!("CARGO_PKG_VERSION").into(),
         position_encoding: "utf8".into(),
         executable_hash: digest(&native_bytes),
@@ -564,14 +638,18 @@ pub fn capture_revision(
         let input = admission
             .producers
             .iter()
-            .find(|p| p.id == "S")
+            .find(|p| p.id != "N")
             .context("semantic executable admission missing")?;
         ensure!(
-            admission.producers.len() == 1 && input.artifact.as_ref() == Some(scip_path),
+            admission.producers.len() == 1
+                && !input.id.is_empty()
+                && input.artifact.as_ref() == Some(scip_path),
             "semantic artifact differs from indexed artifact"
         );
         ensure!(
-            !input.version.is_empty() && !input.position_encoding.is_empty(),
+            !input.tool_name.is_empty()
+                && !input.version.is_empty()
+                && !input.position_encoding.is_empty(),
             "missing semantic producer metadata"
         );
         #[cfg(unix)]
@@ -595,7 +673,7 @@ pub fn capture_revision(
             .and_then(|m| m.tool_info.as_ref())
             .context("SCIP producer metadata missing")?;
         ensure!(
-            tool.name == input.id && tool.version == input.version,
+            tool.name == input.tool_name && tool.version == input.version,
             "SCIP producer metadata does not match admitted producer"
         );
         ensure!(
@@ -642,6 +720,7 @@ pub fn capture_revision(
         }
         producers.push(CapturedProducer {
             id: input.id.clone(),
+            tool_name: tool.name.clone(),
             version: input.version.clone(),
             position_encoding: input.position_encoding.clone(),
             executable_hash: digest(&executable_bytes),
@@ -678,6 +757,7 @@ pub fn capture_revision(
                 .map(|p| {
                     (
                         &p.id,
+                        &p.tool_name,
                         &p.version,
                         &p.position_encoding,
                         &p.executable_hash,
@@ -696,6 +776,7 @@ pub fn capture_revision(
             position.revision_id = revision_id.clone();
         }
     }
+    before_verification();
     for (path, bytes) in observed_inputs {
         check(cancel)?;
         ensure!(
