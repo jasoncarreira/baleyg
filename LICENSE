@@ -8,6 +8,13 @@ Parameters
 Licensor:             Jason Carreira
 
 Licensed Work:        Baleyg. The Licensed Work is (c) 2026 Jason Carreira.
+                      The Licensed Work excludes third-party material that
+                      carries its own license, including the fonts under
+                      web/fonts/ (SIL Open Font License) and the Feature
+                      Factory sources and data under
+                      tests/fixtures/extraction/inputs/feature-factory/ and
+                      tests/fixtures/extraction/feature-factory.*, which
+                      remain under their original terms.
 
 Additional Use Grant: You may make production use of the Licensed Work, free
                       of charge, if (a) you are an individual, or you use the
