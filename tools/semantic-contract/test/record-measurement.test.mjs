@@ -69,20 +69,24 @@ async function admitSpec(spec){
  const revisions=[],annotations=[];
  for(const [key,revision] of raw.revisions){
   const [sourceSetId,id]=JSON.parse(key),documents=[];
-  for(const {key:document} of revision.documents){
-   const sourceFile=`snapshots/${id}/${document.path}`;
+  for(const {key:document,contentHash} of revision.documents){
+   assert.equal(document.sourceSetId,sourceSetId);
+   const sourceFile=`snapshots/${sourceSetId}/${id}/${document.path}`;
    const bytes=raw.sources.get(JSON.stringify([sourceSetId,id,document.path]));
    assert.ok(bytes,`missing source ${sourceSetId}/${id}/${document.path}`);
+   assert.equal(sha(bytes),contentHash,`wrong hash ${sourceSetId}/${id}/${document.path}`);
    material[sourceFile]=bytes;
    const annotation=`${sourceFile}.annotations.json`;
    material[annotation]={formatVersion:1,document,revisionId:id,scenarios:[],facts:[]};
    annotations.push(annotation);
    documents.push({key:document,revisionId:id,sourceFile});
   }
+  documents.sort((a,b)=>Buffer.compare(Buffer.from(a.key.path),Buffer.from(b.key.path)));
   revisions.push({id,sourceSetId,documents,toolchainHash:captures[1].hash,configHash:captures[2].hash,dependencyHash:captures[3].hash});
  }
  const language=producer.languages[0],sourceSetId=revisions[0].sourceSetId;
- material['fixture.json']={formatVersion:1,profile:'example',language,sourceSets:[{id:sourceSetId,rootId:'root',languages:[language],dependencies:[]}],producers:[producer],revisions,comparison:{sourceSetId,revisionId:revisions[0].id,producers:[producer]},coverageIntents:[],nativeArtifact:'captures/native.json',semanticArtifacts:[],annotationFiles:annotations,answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ const sourceSets=[...new Set(revisions.map(revision=>revision.sourceSetId))].map(id=>({id,rootId:`root-${id}`,languages:[language],dependencies:[]}));
+ material['fixture.json']={formatVersion:1,profile:'example',language,sourceSets,producers:[producer],revisions,comparison:{sourceSetId,revisionId:revisions[0].id,producers:[producer]},coverageIntents:[],nativeArtifact:'captures/native.json',semanticArtifacts:[],annotationFiles:annotations,answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  try{
   for(const [path,value] of Object.entries(material)){
    const target=join(root,path);await mkdir(dirname(target),{recursive:true});
@@ -561,6 +565,50 @@ const sourceControls=registerControls([
  {id:'RECORDS.ORDER.controls',baseline:secondCallAndControl,mutate:v=>{v.records.controlRegions.reverse();return v;},expectedAssertion:'RECORDS.ORDER',expectedCode:'invalidRecord',expectedField:'controlRegions'}
 ].map(row=>({check:async s=>{const admitted=await admitSpec(s);return checkMeasurement(admitted.loaded,admitted.records);},...row})));
 for(const row of sourceControls)test(row.id,()=>runControl(row));
+
+function crossSnapshotOwner(axis){
+  const s=sample(),data=Buffer.from(source);
+  const moduleHeader={kind:'module',name:null,modifiers:[],typeParameters:[],parameters:[],resultType:null,bases:[]};
+  const moduleKey={kind:'module',name:null,signature:null,ordinal:0};
+  const moduleRow=(ref,document,revisionId)=>({ref,nativeId:null,document,revisionId,parentRef:null,kind:'module',name:null,range:span(0,data.length),nameRange:null,header:moduleHeader,signature:null,witnesses:[]});
+  const moduleRecord=(document,revisionId)=>{
+    const id=syntax({sourceSet:document.sourceSetId,path:document.path,language:document.language,ancestors:[],declaration:moduleKey});
+    return {syntaxId:id,document,revisionId,kind:'module',name:null,lookupKey:null,ancestors:[],key:moduleKey,range:{start:0,end:data.length},nameRange:null,header:moduleHeader,provenanceId:`native:${revisionId}:${id}`};
+  };
+  s.loaded.native.declarations.unshift(moduleRow('module',doc,'r1'));
+  for(const row of s.loaded.native.declarations.slice(1))row.parentRef='module';
+  s.records.declarations.push(moduleRecord(doc,'r1'));
+  const foreignDoc=axis==='document'?{...doc,path:'src/other.js'}:axis==='sourceSet'?{...doc,sourceSetId:'other'}:doc;
+  const foreignRevision=axis==='revision'?'r2':'r1';
+  const revisionKey=JSON.stringify([foreignDoc.sourceSetId,foreignRevision]);
+  const sourceKey=JSON.stringify([foreignDoc.sourceSetId,foreignRevision,foreignDoc.path]);
+  s.loaded.sources.set(sourceKey,data);
+  if(!s.loaded.revisions.has(revisionKey))s.loaded.revisions.set(revisionKey,{documents:[]});
+  s.loaded.revisions.get(revisionKey).documents.push({key:foreignDoc,contentHash:sha(data)});
+  const foreignModule=moduleRow('foreign-module',foreignDoc,foreignRevision);
+  const foreignMain=structuredClone(s.loaded.native.declarations.find(row=>row.ref==='main'));
+  foreignMain.ref='foreign-main';foreignMain.parentRef='foreign-module';foreignMain.document=foreignDoc;foreignMain.revisionId=foreignRevision;
+  s.loaded.native.declarations.push(foreignModule,foreignMain);
+  s.records.declarations.push(moduleRecord(foreignDoc,foreignRevision));
+  const foreignId=syntax({sourceSet:foreignDoc.sourceSetId,path:foreignDoc.path,language:foreignDoc.language,ancestors:[],declaration:{kind:'function',name:'main',signature:null,ordinal:0}});
+  s.records.declarations.push({...structuredClone(s.records.declarations.find(row=>row.name==='main')),syntaxId:foreignId,document:foreignDoc,revisionId:foreignRevision,provenanceId:`native:${foreignRevision}:${foreignId}`});
+  s.records.declarations.sort(orderSyntax);
+  const foreignControl={...structuredClone(s.loaded.native.controls[0]),ref:'foreign-control',ownerRef:'foreign-main',document:foreignDoc,revisionId:foreignRevision};
+  s.loaded.native.controls.push(foreignControl);
+  const controlId=occurrence({revisionId:foreignRevision,ownerSyntaxId:foreignId,kind:'control',ordinal:0});
+  s.records.controlRegions.push({...structuredClone(s.records.controlRegions[0]),id:controlId,ownerSyntaxId:foreignId,document:foreignDoc,revisionId:foreignRevision,provenanceId:`native:${foreignRevision}:${controlId}`});
+  s.records.controlRegions.sort(orderId);
+  return s;
+}
+const crossSnapshotControls=registerControls(['document','sourceSet','revision'].flatMap(axis=>[
+  {id:`MEASUREMENT.OWNER.${axis}.parent`,mutate:v=>{v.loaded.native.declarations.find(row=>row.ref==='main').parentRef='foreign-module';return v;},expectedAssertion:'MEASUREMENT.OWNER',expectedCode:'invalidRecord',expectedField:'parentRef'},
+  {id:`MEASUREMENT.OWNER.${axis}.call`,mutate:v=>{v.loaded.native.calls[0].ownerRef='foreign-main';return v;},expectedAssertion:'MEASUREMENT.OWNER',expectedCode:'invalidRecord',expectedField:'ownerRef'},
+  {id:`MEASUREMENT.OWNER.${axis}.control`,mutate:v=>{v.loaded.native.controls.find(row=>row.ref==='block').ownerRef='foreign-main';return v;},expectedAssertion:'MEASUREMENT.OWNER',expectedCode:'invalidRecord',expectedField:'ownerRef'},
+  {id:`MEASUREMENT.OWNER.${axis}.reference`,mutate:v=>{v.loaded.native.references[0].ownerRef='foreign-main';return v;},expectedAssertion:'MEASUREMENT.OWNER',expectedCode:'invalidRecord',expectedField:'ownerRef'},
+  {id:`MEASUREMENT.CONTROL.${axis}.parent`,mutate:v=>{v.loaded.native.controls.find(row=>row.ref==='block').parentRef='foreign-control';return v;},expectedAssertion:'MEASUREMENT.CONTROL',expectedCode:'invalidRecord',expectedField:'parentRef'},
+  {id:`MEASUREMENT.REGION.${axis}.chain`,mutate:v=>{v.loaded.native.calls[0].regionRefs=['foreign-control'];return v;},expectedAssertion:'MEASUREMENT.REGION',expectedCode:'invalidRecord',expectedField:'regionRefs'}
+].map(row=>({baseline:()=>crossSnapshotOwner(axis),check:async s=>{const admitted=await admitSpec(s);return checkMeasurement(admitted.loaded,admitted.records);},...row}))));
+for(const row of crossSnapshotControls)test(row.id,()=>runControl(row));
 
 function crossRevisionOwner(){
  const s=sample(),bytes=Buffer.from(source);
