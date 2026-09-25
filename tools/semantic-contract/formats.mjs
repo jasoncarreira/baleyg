@@ -12,7 +12,6 @@ const scalar = s => typeof s === 'string' && s.length > 0 && !/[\uD800-\uDBFF](?
 function walk(spec, value, path) {
   if (typeof spec === 'string' && Object.hasOwn(schemas, spec)) {
     walk(schemas[spec], value, path);
-    if (spec === 'TypeRelationshipFact' && value.source.kind !== 'internal') fail(`${path}.source.kind`, 'source must be internal');
     if (spec === 'ReferenceJoinDiagnostic' && value.join.status === 'exact') fail(`${path}.join.status`, 'non-exact diagnostic required');
     if (spec === 'GraphRequest' || (spec === 'GraphRequestTemplate' && path.endsWith('.result.request'))) {
       if (value.depth > 5 || value.maxNodes < 1 || value.maxNodes > 150 || value.maxCalls > 500) fail(`${path}.request`, 'request limits outside v1');
@@ -53,6 +52,7 @@ function walk(spec, value, path) {
     for (const key of Object.keys(spec.object)) if (!Object.hasOwn(value,key)) fail(`${path}.${key}`, 'missing required field');
     for (const key of Object.keys(value)) if (!Object.hasOwn(spec.object,key)) fail(`${path}.${key}`, 'unknown field');
     for (const [key, child] of Object.entries(spec.object)) walk(child,value[key],`${path}.${key}`);
+    if (spec === schemas.TypeRelationshipFact && value.source.kind !== 'internal') fail(`${path}.source.kind`, 'source must be internal');
     return;
   }
   fail(path, 'invalid schema definition');
