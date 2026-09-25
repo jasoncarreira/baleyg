@@ -12,7 +12,7 @@ function reject(id, field, message) {
 const key = value => JSON.stringify(value);
 const documentKey = x => key([x.sourceSetId,x.language,x.path]);
 const roles=['definition','read','write','call','type','import','alias'];
-const applicable={native:['definition','read','write','call','type','import','alias'],semantic:roles};
+const applicable=language=>language==='java'?roles.filter(x=>x!=='alias'):roles;
 const order = (a,b) => Buffer.compare(Buffer.from(a),Buffer.from(b));
 const languages=['java','rust','python','javascript'];
 const documentOrder=(a,b) => languages.indexOf(a.key.language)-languages.indexOf(b.key.language) || order(a.key.path,b.key.path);
@@ -53,7 +53,7 @@ async function inventory(root,paths) {
   {
     for (const entry of await readdir(root,{withFileTypes:true})) {
       if (entry.name==='fixture.json' || entry.isDirectory()) continue;
-      if (entry.isSymbolicLink() || (!listed.has(entry.name) && /(?:\.json|\.js|\.ts|\.py|\.rs|\.java|\.bin|\.txt)$/.test(entry.name)))
+      if (entry.isSymbolicLink() || (!listed.has(entry.name) && entry.name!=='.DS_Store' && entry.name!=='README.md'))
         reject('IDENTITY.INVENTORY',entry.name,'unlisted root snapshot file or symlink');
     }
   }
@@ -92,7 +92,7 @@ export async function loadFixture(root) {
   for (const producer of [...fixture.producers,...fixture.comparison.producers]) {
     if (!producer.languages.length) reject('IDENTITY.PRODUCER','languages','empty producer languages');
     unique(producer.languages,x=>x,'producers.languages');
-    if (!producer.languages.includes(fixture.language)) reject('IDENTITY.PRODUCER','languages','fixture language unsupported');
+    if (fixture.producers.includes(producer) && !producer.languages.includes(fixture.language)) reject('IDENTITY.PRODUCER','languages','fixture language unsupported');
   }
   unique(fixture.semanticArtifacts,x=>x,'semanticArtifacts');
   unique(fixture.annotationFiles,x=>x,'annotationFiles');
@@ -108,7 +108,7 @@ export async function loadFixture(root) {
         !revision?.documents.some(x=>documentKey(x.key)===documentKey(intent.document)))
       reject('IDENTITY.COVERAGE','coverageIntents','unadmitted producer/document/revision');
     unique(intent.requestedRoles,x=>x,'requestedRoles');
-    if (intent.requestedRoles.some(x=>!applicable[producer.kind].includes(x))) reject('IDENTITY.COVERAGE','requestedRoles','inapplicable role');
+    if (intent.requestedRoles.some(x=>!applicable(intent.document.language).includes(x))) reject('IDENTITY.COVERAGE','requestedRoles','inapplicable role');
     if (intent.measurementSupport.length!==4) reject('IDENTITY.COVERAGE','measurementSupport','four families required');
     unique(intent.measurementSupport,x=>x.kind,'measurementSupport');
     for (const entry of intent.measurementSupport) if (entry.available !== (entry.diagnostic===null))
@@ -174,29 +174,36 @@ export async function loadFixture(root) {
   }
   const semanticFacts=new Map();
   for (const {bytes,value} of semanticBytes) for (const fact of value.facts) {
+    // A normalized provenance basis cannot be embedded in the bytes it hashes.
+    if (fact.kind==='provenance') reject('IDENTITY.SEMANTIC',fact.ref,'raw capture cannot contain normalized provenance');
     const id=key([value.producerId,fact.ref]);
     if (semanticFacts.has(id)) reject('IDENTITY.SEMANTIC','facts','duplicate raw fact');
     semanticFacts.set(id,{fact,hash:contentHash(bytes)});
   }
-  for (const annotation of annotations) for (const fact of annotation.facts) {
-    if (fact.kind==='coverage') continue;
-    if (fact.kind==='provenance' && fact.record.evidenceKind==='measuredSyntax') continue;
-    const provenance=fact.kind==='provenance'?fact.record:
-      annotation.facts.find(x=>x.kind==='provenance' && x.record.id===fact.record?.provenanceId)?.record;
-    if (!provenance) reject('IDENTITY.SEMANTIC',fact.ref,'missing semantic provenance');
-    const raw=semanticFacts.get(key([provenance.producerId,fact.ref]));
-    const normalized=x=>{const copy=structuredClone(x); if (copy.kind==='provenance') { delete copy.record.freshness; if(copy.record.basis) delete copy.record.basis.artifactHash; } return key(copy);};
-    if (!raw || normalized(raw.fact)!==normalized(fact)) reject('IDENTITY.SEMANTIC',fact.ref,'fact absent or contradicts raw capture');
-    if (provenance.basis?.artifactHash!==raw.hash || documentKey(provenance.document)!==documentKey(annotation.document) ||
-        provenance.revisionId!==annotation.revisionId ||
-        (fact.anchor && (documentKey(fact.anchor.document)!==documentKey(annotation.document) || fact.anchor.revisionId!==annotation.revisionId)))
-      reject('IDENTITY.SEMANTIC',fact.ref,'capture basis/document mismatch');
+  const semanticProofs=new Map();
+  for (const annotation of annotations) {
+    const proofById=new Map(annotation.facts.filter(x=>x.kind==='provenance').map(x=>[x.record.id,x.record]));
+    for (const fact of annotation.facts) {
+      if (fact.kind==='coverage' || fact.kind==='provenance') continue;
+      const proofId=fact.kind==='typeRelationship'?fact.provenanceRef:fact.record.provenanceId;
+      const provenance=proofById.get(proofId);
+      if (!provenance || provenance.evidenceKind==='measuredSyntax') reject('IDENTITY.SEMANTIC',fact.ref,'missing semantic provenance');
+      const raw=semanticFacts.get(key([provenance.producerId,fact.ref]));
+      if (!raw || key(raw.fact)!==key(fact)) reject('IDENTITY.SEMANTIC',fact.ref,'fact absent or contradicts raw capture');
+      if (provenance.basis?.artifactHash!==raw.hash || documentKey(provenance.document)!==documentKey(annotation.document) ||
+          provenance.revisionId!==annotation.revisionId ||
+          (fact.anchor && (documentKey(fact.anchor.document)!==documentKey(annotation.document) || fact.anchor.revisionId!==annotation.revisionId)))
+        reject('IDENTITY.SEMANTIC',fact.ref,'capture basis/document mismatch');
+      const existing=semanticProofs.get(provenance.id);
+      if (existing && existing.hash!==raw.hash) reject('IDENTITY.SEMANTIC',fact.ref,'proof spans different captures');
+      semanticProofs.set(provenance.id,raw);
+    }
   }
   const answers=(await jsonFile(root,fixture.answersFile,'AnswersInputV1')).value;
   const dispositions=(await jsonFile(root,fixture.dispositionsFile,'DispositionsV1')).value;
   const anchors=(await jsonFile(root,fixture.anchorCasesFile,'AnchorCasesV1')).value;
   await inventory(root,[...new Set(sourceFiles),...fixture.captures.map(x=>x.file),fixture.nativeArtifact,...fixture.annotationFiles,fixture.answersFile,fixture.dispositionsFile,fixture.anchorCasesFile]);
-  return {root,fixture,comparison:fixture.comparison,selected,revisions,sources,captures,captureBytes,semanticBytes,native,annotations,answers,dispositions,anchors,
+  return {root,fixture,comparison:fixture.comparison,selected,revisions,sources,captures,captureBytes,semanticBytes,semanticProofs,native,annotations,answers,dispositions,anchors,
     sourceManifestHash: revision => sourceManifestHash(revision.documents.map(x=>({document:x.key,contentHash:x.contentHash})))};
 }
 

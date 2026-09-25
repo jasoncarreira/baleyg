@@ -48,10 +48,7 @@ export function checkCapturedBasis(provenance,loaded) {
     'BASIS.LOOKUP_DEPENDENCIES','lookupDependencies','lookup keys cannot be stable IDs');
   for(let i=1;i<deps.length;i++) assert(Buffer.compare(Buffer.from(deps[i-1]),Buffer.from(deps[i]))<0,
     'BASIS.LOOKUP_DEPENDENCIES','lookupDependencies','keys must be sorted and unique');
-  const artifact=loaded.semanticBytes.find(({bytes,value})=>value.producerId===producer.id && contentHash(bytes)===basis.artifactHash);
-  const raw=artifact?.value.facts.find(x=>x.kind==='provenance' && x.record.id===provenance.id);
-  const comparable=x=>{const copy=structuredClone(x);delete copy.freshness;if(copy.basis)delete copy.basis.artifactHash;return JSON.stringify(copy);};
-  assert(raw && comparable(raw.record)===comparable(provenance), 'BASIS.RAW_FACT','provenance','captured semantic provenance absent or changed');
+  assert(loaded.semanticProofs?.get(provenance.id)?.hash===basis.artifactHash, 'BASIS.RAW_FACT','provenance','no matching captured semantic fact for proof');
   return {producer,revision};
 }
 

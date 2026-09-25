@@ -97,8 +97,9 @@ test('IDENTITY.SOURCE_SET and producer descriptors require supported unique admi
 test('IDENTITY.INVENTORY rejects unlisted root files, duplicate annotation and root symlink',async t=>{
  const s=await specimen();t.after(s.cleanup);
  s.fixture.annotationFiles.push(s.fixture.annotationFiles[0]);await s.flush();await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.DUPLICATE'});
- s.fixture.annotationFiles.pop();s.fixture.revisions[0].documents[0].sourceFile='go.js';s.fixture.annotationFiles=['go.js.annotations.json'];s.files['go.js']=s.source;s.files['go.js.annotations.json']=JSON.stringify({formatVersion:1,document:s.document,revisionId:'r1',scenarios:[],facts:[]});delete s.files['src/go.js'];delete s.files['src/go.js.annotations.json'];await rm(join(s.root,'src'),{recursive:true});await s.flush();await writeFile(join(s.root,'unexpected.js'),'x');await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY'});
- await rm(join(s.root,'unexpected.js'));await symlink('/etc/passwd',join(s.root,'unexpected.js'));await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY'});
+ s.fixture.annotationFiles.pop();s.fixture.revisions[0].documents[0].sourceFile='go.js';s.fixture.annotationFiles=['go.js.annotations.json'];s.files['go.js']=s.source;s.files['go.js.annotations.json']=JSON.stringify({formatVersion:1,document:s.document,revisionId:'r1',scenarios:[],facts:[]});delete s.files['src/go.js'];delete s.files['src/go.js.annotations.json'];await rm(join(s.root,'src'),{recursive:true});await s.flush();await writeFile(join(s.root,'unexpected.jsx'),'x');await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY'});
+ await rm(join(s.root,'unexpected.jsx'));await writeFile(join(s.root,'rogue.dat'),'x');await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY'});
+ await rm(join(s.root,'rogue.dat'));await symlink('/etc/passwd',join(s.root,'unexpected.js'));await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.INVENTORY'});
 });
 test('DISCOVERY.PROFILE rejects forged descriptors and nested fixture routing',async t=>{
  const root=await mkdtemp(join(tmpdir(),'discover-negative-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -106,4 +107,17 @@ test('DISCOVERY.PROFILE rejects forged descriptors and nested fixture routing',a
  const s=await specimen();t.after(s.cleanup);await writeFile(join(root,'example','fixture.json'),JSON.stringify({...s.fixture,profile:'corpus'}));
  await assert.rejects(discoverFixtures(root),{assertion:'DISCOVERY.PROFILE'});
  await rm(join(root,'example','fixture.json'));await mkdir(join(root,'example','javascript'));await assert.rejects(discoverFixtures(root),{assertion:'DISCOVERY.PROFILE'});
+});
+
+test('IDENTITY.COVERAGE excludes Java alias but admits Java definition and JS alias',async t=>{
+ const s=await specimen();t.after(s.cleanup);
+ const intent={producerId:'semantic',document:s.document,revisionId:'r1',requestedRoles:['alias','definition'],measurementSupport:['declarationName','callee','invocation','reference'].map(kind=>({kind,available:true,diagnostic:null}))};
+ s.fixture.coverageIntents=[intent];await s.flush();await loadFixture(s.root);
+ const java={...s.document,language:'java'};
+ s.fixture.language='java';s.fixture.sourceSets[0].languages=['java'];
+ for(const producer of [...s.fixture.producers,...s.fixture.comparison.producers])producer.languages=['java'];
+ s.fixture.revisions[0].documents[0].key=java;intent.document=java;
+ s.files['src/go.js.annotations.json']=JSON.stringify({formatVersion:1,document:java,revisionId:'r1',scenarios:[],facts:[]});
+ await s.flush();await assert.rejects(loadFixture(s.root),{assertion:'IDENTITY.COVERAGE',field:'requestedRoles'});
+ intent.requestedRoles=['definition'];await s.flush();assert.equal((await loadFixture(s.root)).fixture.coverageIntents[0].requestedRoles[0],'definition');
 });
