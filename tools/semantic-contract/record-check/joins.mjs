@@ -136,6 +136,9 @@ export function checkJoins(loaded,records,coverage,measurement) {
   if(!owner||!same(owner.document,selector.document)||owner.revisionId!==selector.revisionId)
    reject('JOIN.OWNER','anchor.ownerRef','anchor owner is not a declaration in its source snapshot');
   const anchor={document:selector.document,revisionId:selector.revisionId,contentHash:selector.contentHash,range:position(source,selector.range),kind:family};
+  const ownerRange=position(source,owner.range);
+  if(anchor.range.start<ownerRange.start||anchor.range.end>ownerRange.end)
+   reject('JOIN.OWNER','anchor.ownerRef','anchor falls outside its admitted measured owner');
   const intent=loaded.fixture.coverageIntents.find(x=>x.producerId===native.producerId&&x.revisionId===selector.revisionId&&same(x.document,selector.document));
   const support=intent?.measurementSupport.find(x=>x.kind===family);
   if(!support)reject('JOIN.SUPPORT','measurementSupport','native family capability absent');

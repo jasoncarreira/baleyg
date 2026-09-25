@@ -8,9 +8,11 @@ import {loadFixture} from '../load.mjs';
 import {checkMeasurement} from '../record-check/measurement.mjs';
 import {checkCoverage} from '../record-check/coverage.mjs';
 import {checkJoins} from '../record-check/joins.mjs';
+import {registerControls,runControl} from './mutations.mjs';
 
 // Independently authored source offsets, digest inputs and expected normalized rows.
 const source='function main() { target(); callback; }\nfunction target() {}\n';
+const alternateSource=kind=>`${source}// admitted ${kind} snapshot\n`;
 const document={sourceSetId:'main',language:'javascript',path:'src/main.js'};
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const canonical=value=>value===null||typeof value!=='object'?JSON.stringify(value):Array.isArray(value)?'['+value.map(canonical).join(',')+']':'{'+Object.keys(value).sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b))).map(k=>canonical(k)+':'+canonical(value[k])).join(',')+'}';
@@ -45,11 +47,12 @@ function makeFact(family,status,ref='fact') {
  const coordinates=(status==='exact'?exactSpans:unmatchedSpans)[family];
  return {kind:factType[family],ref,anchor:{document,revisionId:'r1',contentHash,kind:family,range:span(...coordinates),ownerRef:owned[family]},record:structuredClone(templates[factType[family]])};
 }
-async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,unselectedProducer=false,mutateFact=null}={}) {
+async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,unselectedProducer=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false}={}) {
  const root=await mkdtemp(join(tmpdir(),'join-u3-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const fs=new Map(),put=(path,value)=>fs.set(path,typeof value==='string'?value:JSON.stringify(value));
  const shifted=emojiPrefix||encoding!=='utf8',offset=shifted?5:0,positionOffset=encoding==='utf16'?3:encoding==='unicodeScalar'?2:offset;
  const sourceText=shifted?'😀\n'+source:source,sourceHash=sha(sourceText);
+ const alternateText=kind=>`${sourceText}// admitted ${kind} snapshot\n`;
  const measuredNative=structuredClone(native);
  if(shifted)for(const row of [...measuredNative.declarations,...measuredNative.calls,...measuredNative.references]){
   for(const key of ['range','nameRange','calleeRange'])if(row[key]){row[key].start+=offset;row[key].end+=offset;}
@@ -57,10 +60,11 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
  }
  if(control){measuredNative.controls.push({ref:'region',nativeId:null,document,revisionId:'r1',ownerRef:'main',parentRef:null,kind:'if',range:span(18+offset,26+offset),arm:null,witnesses:[]});measuredNative.calls[0].regionRefs=['region'];}
  if(declarationSite)measuredNative.references.push({ref:'declaration-ref',nativeId:null,document,revisionId:'r1',ownerRef:'target',range:span(49+offset,55+offset),spelling:'target',witnesses:[witness('spelling',49+offset,55+offset,'target')]});
+ mutateNative?.(measuredNative);
  put('snapshots/src/main.js',sourceText);put('captures/native.json',measuredNative);
  for(const [name,value] of [['native','native-executable'],['semantic','semantic-executable'],['toolchain','toolchain'],['config','config'],['dependency','dependency']])put(`captures/${name}.txt`,value);
  const authored=structuredClone(facts??[makeFact(family,status)]);
- for(const fact of authored){fact.anchor.contentHash=sourceHash;if(shifted){fact.anchor.range.start+=positionOffset;fact.anchor.range.end+=positionOffset;fact.anchor.range.encoding=encoding;}if(declarationSite&&fact.kind==='reference'&&fact.anchor.range.start===18+positionOffset){fact.anchor.range=span(49+positionOffset,55+positionOffset,encoding);fact.anchor.ownerRef='target';fact.record.site='declaration';fact.record.roles=['definition'];}mutateFact?.(fact);}
+ for(const fact of authored){fact.anchor.contentHash=sourceHash;if(shifted){fact.anchor.range.start+=positionOffset;fact.anchor.range.end+=positionOffset;fact.anchor.range.encoding=encoding;}if(callbackSite&&fact.kind==='reference'){fact.anchor.range=span(28+positionOffset,36+positionOffset,encoding);fact.record.roles=['read'];}if(declarationSite&&fact.kind==='reference'&&fact.anchor.range.start===18+positionOffset){fact.anchor.range=span(49+positionOffset,55+positionOffset,encoding);fact.anchor.ownerRef='target';fact.record.site='declaration';fact.record.roles=['definition'];}mutateFact?.(fact);}
  for(let i=1;i<authored.length;i++)authored[i].record.provenanceId=`proof-${authored[i].ref}`;
  if(unselectedProducer){const other=structuredClone(authored[0]);other.ref='fact-b';other.record.provenanceId='proof-b';authored.push(other);}
  put('captures/semantic.json',{formatVersion:1,producerId:'semantic',facts:authored.filter(f=>f.ref!=='fact-b')});
@@ -68,21 +72,43 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
  const captures=[['native','executable','captures/native.txt'],['semantic','executable','captures/semantic.txt'],['toolchain','toolchain','captures/toolchain.txt'],['config','config','captures/config.txt'],['dependency','dependency','captures/dependency.txt'],['artifact','semanticArtifact','captures/semantic.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(fs.get(file))}));
  if(unselectedProducer)captures.push(...[['semantic-b-executable','executable','captures/semantic-b.txt'],['semantic-b-artifact','semanticArtifact','captures/semantic-b.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(fs.get(file))})));
  const revision={id:'r1',sourceSetId:'main',documents:[{key:document,revisionId:'r1',sourceFile:'snapshots/src/main.js'}],toolchainHash:captures[2].hash,configHash:captures[3].hash,dependencyHash:captures[4].hash};
- const basis={producerId:'semantic',producerVersion:'1',producerHash:semanticProducer.executableHash,artifactHash:captures[5].hash,language:'javascript',sourceSetId:'main',revisionId:'r1',sourceManifestHash:sha(canonical([{document,contentHash:sourceHash}])),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
+ const basis={producerId:'semantic',producerVersion:'1',producerHash:semanticProducer.executableHash,artifactHash:captures[5].hash,language:'javascript',sourceSetId:'main',revisionId:'r1',sourceManifestHash:sha(canonical(alternateTuples?[{document,contentHash:sourceHash},{document:{...document,path:'src/other.js'},contentHash:sha(alternateText('document'))}]:[{document,contentHash:sourceHash}])),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
  const proof={id:'proof',producerId:'semantic',document,revisionId:'r1',contentHash:sourceHash,evidenceKind:family==='declarationName'?'declarationBinding':'semanticReference',basis,freshness:'fresh'};
  const proofs=authored.map(fact=>fact.ref==='fact-b'?{...proof,id:'proof-b',producerId:'semantic-b',basis:{...basis,producerId:'semantic-b',producerHash:sha('semantic-b-executable'),artifactHash:sha(fs.get('captures/semantic-b.json'))},freshness:'possiblyStale'}:{...proof,id:fact.record.provenanceId});
  const proofFacts=proofs.map((record,i)=>({kind:'provenance',ref:`proof-fact-${i}`,record}));
  const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:!(status==='unsupported'&&kind===unsupportedFamily),diagnostic:status==='unsupported'&&kind===unsupportedFamily?'native family unavailable':null}));
+ mutateSupport?.(support);
  const coverage=(producerId)=>({producerId,language:document.language,sourceSetId:document.sourceSetId,documentPath:document.path,revisionId:'r1',requested:true,selected:producerId!=='semantic-b',state:producerId==='semantic-b'?'omitted':status==='unsupported'&&unsupportedFamily==='reference'?'partial':'complete',supportedRoles:['read'],observedRoles:producerId==='semantic-b'||status==='unsupported'&&unsupportedFamily==='reference'?[]:['read'],diagnostic:producerId==='semantic-b'?'producer not selected':status==='unsupported'&&unsupportedFamily==='reference'?'reference unavailable':null});
  put('snapshots/src/main.js.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios:[],facts:[...(unselectedProducer?['native','semantic','semantic-b']:['native','semantic']).map(id=>({kind:'coverage',ref:`coverage-${id}`,record:coverage(id)})),...proofFacts,...authored]});
  const selectedSemantic={...semanticProducer,positionEncoding:encoding};
  const unselectedSemantic={...semanticProducer,id:'semantic-b',executableHash:sha('semantic-b-executable'),positionEncoding:encoding};
  const producers=unselectedProducer?[nativeProducer,selectedSemantic,unselectedSemantic]:[nativeProducer,selectedSemantic];
  const fixture={formatVersion:1,profile:'example',language:'javascript',sourceSets:[{id:'main',rootId:'root',languages:['javascript'],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:[nativeProducer,selectedSemantic]},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles:['read'],measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:unselectedProducer?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ if(alternateTuples){
+  const alternatives=[
+   {document:{...document,path:'src/other.js'},revisionId:'r1',file:'snapshots/src/other.js',kind:'document'},
+   {document,revisionId:'r2',file:'snapshots/r2/src/main.js',kind:'revision'},
+   {document:{...document,sourceSetId:'alternate'},revisionId:'r1',file:'snapshots/alternate/src/main.js',kind:'source set'}
+  ];
+  fixture.revisions[0].documents.push({key:alternatives[0].document,revisionId:'r1',sourceFile:alternatives[0].file});
+  fixture.revisions.push({...revision,id:'r2',documents:[{key:document,revisionId:'r2',sourceFile:alternatives[1].file}]});
+  fixture.revisions.push({...revision,sourceSetId:'alternate',documents:[{key:alternatives[2].document,revisionId:'r1',sourceFile:alternatives[2].file}]});
+  fixture.sourceSets.push({id:'alternate',rootId:'alternate-root',languages:['javascript'],dependencies:[]});
+  for(const alt of alternatives){
+   put(alt.file,alternateText(alt.kind));
+   const rows=producers.map(producer=>({kind:'coverage',ref:`coverage-${producer.id}-${alt.revisionId}-${alt.document.path}`,record:{...coverage(producer.id),sourceSetId:alt.document.sourceSetId,documentPath:alt.document.path,revisionId:alt.revisionId}}));
+   const annotation=`${alt.file}.annotations.json`;
+   put(annotation,{formatVersion:1,document:alt.document,revisionId:alt.revisionId,scenarios:[],facts:rows});
+   fixture.annotationFiles.push(annotation);
+   for(const producer of producers)fixture.coverageIntents.push({producerId:producer.id,document:alt.document,revisionId:alt.revisionId,requestedRoles:['read'],measurementSupport:structuredClone(support)});
+  }
+  // The captured semantic proof's manifest includes both documents of r1/main.
+ }
  put('fixture.json',fixture);put('expected/answers.json',{formatVersion:1,answers:[]});put('expected/dispositions.json',{formatVersion:1,assertions:[],callableValueNegatives:[]});put('expected/anchors.json',{formatVersion:1,cases:[]});
  for(const [path,value] of fs){await mkdir(dirname(join(root,path)),{recursive:true});await writeFile(join(root,path),value);}
  const loaded=await loadFixture(root),records=absent();records.comparison=fixture.comparison;records.producers=ordered(structuredClone(fixture.producers));records.sourceSets=ordered(structuredClone(fixture.sourceSets));
- records.revisions=[{...revision,documents:[{key:document,revisionId:'r1',contentHash:sourceHash,byteLength:Buffer.byteLength(sourceText)}]}];records.provenance=proofs;records.coverage=ordered((unselectedProducer?['native','semantic','semantic-b']:['native','semantic']).map(coverage));
+ records.revisions=ordered(fixture.revisions.map(rev=>({...rev,documents:rev.documents.map(item=>({key:item.key,revisionId:item.revisionId,contentHash:sha(fs.get(item.sourceFile)),byteLength:Buffer.byteLength(fs.get(item.sourceFile))}))})));records.provenance=proofs;
+ records.coverage=ordered(loaded.annotations.flatMap(annotation=>annotation.facts.filter(f=>f.kind==='coverage').map(f=>f.record)));
  const asDeclaration=(name,begin,end,nameStart)=>({syntaxId:syntax(name),document,revisionId:'r1',kind:'function',name,lookupKey:name,ancestors:[],key:{kind:'function',name,signature:null,ordinal:0},range:range(begin,end),nameRange:range(nameStart,nameStart+name.length),header:header(name),provenanceId:`native:r1:${syntax(name)}`});
  records.declarations=[asDeclaration('main',0+offset,39+offset,9+offset),asDeclaration('target',40+offset,60+offset,49+offset)].sort((a,b)=>Buffer.compare(Buffer.from(a.syntaxId),Buffer.from(b.syntaxId)));
  records.calls=[{id:callId,ownerSyntaxId:mainId,ordinal:0,document,revisionId:'r1',range:range(18+offset,26+offset),calleeRange:range(18+offset,24+offset),spelling:'target',regionIds:control?[occurrence(mainId,'control',0)]:[],provenanceId:`native:r1:${callId}`}];
@@ -107,19 +133,21 @@ test('admitted source bytes produce exact/unmatched/unsupported joins for all fo
   if(family==='reference')assert.equal(s.records.references.length,status==='exact'?1:0);
  }
 });
-// Raw-fact controls are authored before loading. Normalized controls change only
-// records after admission; neither path borrows an oracle from the validator.
-async function control(t,{name,options={},raw=null,normalized=null,assertion,field,code='invalidRecord'}){
- const baseline=await specimen(t,options);assert.ok(check(baseline),`${name}: admitted baseline`);
- const changed=raw?await specimen(t,{...options,mutateFact:raw}):await specimen(t,options);
- normalized?.(changed.records);
- assert.doesNotThrow(()=>checkCoverage(changed.loaded,changed.records),`${name}: admitted coverage`);
- assert.doesNotThrow(()=>checkMeasurement(changed.loaded,changed.records),`${name}: admitted measurement`);
- assert.throws(()=>check(changed),error=>{
-  assert.equal(error.assertion,assertion,`${name}: assertion`);
-  assert.equal(error.code,code,`${name}: code`);
-  assert.equal(error.field,field,`${name}: field`);return true;
- });
+// Each control reloads authored bytes before validation. The cloned control state is
+// only a switch; it never mutates a loaded raw artifact after admission.
+async function control(t,{name,options={},raw=null,normalized=null,nativeMutation=null,supportMutation=null,changedOptions={},assertion,field,code='invalidRecord'}){
+ const [row]=registerControls([{
+  id:`U3.${name}`,baseline:()=>({changed:false}),mutate:state=>({...state,changed:true}),
+  check:async state=>{
+   const changed=state.changed;
+   const s=await specimen(t,{...options,...(changed?changedOptions:{}),mutateFact:(options.mutateFact||changed&&raw)?fact=>{options.mutateFact?.(fact);if(changed)raw?.(fact);}:null,mutateNative:changed?nativeMutation:null,mutateSupport:changed?supportMutation:null});
+   if(changed)normalized?.(s.records,s.measurement);
+   assert.doesNotThrow(()=>checkCoverage(s.loaded,s.records),`${name}: admitted coverage`);
+   assert.doesNotThrow(()=>checkMeasurement(s.loaded,s.records),`${name}: admitted measurement`);
+   return check(s);
+  },expectedAssertion:assertion,expectedCode:code,expectedField:field
+ }]);
+ return runControl(row);
 }
 
 test('per-fact installed identity, source proof, native refs, and diagnostic-only mapping',async t=>{
@@ -163,7 +191,8 @@ test('bad byte/scalar boundaries and tuple, family, owner, support facts',async 
   ['hash',{},f=>{f.anchor.contentHash=sha('wrong');},'JOIN.TUPLE','anchor'],
   ['encoding',{},f=>{f.anchor.range.encoding='utf16';},'JOIN.TUPLE','anchor.range'],
   ['family',{},f=>{f.anchor.kind='callee';},'JOIN.FAMILY','anchor.kind'],
-  ['owner',{},f=>{f.anchor.ownerRef='absent';},'JOIN.OWNER','anchor.ownerRef'],
+  ['owner absent',{},f=>{f.anchor.ownerRef='absent';},'JOIN.OWNER','anchor.ownerRef'],
+  ['owner measured but wrong',{},f=>{f.anchor.ownerRef='target';},'JOIN.OWNER','anchor.ownerRef'],
   ['utf8 split',{encoding:'utf8',emojiPrefix:true},f=>{f.anchor.range=span(1,4);},'JOIN.TUPLE','anchor.range','invalidRange'],
   ['utf16 surrogate',{encoding:'utf16'},f=>{f.anchor.range=span(1,3,'utf16');},'JOIN.TUPLE','anchor.range','invalidRange'],
   ['scalar out of bounds',{encoding:'unicodeScalar'},f=>{f.anchor.range=span(1,1000,'unicodeScalar');},'JOIN.TUPLE','anchor.range','invalidRange'],
@@ -172,15 +201,45 @@ test('bad byte/scalar boundaries and tuple, family, owner, support facts',async 
  for(const [name,options,raw,assertion,field,code] of rawCases)await control(t,{name,options,raw,assertion,field,code});
 });
 
+test('alternate admitted source tuples, native support and candidate inventory boundaries',async t=>{
+ const alternate=await specimen(t,{alternateTuples:true});
+ assert.equal(check(alternate).joined.get('fact').installedId,refId);
+ assert.equal(alternate.loaded.revisions.size,3);
+ assert.equal(alternate.loaded.revisions.get(JSON.stringify(['main','r1'])).documents.length,2);
+ assert.equal(alternate.measurement.recordByNativeRef.get('target').syntaxId,targetId);
+ for(const name of ['document','revision','source set'])await control(t,{
+  name:`admitted alternate ${name} hash`,options:{alternateTuples:true},
+  raw:fact=>{fact.anchor.contentHash=sha(alternateSource(name));},assertion:'JOIN.TUPLE',field:'anchor'
+ });
+ // Raw document and revision identity cannot bypass the loader's same-annotation
+ // capture check; these controls exercise that earlier admitted-source boundary.
+ for(const [name,raw] of [
+  ['document',f=>{f.anchor.document={...f.anchor.document,path:'src/other.js'};}],
+  ['revision',f=>{f.anchor.revisionId='r2';}],
+  ['source set',f=>{f.anchor.document={...f.anchor.document,sourceSetId:'alternate'};}]
+ ])await control(t,{name:`loader alternate ${name}`,options:{alternateTuples:true},raw,assertion:'IDENTITY.SEMANTIC',field:'fact'});
+ await control(t,{name:'native family falsely unavailable',options:{family:'callee'},supportMutation:support=>{
+  const family=support.find(x=>x.kind==='callee');family.available=false;family.diagnostic='callee unavailable';
+ },assertion:'JOIN.SUPPORT',field:'measurementSupport'});
+ await control(t,{name:'duplicate native candidate rejected upstream',nativeMutation:artifact=>{
+  artifact.references.push({...structuredClone(artifact.references[0]),ref:'duplicate-ref'});
+ },assertion:'ID.ORDINAL',field:'range'});
+ const unmatched=await specimen(t,{status:'unmatched'});
+ const before=check(unmatched).joined.get('fact');
+ unmatched.measurement.candidateRows.push({...unmatched.measurement.candidateRows[0],anchor:before.join.anchor,ownerRef:'main',id:refId,ref:'target-ref'});
+ const after=check(unmatched).joined.get('fact');
+ assert.deepEqual(after,before);assert.equal(after.installedId,null);
+});
+
 test('reference site, roles and measured identity require independently admitted source',async t=>{
  const declaration=await specimen(t,{declarationSite:true});
  assert.equal(check(declaration).expectedReferences[0].site,'declaration');
  for(const [name,raw,assertion,field,options] of [
   ['empty roles',f=>{f.record.roles=[];},'REFERENCE.ROLES','roles',{}],
-  ['false declaration',f=>{f.record.site='declaration';f.record.roles=['definition'];},'REFERENCE.ROLES','site',{}],
+  ['false declaration',f=>{f.record.site='declaration';},'REFERENCE.ROLES','site',{}],
   ['alias lacks definition',f=>{f.record.roles=['alias'];},'REFERENCE.ROLES','site',{}],
   ['misordered roles',f=>{f.record.roles=['call','read'];},'REFERENCE.ROLES','roles',{}],
-  ['false callback call',f=>{f.anchor.range=span(28,36);f.record.roles=['call'];},'REFERENCE.ROLES','roles',{}],
+  ['false callback call',f=>{f.record.roles=['call'];},'REFERENCE.ROLES','roles',{callbackSite:true}],
   ['bad resolution cardinality',f=>{f.record.resolution='ambiguous';},'REFERENCE.RESOLUTION','resolution',{}],
   ['bad target',f=>{f.record.declaredTarget.revisionId='r2';},'REFERENCE.RESOLUTION','declaredTarget',{}]
  ]){
@@ -214,10 +273,22 @@ test('identical repeated facts keep distinct proof contributors; conflicting fac
  const external={kind:'external',symbol:{scheme:'scip',symbol:'pkg external',scope:'global',document:null}};
  for(const [name,mutate,options] of [
   ['roles',f=>{f.record.roles=['read'];},{}],
-  ['site',f=>{f.record.site='use';f.record.roles=['read'];},{declarationSite:true}],
+  ['site',f=>{f.record.site='use';},{declarationSite:true,mutateFact:f=>{f.record.roles=['read'];}}],
   ['resolution',f=>{f.record.resolution='unresolved';f.record.declaredTarget=null;},{}],
   ['target',f=>{f.record.resolution='external';f.record.declaredTarget=external;},{}]
  ])await control(t,{name:`conflicting ${name}`,options:{facts,...options},raw:f=>{if(f.ref==='fact2')mutate(f);},assertion:'REFERENCE.SOURCE',field:'references'});
+});
+
+test('exact Reference membership and fact-linked diagnostic are closed',async t=>{
+ for(const [name,normalized,assertion,field] of [
+  ['exact reference omitted',r=>{r.references=[];},'REFERENCE.SOURCE','references'],
+  ['exact reference extra',r=>{r.references.push({...r.references[0],id:callbackId});r.references=ordered(r.references);},'REFERENCE.SOURCE','references'],
+  ['exact fact diagnostic',r=>{r.referenceJoinDiagnostics.push({factRef:'fact',provenanceId:'proof',join:{anchor:{document,revisionId:'r1',contentHash,range:range(18,24),kind:'reference'},status:'unmatched',candidateIds:[],diagnostic:'unmatched'}});},'JOIN.DIAGNOSTIC','referenceJoinDiagnostics'],
+  ['exact fact proof swap',r=>{r.references[0].provenanceId='proof-other';},'REFERENCE.SOURCE','references']
+ ])await control(t,{name,normalized,assertion,field});
+ for(const status of ['unmatched','unsupported'])await control(t,{name:`${status} duplicate diagnostic`,options:{status},normalized:r=>{
+  r.referenceJoinDiagnostics.push(structuredClone(r.referenceJoinDiagnostics[0]));
+ },assertion:'JOIN.DIAGNOSTIC',field:'referenceJoinDiagnostics'});
 });
 
 test('diagnostics derive candidate and support state, never install unmatched reference',async t=>{
@@ -235,11 +306,8 @@ test('diagnostics derive candidate and support state, never install unmatched re
 
 test('captured-but-unselected semantic producer cannot use valid proof, including unmatched joins',async t=>{
  const selected=await specimen(t);assert.equal(check(selected).joined.get('fact').installedId,refId);
- for(const status of ['exact','unmatched']){
-  const s=await specimen(t,{unselectedProducer:true,status});
-  assert.equal(s.loaded.semanticProofs.has('proof-b'),true);
-  assert.equal(s.coverageResult.semanticProofsById.has('proof-b'),true);
-  assert.equal(s.coverageResult.checkUse({producerId:'semantic',document,revisionId:'r1',provenanceIds:['proof']}).coverage.selected,true);
-  assert.throws(()=>check(s),error=>{assert.equal(error.assertion,'FRESHNESS.USE');assert.equal(error.code,'invalidRecord');assert.equal(error.field,'coverage');return true;});
- }
+ for(const status of ['exact','unmatched'])await control(t,{
+  name:`unselected ${status}`,options:{status},changedOptions:{unselectedProducer:true},
+  assertion:'FRESHNESS.USE',field:'coverage'
+ });
 });
