@@ -24,3 +24,12 @@ export function verifyWitness(source,witness,{within=null}={}) {
   if (bytes.subarray(range.start,range.end).toString('utf8')!==witness.text) throw new Error('WITNESS.BYTES source spelling differs');
   return range;
 }
+
+// A spelling on a call without a measured callee span still needs its own
+// exact-source witness. This never synthesizes a calleeRange from that witness.
+export function verifyCallSpelling(source,call,witness) {
+  if (call.calleeRange !== null || call.spelling === null) throw new TypeError('WITNESS.CALL requires spelling and null calleeRange');
+  if (witness == null) throw new Error('WITNESS.MISSING separate spelling witness required');
+  if (witness.text !== call.spelling) throw new Error('WITNESS.BYTES source spelling differs');
+  return verifyWitness(source,witness,{within:call.range});
+}

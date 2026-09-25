@@ -46,10 +46,22 @@ export function identityRegistry(hash = digest) {
   }
   return {register};
 }
+// Each row describes a native declaration in one immutable document snapshot:
+// {sourceSetId, documentPath, revisionId, container: Key[] (outermost to
+// immediate parent, excluding the document module), kind, name, signature,
+// range:{start,end}, nativeId?}. Native IDs and lookup keys are not identity.
 export function assignOrdinals(rows) {
   const groups = new Map();
   for (const row of rows) {
-    const group = canonicalBytes([row.container, row.kind,row.name,row.signature]).toString('hex');
+    if (typeof row.sourceSetId !== 'string' || !row.sourceSetId ||
+        typeof row.documentPath !== 'string' || !row.documentPath ||
+        typeof row.revisionId !== 'string' || !row.revisionId ||
+        !Array.isArray(row.container) || !row.range ||
+        !Number.isSafeInteger(row.range.start) || !Number.isSafeInteger(row.range.end) ||
+        row.range.start < 0 || row.range.end < row.range.start)
+      throw new TypeError('IDENTITY.ORDINAL invalid snapshot declaration row');
+    const group = canonicalBytes([row.sourceSetId,row.documentPath,row.revisionId,
+      row.container,row.kind,row.name,row.signature]).toString('hex');
     if (!groups.has(group)) groups.set(group,[]);
     groups.get(group).push(row);
   }

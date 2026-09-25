@@ -12,7 +12,10 @@ function decodeEscapes(spelling,language) {
 }
 export function lookupKey(language,spelling) {
   if (!languages.includes(language) || typeof spelling!=='string' || !spelling.length) throw new TypeError('LOOKUP.INPUT invalid language or spelling');
-  if (language==='rust' && spelling.startsWith('r#')) spelling=spelling.slice(2);
+  if (language==='rust' && spelling.startsWith('r#')) {
+    spelling=spelling.slice(2);
+    if (!spelling || spelling.startsWith('#')) throw new SyntaxError('LOOKUP.ESCAPE invalid raw identifier');
+  }
   if (!spelling.length) throw new SyntaxError('LOOKUP.ESCAPE empty identifier');
   const decoded=decodeEscapes(spelling,language);
   if (decoded.includes('\\') || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(decoded)) throw new SyntaxError('LOOKUP.ESCAPE malformed identifier escape');
@@ -30,6 +33,7 @@ export function validateRoles(language,selected,{site,callee=false}={}) {
     if (index<=last) throw new Error('ROLE.ORDER inapplicable, duplicate or unordered role');
     last=index;
   }
+  if (selected.includes('definition') && site!=='declaration') throw new Error('ROLE.DEFINITION requires declaration');
   if (selected.includes('alias') && (site!=='declaration' || !selected.includes('definition'))) throw new Error('ROLE.ALIAS requires declaration and definition');
   if (selected.includes('call') && !callee) throw new Error('ROLE.CALL requires measured callee');
 }

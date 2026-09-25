@@ -23,3 +23,28 @@ test('ROLE.APPLICABILITY alias is absent in Java and requires definition on decl
   assert.throws(()=>validateRoles('javascript',['call'],{callee:false}),/ROLE.CALL/);
   validateRoles('javascript',['read','call'],{callee:true});
 });
+
+test('LOOKUP and ROLE raw spelling, declaration sites and all language roles',()=>{
+  for (const language of ['java','rust','python','javascript']) {
+    assert.deepEqual(applicableRoles(language),language==='java' ? ['definition','read','write','call','type','import'] : ['definition','read','write','call','type','import','alias']);
+    validateRoles(language,['definition'],{site:'declaration'});
+    validateRoles(language,['read','write','type','import'],{site:'use'});
+    validateRoles(language,['read','call'],{site:'use',callee:true});
+    validateRoles(language,['read'],{site:'use',callee:false}); // callback value is not a call
+    assert.throws(()=>validateRoles(language,['definition'],{site:'use'}),/ROLE.DEFINITION/);
+    assert.throws(()=>validateRoles(language,['call'],{site:'use',callee:false}),/ROLE.CALL/);
+    assert.throws(()=>validateRoles(language,['read','read'],{site:'use'}),/ROLE.ORDER/);
+    assert.throws(()=>validateRoles(language,['write','read'],{site:'use'}),/ROLE.ORDER/);
+    assert.throws(()=>validateRoles(language,['bogus'],{site:'use'}),/ROLE.ORDER/);
+    if (language==='java') assert.throws(()=>validateRoles(language,['definition','alias'],{site:'declaration'}),/ROLE.ORDER/);
+    else {
+      validateRoles(language,['definition','alias'],{site:'declaration'});
+      assert.throws(()=>validateRoles(language,['alias'],{site:'use'}),/ROLE.ALIAS/);
+    }
+  }
+  assert.equal(lookupKey('rust','r#name'),lookupKey('rust','name'));
+  assert.throws(()=>lookupKey('rust','r##name'),/LOOKUP.ESCAPE/);
+  assert.throws(()=>lookupKey('rust','r#'),/LOOKUP.ESCAPE/);
+  const key=name=>syntaxId({sourceSet:'core',path:'a.rs',language:'rust',ancestors:[],declaration:{kind:'function',name,signature:null,ordinal:0}});
+  assert.notEqual(key('r#name'),key('name'));
+});
