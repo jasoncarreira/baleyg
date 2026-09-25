@@ -1,149 +1,127 @@
-# MCP read-only contract
+# MCP read-only pilot: first-release wire contract
 
-Status: **direction accepted by the owner (2026-09-23); the mechanics in this document are proposed
-until Stage 1 ratifies them.** It binds to MCP specification revision `2026-07-28` and its stdio
-transport, and defines the agent-facing surface of the [local topology](local-topology.md). It
-supersedes the earlier grant-based pilot contract: grants, principals, budgets, enrollment latching,
-grant handoff files and HTTP tool routes are removed.
+**Status: normative for future #17 implementation; no server or interoperability test is shipped by this document.** This is the agent-facing projection of [#22 semantic evidence](semantic-evidence/contract-v1.md) and [#23 local topology](local-topology.md). #22 owns evidence meaning, identity, validity, coverage and provenance; #23 owns coherent snapshot eligibility. This document owns only the wire projection. The configured client launches `baleyg mcp` for one workspace selected by [#23 discovery](local-topology.md#workspace-discovery). The OS user, not an MCP principal or grant, is the boundary. No network listener, authentication role, ACP permission or tool annotation enforces access. Configuring an agent can disclose indexed checkout text to that agent/provider; repository text is untrusted data.
 
-## Boundary
+Tools use cached source/index projections, never live files. They never request indexing, start a producer/build, run repository code, open a terminal, invoke a provider or make a durable write. Background index work belongs to process leadership. No storage table, class or implementation mechanism is prescribed. There are four tools in catalog order: `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect`, `baleyg_read_source`. Inspect accepts **only** `declaration` and `outgoing_calls`.
 
-- `baleyg mcp` is a stdio MCP server launched by an agent client. It serves exactly one workspace,
-  chosen by the [discovery order](local-topology.md#workspace-discovery), for its whole lifetime, and
-  opens no network listener.
-- Tools read only cached source and indexed evidence. No tool triggers indexing, runs a semantic
-  producer, builds, downloads, writes durable data, calls a provider, executes repository code, opens
-  a terminal, reads the live working tree, or selects another workspace.
-- The catalog has four tools: `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect`,
-  `baleyg_read_source`. The first release of `baleyg_inspect` has three views: `declaration`,
-  `outgoing_calls` and `incoming_calls`, over syntax-tier evidence. Later stages add `call_paths`,
-  `usages`, `type_hierarchy`, `implementations` and `coverage`, and semantic evidence in every view,
-  without changing existing schemas.
+## Protocol, negotiation and transport
 
-Direct terminal agents, agents in Herdr panes, and agents reached through ACP use the same server:
+Normative modern revision: [official MCP 2026-07-28, commit `0cb6c6a31768cbb16129b35e6b569a31fecfe1b6`](https://github.com/modelcontextprotocol/specification/blob/0cb6c6a31768cbb16129b35e6b569a31fecfe1b6/docs/specification/2026-07-28/basic/index.mdx#L322-L409); see [discovery](https://github.com/modelcontextprotocol/specification/blob/0cb6c6a31768cbb16129b35e6b569a31fecfe1b6/docs/specification/2026-07-28/server/discover.mdx#L7-L59), [schema](https://github.com/modelcontextprotocol/specification/blob/0cb6c6a31768cbb16129b35e6b569a31fecfe1b6/schema/2026-07-28/schema.ts#L35-L110) and [stdio](https://github.com/modelcontextprotocol/specification/blob/0cb6c6a31768cbb16129b35e6b569a31fecfe1b6/docs/specification/2026-07-28/basic/transports/stdio.mdx#L7-L85). Support **exactly one** legacy revision, `2025-11-25`; no general older-SDK guarantee.
 
-```json
-{ "mcpServers": { "baleyg": { "command": "baleyg", "args": ["mcp"] } } }
-```
+Use one newline-delimited UTF-8 JSON-RPC 2.0 message per line, **not** Content-Length framing. Stdout carries protocol messages only, stderr diagnostics only. Reject batches. IDs are non-null strings or safe integers; an outstanding ID cannot be reused. EOF cancels outstanding work and exits. Do not promise detecting client `kill -9` while another process keeps stdin open. A valid `notifications/cancelled` has `{requestId,reason?:string}`; suppress every further response for that outstanding request, even a tool error. Ignore unknown/completed IDs and unknown notifications without responses. Cancellation overrides an unsent result.
 
-A remote agent cannot reach a local stdio server; that needs a separately secured bridge.
+Modern mode has **no** initialize/initialized exchange. Each request has `params._meta` with literal keys `"io.modelcontextprotocol/protocolVersion":"2026-07-28"` and `"io.modelcontextprotocol/clientCapabilities":{}` (or valid capabilities); optional `"io.modelcontextprotocol/clientInfo"` follows MCP `Implementation`. These are single namespaced keys, not dotted nested objects. Notifications need no request metadata. `server/discover` takes only this protocol `_meta` and returns exactly `{resultType:"complete",supportedVersions:["2026-07-28","2025-11-25"],capabilities:{tools:{}},serverInfo:{name:"baleyg",version:<build-version>}}`. Omit instructions, TTL and cache scope. Advertise no subscriptions, sampling, elicitation, prompts, resources, tasks or client roots; empty client capabilities suffice.
 
-## Protocol and lifecycle
+`tools/list` takes only protocol metadata and returns `{tools:[<four catalog entries>]}` in catalog order, without pagination or next cursor; supplied cursor is a protocol parameter error. Each entry has its closed input schema below and an output schema that is the success/error envelope union. Each advertises `readOnlyHint:true`, `destructiveHint:false`, `idempotentHint:true`, `openWorldHint:false`. These are hints, not permissions or a promise that repeat reads have the same basis. `tools/call` takes `{name,arguments,_meta}`. Both success and failure tool results contain `{isError:<boolean>,structuredContent:<envelope>,content:[{type:"text",text:<JSON encoding of the identical envelope>}]}`. Decode the text to the same envelope; count **both** copies toward the response cap. This compatibility duplication costs tokens.
 
-- MCP `2026-07-28`, stateless: every request carries its protocol version and capabilities in `_meta`.
-  The server answers `server/discover`, `tools/list` and `tools/call`. Stage 1 decides which earlier,
-  `initialize`-based revisions it also accepts, based on the agent clients in use.
-- stdio framing: one newline-delimited UTF-8 JSON-RPC message per line. Stdout carries only protocol
-  messages; diagnostics go to stderr. Cancellation arrives as `notifications/cancelled`.
-- The server exits when stdin reaches end-of-file. It never daemonizes or outlives its client.
-- **Startup.** The server tries the leader lock. As leader it runs the catch-up scan, or the initial
-  index, on a background thread; this is part of process start, not of any tool call.
-  `server/discover` and `tools/list` answer immediately. Until the index is reconciled, describe
-  reports `indexing` or `reconciling` with progress, and evidence tools return `index_not_ready`.
+Legacy mode starts with MCP `initialize` carrying `protocolVersion`, `capabilities`, `clientInfo`; respond with `protocolVersion:"2025-11-25"`, `capabilities:{tools:{}}`, `serverInfo:{name:"baleyg",version:<build-version>}`. A different requested revision receives this supported revision per legacy negotiation; an incompatible client must disconnect. Wait for `notifications/initialized` before list/call; then use negotiated connection state, not modern required metadata. Repeated initialize and premature tool requests fail `-32600`. Select connection mode on the first valid modern request or initialize; reject switching modes. Cancellation remains available during work.
 
-## Evidence basis and pins
-
-Every evidence result comes from one SQLite read transaction and reports
-`evidenceBasis: {indexGeneration, indexRevision}`. Pins are optional:
-
-- `expectedBasis` (`indexGeneration` and `indexRevision` together; a revision alone is rejected as
-  `invalid_request`), when supplied and not current, returns `revision_conflict` with `currentBasis`.
-- `baleyg_read_source` may take `expectedContentHash`; if the cached file's hash differs it returns
-  `revision_conflict` with the current hash.
-
-## Result fields
-
-Every evidence item reports `evidenceTier` (`syntax` or `semantic`), `semanticBasis` (`null` for
-syntax), `freshness` (`fresh`, `possiblyStale`, `stale`, `unavailable`), `staleBecause` (reasons; empty
-when fresh), and for bindings a `disposition`: `resolved`, `external`, `ambiguous`, `unresolved`,
-`unsupported`, `dynamic`, `declarationOnly` or `staleTarget`. Freshness never promotes a disposition.
-A `staleTarget` binding has no current target ID and is never presented as resolved. In the first
-release every item is `syntax`, so these fields are present with syntax values and later stages only
-add semantic values.
-
-## Tools
-
-All inputs are JSON objects with `schemaVersion: 1`; unknown fields are rejected. Tool annotations
-are hints, not permissions.
-
-| Tool | Input | Output |
-| --- | --- | --- |
-| `baleyg_workspace_describe` | none | Workspace label (not an absolute path), current basis, index state and progress, per-language extraction tier and coverage, tool and schema versions, limits |
-| `baleyg_find_symbols` | `query` (literal name/ID substring, 1–256 UTF-8 bytes), optional `limit` (default 20, 1–50), optional pin | Symbol summaries: stable ID, name, kind, relative path, range, content hash, result fields; no source body |
-| `baleyg_inspect` | `symbolId` (1–8192 bytes), `view`, view-specific bounds, optional pin | `declaration`: declaration metadata. `outgoing_calls` / `incoming_calls`: depth-one call sites with call-site IDs, ranges, target or caller IDs, result fields, and bounded literal `calleeText`; max 50 calls |
-| `baleyg_read_source` | `path`, `startLine`, `endLine`, optional `expectedContentHash` or pin | Cached text only, content hash, exact line/byte range; max 200 lines and 16 KiB |
-
-Paths are validated relative indexed paths: no absolute path, backslash, colon, NUL, empty, `.` or `..`
-segment; max 4096 UTF-8 bytes. Lines are 1-based inclusive within the cached file; byte offsets are
-0-based UTF-8 half-open. Tools never open a source path on disk.
-
-An unresolved call site still records measured call syntax. Never promote a candidate or unresolved
-target to a resolved or runtime binding. Serialize an explicit projection, never native DTOs:
-`calleeText` is capped at 1024 UTF-8 bytes per call at a code-point boundary with
-`calleeTextTruncated: true`. Symbol lookup uses literal `lower`/`instr` semantics with deterministic
-ordering (exact name, name prefix, other substring; then name/ID). Calls are ordered by path, range and
-ID. Fetch one extra record to detect truncation; never report a clipped list as complete.
-
-Success envelope: `{schemaVersion: 1, requestId, evidenceBasis, data, warnings, truncated,
-truncationReason}`.
-
-## Bounds
-
-16 KiB request, 64 KiB complete response, 16 KiB source text, 5-second deadline, small per-process
-concurrency cap. Over-cap limits are rejected, not expanded. There are no per-session budgets; per-call
-limits do not bound aggregate use across many processes of one user.
-
-## Errors
-
-Failures return a tool result with `isError: true` and
-`{schemaVersion: 1, error: {code, message, retryable, currentBasis}, requestId}`, where `currentBasis`
-is the current basis or `null`. Malformed requests use protocol errors. Errors never expose SQL,
-absolute paths outside the workspace, or source.
-
-| Code | Meaning |
+| Protocol condition | JSON-RPC error |
 | --- | --- |
-| `invalid_request`, `range_too_large` | Malformed or over-limit input |
-| `revision_conflict` | A supplied pin or content hash is not current; re-query |
-| `index_not_ready` | Initial index or post-restart reconciliation still running; retryable |
-| `not_found` | Missing symbol or cached path at the current basis |
-| `too_many_requests` | Concurrency cap reached; retryable |
-| `deadline_exceeded` | Bounded work cancelled; no partial evidence |
-| `store_unavailable` | Index unreadable and being rebuilt, or the workspace root no longer names the directory this server started in; no repair from a tool call |
+| Malformed JSON or UTF-8 | `-32700` |
+| Invalid JSON-RPC shape, batches, oversized input, lifecycle violation | `-32600` |
+| Unknown method | `-32601` |
+| Invalid protocol parameters, missing modern metadata, supplied list cursor, unknown tool | `-32602` |
+| Unexpected internal protocol failure | `-32603` |
+| Unsupported modern revision | `-32022` |
 
-On cancellation, interrupt the read where supported and emit nothing further for that request.
+`-32021` is reserved for genuinely required missing client capability (none here); `-32020` HeaderMismatch does not apply to stdio. Bad **application** arguments to a known tool instead return the typed error envelope. Oversized wire input is discarded through its line delimiter and receives bounded `-32600`; malformed parsing has `-32700` precedence when no valid request was obtained.
 
-## Threat limits
+### Compatibility decision (W7)
 
-The boundary is the OS user; tools add bounded, typed, read-only access, not isolation. Configuring the
-server discloses the whole indexed checkout to the agent and its provider. MCP cannot attest the
-downstream provider. Repository text is untrusted evidence. Jev/ACP allowances are untouched.
+| Recorded evidence | Honest conclusion |
+| --- | --- |
+| Pinned [MCP TypeScript SDK 1.30.0](../tools/selection/package.json), [supported revisions](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/types.ts#L4-L6), [client initialization](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/client/index.ts#L464-L505) and [offline initialize/list/call smoke](../tools/selection/acp-smoke.test.mjs) | Supports `2025-11-25`; justifies the legacy target, **not** tested Baleyg interoperability. |
+| [Claude Code 2.1.266, Claude ACP 0.79.0 and underlying Claude Agent SDK 0.3.274](research/selection/ACP-SETUP.md); [successful Claude ACP experiment](research/selection/SMOKE-RESULTS.md) | Initialize-era MCP and an ACP experiment are recorded. ACP wire version 1 is **not** an MCP revision. Exact MCP negotiation was not recorded; legacy mode is a target for #17 fixture verification, not certified Claude/modern support. |
+| [Codex CLI 0.150.1, Codex ACP 1.12.0 and legacy ACP 0.16.0](codex-acp-check.md) | Considered, not certified. CLI inference smoke proves neither ACP/MCP interoperability nor the evidence-only boundary. |
 
-## Acceptance tests
+## Shared schema and limits
 
-Fixtures and a synthetic MCP client; no model, provider, repository commands or builds.
+Every application object is closed: unknown fields fail. All fields are required unless marked `?` optional; a nullable field is **present**, with null allowed. Explicit null is invalid for an optional non-null input. JSON `UInt` is `[0,2^53-1]`; strings contain valid Unicode scalars; byte limits count UTF-8, never characters. Import #22's [Text, Language, Kind, Range, SyntaxId, OccurrenceId](semantic-evidence/contract-v1.md#conventions-and-shared-types), [DocumentKey, Coverage, Provenance, SemanticBasis](semantic-evidence/contract-v1.md#identity-and-coverage), [freshness](semantic-evidence/contract-v1.md#basis-and-freshness), [Declaration](semantic-evidence/contract-v1.md#records-and-bindings), [CallBinding](semantic-evidence/contract-v1.md#dispatch), [Hash](semantic-evidence/contract-v1.md#conventions-and-shared-types) and [canonical IDs](semantic-evidence/contract-v1.md#stable-identifiers), and [warnings-v1](semantic-evidence/contract-v1.md#warning-completeness-warnings-v1) without redefining their nested fields or invariants. `Range` is zero-based, half-open, UTF-8 scalar-aligned. A symbol ID is canonical `sid:v1:` plus 32 lowercase hex digits; examples below use illustrative valid-shaped IDs, **not** #22 identity vectors.
 
-1. **Happy path:** describe → find → inspect (all three views) → read_source, with matching basis and
-   hashes, from a direct-terminal client and an ACP-bridge fixture, with identical schemas.
-2. **Workspace:** launched in a subdirectory, a linked worktree, a submodule, and a non-Git root, the
-   server serves exactly the chosen workspace; two worktrees never see each other's evidence; home and
-   filesystem root are refused without `--workspace`.
-3. **Lifecycle:** stdin end-of-file and `kill -9` of the client leave no server process; a restart
-   needs no owner action.
-4. **Startup:** with no index, `server/discover` and `tools/list` answer within their deadlines while
-   indexing runs; evidence tools return `index_not_ready`, then succeed.
-5. **Leader:** with several servers on one checkout, exactly one watches and writes; killing it makes
-   another take over, reconcile, and serve again; edits made while no leader ran are published by the
-   successor's catch-up reconcile. Apart from the documented takeover window, no evidence is served
-   until that reconcile completes; during the window, a reader may serve the previous leader's last
-   reconciled, basis-labelled revision, which does not yet include those edits. A crashed leader's
-   `reconciled` marker is never accepted once the successor has recorded its incarnation. Moving the
-   checkout, or putting a different directory at its path, stops the old server from serving it.
-6. **Live edits:** an edit is reflected within the ratified incremental budget; a body-only edit keeps
-   every declaration ID; an added declaration resolves a previously unresolved call elsewhere.
-7. **Pins:** a stale `expectedBasis` or `expectedContentHash` conflicts with the current basis; a
-   revision without its generation is rejected; omitted pins answer from the current revision; no
-   answer mixes revisions.
-8. **No side effects:** tool calls start no indexing, producer, build, download, provider call or
-   durable write, and never read the live working tree.
-9. **Bounds and cancellation:** malformed or oversized inputs fail or report exact truncation; a
-   cancelled or timed-out read emits nothing afterwards.
+| Wire type | Exact shape and rule |
+| --- | --- |
+| `Basis` | `{indexGeneration:string,indexRevision:UInt}`; generation is fresh on creation/rebuild, non-nil lowercase canonical UUID; revision advances per successful publication. Not #22 revision ID: the snapshot unambiguously maps to each evidence record's source-set/revision identity; inconsistent mapping fails `store_unavailable`. |
+| `Evidence` | `{evidenceTier:"syntax"\|"semantic",semanticBasis:SemanticBasis\|null,freshness:"fresh"\|"possiblyStale"\|"stale"\|"unavailable",staleBecause:string[]}`. Successful first-release value is **only** `syntax,null,fresh,[]`, relative to eligible captured snapshot, not instantaneous disk. No unavailable placeholder or promised schema-compatible automatic semantic expansion. |
+| `Symbol` | `{symbolId:SyntaxId,name:Text\|null,kind:Kind,document:DocumentKey,range:Range,nameRange:Range\|null,contentHash:Hash,provenanceId:Text,...Evidence}`; preserve #22 name/nullability and identity. No display key replaces an ID. |
+| `Warning` | `{code:"coverageIncomplete"\|"staleEvidence"\|"staleTarget"\|"bindingAmbiguous"\|"syntaxOnly",message:Text,provenanceId:Text\|null}`. |
+| `Limits` | `{requestBytes:16384,responseBytes:65536,sourceBytes:16384,sourceLines:200,defaultLimit:20,maxLimit:50,calleeTextBytes:1024,deadlineMs:5000,concurrency:4}`. |
+
+Success envelope: `{schemaVersion:1,requestId,evidenceBasis:Basis|null,data,warnings:Warning[],partial:boolean,truncated:boolean,truncationReason:null|"response_bytes"|"limit"|"callee_text"}`. `requestId` equals the outer JSON-RPC ID. Only describe may succeed with a null basis. There is no `ok` wrapper. Failure: `{schemaVersion:1,requestId,error:{code,message,retryable,currentBasis:Basis|null,currentContentHash:Hash|null}}`, without success fields or evidence, and `isError:true`. A non-null current basis is safely verified eligible; otherwise null. A non-null current hash occurs **only** for a hash mismatch at a found cached path, never from disk.
+
+Find and both inspect data objects contain `coverage:Coverage[]` and `provenance:Provenance[]`. Inspect coverage contains **all relevant native tuples** for selected declaration and returned measured calls. Find coverage contains **every native tuple in the searched workspace/snapshot**, including selected and unselected, regardless of matches, limit or returned symbol count. Include selected failed/partial tuples recorded by the eligible snapshot. Provenance is the complete closure for returned evidence; do not fabricate it for failed extraction or negative search. Sort coverage by `(producerId,language,sourceSetId,documentPath,revisionId)` with #22 enum/byte order and provenance by ID. Missing required rows, corrupt digests or mixed revisions are hard failures (`store_unavailable`), never best-effort warnings. Describe and read_source have neither array.
+
+## Tool catalog
+
+### `baleyg_workspace_describe` (W1)
+
+Input exactly `{schemaVersion:1}`; no pins or indexing flags. Data exactly `{workspaceLabel:Text,indexState:"indexing"|"reconciling"|"ready"|"unavailable",progress:{completed:UInt,total:UInt|null}|null,watcherDegraded:boolean,languages:LanguageStatus[],toolVersion:1,schemaVersion:1,limits:Limits}`. Label is not an absolute path. `completed<=total` when total known; progress null if ready, unavailable or unmeasured. `LanguageStatus={language:Language,evidenceTier:"syntax",coverage:{selected:UInt,complete:UInt,partial:UInt,failed:UInt,unselected:UInt}}`; these count native coverage tuples, **not** universal language capabilities, and complete+partial+failed=selected. When ready return exactly four languages in #22 order (java, rust, python, javascript), even with zero counts. Otherwise `languages:[]`, null basis, no previous coverage advertised as current. Describe warnings=[], truncated=false, truncationReason=null; partial iff not ready or any selected partial/failed count is nonzero.
+
+### `baleyg_find_symbols` (W2)
+
+Input `{schemaVersion:1,query:string,limit?:UInt,expectedBasis?:Basis}`. Query is 1–256 UTF-8 bytes, literal name/ID substring: no trimming, regex, glob, wildcard or Unicode normalization. Use SQLite built-in ASCII `lower` and literal `instr`. Default limit 20; accepted 1–50. Search all admitted source sets/documents at one eligible snapshot, with no path/language/source-set filter. Rank exact case-folded name, name prefix, other name/ID substring; ID-only is rank three. Tie-break original name (null first), then ID in UTF-8/ASCII byte order. Fetch one extra match to detect omitted rows. Data exactly `{symbols:Symbol[],coverage:Coverage[],provenance:Provenance[]}`. No snippets or bodies. No hit is `symbols:[]`, **not** not_found, while full searched-scope coverage remains. Selected failed/partial coverage sets partial and one aggregate `coverageIncomplete` warning before `syntaxOnly`; an unselected omitted/unsupported row alone does neither. Empty symbols cannot prove complete extraction.
+
+### `baleyg_inspect` (W3–W4)
+
+Closed discriminated request union: `{schemaVersion:1,symbolId:SyntaxId,view:"declaration",expectedBasis?:Basis}` OR `{schemaVersion:1,symbolId:SyntaxId,view:"outgoing_calls",limit?:UInt,expectedBasis?:Basis}`. IDs retain an 8192-byte ceiling and must have canonical #22 syntax. Invalid syntax gives `invalid_request`; absent valid ID gives `not_found`. Declaration rejects `limit`, `depth` or graph budgets; outgoing uses default 20 and accepted range 1–50. Every other view is `invalid_request`, not an empty projection.
+
+Declaration data exactly `{declaration:Declaration,contentHash:Hash,evidence:Evidence,coverage:Coverage[],provenance:Provenance[]}`. Import #22 Declaration's syntaxId/document/revisionId/kind/name/lookupKey/ancestors/key/range/nameRange/header/provenanceId and measured array order. Do not add source body, guessed type or durable-anchor schema. A body-only edit can keep syntax ID yet change content hash/basis; a complete old pin conflicts rather than silently selecting another revision.
+
+Outgoing data exactly `{symbolId:SyntaxId,calls:CallItem[],coverage:Coverage[],provenance:Provenance[]}`. `CallItem` exactly `{callId:OccurrenceId,ownerSyntaxId:SyntaxId,ordinal:UInt,document:DocumentKey,revisionId:Text,range:Range,calleeRange:Range|null,contentHash:Hash,provenanceId:Text,calleeText:string|null,calleeTextTruncated:boolean,binding:CallBinding|null,disposition:"resolved"|"external"|"ambiguous"|"unresolved"|"unsupported"|"dynamic"|"declarationOnly"|"staleTarget",targetId:SyntaxId|null,boundaryReason:"missingEvidence",...Evidence}`. First release fixes binding=null, disposition=unresolved, targetId=null and boundaryReason=missingEvidence; native lookup candidates are **not** producer-established #22 bindings. Emit each measured call whose owner is the selected declaration once; exclude nested callable bodies. Depth-one measured sites, not graph traversal. Order by `(document.path,range.start,range.end,callId)`. Complete relevant coverage and no measured calls allow an empty complete answer; incomplete coverage cannot support that claim. Read calleeText only from cached calleeRange; absent range means null/false. Clip at 1024 UTF-8 bytes on a scalar boundary and flag clipping; never export unbounded native spelling or arbitrary body/invocation text. #22 [resolution cardinalities and expansion](semantic-evidence/contract-v1.md#dispatch) remain authoritative: no semantic expansion, guessed target or runtime edge in this release.
+
+### `baleyg_read_source` (W5)
+
+Input `{schemaVersion:1,path:string,startLine:UInt,endLine:UInt,expectedBasis?:Basis,expectedContentHash?:Hash}`; both guards may coexist and must pass. Indexed root-relative POSIX path, 1–4096 UTF-8 bytes: reject absolute paths, backslash, colon, NUL, and empty/`.`/`..` segments; no normalization or disk fallback. Data exactly `{path,contentHash:Hash,startLine:UInt,endLine:UInt,byteRange:Range,text:string,evidence:Evidence}`. Lines are 1-based inclusive, `1<=start<=end<=cached line count`. Locate lines by raw LF byte `0x0a` before decoding; preserve CRLF; final LF adds no empty line; empty file has zero selectable lines. Once guards and bounds pass, **strictly decode only selected cached bytes as UTF-8**. Invalid selection returns `unsupported_encoding`, retryable=false, safely verified currentBasis and null currentContentHash; never replacement U+FFFD, byte loss, transcoding, normalization, base64, changed cache/hash or live-file access. Invalid bytes elsewhere do not prevent a valid selected slice. Successful decoded text re-encodes byte-for-byte to that slice including terminators; contentHash is SHA-256 of the **whole original cached file**. At most 200 lines and 16384 raw selected bytes (equal to successful text UTF-8 length); oversized, reversed or out-of-file selections fail, never clip. Source bytes are not fabricated #22 provenance.
+
+## Result completeness, bounds and failure precedence
+
+Find/declaration/outgoing `partial` iff truncated, returned selected coverage incomplete, or a returned boundary call. Thus nonempty syntax-only outgoing calls are partial without a dedicated warning. Source success is never partial/truncated; describe follows its status rule. For evidence responses apply [#22 warnings-v1](semantic-evidence/contract-v1.md#warning-completeness-warnings-v1) with selection `semanticProducerId=null`: `syntaxOnly/null` is required even for empty find and source. Selected failed/partial coverage adds `coverageIncomplete/null`. Other triggers are #22 stale provenance per ID, possiblyStale aggregate/null, staleTarget per binding provenance and ambiguous binding per provenance; unreachable under valid fresh syntax-only first release. Deduplicate `(code,provenanceId)`; order by declared enum **coverageIncomplete, staleEvidence, staleTarget, bindingAmbiguous, syntaxOnly**, then null-before-text provenance and message. No unresolved/unsupported/truncation warning.
+
+Request cap 16384 bytes counts UTF-8 JSON-RPC line excluding delimiter. Response cap 65536 counts **complete serialized JSON-RPC line including both content representations**. For lists choose longest fitting ordered item prefix, recompute provenance closure and warnings; never trim identity, mandatory coverage or provenance. Find's entire searched-scope coverage is fixed overhead, even for zero hits. If it alone plus envelope, or the first required item plus closure, cannot fit, return `range_too_large`: do not shrink search scope or falsely report complete empty results. Single-object/source outputs fail rather than truncate. Truncation reason priority: `response_bytes`, then `limit`, then `callee_text`. Exactly meeting a cap is not truncated; clipped callee sets partial/truncated even when all call rows fit. Four concurrent admitted calls; fifth receives `too_many_requests` without queueing. Five-second admitted-call deadline returns `deadline_exceeded` with no partial evidence unless cancellation suppresses output.
+
+| Typed error code | Condition / retryability |
+| --- | --- |
+| `invalid_request` | Bad application field, path, ID, partial/malformed pin, reversed range; false |
+| `range_too_large` | Numeric cap, source/response size, out-of-file range; false |
+| `unsupported_encoding` | Selected cached source slice invalid UTF-8; false |
+| `revision_conflict` | Complete basis or found cached path hash mismatch; false (change guards) |
+| `index_not_ready` | No eligible reconciled index; true |
+| `not_found` | Valid ID or cached path missing; false |
+| `too_many_requests`, `deadline_exceeded` | Admission cap or deadline; true |
+| `store_unavailable` | Unreadable/invalid store, missing coverage, broken root; false (no automatic same-call retry) |
+
+The output-schema failure enum includes **all nine** codes including `unsupported_encoding`. Sanitize error messages: no SQL, source, credentials or absolute roots. Validate application fields before admission, readiness, basis comparison, object lookup, hash comparison, range/materialization and final eligibility check, in that order. Startup gives `index_not_ready` before comparing a complete pin; stale complete pin conflicts before not_found; hash guard follows successful cached path lookup. A selected encoding error is not store corruption and requests no repair. Cancellation overrides all unsent outcomes.
+
+## Snapshot eligibility (W8)
+
+Discover/list operate during startup. Describe reports status; evidence tools need eligible snapshot. Use [#23 reader checks](local-topology.md#leader) on root pathname/opened identity, held leader lock and reconciled incarnation **before and after** materializing one SQLite snapshot. Discard rejected responses. Invalid/replaced/unreadable root or store → `store_unavailable`; absent leader, incarnation mismatch or reconciliation → `index_not_ready`. Do not leak rejected snapshot as currentBasis. A normal later publication does not invalidate a coherent in-flight snapshot whose checks pass; guards compare **inside that snapshot**. No mixed graph/source revision, historical fallback or linearizable filesystem freshness.
+
+| Situation | Eligibility |
+| --- | --- |
+| No leader or initial indexing/reconciling | No evidence; describe status, evidence `index_not_ready`. |
+| Successor has acquired flock, not yet published fresh incarnation | Follower **may** serve predecessor's last reconciled basis-labelled snapshot if checks pass. Suspension means no finite wall-clock bound; no deliberate work before incarnation write. |
+| Fresh successor incarnation visible, before full reconcile | Old snapshot unavailable; `index_not_ready`. |
+| Full root-checked successor reconcile committed | New coherent eligible basis. |
+| Root removed/replaced/unreadable or invalid store | Discard evidence; `store_unavailable` and no rejected currentBasis. |
+| Rebuild/new generation | Old complete generation pin conflicts at eligible new basis; incompatible old store never fallback. |
+| Normal publication while reading eligible revision R | In-flight response can remain at coherent R after publication R+1 if root/incarnation checks pass; pin compares at R. |
+
+## Hand-reviewed contract checks (not executed tests)
+
+The compact projections below use `B={indexGeneration:"123e4567-e89b-42d3-a456-426614174000",indexRevision:7}`, `S="sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`, `H="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`. These are **illustrative valid-shaped tokens**, not computed #22 identity vectors. `E={evidenceTier:"syntax",semanticBasis:null,freshness:"fresh",staleBecause:[]}`. `success(data,B,partial,truncated,reason,warnings)` abbreviates the **exact** success envelope above, with schemaVersion=1, matching outer requestId and expanded data schema; it never authorizes omitted fields in a real response. `failure(code,basis,hash)` abbreviates the exact error envelope with sanitized nonempty message, retryable per table and matching ID. Example `Coverage`/`Provenance` rows must expand every #22-required nested field; shorthand names below refer to complete valid rows, not alternative schemas.
+
+**W1 status.** `tools/call` arguments `{schemaVersion:1}` on startup yields success data `{workspaceLabel:"checkout",indexState:"indexing",progress:{completed:0,total:null},watcherDegraded:false,languages:[],toolVersion:1,schemaVersion:1,limits:{requestBytes:16384,responseBytes:65536,sourceBytes:16384,sourceLines:200,defaultLimit:20,maxLimit:50,calleeTextBytes:1024,deadlineMs:5000,concurrency:4}}`, basis=null, partial=true, warnings=[], truncated=false, reason=null. Ready returns four language rows in declared order, progress=null, non-null B; selected partial/failed counts make partial=true. `{schemaVersion:1,expectedBasis:B}` fails invalid_request.
+
+**W2 find and pins.** `{schemaVersion:1,query:"Foo"}` defaults to 20. Exact folded name ranks ahead of prefix, then substring or ID-only; original name/null then ID breaks ties. At limit=50, **exactly 50 matches** returns 50, truncated=false (absent callee clipping); **51 matches** returns first 50, truncated=true, reason=limit, partial=true, full searched-scope coverage and provenance closure of only those 50. `limit:51` fails range_too_large; `expectedBasis:{indexRevision:7}` fails invalid_request; an old complete generation/revision conflicts before lookup. For `query:"absent"`, native A selected complete and B selected failed with required diagnostic return `symbols:[],coverage:[A,B],provenance:[]`, partial=true, truncated=false, reason=null, warning keys `[(coverageIncomplete,null),(syntaxOnly,null)]`. B selected partial has the same outcome; both selected complete give partial=false and `[(syntaxOnly,null)]`. An additional unselected unsupported tuple U remains in coverage and **alone** changes neither partial nor warnings. Even zero matches with fixed full coverage over cap fail range_too_large, not omitted-row success; missing B fails store_unavailable.
+
+**W3 declaration.** `{schemaVersion:1,symbolId:S,view:"declaration",expectedBasis:B}` returns the complete #22 declaration with `syntaxId:S`, whole-file `contentHash:H`, E, relevant full coverage and provenance closure. No source body. A body edit may retain S but change hash/basis; B then conflicts before ID lookup. Unknown canonical S gives not_found. `limit:1` with declaration fails invalid_request.
+
+**W4 outgoing.** `{schemaVersion:1,symbolId:S,view:"outgoing_calls"}` defaults 20; measured calls ordered path/range/ID, each ownerSyntaxId=S. A nested callable's call belongs to its **own** syntax ID and is excluded. One unresolved measured call has binding=null, disposition=unresolved, targetId=null, boundaryReason=missingEvidence, E, partial=true, no dedicated unresolved warning (syntaxOnly still required). No calls **with complete relevant coverage** returns `calls:[]`, partial=false; no calls with failed/partial selected coverage has coverageIncomplete and partial=true, not a complete-negative claim. Cached callee text over 1024 bytes clips on scalar boundary, calleeTextTruncated=true, truncated/partial=true, reason=callee_text unless response_bytes/limit takes priority. No calleeRange means calleeText=null, calleeTextTruncated=false. `limit:51` fails range_too_large.
+
+**W5 source.** `{schemaVersion:1,path:"src/a.rs",startLine:1,endLine:1,expectedBasis:B,expectedContentHash:H}` returns exact selected bytes and E with basis B, syntaxOnly warning, partial=false, truncated=false. For raw cached `61 0a ff 0a`, the whole-file SHA-256 is `ead0215fe443756c2739e50b368ff79c283d540214d4ef503350fa25103198be`. Lines 2–2 select `ff 0a` and fail `unsupported_encoding`, retryable=false, currentBasis=B, currentContentHash=null, **no data or replacement text**. Lines 1–1 succeed with text `"a\n"`, byteRange `{start:0,end:2}` and the same whole-file hash despite invalid bytes elsewhere. Neither opens disk nor changes cache. Wrong hash conflicts before decoding and reports found cached hash; over-cap selection fails range_too_large before decoding. A CRLF line returns existing `\r\n` bytes unchanged. Reject `../a`, `/a`, `a\\b`, `a:b`, zero/reversed lines and >200 lines as typed above; final LF creates no phantom line.
+
+**W6 protocol fixture transcripts.** Modern sequence: request `server/discover` with `params:{_meta:{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}` → complete discovery; same `_meta` on `tools/list` → four ordered entries; `tools/call` `{name:"baleyg_workspace_describe",arguments:{schemaVersion:1},_meta:<same literal-key object>}` → structured/text identical result. Legacy sequence: `initialize` with revision `2025-11-25`, capabilities `{}`, clientInfo → negotiated response; `notifications/initialized` → list → call using connection state. Missing modern metadata `-32602`; unsupported modern revision `-32022`; unknown tool `-32602`; premature legacy call `-32600`. Cancellation suppresses a pending result; an admitted five-second timeout returns deadline_exceeded unless cancelled; fifth concurrent call returns too_many_requests; oversized complete dual-content response uses longest fitting list prefix or range_too_large for fixed coverage/first item. These are review fixtures **for #17**, not executed client or runtime interoperability.
+
+**W9 warning checks.** Empty complete syntax evidence → `[(syntaxOnly,null)]`, partial=false. Selected partial/failed → `[(coverageIncomplete,null),(syntaxOnly,null)]`, partial=true. Unresolved outgoing boundary → partial=true without special warning. Clipping → truncated/partial without coverageIncomplete. As a consistency check only, #22's semantic examples of stale provenance and ambiguous binding would add staleEvidence/bindingAmbiguous at their declared keys and order; **not emitted by first-release syntax evidence**. A failed extraction does not invent provenance.
+
+**W10 closed view check.** The inspect schema's only discriminator values are `declaration | outgoing_calls`. Each of `incoming_calls`, `call_paths`, `usages`, `type_hierarchy`, `implementations`, `coverage` fails `invalid_request`. There is no reservation, placeholder, guessed caller or reverse-completeness claim. [#11](https://github.com/jasoncarreira/baleyg/issues/11) separately ratifies evidence-backed later relations/views. Stale claims in `SPEC.md` and `docs/agent-integration-plan.md` are separate follow-ups, not authority to expand this release; do not edit them here. An added declaration does not automatically resolve historical semantic calls; #23 promises no fixed incremental publication deadline.
