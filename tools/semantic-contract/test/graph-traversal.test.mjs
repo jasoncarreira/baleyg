@@ -125,8 +125,13 @@ test('fresh r2 caller expands stable r1 internal target only when target bytes m
 
 // Control expectations are authored constants; each check re-runs production on the
 // current source specimen, including the one-member mutation made by runControl.
-function decisionCheck(input,{assertion,field,expected,select}){
+function decisionCheck(input,{assertion,field,expected,select,callId=null}){
  const answer=traverseGraph(input);
+ if(callId!==null){
+  assert.equal(answer.ok,true,'expected a successful pinned traversal');
+  assert.equal(answer.result.edges.length,1,'the r2 measured call must remain emitted');
+  assert.equal(answer.result.edges[0].call.id,callId,'the boundary must belong to the r2 occurrence');
+ }
  const actual=answer.ok?select(answer.result):undefined;
  if(!Object.is(actual,expected)){
   const error=new Error(`${assertion} ${field}: expected ${String(expected)}, got ${String(actual)}`);
@@ -140,10 +145,10 @@ const controls=registerControls([
   check:input=>decisionCheck(input,{assertion:'GRAPH.NODE_LIMIT',field:'edges[0].to',expected:null,select:r=>r.edges[0]?.to}),
   expectedAssertion:'GRAPH.NODE_LIMIT',expectedCode:'invalidRecord',expectedField:'edges[0].to'},
  {id:'GRAPH.failedRefresh.reason',baseline:()=>{const s=specimen();s.add('A','B',{revision:'r1',callRevision:'r1'});
-   s.records.calls.push({id:oid(101),ownerSyntaxId:s.ids.A,ordinal:0,document:doc,revisionId:'r2',range:{start:0,end:5}});
+   const current=s.add('A','B',{revision:'r2'});assert.equal(current.id,oid(2));
    s.records.coverage[0].state='failed';return {records:s.records,request:s.request};},
-  mutate:input=>{input.records.calls[1].revisionId='r1';return input;},
-  check:input=>decisionCheck(input,{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].boundaryReason',expected:'missingEvidence',select:r=>r.edges[0]?.boundaryReason}),
+  mutate:input=>{input.records.coverage[0].state='complete';return input;},
+  check:input=>decisionCheck(input,{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].boundaryReason',expected:'missingEvidence',callId:oid(2),select:r=>r.edges[0].boundaryReason}),
   expectedAssertion:'GRAPH.FAILED_REFRESH',expectedCode:'invalidRecord',expectedField:'edges[0].boundaryReason'}
 ]);
 for(const row of controls)test(`source baseline → single mutation → production check: ${row.id}`,async()=>{
