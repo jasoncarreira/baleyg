@@ -312,16 +312,19 @@ test('captured current binding: selected complete/partial self-call and failed l
   assert.ok(binding);assert.equal(binding.callId,call.id);
   assert.equal(binding.join.anchor.revisionId,'r2');
   assert.equal(loaded.semanticProofs.get('r2-call-proof').factRef,'r2-binding');
+  const usable=state!=='failed';
   const request={sourceSetId:'main',revisionId:'r2',rootSyntaxId:declaration.syntaxId,
    semanticProducerId:'semantic',depth:2,maxNodes:150,maxCalls:500};
-  const proofIds=[declaration.provenanceId,call.provenanceId,'r2-call-proof'];
+  const proofIds=[declaration.provenanceId,call.provenanceId,...(usable?['r2-call-proof']:['r1-proof'])];
   const provenance=proofIds.map(id=>records.provenance.find(row=>row.id===id))
    .sort((a,b)=>Buffer.compare(Buffer.from(a.id),Buffer.from(b.id)));
-  const coverage=records.coverage.filter(row=>row.revisionId==='r2')
+  const coverage=records.coverage.filter(row=>row.revisionId==='r2'||!usable&&row.revisionId==='r1'&&row.producerId==='semantic')
    .sort((a,b)=>Buffer.compare(Buffer.from(a.producerId),Buffer.from(b.producerId))||
     Buffer.compare(Buffer.from(a.revisionId),Buffer.from(b.revisionId)));
-  const warnings=state==='complete'?[]:[{code:'coverageIncomplete',provenanceId:null,message:'selected coverage incomplete'}];
-  const edge={call,from:declaration.syntaxId,to:declaration.syntaxId,binding,visit:'seen',boundaryReason:'none'};
+  const warnings=[...(state==='complete'?[]:[{code:'coverageIncomplete',provenanceId:null,message:'selected coverage incomplete'}]),
+   ...(usable?[]:[{code:'staleEvidence',provenanceId:null,message:'historical declaration'}])];
+  const edge={call,from:declaration.syntaxId,to:usable?declaration.syntaxId:null,binding:usable?binding:null,
+   visit:usable?'seen':'boundary',boundaryReason:usable?'none':'missingEvidence'};
   const answer={id:`captured-${state}`,attemptedRequest:request,answer:{ok:true,result:{request,
    resolvedRevisionId:'r2',nodes:[{declaration,depth:0}],edges:[edge],frontier:[],coverage,
    provenance,partial:!usable||state==='partial',truncated:false,warnings}}};
@@ -336,6 +339,7 @@ test('captured current binding: selected complete/partial self-call and failed l
   }
  }
 });
+
 
 test('source-backed impossible r2 call facts reject atomically; absence remains a missingEvidence boundary',async t=>{
  for(const state of ['failed','omitted']){
