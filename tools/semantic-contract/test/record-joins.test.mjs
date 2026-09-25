@@ -47,7 +47,7 @@ function makeFact(family,status,ref='fact') {
  const coordinates=(status==='exact'?exactSpans:unmatchedSpans)[family];
  return {kind:factType[family],ref,anchor:{document,revisionId:'r1',contentHash,kind:family,range:span(...coordinates),ownerRef:owned[family]},record:structuredClone(templates[factType[family]])};
 }
-async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,unselectedProducer=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false}={}) {
+async function specimen(t,{family='reference',status='exact',facts=null,unsupportedFamily=family,encoding='utf8',emojiPrefix=false,control=false,declarationSite=false,callbackSite=false,twoProducers=false,selectSecond=false,mutateFact=null,mutateNative=null,mutateSupport=null,alternateTuples=false}={}) {
  const root=await mkdtemp(join(tmpdir(),'join-u3-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const fs=new Map(),put=(path,value)=>fs.set(path,typeof value==='string'?value:JSON.stringify(value));
  const shifted=emojiPrefix||encoding!=='utf8',offset=shifted?5:0,positionOffset=encoding==='utf16'?3:encoding==='unicodeScalar'?2:offset;
@@ -66,11 +66,11 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
  const authored=structuredClone(facts??[makeFact(family,status)]);
  for(const fact of authored){fact.anchor.contentHash=sourceHash;if(shifted){fact.anchor.range.start+=positionOffset;fact.anchor.range.end+=positionOffset;fact.anchor.range.encoding=encoding;}if(callbackSite&&fact.kind==='reference'){fact.anchor.range=span(28+positionOffset,36+positionOffset,encoding);fact.record.roles=['read'];}if(declarationSite&&fact.kind==='reference'&&fact.anchor.range.start===18+positionOffset){fact.anchor.range=span(49+positionOffset,55+positionOffset,encoding);fact.anchor.ownerRef='target';fact.record.site='declaration';fact.record.roles=['definition'];}mutateFact?.(fact);}
  for(let i=1;i<authored.length;i++)authored[i].record.provenanceId=`proof-${authored[i].ref}`;
- if(unselectedProducer){const other=structuredClone(authored[0]);other.ref='fact-b';other.record.provenanceId='proof-b';authored.push(other);}
+ if(twoProducers){const other=structuredClone(authored[0]);other.ref='fact-b';other.record.provenanceId='proof-b';authored.push(other);}
  put('captures/semantic.json',{formatVersion:1,producerId:'semantic',facts:authored.filter(f=>f.ref!=='fact-b')});
- if(unselectedProducer){put('captures/semantic-b.txt','semantic-b-executable');put('captures/semantic-b.json',{formatVersion:1,producerId:'semantic-b',facts:authored.filter(f=>f.ref==='fact-b')});}
+ if(twoProducers){put('captures/semantic-b.txt','semantic-b-executable');put('captures/semantic-b.json',{formatVersion:1,producerId:'semantic-b',facts:authored.filter(f=>f.ref==='fact-b')});}
  const captures=[['native','executable','captures/native.txt'],['semantic','executable','captures/semantic.txt'],['toolchain','toolchain','captures/toolchain.txt'],['config','config','captures/config.txt'],['dependency','dependency','captures/dependency.txt'],['artifact','semanticArtifact','captures/semantic.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(fs.get(file))}));
- if(unselectedProducer)captures.push(...[['semantic-b-executable','executable','captures/semantic-b.txt'],['semantic-b-artifact','semanticArtifact','captures/semantic-b.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(fs.get(file))})));
+ if(twoProducers)captures.push(...[['semantic-b-executable','executable','captures/semantic-b.txt'],['semantic-b-artifact','semanticArtifact','captures/semantic-b.json']].map(([ref,kind,file])=>({ref,kind,file,hash:sha(fs.get(file))})));
  const revision={id:'r1',sourceSetId:'main',documents:[{key:document,revisionId:'r1',sourceFile:'snapshots/src/main.js'}],toolchainHash:captures[2].hash,configHash:captures[3].hash,dependencyHash:captures[4].hash};
  const basis={producerId:'semantic',producerVersion:'1',producerHash:semanticProducer.executableHash,artifactHash:captures[5].hash,language:'javascript',sourceSetId:'main',revisionId:'r1',sourceManifestHash:sha(canonical(alternateTuples?[{document,contentHash:sourceHash},{document:{...document,path:'src/other.js'},contentHash:sha(alternateText('document'))}]:[{document,contentHash:sourceHash}])),toolchainHash:revision.toolchainHash,configHash:revision.configHash,dependencyHash:revision.dependencyHash,lookupDependencies:[]};
  const proof={id:'proof',producerId:'semantic',document,revisionId:'r1',contentHash:sourceHash,evidenceKind:family==='declarationName'?'declarationBinding':'semanticReference',basis,freshness:'fresh'};
@@ -78,12 +78,12 @@ async function specimen(t,{family='reference',status='exact',facts=null,unsuppor
  const proofFacts=proofs.map((record,i)=>({kind:'provenance',ref:`proof-fact-${i}`,record}));
  const support=['declarationName','callee','invocation','reference'].map(kind=>({kind,available:!(status==='unsupported'&&kind===unsupportedFamily),diagnostic:status==='unsupported'&&kind===unsupportedFamily?'native family unavailable':null}));
  mutateSupport?.(support);
- const coverage=(producerId)=>({producerId,language:document.language,sourceSetId:document.sourceSetId,documentPath:document.path,revisionId:'r1',requested:true,selected:producerId!=='semantic-b',state:producerId==='semantic-b'?'omitted':status==='unsupported'&&unsupportedFamily==='reference'?'partial':'complete',supportedRoles:['read'],observedRoles:producerId==='semantic-b'||status==='unsupported'&&unsupportedFamily==='reference'?[]:['read'],diagnostic:producerId==='semantic-b'?'producer not selected':status==='unsupported'&&unsupportedFamily==='reference'?'reference unavailable':null});
- put('snapshots/src/main.js.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios:[],facts:[...(unselectedProducer?['native','semantic','semantic-b']:['native','semantic']).map(id=>({kind:'coverage',ref:`coverage-${id}`,record:coverage(id)})),...proofFacts,...authored]});
+ const coverage=(producerId)=>({producerId,language:document.language,sourceSetId:document.sourceSetId,documentPath:document.path,revisionId:'r1',requested:true,selected:producerId!=='semantic-b'||selectSecond,state:producerId==='semantic-b'?(selectSecond?'partial':'omitted'):status==='unsupported'&&unsupportedFamily==='reference'?'partial':'complete',supportedRoles:['read'],observedRoles:producerId==='semantic-b'||status==='unsupported'&&unsupportedFamily==='reference'?[]:['read'],diagnostic:producerId==='semantic-b'?(selectSecond?'reference not observed':'producer not selected'):status==='unsupported'&&unsupportedFamily==='reference'?'reference unavailable':null});
+ put('snapshots/src/main.js.annotations.json',{formatVersion:1,document,revisionId:'r1',scenarios:[],facts:[...(twoProducers?['native','semantic','semantic-b']:['native','semantic']).map(id=>({kind:'coverage',ref:`coverage-${id}`,record:coverage(id)})),...proofFacts,...authored]});
  const selectedSemantic={...semanticProducer,positionEncoding:encoding};
  const unselectedSemantic={...semanticProducer,id:'semantic-b',executableHash:sha('semantic-b-executable'),positionEncoding:encoding};
- const producers=unselectedProducer?[nativeProducer,selectedSemantic,unselectedSemantic]:[nativeProducer,selectedSemantic];
- const fixture={formatVersion:1,profile:'example',language:'javascript',sourceSets:[{id:'main',rootId:'root',languages:['javascript'],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:[nativeProducer,selectedSemantic]},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles:['read'],measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:unselectedProducer?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
+ const producers=twoProducers?[nativeProducer,selectedSemantic,unselectedSemantic]:[nativeProducer,selectedSemantic];
+ const fixture={formatVersion:1,profile:'example',language:'javascript',sourceSets:[{id:'main',rootId:'root',languages:['javascript'],dependencies:[]}],producers,revisions:[revision],comparison:{sourceSetId:'main',revisionId:'r1',producers:[nativeProducer,selectedSemantic]},coverageIntents:producers.map(producer=>({producerId:producer.id,document,revisionId:'r1',requestedRoles:['read'],measurementSupport:support})),nativeArtifact:'captures/native.json',semanticArtifacts:twoProducers?['captures/semantic.json','captures/semantic-b.json']:['captures/semantic.json'],annotationFiles:['snapshots/src/main.js.annotations.json'],answersFile:'expected/answers.json',dispositionsFile:'expected/dispositions.json',anchorCasesFile:'expected/anchors.json',captures};
  if(alternateTuples){
   const alternatives=[
    {document:{...document,path:'src/other.js'},revisionId:'r1',file:'snapshots/src/other.js',kind:'document'},
@@ -305,9 +305,58 @@ test('diagnostics derive candidate and support state, never install unmatched re
 });
 
 test('captured-but-unselected semantic producer cannot use valid proof, including unmatched joins',async t=>{
- const selected=await specimen(t);assert.equal(check(selected).joined.get('fact').installedId,refId);
- for(const status of ['exact','unmatched'])await control(t,{
-  name:`unselected ${status}`,options:{status},changedOptions:{unselectedProducer:true},
-  assertion:'FRESHNESS.USE',field:'coverage'
- });
+ for(const status of ['exact','unmatched']){
+  let admitted;
+  const [row]=registerControls([{
+   id:`U3.unselected ${status}`,
+   baseline:()=>({selected:true}),
+   mutate:state=>({...state,selected:false}),
+   check:async ({selected})=>{
+    const specimenRow=await specimen(t,{status,twoProducers:true,selectSecond:selected});
+    const {loaded,records}=specimenRow;
+    const captured={
+     fixture:loaded.fixture,
+     sources:[...loaded.sources].map(([key,bytes])=>[key,bytes.toString('hex')]),
+     captures:[...loaded.captureBytes].map(([key,bytes])=>[key,bytes.toString('hex')]),
+     native:loaded.native,
+     semantic:loaded.semanticBytes.map(x=>x.value),
+     facts:loaded.annotations.flatMap(x=>x.facts.filter(f=>f.kind!=='coverage')),
+     factTuples:loaded.annotations.flatMap(x=>x.facts.filter(f=>f.kind==='reference').map(f=>({ref:f.ref,kind:f.kind,anchor:f.anchor,provenanceId:f.record.provenanceId}))),
+     proofs:records.provenance,
+     proofTuples:records.provenance.map(({id,producerId,document,revisionId,contentHash,basis})=>({id,producerId,document,revisionId,contentHash,basis})),
+     coverage:loaded.annotations.flatMap(x=>x.facts.filter(f=>f.kind==='coverage')),
+     normalizedCoverage:records.coverage
+    };
+    if(selected){
+     admitted=structuredClone(captured);
+     assert.deepEqual(captured.fixture.producers.map(x=>x.id),['native','semantic','semantic-b']);
+     assert.deepEqual(captured.semantic.map(x=>x.producerId),['semantic','semantic-b']);
+     assert.deepEqual(captured.facts.filter(x=>x.kind==='reference').map(x=>x.ref),['fact','fact-b']);
+    }else{
+     for(const field of ['fixture','sources','captures','native','semantic','facts','factTuples','proofs','proofTuples'])
+      assert.equal(canonical(captured[field]),canonical(admitted[field]),`${status}: fixed ${field}`);
+     for(const field of ['coverage','normalizedCoverage']){
+      assert.deepEqual(captured[field].map(x=>field==='coverage'?x.ref:x.producerId),admitted[field].map(x=>field==='coverage'?x.ref:x.producerId));
+      for(let i=0;i<captured[field].length;i++){
+       const current=field==='coverage'?captured[field][i].record:captured[field][i];
+       const previous=field==='coverage'?admitted[field][i].record:admitted[field][i];
+       if(current.producerId==='semantic-b'){
+        const fixed=({selected:selection,state,diagnostic,...rest})=>rest;
+        assert.equal(canonical(fixed(current)),canonical(fixed(previous)),`${status}: one selection claim and its policy projections`);
+        assert.deepEqual([previous.selected,previous.state,previous.diagnostic],[true,'partial','reference not observed']);
+        assert.deepEqual([current.selected,current.state,current.diagnostic],[false,'omitted','producer not selected']);
+       }else assert.equal(canonical(current),canonical(previous),`${status}: other coverage unchanged`);
+      }
+     }
+    }
+    assert.doesNotThrow(()=>checkCoverage(loaded,records),`${status}: admitted coverage`);
+    assert.doesNotThrow(()=>checkMeasurement(loaded,records),`${status}: admitted measurement`);
+    const result=check(specimenRow);
+    assert.equal(result.joined.get('fact-b').join.status,status);
+    assert.equal(result.joined.get('fact-b').producerId,'semantic-b');
+    return result;
+   },expectedAssertion:'FRESHNESS.USE',expectedCode:'invalidRecord',expectedField:'coverage'
+  }]);
+  await runControl(row);
+ }
 });
