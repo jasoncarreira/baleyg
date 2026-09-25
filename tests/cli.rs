@@ -475,3 +475,50 @@ fn gc_report_without_workspace_does_not_create_state() {
     assert_eq!(inventory["derived"][0]["status"], "unknown");
     assert_eq!(inventory["derived"][0]["reason"], "recent_open");
 }
+
+#[test]
+fn gc_cli_reports_multiple_indexes_in_sorted_order() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let mut workspaces = (0..3)
+        .map(|n| {
+            let root = temp.path().join(format!("sorted-index-{n}"));
+            fs::create_dir(&root).unwrap();
+            let identity =
+                baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+            (identity.root_key, root)
+        })
+        .collect::<Vec<_>>();
+    workspaces.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, root) in &workspaces {
+        let status = command(root, &home, "status").output().unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .args(["gc", "--report"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let actual = report["derived"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["rootKey"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let mut expected = workspaces
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected);
+}

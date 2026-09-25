@@ -1542,3 +1542,163 @@ fn gc_age_and_record_inventory_are_read_only() {
     fs::remove_file(&lock).unwrap();
     fs::rename(&backup, &lock).unwrap();
 }
+
+#[test]
+fn gc_rejects_dangling_recovery_sidecars_without_writes() {
+    use baleyg::model::Annotation;
+    use baleyg::store::topology::DurableRecords;
+    use std::os::unix::fs::symlink;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    drop(common::open_store(temp.path(), &work).unwrap());
+    DurableRecords::new(&roots, &identity)
+        .put_annotation(&Annotation {
+            id: "note".into(),
+            node_id: "node".into(),
+            body: "saved".into(),
+        })
+        .unwrap();
+    for (db, is_record) in [
+        (roots.index_db(&identity), false),
+        (roots.record_db(&identity), true),
+    ] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = db.with_file_name(format!(
+                "{}{suffix}",
+                db.file_name().unwrap().to_string_lossy()
+            ));
+            symlink(temp.path().join("absent"), &sidecar).unwrap();
+            assert!(fs::symlink_metadata(&sidecar).is_ok());
+            assert!(!sidecar.exists(), "fixture must be a dangling link");
+            let before = gc_manifest(temp.path());
+            if is_record {
+                assert!(roots.record_by_id(&identity.record_id).is_err(), "{suffix}");
+                assert!(roots.gc_report_at(1_800_000_000).is_err(), "{suffix}");
+            } else {
+                let report = roots.gc_report_at(1_800_000_000).unwrap();
+                assert_eq!(
+                    (report.derived[0].status, report.derived[0].reason),
+                    ("unknown", "metadata_unreadable"),
+                    "{suffix}"
+                );
+            }
+            assert_eq!(
+                gc_manifest(temp.path()),
+                before,
+                "report wrote with {suffix}"
+            );
+            fs::remove_file(sidecar).unwrap();
+        }
+    }
+}
+
+#[test]
+fn gc_refuses_countable_records_with_missing_durable_columns() {
+    use baleyg::model::Annotation;
+    use baleyg::store::topology::DurableRecords;
+    let (temp, roots) = common::fixture();
+    for (n, table, column) in [
+        (0, "known_roots", "device"),
+        (1, "known_roots", "inode"),
+        (2, "views", "payload"),
+        (3, "annotations", "node_id"),
+        (4, "annotations", "payload"),
+    ] {
+        let work = temp.path().join(format!("record-{n}"));
+        fs::create_dir(&work).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        DurableRecords::new(&roots, &identity)
+            .put_annotation(&Annotation {
+                id: "note".into(),
+                node_id: "node".into(),
+                body: "saved".into(),
+            })
+            .unwrap();
+        let db = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
+        db.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+            .unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM annotations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(db);
+        assert!(
+            roots.record_by_id(&identity.record_id).is_err(),
+            "{table}.{column}"
+        );
+        assert!(
+            roots.gc_report_at(1_800_000_000).is_err(),
+            "{table}.{column}"
+        );
+    }
+}
+
+#[test]
+fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
+    use baleyg::model::Annotation;
+    use baleyg::store::topology::DurableRecords;
+    let (temp, roots) = common::fixture();
+    let mut identities = (0..3)
+        .map(|n| {
+            let work = temp.path().join(format!("sort-{n}"));
+            fs::create_dir(&work).unwrap();
+            WorkspaceIdentity::discover(Some(&work), &work).unwrap()
+        })
+        .collect::<Vec<_>>();
+    identities.sort_by(|a, b| b.root_key.cmp(&a.root_key));
+    let insertion_keys: Vec<_> = identities.iter().map(|id| id.root_key.clone()).collect();
+    let insertion_ids: Vec<_> = identities.iter().map(|id| id.record_id.clone()).collect();
+    for identity in &identities {
+        drop(common::open_store(temp.path(), &identity.root).unwrap());
+        DurableRecords::new(&roots, identity)
+            .put_annotation(&Annotation {
+                id: "note".into(),
+                node_id: "node".into(),
+                body: "saved".into(),
+            })
+            .unwrap();
+        let db = rusqlite::Connection::open(roots.record_db(identity)).unwrap();
+        for name in ["z", "m", "a"] {
+            db.execute(
+                "INSERT INTO known_roots(path,device,inode) VALUES(?1,'1','1')",
+                [temp
+                    .path()
+                    .join(format!("missing-{}-{name}", identity.record_id))
+                    .to_str()
+                    .unwrap()],
+            )
+            .unwrap();
+        }
+    }
+    let report = roots.gc_report_at(1_800_000_000).unwrap();
+    let mut expected_keys = insertion_keys.clone();
+    expected_keys.sort();
+    let mut expected_ids = insertion_ids.clone();
+    expected_ids.sort();
+    assert_eq!(
+        report
+            .derived
+            .iter()
+            .map(|entry| entry.root_key.clone())
+            .collect::<Vec<_>>(),
+        expected_keys
+    );
+    assert_eq!(
+        report
+            .records
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    for record in &report.records {
+        let mut expected = record.missing_known_paths.clone();
+        expected.sort();
+        assert_eq!(record.missing_known_paths, expected);
+        assert_eq!(record.missing_known_paths.len(), 3);
+        assert!(record.missing_known_paths[0].ends_with("-a"));
+    }
+}

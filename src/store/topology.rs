@@ -1120,7 +1120,11 @@ fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
             "{}{suffix}",
             path.file_name().unwrap().to_string_lossy()
         ));
-        ensure!(!sidecar.try_exists()?, "recovery sidecar present");
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => anyhow::bail!("recovery sidecar present"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     let db = Connection::open_with_flags(
         path,
@@ -1211,6 +1215,9 @@ impl TopologyRoots {
             row == (1, id.to_owned(), 1),
             "incomplete_record: metadata mismatch"
         );
+        db.prepare("SELECT path,device,inode FROM known_roots")?;
+        db.prepare("SELECT id,payload FROM views")?;
+        db.prepare("SELECT id,node_id,payload FROM annotations")?;
         let views = db.query_row("SELECT count(*) FROM views", [], |r| r.get(0))?;
         let annotations = db.query_row("SELECT count(*) FROM annotations", [], |r| r.get(0))?;
         let paths = db
