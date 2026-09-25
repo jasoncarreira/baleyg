@@ -238,12 +238,35 @@ fn coverage() {
         "{:?}",
         validate_evidence(&capture, &evidence, &capture)
     );
-    let mut bad = evidence.clone();
-    bad.coverage
+    let mut partial = evidence.clone();
+    let selected = partial
+        .coverage
         .iter_mut()
         .find(|c| c.producer_id.as_str() == "S")
-        .unwrap()
-        .diagnostic = None;
+        .unwrap();
+    selected.selected = true;
+    selected.state = CoverageState::Partial;
+    assert!(validate_evidence(&capture, &partial, &capture).is_ok());
+    let mut bad = partial.clone();
+    let failed = bad
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S")
+        .unwrap();
+    failed.state = CoverageState::Failed;
+    failed.diagnostic = None;
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Coverage(_))
+    ));
+    let mut bad = partial.clone();
+    let failed = bad
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S")
+        .unwrap();
+    failed.state = CoverageState::Failed;
+    failed.selected = false;
     assert!(matches!(
         validate_evidence(&capture, &bad, &capture),
         Err(EvidenceError::Coverage(_))
