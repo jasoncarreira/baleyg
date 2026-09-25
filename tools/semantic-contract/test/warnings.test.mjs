@@ -25,23 +25,22 @@ test('unselected omitted, limits and boundary do not imply coverage warning; syn
  s.warnings=[];assert.equal(checkWarnings(s),true);assert.deepEqual(deriveWarnings(s),[]);
  s.request.semanticProducerId=null;s.warnings=deriveWarnings(s);assert.deepEqual(keys(s.warnings),[['syntaxOnly',null]]);
 });
-test('forbidden, missing, duplicate and out-of-order keys fail exact checker',()=>{
+test('warning negatives run exact checker controls',async t=>{
  const s=specimen();s.warnings=deriveWarnings(s);
- const variants=[s.warnings.slice(1),[...s.warnings,{code:'syntaxOnly',provenanceId:null,message:'extra'}],
-  [...s.warnings,s.warnings[0]],[...s.warnings].reverse()];
- for(const warnings of variants)assert.throws(()=>checkWarnings({...s,warnings}),{code:'invalidRecord'});
- assert.throws(()=>checkWarnings({...s,warnings:[{...s.warnings[0],message:''},...s.warnings.slice(1)]}),
-  {assertion:'WARNING.SHAPE',field:'warnings[0]'});
+ const rows=registerControls([
+  ['missing',x=>{x.warnings.shift();return x;},'WARNING.KEYS','warnings'],
+  ['extra',x=>{x.warnings.push({code:'syntaxOnly',provenanceId:null,message:'extra'});return x;},'WARNING.KEYS','warnings'],
+  ['duplicate',x=>{x.warnings.push({...x.warnings[0]});return x;},'WARNING.DUPLICATE',`warnings[${s.warnings.length}]`],
+  ['order',x=>{x.warnings.reverse();return x;},'WARNING.KEYS','warnings'],
+  ['shape',x=>{x.warnings[0].message='';return x;},'WARNING.SHAPE','warnings[0]'],
+  ['foreignBindingProof',x=>{x.edges[0].binding.provenanceId='unreturned';return x;},'WARNING.PROVENANCE','edges.binding.provenanceId'],
+ ].map(([id,mutate,expectedAssertion,expectedField])=>({id:`WARNING.${id}`,baseline:()=>s,
+  mutate,check:checkWarnings,expectedAssertion,expectedCode:'invalidRecord',expectedField})));
+ for(const row of rows)await t.test(row.id,()=>runControl(row));
+ const omitted=specimen();omitted.coverage=[{state:'omitted',selected:false}];omitted.provenance=[];omitted.edges=[];
+ omitted.warnings=[];
+ const selected=registerControls([{id:'WARNING.selectedOnly',baseline:()=>omitted,
+  mutate:x=>{x.warnings=[{code:'coverageIncomplete',provenanceId:null,message:'not selected'}];return x;},
+  check:checkWarnings,expectedAssertion:'WARNING.KEYS',expectedCode:'invalidRecord',expectedField:'warnings'}])[0];
+ await t.test(selected.id,()=>runControl(selected));
 });
-const controls=registerControls([{id:'WARNING.selectedOnly',baseline:()=>({source:readFileSync(new URL('../graph-warnings.mjs',import.meta.url),'utf8')}),
- mutate:input=>{const old="row.selected&&['failed','partial'].includes(row.state)";assert.equal(input.source.split(old).length,2);
-  input.source=input.source.replace(old,"['failed','partial','omitted'].includes(row.state)");return input;},
- check:async input=>{
-  const source=input.source.replace("from './schema.mjs'",`from '${new URL('../schema.mjs',import.meta.url).href}'`)
-   .replace("from './json.mjs'",`from '${new URL('../json.mjs',import.meta.url).href}'`);
-  const {deriveWarnings:derived}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
-  const s=specimen();s.coverage=[{selected:false,state:'omitted'}];s.provenance=[];s.edges=[];
-  const actual=keys(derived(s));if(actual.length){const error=new Error('WARNING.KEYS warnings: unselected omitted created an incomplete warning');
-   Object.assign(error,{assertion:'WARNING.KEYS',code:'invalidRecord',field:'warnings'});throw error;}return true;
- },expectedAssertion:'WARNING.KEYS',expectedCode:'invalidRecord',expectedField:'warnings'}]);
-for(const row of controls)test(`source baseline → one production mutation → assertion: ${row.id}`,async()=>assert.equal(await runControl(row),row.id));

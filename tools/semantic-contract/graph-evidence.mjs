@@ -51,6 +51,9 @@ export function selectGraphEvidence(loaded,records,checked,result) {
  for(const edge of result.edges){
   addProof(edge.call.provenanceId,nativeId,edge.call.document,revisionId);
   if(edge.binding!==null){
+   const current=coverageByTuple.get(tupleKey(producerId,edge.call.document,revisionId));
+   if(current&&(!current.selected||!['complete','partial'].includes(current.state)))
+    fail('GRAPH.OCCURRENCE','edges.binding','failed or omitted current tuple cannot authorize a call binding');
    if(producerId===null||edge.call.revisionId!==revisionId||edge.binding.callId!==edge.call.id||
       edge.binding.join.anchor.revisionId!==revisionId||
       docKey(edge.binding.join.anchor.document)!==docKey(edge.call.document))
