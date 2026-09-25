@@ -404,78 +404,165 @@ fn measured<'a>(
     } else if !witness.header_bytes.is_empty() {
         return Err(native_error("non-declaration witness has header bytes"));
     }
-    if doc.key.language == Language::Java {
-        let expected = if matches!(
-            node.kind.as_str(),
-            "method_invocation" | "object_creation_expression" | "explicit_constructor_invocation"
-        ) {
-            NativeCandidateKind::Invocation
-        } else if matches!(
-            node.kind.as_str(),
-            "if_statement"
-                | "while_statement"
-                | "do_statement"
-                | "for_statement"
-                | "enhanced_for_statement"
-                | "switch_expression"
-                | "switch_block_statement_group"
-                | "switch_rule"
-                | "try_statement"
-                | "try_with_resources_statement"
-                | "catch_clause"
-                | "finally_clause"
-                | "synchronized_statement"
-                | "ternary_expression"
-        ) {
-            NativeCandidateKind::ControlRegion
-        } else if matches!(
-            node.kind.as_str(),
+    let supported_kind = match doc.key.language {
+        Language::Java => match node.kind.as_str() {
+            "method_invocation"
+            | "object_creation_expression"
+            | "explicit_constructor_invocation" => Some(NativeCandidateKind::Invocation),
             "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "annotation_type_declaration"
-                | "method_declaration"
-                | "annotation_type_element_declaration"
-                | "constructor_declaration"
-                | "compact_constructor_declaration"
-                | "lambda_expression"
-        ) {
-            NativeCandidateKind::Declaration
-        } else {
-            NativeCandidateKind::Occurrence
-        };
-        if witness.stable_id.is_some() && witness.candidate_kind != expected {
-            return Err(native_error("Java candidate kind differs from AST kind"));
-        }
-    }
-    if witness.candidate_kind == NativeCandidateKind::Invocation {
-        let expected = match doc.key.language {
-            Language::Java if node.kind == "method_invocation" && witness.verified_member_token => {
-                doc.syntax.iter().find(|candidate| {
-                    candidate.parent_id == Some(node.id)
-                        && candidate.field_name.as_deref() == Some("name")
-                        && candidate.start_byte == witness.token_start_byte
-                        && candidate.end_byte == witness.token_end_byte
-                })
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+            | "method_declaration"
+            | "annotation_type_element_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "lambda_expression" => Some(NativeCandidateKind::Declaration),
+            "if_statement"
+            | "while_statement"
+            | "do_statement"
+            | "for_statement"
+            | "enhanced_for_statement"
+            | "switch_expression"
+            | "switch_block_statement_group"
+            | "switch_rule"
+            | "try_statement"
+            | "try_with_resources_statement"
+            | "catch_clause"
+            | "finally_clause"
+            | "synchronized_statement"
+            | "ternary_expression" => Some(NativeCandidateKind::ControlRegion),
+            _ => None,
+        },
+        Language::Javascript => match node.kind.as_str() {
+            "call_expression" | "new_expression" => Some(NativeCandidateKind::Invocation),
+            "class_declaration"
+            | "class"
+            | "method_definition"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function" => Some(NativeCandidateKind::Declaration),
+            "if_statement"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_statement"
+            | "do_statement"
+            | "switch_statement"
+            | "switch_case"
+            | "switch_default"
+            | "try_statement"
+            | "catch_clause"
+            | "finally_clause"
+            | "ternary_expression"
+            | "conditional_expression"
+            | "statement_block"
+            | "expression_statement"
+            | "binary_expression"
+            | "class_static_block" => Some(NativeCandidateKind::ControlRegion),
+            _ => None,
+        },
+        Language::Python => match node.kind.as_str() {
+            "call" => Some(NativeCandidateKind::Invocation),
+            "class_definition" | "function_definition" | "lambda" => {
+                Some(NativeCandidateKind::Declaration)
+            }
+            "if_statement"
+            | "elif_clause"
+            | "else_clause"
+            | "for_statement"
+            | "while_statement"
+            | "try_statement"
+            | "except_clause"
+            | "finally_clause"
+            | "with_statement"
+            | "match_statement"
+            | "boolean_operator"
+            | "conditional_expression"
+            | "list_comprehension"
+            | "set_comprehension"
+            | "dictionary_comprehension"
+            | "generator_expression" => Some(NativeCandidateKind::ControlRegion),
+            _ => None,
+        },
+        Language::Rust => match node.kind.as_str() {
+            "call_expression" | "method_call_expression" => Some(NativeCandidateKind::Invocation),
+            "function_item" | "closure_expression" | "impl_item" | "trait_item" | "struct_item"
+            | "enum_item" | "union_item" | "mod_item" => Some(NativeCandidateKind::Declaration),
+            "if_expression" | "match_arm" | "loop_expression" | "while_expression"
+            | "for_expression" | "async_block" | "unsafe_block" => {
+                Some(NativeCandidateKind::ControlRegion)
             }
             _ => None,
+        },
+    };
+    if witness.stable_id.is_some() && supported_kind != Some(witness.candidate_kind.clone()) {
+        return Err(native_error(
+            "candidate kind differs from supported AST kind",
+        ));
+    }
+    if witness.candidate_kind == NativeCandidateKind::Invocation {
+        let child = |parent: usize, field: &str| {
+            doc.syntax
+                .iter()
+                .find(|n| n.parent_id == Some(parent) && n.field_name.as_deref() == Some(field))
         };
-        if doc.key.language == Language::Java && witness.verified_member_token && expected.is_none()
-        {
-            return Err(native_error(
-                "member token is not the invocation name field",
-            ));
-        }
-        if let Some(member) = expected {
-            let decoded = std::str::from_utf8(&member.source_bytes)
-                .ok()
-                .and_then(|s| crate::semantic_identity::lookup_key(doc.key.language, s).ok());
-            if witness.spelling.as_deref() != decoded.as_deref()
-                || witness.name_bytes != member.source_bytes
+        let function = child(node.id, "function");
+        let member = match doc.key.language {
+            Language::Java
+                if node.kind == "method_invocation" && child(node.id, "object").is_some() =>
             {
-                return Err(native_error("member spelling differs from AST token"));
+                child(node.id, "name").filter(|n| n.kind == "identifier")
             }
+            Language::Javascript => function
+                .filter(|n| {
+                    n.kind == "member_expression"
+                        && !doc
+                            .syntax
+                            .iter()
+                            .any(|c| c.parent_id == Some(n.id) && c.kind == "optional_chain")
+                })
+                .and_then(|n| child(n.id, "property"))
+                .filter(|n| {
+                    matches!(
+                        n.kind.as_str(),
+                        "property_identifier" | "private_property_identifier"
+                    )
+                }),
+            Language::Python => function
+                .filter(|n| n.kind == "attribute" && child(n.id, "object").is_some())
+                .and_then(|n| child(n.id, "attribute"))
+                .filter(|n| n.kind == "identifier"),
+            Language::Rust => function
+                .filter(|n| n.kind == "field_expression" && child(n.id, "value").is_some())
+                .and_then(|n| child(n.id, "field"))
+                .filter(|n| n.kind == "field_identifier"),
+            _ => None,
+        };
+        let verified = member.is_some();
+        let spelling = if let Some(member) = member {
+            std::str::from_utf8(&member.source_bytes)
+                .ok()
+                .and_then(|raw| crate::semantic_identity::lookup_key(doc.key.language, raw).ok())
+        } else if doc.key.language == Language::Javascript {
+            function
+                .filter(|n| n.kind == "identifier")
+                .and_then(|n| std::str::from_utf8(&n.source_bytes).ok())
+                .and_then(|raw| crate::semantic_identity::lookup_key(doc.key.language, raw).ok())
+        } else {
+            None
+        };
+        if witness.verified_member_token != verified
+            || witness.spelling != spelling
+            || member.is_some_and(|n| {
+                n.start_byte != witness.token_start_byte
+                    || n.end_byte != witness.token_end_byte
+                    || n.source_bytes != witness.name_bytes
+            })
+        {
+            return Err(native_error("member token or spelling differs from AST"));
         }
     } else if witness.verified_member_token || witness.spelling.is_some() {
         return Err(native_error("non-invocation has member-token metadata"));
@@ -629,6 +716,186 @@ fn java_header(
     Ok((key, header))
 }
 
+fn non_java_header(
+    doc: &CapturedDocument,
+    witness: &CapturedNativeWitness,
+) -> Result<(Key, Header), EvidenceError> {
+    let node = &doc.syntax[witness.node_id];
+    let children = |id: usize| doc.syntax.iter().filter(move |n| n.parent_id == Some(id));
+    let field =
+        |id: usize, label: &str| children(id).find(|n| n.field_name.as_deref() == Some(label));
+    let text = |n: &crate::indexer::CapturedSyntaxNode| {
+        std::str::from_utf8(&n.source_bytes)
+            .ok()
+            .and_then(|s| Text::new(s.to_owned()))
+            .ok_or_else(|| native_error("invalid declaration source token"))
+    };
+    let kind = match (doc.key.language, node.kind.as_str()) {
+        (Language::Javascript, "class_declaration" | "class")
+        | (Language::Python, "class_definition")
+        | (
+            Language::Rust,
+            "impl_item" | "trait_item" | "struct_item" | "enum_item" | "union_item" | "mod_item",
+        ) => Kind::Type,
+        (Language::Javascript, "method_definition") => Kind::Method,
+        (Language::Javascript, "function_expression" | "generator_function")
+            if field(node.id, "name").is_none() =>
+        {
+            Kind::AnonymousFunction
+        }
+        (
+            Language::Javascript,
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function",
+        )
+        | (Language::Python, "function_definition") => Kind::Function,
+        (Language::Javascript, "arrow_function")
+        | (Language::Python, "lambda")
+        | (Language::Rust, "closure_expression") => Kind::AnonymousFunction,
+        (Language::Rust, "function_item") => {
+            let parent = node.parent_id.and_then(|id| doc.syntax.get(id));
+            let grandparent = parent
+                .and_then(|n| n.parent_id)
+                .and_then(|id| doc.syntax.get(id));
+            if parent.is_some_and(|n| n.kind == "declaration_list")
+                && grandparent
+                    .is_some_and(|n| matches!(n.kind.as_str(), "impl_item" | "trait_item"))
+            {
+                Kind::Method
+            } else {
+                Kind::Function
+            }
+        }
+        _ => return Err(native_error("unsupported non-Java declaration kind")),
+    };
+    let named = field(node.id, "name");
+    let name = if doc.key.language == Language::Rust && node.kind == "impl_item" {
+        let ty = field(node.id, "type").ok_or_else(|| native_error("impl type missing"))?;
+        let prefix = field(node.id, "trait")
+            .map(|n| format!("{} for ", String::from_utf8_lossy(&n.source_bytes)))
+            .unwrap_or_default();
+        Text::new(format!(
+            "impl {prefix}{}",
+            String::from_utf8_lossy(&ty.source_bytes)
+        ))
+    } else if named.is_none()
+        && matches!(
+            node.kind.as_str(),
+            "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "lambda"
+                | "closure_expression"
+        )
+    {
+        None
+    } else {
+        named.map(&text).transpose()?
+    };
+    let kind = if doc.key.language == Language::Python
+        && kind == Kind::Function
+        && enclosing_declaration(doc, node.id)
+            .is_some_and(|parent| doc.syntax[parent].kind == "class_definition")
+    {
+        Kind::Method
+    } else {
+        kind
+    };
+    let key = Key {
+        kind,
+        name: name.clone(),
+        signature: None,
+        ordinal: UInt::new(0).unwrap(),
+    };
+    let mut modifiers = Vec::new();
+    for part in children(node.id).filter(|n| n.kind == "visibility_modifier") {
+        modifiers.push(text(part)?);
+    }
+    let type_parameters = field(node.id, "type_parameters")
+        .map(|n| {
+            children(n.id)
+                .filter(|part| part.candidate_kind.is_some() && part.kind != "type_parameter_list")
+                .map(&text)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let parameters = field(node.id, "parameters")
+        .or_else(|| field(node.id, "formal_parameters"))
+        .map(|n| {
+            children(n.id)
+                .filter(|part| part.candidate_kind.is_some())
+                .map(|part| {
+                    Ok(Parameter {
+                        name: field(part.id, "name").map(&text).transpose()?,
+                        r#type: field(part.id, "type").map(&text).transpose()?,
+                        variadic: matches!(
+                            part.kind.as_str(),
+                            "rest_pattern" | "list_splat_pattern"
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>, EvidenceError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let bases = doc
+        .heritage
+        .iter()
+        .filter(|h| h.class_node_id == node.id)
+        .map(|h| {
+            std::str::from_utf8(
+                doc.bytes
+                    .get(h.base_start..h.base_end)
+                    .ok_or_else(|| native_error("base outside source"))?,
+            )
+            .ok()
+            .and_then(|s| Text::new(s.to_owned()))
+            .ok_or_else(|| native_error("invalid base source"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        key,
+        Header {
+            kind,
+            name,
+            modifiers,
+            type_parameters,
+            parameters,
+            result_type: field(node.id, "return_type").map(&text).transpose()?,
+            bases,
+        },
+    ))
+}
+
+fn enclosing_declaration(doc: &CapturedDocument, node_id: usize) -> Option<usize> {
+    let mut child = node_id;
+    let mut parent = doc.syntax[node_id].parent_id;
+    while let Some(id) = parent {
+        let node = &doc.syntax[id];
+        let python_header = doc.key.language == Language::Python
+            && matches!(
+                node.kind.as_str(),
+                "class_definition" | "function_definition" | "lambda"
+            )
+            && doc.syntax[child].field_name.as_deref() != Some("body");
+        if !python_header
+            && doc.native_candidates.iter().any(|w| {
+                w.node_id == id
+                    && w.candidate_kind == NativeCandidateKind::Declaration
+                    && w.stable_id.is_some()
+            })
+        {
+            return Some(id);
+        }
+        child = id;
+        parent = node.parent_id;
+    }
+    None
+}
+
 fn measured_lineage(
     doc: &CapturedDocument,
     witness: &CapturedNativeWitness,
@@ -649,21 +916,24 @@ fn measured_lineage(
     .map_err(|_| native_error("invalid module identity"))?;
     let mut ids = vec![module.as_str().to_owned()];
     let mut parents = Vec::new();
-    let mut parent = doc.syntax[witness.node_id].parent_id;
+    let mut parent = enclosing_declaration(doc, witness.node_id);
     while let Some(node_id) = parent {
-        if let Some(candidate) = doc.native_candidates.iter().find(|candidate| {
-            candidate.node_id == node_id
-                && candidate.candidate_kind == NativeCandidateKind::Declaration
-                && candidate.stable_id.is_some()
-        }) {
-            let row = file
-                .declarations
-                .iter()
-                .find(|row| candidate.stable_id.as_deref() == Some(row.syntax_id.as_str()))
-                .ok_or_else(|| native_error("actual enclosing declaration is absent"))?;
-            parents.push(row.syntax_id.as_str().to_owned());
-        }
-        parent = doc.syntax[node_id].parent_id;
+        let candidate = doc
+            .native_candidates
+            .iter()
+            .find(|w| {
+                w.node_id == node_id
+                    && w.candidate_kind == NativeCandidateKind::Declaration
+                    && w.stable_id.is_some()
+            })
+            .ok_or_else(|| native_error("enclosing declaration witness missing"))?;
+        let row = file
+            .declarations
+            .iter()
+            .find(|row| candidate.stable_id.as_deref() == Some(row.syntax_id.as_str()))
+            .ok_or_else(|| native_error("actual enclosing declaration is absent"))?;
+        parents.push(row.syntax_id.as_str().to_owned());
+        parent = enclosing_declaration(doc, node_id);
     }
     ids.extend(parents.into_iter().rev());
     Ok(ids)
@@ -726,6 +996,144 @@ pub fn validate_native(
         for witness in witnesses {
             measured(doc, witness)?;
         }
+        for node in &doc.syntax {
+            let kind = match doc.key.language {
+                Language::Java => match node.kind.as_str() {
+                    "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+                    | "method_declaration"
+                    | "annotation_type_element_declaration"
+                    | "constructor_declaration"
+                    | "compact_constructor_declaration"
+                    | "lambda_expression" => Some(NativeCandidateKind::Declaration),
+                    "method_invocation"
+                    | "object_creation_expression"
+                    | "explicit_constructor_invocation" => Some(NativeCandidateKind::Invocation),
+                    "if_statement"
+                    | "while_statement"
+                    | "do_statement"
+                    | "for_statement"
+                    | "enhanced_for_statement"
+                    | "switch_expression"
+                    | "switch_block_statement_group"
+                    | "switch_rule"
+                    | "try_statement"
+                    | "try_with_resources_statement"
+                    | "catch_clause"
+                    | "finally_clause"
+                    | "synchronized_statement"
+                    | "ternary_expression" => Some(NativeCandidateKind::ControlRegion),
+                    _ => None,
+                },
+                Language::Javascript => match node.kind.as_str() {
+                    "class_declaration"
+                    | "class"
+                    | "method_definition"
+                    | "function_declaration"
+                    | "generator_function_declaration"
+                    | "function_expression"
+                    | "generator_function"
+                    | "arrow_function" => Some(NativeCandidateKind::Declaration),
+                    "call_expression" | "new_expression" => Some(NativeCandidateKind::Invocation),
+                    "if_statement"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "while_statement"
+                    | "do_statement"
+                    | "switch_statement"
+                    | "switch_case"
+                    | "switch_default"
+                    | "try_statement"
+                    | "catch_clause"
+                    | "finally_clause"
+                    | "ternary_expression"
+                    | "conditional_expression"
+                    | "statement_block"
+                    | "expression_statement"
+                    | "binary_expression"
+                    | "class_static_block" => Some(NativeCandidateKind::ControlRegion),
+                    _ => None,
+                },
+                Language::Python => match node.kind.as_str() {
+                    "class_definition" | "function_definition" | "lambda" => {
+                        Some(NativeCandidateKind::Declaration)
+                    }
+                    "call" => Some(NativeCandidateKind::Invocation),
+                    "if_statement"
+                    | "elif_clause"
+                    | "else_clause"
+                    | "for_statement"
+                    | "while_statement"
+                    | "try_statement"
+                    | "except_clause"
+                    | "finally_clause"
+                    | "with_statement"
+                    | "match_statement"
+                    | "boolean_operator"
+                    | "conditional_expression"
+                    | "list_comprehension"
+                    | "set_comprehension"
+                    | "dictionary_comprehension"
+                    | "generator_expression" => Some(NativeCandidateKind::ControlRegion),
+                    _ => None,
+                },
+                Language::Rust => match node.kind.as_str() {
+                    "function_item" | "closure_expression" | "impl_item" | "trait_item"
+                    | "struct_item" | "enum_item" | "union_item" | "mod_item" => {
+                        Some(NativeCandidateKind::Declaration)
+                    }
+                    "call_expression" | "method_call_expression" => {
+                        Some(NativeCandidateKind::Invocation)
+                    }
+                    "if_expression" | "match_arm" | "loop_expression" | "while_expression"
+                    | "for_expression" | "async_block" | "unsafe_block" => {
+                        Some(NativeCandidateKind::ControlRegion)
+                    }
+                    _ => None,
+                },
+            };
+            if let Some(kind) = kind {
+                let matches: Vec<_> = witnesses
+                    .iter()
+                    .filter(|w| {
+                        w.node_id == node.id && w.candidate_kind == kind && w.stable_id.is_some()
+                    })
+                    .collect();
+                if matches.len() != 1 {
+                    return Err(native_error(
+                        "supported AST candidate lacks exactly one native witness",
+                    ));
+                }
+            }
+        }
+        for witness in witnesses.iter().filter(|w| w.stable_id.is_some()) {
+            let count = match witness.candidate_kind {
+                NativeCandidateKind::Declaration => file
+                    .declarations
+                    .iter()
+                    .filter(|r| Some(r.syntax_id.as_str()) == witness.stable_id.as_deref())
+                    .count(),
+                NativeCandidateKind::Invocation => file
+                    .calls
+                    .iter()
+                    .filter(|r| Some(r.id.as_str()) == witness.stable_id.as_deref())
+                    .count(),
+                NativeCandidateKind::ControlRegion => file
+                    .control_regions
+                    .iter()
+                    .filter(|r| Some(r.id.as_str()) == witness.stable_id.as_deref())
+                    .count(),
+                NativeCandidateKind::Occurrence => 0,
+            };
+            if count != 1 {
+                return Err(native_error(
+                    "selected complete document omits a captured supported candidate",
+                ));
+            }
+        }
         let declaration = |id: &SyntaxId| file.declarations.iter().find(|d| d.syntax_id == *id);
         for row in &file.declarations {
             let matches: Vec<_> = witnesses
@@ -759,10 +1167,10 @@ pub fn validate_native(
                 || row.name_range.as_ref().is_some_and(|r| {
                     !same_range(r, witness.token_start_byte, witness.token_end_byte)
                 })
-                || row
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| name.as_str().as_bytes() != witness.name_bytes)
+                || row.name.as_ref().is_some_and(|name| {
+                    !(doc.key.language == Language::Rust && witness.node_kind == "impl_item")
+                        && name.as_str().as_bytes() != witness.name_bytes
+                })
                 || row.lookup_key.as_ref().map(Text::as_str)
                     != row
                         .name
@@ -787,22 +1195,15 @@ pub fn validate_native(
                     "declaration ID, token, header or lookup mismatch",
                 ));
             }
-            if doc.key.language == Language::Java {
-                let (measured_key, measured_header) = java_header(doc, witness)?;
+            if true {
+                let (measured_key, measured_header) = if doc.key.language == Language::Java {
+                    java_header(doc, witness)?
+                } else {
+                    non_java_header(doc, witness)?
+                };
                 let node = &doc.syntax[witness.node_id];
                 let parent_declaration = |candidate: &CapturedNativeWitness| {
-                    let mut parent = doc.syntax[candidate.node_id].parent_id;
-                    while let Some(id) = parent {
-                        if let Some(found) = witnesses.iter().find(|w| {
-                            w.candidate_kind == NativeCandidateKind::Declaration
-                                && w.node_id == id
-                                && w.stable_id.is_some()
-                        }) {
-                            return Some(found.node_id);
-                        }
-                        parent = doc.syntax[id].parent_id;
-                    }
-                    None
+                    enclosing_declaration(doc, candidate.node_id)
                 };
                 let mut ancestor_nodes = Vec::new();
                 let mut parent = parent_declaration(witness);
@@ -823,7 +1224,12 @@ pub fn validate_native(
                     signature: None,
                     ordinal: UInt::new(0).unwrap(),
                 };
-                let mut measured_ancestors = vec![module];
+                let mut measured_ancestors =
+                    if matches!(doc.key.language, Language::Python | Language::Rust) {
+                        vec![]
+                    } else {
+                        vec![module]
+                    };
                 for id in ancestor_nodes {
                     let ancestor = file
                         .declarations
@@ -845,7 +1251,12 @@ pub fn validate_native(
                             && parent_declaration(candidate) == parent_declaration(witness)
                     })
                     .filter_map(|candidate| {
-                        let (key, _) = java_header(doc, candidate).ok()?;
+                        let (key, _) = if doc.key.language == Language::Java {
+                            java_header(doc, candidate)
+                        } else {
+                            non_java_header(doc, candidate)
+                        }
+                        .ok()?;
                         (key.kind == measured_key.kind
                             && key.name == measured_key.name
                             && key.signature == measured_key.signature)
@@ -867,10 +1278,42 @@ pub fn validate_native(
                     || row.key.signature != measured_key.signature
                     || row.header != measured_header
                 {
-                    return Err(native_error("Java key or complete header differs from AST"));
+                    return Err(native_error(
+                        "declaration key or complete header differs from AST",
+                    ));
                 }
             }
             if row.kind == Kind::Type {
+                if doc.key.language == Language::Java {
+                    let class = &doc.syntax[witness.node_id];
+                    let superclass = doc.syntax.iter().find(|n| {
+                        n.parent_id == Some(class.id)
+                            && n.field_name.as_deref() == Some("superclass")
+                    });
+                    let expected = superclass.and_then(|n| {
+                        doc.syntax.iter().find(|child| {
+                            child.parent_id == Some(n.id) && child.candidate_kind.is_some()
+                        })
+                    });
+                    let actual: Vec<_> = doc
+                        .heritage
+                        .iter()
+                        .filter(|h| h.class_node_id == class.id)
+                        .collect();
+                    match expected {
+                        Some(base)
+                            if actual.len() == 1
+                                && actual[0].base_start == base.start_byte
+                                && actual[0].base_end == base.end_byte
+                                && actual[0].base_bytes == base.source_bytes => {}
+                        None if actual.is_empty() => {}
+                        _ => {
+                            return Err(native_error(
+                                "Java superclass heritage differs from AST field",
+                            ));
+                        }
+                    }
+                }
                 let measured_bases: Vec<_> = doc
                     .heritage
                     .iter()
@@ -915,16 +1358,23 @@ pub fn validate_native(
                 }
             }
             if let Some(owner) = witness.ancestor_ids.last()
-                && row.ancestors.last().is_none_or(|key| {
-                    crate::semantic_identity::syntax_id(
-                        &doc.key.source_set_id,
-                        &doc.key.path,
-                        doc.key.language,
-                        &row.ancestors[..row.ancestors.len() - 1],
-                        key,
-                    )
-                    .map_or(true, |id| id.as_str() != owner)
-                })
+                && row.ancestors.last().map_or(
+                    !module_owner(
+                        doc,
+                        &SyntaxId::new(owner.clone())
+                            .ok_or_else(|| native_error("invalid module owner"))?,
+                    ),
+                    |key| {
+                        crate::semantic_identity::syntax_id(
+                            &doc.key.source_set_id,
+                            &doc.key.path,
+                            doc.key.language,
+                            &row.ancestors[..row.ancestors.len() - 1],
+                            key,
+                        )
+                        .map_or(true, |id| id.as_str() != owner)
+                    },
+                )
             {
                 return Err(native_error("declaration owner differs from AST"));
             }
