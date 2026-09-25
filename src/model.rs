@@ -76,6 +76,10 @@ pub enum SymbolKind {
     Function,
     Method,
     Class,
+    Type,
+    Constructor,
+    Implementation,
+    AnonymousFunction,
 }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -351,4 +355,444 @@ pub fn validate_record_id(id: &str) -> anyhow::Result<()> {
         "id must contain 1..128 ASCII letters, digits, '.', '_' or '-'"
     );
     Ok(())
+}
+
+/// Prospective #22 evidence types. These do not reinterpret the historical browser Graph.
+pub mod v1 {
+    use super::{Graph, Position, ViewQuery};
+    use serde::{Deserialize, Deserializer, Serialize};
+    use std::collections::BTreeMap;
+
+    pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+    #[serde(transparent)]
+    pub struct UInt(u64);
+    impl UInt {
+        pub fn new(value: u64) -> Option<Self> {
+            (value <= MAX_SAFE_INTEGER).then_some(Self(value))
+        }
+        pub fn get(self) -> u64 {
+            self.0
+        }
+    }
+    impl<'de> Deserialize<'de> for UInt {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let value = u64::deserialize(deserializer)?;
+            Self::new(value)
+                .ok_or_else(|| serde::de::Error::custom("UInt exceeds the safe integer range"))
+        }
+    }
+
+    macro_rules! checked_text {
+        ($name:ident, $valid:expr, $message:literal) => {
+            #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+            #[serde(transparent)]
+            pub struct $name(String);
+            impl $name {
+                pub fn new(value: impl Into<String>) -> Option<Self> {
+                    let value = value.into();
+                    ($valid)(&value).then_some(Self(value))
+                }
+                pub fn as_str(&self) -> &str {
+                    &self.0
+                }
+            }
+            impl<'de> Deserialize<'de> for $name {
+                fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                    let value = String::deserialize(deserializer)?;
+                    Self::new(value).ok_or_else(|| serde::de::Error::custom($message))
+                }
+            }
+        };
+    }
+    checked_text!(Text, |s: &str| !s.is_empty(), "expected nonempty text");
+    checked_text!(
+        Hash,
+        |s: &str| s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "expected lowercase SHA-256 hex"
+    );
+    checked_text!(
+        SyntaxId,
+        |s: &str| s
+            .strip_prefix("sid:v1:")
+            .is_some_and(|tail| tail.len() == 32
+                && tail
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+        "expected sid:v1: followed by 32 lowercase hex digits"
+    );
+    checked_text!(
+        OccurrenceId,
+        |s: &str| s
+            .strip_prefix("occ:v1:")
+            .is_some_and(|tail| tail.len() == 32
+                && tail
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+        "expected occ:v1: followed by 32 lowercase hex digits"
+    );
+    checked_text!(
+        Path,
+        |s: &str| !s.is_empty()
+            && !s.contains(['\\', '\0'])
+            && s.split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."),
+        "expected source-root-relative POSIX path"
+    );
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Language {
+        Java,
+        Rust,
+        Python,
+        Javascript,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Kind {
+        Module,
+        Namespace,
+        Type,
+        Implementation,
+        Function,
+        Method,
+        Constructor,
+        Field,
+        Variable,
+        Parameter,
+        TypeParameter,
+        Alias,
+        AnonymousFunction,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Role {
+        Definition,
+        Read,
+        Write,
+        Call,
+        Type,
+        Import,
+        Alias,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Resolution {
+        Resolved,
+        External,
+        Ambiguous,
+        Unresolved,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum ProducerKind {
+        Native,
+        Semantic,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum PositionEncoding {
+        Utf8,
+        Utf16,
+        UnicodeScalar,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum CoverageState {
+        NotRequested,
+        Omitted,
+        Unsupported,
+        Failed,
+        Partial,
+        Complete,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum EvidenceKind {
+        MeasuredSyntax,
+        DeclarationBinding,
+        SemanticReference,
+        TypeRelationship,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Freshness {
+        Fresh,
+        PossiblyStale,
+        Stale,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum SymbolScope {
+        Global,
+        Document,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum SymbolScheme {
+        Scip,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum RelationshipKind {
+        Extends,
+        Implements,
+        Overrides,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum AnchorKind {
+        DeclarationName,
+        Callee,
+        Invocation,
+        Reference,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum JoinStatus {
+        Exact,
+        Ambiguous,
+        Unmatched,
+        Unsupported,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum ReferenceSite {
+        Declaration,
+        Use,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Dispatch {
+        Direct,
+        Constructor,
+        Virtual,
+        Interface,
+        Dynamic,
+        Unknown,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum ContinuityState {
+        Unchanged,
+        Changed,
+        Unknown,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum AnchorStatus {
+        Attached,
+        Orphaned,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum AnchorReason {
+        None,
+        Missing,
+        HeaderMismatch,
+        GroupChanged,
+        UnprovenContinuity,
+    }
+
+    fn required_nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<Option<T>, D::Error> {
+        Option::<T>::deserialize(deserializer)
+    }
+
+    macro_rules! record {
+        ($name:ident { $( $(#[$attr:meta])* $field:ident: $ty:ty),* $(,)? }) => {
+            #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+            #[serde(rename_all="camelCase", deny_unknown_fields)]
+            pub struct $name { $( $(#[$attr])* pub $field: $ty),* }
+        };
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", try_from = "UncheckedRange")]
+    pub struct Range {
+        pub start: UInt,
+        pub end: UInt,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct UncheckedRange {
+        start: UInt,
+        end: UInt,
+    }
+    impl TryFrom<UncheckedRange> for Range {
+        type Error = &'static str;
+        fn try_from(value: UncheckedRange) -> Result<Self, Self::Error> {
+            if value.start > value.end {
+                return Err("range start exceeds end");
+            }
+            Ok(Self {
+                start: value.start,
+                end: value.end,
+            })
+        }
+    }
+    record!(Producer { id: Text, version: Text, executable_hash: Hash, kind: ProducerKind, languages: Vec<Language>, position_encoding: PositionEncoding });
+    record!(SourceSet { id: Text, root_id: Text, languages: Vec<Language>, dependencies: Vec<Text> });
+    record!(DocumentKey {
+        source_set_id: Text,
+        language: Language,
+        path: Path
+    });
+    record!(Document {
+        key: DocumentKey,
+        revision_id: Text,
+        content_hash: Hash,
+        byte_length: UInt
+    });
+    record!(Revision { id: Text, source_set_id: Text, documents: Vec<Document>, toolchain_hash: Hash, config_hash: Hash, dependency_hash: Hash });
+    record!(Coverage { producer_id: Text, language: Language, source_set_id: Text, document_path: Path, revision_id: Text, requested: bool, selected: bool, state: CoverageState, supported_roles: Vec<Role>, observed_roles: Vec<Role>, #[serde(deserialize_with="required_nullable")] diagnostic: Option<Text> });
+    record!(SemanticBasis { producer_id: Text, producer_version: Text, producer_hash: Hash, artifact_hash: Hash, language: Language, source_set_id: Text, revision_id: Text, source_manifest_hash: Hash, toolchain_hash: Hash, config_hash: Hash, dependency_hash: Hash, lookup_dependencies: Vec<Text> });
+    record!(Provenance { id: Text, producer_id: Text, document: DocumentKey, revision_id: Text, content_hash: Hash, evidence_kind: EvidenceKind, #[serde(deserialize_with="required_nullable")] basis: Option<SemanticBasis>, freshness: Freshness });
+    record!(Signature { parameter_types: Vec<Text>, type_parameter_count: UInt, variadic: bool });
+    record!(Key { kind: Kind, #[serde(deserialize_with="required_nullable")] name: Option<Text>, #[serde(deserialize_with="required_nullable")] signature: Option<Signature>, ordinal: UInt });
+    record!(Parameter { #[serde(deserialize_with="required_nullable")] name: Option<Text>, #[serde(deserialize_with="required_nullable")] r#type: Option<Text>, variadic: bool });
+    record!(Header { kind: Kind, #[serde(deserialize_with="required_nullable")] name: Option<Text>, modifiers: Vec<Text>, type_parameters: Vec<Text>, parameters: Vec<Parameter>, #[serde(deserialize_with="required_nullable")] result_type: Option<Text>, bases: Vec<Text> });
+    record!(Declaration { syntax_id: SyntaxId, document: DocumentKey, revision_id: Text, kind: Kind, #[serde(deserialize_with="required_nullable")] name: Option<Text>, #[serde(deserialize_with="required_nullable")] lookup_key: Option<Text>, ancestors: Vec<Key>, key: Key, range: Range, #[serde(deserialize_with="required_nullable")] name_range: Option<Range>, header: Header, provenance_id: Text });
+    record!(SymbolKey { scheme: SymbolScheme, symbol: Text, scope: SymbolScope, #[serde(deserialize_with="required_nullable")] document: Option<DocumentKey> });
+    record!(Symbol { key: SymbolKey, #[serde(deserialize_with="required_nullable")] display_name: Option<Text>, declarations: Vec<Target>, provenance_id: Text });
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(
+        tag = "kind",
+        rename_all = "camelCase",
+        rename_all_fields = "camelCase",
+        deny_unknown_fields
+    )]
+    pub enum Target {
+        Internal {
+            syntax_id: SyntaxId,
+            document: DocumentKey,
+            revision_id: Text,
+        },
+        External {
+            symbol: SymbolKey,
+        },
+    }
+    record!(DeclarationBinding { #[serde(deserialize_with="required_nullable")] syntax_id: Option<SyntaxId>, symbols: Vec<SymbolKey>, join: Join, provenance_id: Text });
+    record!(TypeRelationship {
+        kind: RelationshipKind,
+        source: Target,
+        target: Target,
+        provenance_id: Text
+    });
+    record!(MeasuredAnchor {
+        document: DocumentKey,
+        revision_id: Text,
+        content_hash: Hash,
+        range: Range,
+        kind: AnchorKind
+    });
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum CandidateId {
+        Syntax(SyntaxId),
+        Occurrence(OccurrenceId),
+    }
+    record!(Join { anchor: MeasuredAnchor, status: JoinStatus, candidate_ids: Vec<CandidateId>, #[serde(deserialize_with="required_nullable")] diagnostic: Option<Text> });
+    record!(Call { id: OccurrenceId, owner_syntax_id: SyntaxId, ordinal: UInt, document: DocumentKey, revision_id: Text, range: Range, #[serde(deserialize_with="required_nullable")] callee_range: Option<Range>, #[serde(deserialize_with="required_nullable")] spelling: Option<Text>, region_ids: Vec<OccurrenceId>, provenance_id: Text });
+    record!(ControlRegion { id: OccurrenceId, owner_syntax_id: SyntaxId, ordinal: UInt, document: DocumentKey, revision_id: Text, kind: Text, range: Range, #[serde(deserialize_with="required_nullable")] parent_id: Option<OccurrenceId>, #[serde(deserialize_with="required_nullable")] arm: Option<Text>, provenance_id: Text });
+    record!(Reference { id: OccurrenceId, owner_syntax_id: SyntaxId, ordinal: UInt, document: DocumentKey, revision_id: Text, range: Range, spelling: Text, lookup_key: Text, site: ReferenceSite, roles: Vec<Role>, resolution: Resolution, #[serde(deserialize_with="required_nullable")] declared_target: Option<Target>, candidates: Vec<Target>, provenance_id: Text });
+    record!(CallBinding { #[serde(deserialize_with="required_nullable")] call_id: Option<OccurrenceId>, join: Join, resolution: Resolution, #[serde(deserialize_with="required_nullable")] declared_target: Option<Target>, candidates: Vec<Target>, dispatch: Dispatch, possible_dispatch: Vec<Target>, possible_dispatch_complete: bool, #[serde(deserialize_with="required_nullable")] stale_target: Option<bool>, provenance_id: Text });
+    record!(DurableAnchor {
+        syntax_id: SyntaxId,
+        document: DocumentKey,
+        captured_revision_id: Text,
+        header_hash: Hash,
+        sibling_group_hash: Hash,
+        sibling_count: UInt,
+        identical_header_count: UInt
+    });
+    record!(GroupContinuity { from_revision_id: Text, to_revision_id: Text, state: ContinuityState, #[serde(deserialize_with="required_nullable")] evidence: Option<Text> });
+    record!(AnchorResult { status: AnchorStatus, #[serde(deserialize_with="required_nullable")] target_id: Option<SyntaxId>, reason: AnchorReason });
+
+    record!(NativeRevisionContext {
+        source_set: SourceSet,
+        revision: Revision,
+        producer: Producer
+    });
+    record!(NativeFileEvidence { document: Document, coverage: Coverage, provenance: Provenance, declarations: Vec<Declaration>, calls: Vec<Call>, control_regions: Vec<ControlRegion>, diagnostics: Vec<Text> });
+    record!(Evidence { context: NativeRevisionContext, native_files: Vec<NativeFileEvidence>, producers: Vec<Producer>, coverage: Vec<Coverage>, provenance: Vec<Provenance>, symbols: Vec<Symbol>, declaration_bindings: Vec<DeclarationBinding>, type_relationships: Vec<TypeRelationship>, references: Vec<Reference>, call_bindings: Vec<CallBinding> });
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct IndexSnapshot {
+        pub graph: Graph,
+        pub evidence: Evidence,
+    }
+
+    /// Requests cannot set the captured server-managed anchors.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct SavedViewWrite {
+        pub id: String,
+        pub title: String,
+        pub query: ViewQuery,
+        pub pins: BTreeMap<String, Position>,
+        pub hidden: Vec<String>,
+    }
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct AnnotationWrite {
+        pub id: String,
+        pub node_id: String,
+        pub body: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct SavedViewDurable {
+        pub id: String,
+        pub title: String,
+        pub query: ViewQuery,
+        pub pins: BTreeMap<String, Position>,
+        pub hidden: Vec<String>,
+        pub anchors: BTreeMap<SyntaxId, DurableAnchor>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct AnnotationDurable {
+        pub id: String,
+        pub node_id: String,
+        pub body: String,
+        #[serde(deserialize_with = "required_nullable")]
+        pub anchor: Option<DurableAnchor>,
+    }
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct SavedViewResponse {
+        pub view: SavedViewDurable,
+        pub attachments: BTreeMap<String, Attachment>,
+        pub orphaned_ids: Vec<String>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct AnnotationResponse {
+        pub annotation: AnnotationDurable,
+        pub attachment: Attachment,
+        pub orphaned: bool,
+    }
+    /// Compatibility dispositions cannot masquerade as #22 AnchorResult reasons.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum CompatibilityDisposition {
+        MissingAnchor,
+        CaptureUnavailable,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub struct CompatibilityAttachment {
+        pub status: CompatibilityDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum Attachment {
+        Evaluated(AnchorResult),
+        Compatibility(CompatibilityAttachment),
+    }
 }
