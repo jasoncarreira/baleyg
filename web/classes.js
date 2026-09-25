@@ -279,14 +279,9 @@
   async function lookup({path = "", q = "", offset = 0, autoOpen = false} = {}) {
     const c = context(), ticket = ++searchSerial;
     if (api.onChange) api.onChange();
-    serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
-    controls.hidden = true;
-    if (!offset) {
-      showAll = false; membersOpen.clear(); expanded = [];
-      seed = null; diagram = null; diagramGeneration++; ui.diagram.replaceChildren();
-      stage = null; cards = new Map(); positions = new Map(); ui.results.replaceChildren();
-    }
     ui.diagram.setAttribute("aria-busy", "false");
+    // Keep the current diagram and its callbacks usable while lookup is pending.
+    // A failed non-revision request must not discard the only loaded view.
     state("Looking for indexed classes…", "loading");
     try {
       const params = new URLSearchParams({q, offset: String(offset), limit: "100", indexGeneration: c.revision.indexGeneration, indexRevision: String(c.revision.indexRevision)});
@@ -297,6 +292,14 @@
         reset(); api.onStale?.("Workspace revision changed. Search again.");
         state("Workspace revision changed. Search again.", "stale"); return;
       }
+      serial++; closeContextMenu(false); closeChooser(); ui.results.hidden = false;
+      controls.hidden = true;
+      if (!offset) {
+        showAll = false; membersOpen.clear(); expanded = [];
+        seed = null; diagram = null; snapshot = null; diagramGeneration++; ui.diagram.replaceChildren();
+        stage = null; cards = new Map(); positions = new Map(); ui.results.replaceChildren();
+      }
+      ui.diagram.setAttribute("aria-busy", "false");
       const items = data.items || [];
       for (const definition of items) {
         const button = el("button", undefined, "classes-result"); button.type = "button";
@@ -324,7 +327,7 @@
   }
   async function loadDiagram(nextSeed, nextExpanded, fresh = false, focusId = null) {
     // A chosen diagram owns status/notices; late catalog pages must not replace them.
-    searchSerial++;
+    const searchTicket = ++searchSerial;
     const c = context(), ticket = ++serial, focusBefore = document.activeElement;
     const restoreFocus = () => {
       if ((!fresh && !focusId) || ticket !== serial || !valid(c) || displayTicket !== ticket) return;
@@ -339,7 +342,7 @@
     const expansion = [...nextExpanded];
     try {
       const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: true, includeUnmatched: !!ui.unmatched.checked}});
-      if (ticket !== serial || !valid(c)) return;
+      if (ticket !== serial || searchTicket !== searchSerial || !valid(c)) return;
       if (!window.BaleygIndexPin.equal(data.revision, c.revision)) {
         reset(); api.onStale?.("Workspace revision changed. Open the class again.");
         state("Workspace revision changed. Open the class again.", "stale"); return;
@@ -350,7 +353,7 @@
       render(data); renderWarnings(data.warnings || []);
       updateStatus(); restoreFocus();
     } catch (error) {
-      if (ticket === serial && valid(c) && error.name !== "AbortError") {
+      if (ticket === serial && searchTicket === searchSerial && valid(c) && error.name !== "AbortError") {
         const conflict = window.BaleygIndexPin.isConflict(error);
         const recoverable = diagram && snapshot && valid(snapshot) && ![401, 403].includes(error.status) && !conflict;
         if (recoverable) {
@@ -365,7 +368,7 @@
           state(`${error.message || "Class diagram unavailable."} ${conflict ? "Workspace revision changed. Refresh status and open the class again." : "Try opening the class again."}`, conflict ? "stale" : "error");
         }
       }
-    } finally { if (ticket === serial && valid(c)) ui.diagram.setAttribute("aria-busy", "false"); }
+    } finally { if (ticket === serial && searchTicket === searchSerial && valid(c)) ui.diagram.setAttribute("aria-busy", "false"); }
   }
   function classActions(node) {
     const c = snapshot, generation = diagramGeneration;

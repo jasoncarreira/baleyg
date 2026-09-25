@@ -191,6 +191,27 @@ test("failed expansion restores the prior view controls and can be retried",asyn
  h.setRequest(async()=>diagram(["A","B","C"]));await related(h,"A",["B"]);
  assert.deepEqual(Array.from(h.calls.at(-1).options.body.expanded),["B"]);assert.ok(h.card("B"));assert.equal(h.card("C"),undefined);
 });
+test("class search keeps its prior diagram and controls through storage_busy, then clears on revision_conflict",async()=>{
+ const h=harness();await h.controller.open({seed:"A"});
+ const card=h.card("A"), control=h.button(h.document.body,"Show all returned classes"), pending=deferred();
+ h.setRequest(()=>pending.promise);
+ const searching=h.get("classes-search").fire("click");
+ assert.equal(h.card("A"),card);assert.equal(control.parentNode.hidden,false);
+ const busy=Error("Storage is busy");busy.status=409;busy.code="storage_busy";
+ pending.reject(busy);await searching;
+ assert.equal(h.card("A"),card);assert.equal(control.parentNode.hidden,false);
+ assert.equal(h.get("classes-state").dataset.state,"error");
+ assert.match(text(h.get("classes-state")),/Storage is busy/);
+ assert.equal(h.stale.length,0);
+ await h.button(card,"execute()").fire("click");assert.equal(h.methods.length,1);
+ h.setRequest(async()=>{const error=Error("Index changed");error.status=409;error.code="revision_conflict";throw error;});
+ await h.get("classes-search").fire("click");
+ assert.equal(h.card("A"),undefined);assert.equal(control.parentNode.hidden,true);
+ assert.equal(h.get("classes-state").dataset.state,"stale");
+ assert.equal(h.stale.length,1);
+ await h.button(card,"execute()").fire("click");assert.equal(h.methods.length,1);
+});
+
 test("non-revision 409 retains the current class diagram and its callbacks",async()=>{
  const h=harness();await h.controller.open({seed:"A"});const card=h.card("A");
  h.setRequest(async()=>{const error=Error("Storage is busy");error.status=409;error.code="storage_busy";throw error;});
