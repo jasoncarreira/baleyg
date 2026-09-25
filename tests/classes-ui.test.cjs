@@ -191,9 +191,19 @@ test("failed expansion restores the prior view controls and can be retried",asyn
  h.setRequest(async()=>diagram(["A","B","C"]));await related(h,"A",["B"]);
  assert.deepEqual(Array.from(h.calls.at(-1).options.body.expanded),["B"]);assert.ok(h.card("B"));assert.equal(h.card("C"),undefined);
 });
+test("non-revision 409 retains the current class diagram and its callbacks",async()=>{
+ const h=harness();await h.controller.open({seed:"A"});const card=h.card("A");
+ h.setRequest(async()=>{const error=Error("Storage is busy");error.status=409;error.code="storage_busy";throw error;});
+ await related(h,"A",["B"]);
+ assert.equal(h.card("A"),card);
+ assert.equal(h.get("classes-state").dataset.state,"error");
+ assert.match(text(h.get("classes-state")),/Storage is busy.*Previous diagram retained/);
+ assert.equal(h.stale.length,0);
+ await h.button(card,"execute()").fire("click");assert.equal(h.methods.length,1);
+});
 test("revision conflict clears old diagram and never restores its callbacks",async()=>{
  const h=harness();await h.controller.open({seed:"A"});const member=h.button(h.card("A"),"execute()");
- h.setRequest(async()=>{const error=Error("Index changed");error.status=409;throw error;});
+ h.setRequest(async()=>{const error=Error("Index changed");error.status=409;error.code="revision_conflict";throw error;});
  await related(h,"A",["B"]);
  assert.equal(h.card("A"),undefined);assert.equal(h.get("classes-state").dataset.state,"stale");
  await member.fire("click");assert.equal(h.methods.length,0);

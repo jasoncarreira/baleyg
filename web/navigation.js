@@ -160,7 +160,7 @@
     } catch (error) {
       if (!mayPublish()) return;
       display([notice(`Navigation failed: ${text(error?.message || "Request unavailable.")}`), retry, close]);
-      if (error.status === 409) owner.onStale?.("Navigation is stale. Refresh the indexed view and try again.");
+      if (window.BaleygIndexPin.isConflict(error)) owner.onStale?.("Navigation is stale. Refresh the indexed view and try again.");
     }
   }
   function attachSource(container, {path, revision, startLine = 1, isCurrent} = {}) {

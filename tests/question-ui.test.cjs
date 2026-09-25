@@ -106,7 +106,7 @@ test("current failures still display and only a current conflict invalidates foc
   assert.equal(h.get("error").hidden, false);
   assert.equal(h.get("error").textContent, "current validation failure");
   h.run("packet = {packetId:'current'}; focused = {marker:'current'};");
-  h.context.fetch = async () => ({status: 409, ok: false, json: async () => ({error: {message: "current conflict"}})});
+  h.context.fetch = async () => ({status: 409, ok: false, json: async () => ({error: {code: "revision_conflict", message: "current conflict"}})});
   await h.run(`perform(() => api('/api/questions/current/jev-response'))`);
   assert.equal(h.run("packet"), null);
   assert.equal(h.run("focused"), null);

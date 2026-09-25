@@ -116,6 +116,20 @@ test("errors have explicit retry; malformed and stale responses never navigate",
   assert.equal(h.selected.length,0);
 });
 
+test("non-revision 409 navigation reports its error without refreshing the pair",async()=>{
+  const h=harness();h.request=async()=>{const error=Error("Storage is busy");error.status=409;error.code="storage_busy";throw error;};
+  await h.nav.open(h.event(),selector);
+  assert.match(h.latest.actions[0].label,/Storage is busy/);
+  assert.equal(h.stale.length,0);
+});
+
+test("revision_conflict navigation requests refresh",async()=>{
+  const h=harness();h.request=async()=>{const error=Error("Index changed");error.status=409;error.code="revision_conflict";throw error;};
+  await h.nav.open(h.event(),selector);
+  assert.match(h.latest.actions[0].label,/Index changed/);
+  assert.equal(h.stale.length,1);
+});
+
 test("out-of-order response, reset, session, revision and scope changes suppress late results",async()=>{
   for(const invalidate of [h=>h.nav.reset(),h=>{h.session="two";},h=>{h.revision=2;},(_h,scope)=>{scope.current=false;}]) {
     const h=harness(),gate=deferred(),scope={current:true};h.request=()=>gate.promise;

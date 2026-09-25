@@ -23,6 +23,7 @@ const IndexPin = Object.freeze({
   key(value) { const pin = this.copy(value); return `${pin.indexGeneration}:${pin.indexRevision}`; },
   query(value) { const pin = this.copy(value); return `indexGeneration=${encodeURIComponent(pin.indexGeneration)}&indexRevision=${pin.indexRevision}`; },
   label(value) { const pin = this.copy(value); return `${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`; },
+  isConflict(error) { return error?.status === 409 && error.code === "revision_conflict"; },
 });
 window.BaleygIndexPin = IndexPin;
 const sourceCache = new Map();
@@ -71,6 +72,7 @@ async function api(path, method = "GET", body) {
   if (!response.ok) {
     const error = new Error(data?.error?.message || `Request failed (${response.status})`);
     error.status = response.status;
+    error.code = data?.error?.code;
     throw error;
   }
   return data;
@@ -87,7 +89,7 @@ async function perform(action, control) {
     current = operationGuard();
     await pending;
   }
-  catch (error) { if (error.name !== "AbortError" && current()) { if (error.status === 409) { void refreshStatus().catch(() => {}); window.BaleygShell?.resetInspector(); diagramSerial++; invalidateFocus("Index changed. Preview again after refreshing."); clearSource(); renderResult(); stale("The index revision changed. Refresh this view before reading source."); } $("error").textContent = error.message; $("error").hidden = false; if ($("focus-state").textContent.startsWith("Preparing")) $("focus-state").textContent = "Preview failed. Check the error and try again."; } }
+  catch (error) { if (error.name !== "AbortError" && current()) { if (IndexPin.isConflict(error)) { void refreshStatus().catch(() => {}); window.BaleygShell?.resetInspector(); diagramSerial++; invalidateFocus("Index changed. Preview again after refreshing."); clearSource(); renderResult(); stale("The index revision changed. Refresh this view before reading source."); } $("error").textContent = error.message; $("error").hidden = false; if ($("focus-state").textContent.startsWith("Preparing")) $("focus-state").textContent = "Preview failed. Check the error and try again."; } }
   finally { if (control) control.disabled = false; syncFocusControls(); }
 }
 function form(id, action) {
@@ -687,7 +689,7 @@ async function browseRequest(action, current, state) {
   try { await action(); }
   catch (error) {
     if (!current() || error.name === "AbortError") return;
-    if (error.status === 409) { void refreshStatus().catch(() => {}); clearBrowse("Index changed. Refresh status before selecting a method."); clearSource(); }
+    if (IndexPin.isConflict(error)) { void refreshStatus().catch(() => {}); clearBrowse("Index changed. Refresh status before selecting a method."); clearSource(); }
     $(state).textContent = error.message;
   }
 }
@@ -766,7 +768,7 @@ async function toggleFile(file) {
     state.items = data.items; state.truncated = data.truncated;
   } catch (error) {
     if (!current() || error.name === "AbortError") return;
-    if (error.status === 409) { clearBrowse("Index changed. Refresh status."); clearSource(); return; }
+    if (IndexPin.isConflict(error)) { void refreshStatus().catch(() => {}); clearBrowse("Index changed. Refresh status."); clearSource(); return; }
     state.error = error.message;
   } finally { if (current()) { state.loading = false; renderFiles(); } }
 }

@@ -316,8 +316,9 @@
       if (autoOpen && items.length) await loadDiagram(items[0].symbol.id, [], true);
     } catch (error) {
       if (ticket === searchSerial && valid(c) && error.name !== "AbortError") {
-        if (error.status === 409) { reset(); api.onStale?.("Workspace revision changed. Search again."); }
-        state(error.message || "Class lookup failed. Try Search again.", error.status === 409 ? "stale" : "error");
+        const conflict = window.BaleygIndexPin.isConflict(error);
+        if (conflict) { reset(); api.onStale?.("Workspace revision changed. Search again."); }
+        state(error.message || "Class lookup failed. Try Search again.", conflict ? "stale" : "error");
       }
     }
   }
@@ -350,7 +351,8 @@
       updateStatus(); restoreFocus();
     } catch (error) {
       if (ticket === serial && valid(c) && error.name !== "AbortError") {
-        const recoverable = diagram && snapshot && valid(snapshot) && ![401, 403, 409].includes(error.status);
+        const conflict = window.BaleygIndexPin.isConflict(error);
+        const recoverable = diagram && snapshot && valid(snapshot) && ![401, 403].includes(error.status) && !conflict;
         if (recoverable) {
           // This request never published a new view. Restore only the still-current cached view.
           displayTicket = ticket;
@@ -359,8 +361,8 @@
         } else {
           diagramGeneration++; diagram = null; snapshot = null; seed = null; expanded = [];
           stage = null; cards = new Map(); positions = new Map(); controls.hidden = true; ui.diagram.replaceChildren();
-          if (error.status === 409) api.onStale?.("Workspace revision changed. Refresh status and open the class again.");
-          state(`${error.message || "Class diagram unavailable."} ${error.status === 409 ? "Workspace revision changed. Refresh status and open the class again." : "Try opening the class again."}`, error.status === 409 ? "stale" : "error");
+          if (conflict) api.onStale?.("Workspace revision changed. Refresh status and open the class again.");
+          state(`${error.message || "Class diagram unavailable."} ${conflict ? "Workspace revision changed. Refresh status and open the class again." : "Try opening the class again."}`, conflict ? "stale" : "error");
         }
       }
     } finally { if (ticket === serial && valid(c)) ui.diagram.setAttribute("aria-busy", "false"); }

@@ -142,7 +142,7 @@ test("current sequence errors replace loading state and mismatch never paints",a
   const h=harness(); h.context.fetch=async()=>response(view("wrong"));
   await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
   assert.match(h.get("sequence-state").textContent,/provenance mismatch/); assert.equal(h.get("sequence-diagram").children.length,0);
-  h.context.fetch=async()=>({ok:false,status:409,json:async()=>({error:{message:"refresh required"}})});
+  h.context.fetch=async()=>({ok:false,status:409,json:async()=>({error:{code:"revision_conflict",message:"refresh required"}})});
   await h.run("loadSequence()"); assert.equal(h.run("selectedMethod"),null); assert.equal(h.get("sequence-state").textContent,"refresh required");
 });
 
@@ -630,6 +630,56 @@ test("late catalog with reused numeric revision cannot paint the new generation"
   await pending;assert.equal(h.run('files.length'),0);
 });
 
+test("non-revision 409 preserves the loaded tree and reports its exact error", async () => {
+  const h = harness(), requests = [];
+  h.context.fetch = async url => {
+    requests.push(url);
+    if (url.startsWith("/api/tree")) return response(treePage("", [treeFile("README.md", "README.md")]));
+    if (url.startsWith("/api/files") || url.startsWith("/api/methods") || url === "/api/query") return {ok:false,status:409,json:async()=>({error:{code:"storage_busy",message:"Storage is busy"}})};
+    if (url === "/api/status") return response({revision:oldPair,stats:{}});
+    if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:oldPair,catalogId:null,packages:[],warnings:[]});
+    throw Error(`Unexpected request ${url}`);
+  };
+  await h.run("loadTreeRoot()");
+  assert.match(text(h.get("file-tree")), /README.md/);
+  await h.run("loadFiles(true)");
+  assert.match(text(h.get("file-tree")), /README.md/);
+  assert.equal(h.get("files-state").textContent, "Storage is busy");
+  assert.equal(h.run("treeMode"), true);
+  await h.run("toggleFile({path:'README.md',methodCount:1})");
+  assert.match(text(h.get("file-tree")), /Storage is busy/);
+  assert.match(text(h.get("file-tree")), /README.md/);
+  await h.run("perform(() => api('/api/query'))");
+  assert.match(text(h.get("file-tree")), /README.md/);
+  assert.equal(h.get("error").textContent, "Storage is busy");
+  assert.equal(requests.filter(url => url === "/api/status").length, 0);
+  await h.run("refreshStatus()");
+  assert.match(text(h.get("file-tree")), /README.md/);
+  assert.equal(requests.filter(url => url.startsWith("/api/tree")).length, 1);
+});
+
+test("revision_conflict reloads the complete new pair after clearing browse", async () => {
+  const h = harness(), requests = [];
+  h.run(`status={revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},workspaceRoot:"/same"}`);
+  h.context.fetch = async url => {
+    requests.push(url);
+    if (url.startsWith("/api/tree")) return response({...treePage("", [treeFile(requests.includes("/api/status") ? "fresh.md" : "old.md")]),
+      revision:requests.includes("/api/status") ? newPair : oldPair});
+    if (url.startsWith("/api/files")) return {ok:false,status:409,json:async()=>({error:{code:"revision_conflict",message:"Index changed"}})};
+    if (url === "/api/status") return response({revision:newPair,workspaceRoot:"/same",stats:{}});
+    if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:newPair,catalogId:null,packages:[],warnings:[]});
+    throw Error(`Unexpected request ${url}`);
+  };
+  await h.run("loadTreeRoot()");
+  assert.match(text(h.get("file-tree")), /old.md/);
+  await h.run("loadFiles(true)");
+  await new Promise(setImmediate);
+  assert.equal(h.run("status.revision.indexGeneration"), newPair.indexGeneration);
+  assert.match(text(h.get("file-tree")), /fresh.md/);
+  assert.doesNotMatch(text(h.get("file-tree")), /old.md/);
+  assert.equal(requests.filter(url => url.startsWith("/api/tree")).length, 2);
+});
+
 const oldPair = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
 const newPair = {indexGeneration:"87654321-4321-4321-8321-abcdef123456", indexRevision:1};
 test("same-workspace conflict refresh keeps persisted views and notes while invalidating the index", async () => {
@@ -644,7 +694,7 @@ test("same-workspace conflict refresh keeps persisted views and notes while inva
     if (url === "/api/status") return response({revision:newPair,workspaceRoot:"/same",stats:{}});
     if (url === "/api/tree?path=&offset=0&limit=200") return response({...treePage("",[]),revision:newPair});
     if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:newPair,catalogId:null,packages:[],warnings:[]});
-    return {ok:false,status:409,json:async()=>({error:{message:"Index changed"}})};
+    return {ok:false,status:409,json:async()=>({error:{code:"revision_conflict",message:"Index changed"}})};
   };
   await h.run("loadSaved()");
   assert.match(text(h.get("views")), /Keep view/);
