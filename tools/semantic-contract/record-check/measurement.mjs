@@ -60,8 +60,6 @@ function witnesses(row,source,within,encoding) {
  for(const leaf of expected.values())if(!seen.has(leaf.field))reject('MEASUREMENT.WITNESS',leaf.field,'missing source witness');
 }
 function hash(domain,input) {return createHash('sha256').update(`baleyg.${domain}.v1\0`).update(bytes(input)).digest('hex');}
-const syntax = input => `sid:v1:${hash('syntax',input).slice(0,32)}`;
-const occurrence = input => `occ:v1:${hash('occurrence',input).slice(0,32)}`;
 export const measuredHeaderHash = header => hash('header',header);
 export const measuredSiblingGroupHash = headers => hash('sibling-group',{headers});
 // Storage ordering is not traversal order. Do not sort the measured source rows.
@@ -89,7 +87,14 @@ function closure(field,expected,actual) {
 function spell(language,text) {
  try{return lookupKey(language,text);}catch(error){reject('MEASUREMENT.WITNESS','spelling',error.message);}
 }
-export function checkMeasurement(loaded,records) {
+export function checkMeasurement(loaded,records,{handleDigest=hash}={}) {
+ const handles=new Map();
+ function handle(domain,input){
+  const id=`${domain==='syntax'?'sid':'occ'}:v1:${handleDigest(domain,input).slice(0,32)}`;
+  const descriptor=hex(input),prior=handles.get(id);
+  if(prior!==undefined&&prior!==descriptor)reject('ID.SOURCE','id','distinct canonical descriptors collide');
+  handles.set(id,descriptor);return id;
+ }
  validate('NativeArtifact',loaded.native);
  const native=loaded.native;
  const producer=loaded.fixture.producers.find(x=>x.id===native.producerId && x.kind==='native');
@@ -107,6 +112,7 @@ export function checkMeasurement(loaded,records) {
   if((row.name===null)!==(row.nameRange===null)||(row.kind==='module'||row.kind==='anonymousFunction')!==(row.name===null)||nameRange!==null&&!contains(range,nameRange))reject('MEASUREMENT.WITNESS','nameRange','invalid name and range');
   if(row.header.kind!==row.kind||row.header.name!==row.name)reject('MEASUREMENT.WITNESS','header','header projection differs');
   if(row.header.parameters.slice(0,-1).some(x=>x.variadic))reject('MEASUREMENT.WITNESS','header.parameters','variadic parameter must be final');
+  if(row.document.language==='java'&&row.kind==='function')reject('MEASUREMENT.WITNESS','kind','Java ordinary function does not exist');
   if(row.signature!==null && (row.document.language!=='java'||!['method','constructor'].includes(row.kind)))reject('MEASUREMENT.WITNESS','signature','signature only applies to Java methods/constructors');
   if(row.signature!==null&&(row.signature.typeParameterCount!==row.header.typeParameters.length||row.signature.parameterTypes.length!==row.header.parameters.length||row.signature.variadic!==(row.header.parameters.at(-1)?.variadic??false)||row.header.parameters.slice(0,-1).some(x=>x.variadic)||row.signature.parameterTypes.some((x,i)=>x!==row.header.parameters[i].type)))reject('MEASUREMENT.WITNESS','signature','signature projection differs');
   witnesses(row,source,range,encoding);position.set(row.ref,{range,nameRange});decls.push(row);
@@ -125,7 +131,8 @@ export function checkMeasurement(loaded,records) {
   }
   const candidates=decls.filter(x=>x.ref!==row.ref&&snapshot(x)===snapshot(row)&&strict(position.get(x.ref).range,child));
   const immediate=candidates.filter(x=>!candidates.some(y=>y!==x&&strict(position.get(x.ref).range,position.get(y.ref).range)&&contains(position.get(y.ref).range,child)));
-  if(row.parentRef===null && immediate.length||row.parentRef!==null&&(!immediate.some(x=>x.ref===row.parentRef)&&!(declarationByRef.get(row.parentRef)?.kind==='module'&&equal(position.get(row.parentRef).range,child)&&immediate.length===0)||immediate.some(x=>x.ref!==row.parentRef)))reject('MEASUREMENT.OWNER','parentRef','not the immediate source container');
+  if(immediate.length===0)immediate.push(...decls.filter(x=>x.ref!==row.ref&&x.kind==='module'&&snapshot(x)===snapshot(row)&&equal(position.get(x.ref).range,child)));
+  if(row.parentRef===null && immediate.length||row.parentRef!==null&&(!immediate.some(x=>x.ref===row.parentRef)||immediate.some(x=>x.ref!==row.parentRef)))reject('MEASUREMENT.OWNER','parentRef','not the immediate source container');
   descriptors.set(row.ref,chain);visiting.delete(row.ref);return chain;
  }
  for(const row of decls)ancestors(row);
@@ -142,7 +149,7 @@ export function checkMeasurement(loaded,records) {
     const {row,ancestry}=group[i],range=position.get(row.ref).range;
     if(i&&equal(range,position.get(group[i-1].row.ref).range))reject('ID.ORDINAL','range','duplicate sibling range');
     const key={kind:row.kind,name:row.name,signature:row.signature,ordinal:i};
-    const id=syntax({sourceSet:row.document.sourceSetId,path:row.document.path,language:row.document.language,ancestors:ancestry,declaration:key});
+    const id=handle('syntax',{sourceSet:row.document.sourceSetId,path:row.document.path,language:row.document.language,ancestors:ancestry,declaration:key});
     const value={syntaxId:id,document:row.document,revisionId:row.revisionId,kind:row.kind,name:row.name,lookupKey:row.name===null?null:spell(row.document.language,row.name),ancestors:ancestry,key,range,nameRange:position.get(row.ref).nameRange,header:row.header,provenanceId:`native:${row.revisionId}:${id}`};
     validate('Declaration',value);ids.set(row.ref,{id,key});identityByRef.set(row.ref,id);recordByNativeRef.set(row.ref,value);declaration.set(hex([row.document.sourceSetId,row.revisionId,id]),value);
    }
@@ -170,7 +177,7 @@ export function checkMeasurement(loaded,records) {
   items.push({row,kind,range,calleeRange,ownerSyntaxId:ids.get(owner.ref).id});
  }
  const grouped=new Map();for(const x of items){const key=hex([x.row.revisionId,x.ownerSyntaxId,x.kind]);if(!grouped.has(key))grouped.set(key,[]);grouped.get(key).push(x);}
- for(const group of grouped.values()){group.sort((a,b)=>a.range.start-b.range.start||a.range.end-b.range.end);group.forEach((x,i)=>{x.ordinal=i;x.id=occurrence({revisionId:x.row.revisionId,ownerSyntaxId:x.ownerSyntaxId,kind:x.kind,ordinal:i});identityByRef.set(x.row.ref,x.id);measuredOccurrence.set(hex([x.row.revisionId,x.kind,x.id]),x);});}
+ for(const group of grouped.values()){group.sort((a,b)=>a.range.start-b.range.start||a.range.end-b.range.end);group.forEach((x,i)=>{x.ordinal=i;x.id=handle('occurrence',{revisionId:x.row.revisionId,ownerSyntaxId:x.ownerSyntaxId,kind:x.kind,ordinal:i});identityByRef.set(x.row.ref,x.id);measuredOccurrence.set(hex([x.row.revisionId,x.kind,x.id]),x);});}
  const controlByRef=new Map(items.filter(x=>x.kind==='control').map(x=>[x.row.ref,x]));
  function controlParents(x,visiting=new Set()){
   if(visiting.has(x.row.ref))reject('MEASUREMENT.CONTROL','parentRef','control cycle');
