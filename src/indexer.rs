@@ -180,7 +180,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
         let declaration = is_declaration(&node.kind)
             || matches!(
                 node.kind.as_str(),
-                "function_expression" | "generator_function" | "arrow_function"
+                "class" | "function_expression" | "generator_function" | "arrow_function"
             );
         let invocation = matches!(
             node.kind.as_str(),
@@ -240,7 +240,7 @@ fn native_candidates(nodes: &[CapturedSyntaxNode]) -> Vec<CapturedNativeWitness>
             && !is_declaration(&nodes[owner].kind)
             && !matches!(
                 nodes[owner].kind.as_str(),
-                "function_expression" | "generator_function" | "arrow_function"
+                "class" | "function_expression" | "generator_function" | "arrow_function"
             )
         {
             owner = nodes[owner].parent_id.unwrap_or(0);
@@ -742,6 +742,7 @@ fn capture_file(root: &Path, path: &Path, cap: u64) -> Result<Vec<u8>> {
 fn discover_capture_inputs(
     root: &Path,
     cancel: &CancelFlag,
+    skip_symlinks: bool,
 ) -> Result<Vec<(PathBuf, Option<crate::model::v1::Language>)>> {
     use crate::model::v1::Language;
     let mut paths = Vec::new();
@@ -779,6 +780,9 @@ fn discover_capture_inputs(
         let entry = entry.context("unsafe or unreadable source discovery")?;
         if entry.file_type().is_some_and(|t| t.is_symlink()) {
             let extension = entry.path().extension().and_then(|s| s.to_str());
+            if skip_symlinks {
+                continue;
+            }
             ensure!(
                 !matches!(extension, Some("rs" | "java" | "py" | "js" | "mjs" | "cjs")),
                 "unsafe symlink source: {}",
@@ -830,12 +834,78 @@ fn discover_capture_inputs(
         "Pipfile.lock",
     ] {
         let path = root.join(name);
-        if fs::symlink_metadata(&path).is_ok() && !paths.iter().any(|(p, _)| p == &path) {
+        if fs::symlink_metadata(&path).is_ok_and(|m| !skip_symlinks || m.is_file())
+            && !paths.iter().any(|(p, _)| p == &path)
+        {
             paths.push((path, None));
         }
     }
     paths.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(paths)
+}
+
+struct RevisionBasis<'a> {
+    source_set_id: &'a str,
+    root_id: &'a str,
+    manifest_bytes: &'a [u8],
+    languages: &'a [crate::model::v1::Language],
+    dependency_source_sets: &'a [String],
+    source_inputs: &'a [(String, Vec<u8>)],
+    toolchain_bytes: &'a [u8],
+    config_bytes: &'a [u8],
+    dependency_bytes: &'a [u8],
+    producers: &'a [CapturedProducer],
+}
+
+fn captured_revision_id(basis: RevisionBasis<'_>) -> Result<String> {
+    let RevisionBasis {
+        source_set_id,
+        root_id,
+        manifest_bytes,
+        languages,
+        dependency_source_sets,
+        source_inputs,
+        toolchain_bytes,
+        config_bytes,
+        dependency_bytes,
+        producers,
+    } = basis;
+    let languages_bytes = crate::semantic_identity::canonical_json(&languages)?;
+    let dependencies_bytes = crate::semantic_identity::canonical_json(&dependency_source_sets)?;
+    let source_bytes = serde_json::to_vec(source_inputs)?;
+    let producer_bytes = serde_json::to_vec(
+        &producers
+            .iter()
+            .map(|p| {
+                (
+                    &p.id,
+                    &p.tool_name,
+                    &p.version,
+                    &p.position_encoding,
+                    &p.executable_hash,
+                    &p.artifact_hash,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let mut revision = Sha256::new();
+    for part in [
+        b"baleyg-captured-revision-v1".as_slice(),
+        source_set_id.as_bytes(),
+        root_id.as_bytes(),
+        manifest_bytes,
+        &languages_bytes,
+        &dependencies_bytes,
+        &source_bytes,
+        toolchain_bytes,
+        config_bytes,
+        dependency_bytes,
+        &producer_bytes,
+    ] {
+        revision.update((part.len() as u64).to_be_bytes());
+        revision.update(part);
+    }
+    Ok(format!("rev:v1:{}", hex::encode(revision.finalize())))
 }
 
 pub fn capture_revision(
@@ -890,7 +960,7 @@ pub fn capture_revision_with_hook(
     let root = identity.root.clone();
     let mut documents = Vec::new();
     let mut source_inputs = Vec::new();
-    let paths = discover_capture_inputs(&root, cancel)?;
+    let paths = discover_capture_inputs(&root, cancel, false)?;
     let mut total = 0u64;
     let mut observed_inputs = Vec::new();
     for (path, language) in &paths {
@@ -1077,38 +1147,18 @@ pub fn capture_revision_with_hook(
     let dependency_hash = digest(&dependency_bytes);
     // Length-prefixed parts prevent boundary ambiguity; no machine path or graph
     // index pin participates in this immutable identity.
-    let mut revision = Sha256::new();
-    for part in [
-        b"baleyg-captured-revision-v1".as_slice(),
-        admission.source_set_id.as_bytes(),
-        admission.root_id.as_bytes(),
-        &manifest_bytes,
-        &crate::semantic_identity::canonical_json(&admission.languages)?,
-        &crate::semantic_identity::canonical_json(&admission.dependency_source_sets)?,
-        &serde_json::to_vec(&source_inputs)?,
-        &toolchain_bytes,
-        &config_bytes,
-        &dependency_bytes,
-        &serde_json::to_vec(
-            &producers
-                .iter()
-                .map(|p| {
-                    (
-                        &p.id,
-                        &p.tool_name,
-                        &p.version,
-                        &p.position_encoding,
-                        &p.executable_hash,
-                        &p.artifact_hash,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )?,
-    ] {
-        revision.update((part.len() as u64).to_be_bytes());
-        revision.update(part);
-    }
-    let revision_id = format!("rev:v1:{}", hex::encode(revision.finalize()));
+    let revision_id = captured_revision_id(RevisionBasis {
+        source_set_id: &admission.source_set_id,
+        root_id: &admission.root_id,
+        manifest_bytes: &manifest_bytes,
+        languages: &admission.languages,
+        dependency_source_sets: &admission.dependency_source_sets,
+        source_inputs: &source_inputs,
+        toolchain_bytes: &toolchain_bytes,
+        config_bytes: &config_bytes,
+        dependency_bytes: &dependency_bytes,
+        producers: &producers,
+    })?;
     for document in &mut documents {
         if document.key.language == Language::Javascript {
             identify_javascript(document, &revision_id)?;
@@ -1155,7 +1205,7 @@ pub fn capture_revision_with_hook(
         }
     }
     ensure!(
-        discover_capture_inputs(&root, cancel)? == paths,
+        discover_capture_inputs(&root, cancel, false)? == paths,
         "source set changed during capture"
     );
     identity.verify()?;
@@ -1175,6 +1225,162 @@ pub fn capture_revision_with_hook(
         dependency_hash,
         producers,
         dependency_source_sets: admission.dependency_source_sets.clone(),
+    })
+}
+
+// Browser occurrences use a complete, admitted source-set snapshot. No single-file
+// hash is a revision, and absent optional metadata is captured as an empty basis.
+struct BrowserCapture {
+    revision_id: String,
+    observed: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn capture_browser_revision(
+    options: &IndexOptions,
+    root: &Path,
+    files: &[SourceFile],
+    cancel: &CancelFlag,
+) -> Result<BrowserCapture> {
+    use crate::model::v1::{DocumentKey, Language, Path as EvidencePath, Text};
+    let identity =
+        crate::store::topology::WorkspaceIdentity::discover_unattached(Some(root), root)?;
+    identity.verify()?;
+    let paths = discover_capture_inputs(root, cancel, true)?;
+    let mut observed = Vec::new();
+    let mut source_inputs = Vec::new();
+    let mut source_documents = Vec::new();
+    let mut languages = Vec::new();
+    let mut config = Vec::new();
+    let mut dependency = Vec::new();
+    for (path, language) in &paths {
+        check(cancel)?;
+        let relative = path
+            .strip_prefix(root)?
+            .to_str()
+            .context("non-UTF8 captured path")?
+            .replace('\\', "/");
+        let bytes = capture_file(root, path, options.max_file_bytes.min(256 * 1024 * 1024))?;
+        if let Some(language) = language {
+            let file = files
+                .iter()
+                .find(|f| f.path == relative)
+                .context("captured source missing from graph inventory")?;
+            ensure!(
+                file.hash == digest(&bytes) && file.text.as_bytes() == bytes,
+                "graph source changed during capture: {relative}"
+            );
+            if !languages.contains(language) {
+                languages.push(*language);
+            }
+            let key = DocumentKey {
+                source_set_id: Text::new(&identity.record_id).context("invalid source set")?,
+                language: *language,
+                path: EvidencePath::new(relative).context("invalid source path")?,
+            };
+            source_documents.push((key, digest(&bytes)));
+        } else {
+            let name = relative.as_str();
+            if matches!(
+                name,
+                "package.json"
+                    | "tsconfig.json"
+                    | "jsconfig.json"
+                    | "Cargo.toml"
+                    | "pom.xml"
+                    | "build.gradle"
+                    | "build.gradle.kts"
+                    | "settings.gradle"
+                    | "settings.gradle.kts"
+                    | "gradle.properties"
+                    | "pyproject.toml"
+            ) {
+                config.push((relative.clone(), bytes.clone()));
+            }
+            if matches!(
+                name,
+                "package-lock.json"
+                    | "yarn.lock"
+                    | "pnpm-lock.yaml"
+                    | "bun.lock"
+                    | "bun.lockb"
+                    | "Cargo.lock"
+                    | "uv.lock"
+                    | "poetry.lock"
+                    | "Pipfile.lock"
+                    | "requirements.txt"
+                    | "Pipfile"
+            ) {
+                dependency.push((relative.clone(), bytes.clone()));
+            }
+            source_inputs.push((relative, bytes.clone()));
+        }
+        observed.push((path.clone(), bytes));
+    }
+    ensure!(
+        source_documents.len() == files.len(),
+        "graph inventory differs from captured sources"
+    );
+    // Use the same language ordering as the explicit capture's canonical manifest.
+    fn order(language: Language) -> u8 {
+        match language {
+            Language::Java => 0,
+            Language::Rust => 1,
+            Language::Python => 2,
+            Language::Javascript => 3,
+        }
+    }
+    source_documents.sort_by(|a, b| {
+        (order(a.0.language), a.0.path.as_str().as_bytes())
+            .cmp(&(order(b.0.language), b.0.path.as_str().as_bytes()))
+    });
+    languages.sort_by_key(|l| order(*l));
+    let manifest: Vec<_> = source_documents
+        .iter()
+        .map(|(key, hash)| serde_json::json!({"document":key,"contentHash":hash}))
+        .collect();
+    let manifest_bytes = crate::semantic_identity::canonical_json(&manifest)?;
+    let executable_bytes = safe_read(&std::env::current_exe()?, 256 * 1024 * 1024)?;
+    let producer = CapturedProducer {
+        id: "N".into(),
+        tool_name: env!("CARGO_PKG_NAME").into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        position_encoding: "utf8".into(),
+        executable_hash: digest(&executable_bytes),
+        executable_bytes: executable_bytes.clone(),
+        artifact_hash: None,
+        artifact_bytes: None,
+    };
+    // Root metadata is captured in source_inputs too; these independently captured
+    // basis projections make the explicit absent-config case unambiguous.
+    let config_bytes = crate::semantic_identity::canonical_json(&config)?;
+    let dependency_bytes = crate::semantic_identity::canonical_json(&dependency)?;
+    let revision = captured_revision_id(RevisionBasis {
+        source_set_id: &identity.record_id,
+        root_id: &identity.root_key,
+        manifest_bytes: &manifest_bytes,
+        languages: &languages,
+        dependency_source_sets: &[],
+        source_inputs: &source_inputs,
+        toolchain_bytes: &executable_bytes,
+        config_bytes: &config_bytes,
+        dependency_bytes: &dependency_bytes,
+        producers: &[producer],
+    })?;
+    for (path, bytes) in &observed {
+        ensure!(
+            capture_file(root, path, options.max_file_bytes.min(256 * 1024 * 1024))? == *bytes,
+            "source changed during browser capture: {}",
+            path.display()
+        );
+    }
+    ensure!(
+        discover_capture_inputs(root, cancel, true)? == paths,
+        "source set changed during browser capture"
+    );
+    identity.verify()?;
+    Ok(BrowserCapture {
+        revision_id: revision,
+        observed,
     })
 }
 
@@ -1371,6 +1577,16 @@ pub fn index_workspace(
             Err(e) => diag(&mut g, None, "scip-unavailable", e.to_string()),
         }
     }
+    let browser_capture = if g.files.iter().any(|f| f.language == "javascript") {
+        Some(capture_browser_revision(
+            options,
+            &workspace_root,
+            &g.files,
+            cancel,
+        )?)
+    } else {
+        None
+    };
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
     let mut semantic_nodes = HashMap::new();
@@ -1430,9 +1646,7 @@ pub fn index_workspace(
             semantic_positions: Vec::new(),
             heritage: Vec::new(),
         };
-        // A browser index has no admitted captured revision. Its occurrence IDs
-        // are scoped to this source snapshot, not claimed as capture-revision IDs.
-        identify_javascript(&mut native, &format!("rev:v1:{}", file.hash))?;
+        identify_javascript(&mut native, &browser_capture.as_ref().unwrap().revision_id)?;
         let native_ids: HashMap<_, _> = native
             .native_candidates
             .iter()
@@ -1561,6 +1775,37 @@ pub fn index_workspace(
         total: g.files.len(),
     });
     check(cancel)?;
+    if let Some(browser_capture) = browser_capture {
+        let inventory: Vec<_> = browser_capture
+            .observed
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        for (path, bytes) in browser_capture.observed {
+            ensure!(
+                capture_file(
+                    &workspace_root,
+                    &path,
+                    options.max_file_bytes.min(256 * 1024 * 1024)
+                )? == bytes,
+                "source changed during graph extraction: {}",
+                path.display()
+            );
+        }
+        ensure!(
+            discover_capture_inputs(&workspace_root, cancel, true)?
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>()
+                == inventory,
+            "source set changed during graph extraction"
+        );
+        crate::store::topology::WorkspaceIdentity::discover_unattached(
+            Some(&workspace_root),
+            &workspace_root,
+        )?
+        .verify()?;
+    }
     Ok(g)
 }
 fn range(n: Node<'_>) -> SourceRange {

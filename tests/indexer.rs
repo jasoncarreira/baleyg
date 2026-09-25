@@ -1341,3 +1341,101 @@ fn javascript_nested_duplicate_ordinals_inventory_and_graph_ids() {
         next.iter().map(|m| &m.stable_id).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn named_class_expression_preserves_instance_initializer_owner() {
+    use baleyg::indexer::NativeCandidateKind as K;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "fields.js",
+        "function make() { if (ok) return class C { [fieldKey()] = build(); static eager = now(); [key()]() { body(); } }; }\n",
+    );
+    let admission = capture_admission(root);
+    let captured =
+        baleyg::indexer::capture_revision(&capture_options(root), &admission, &cancel()).unwrap();
+    let class = captured.documents[0]
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "class" && w.candidate_kind == K::Declaration)
+        .unwrap();
+    assert_eq!(class.name_bytes, b"C");
+    assert!(class.stable_id.as_deref().unwrap().starts_with("sid:v1:"));
+    let graph = run(&IndexOptions::new(root.to_owned()));
+    let owner = |callee: &str| {
+        let call = graph
+            .calls
+            .iter()
+            .find(|c| c.callee_text == callee)
+            .unwrap();
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.id == call.caller)
+            .unwrap()
+            .name
+            .as_str()
+    };
+    for callee in ["fieldKey", "now", "key"] {
+        assert_eq!(owner(callee), "make");
+    }
+    assert_eq!(owner("build"), "C");
+    let build = graph
+        .calls
+        .iter()
+        .find(|c| c.callee_text == "build")
+        .unwrap();
+    assert!(
+        graph
+            .regions
+            .iter()
+            .any(|r| r.kind == "instance-initializer"
+                && r.owner == build.caller
+                && build.regions.contains(&r.id))
+    );
+}
+
+#[test]
+fn browser_occurrences_follow_complete_source_and_basis_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "main.js", "function keep() { call(); }\n");
+    write(root, "sibling.js", "function sibling() {}\n");
+    let options = IndexOptions::new(root.to_owned());
+    let read = || {
+        let graph = run(&options);
+        let declaration = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "keep")
+            .unwrap()
+            .id
+            .clone();
+        let occurrence = graph
+            .calls
+            .iter()
+            .find(|c| c.callee_text == "call")
+            .unwrap()
+            .id
+            .clone();
+        (declaration, occurrence)
+    };
+    let first = read();
+    write(root, "sibling.js", "function sibling() { changed(); }\n");
+    let sibling = read();
+    assert_eq!(first.0, sibling.0);
+    assert_ne!(first.1, sibling.1);
+    write(root, "package.json", "{\"name\":\"one\"}");
+    let basis = read();
+    assert_eq!(sibling.0, basis.0);
+    assert_ne!(sibling.1, basis.1);
+    write(root, "package.json", "{\"name\":\"two\"}");
+    let changed_basis = read();
+    assert_eq!(basis.0, changed_basis.0);
+    assert_ne!(basis.1, changed_basis.1);
+    write(root, "main.js", "function keep() { call(); other(); }\n");
+    let body = read();
+    assert_eq!(changed_basis.0, body.0);
+    assert_ne!(changed_basis.1, body.1);
+}
