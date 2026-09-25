@@ -312,7 +312,7 @@ pub struct WorkspaceIdentity {
 }
 impl WorkspaceIdentity {
     pub fn discover(explicit: Option<&Path>, cwd: &Path) -> Result<Self> {
-        Self::discover_with_marker_sync_hook(explicit, cwd, || Ok(()))
+        Self::discover_with_marker_hook(explicit, cwd, |_| Ok(()))
     }
     /// Fixture hook to inject a failure immediately before marker descriptor fsync.
     pub fn discover_with_marker_sync_hook(
@@ -320,7 +320,22 @@ impl WorkspaceIdentity {
         cwd: &Path,
         before_sync: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
-        Self::discover_unattached(explicit, cwd)?.attach_marker_with_hook(before_sync)
+        let mut before_sync = Some(before_sync);
+        Self::discover_with_marker_hook(explicit, cwd, |stage| {
+            if stage == MarkerStage::MarkerSync {
+                before_sync.take().context("marker sync hook reused")?()
+            } else {
+                Ok(())
+            }
+        })
+    }
+    /// Fixture-only interleaving and durability hook; ordinary discovery supplies no barrier.
+    pub fn discover_with_marker_hook(
+        explicit: Option<&Path>,
+        cwd: &Path,
+        mut hook: impl FnMut(MarkerStage) -> Result<()>,
+    ) -> Result<Self> {
+        Self::discover_unattached(explicit, cwd)?.attach_marker_with_hook(&mut hook)
     }
     /// Inspect identity without creating the Git marker, for external destination preflight.
     pub fn discover_unattached(explicit: Option<&Path>, cwd: &Path) -> Result<Self> {
@@ -390,9 +405,12 @@ impl WorkspaceIdentity {
         })
     }
     pub fn attach_marker(self) -> Result<Self> {
-        self.attach_marker_with_hook(|| Ok(()))
+        self.attach_marker_with_hook(&mut |_| Ok(()))
     }
-    fn attach_marker_with_hook(mut self, before_sync: impl FnOnce() -> Result<()>) -> Result<Self> {
+    fn attach_marker_with_hook(
+        mut self,
+        hook: &mut impl FnMut(MarkerStage) -> Result<()>,
+    ) -> Result<Self> {
         let current = metadata(&self.root).context("root_changed")?;
         let captured = self.root_handle.metadata()?;
         ensure!(
@@ -407,7 +425,7 @@ impl WorkspaceIdentity {
                 resolve_git_dir(&self.root)?.as_deref() == Some(git),
                 "workspace_id_changed"
             );
-            let marker = marker_at(git, before_sync)?;
+            let marker = marker_at(git, hook)?;
             self.record_id = marker.to_string();
             self.marker = Some(marker);
         }
@@ -519,10 +537,28 @@ fn parse_git_pointer(path: &Path) -> Result<PathBuf> {
     ensure!(m.is_dir() && m.uid() == owner(), "unsafe Git directory");
     Ok(normalized)
 }
-fn read_marker_file(path: &Path) -> Result<(Uuid, File)> {
+/// Stages exposed only to integration fixtures; no production behavior depends on a hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerStage {
+    CreatedBeforeWrite,
+    ShortRead,
+    MarkerSync,
+    PrivateDirSync,
+    GitDirSync,
+}
+
+enum MarkerRead {
+    Valid(Uuid, File),
+    Short(File),
+}
+fn read_marker_file(path: &Path) -> Result<MarkerRead> {
     let f = open_file(path, false)?;
     let mut data = Vec::new();
     (&f).take(37).read_to_end(&mut data)?;
+    private_file(path, &f)?;
+    if data.len() < 36 {
+        return Ok(MarkerRead::Short(f));
+    }
     ensure!(data.len() == 36, "invalid workspace-id marker");
     let text = std::str::from_utf8(&data)?;
     let id = Uuid::parse_str(text)?;
@@ -530,29 +566,29 @@ fn read_marker_file(path: &Path) -> Result<(Uuid, File)> {
         !id.is_nil() && id.get_version_num() == 4 && id.to_string() == text,
         "invalid workspace-id marker"
     );
-    Ok((id, f))
+    Ok(MarkerRead::Valid(id, f))
 }
 fn read_marker(path: &Path) -> Result<Uuid> {
-    Ok(read_marker_file(path)?.0)
+    match read_marker_file(path)? {
+        MarkerRead::Valid(id, _) => Ok(id),
+        MarkerRead::Short(_) => bail!("invalid workspace-id marker"),
+    }
 }
-fn read_marker_during_creation(path: &Path) -> Result<(Uuid, File)> {
+fn read_marker_during_creation(
+    path: &Path,
+    hook: &mut impl FnMut(MarkerStage) -> Result<()>,
+) -> Result<(Uuid, File)> {
     for attempt in 0..20 {
-        let result = read_marker_file(path);
-        if result.is_ok() || attempt == 19 {
-            return result;
-        }
-        match fs::symlink_metadata(path) {
-            Ok(m)
-                if m.is_file()
-                    && !m.file_type().is_symlink()
-                    && m.uid() == owner()
-                    && m.nlink() == 1
-                    && m.mode() & 0o777 == 0o600
-                    && m.len() < 36 =>
-            {
-                std::thread::sleep(Duration::from_millis(5))
+        match read_marker_file(path)? {
+            MarkerRead::Valid(id, file) => return Ok((id, file)),
+            MarkerRead::Short(file) => {
+                hook(MarkerStage::ShortRead)?;
+                private_file(path, &file)?;
+                if attempt == 19 {
+                    bail!("invalid workspace-id marker: persistently short");
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            _ => return result,
         }
     }
     unreachable!()
@@ -562,15 +598,20 @@ fn durable_marker(
     baleyg: &Path,
     git: &Path,
     file: &File,
-    before_sync: impl FnOnce() -> Result<()>,
+    hook: &mut impl FnMut(MarkerStage) -> Result<()>,
 ) -> Result<()> {
     private_file(path, file).context("workspace_id_not_durable")?;
-    before_sync().context("workspace_id_not_durable")?;
+    hook(MarkerStage::MarkerSync).context("workspace_id_not_durable")?;
     file.sync_all().context("workspace_id_not_durable")?;
+    private_file(path, file).context("workspace_id_not_durable")?;
+    hook(MarkerStage::PrivateDirSync).context("workspace_id_not_durable")?;
     sync_directory(baleyg).context("workspace_id_not_durable")?;
-    sync_directory(git).context("workspace_id_not_durable")
+    private_file(path, file).context("workspace_id_not_durable")?;
+    hook(MarkerStage::GitDirSync).context("workspace_id_not_durable")?;
+    sync_directory(git).context("workspace_id_not_durable")?;
+    private_file(path, file).context("workspace_id_not_durable")
 }
-fn marker_at(git: &Path, before_sync: impl FnOnce() -> Result<()>) -> Result<Uuid> {
+fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Result<Uuid> {
     ensure!(
         metadata(git)?.uid() == owner() && metadata(git)?.is_dir(),
         "unsafe Git directory"
@@ -578,9 +619,9 @@ fn marker_at(git: &Path, before_sync: impl FnOnce() -> Result<()>) -> Result<Uui
     let baleyg = git.join("baleyg");
     make_private(&baleyg)?;
     let path = baleyg.join("workspace-id");
-    match read_marker_during_creation(&path) {
+    match read_marker_during_creation(&path, hook) {
         Ok((id, file)) => {
-            durable_marker(&path, &baleyg, git, &file, before_sync)?;
+            durable_marker(&path, &baleyg, git, &file, hook)?;
             Ok(id)
         }
         Err(e)
@@ -597,21 +638,15 @@ fn marker_at(git: &Path, before_sync: impl FnOnce() -> Result<()>) -> Result<Uui
             match created {
                 Ok(mut f) => {
                     private_file(&path, &f)?;
+                    hook(MarkerStage::CreatedBeforeWrite)?;
                     f.write_all(id.to_string().as_bytes())?;
-                    durable_marker(&path, &baleyg, git, &f, before_sync)?;
+                    durable_marker(&path, &baleyg, git, &f, hook)?;
                     Ok(id)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    for _ in 0..20 {
-                        match read_marker_during_creation(&path) {
-                            Ok((id, file)) => {
-                                durable_marker(&path, &baleyg, git, &file, before_sync)?;
-                                return Ok(id);
-                            }
-                            Err(_) => std::thread::sleep(Duration::from_millis(5)),
-                        }
-                    }
-                    bail!("invalid workspace-id marker after concurrent creation")
+                    let (id, file) = read_marker_during_creation(&path, hook)?;
+                    durable_marker(&path, &baleyg, git, &file, hook)?;
+                    Ok(id)
                 }
                 Err(e) => Err(e.into()),
             }
