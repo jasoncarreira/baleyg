@@ -1,6 +1,11 @@
 import {validate} from './formats.mjs';
 import {canonicalBytes} from './json.mjs';
 import {toByteRange} from './coordinates.mjs';
+import {checkMeasurement} from './record-check/measurement.mjs';
+import {checkCoverage} from './record-check/coverage.mjs';
+import {checkJoins} from './record-check/joins.mjs';
+import {checkRelationships} from './record-check/relationships.mjs';
+import {checkBindings} from './record-check/bindings.mjs';
 
 const categories=['sameNameOverload','importsAliases','callableValues','recursion','relationshipsDispatch','unicodeCoordinates','coverageFreshness','compatibilityControl'];
 const outcomes=['resolved','provenExternal','ambiguous','unresolved','unsupported'];
@@ -19,143 +24,231 @@ function unique(rows,selector,field) {
   seen.add(key);
  }
 }
-function source(loaded,row) {
- return loaded.sources.get(JSON.stringify([row.document.sourceSetId,row.revisionId,row.document.path]));
+const tuple=row=>JSON.stringify([row.document.sourceSetId,row.revisionId,row.document.path]);
+const documentOf=(loaded,row)=>loaded.revisions.get(JSON.stringify([row.document.sourceSetId,row.revisionId]))?.documents.find(x=>same(x.key,row.document));
+function span(loaded,row,range=row.range) {
+ const bytes=loaded.sources.get(tuple(row));
+ if(!bytes)fail('COUNT.SOURCE','document','source bytes unavailable');
+ return toByteRange(bytes,range);
 }
-function nativeKey(row) {return identity([row.document,row.revisionId,row.range]);}
-function anchorMatches(loaded,anchor) {
- const bytes=source(loaded,anchor);
- if(!bytes)return false;
- const range=toByteRange(bytes,anchor.range);
- const native=loaded.native;
- const candidates=anchor.kind==='declarationName'?native.declarations.filter(x=>x.nameRange!==null).map(x=>({...x,range:x.nameRange})):anchor.kind==='reference'?native.references:anchor.kind==='callee'?native.calls.filter(x=>x.calleeRange!==null).map(x=>({...x,range:x.calleeRange})):native.calls;
- return candidates.some(x=>same(x.document,anchor.document)&&x.revisionId===anchor.revisionId&&
-  same(toByteRange(source(loaded,x),x.range),range) &&
-  (x.ref===anchor.ownerRef || x.ownerRef===anchor.ownerRef));
+function proofFor(loaded,records,fact,annotation) {
+ const id=fact.kind==='typeRelationship'?fact.provenanceRef:fact.record?.provenanceId;
+ const proof=records.provenance.find(x=>x.id===id),captured=loaded.semanticProofs.get(id);
+ const strip=({freshness,...rest})=>rest;
+ if(!proof||!captured||captured.factRef!==fact.ref||captured.factKind!==fact.kind||
+  !same(strip(proof),strip(captured.wrapper))||!same(proof.document,annotation.document)||
+  proof.revisionId!==annotation.revisionId||proof.contentHash!==documentOf(loaded,annotation)?.contentHash||
+  proof.evidenceKind!==({typeRelationship:'typeRelationship',declarationBinding:'declarationBinding',reference:'semanticReference',callBinding:'semanticReference'}[fact.kind]))
+  fail('COUNT.PROOF','provenanceId','fact is not authenticated by the captured semantic artifact and source tuple');
+ return proof;
 }
-
-// Count only measured occurrences and authenticated captured facts, never reported totals.
+function target(loaded,measurement,ref) {
+ if(ref===null)return null;
+ if(ref.kind==='external')return {kind:'external',symbol:ref.symbol};
+ const row=measurement.recordByNativeRef.get(ref.declarationRef);
+ if(!row?.syntaxId||row.revisionId!==ref.revisionId)
+  fail('COUNT.RELATIONSHIP','typeRelationships','target is not an independently measured declaration');
+ return {kind:'internal',syntaxId:row.syntaxId,document:row.document,revisionId:row.revisionId};
+}
+function anchored(loaded,measurement,anchor) {
+ const document=documentOf(loaded,anchor);
+ const range=span(loaded,anchor);
+ if(!document||anchor.contentHash!==document.contentHash)
+  fail('COUNT.SCENARIO','anchors','anchor differs from source bytes');
+ return measurement.candidateRows.filter(x=>same(x.anchor.document,anchor.document)&&
+  x.anchor.revisionId===anchor.revisionId&&x.anchor.kind===anchor.kind&&
+  x.anchor.contentHash===document.contentHash&&same(x.anchor.range,range)&&x.ownerRef===anchor.ownerRef);
+}
+// Re-measure native identities and inspect captured semantic wrappers. Authored
+// count assertions cannot create source occurrences or turn diagnostic joins into them.
 export function checkCounts(loaded,records,dispositions=loaded.dispositions) {
  validate('NormalizedRecordsV1',records);
  validate('DispositionsV1',dispositions);
+ let measurement;
+ try {measurement=checkMeasurement(loaded,records);}
+ catch(error) {
+  if(error.assertion==='RECORDS.MEMBERSHIP'&&['calls','declarations','controlRegions'].includes(error.field))
+   fail('COUNT.CALLS','measuredCalls','native occurrence IDs, owner, span or proof differ');
+  throw error;
+ }
+ const coverage=checkCoverage(loaded,records);
+ const joins=checkJoins(loaded,records,coverage,measurement);
+ checkRelationships(loaded,records,coverage,measurement,joins);
+ checkBindings(loaded,records,coverage,measurement,joins);
  const {fixture,native,annotations}=loaded;
- const annotationsFacts=annotations.flatMap(a=>a.facts.filter(f=>f.kind!=='provenance').map(f=>({fact:f,annotation:a})));
- const facts=new Map(annotationsFacts.map(row=>[row.fact.ref,row]));
- unique(annotationsFacts,x=>x.fact.ref,'facts');
- const proofs=new Map(records.provenance.map(x=>[x.id,x]));
- const scenarios=annotations.flatMap(a=>a.scenarios.map(s=>({scenario:s,annotation:a})));
+ const facts=new Map();
+ for(const annotation of annotations)for(const fact of annotation.facts) {
+  if(facts.has(fact.ref))fail('COUNT.DUPLICATE','facts','duplicate captured fact reference');
+  facts.set(fact.ref,{fact,annotation});
+ }
+ const scenarios=annotations.flatMap(annotation=>annotation.scenarios.map(scenario=>({scenario,annotation})));
  unique(scenarios,x=>x.scenario.id,'scenarios');
- unique(scenarios,x=>identity([x.scenario.category,x.scenario.anchors.map(identity).sort()]),'scenarios.anchors');
- const scenarioById=new Map(scenarios.map(x=>[x.scenario.id,x]));
+ const scenariosById=new Map(scenarios.map(x=>[x.scenario.id,x]));
+ const usedAnchors=new Set();
  for(const {scenario,annotation} of scenarios) {
-  if(!scenario.anchors.length)fail('COUNT.SCENARIO','anchors','scenario has no measured anchor');
+  if(!scenario.anchors.length||!scenario.factRefs.length)
+   fail('COUNT.SCENARIO','anchors','scenario requires measured anchors and connected facts');
   unique(scenario.anchors,identity,'anchors');unique(scenario.factRefs,x=>x,'factRefs');
+  const witnessed=[];
   for(const anchor of scenario.anchors) {
-   if(!same(anchor.document,annotation.document)||anchor.revisionId!==annotation.revisionId||!anchorMatches(loaded,anchor))
-    fail('COUNT.SCENARIO','anchors','scenario anchor is not an exact measured occurrence');
+   if(!same(anchor.document,annotation.document)||anchor.revisionId!==annotation.revisionId||anchored(loaded,measurement,anchor).length!==1)
+    fail('COUNT.SCENARIO','anchors','scenario anchor is not uniquely measured in its document');
+   const key=identity([anchor.document,anchor.revisionId,anchor.kind,span(loaded,anchor),anchor.ownerRef]);
+   if(usedAnchors.has(key))fail('COUNT.SCENARIO','anchors','reused or relabelled source anchor');
+   usedAnchors.add(key);witnessed.push(key);
   }
-  for(const ref of scenario.factRefs)if(!facts.has(ref))fail('COUNT.SCENARIO','factRefs','uncaptured fact');
+  const attached=[];
+  for(const ref of scenario.factRefs) {
+   const entry=facts.get(ref);
+   if(!entry||!same(entry.annotation.document,annotation.document)||entry.annotation.revisionId!==annotation.revisionId)
+    fail('COUNT.SCENARIO','factRefs','fact belongs to another source tuple');
+   const {fact}=entry;
+   let selector=fact.anchor;
+   if(fact.kind==='typeRelationship') {
+    const source=native.declarations.find(row=>row.ref===fact.source.declarationRef&&row.revisionId===fact.source.revisionId);
+    const document=documentOf(loaded,source??annotation);
+    if(!source?.nameRange||!same(source.document,annotation.document)||source.revisionId!==annotation.revisionId||!document)
+     fail('COUNT.SCENARIO','factRefs','directed relationship lacks measured source');
+    selector={document:source.document,revisionId:source.revisionId,kind:'declarationName',contentHash:document.contentHash,
+     range:source.nameRange,ownerRef:source.parentRef??source.ref};
+   }
+   if(!selector||!witnessed.includes(identity([selector.document,selector.revisionId,
+     selector.kind,span(loaded,selector),selector.ownerRef])))
+    fail('COUNT.SCENARIO','factRefs','fact is not joined to a scenario source anchor and tuple');
+   const proof=proofFor(loaded,records,fact,annotation);
+   attached.push({fact,proof});
+  }
+  const anchors=scenario.anchors.map(anchor=>anchored(loaded,measurement,anchor)[0]);
+  const kinds=attached.map(x=>x.fact.kind);
+  const source=loaded.sources.get(tuple(annotation));
+  const siblings=anchors.map(x=>native.declarations.find(row=>row.ref===x.ref));
+  const identical=anchors.length>=2&&anchors.every(x=>x.anchor.kind==='declarationName')&&
+   siblings.every(row=>row&&row.name===siblings[0].name&&row.kind===siblings[0].kind&&
+    row.parentRef===siblings[0].parentRef&&same(row.signature,siblings[0].signature));
+  const includes=(role)=>attached.some(({fact})=>fact.kind==='reference'&&fact.record.roles.includes(role));
+  const recursive=attached.some(({fact})=>fact.kind==='callBinding'&&fact.record.declaredTarget?.kind==='internal'&&
+   fact.record.declaredTarget.declarationRef===fact.anchor.ownerRef);
+  const directed=attached.some(({fact})=>fact.kind==='typeRelationship');
+  const dispatch=attached.some(({fact})=>fact.kind==='callBinding'&&fact.record.dispatch!=='unknown');
+  const nonAscii=scenario.anchors.some(anchor=>{const at=span(loaded,anchor);return [...source.subarray(0,at.end)].some(byte=>byte>=128);});
+  const incomplete=attached.some(({proof})=>records.coverage.some(row=>row.producerId===proof.producerId&&
+   row.sourceSetId===annotation.document.sourceSetId&&row.documentPath===annotation.document.path&&
+   row.revisionId===annotation.revisionId&&['partial','failed','omitted'].includes(row.state)));
+  const supported={sameNameOverload:identical,importsAliases:includes('import')||includes('alias'),
+   callableValues:includes('read')&&anchors.some(x=>x.anchor.kind==='reference'),recursion:recursive,
+   relationshipsDispatch:directed||dispatch,unicodeCoordinates:nonAscii,
+   coverageFreshness:incomplete||attached.some(x=>x.proof.freshness!=='fresh'),
+   compatibilityControl:includes('read')||includes('definition')};
+  if(!supported[scenario.category])fail('COUNT.SCENARIO','category','category lacks independently measured evidence');
  }
- const nativeCalls=new Map(native.calls.map(x=>[x.ref,x]));
- const installedCalls=new Set(records.calls.map(x=>identity([x.id,x.document,x.revisionId])));
- if(records.calls.length!==native.calls.length||installedCalls.size!==native.calls.length)
-  fail('COUNT.CALLS','measuredCalls','calls must be measured native occurrences');
- const nativeRefs=new Map(native.references.map(x=>[x.ref,x]));
- const referenceFacts=annotationsFacts.filter(x=>x.fact.kind==='reference');
- const exactReferences=new Map();
- for(const {fact,annotation} of referenceFacts) {
-  const proof=proofs.get(fact.record.provenanceId);
-  if(!proof || loaded.semanticProofs.get(proof.id)?.factRef!==fact.ref || proof.evidenceKind!=='semanticReference'||
-     !same(proof.document,annotation.document)||proof.revisionId!==annotation.revisionId)
-   fail('COUNT.PROOF','references','reference lacks its captured proof');
-  const candidates=[...nativeRefs.values()].filter(row=>same(row.document,annotation.document)&&row.revisionId===annotation.revisionId&&
-    same(toByteRange(source(loaded,row),row.range),toByteRange(source(loaded,fact.anchor),fact.anchor.range))&&
-    row.ownerRef===fact.anchor.ownerRef);
-  const installed=records.references.filter(r=>r.provenanceId===proof.id);
-  if(candidates.length===1 && installed.length===1 && same(installed[0].range,toByteRange(source(loaded,candidates[0]),candidates[0].range)))
-   exactReferences.set(fact.ref,{row:candidates[0],record:installed[0]});
-  else if(installed.length)fail('COUNT.REFERENCE','references','non-exact reference was installed');
+ const exactReferences=new Map(),referenceOccurrences=new Set();
+ for(const {fact,annotation} of facts.values())if(fact.kind==='reference') {
+  const proof=proofFor(loaded,records,fact,annotation);
+  const matches=anchored(loaded,measurement,fact.anchor);
+  const record=records.references.find(r=>r.provenanceId===proof.id);
+  if(matches.length!==1) {
+   if(record)fail('COUNT.REFERENCE','references','non-exact reference installed');
+   continue;
+  }
+  const candidate=matches[0],nativeRow=native.references.find(x=>x.ref===candidate.ref);
+  if(!record||!nativeRow||record.id!==candidate.id||record.ownerSyntaxId!==measurement.identityByRef.get(nativeRow.ownerRef)||
+    !same(record.document,nativeRow.document)||record.revisionId!==nativeRow.revisionId||
+    !same(record.range,span(loaded,nativeRow))||record.provenanceId!==proof.id)
+   fail('COUNT.REFERENCE','references','installed reference does not match exact measured occurrence and proof');
+  exactReferences.set(fact.ref,{row:nativeRow,record,candidate});
+  referenceOccurrences.add(identity([record.document,record.revisionId,record.id]));
  }
- for(const row of records.references)if(![...exactReferences.values()].some(x=>same(x.record,row)))
-  fail('COUNT.REFERENCE','references','installed reference has no exact captured occurrence and proof');
- const referenceKeys=new Set([...exactReferences.values()].map(x=>nativeKey(x.row)));
- const negatives=new Set();
+ for(const record of records.references)if(![...exactReferences.values()].some(x=>same(x.record,record)))
+  fail('COUNT.REFERENCE','references','unproven installed reference');
+ const negativeOccurrences=new Set();
  unique(dispositions.callableValueNegatives,x=>identity([x.scenarioId,x.referenceRef]),'callableValueNegatives');
  for(const negative of dispositions.callableValueNegatives) {
-  const scenario=scenarioById.get(negative.scenarioId)?.scenario;
-  const exact=exactReferences.get(negative.referenceRef);
-  const ref=exact?.row;
-  // A callable-value read is a Reference, not a call, even if its spelling is callable.
-  const ownerCall=ref && native.calls.some(c=>same(c.document,ref.document)&&c.revisionId===ref.revisionId&&
-   c.ownerRef===ref.ownerRef&&same(toByteRange(source(loaded,c),c.calleeRange??c.range),toByteRange(source(loaded,ref),ref.range)));
-  if(!ref||!exact||!scenario||scenario.category!=='callableValues'||
-     !scenario.factRefs.includes(negative.referenceRef)||ref.ownerRef!==negative.ownerRef||
-     !same(ref.range,negative.range)||ownerCall||!exact.record.roles.includes('read')||exact.record.roles.includes('call')||
-   !records.declarations.some(d=>exact.record.declaredTarget?.kind==='internal'&&
-    ['function','method','constructor','anonymousFunction'].includes(d.kind)&&
-    d.syntaxId===exact.record.declaredTarget.syntaxId&&same(d.document,exact.record.declaredTarget.document)&&
-    d.revisionId===exact.record.declaredTarget.revisionId))
-   fail('COUNT.NEGATIVE','callableValueNegatives','negative needs an exact measured non-call read and callable-value scenario');
-  negatives.add(nativeKey(ref));
+  const scenario=scenariosById.get(negative.scenarioId)?.scenario;
+  const installed=exactReferences.get(negative.referenceRef),row=installed?.row,record=installed?.record;
+  const callCallees=row&&native.calls.filter(c=>same(c.document,row.document)&&c.revisionId===row.revisionId&&c.ownerRef===row.ownerRef&&c.calleeRange!==null)
+   .map(c=>span(loaded,c,c.calleeRange));
+  const position=row&&span(loaded,row);
+  const inCallee=callCallees?.some(c=>c.start<position.end&&position.start<c.end);
+  if(!row||!scenario||scenario.category!=='callableValues'||!scenario.factRefs.includes(negative.referenceRef)||
+   row.ownerRef!==negative.ownerRef||!same(position,span(loaded,row,negative.range))||inCallee||
+   !record.roles.includes('read')||record.roles.includes('call')||
+   !records.declarations.some(d=>record.declaredTarget?.kind==='internal'&&d.syntaxId===record.declaredTarget.syntaxId&&
+    same(d.document,record.declaredTarget.document)&&d.revisionId===record.declaredTarget.revisionId&&
+    ['function','method','constructor','anonymousFunction'].includes(d.kind)))
+   fail('COUNT.NEGATIVE','callableValueNegatives','callable read requires source-backed target outside every measured call callee');
+  negativeOccurrences.add(identity([row.document,row.revisionId,installed.candidate.id]));
  }
- const relationships=annotationsFacts.filter(({fact})=>fact.kind==='typeRelationship');
- const applicableRelationships=new Set();
- for(const {fact} of relationships) {
-  const proof=proofs.get(fact.provenanceRef);
-  if(!proof||loaded.semanticProofs.get(proof.id)?.factRef!==fact.ref||proof.evidenceKind!=='typeRelationship'||
-     !records.typeRelationships.some(x=>x.provenanceId===proof.id&&x.kind===fact.relationshipKind))
-   fail('COUNT.RELATIONSHIP','typeRelationships','relationship lacks a checked directed proof');
-  applicableRelationships.add(identity([fact.relationshipKind,fact.source,fact.target]));
+ const relationships=new Set();
+ for(const {fact,annotation} of facts.values())if(fact.kind==='typeRelationship') {
+  const proof=proofFor(loaded,records,fact,annotation);
+  const source=target(loaded,measurement,fact.source),destination=target(loaded,measurement,fact.target);
+  const record=records.typeRelationships.find(x=>x.provenanceId===proof.id);
+  if(source?.kind!=='internal'||!same(source.document,annotation.document)||source.revisionId!==annotation.revisionId||
+   !record||record.kind!==fact.relationshipKind||!same(record.source,source)||!same(record.target,destination))
+   fail('COUNT.RELATIONSHIP','typeRelationships','captured directed source, target or proof disagrees');
+  relationships.add(identity([record.kind,record.source,record.target]));
  }
- const authored=dispositions.assertions;
- unique(authored,x=>identity([x.kind,x.factRef]),'assertions');
+ for(const record of records.typeRelationships)if(![...facts.values()].some(({fact})=>fact.kind==='typeRelationship'&&fact.provenanceRef===record.provenanceId))
+  fail('COUNT.RELATIONSHIP','typeRelationships','relationship lacks captured directed source');
  const outcomeKeys=new Map(outcomes.map(x=>[x,new Set()]));
- for(const row of authored) {
-  const entry=facts.get(row.factRef);
-  if(!entry||!['callBinding','reference','declarationBinding'].includes(entry.fact.kind))
-   fail('COUNT.DISPOSITION','assertions','disposition does not name a captured join fact');
-  const fact=entry.fact,proofId=fact.record.provenanceId,proof=proofs.get(proofId);
-  if(!proof||loaded.semanticProofs.get(proofId)?.factRef!==fact.ref)
-   fail('COUNT.PROOF','assertions','disposition has no authenticated proof');
-  const diag=records.referenceJoinDiagnostics.find(x=>x.factRef===fact.ref);
-  const record=entry.fact.kind==='reference'?records.references.find(x=>x.provenanceId===proofId):
-   entry.fact.kind==='callBinding'?records.callBindings.find(x=>x.provenanceId===proofId):
-   records.declarationBindings.find(x=>x.provenanceId===proofId);
-  const join=record?.join??diag?.join??(exactReferences.has(fact.ref)?{status:'exact'}:null);
-  if(row.kind==='join') {
-   if(!join || row.disposition!==join.status)fail('COUNT.DISPOSITION','assertions','join does not match measured result');
-   if(row.disposition==='unsupported') {
-    const support=fixture.coverageIntents?.find(x=>x.producerId===proof.producerId&&same(x.document,fact.anchor.document)&&x.revisionId===fact.anchor.revisionId)?.measurementSupport.find(x=>x.kind===fact.anchor.kind);
-    if(support?.available!==false)fail('COUNT.DISPOSITION','assertions','unsupported join needs independently declared unavailable measurement');
-    outcomeKeys.get('unsupported').add(identity([fact.anchor.document,fact.anchor.revisionId,fact.anchor.kind,fact.anchor.range]));
-   }
+ unique(dispositions.assertions,x=>identity([x.kind,x.factRef]),'assertions');
+ for(const assertion of dispositions.assertions) {
+  const entry=facts.get(assertion.factRef),fact=entry?.fact;
+  if(!fact||!['callBinding','reference','declarationBinding'].includes(fact.kind))
+   fail('COUNT.DISPOSITION','assertions','assertion lacks a captured join fact');
+  const proof=proofFor(loaded,records,fact,entry.annotation);
+  const candidate=anchored(loaded,measurement,fact.anchor);
+  const capturedJoin=joins.joined.get(fact.ref)?.join;
+  const status=capturedJoin?.status;
+  if(!capturedJoin||!same(capturedJoin.anchor,{document:fact.anchor.document,revisionId:fact.anchor.revisionId,
+    contentHash:fact.anchor.contentHash,range:span(loaded,fact.anchor),kind:fact.anchor.kind}))
+   fail('COUNT.DISPOSITION','assertions','disposition lacks its verified measured join');
+  const record=fact.kind==='reference'?records.references.find(x=>x.provenanceId===proof.id):
+   fact.kind==='callBinding'?records.callBindings.find(x=>x.provenanceId===proof.id):
+   records.declarationBindings.find(x=>x.provenanceId===proof.id);
+  const diagnostic=records.referenceJoinDiagnostics.find(x=>x.factRef===fact.ref&&x.provenanceId===proof.id);
+  if(assertion.kind==='join') {
+   if(assertion.disposition!==status || (fact.kind==='reference'&&status==='exact'&&!exactReferences.has(fact.ref)) ||
+      (fact.kind==='reference'&&status!=='exact'&&(!diagnostic||!same(diagnostic.join,capturedJoin))) ||
+      (fact.kind!=='reference'&&(!record||!same(record.join,capturedJoin))))
+    fail('COUNT.DISPOSITION','assertions','join conflicts with measured candidate or capability');
+   if(status==='unsupported')outcomeKeys.get('unsupported').add(identity([fact.anchor.document,fact.anchor.revisionId,span(loaded,fact.anchor)]));
   } else {
-   if(!record||!['reference','callBinding'].includes(fact.kind)||record.join?.status&&record.join.status!=='exact')
-    fail('COUNT.DISPOSITION','assertions','resolution requires installed exact proof');
+   if(status!=='exact'||!record||!['reference','callBinding'].includes(fact.kind)||
+    fact.kind==='callBinding'&&(record.callId!==capturedJoin.candidateIds[0]||!same(record.join,capturedJoin))||
+    fact.kind==='reference'&&!exactReferences.has(fact.ref))
+    fail('COUNT.DISPOSITION','assertions','resolution lacks an exact measured occurrence');
+   if(!same(record.declaredTarget,fact.record.declaredTarget===null?null:target(loaded,measurement,fact.record.declaredTarget))||
+      !same(record.candidates,fact.record.candidates.map(x=>target(loaded,measurement,x)))||
+      record.resolution!==fact.record.resolution)
+    fail('COUNT.DISPOSITION','assertions','resolution disagrees with captured semantic target');
    const expected=record.resolution==='external'?'provenExternal':record.resolution;
-   if(row.disposition!==expected)fail('COUNT.DISPOSITION','assertions','resolution contradicts checked proof');
-   const id=fact.kind==='reference'?record.id:record.callId;
-   if(id===null)fail('COUNT.DISPOSITION','assertions','uninstalled occurrence cannot count');
-   outcomeKeys.get(expected).add(identity([fact.kind,entry.annotation.document,entry.annotation.revisionId,id]));
+   if(assertion.disposition!==expected||!outcomeKeys.has(expected))
+    fail('COUNT.DISPOSITION','assertions','resolution contradicts captured exact proof');
+   outcomeKeys.get(expected).add(identity([fact.kind,fact.anchor.document,fact.anchor.revisionId,capturedJoin.candidateIds[0]]));
   }
  }
- const observed=new Set(records.references.flatMap(r=>r.roles));
- const count={formatVersion:1,language:fixture.language,profile:fixture.profile,
-  floorsEnforced:!(fixture.profile==='example'&&loaded.root?.replaceAll('\\','/').split('/').at(-1)==='example'),
-  scenariosTotal:scenarios.length,
-  scenariosByCategory:categories.map(category=>({category,count:scenarios.filter(x=>x.scenario.category===category).length})),
-  measuredCalls:installedCalls.size,references:referenceKeys.size,callableValueNegatives:negatives.size,
-  typeRelationships:applicableRelationships.size,
-  outcomes:outcomes.map(disposition=>({disposition,count:outcomeKeys.get(disposition).size})),
+ const observed=new Set([...exactReferences.values()].flatMap(x=>x.record.roles));
+ const floorsEnforced=!(fixture.profile==='example'&&loaded.root?.replaceAll('\\','/').split('/').at(-1)==='example');
+ const count={formatVersion:1,language:fixture.language,profile:fixture.profile,floorsEnforced,
+  scenariosTotal:scenarios.length,scenariosByCategory:categories.map(category=>({category,count:scenarios.filter(x=>x.scenario.category===category).length})),
+  measuredCalls:records.calls.length,references:referenceOccurrences.size,callableValueNegatives:negativeOccurrences.size,
+  typeRelationships:relationships.size,outcomes:outcomes.map(disposition=>({disposition,count:outcomeKeys.get(disposition).size})),
   observedRoles:roles.filter(role=>observed.has(role))};
  validate('CountsV1',count);
- if(fixture.profile==='example'&&count.floorsEnforced)fail('COUNT.PROFILE','profile','only literal example/ can bypass floors');
- if(count.floorsEnforced) {
-  const required=roles.filter(x=>fixture.language!=='java'||x!=='alias');
-  if(count.scenariosTotal<32||count.scenariosByCategory.some(x=>x.count<4)||count.measuredCalls<120||
-     count.references<40||count.callableValueNegatives<20||count.typeRelationships<20||
-     count.outcomes.some(x=>x.count<20)||required.some(x=>!observed.has(x)))
-   fail('COUNT.FLOOR','counts','corpus-profile minimum not met');
- }
+ if(fixture.profile==='example'&&floorsEnforced)fail('COUNT.PROFILE','profile','only literal example/ can bypass floors');
+ if(floorsEnforced)assertCorpusFloors(count);
+ return count;
+}
+
+// The count inventory is independently source-checked above. Keep the floor
+// predicate separate so each boundary can be tested without forging sources.
+export function assertCorpusFloors(count) {
+ validate('CountsV1',count);
+ const required=roles.filter(role=>count.language!=='java'||role!=='alias');
+ if(count.scenariosTotal<32||count.scenariosByCategory.some(x=>x.count<4)||count.measuredCalls<120||
+    count.references<40||count.callableValueNegatives<20||count.typeRelationships<20||
+    count.outcomes.some(x=>x.count<20)||required.some(role=>!count.observedRoles.includes(role)))
+  fail('COUNT.FLOOR','counts','corpus-profile minimum not met');
  return count;
 }
