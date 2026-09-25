@@ -135,6 +135,7 @@ printf '%s' "\${0##*/}" >> "$FAKE_VERIFY_LOG"
 printf '\\t%s' "$@" >> "$FAKE_VERIFY_LOG"
 printf '\\n' >> "$FAKE_VERIFY_LOG"
 if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; fi
+if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
 `;
   try {
     for (const name of ["cargo", "node"]) {
@@ -162,6 +163,7 @@ if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; 
       ["cargo", "test", "--locked", "--all-targets"],
       ["node", "--test", "runtime/acp/runner.test.mjs"],
       ["node", "--test", "tests/factory-config.test.cjs"],
+      ["node", "tools/semantic-contract/test/run.mjs"],
       ["node", "--check", "web/app.js"],
       ["node", "--test", "tests/question-ui.test.cjs", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs"],
     ];
@@ -172,6 +174,10 @@ if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; 
     const failure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" });
     assert.equal(failure.result.status, 23);
     assert.deepEqual(failure.commands, expected.slice(0, 2));
+    rmSync(log);
+    const semanticFailure = runVerify({ FAKE_VERIFY_FAIL_SEMANTIC: "1" });
+    assert.equal(semanticFailure.result.status, 29);
+    assert.deepEqual(semanticFailure.commands, expected.slice(0, 6));
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }

@@ -22,5 +22,6 @@ jobs:
       - run: cargo test --locked --all-targets
       - run: node --test runtime/acp/runner.test.mjs
       - run: node --test tests/factory-config.test.cjs
+      - run: node tools/semantic-contract/test/run.mjs
       - run: node --check web/app.js
       - run: node --test tests/question-ui.test.cjs tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs
