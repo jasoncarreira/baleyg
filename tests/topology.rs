@@ -148,6 +148,162 @@ fn marker_child() {
 }
 
 #[test]
+fn paused_creator_and_adopter_share_the_single_marker() {
+    use baleyg::store::topology::MarkerStage;
+    use std::sync::mpsc;
+    for initial in [b"".as_slice(), b"partial".as_slice()] {
+        let (temp, _) = common::fixture();
+        let work = root(temp.path());
+        common::private(&work.join(".git"));
+        let marker = work.join(".git/baleyg/workspace-id");
+        let (created_tx, created_rx) = mpsc::channel();
+        let (write_tx, write_rx) = mpsc::channel();
+        let (short_tx, short_rx) = mpsc::channel();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let work_ref = &work;
+            let creator = scope.spawn(move || {
+                WorkspaceIdentity::discover_with_marker_hook(Some(work_ref), work_ref, |stage| {
+                    if stage == MarkerStage::CreatedBeforeWrite {
+                        created_tx.send(()).unwrap();
+                        write_rx.recv().unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap()
+            });
+            created_rx.recv().unwrap();
+            assert_eq!(fs::read(&marker).unwrap(), b"");
+            fs::write(&marker, initial).unwrap();
+            let adopter = scope.spawn(move || {
+                WorkspaceIdentity::discover_with_marker_hook(Some(work_ref), work_ref, |stage| {
+                    if stage == MarkerStage::ShortRead {
+                        short_tx.send(()).unwrap();
+                        retry_rx.recv().unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap()
+            });
+            short_rx.recv().unwrap();
+            write_tx.send(()).unwrap();
+            let winner = creator.join().unwrap();
+            assert_eq!(fs::read(&marker).unwrap().len(), 36);
+            retry_tx.send(()).unwrap();
+            let loser = adopter.join().unwrap();
+            assert_eq!(winner.record_id, loser.record_id);
+            winner.verify().unwrap();
+            loser.verify().unwrap();
+        });
+    }
+}
+
+#[test]
+fn short_marker_disappearing_or_replaced_at_barrier_is_not_regenerated() {
+    use baleyg::store::topology::MarkerStage;
+    for replacement in [None, Some("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa")] {
+        let (temp, _) = common::fixture();
+        let work = root(temp.path());
+        common::private(&work.join(".git"));
+        let marker = work.join(".git/baleyg/workspace-id");
+        let original = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        fs::write(&marker, b"partial").unwrap();
+        let mut saw_short = false;
+        let error = WorkspaceIdentity::discover_with_marker_hook(Some(&work), &work, |stage| {
+            if stage == MarkerStage::ShortRechecked {
+                saw_short = true;
+                fs::remove_file(&marker)?;
+                if let Some(bytes) = replacement {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::write(&marker, bytes)?;
+                    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(saw_short);
+        assert!(!error.to_string().is_empty());
+        match replacement {
+            None => assert!(!marker.exists(), "a vanished short marker was regenerated"),
+            Some(bytes) => assert_eq!(fs::read(&marker).unwrap(), bytes.as_bytes()),
+        }
+        assert!(original.verify().is_err());
+    }
+}
+
+#[test]
+fn every_marker_sync_stage_is_required_for_creator_and_adopter() {
+    use baleyg::store::topology::MarkerStage;
+    for stage in [
+        MarkerStage::MarkerSync,
+        MarkerStage::PrivateDirSync,
+        MarkerStage::GitDirSync,
+    ] {
+        let (temp, _) = common::fixture();
+        let work = root(temp.path());
+        common::private(&work.join(".git"));
+        let marker = work.join(".git/baleyg/workspace-id");
+        let mut reached = vec![];
+        let error = WorkspaceIdentity::discover_with_marker_hook(Some(&work), &work, |at| {
+            reached.push(at);
+            if at == stage {
+                anyhow::bail!("injected {stage:?}")
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("workspace_id_not_durable"));
+        assert_eq!(fs::read(&marker).unwrap().len(), 36);
+        let mut adopted = vec![];
+        let id = WorkspaceIdentity::discover_with_marker_hook(Some(&work), &work, |at| {
+            adopted.push(at);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(id.record_id, fs::read_to_string(&marker).unwrap());
+        assert_eq!(
+            adopted,
+            [
+                MarkerStage::MarkerSync,
+                MarkerStage::PrivateDirSync,
+                MarkerStage::GitDirSync
+            ]
+        );
+        id.verify().unwrap();
+    }
+}
+
+#[test]
+fn persistent_short_and_malformed_markers_remain_unchanged() {
+    let (temp, _) = common::fixture();
+    let work = root(temp.path());
+    common::private(&work.join(".git"));
+    let marker = work.join(".git/baleyg/workspace-id");
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    for bytes in [
+        b"partial".as_slice(),
+        b"gaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",
+        b"aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaaextra",
+    ] {
+        fs::write(&marker, bytes).unwrap();
+        assert!(WorkspaceIdentity::discover(Some(&work), &work).is_err());
+        assert_eq!(fs::read(&marker).unwrap(), bytes);
+    }
+    fs::write(&marker, id.record_id.as_bytes()).unwrap();
+    let original = id.record_id;
+    assert_eq!(
+        WorkspaceIdentity::discover(Some(&work), &work)
+            .unwrap()
+            .record_id,
+        original
+    );
+    fs::remove_file(&marker).unwrap();
+    std::os::unix::fs::symlink(work.join(".git"), &marker).unwrap();
+    assert!(WorkspaceIdentity::discover(Some(&work), &work).is_err());
+}
+
+#[test]
 fn multiprocess_lock_protocol() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
