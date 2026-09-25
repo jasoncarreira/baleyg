@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {traverseGraph} from '../graph-traversal.mjs';
 import {registerControls,runControl} from './mutations.mjs';
 
@@ -81,15 +82,19 @@ test('boundary precedence and fresh exact static expansion, not possible dispatc
  assert.deepEqual(r.frontier,[frontier('nodeLimit',s.ids.A,direct.id,s.ids.B,null,0)]);
  assert.equal(r.nodes.length,1);assert.equal(r.edges.find(e=>e.call.id===missing.id).binding,null);
 });
-test('failed refresh and syntax-only cannot reuse old occurrence proof; incomplete coverage sets partial',()=>{
+test('failed r2 refresh never attaches old r1 occurrence proof or reference to its pinned call',()=>{
  const s=specimen();const old=s.add('A','B',{revision:'r1',callRevision:'r1'});
  const current={...old,id:oid(101),revisionId:'r2',ordinal:0};s.records.calls.push(current);
  s.records.references=[{id:oid(102),ownerSyntaxId:s.ids.A,revisionId:'r1',declaredTarget:{kind:'internal',syntaxId:s.ids.B,document:doc,revisionId:'r1'}}];
  s.records.coverage[0].state='failed';
- let r=s.run().result;assert.equal(r.edges.length,1);assert.equal(r.edges[0].call.id,current.id);
- assert.notEqual(old.id,current.id);assert.equal(r.edges[0].binding,null);assert.equal(r.edges[0].boundaryReason,'missingEvidence');assert.equal(r.partial,true);
- s.records.coverage[0].state='complete';s.request.semanticProducerId=null;r=s.run().result;
- assert.equal(r.edges[0].binding,null);assert.equal(r.edges[0].boundaryReason,'missingEvidence');
+ const check=()=>{const r=s.run().result;assert.equal(r.edges.length,1);assert.equal(r.edges[0].call.id,current.id);
+  assert.notEqual(old.id,current.id);assert.equal(r.edges[0].binding,null);assert.equal(r.edges[0].boundaryReason,'missingEvidence');
+  assert.equal(r.nodes.length,1);assert.equal(r.partial,true);assert.deepEqual(r.coverage,[]);assert.deepEqual(r.provenance,[]);};
+ check();
+ // Finishing coverage cannot promote a proof whose call and source revision are still r1.
+ s.records.coverage[0].state='complete';check();
+ // Changed target bytes are represented by staleTarget in the separate r2-binding test.
+ s.request.semanticProducerId=null;check();
  const empty=specimen();assert.equal(traverseGraph({records:empty.records,request:empty.request,selectedCoverageIncomplete:true}).result.partial,true);
 });
 
@@ -125,8 +130,8 @@ test('fresh r2 caller expands stable r1 internal target only when target bytes m
 
 // Control expectations are authored constants; each check re-runs production on the
 // current source specimen, including the one-member mutation made by runControl.
-function decisionCheck(input,{assertion,field,expected,select,callId=null}){
- const answer=traverseGraph(input);
+function decisionCheck(input,{assertion,field,expected,select,callId=null,traversal=traverseGraph}){
+ const answer=traversal(input);
  if(callId!==null){
   assert.equal(answer.ok,true,'expected a successful pinned traversal');
   assert.equal(answer.result.edges.length,1,'the r2 measured call must remain emitted');
@@ -144,12 +149,30 @@ const controls=registerControls([
   mutate:input=>{input.request.maxNodes=2;return input;},
   check:input=>decisionCheck(input,{assertion:'GRAPH.NODE_LIMIT',field:'edges[0].to',expected:null,select:r=>r.edges[0]?.to}),
   expectedAssertion:'GRAPH.NODE_LIMIT',expectedCode:'invalidRecord',expectedField:'edges[0].to'},
- {id:'GRAPH.failedRefresh.reason',baseline:()=>{const s=specimen();s.add('A','B',{revision:'r1',callRevision:'r1'});
+ {id:'GRAPH.r2Coverage.reason',baseline:()=>{const s=specimen();s.add('A','B',{revision:'r1',callRevision:'r1'});
    const current=s.add('A','B',{revision:'r2'});assert.equal(current.id,oid(2));
+   // This is a fresh r2 binding; failed r2 coverage alone withholds its use.
    s.records.coverage[0].state='failed';return {records:s.records,request:s.request};},
   mutate:input=>{input.records.coverage[0].state='complete';return input;},
-  check:input=>decisionCheck(input,{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].boundaryReason',expected:'missingEvidence',callId:oid(2),select:r=>r.edges[0].boundaryReason}),
-  expectedAssertion:'GRAPH.FAILED_REFRESH',expectedCode:'invalidRecord',expectedField:'edges[0].boundaryReason'}
+  check:input=>decisionCheck(input,{assertion:'GRAPH.R2_COVERAGE',field:'edges[0].boundaryReason',expected:'missingEvidence',callId:oid(2),select:r=>r.edges[0].boundaryReason}),
+  expectedAssertion:'GRAPH.R2_COVERAGE',expectedCode:'invalidRecord',expectedField:'edges[0].boundaryReason'},
+ {id:'GRAPH.failedRefresh.oldBinding',baseline:()=>{const s=specimen();const old=s.add('A','B',{revision:'r1',callRevision:'r1'});
+   const current={...old,id:oid(101),revisionId:'r2',ordinal:0};s.records.calls.push(current);
+   s.records.coverage[0].state='failed';
+   assert.equal(s.records.callBindings.length,1);assert.equal(s.records.callBindings[0].callId,old.id);
+   assert.equal(s.records.provenance[0].revisionId,'r1');assert.notEqual(old.id,current.id);
+   return {records:s.records,request:s.request,source:readFileSync(new URL('../graph-traversal.mjs',import.meta.url),'utf8')};},
+  mutate:input=>{const clause='bindings.get(call.id)??[]';
+   assert.equal(input.source.split(clause).length,2,'production binding lookup must have one mutation site');
+   input.source=input.source.replace(clause,'bindings.get(call.id)??records.callBindings');return input;},
+  check:async input=>{const module=await import(`data:text/javascript;base64,${Buffer.from(input.source).toString('base64')}`);
+   return decisionCheck({records:input.records,request:input.request},{assertion:'GRAPH.FAILED_REFRESH',field:'edges[0].binding',expected:null,
+    callId:oid(101),traversal:module.traverseGraph,select:r=>{const edge=r.edges[0];
+     assert.equal(edge.boundaryReason,'missingEvidence','failed r2 coverage remains withheld');
+     if(edge.binding){assert.equal(edge.binding.callId,oid(1),'only the old r1 binding is present');
+      assert.equal(edge.binding.provenanceId,'proof-1');}
+     return edge.binding;}});},
+  expectedAssertion:'GRAPH.FAILED_REFRESH',expectedCode:'invalidRecord',expectedField:'edges[0].binding'}
 ]);
 for(const row of controls)test(`source baseline → single mutation → production check: ${row.id}`,async()=>{
  assert.equal(await runControl(row),row.id);
