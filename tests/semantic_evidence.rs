@@ -1,0 +1,257 @@
+use baleyg::{
+    indexer::{CaptureAdmission, CapturedRevision, IndexOptions, capture_revision},
+    model::v1::*,
+    semantic_evidence::{EvidenceError, validate_capture, validate_evidence},
+};
+use protobuf::Message;
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    sync::{Arc, atomic::AtomicBool},
+};
+
+fn text(s: &str) -> Text {
+    Text::new(s).unwrap()
+}
+fn hash(bytes: &[u8]) -> Hash {
+    Hash::new(hex::encode(Sha256::digest(bytes))).unwrap()
+}
+fn fixture() -> (tempfile::TempDir, CapturedRevision, Evidence) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("java/src")).unwrap();
+    fs::create_dir_all(root.join("rust/src")).unwrap();
+    fs::write(
+        root.join("java/src/A.java"),
+        "class Child extends Base { void foo() { é(); } }
+",
+    )
+    .unwrap();
+    fs::write(
+        root.join("rust/src/B.rs"),
+        r#"fn b() { let _ = "😀"; }
+"#,
+    )
+    .unwrap();
+    for name in ["toolchain.capture", "config.capture", "dependency.capture"] {
+        fs::write(root.join(name), name).unwrap();
+    }
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(root), root).unwrap();
+    let mut index = scip::types::Index::new();
+    let mut metadata = scip::types::Metadata::new();
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "scip-test".into();
+    tool.version = "1".into();
+    metadata.tool_info = protobuf::MessageField::some(tool);
+    index.metadata = protobuf::MessageField::some(metadata);
+    fs::write(
+        root.join("semantic.artifact"),
+        index.write_to_bytes().unwrap(),
+    )
+    .unwrap();
+    let admission = CaptureAdmission {
+        source_set_id: identity.record_id,
+        root_id: identity.root_key,
+        languages: vec![Language::Java, Language::Rust],
+        toolchain: root.join("toolchain.capture"),
+        config: root.join("config.capture"),
+        dependency: root.join("dependency.capture"),
+        dependency_source_sets: vec![],
+        producers: vec![baleyg::indexer::ProducerInput {
+            id: "S".into(),
+            tool_name: "scip-test".into(),
+            version: "1".into(),
+            position_encoding: "utf8".into(),
+            executable: std::env::current_exe().unwrap(),
+            artifact: Some(root.join("semantic.artifact")),
+        }],
+    };
+    let mut options = IndexOptions::new(root.to_owned());
+    options.scip_path = Some(root.join("semantic.artifact"));
+    let capture =
+        capture_revision(&options, &admission, &Arc::new(AtomicBool::new(false))).unwrap();
+    let producer = |id: &str, kind| Producer {
+        id: text(id),
+        version: text(
+            &capture
+                .producers
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .version,
+        ),
+        executable_hash: hash(
+            &capture
+                .producers
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .executable_bytes,
+        ),
+        kind,
+        languages: vec![Language::Java, Language::Rust],
+        position_encoding: PositionEncoding::Utf8,
+    };
+    let documents = capture
+        .documents
+        .iter()
+        .map(|d| Document {
+            key: d.key.clone(),
+            revision_id: text(&capture.revision_id),
+            content_hash: hash(&d.bytes),
+            byte_length: UInt::new(d.bytes.len() as u64).unwrap(),
+        })
+        .collect();
+    let mut coverage = vec![];
+    for id in ["N", "S"] {
+        for d in &capture.documents {
+            coverage.push(Coverage {
+                producer_id: text(id),
+                language: d.key.language,
+                source_set_id: text(&capture.source_set_id),
+                document_path: d.key.path.clone(),
+                revision_id: text(&capture.revision_id),
+                requested: true,
+                selected: id == "N",
+                state: if id == "N" {
+                    CoverageState::Complete
+                } else {
+                    CoverageState::Omitted
+                },
+                supported_roles: vec![],
+                observed_roles: vec![],
+                diagnostic: (id == "S").then(|| text("producer omitted")),
+            });
+        }
+    }
+    let evidence = Evidence {
+        context: NativeRevisionContext {
+            source_set: SourceSet {
+                id: text(&capture.source_set_id),
+                root_id: text(&capture.root_id),
+                languages: vec![Language::Java, Language::Rust],
+                dependencies: vec![],
+            },
+            revision: Revision {
+                id: text(&capture.revision_id),
+                source_set_id: text(&capture.source_set_id),
+                documents,
+                toolchain_hash: hash(&capture.toolchain_bytes),
+                config_hash: hash(&capture.config_bytes),
+                dependency_hash: hash(&capture.dependency_bytes),
+            },
+            producer: producer("N", ProducerKind::Native),
+        },
+        native_files: vec![],
+        producers: vec![producer("S", ProducerKind::Semantic)],
+        coverage,
+        provenance: vec![],
+        symbols: vec![],
+        declaration_bindings: vec![],
+        type_relationships: vec![],
+        references: vec![],
+        call_bindings: vec![],
+    };
+    (dir, capture, evidence)
+}
+#[test]
+fn producer() {
+    let (_d, capture, evidence) = fixture();
+    assert!(
+        validate_evidence(&capture, &evidence, &capture).is_ok(),
+        "{:?}",
+        validate_evidence(&capture, &evidence, &capture)
+    );
+    let mut bad = evidence.clone();
+    bad.producers[0].executable_hash = hash(b"forged");
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Producer(_))
+    ));
+    let mut missing = capture.clone();
+    missing.producers[1].artifact_bytes = None;
+    assert!(matches!(
+        validate_evidence(&missing, &evidence, &missing),
+        Err(EvidenceError::Producer(_))
+    ));
+}
+#[test]
+fn source_set() {
+    let (_d, capture, evidence) = fixture();
+    assert!(
+        validate_capture(&capture, &evidence).is_ok(),
+        "{:?}",
+        validate_capture(&capture, &evidence)
+    );
+    let mut bad = evidence.clone();
+    bad.context.source_set.dependencies = vec![text("unknown")];
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::SourceSet(_))
+    ));
+}
+#[test]
+fn revision() {
+    let (_d, capture, evidence) = fixture();
+    assert!(
+        validate_capture(&capture, &evidence).is_ok(),
+        "{:?}",
+        validate_capture(&capture, &evidence)
+    );
+    let mut bad = evidence.clone();
+    bad.context.revision.documents[1] = bad.context.revision.documents[0].clone();
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Revision(_) | EvidenceError::Document(_))
+    ));
+    let mut changed = capture.clone();
+    changed.toolchain_bytes.push(b'!');
+    changed.toolchain_hash = hex::encode(Sha256::digest(&changed.toolchain_bytes));
+    let mut matching = evidence.clone();
+    matching.context.revision.toolchain_hash = Hash::new(changed.toolchain_hash.clone()).unwrap();
+    assert!(matches!(
+        validate_evidence(&changed, &matching, &changed),
+        Err(EvidenceError::Revision(_))
+    ));
+}
+#[test]
+fn document() {
+    let (_d, capture, evidence) = fixture();
+    assert!(
+        validate_capture(&capture, &evidence).is_ok(),
+        "{:?}",
+        validate_capture(&capture, &evidence)
+    );
+    let mut bad = evidence.clone();
+    bad.context.revision.documents[0].byte_length = UInt::new(1).unwrap();
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Document(_))
+    ));
+}
+#[test]
+fn coverage() {
+    let (_d, capture, evidence) = fixture();
+    assert!(
+        validate_evidence(&capture, &evidence, &capture).is_ok(),
+        "{:?}",
+        validate_evidence(&capture, &evidence, &capture)
+    );
+    let mut bad = evidence.clone();
+    bad.coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S")
+        .unwrap()
+        .diagnostic = None;
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Coverage(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.coverage.pop();
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Coverage(_))
+    ));
+}
