@@ -110,8 +110,23 @@ excluded; local archives and runtime state must not be committed.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Bundled fonts keep their own SIL OFL licenses under `web/fonts/`;
-the Feature Factory fixtures under `tests/fixtures/` carry their original project's terms.
+Baleyg is source-available under the [Business Source License 1.1](LICENSE) (`BUSL-1.1`).
+You may use it in production free of charge if you are an individual, use it non-commercially
+or for education or research, or are an organization (with affiliates) of no more than 5
+employees and contractors, under US$5M annual revenue and under US$50M total outside funding.
+Non-production use (reading, modifying, testing) is always free; anyone may also evaluate it in
+production for up to 30 days. While a version is under the BSL, offering it, or a product
+substantially derived from it, to third parties as a commercial hosted service or embedded
+product is outside the free grant and needs a commercial license. Each version converts to the
+Apache License 2.0 three years after it is first publicly distributed under BSL-1.1, and those
+restrictions then end.
+For commercial licensing, contact jcarreira@gmail.com. The [LICENSE](LICENSE) text governs; this
+summary does not.
+
+Versions published before the switch remain available under the MIT License. Third-party material
+is not part of the Licensed Work: bundled fonts keep their own SIL OFL licenses under `web/fonts/`,
+and the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-factory/` and
+`tests/fixtures/extraction/feature-factory.*`) carry their original project's terms.
 
 ## Read more
 
