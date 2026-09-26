@@ -19,6 +19,7 @@ pub enum EvidenceError {
     Coverage(&'static str),
     NotYetValidated(&'static str),
     Native(&'static str),
+    Basis(&'static str),
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -1598,6 +1599,122 @@ pub fn validate_native(
     }
     Ok(())
 }
+
+fn basis_error(message: &'static str) -> EvidenceError {
+    EvidenceError::Basis(message)
+}
+
+/// Validates the captured semantic artifact before comparing it with a requested snapshot.
+/// The comparison cannot repair a malformed captured basis.
+pub fn validate_semantic_basis(
+    capture: &CapturedRevision,
+    evidence: &Evidence,
+    requested_snapshot: &CapturedRevision,
+) -> Result<(), EvidenceError> {
+    validate_capture(capture, evidence)?;
+    let native_ids: BTreeSet<_> = evidence
+        .native_files
+        .iter()
+        .map(|f| f.provenance.id.as_str())
+        .collect();
+    let mut ids = native_ids;
+    for provenance in &evidence.provenance {
+        if !ids.insert(provenance.id.as_str()) {
+            return Err(basis_error("duplicate provenance identity"));
+        }
+        let producer = evidence
+            .producers
+            .iter()
+            .find(|p| p.id == provenance.producer_id && p.kind == ProducerKind::Semantic)
+            .ok_or_else(|| basis_error("semantic provenance lacks producer"))?;
+        let captured_producer = captured_producer(capture, producer)?;
+        let basis = provenance
+            .basis
+            .as_ref()
+            .ok_or_else(|| basis_error("semantic provenance lacks basis"))?;
+        let document = capture
+            .documents
+            .iter()
+            .find(|d| d.key == provenance.document)
+            .ok_or_else(|| basis_error("semantic provenance lacks captured document"))?;
+        let coverage = evidence
+            .coverage
+            .iter()
+            .find(|c| {
+                c.producer_id == producer.id
+                    && c.language == document.key.language
+                    && c.document_path == document.key.path
+            })
+            .ok_or_else(|| basis_error("semantic provenance lacks coverage"))?;
+        let artifact = captured_producer
+            .artifact_bytes
+            .as_deref()
+            .ok_or_else(|| basis_error("semantic producer lacks captured artifact"))?;
+        if !matches!(
+            coverage.state,
+            CoverageState::Complete | CoverageState::Partial
+        ) || provenance.revision_id != evidence.context.revision.id
+            || provenance.content_hash.as_str() != digest(&document.bytes)
+            || !producer.languages.contains(&document.key.language)
+            || provenance.evidence_kind == EvidenceKind::MeasuredSyntax
+            || basis.producer_id != producer.id
+            || basis.producer_version != producer.version
+            || basis.producer_hash != producer.executable_hash
+            || basis.producer_hash.as_str() != digest(&captured_producer.executable_bytes)
+            || basis.artifact_hash.as_str() != digest(artifact)
+            || captured_producer.artifact_hash.as_deref() != Some(basis.artifact_hash.as_str())
+            || basis.language != document.key.language
+            || basis.source_set_id != evidence.context.source_set.id
+            || basis.revision_id != evidence.context.revision.id
+            || basis.source_manifest_hash.as_str() != digest(&capture.manifest_bytes)
+            || basis.toolchain_hash.as_str() != digest(&capture.toolchain_bytes)
+            || basis.config_hash.as_str() != digest(&capture.config_bytes)
+            || basis.dependency_hash.as_str() != digest(&capture.dependency_bytes)
+            || !ordered_unique_or_empty(&basis.lookup_dependencies)
+        {
+            return Err(basis_error(
+                "semantic basis or provenance differs from captured bytes",
+            ));
+        }
+        let requested_document = requested_snapshot
+            .documents
+            .iter()
+            .find(|d| d.key == document.key);
+        let freshness = if requested_document.is_none_or(|d| d.bytes != document.bytes) {
+            Freshness::Stale
+        } else if requested_snapshot.revision_id != capture.revision_id
+            || requested_snapshot.source_set_id != capture.source_set_id
+            || requested_snapshot.manifest_bytes != capture.manifest_bytes
+            || requested_snapshot.toolchain_bytes != capture.toolchain_bytes
+            || requested_snapshot.config_bytes != capture.config_bytes
+            || requested_snapshot.dependency_bytes != capture.dependency_bytes
+            || !requested_snapshot.producers.iter().any(|p| {
+                p.id == captured_producer.id
+                    && p.version == captured_producer.version
+                    && p.executable_bytes == captured_producer.executable_bytes
+            })
+        {
+            Freshness::PossiblyStale
+        } else {
+            Freshness::Fresh
+        };
+        if provenance.freshness != freshness {
+            return Err(basis_error(
+                "semantic freshness differs from captured comparison",
+            ));
+        }
+    }
+    if !evidence.symbols.is_empty()
+        || !evidence.references.is_empty()
+        || !evidence.type_relationships.is_empty()
+    {
+        return Err(EvidenceError::NotYetValidated(
+            "semantic facts require independent producer assertions and joins",
+        ));
+    }
+    Ok(())
+}
+
 fn module_owner(doc: &CapturedDocument, id: &SyntaxId) -> bool {
     crate::semantic_identity::syntax_id(
         &doc.key.source_set_id,
@@ -1620,17 +1737,13 @@ pub fn validate_evidence(
     requested_snapshot: &CapturedRevision,
 ) -> Result<Evidence, EvidenceError> {
     validate_capture(capture, evidence)?;
-    if capture != requested_snapshot {
-        return Err(EvidenceError::Revision(
-            "snapshot comparison awaits basis validation",
-        ));
-    }
     if evidence.native_files.is_empty() {
         return Err(EvidenceError::NotYetValidated(
             "native syntax and later phases not supplied",
         ));
     }
     validate_native(capture, evidence)?;
+    validate_semantic_basis(capture, evidence, requested_snapshot)?;
     if !evidence.native_files.is_empty()
         || !evidence.provenance.is_empty()
         || !evidence.symbols.is_empty()
@@ -1640,7 +1753,7 @@ pub fn validate_evidence(
         || !evidence.call_bindings.is_empty()
     {
         return Err(EvidenceError::NotYetValidated(
-            "fact families require later validator phases",
+            "measured joins and bindings require later validator phase",
         ));
     }
     Err(EvidenceError::NotYetValidated(

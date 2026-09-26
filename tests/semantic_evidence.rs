@@ -1761,3 +1761,122 @@ fn native_call_ordinal_owner_and_member_span_are_source_checked() {
         Err(EvidenceError::Native(_))
     ));
 }
+
+fn semantic_provenance(
+    capture: &CapturedRevision,
+    evidence: &Evidence,
+    document_index: usize,
+) -> Provenance {
+    let doc = &capture.documents[document_index];
+    let producer = capture.producers.iter().find(|p| p.id == "S").unwrap();
+    Provenance {
+        id: text(&format!("semantic-{document_index}")),
+        producer_id: text("S"),
+        document: doc.key.clone(),
+        revision_id: text(&capture.revision_id),
+        content_hash: hash(&doc.bytes),
+        evidence_kind: EvidenceKind::SemanticReference,
+        basis: Some(SemanticBasis {
+            producer_id: text("S"),
+            producer_version: text(&producer.version),
+            producer_hash: hash(&producer.executable_bytes),
+            artifact_hash: hash(producer.artifact_bytes.as_ref().unwrap()),
+            language: doc.key.language,
+            source_set_id: evidence.context.source_set.id.clone(),
+            revision_id: text(&capture.revision_id),
+            source_manifest_hash: hash(&capture.manifest_bytes),
+            toolchain_hash: hash(&capture.toolchain_bytes),
+            config_hash: hash(&capture.config_bytes),
+            dependency_hash: hash(&capture.dependency_bytes),
+            lookup_dependencies: vec![],
+        }),
+        freshness: Freshness::Fresh,
+    }
+}
+
+#[test]
+fn semantic_basis_proves_independent_artifact_and_components() {
+    let (_dir, capture, mut evidence) = fixture();
+    complete_native_evidence(&capture, &mut evidence);
+    let selected = evidence
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == capture.documents[0].key.path)
+        .unwrap();
+    selected.state = CoverageState::Partial;
+    selected.selected = true;
+    evidence
+        .provenance
+        .push(semantic_provenance(&capture, &evidence, 0));
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_basis(&capture, &evidence, &capture),
+        Ok(())
+    );
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].basis.as_mut().unwrap().artifact_hash = hash(b"forged artifact");
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].basis.as_mut().unwrap().config_hash = hash(b"forged config");
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].basis.as_mut().unwrap().producer_hash = hash(b"forged executable");
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].basis = None;
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].id = evidence.native_files[0].provenance.id.clone();
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+#[test]
+fn semantic_basis_freshness_uses_requested_captured_bytes() {
+    let (_dir, capture, mut evidence) = fixture();
+    complete_native_evidence(&capture, &mut evidence);
+    let selected = evidence
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == capture.documents[0].key.path)
+        .unwrap();
+    selected.state = CoverageState::Partial;
+    selected.selected = true;
+    evidence
+        .provenance
+        .push(semantic_provenance(&capture, &evidence, 0));
+    let mut requested = capture.clone();
+    requested.config_bytes.push(1);
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &requested),
+        Err(EvidenceError::Basis(_))
+    ));
+    evidence.provenance[0].freshness = Freshness::PossiblyStale;
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_basis(&capture, &evidence, &requested),
+        Ok(())
+    );
+    requested.documents[0].bytes.push(b'!');
+    evidence.provenance[0].freshness = Freshness::Stale;
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_basis(&capture, &evidence, &requested),
+        Ok(())
+    );
+}
