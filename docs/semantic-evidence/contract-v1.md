@@ -43,7 +43,7 @@ A document-level measured `module` owns top-level occurrences. Records resolve w
 | `.revisionId` | `Text` | Equals containing immutable revision. | Mismatch invalidates artifact. |
 | `.contentHash` | `Hash` | SHA-256 of exact source bytes with empty domain prefix. | Digest mismatch invalidates artifact. |
 | `.byteLength` | `UInt` | Exact byte length of those source bytes. | Mismatch invalidates artifact/ranges. |
-| `Revision.id` | `Text` | Immutable complete snapshot identity, including dirty/non-Git content. | Mutation or mismatch makes revision unavailable/invalid. |
+| `Revision.id` | `Text` | Immutable complete snapshot identity, including dirty/non-Git content. It covers the source documents, toolchain, config and dependency captures and the native extractor; it never includes semantic producers or their artifacts, which rule 2 compares through each proof's `SemanticBasis`. | Mutation or mismatch makes revision unavailable/invalid. |
 | `.sourceSetId` | `Text` | One admitted source set. | Mismatch rejects revision. |
 | `.documents` | `Document[]` | Complete, unique by key, sorted by language then path. | Missing/duplicate/unsorted rows invalidate revision. |
 | `.toolchainHash` | `Hash` | Captured toolchain artifact digest, not a timestamp. | Missing/mismatch invalidates basis use. |
@@ -118,7 +118,7 @@ Occurrence-keyed evidence never crosses revisions, because occurrence IDs includ
 
 Provenance selected merely because it exists, or that selects itself, is invalid.
 
-`CallBinding.staleTarget` is null when there is no internal declared target; true when that target is missing or its captured target document bytes differ from the requested snapshot; false when it exists with matching bytes. Thus a caller can be fresh while the target is stale. `possiblyStale`, `stale`, or `staleTarget=true` forbids expansion.
+`CallBinding.staleTarget` is null when there is no internal declared target; true when that target is missing or its captured target document bytes differ from the requested snapshot; false when it exists with matching bytes. In v1 an internal target always has the revision of the binding that names it (Target `.revisionId`), so this derivation yields `false` for every admitted internal binding. `staleTarget=true` and its warning are reserved for later overlay evidence (#11), and a v1 artifact claiming it is invalid. `possiblyStale`, `stale`, or `staleTarget=true` forbids expansion.
 
 Hand-checks:
 
@@ -129,7 +129,7 @@ Hand-checks:
 | Complete but stale | `complete` remains a coverage fact. | Changed document bytes makes provenance `stale`; overlay is withheld. |
 | Caller bytes unchanged; dependency, config, or producer changes | Coverage is unchanged. | Each independently makes semantic evidence `possiblyStale`. |
 | Missing basis | Semantic artifact is malformed and atomically rejected; absence may be exposed as failed/missing coverage. | It cannot be called fresh. |
-| Fresh caller, changed target bytes | Caller may be fresh. | Internal binding has `staleTarget=true`; boundary, no expansion. |
+| Unchanged caller, changed target bytes | Caller coverage is unchanged. | An older caller proof is `possiblyStale` (rule 2) and cannot bind to the new revision's occurrences. A stale internal target (`staleTarget=true`) is deferred to later overlay evidence (#11). |
 | Refresh fails | New tuple row is `failed`, diagnostic required. | Old basis remains historical with its old label; never promoted. Only provenance of declaration-keyed facts for returned declarations may appear in the new answer, plus the latest eligible earlier coverage row for each returned declaration's document even without a matching fact ([scope](#historical-evidence-scope)); no old call binding does. |
 
 ## Records and bindings
@@ -157,9 +157,9 @@ Hand-checks:
 | `.declarations` | `Target[]` | Unique targets; empty means external/unlocated, never local evidence. | Duplicate target invalid. |
 | `.provenanceId` | `Text` | Resolves to semantic provenance. | Dangling invalidates artifact. |
 | `Target.kind` | `internal \| external` | Selects exactly one variant. | Mixed/incomplete variant invalid. |
-| internal `.syntaxId` | `SyntaxId` | In answer source set/snapshot. | Dangling or other-source target cannot be internal. |
+| internal `.syntaxId` | `SyntaxId` | In the answer source set, at the revision of the containing fact or binding (the answer snapshot for current facts). | Dangling or other-source target cannot be internal. |
 | internal `.document` | `DocumentKey` | Matches syntax declaration. | Mismatch invalid. |
-| internal `.revisionId` | `Text` | Matches answer snapshot when current. | Old target may only be retained as labelled historical evidence with derived freshness, not promoted. |
+| internal `.revisionId` | `Text` | Equals the revision of the fact or binding that contains it (v1); matches answer snapshot when current. | Any other revision is invalid. A historical fact's target keeps that fact's revision, labelled with derived freshness, never promoted. |
 | external `.symbol` | `SymbolKey` | Explicit external boundary, including other source sets in v1. | Missing key invalid. |
 | `DeclarationBinding.syntaxId` | `SyntaxId?` | Exact declaration-name join has its one ID; non-exact is null. | Wrong join/cardinality invalid. |
 | `.symbols` | `SymbolKey[]` | Exact binding has at least one explicit unique symbol; non-exact diagnostic evidence may be empty. | Exact empty list invalid. |
@@ -463,7 +463,7 @@ The following are hand-evaluated warning-key arrays; each assumes an otherwise v
 1. **Syntax only.** The request has `semanticProducerId=null`, all returned selected coverage is complete, the root has no calls, and no returned provenance is non-fresh. `partial=false`; warning keys are `[(syntaxOnly,null)]`. No `coverageIncomplete` follows from syntax-only selection itself.
 2. **Two ambiguous bindings, one provenance.** The request names a semantic producer; two returned edges have ambiguous bindings with `provenanceId=pA`, and all selected coverage is complete and returned provenance fresh. Both edges are boundaries, so `partial=true`, but warning keys are only `[(bindingAmbiguous,pA)]`—not two warnings and not `coverageIncomplete`.
 3. **Three possibly-stale provenances.** Returned provenances `p1,p2,p3` each have `freshness=possiblyStale`; the request names a semantic producer, selected coverage is complete, and no returned edge binding is ambiguous or has a stale target. Warning keys are `[(staleEvidence,null)]`, not three per-provenance warnings. Each provenance still exposes its own freshness.
-4. **Mixed freshness and target.** Returned `p1` and `p3` are `possiblyStale`, `p2` is `stale`, and a returned edge binding has `provenanceId=p3` and `staleTarget=true` because its internal target bytes changed. The request names a semantic producer and selected coverage is complete. Warning keys, in code-enum and null-before-text order, are `[(staleEvidence,null),(staleEvidence,p2),(staleTarget,p3)]`; the stale boundary sets `partial=true` without adding `coverageIncomplete`.
+4. **Mixed freshness and a stale boundary.** Returned `p1` and `p3` are `possiblyStale`, `p2` is `stale`, and a returned edge binding captured at the requested revision has `provenanceId=p3`. `p3` is `possiblyStale` because the request compares its producer at a different version (same revision, same occurrences), so the edge is a `stale` boundary. `p2` is a historical declaration proof for a returned declaration in document `D2`. `D2`'s bytes changed since `p2`'s captured revision, and the producer's requested-revision tuple for `D2` is `omitted`, which is unselected and so adds no `coverageIncomplete`. The request names a semantic producer and selected coverage is complete. Warning keys, in code-enum and null-before-text order, are `[(staleEvidence,null),(staleEvidence,p2)]`; the stale boundary sets `partial=true` without adding `coverageIncomplete`. No `staleTarget` key arises in v1 (see `CallBinding.staleTarget`).
 5. **Coverage versus other partial causes.** With a selected `partial` coverage row and an unselected `unsupported` row for a distinct relevant tuple, no other triggers, `partial=true` and warning keys are `[(coverageIncomplete,null)]`. If the selected row becomes `complete` while only the unselected `unsupported` row remains, no boundary or frontier exists, and all else stays fresh, then `partial=false` and `warnings=[]`. A depth frontier alone instead makes `partial=true` and `truncated=true` with `warnings=[]`.
 
 ### Pinned FIFO breadth-first algorithm
@@ -490,7 +490,7 @@ Notation: `N(X,d)` is a node; `E(call,from,to,visit,reason)` is an edge; `F(reas
 5. **Depth.** Chain A→B→C, depth 1: `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none)]`; `frontier=[F(depth,B,null,null,0,1)]`; calls=1; truncated/partial true. Depth 0: `nodes=[N(A,0)]`; `edges=[]`; `frontier=[F(depth,A,null,null,0,1)]`; calls=0.
 6. **Node cap with later seen edge.** A calls in order `a0→B,a1→C,a2→A`, maxNodes=2. `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none),E(a1,A,null,boundary,nodeLimit),E(a2,A,A,seen,none)]`; `frontier=[F(nodeLimit,A,a1,C,null,0)]`; calls=3. The refused C does not stop the later self-loop.
 7. **Global call cap.** A calls `a0→B,a1→C`; B calls `b0→D`; maxCalls=1. After a0: `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none)]`; `frontier=[F(callLimit,A,null,null,1,1),F(callLimit,B,null,null,0,1)]`; calls=1. The first frontier is created at A, then B is drained in queue order. With maxCalls=0 and root calls `[a0,a1]`: `nodes=[N(A,0)]`; `edges=[]`; `frontier=[F(callLimit,A,null,null,0,2)]`; calls=0. With maxCalls=1 and A's only call `a0→B`, B empty: arrays are nodes A,B, one new edge, `frontier=[]`; exact cap has no remaining work, so not truncated.
-8. **Dispatch and freshness.** A has c0 with a fresh resolved internal virtual binding and one possible target V: `E(c0,A,null,boundary,dispatch)`. A also has c1 whose caller evidence is fresh but internal direct target bytes changed, `staleTarget=true`: `E(c1,A,null,boundary,stale)`. `nodes=[N(A,0)]`; edges are those two in source order; `frontier=[]`; calls=2. Neither V nor the stale target is admitted; possible dispatch remains only in binding; partial is true.
+8. **Dispatch and freshness.** (a) A has c0 with a fresh resolved internal virtual binding and one possible target V: `E(c0,A,null,boundary,dispatch)`. `nodes=[N(A,0)]`; `edges` is that one; `frontier=[]`; calls=1. V is not admitted; possible dispatch remains only in the binding; partial is true. (b) An independent snapshot: A has c0 as in (a) plus c1 with an exact direct internal binding. The request compares the selected producer P at a different version than P's captured basis; within (b) the captured and requested comparisons share its one unchanged revision, source calls and occurrence IDs. Every P proof is then `possiblyStale`, and `stale` precedes `dispatch`: `E(c0,A,null,boundary,stale)`, `E(c1,A,null,boundary,stale)`. `nodes=[N(A,0)]`; edges are those two in source order; `frontier=[]`; calls=2. Neither V nor c1's target is admitted; partial is true.
 
 ## Artifact validity and failure disposition
 
@@ -516,11 +516,11 @@ The independent reviewer must mark every finite item before vectors are authored
 - [ ] Signature, Key, Header, Parameter, DurableAnchor, GroupContinuity, and AnchorResult; required nulls and all digest domains.
 - [ ] GraphRequest defaults/limits and every GraphNode, GraphEdge, Frontier, Warning, GraphResult, and Error field.
 - [ ] Malformed artifact atomic rejection versus valid partial publication.
-- [ ] Two producers/document; partial-fresh; complete-stale; changed dependency/config/producer with same caller; missing basis; stale target; failed refresh.
+- [ ] Two producers/document; partial-fresh; complete-stale; changed dependency/config/producer with same caller; missing basis; v1 rejection of `staleTarget=true` and of wrong-revision internal targets (stale targets deferred to #11); failed refresh.
 - [ ] All four lookup rules, measured spelling versus lookup normalization, seven roles, only Java alias N/A, and the per-language 40-reference-record counting boundary.
 - [ ] Canonical bytes byte-for-byte; NUL is part of each domain; stable declaration input/exclusions; Java signatures; exact sibling grouping/ordinals; revision-local occurrences.
 - [ ] Header projection limitations; group hashes/counts; continuity is independent; all six anchor scenarios and unknown same-count continuity.
-- [ ] FIFO BFS admission/dequeue/local ordering and each explicit graph array: nested/evaluation, callback, cycle, self-loop, queued diamond, depth 0/1, node cap plus later seen, call cap/zero/exact, dispatch, stale target.
+- [ ] FIFO BFS admission/dequeue/local ordering and each explicit graph array: nested/evaluation, callback, cycle, self-loop, queued diamond, depth 0/1, node cap plus later seen, call cap/zero/exact, dispatch, producer-version stale boundary.
 - [ ] Counters, frontier combinations/arithmetic, creation order, exact-cap behavior, boundary precedence, partial/truncated definitions.
 - [ ] Wording never equates syntax, semantic binding, reference, call, or possible dispatch and never promises runtime completeness.
 - [ ] Scope remains prospective: no production ID/API/storage/traversal migration and no executable checker claim in this slice.
