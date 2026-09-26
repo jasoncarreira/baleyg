@@ -1599,8 +1599,9 @@ test("finite loaded binding controls run valid baseline before each one-property
           revisionId: "r2",
         };
       },
-      assertion: "BINDING.CARDINALITY",
-      field: "resolution",
+      // v1: an internal target must share its binding's revision.
+      assertion: "BINDING.TARGET",
+      field: "declaredTarget",
     },
     {
       id: "BINDING.TARGET.measured-document",

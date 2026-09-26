@@ -150,6 +150,16 @@ function resolveTarget(ref, ids, decls, context = null) {
   );
   if (row.revisionId !== ref.revisionId)
     fail("NORMALIZE.TARGET", "revisionId", "target revision differs");
+  // v1: an internal target has the revision of the fact that names it.
+  if (
+    context?.revisionId !== undefined &&
+    row.revisionId !== context.revisionId
+  )
+    fail(
+      "NORMALIZE.TARGET",
+      "revisionId",
+      "internal target must share its fact's revision",
+    );
   if (context && row.document.sourceSetId !== context.sourceSetId)
     fail(
       "NORMALIZE.TARGET",
@@ -990,7 +1000,7 @@ export function normalizeFixture(loaded) {
       const value = {
         ...fact.record,
         declarations: fact.record.declarations.map((x) =>
-          target(x, proof.document),
+          target(x, { ...proof.document, revisionId: proof.revisionId }),
         ),
       };
       if (
@@ -1010,7 +1020,10 @@ export function normalizeFixture(loaded) {
           "provenanceRef",
           "wrong independent proof",
         );
-      const value = normalizeRelationship(fact, keys.ids, decl, proof.document);
+      const value = normalizeRelationship(fact, keys.ids, decl, {
+        ...proof.document,
+        revisionId: proof.revisionId,
+      });
       records.typeRelationships.push(value);
       insert(recordMap, fact.ref, value);
       continue;
@@ -1088,9 +1101,14 @@ export function normalizeFixture(loaded) {
         site: fact.record.site,
         roles: fact.record.roles,
         resolution: fact.record.resolution,
-        declaredTarget: target(fact.record.declaredTarget, proof.document),
+        declaredTarget: target(fact.record.declaredTarget, {
+          ...proof.document,
+          revisionId: proof.revisionId,
+        }),
         candidates: distinctTargets(
-          fact.record.candidates.map((x) => target(x, proof.document)),
+          fact.record.candidates.map((x) =>
+            target(x, { ...proof.document, revisionId: proof.revisionId }),
+          ),
         ),
         provenanceId: proof.id,
       };
@@ -1117,13 +1135,20 @@ export function normalizeFixture(loaded) {
         callId: join.status === "exact" ? join.candidateIds[0] : null,
         join,
         resolution: fact.record.resolution,
-        declaredTarget: target(fact.record.declaredTarget, proof.document),
+        declaredTarget: target(fact.record.declaredTarget, {
+          ...proof.document,
+          revisionId: proof.revisionId,
+        }),
         candidates: distinctTargets(
-          fact.record.candidates.map((x) => target(x, proof.document)),
+          fact.record.candidates.map((x) =>
+            target(x, { ...proof.document, revisionId: proof.revisionId }),
+          ),
         ),
         dispatch: fact.record.dispatch,
         possibleDispatch: distinctTargets(
-          fact.record.possibleDispatch.map((x) => target(x, proof.document)),
+          fact.record.possibleDispatch.map((x) =>
+            target(x, { ...proof.document, revisionId: proof.revisionId }),
+          ),
         ),
         possibleDispatchComplete: false,
         staleTarget: null,

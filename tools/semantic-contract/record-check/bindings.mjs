@@ -108,6 +108,8 @@ export function checkBindings(loaded, records, C, M, J) {
       !measured?.syntaxId ||
       native.revisionId !== ref.revisionId ||
       measured.revisionId !== native.revisionId ||
+      // v1: an internal target has its binding's revision.
+      native.revisionId !== proof.revisionId ||
       !same(native.document, measured.document) ||
       native.document.sourceSetId !== proof.document.sourceSetId
     )
