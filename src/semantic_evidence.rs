@@ -197,6 +197,21 @@ pub fn validate_capture(
             "revision basis differs from captured bytes",
         ));
     }
+    if capture.lookup_dependencies.len() != capture.documents.len()
+        || capture
+            .lookup_dependencies
+            .iter()
+            .zip(&capture.documents)
+            .any(|((key, keys), document)| {
+                key != &document.key
+                    || crate::indexer::captured_lookup_dependencies(document)
+                        .map_or(true, |derived| derived != *keys)
+            })
+    {
+        return Err(EvidenceError::Basis(
+            "lookup dependencies differ from captured source positions",
+        ));
+    }
     let mut manifest = Vec::new();
     let mut previous = None;
     for (document, captured) in revision.documents.iter().zip(&capture.documents) {
@@ -2109,7 +2124,29 @@ pub fn validate_semantic_facts(
                         || document.syntax.iter().any(|node| {
                             node.start_byte == reference.range.start.get() as usize
                                 && node.end_byte == reference.range.end.get() as usize
-                                && matches!(node.field_name.as_deref(), Some("alias" | "name"))
+                                && node.parent_id.is_some_and(|id| {
+                                    document.syntax.iter().any(|parent| {
+                                        parent.id == id
+                                            && match reference.document.language {
+                                                Language::Python => {
+                                                    parent.kind == "aliased_import"
+                                                        && node.field_name.as_deref()
+                                                            == Some("alias")
+                                                }
+                                                Language::Javascript => {
+                                                    parent.kind == "import_specifier"
+                                                        && node.field_name.as_deref()
+                                                            == Some("alias")
+                                                }
+                                                Language::Rust => {
+                                                    parent.kind == "use_as_clause"
+                                                        && node.field_name.as_deref()
+                                                            == Some("alias")
+                                                }
+                                                Language::Java => false,
+                                            }
+                                    })
+                                })
                         }))
                     && position.revision_id == proof.revision_id.as_str()
                     && position.artifact_hash
@@ -2261,6 +2298,10 @@ pub fn validate_semantic_facts(
         let header = std::str::from_utf8(&measured_header.header_bytes)
             .map_err(|_| basis_error("relationship header invalid"))?;
         if relationship.kind == RelationshipKind::Overrides {
+            let target_owner = target_symbol
+                .split('#')
+                .next()
+                .and_then(|prefix| prefix.split([' ', '/', '.', '$']).next_back());
             if source.kind != Kind::Method
                 || !evidence.native_files.iter().any(|file| {
                     file.document.key == *document
@@ -2268,7 +2309,12 @@ pub fn validate_semantic_facts(
                             owner.kind == Kind::Type
                                 && owner.range.start <= source.range.start
                                 && source.range.end <= owner.range.end
-                                && !owner.header.bases.is_empty()
+                                && target_owner.is_some_and(|target_owner| {
+                                    owner.header.bases.iter().any(|base| {
+                                        base.as_str().split(['.', '$']).next_back()
+                                            == Some(target_owner)
+                                    })
+                                })
                         })
                 })
                 || target_name

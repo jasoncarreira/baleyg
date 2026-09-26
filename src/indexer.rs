@@ -980,7 +980,7 @@ fn captured_revision_id(basis: RevisionBasis<'_>) -> Result<String> {
     Ok(format!("rev:v1:{}", hex::encode(revision.finalize())))
 }
 
-fn captured_lookup_dependencies(document: &CapturedDocument) -> Result<Vec<String>> {
+pub(crate) fn captured_lookup_dependencies(document: &CapturedDocument) -> Result<Vec<String>> {
     let source = std::str::from_utf8(&document.bytes)?;
     let mut keys = std::collections::BTreeSet::new();
     for position in &document.semantic_positions {
