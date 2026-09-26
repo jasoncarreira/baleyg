@@ -746,6 +746,12 @@ export function checkCoverage(loaded, records) {
           "declaredTarget",
           "verified declaration map required",
         );
+      if (target.revisionId !== proof.revisionId)
+        fail(
+          "FRESHNESS.TARGET",
+          "declaredTarget",
+          "internal target must share its binding's revision",
+        );
       const captured = documentAt(loaded, target.document, target.revisionId);
       const declaration = verifiedDeclarations
         .get(snapshotKey(target.document.sourceSetId, target.revisionId))
@@ -756,22 +762,9 @@ export function checkCoverage(loaded, records) {
           "declaredTarget",
           "target not present in captured declarations",
         );
-      const wanted = loaded.selected.documents.find((x) =>
-        equal(x.key, target.document),
-      );
-      const current = verifiedDeclarations
-        .get(
-          snapshotKey(
-            loaded.comparison.sourceSetId,
-            loaded.comparison.revisionId,
-          ),
-        )
-        ?.get(target.syntaxId);
-      staleTarget =
-        !wanted ||
-        wanted.contentHash !== captured.contentHash ||
-        !current ||
-        !equal(current, wanted.key);
+      // v1: a present target at the binding's revision is never stale;
+      // positive staleTarget is reserved for later overlays (#11).
+      staleTarget = false;
     }
     if (binding.staleTarget !== staleTarget)
       fail(

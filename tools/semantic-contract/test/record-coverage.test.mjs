@@ -803,7 +803,7 @@ test("FRESHNESS.USE keeps captured historical tuple and rejects wrong producer, 
   );
   for (const row of rows) await t.test(row.id, () => runControl(row));
 });
-test("FRESHNESS.TARGET verifies captured declaration and independent current bytes", async (t) => {
+test("FRESHNESS.TARGET verifies the captured declaration; v1 staleTarget is false", async (t) => {
   const baseline = await specimen(t),
     C = checkCoverage(baseline.loaded, baseline.records),
     proof = baseline.records.provenance[0];
@@ -835,19 +835,20 @@ test("FRESHNESS.TARGET verifies captured declaration and independent current byt
     dispatch: "direct",
     possibleDispatch: [],
     possibleDispatchComplete: false,
-    staleTarget: true,
+    staleTarget: false,
     provenanceId: proof.id,
   };
   const declarations = new Map([
     ['["main","r1"]', new Map([[syntaxId, target.document]])],
   ]);
-  assert.equal(C.checkTarget(binding, proof, declarations), true);
+  // v1: a present target at the binding's own revision is never stale.
+  assert.equal(C.checkTarget(binding, proof, declarations), false);
   const rows = registerControls(
     [
       {
-        id: "U1.target-false-fresh",
+        id: "U1.target-true-invalid",
         mutate: (x) => {
-          x.binding.staleTarget = false;
+          x.binding.staleTarget = true;
           return x;
         },
         expectedField: "staleTarget",
@@ -871,7 +872,10 @@ test("FRESHNESS.TARGET verifies captured declaration and independent current byt
     ].map((row) => ({
       ...row,
       baseline: () => ({ binding, declarations }),
-      check: (x) => C.checkTarget(x.binding, proof, x.declarations),
+      // Wrapped: a valid v1 result is false, and the harness needs a truthy baseline.
+      check: (x) => ({
+        staleTarget: C.checkTarget(x.binding, proof, x.declarations),
+      }),
       expectedAssertion: "FRESHNESS.TARGET",
       expectedCode: "invalidRecord",
     })),
@@ -922,68 +926,6 @@ test("captured semantic proof is fresh when every requested component matches", 
     }).proofs[0].freshness,
     "fresh",
   );
-});
-
-test("fresh caller and target staleness are independent, including missing current declaration", async (t) => {
-  const baseline = await specimen(t, { sameCallerBytes: true }),
-    doc = baseline.docs[0];
-  const caller = {
-    id: `native:r2:sid:v1:${"a".repeat(32)}`,
-    producerId: "native",
-    document: doc,
-    revisionId: "r2",
-    contentHash: hash(baseline.source.r2[0]),
-    evidenceKind: "measuredSyntax",
-    basis: null,
-    freshness: "fresh",
-  };
-  baseline.records.provenance.push(caller);
-  const C = checkCoverage(baseline.loaded, baseline.records);
-  const syntaxId = `sid:v1:${"b".repeat(32)}`,
-    historical = baseline.docs[1],
-    target = {
-      kind: "internal",
-      syntaxId,
-      document: historical,
-      revisionId: "r1",
-    };
-  const binding = {
-    callId: null,
-    join: {
-      anchor: {
-        document: doc,
-        revisionId: "r2",
-        contentHash: caller.contentHash,
-        range: { start: 0, end: 1 },
-        kind: "callee",
-      },
-      status: "unmatched",
-      candidateIds: [],
-      diagnostic: "unmatched",
-    },
-    resolution: "resolved",
-    declaredTarget: target,
-    candidates: [],
-    dispatch: "direct",
-    possibleDispatch: [],
-    possibleDispatchComplete: false,
-    staleTarget: true,
-    provenanceId: caller.id,
-  };
-  const declarations = new Map([
-    ['["main","r1"]', new Map([[syntaxId, historical]])],
-    ['["main","r2"]', new Map([[syntaxId, historical]])],
-  ]);
-  assert.equal(C.checkTarget(binding, caller, declarations), true);
-  declarations.get('["main","r2"]').delete(syntaxId);
-  assert.equal(C.checkTarget(binding, caller, declarations), true);
-  const sameTarget = {
-    ...binding,
-    declaredTarget: { ...target, document: doc, revisionId: "r2" },
-    staleTarget: false,
-  };
-  declarations.get('["main","r2"]').set(syntaxId, doc);
-  assert.equal(C.checkTarget(sameTarget, caller, declarations), false);
 });
 
 test("requested producer components do not fall back to captured identity", async (t) => {
@@ -1587,116 +1529,6 @@ test("both semantic producers retain historical r1 proofs despite failed r2 refr
   await runControl(control);
 });
 
-test("fresh callers report target byte, declaration and document changes independently", async (t) => {
-  const b = await specimen(t, { sameCallerBytes: true });
-  const doc = b.docs[0],
-    historical = b.docs[1];
-  const caller = {
-    id: `native:r2:sid:v1:${"a".repeat(32)}`,
-    producerId: "native",
-    document: doc,
-    revisionId: "r2",
-    contentHash: hash(b.source.r2[0]),
-    evidenceKind: "measuredSyntax",
-    basis: null,
-    freshness: "fresh",
-  };
-  b.records.provenance.push(caller);
-  const C = checkCoverage(b.loaded, b.records),
-    syntaxId = `sid:v1:${"b".repeat(32)}`;
-  const anchor = {
-    document: doc,
-    revisionId: "r2",
-    contentHash: caller.contentHash,
-    range: { start: 0, end: 1 },
-    kind: "callee",
-  };
-  const binding = {
-    callId: null,
-    join: {
-      anchor,
-      status: "unmatched",
-      candidateIds: [],
-      diagnostic: "unmatched",
-    },
-    resolution: "resolved",
-    declaredTarget: {
-      kind: "internal",
-      syntaxId,
-      document: historical,
-      revisionId: "r1",
-    },
-    candidates: [],
-    dispatch: "direct",
-    possibleDispatch: [],
-    possibleDispatchComplete: false,
-    staleTarget: true,
-    provenanceId: caller.id,
-  };
-  const rows = [
-    [
-      "changed-bytes",
-      new Map([
-        ['["main","r1"]', new Map([[syntaxId, historical]])],
-        ['["main","r2"]', new Map([[syntaxId, historical]])],
-      ]),
-      binding,
-    ],
-    [
-      "missing-current-declaration",
-      new Map([['["main","r1"]', new Map([[syntaxId, historical]])]]),
-      binding,
-    ],
-  ];
-  for (const [name, declarations, expected] of rows) {
-    const control = registerControls([
-      {
-        id: `U1.target-${name}-false-bit`,
-        baseline: () => ({ binding: expected, declarations }),
-        check: (x) => C.checkTarget(x.binding, caller, x.declarations),
-        mutate: (x) => {
-          x.binding.staleTarget = false;
-          return x;
-        },
-        expectedAssertion: "FRESHNESS.TARGET",
-        expectedCode: "invalidRecord",
-        expectedField: "staleTarget",
-      },
-    ])[0];
-    await t.test(control.id, () => runControl(control));
-  }
-  const same = {
-    ...binding,
-    declaredTarget: {
-      ...binding.declaredTarget,
-      document: doc,
-      revisionId: "r2",
-    },
-    staleTarget: false,
-  };
-  const sameDeclarations = new Map([
-    ['["main","r2"]', new Map([[syntaxId, doc]])],
-  ]);
-  assert.equal(C.checkTarget(same, caller, sameDeclarations), false);
-  const control = registerControls([
-    {
-      id: "U1.target-same-bytes-true-bit",
-      baseline: () => ({ binding: same, declarations: sameDeclarations }),
-      check: (x) => ({
-        staleTarget: C.checkTarget(x.binding, caller, x.declarations),
-      }),
-      mutate: (x) => {
-        x.binding.staleTarget = true;
-        return x;
-      },
-      expectedAssertion: "FRESHNESS.TARGET",
-      expectedCode: "invalidRecord",
-      expectedField: "staleTarget",
-    },
-  ])[0];
-  await runControl(control);
-});
-
 test("selected unsupported request and missing supported observation are distinct valid partial states", async (t) => {
   const b = await specimen(t);
   for (const [name, supported] of [
@@ -2218,11 +2050,11 @@ test("semantic proof envelope, lookup keys and capture descriptors bind to admit
   }
 });
 
-test("fresh caller target checks one-byte current change, missing document and nullable external target", async (t) => {
+test("v1 staleTarget: cross-revision targets are rejected, same-revision targets are never stale, others are null", async (t) => {
   const b = await specimen(t, { sameCallerBytes: true }),
     doc = b.docs[0],
     syntaxId = `sid:v1:${"b".repeat(32)}`;
-  const proof = {
+  const caller = {
     id: `native:r2:sid:v1:${"a".repeat(32)}`,
     producerId: "native",
     document: doc,
@@ -2232,24 +2064,14 @@ test("fresh caller target checks one-byte current change, missing document and n
     basis: null,
     freshness: "fresh",
   };
-  b.records.provenance.push(proof);
-  const target = {
-      kind: "internal",
-      syntaxId,
-      document: doc,
-      revisionId: "r1",
-    },
-    declarations = new Map([
-      ['["main","r1"]', new Map([[syntaxId, doc]])],
-      ['["main","r2"]', new Map([[syntaxId, doc]])],
-    ]);
-  const binding = {
+  b.records.provenance.push(caller);
+  const binding = (declaredTarget, staleTarget) => ({
     callId: null,
     join: {
       anchor: {
         document: doc,
         revisionId: "r2",
-        contentHash: proof.contentHash,
+        contentHash: caller.contentHash,
         range: { start: 0, end: 1 },
         kind: "callee",
       },
@@ -2257,37 +2079,50 @@ test("fresh caller target checks one-byte current change, missing document and n
       candidateIds: [],
       diagnostic: "unmatched",
     },
-    resolution: "resolved",
-    declaredTarget: target,
+    resolution: declaredTarget ? "resolved" : "unresolved",
+    declaredTarget,
     candidates: [],
     dispatch: "direct",
     possibleDispatch: [],
     possibleDispatchComplete: false,
-    staleTarget: false,
-    provenanceId: proof.id,
-  };
-  const selected = structuredClone(b.loaded.selected),
-    current = selected.documents.find((x) => x.key.path === "a.js");
-  current.contentHash = hash("changed current target");
-  for (const [name, chosen] of [
-    ["changed-current-bytes", selected],
-    [
-      "missing-current-document",
-      {
-        ...selected,
-        documents: selected.documents.filter((x) => x.key.path !== "a.js"),
-      },
-    ],
-  ]) {
-    const C = checkCoverage({ ...b.loaded, selected: chosen }, b.records),
-      stale = { ...binding, staleTarget: true };
+    staleTarget,
+    provenanceId: caller.id,
+  });
+  const internal = (revisionId) => ({
+    kind: "internal",
+    syntaxId,
+    document: doc,
+    revisionId,
+  });
+  const declarations = new Map([
+    ['["main","r1"]', new Map([[syntaxId, doc]])],
+    ['["main","r2"]', new Map([[syntaxId, doc]])],
+  ]);
+  const C = checkCoverage(b.loaded, b.records);
+  // A current caller naming an older target is invalid in v1, whatever its flag.
+  for (const flag of [true, false])
+    assert.throws(
+      () => C.checkTarget(binding(internal("r1"), flag), caller, declarations),
+      { assertion: "FRESHNESS.TARGET", field: "declaredTarget" },
+    );
+  // A same-revision target is never stale, even when the comparison's bytes differ.
+  const selected = structuredClone(b.loaded.selected);
+  for (const row of selected.documents) row.contentHash = hash("changed");
+  for (const loaded of [b.loaded, { ...b.loaded, selected }]) {
+    const checker = checkCoverage(loaded, b.records);
+    assert.equal(
+      checker.checkTarget(binding(internal("r2"), false), caller, declarations),
+      false,
+    );
     const control = registerControls([
       {
-        id: `U1.target-${name}`,
-        baseline: () => stale,
-        check: (x) => C.checkTarget(x, proof, declarations),
+        id: `U1.target-same-revision-true-bit-${loaded === b.loaded ? "base" : "changed"}`,
+        baseline: () => binding(internal("r2"), false),
+        check: (x) => ({
+          staleTarget: checker.checkTarget(x, caller, declarations),
+        }),
         mutate: (x) => {
-          x.staleTarget = false;
+          x.staleTarget = true;
           return x;
         },
         expectedAssertion: "FRESHNESS.TARGET",
@@ -2297,21 +2132,17 @@ test("fresh caller target checks one-byte current change, missing document and n
     ])[0];
     await t.test(control.id, () => runControl(control));
   }
-  const C = checkCoverage(b.loaded, b.records),
-    external = {
-      ...binding,
-      declaredTarget: { kind: "external", symbol },
-      staleTarget: null,
-    };
-  for (const [name, candidate] of [
-    ["external", external],
-    ["no-target", { ...binding, declaredTarget: null, staleTarget: null }],
+  for (const [name, target] of [
+    ["external", { kind: "external", symbol }],
+    ["no-target", null],
   ]) {
     const control = registerControls([
       {
         id: `U1.target-${name}-null`,
-        baseline: () => candidate,
-        check: (x) => C.checkTarget(x, proof, declarations),
+        baseline: () => binding(target, null),
+        check: (x) => ({
+          staleTarget: C.checkTarget(x, caller, declarations),
+        }),
         mutate: (x) => {
           x.staleTarget = false;
           return x;

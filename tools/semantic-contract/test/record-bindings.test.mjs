@@ -688,7 +688,7 @@ async function specimen(
             : null;
     const stale =
       declaredTarget?.kind === "internal"
-        ? rev === "r1" && history && staleTarget
+        ? false // v1: evaluated at the binding's own revision (#52)
         : null;
     return {
       callId: status === "exact" ? callId(rev) : null,
@@ -730,10 +730,7 @@ function check(s) {
 
 // These expected rows come from authored source offsets, declaration identities and proof IDs.
 // They do not read the binding checker result to calculate any expected member.
-function expectedMembers(
-  names,
-  { possibleDispatch = [], history = false, staleTarget = false } = {},
-) {
+function expectedMembers(names, { possibleDispatch = [] } = {}) {
   const targets = order([...new Set(names)].map((name) => internal(name)));
   const contradictory = targets.length > 1;
   const start = source.indexOf("target();");
@@ -759,7 +756,7 @@ function expectedMembers(
       dispatch: "direct",
       possibleDispatch: order(possibleDispatch.map((x) => internal(x))),
       possibleDispatchComplete: false,
-      staleTarget: contradictory ? null : history && staleTarget,
+      staleTarget: contradictory ? null : false,
       provenanceId: `proof-${i}`,
     })),
   );
@@ -900,13 +897,14 @@ test("all resolution cardinalities, six dispatch classes, producer isolation and
   assert.equal(check(independent).groups.size, 2);
 });
 
-test("historical proof remains linked to r1 and target freshness is independent", async (t) => {
+test("historical proof remains linked to r1; a changed r2 target never marks the r1 binding stale", async (t) => {
   for (const staleTarget of [false, true]) {
     const s = await specimen(t, { history: true, staleTarget }),
       B = check(s),
       member = B.callBindings[0];
     assert.equal(member.callId, callId("r1"));
-    assert.equal(member.staleTarget, staleTarget);
+    // v1: staleTarget is evaluated at the binding's own revision (#52).
+    assert.equal(member.staleTarget, false);
     assert.equal(B.groups.size, 1);
     assert.equal(
       [...B.groups.values()][0].historicalTuples[0].revisionId,

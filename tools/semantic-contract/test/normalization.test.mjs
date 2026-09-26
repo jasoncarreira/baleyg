@@ -1455,10 +1455,8 @@ test("isolated r1/r2 comparison keeps historical provenance and never rebinds r1
       result.records.callBindings[0].callId,
       result.identityMap.get("call-r2"),
     );
-    assert.equal(
-      result.records.callBindings[0].staleTarget,
-      label === "changed",
-    );
+    // v1: evaluated at the binding's own revision (#52), so never stale.
+    assert.equal(result.records.callBindings[0].staleTarget, false);
     assert.equal(
       result.identityMap.get("decl"),
       result.identityMap.get("decl-r2"),
@@ -1824,7 +1822,7 @@ test("two semantic producers retain separate proof and binding partitions on the
   assert.equal(normalize(loaded).records.callBindings.length, 1);
 });
 
-test("unchanged caller with changed target bytes has possiblyStale proof but staleTarget=true", async (t) => {
+test("unchanged caller with changed target bytes has a possiblyStale proof; v1 staleTarget stays false", async (t) => {
   const d = { sourceSetId: "main", language: "javascript", path: "src/go.js" },
     a = {
       document: d,
@@ -1950,7 +1948,8 @@ test("unchanged caller with changed target bytes has possiblyStale proof but sta
     output.records.provenance.find((x) => x.id === "target-proof").freshness,
     "possiblyStale",
   );
-  assert.equal(output.records.callBindings[0].staleTarget, true);
+  // v1: the r1 binding's target shares its revision, so it is never stale (#52).
+  assert.equal(output.records.callBindings[0].staleTarget, false);
   assert.equal(output.records.callBindings[0].declaredTarget.revisionId, "r1");
 });
 
