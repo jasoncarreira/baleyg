@@ -603,13 +603,16 @@ export function checkCounts(
   const observed = new Set(
     [...exactReferences.values()].flatMap((x) => x.record.roles),
   );
-  const literalExample =
-    loaded.root?.replaceAll("\\", "/").split("/").at(-1) === "example";
+  const directory = loaded.root?.replaceAll("\\", "/").split("/").at(-1);
+  const literalExample = directory === "example";
+  const languageDirectory = ["java", "rust", "python", "javascript"].includes(
+    directory,
+  );
   // Draft corpora check every invariant except the floors; the final corpus
   // profile always enforces them.
   const floorsEnforced = !(
     (fixture.profile === "example" && literalExample) ||
-    (fixture.profile === "draft" && !literalExample)
+    (fixture.profile === "draft" && languageDirectory)
   );
   const count = {
     formatVersion: 1,
@@ -636,7 +639,7 @@ export function checkCounts(
     fail(
       "COUNT.PROFILE",
       "profile",
-      "only literal example/ or a draft language corpus can bypass floors",
+      "only literal example/ or a draft corpus in its language directory can bypass floors",
     );
   if (floorsEnforced) assertCorpusFloors(count);
   return count;

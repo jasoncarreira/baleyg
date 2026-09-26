@@ -279,8 +279,9 @@ async function specimen(
   } = {},
 ) {
   const document = documentOverride ?? baseDocument;
+  // The directory name fixes the admitted profile and language.
   const parent = await mkdtemp(join(tmpdir(), "count-u5-")),
-    root = join(parent, "example");
+    root = join(parent, profile === "example" ? "example" : document.language);
   await mkdir(root);
   t.after(() => rm(parent, { recursive: true, force: true }));
   const fs = new Map(),
