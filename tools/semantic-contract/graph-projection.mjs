@@ -64,7 +64,6 @@ export function graphProjection(loaded, records, request) {
               proofs.get(row.provenanceId),
               loaded,
               declarations,
-              request,
             ),
           },
   };

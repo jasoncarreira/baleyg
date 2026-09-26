@@ -1155,16 +1155,11 @@ export function normalizeFixture(loaded) {
         provenanceId: proof.id,
       };
       resolution(value.declaredTarget, value.candidates, value.resolution);
-      // v1: evaluated at the binding's own revision, where its target lives.
       value.staleTarget = expectedStaleTarget(
         value,
         proof,
         loaded,
         keys.verified,
-        {
-          sourceSetId: proof.document.sourceSetId,
-          revisionId: proof.revisionId,
-        },
       );
       validate("CallBinding", value);
       const k = encode([

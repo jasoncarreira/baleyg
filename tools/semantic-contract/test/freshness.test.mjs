@@ -300,7 +300,7 @@ test("FRESHNESS.COMPONENTS requested producer, manifest, toolchain and config ca
     s.fixture.revisions[1][field] = old;
   }
 });
-test("TARGET_STALENESS.TWO_REVISION_CONTEXT checks captured target bytes, not reused r1 label", async (t) => {
+test("TARGET_STALENESS.TWO_REVISION_CONTEXT evaluates at the binding revision, not the r2 comparison", async (t) => {
   const { s, r1, base } = await prepared(t);
   const target = {
     sourceSetId: "main",
@@ -397,22 +397,36 @@ test("TARGET_STALENESS.TWO_REVISION_CONTEXT checks captured target bytes, not re
   s.files["r2/target.js"] = "export const target = 2;\n";
   await s.flush();
   const changed = await loadFixture(s.root);
+  // v1 (#52): the r1 binding's r1 target is evaluated at r1, so a changed r2
+  // comparison never makes it stale, and a claimed true bit is rejected.
   assert.equal(
     expectedStaleTarget(binding, proof, changed, declarations),
-    true,
+    false,
   );
-  assert.throws(() => checkStaleTarget(binding, proof, changed, declarations), {
-    assertion: "TARGET_STALENESS.LABEL",
-    field: "staleTarget",
-  });
-  assert.equal(
-    checkStaleTarget(
-      { ...binding, staleTarget: true },
-      proof,
-      changed,
-      declarations,
-    ),
-    true,
+  assert.equal(checkStaleTarget(binding, proof, changed, declarations), false);
+  assert.throws(
+    () =>
+      checkStaleTarget(
+        { ...binding, staleTarget: true },
+        proof,
+        changed,
+        declarations,
+      ),
+    { assertion: "TARGET_STALENESS.LABEL", field: "staleTarget" },
+  );
+  // A target at another revision than its binding is invalid in v1.
+  assert.throws(
+    () =>
+      expectedStaleTarget(
+        {
+          ...binding,
+          declaredTarget: { ...binding.declaredTarget, revisionId: "r2" },
+        },
+        proof,
+        changed,
+        declarations,
+      ),
+    { assertion: "TARGET_STALENESS.REVISION", field: "declaredTarget" },
   );
 });
 
@@ -485,7 +499,7 @@ test("BASIS.RAW_FACT rejects missing and contradictory captured semantic proof",
     { assertion: "BASIS.RAW_FACT" },
   );
 });
-test("TARGET_STALENESS uses source-verified captured and requested declarations", async (t) => {
+test("TARGET_STALENESS verifies the captured declaration; later r2 changes never mark the r1 binding stale", async (t) => {
   const { s, base } = await prepared(t);
   const target = {
     sourceSetId: "main",
@@ -578,13 +592,20 @@ test("TARGET_STALENESS uses source-verified captured and requested declarations"
     selected.selected.documents.find((x) => x.key.path === target.path)
       .contentHash,
   );
+  // v1 (#52): the r1 target is present at r1, so a missing r2 declaration
+  // does not make it stale, and a claimed true bit is rejected.
   assert.equal(
     expectedStaleTarget(binding, proof, absent, verifiedDeclarations(absent)),
-    true,
+    false,
   );
   assert.throws(
     () =>
-      checkStaleTarget(binding, proof, absent, verifiedDeclarations(absent)),
+      checkStaleTarget(
+        { ...binding, staleTarget: true },
+        proof,
+        absent,
+        verifiedDeclarations(absent),
+      ),
     { assertion: "TARGET_STALENESS.LABEL" },
   );
   addTargetDeclaration(s, target, "r2", "r2/target.js");
@@ -607,7 +628,7 @@ test("TARGET_STALENESS uses source-verified captured and requested declarations"
   const missing = await loadFixture(s.root);
   assert.equal(
     expectedStaleTarget(binding, proof, missing, verifiedDeclarations(missing)),
-    true,
+    false,
   );
   s.fixture.revisions[1].documents.push({
     key: target,
@@ -620,7 +641,7 @@ test("TARGET_STALENESS uses source-verified captured and requested declarations"
   const changed = await loadFixture(s.root);
   assert.equal(
     expectedStaleTarget(binding, proof, changed, verifiedDeclarations(changed)),
-    true,
+    false,
   );
 });
 

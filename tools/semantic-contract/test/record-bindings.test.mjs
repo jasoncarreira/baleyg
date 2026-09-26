@@ -172,7 +172,7 @@ async function specimen(
     resolution = "resolved",
     status = "exact",
     history = false,
-    staleTarget = false,
+    changedSource = false,
     producers = false,
     possibleDispatch = [],
     externalSymbol = external.symbol,
@@ -193,7 +193,7 @@ async function specimen(
         path,
         typeof value === "string" ? value : JSON.stringify(value),
       );
-  const r2text = staleTarget
+  const r2text = changedSource
     ? source.replace(
         "function target() { return 1; }",
         "function target() { return 9; }",
@@ -405,7 +405,7 @@ async function specimen(
     basis: basis(producerId, fact.anchor.revisionId),
     freshness:
       fact.anchor.revisionId === "r1" && revisions.length > 1
-        ? staleTarget
+        ? changedSource
           ? "stale"
           : "possiblyStale"
         : "fresh",
@@ -647,7 +647,7 @@ async function specimen(
         d.document.sourceSetId !== "main"
           ? "stale"
           : d.revisionId === "r1" && revisions.length > 1
-            ? staleTarget && d.document === document
+            ? changedSource && d.document === document
               ? "stale"
               : "possiblyStale"
             : "fresh",
@@ -771,7 +771,7 @@ test("loaded exact claims retain full member/proof closure and canonical bytes f
       claims: names,
       possibleDispatch: ["other", "third"],
       history: true,
-      staleTarget: true,
+      changedSource: true,
     };
     const s = await specimen(t, options),
       B = check(s),
@@ -898,8 +898,8 @@ test("all resolution cardinalities, six dispatch classes, producer isolation and
 });
 
 test("historical proof remains linked to r1; a changed r2 target never marks the r1 binding stale", async (t) => {
-  for (const staleTarget of [false, true]) {
-    const s = await specimen(t, { history: true, staleTarget }),
+  for (const changedSource of [false, true]) {
+    const s = await specimen(t, { history: true, changedSource }),
       B = check(s),
       member = B.callBindings[0];
     assert.equal(member.callId, callId("r1"));
@@ -912,7 +912,7 @@ test("historical proof remains linked to r1; a changed r2 target never marks the
     );
     assert.equal(
       s.proofs[0].freshness,
-      staleTarget ? "stale" : "possiblyStale",
+      changedSource ? "stale" : "possiblyStale",
     );
   }
 });
@@ -922,7 +922,7 @@ test("two measured revisions close each call, fact, proof and historical group i
     s = await specimen(t, {
       claims: names,
       bothRevisions: true,
-      staleTarget: true,
+      changedSource: true,
     });
   const { C, M, J } = s.prechecks(),
     B = checkBindings(s.loaded, s.records, C, M, J);
@@ -1045,7 +1045,7 @@ test("two measured revisions close each call, fact, proof and historical group i
   const wrong = await specimen(t, {
     claims: names,
     bothRevisions: true,
-    staleTarget: true,
+    changedSource: true,
     output: (rows) => {
       rows.find((row) => row.provenanceId === "proof-0").callId = callId("r2");
       rows.splice(0, rows.length, ...orderedEnvelope("callBindings", rows));
@@ -1558,7 +1558,7 @@ test("finite loaded binding controls run valid baseline before each one-property
     },
     {
       id: "BINDING.TARGET.historical-attachment",
-      options: { history: true, staleTarget: true },
+      options: { history: true, changedSource: true },
       output: (r) => {
         r[0].declaredTarget.revisionId = "r2";
       },
