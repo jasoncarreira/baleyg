@@ -1939,6 +1939,7 @@ pub fn validate_semantic_facts(
         if proof.evidence_kind != EvidenceKind::SemanticReference
             || reference.document != proof.document
             || reference.revision_id != proof.revision_id
+            || reference.revision_id != evidence.context.revision.id
             || !ordered_unique_or_empty(
                 &reference
                     .roles
@@ -2301,21 +2302,31 @@ pub fn validate_semantic_facts(
             let target_owner = target_symbol
                 .split('#')
                 .next()
-                .and_then(|prefix| prefix.split([' ', '/', '.', '$']).next_back());
-            if source.kind != Kind::Method
-                || !evidence.native_files.iter().any(|file| {
-                    file.document.key == *document
-                        && file.declarations.iter().any(|owner| {
+                .and_then(|prefix| prefix.split_whitespace().last())
+                .map(|owner| owner.replace(['/', '$'], "."));
+            let containing_type = evidence
+                .native_files
+                .iter()
+                .find(|file| file.document.key == *document)
+                .and_then(|file| {
+                    file.declarations
+                        .iter()
+                        .filter(|owner| {
                             owner.kind == Kind::Type
                                 && owner.range.start <= source.range.start
                                 && source.range.end <= owner.range.end
-                                && target_owner.is_some_and(|target_owner| {
-                                    owner.header.bases.iter().any(|base| {
-                                        base.as_str().split(['.', '$']).next_back()
-                                            == Some(target_owner)
-                                    })
-                                })
                         })
+                        .min_by_key(|owner| owner.range.end.get() - owner.range.start.get())
+                });
+            if source.kind != Kind::Method
+                || !containing_type.is_some_and(|owner| {
+                    target_owner.as_ref().is_some_and(|target_owner| {
+                        owner
+                            .header
+                            .bases
+                            .iter()
+                            .any(|base| base.as_str().replace(['/', '$'], ".") == *target_owner)
+                    })
                 })
                 || target_name
                     .is_some_and(|name| source.name.as_ref().map(Text::as_str) != Some(name))
