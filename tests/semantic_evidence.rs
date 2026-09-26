@@ -824,35 +824,42 @@ fn native_provenance_is_bound_to_each_captured_document() {
 }
 
 #[test]
-fn rust_same_span_control_alias_is_rejected_until_producer_is_fixed() {
+fn rust_same_span_control_uses_supported_ast_identity() {
     let (_dir, capture, mut evidence) =
         fixture_with_sources(None, None, Some("fn b() { if true { obj.foo(); } }\n"));
-    let doc = capture
+    let index = capture
         .documents
         .iter()
-        .find(|d| d.key.language == Language::Rust)
+        .position(|d| d.key.language == Language::Rust)
         .unwrap();
-    let aliases: Vec<_> = doc
+    let doc = &capture.documents[index];
+    let regions: Vec<_> = doc
         .native_candidates
         .iter()
-        .filter(|w| {
-            w.candidate_kind == baleyg::indexer::NativeCandidateKind::ControlRegion
-                && w.stable_id.is_some()
-        })
+        .filter(|w| w.candidate_kind == baleyg::indexer::NativeCandidateKind::ControlRegion)
         .collect();
-    assert_eq!(aliases.len(), 2);
-    assert_eq!((aliases[0].start_byte, aliases[0].end_byte), (9, 31));
-    assert_eq!((aliases[1].start_byte, aliases[1].end_byte), (9, 31));
-    assert_eq!(aliases[0].stable_id, aliases[1].stable_id);
-    assert_eq!(
-        (aliases[0].node_kind.as_str(), aliases[1].node_kind.as_str()),
-        ("expression_statement", "if_expression")
-    );
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].node_kind, "if_expression");
+    assert_eq!((regions[0].start_byte, regions[0].end_byte), (9, 31));
     complete_native_evidence(&capture, &mut evidence);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    let mut forged = capture.clone();
+    forged.documents[index]
+        .native_candidates
+        .iter_mut()
+        .find(|w| w.candidate_kind == baleyg::indexer::NativeCandidateKind::ControlRegion)
+        .unwrap()
+        .node_kind = "expression_statement".into();
+    assert!(matches!(
+        validate_native(&forged, &evidence),
+        Err(EvidenceError::Native(_))
+    ));
+    let mut missing = evidence.clone();
+    missing.native_files[index].control_regions.clear();
     assert_eq!(
-        validate_native(&capture, &evidence),
+        validate_native(&capture, &missing),
         Err(EvidenceError::Native(
-            "candidate kind differs from supported AST kind"
+            "selected complete document omits a captured supported candidate"
         ))
     );
 }

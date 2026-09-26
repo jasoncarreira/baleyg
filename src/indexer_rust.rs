@@ -79,8 +79,11 @@ fn declaration(n: Node<'_>, bytes: &[u8]) -> Result<Option<Key>> {
     }))
 }
 fn region(n: Node<'_>) -> bool {
+    region_kind(n.kind())
+}
+fn region_kind(kind: &str) -> bool {
     matches!(
-        n.kind(),
+        kind,
         "if_expression"
             | "match_arm"
             | "loop_expression"
@@ -270,19 +273,23 @@ pub(crate) fn identify_document(
         revision,
         document.key.source_set_id.as_str(),
     )?;
+    // A wrapper expression_statement can have exactly the same byte range as
+    // its if_expression child. Byte spans alone cannot identify the AST node.
     document.native_candidates.retain(|w| {
-        !matches!(
-            w.candidate_kind,
-            NativeCandidateKind::ControlRegion | NativeCandidateKind::Invocation
-        ) || ids.ids.contains_key(&(
-            w.start_byte,
-            w.end_byte,
-            if w.candidate_kind == NativeCandidateKind::Invocation {
+        let prefix = match w.candidate_kind {
+            NativeCandidateKind::ControlRegion if region_kind(&w.node_kind) => "region",
+            NativeCandidateKind::Invocation
+                if matches!(
+                    w.node_kind.as_str(),
+                    "call_expression" | "method_call_expression"
+                ) =>
+            {
                 "call"
-            } else {
-                "region"
-            },
-        ))
+            }
+            NativeCandidateKind::ControlRegion | NativeCandidateKind::Invocation => return false,
+            _ => return true,
+        };
+        ids.ids.contains_key(&(w.start_byte, w.end_byte, prefix))
     });
     for witness in &mut document.native_candidates {
         let prefix = match witness.candidate_kind {
