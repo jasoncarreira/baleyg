@@ -538,6 +538,22 @@ fn complete_native_file(
             })
             .collect::<Vec<_>>();
         let result_type = field(node.id, "return_type").map(&source_text);
+        let modifiers = doc
+            .syntax
+            .iter()
+            .filter(|n| n.parent_id == Some(node.id) && n.kind == "visibility_modifier")
+            .map(&source_text)
+            .collect::<Vec<_>>();
+        let type_parameters = field(node.id, "type_parameters")
+            .into_iter()
+            .flat_map(|n| {
+                doc.syntax.iter().filter(move |part| {
+                    part.parent_id == Some(n.id) && part.kind == "type_parameter"
+                })
+            })
+            .map(&source_text)
+            .collect::<Vec<_>>();
+        let declared_name = field(node.id, "name").map(&source_text);
         let mut enclosing = node.parent_id;
         let mut parent_keys = vec![];
         let mut parent_node_id = None;
@@ -546,15 +562,13 @@ fn complete_native_file(
                 candidate.node_id == id
                     && candidate.candidate_kind == baleyg::indexer::NativeCandidateKind::Declaration
                     && candidate.stable_id.is_some()
-            }) {
-                if let Some(row) = file
-                    .declarations
-                    .iter()
-                    .find(|row| parent.stable_id.as_deref() == Some(row.syntax_id.as_str()))
-                {
-                    parent_keys.push(row.key.clone());
-                    parent_node_id = Some(id);
-                }
+            }) && let Some(row) = file
+                .declarations
+                .iter()
+                .find(|row| parent.stable_id.as_deref() == Some(row.syntax_id.as_str()))
+            {
+                parent_keys.push(row.key.clone());
+                parent_node_id = Some(id);
             }
             enclosing = doc.syntax[id].parent_id;
         }
@@ -565,7 +579,7 @@ fn complete_native_file(
             } else {
                 vec![module.clone()]
             };
-        function_ancestors.extend(parent_keys);
+        function_ancestors.extend(parent_keys.iter().cloned());
         let ordinal = doc
             .native_candidates
             .iter()
@@ -661,6 +675,81 @@ fn complete_native_file(
                             parameters: vec![],
                             result_type: None,
                             bases: vec![text("Base")],
+                        },
+                    )
+                }
+                (Language::Javascript, "method_definition")
+                | (Language::Python, "function_definition")
+                    if parent_keys.last().is_some_and(|p| p.kind == Kind::Type) =>
+                {
+                    let name = declared_name.clone().unwrap();
+                    (
+                        Kind::Method,
+                        name.clone(),
+                        Key {
+                            kind: Kind::Method,
+                            name: Some(name.clone()),
+                            signature: None,
+                            ordinal: UInt::new(ordinal as u64).unwrap(),
+                        },
+                        function_ancestors.clone(),
+                        Header {
+                            kind: Kind::Method,
+                            name: Some(name),
+                            modifiers: modifiers.clone(),
+                            type_parameters: type_parameters.clone(),
+                            parameters: parameters.clone(),
+                            result_type: result_type.clone(),
+                            bases: vec![],
+                        },
+                    )
+                }
+                (Language::Rust, "impl_item") => {
+                    let ty = field(node.id, "type").map(&source_text).unwrap();
+                    let name = text(&format!("impl {}", ty.as_str()));
+                    (
+                        Kind::Type,
+                        name.clone(),
+                        Key {
+                            kind: Kind::Type,
+                            name: Some(name.clone()),
+                            signature: None,
+                            ordinal: UInt::new(ordinal as u64).unwrap(),
+                        },
+                        function_ancestors.clone(),
+                        Header {
+                            kind: Kind::Type,
+                            name: Some(name),
+                            modifiers: modifiers.clone(),
+                            type_parameters: type_parameters.clone(),
+                            parameters: vec![],
+                            result_type: None,
+                            bases: vec![],
+                        },
+                    )
+                }
+                (Language::Rust, "function_item")
+                    if parent_keys.last().is_some_and(|p| p.kind == Kind::Type) =>
+                {
+                    let name = declared_name.clone().unwrap();
+                    (
+                        Kind::Method,
+                        name.clone(),
+                        Key {
+                            kind: Kind::Method,
+                            name: Some(name.clone()),
+                            signature: None,
+                            ordinal: UInt::new(ordinal as u64).unwrap(),
+                        },
+                        function_ancestors.clone(),
+                        Header {
+                            kind: Kind::Method,
+                            name: Some(name),
+                            modifiers: modifiers.clone(),
+                            type_parameters: type_parameters.clone(),
+                            parameters: parameters.clone(),
+                            result_type: result_type.clone(),
+                            bases: vec![],
                         },
                     )
                 }
@@ -1018,6 +1107,51 @@ fn javascript_nested_control_parent_is_exact_ast_parent() {
     ifs.sort_by_key(|r| r.range.start.get());
     assert_eq!(ifs.len(), 2);
     let (outer, nested) = (ifs[0], ifs[1]);
+    let doc = &capture.documents[index];
+    let measured_parent = doc
+        .native_candidates
+        .iter()
+        .find(|w| {
+            w.node_kind == "statement_block"
+                && w.stable_id.as_deref() == nested.parent_id.as_ref().map(OccurrenceId::as_str)
+        })
+        .unwrap();
+    let nested_witness = doc
+        .native_candidates
+        .iter()
+        .find(|w| w.stable_id.as_deref() == Some(nested.id.as_str()))
+        .unwrap();
+    assert_eq!(
+        doc.syntax[nested_witness.node_id].parent_id,
+        Some(measured_parent.node_id)
+    );
+    assert_eq!(
+        doc.syntax[measured_parent.node_id].field_name.as_deref(),
+        Some("consequence")
+    );
+    assert_eq!(
+        nested.parent_id.as_ref().map(OccurrenceId::as_str),
+        measured_parent.stable_id.as_deref()
+    );
+    let arm_region = regions
+        .iter()
+        .find(|r| r.id.as_str() == measured_parent.stable_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(
+        arm_region.arm.as_ref().map(Text::as_str),
+        Some("consequence")
+    );
+    let mut wrong_arm = evidence.clone();
+    wrong_arm.native_files[index]
+        .control_regions
+        .iter_mut()
+        .find(|r| r.id == arm_region.id)
+        .unwrap()
+        .arm = Some(text("alternative"));
+    assert!(matches!(
+        validate_native(&capture, &wrong_arm),
+        Err(EvidenceError::Native(_))
+    ));
     assert!(outer.range.start <= nested.range.start && nested.range.end <= outer.range.end);
     assert_ne!(nested.parent_id.as_ref(), Some(&outer.id));
     let mut wrong = evidence.clone();
@@ -1031,6 +1165,93 @@ fn javascript_nested_control_parent_is_exact_ast_parent() {
         validate_native(&capture, &wrong),
         Err(EvidenceError::Native(_))
     ));
+}
+
+#[test]
+fn non_java_member_declarations_and_rust_generic_modifiers_are_source_checked() {
+    let (_dir, capture, mut evidence) = fixture_with_sources(
+        Some("class Child extends Base { foo(a) { return a; } }\n"),
+        Some("class Child(Base):\n    def f(self, a: int) -> int:\n        return a\n"),
+        Some("impl Child { pub fn b<T>(a: T) -> T { a } }\n"),
+    );
+    complete_native_evidence(&capture, &mut evidence);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
+    for language in [Language::Javascript, Language::Python, Language::Rust] {
+        let index = capture
+            .documents
+            .iter()
+            .position(|d| d.key.language == language)
+            .unwrap();
+        let declarations = &evidence.native_files[index].declarations;
+        let method = declarations
+            .iter()
+            .find(|d| d.kind == Kind::Method)
+            .unwrap();
+        assert_eq!(method.ancestors.last(), Some(&declarations[0].key));
+        assert_eq!(method.key.kind, Kind::Method);
+        assert_eq!(method.key.name, method.header.name);
+        assert!(!method.header.parameters.is_empty());
+        let method_id = method.syntax_id.clone();
+        let mut wrong = evidence.clone();
+        wrong.native_files[index]
+            .declarations
+            .iter_mut()
+            .find(|d| d.syntax_id == method_id)
+            .unwrap()
+            .header
+            .parameters
+            .clear();
+        assert!(matches!(
+            validate_native(&capture, &wrong),
+            Err(EvidenceError::Native(_))
+        ));
+        let mut wrong = evidence.clone();
+        wrong.native_files[index]
+            .declarations
+            .iter_mut()
+            .find(|d| d.syntax_id == method_id)
+            .unwrap()
+            .ancestors
+            .clear();
+        assert!(matches!(
+            validate_native(&capture, &wrong),
+            Err(EvidenceError::Native(_))
+        ));
+        if language == Language::Rust {
+            assert_eq!(method.header.modifiers, vec![text("pub")]);
+            assert_eq!(method.header.type_parameters, vec![text("T")]);
+            let mut wrong = evidence.clone();
+            wrong.native_files[index]
+                .declarations
+                .iter_mut()
+                .find(|d| d.syntax_id == method_id)
+                .unwrap()
+                .header
+                .modifiers
+                .clear();
+            assert!(matches!(
+                validate_native(&capture, &wrong),
+                Err(EvidenceError::Native(_))
+            ));
+            let mut wrong = evidence.clone();
+            wrong.native_files[index]
+                .declarations
+                .iter_mut()
+                .find(|d| d.syntax_id == method_id)
+                .unwrap()
+                .header
+                .type_parameters
+                .clear();
+            assert!(matches!(
+                validate_native(&capture, &wrong),
+                Err(EvidenceError::Native(_))
+            ));
+        }
+    }
 }
 
 #[test]
