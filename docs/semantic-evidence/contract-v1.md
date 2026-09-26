@@ -118,7 +118,7 @@ Occurrence-keyed evidence never crosses revisions, because occurrence IDs includ
 
 Provenance selected merely because it exists, or that selects itself, is invalid.
 
-`CallBinding.staleTarget` is null when there is no internal declared target; true when that target is missing or its captured target document bytes differ from the requested snapshot; false when it exists with matching bytes. Thus a caller can be fresh while the target is stale. `possiblyStale`, `stale`, or `staleTarget=true` forbids expansion.
+`CallBinding.staleTarget` is null when there is no internal declared target; true when that target is missing or its captured target document bytes differ from the requested snapshot; false when it exists with matching bytes. Thus a caller can be fresh while the target is stale: a caller proof captured at the requested revision whose internal target names a declaration at an earlier revision, whose document bytes have since changed. An older caller proof cannot be that fresh caller. By rule 2 its evidence is at least `possiblyStale` source-set-wide, and its call binding cannot attach to the requested revision's occurrences. `possiblyStale`, `stale`, or `staleTarget=true` forbids expansion.
 
 Hand-checks:
 
@@ -129,7 +129,7 @@ Hand-checks:
 | Complete but stale | `complete` remains a coverage fact. | Changed document bytes makes provenance `stale`; overlay is withheld. |
 | Caller bytes unchanged; dependency, config, or producer changes | Coverage is unchanged. | Each independently makes semantic evidence `possiblyStale`. |
 | Missing basis | Semantic artifact is malformed and atomically rejected; absence may be exposed as failed/missing coverage. | It cannot be called fresh. |
-| Fresh caller, changed target bytes | Caller may be fresh. | Internal binding has `staleTarget=true`; boundary, no expansion. |
+| Fresh caller, changed target bytes | Caller proof captured at the requested revision is fresh; its internal target names an earlier revision whose target document bytes differ. | Internal binding has `staleTarget=true`; boundary, no expansion. An older caller proof would be at least `possiblyStale` instead (rule 2). |
 | Refresh fails | New tuple row is `failed`, diagnostic required. | Old basis remains historical with its old label; never promoted. Only provenance of declaration-keyed facts for returned declarations may appear in the new answer, plus the latest eligible earlier coverage row for each returned declaration's document even without a matching fact ([scope](#historical-evidence-scope)); no old call binding does. |
 
 ## Records and bindings
@@ -490,7 +490,7 @@ Notation: `N(X,d)` is a node; `E(call,from,to,visit,reason)` is an edge; `F(reas
 5. **Depth.** Chain A→B→C, depth 1: `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none)]`; `frontier=[F(depth,B,null,null,0,1)]`; calls=1; truncated/partial true. Depth 0: `nodes=[N(A,0)]`; `edges=[]`; `frontier=[F(depth,A,null,null,0,1)]`; calls=0.
 6. **Node cap with later seen edge.** A calls in order `a0→B,a1→C,a2→A`, maxNodes=2. `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none),E(a1,A,null,boundary,nodeLimit),E(a2,A,A,seen,none)]`; `frontier=[F(nodeLimit,A,a1,C,null,0)]`; calls=3. The refused C does not stop the later self-loop.
 7. **Global call cap.** A calls `a0→B,a1→C`; B calls `b0→D`; maxCalls=1. After a0: `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none)]`; `frontier=[F(callLimit,A,null,null,1,1),F(callLimit,B,null,null,0,1)]`; calls=1. The first frontier is created at A, then B is drained in queue order. With maxCalls=0 and root calls `[a0,a1]`: `nodes=[N(A,0)]`; `edges=[]`; `frontier=[F(callLimit,A,null,null,0,2)]`; calls=0. With maxCalls=1 and A's only call `a0→B`, B empty: arrays are nodes A,B, one new edge, `frontier=[]`; exact cap has no remaining work, so not truncated.
-8. **Dispatch and freshness.** A has c0 with a fresh resolved internal virtual binding and one possible target V: `E(c0,A,null,boundary,dispatch)`. A also has c1 whose caller evidence is fresh but internal direct target bytes changed, `staleTarget=true`: `E(c1,A,null,boundary,stale)`. `nodes=[N(A,0)]`; edges are those two in source order; `frontier=[]`; calls=2. Neither V nor the stale target is admitted; possible dispatch remains only in binding; partial is true.
+8. **Dispatch and freshness.** A has c0 with a fresh resolved internal virtual binding and one possible target V: `E(c0,A,null,boundary,dispatch)`. A also has c1 whose caller proof is captured at the requested revision and fresh, but whose internal direct target names an earlier revision with different target document bytes, `staleTarget=true`: `E(c1,A,null,boundary,stale)`. `nodes=[N(A,0)]`; edges are those two in source order; `frontier=[]`; calls=2. Neither V nor the stale target is admitted; possible dispatch remains only in binding; partial is true.
 
 ## Artifact validity and failure disposition
 
