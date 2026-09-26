@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   chmod,
   cp,
+  realpath,
   mkdtemp,
   readdir,
   readFile,
@@ -294,6 +295,35 @@ test("publication: manifest paths, hashes and canonical bytes are checked withou
     );
   } finally {
     await cleanup();
+  }
+});
+
+test("CLI generate and check admit the directory's profile and language, like discovery", async () => {
+  const parent = await realpath(
+    await mkdtemp(join(tmpdir(), "baleyg-cli-admission-")),
+  );
+  try {
+    const root = join(parent, "python");
+    await cp(example, root, { recursive: true });
+    const path = join(root, "fixture.json");
+    const fixture = JSON.parse(await readFile(path, "utf8"));
+    // A mislabelled draft must not reach generation and skip corpus floors.
+    await writeFile(path, JSON.stringify({ ...fixture, profile: "draft" }));
+    for (const args of [
+      ["generate", "--fixture", "python", "--fixtures-root", parent],
+      ["generate", "--check", "--fixture", "python", "--fixtures-root", parent],
+      ["check", "--fixture", "python", "--fixtures-root", parent],
+    ])
+      await assert.rejects(main(args), (error) =>
+        rejects(error, "DISCOVERY.PROFILE", root),
+      );
+    assert.deepEqual(
+      (await readdir(join(root, "generated", "bundles"))).length,
+      1,
+      "no new bundle published",
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
   }
 });
 

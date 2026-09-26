@@ -1,5 +1,5 @@
 import { readFile, readdir, realpath, lstat } from "node:fs/promises";
-import { resolve, relative, join } from "node:path";
+import { basename, resolve, relative, join } from "node:path";
 import { validate } from "./formats.mjs";
 import { parseJson } from "./json.mjs";
 import { contentHash, sourceManifestHash } from "./identity.mjs";
@@ -98,9 +98,23 @@ async function inventory(root, paths) {
   for (const path of listed) await confinedFile(root, path);
 }
 
+// The fixture directory name fixes its profile and language on every path
+// (discovery, CLI generate/check): example/ is the JavaScript example, and a
+// language directory holds that language's corpus, final or draft.
+function admitDescriptor(root, fixture) {
+  const name = basename(root);
+  // Only these names are reachable from discovery and the CLI; other directory
+  // names are unit-test roots, which count floors treat as final corpora.
+  if (name !== "example" && !languages.includes(name)) return;
+  const profiles = name === "example" ? ["example"] : ["corpus", "draft"];
+  const language = name === "example" ? "javascript" : name;
+  if (!profiles.includes(fixture.profile) || fixture.language !== language)
+    reject("DISCOVERY.PROFILE", root, "fixture descriptor mismatch");
+}
 export async function loadFixture(root) {
   root = await realpath(root);
   const { value: fixture } = await jsonFile(root, "fixture.json", "FixtureV1");
+  admitDescriptor(root, fixture);
   unique(fixture.sourceSets, (x) => x.id, "sourceSets");
   unique(fixture.producers, (x) => x.id, "producers");
   unique(fixture.comparison.producers, (x) => x.id, "comparison.producers");
@@ -641,12 +655,9 @@ export async function discoverFixtures(root) {
   const seen = new Set();
   for (const path of fixtures) {
     const { value } = await jsonFile(path, "fixture.json", "FixtureV1");
-    const name = relative(root, path),
-      profile = name === "example" ? "example" : "corpus";
-    const language = name === "example" ? "javascript" : name;
-    if (value.profile !== profile || value.language !== language)
-      reject("DISCOVERY.PROFILE", path, "fixture descriptor mismatch");
-    const pair = key([profile, language]);
+    const name = relative(root, path);
+    admitDescriptor(path, value);
+    const pair = key([name]);
     if (seen.has(pair))
       reject("DISCOVERY.DUPLICATE", path, "duplicate fixture");
     seen.add(pair);

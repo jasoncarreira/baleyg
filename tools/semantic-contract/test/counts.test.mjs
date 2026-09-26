@@ -279,8 +279,9 @@ async function specimen(
   } = {},
 ) {
   const document = documentOverride ?? baseDocument;
+  // The directory name fixes the admitted profile and language.
   const parent = await mkdtemp(join(tmpdir(), "count-u5-")),
-    root = join(parent, "example");
+    root = join(parent, profile === "example" ? "example" : document.language);
   await mkdir(root);
   t.after(() => rm(parent, { recursive: true, force: true }));
   const fs = new Map(),
@@ -1085,6 +1086,58 @@ test("corpus profile enforces all floors, not only totals", async (t) => {
       expectedAssertion: "COUNT.FLOOR",
       expectedCode: "invalidRecord",
       expectedField: "counts",
+    },
+  ]);
+  for (const control of controls) await runControl(control);
+});
+
+test("draft language corpus skips only count floors; example and draft stay in their own directories", async (t) => {
+  const s = await specimen(t);
+  const asLanguage = (fixture) => ({
+    ...s.loaded,
+    root: s.loaded.root.replace(/example$/, "javascript"),
+    fixture,
+  });
+  const draft = checkCounts(
+    asLanguage({ ...s.loaded.fixture, profile: "draft" }),
+    s.records,
+  );
+  assert.equal(draft.profile, "draft");
+  assert.equal(draft.floorsEnforced, false);
+  const controls = registerControls([
+    {
+      id: "COUNT.profile.final-corpus-enforces-floors",
+      baseline: () => ({ ...s.loaded.fixture, profile: "draft" }),
+      mutate: (fixture) => ({ ...fixture, profile: "corpus" }),
+      check: (fixture) => checkCounts(asLanguage(fixture), s.records),
+      expectedAssertion: "COUNT.FLOOR",
+      expectedCode: "invalidRecord",
+      expectedField: "counts",
+    },
+    {
+      id: "COUNT.profile.draft-not-in-example",
+      baseline: () => s.loaded.fixture,
+      mutate: (fixture) => ({ ...fixture, profile: "draft" }),
+      check: (fixture) => checkCounts({ ...s.loaded, fixture }, s.records),
+      expectedAssertion: "COUNT.PROFILE",
+      expectedCode: "invalidRecord",
+      expectedField: "profile",
+    },
+    {
+      id: "COUNT.profile.draft-still-checks-invariants",
+      baseline: () => s.records,
+      mutate: (records) => {
+        records.references[0].id = `occ:v1:${"b".repeat(32)}`;
+        return records;
+      },
+      check: (records) =>
+        checkCounts(
+          asLanguage({ ...s.loaded.fixture, profile: "draft" }),
+          records,
+        ),
+      expectedAssertion: "REFERENCE.SOURCE",
+      expectedCode: "invalidRecord",
+      expectedField: "references",
     },
   ]);
   for (const control of controls) await runControl(control);
