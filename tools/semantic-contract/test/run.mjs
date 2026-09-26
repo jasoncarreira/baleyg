@@ -92,7 +92,14 @@ export async function runFixtures(root) {
     const temporary = await mkdtemp(join(tmpdir(), "baleyg-semantic-runner-"));
     const copy = join(temporary, basename(fixture));
     try {
-      console.log(`Checking fixture ${fixture}`);
+      const { profile } = JSON.parse(
+        await readFile(join(fixture, "fixture.json"), "utf8"),
+      );
+      console.log(
+        profile === "draft"
+          ? `Checking fixture ${fixture} (DRAFT: count floors not enforced)`
+          : `Checking fixture ${fixture}`,
+      );
       await cp(fixture, copy, { recursive: true });
       const first = await generateFixture(copy);
       const original = await publicationBytes(copy, first);

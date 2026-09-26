@@ -641,12 +641,13 @@ export async function discoverFixtures(root) {
   const seen = new Set();
   for (const path of fixtures) {
     const { value } = await jsonFile(path, "fixture.json", "FixtureV1");
-    const name = relative(root, path),
-      profile = name === "example" ? "example" : "corpus";
+    const name = relative(root, path);
+    // A language corpus is "draft" while it is being built and "corpus" once final.
+    const profiles = name === "example" ? ["example"] : ["corpus", "draft"];
     const language = name === "example" ? "javascript" : name;
-    if (value.profile !== profile || value.language !== language)
+    if (!profiles.includes(value.profile) || value.language !== language)
       reject("DISCOVERY.PROFILE", path, "fixture descriptor mismatch");
-    const pair = key([profile, language]);
+    const pair = key([name === "example" ? "example" : "corpus", language]);
     if (seen.has(pair))
       reject("DISCOVERY.DUPLICATE", path, "duplicate fixture");
     seen.add(pair);

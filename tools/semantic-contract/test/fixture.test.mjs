@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverFixtures } from "../load.mjs";
-import { checkPublication } from "../publish.mjs";
+import { checkPublication, generateFixture } from "../publish.mjs";
 import { runFixtures, parseRunnerArgs } from "./run.mjs";
 
 const defaultRoot = resolve(
@@ -1010,6 +1010,36 @@ test("a copied minimal example cannot evade corpus floors by changing its profil
   });
   assert.deepEqual(await discoverFixtures(root), [join(root, "javascript")]);
   await assert.rejects(runFixtures(root), error("COUNT.FLOOR", "counts"));
+});
+
+test("a draft language corpus passes every invariant without floors until it is marked corpus", async (t) => {
+  const { root, cleanup } = await copyExample();
+  t.after(cleanup);
+  await rename(join(root, "example"), join(root, "javascript"));
+  await descriptor(root, "javascript", (value) => {
+    value.profile = "draft";
+  });
+  assert.deepEqual(await discoverFixtures(root), [join(root, "javascript")]);
+  // An author republishes after changing the descriptor; the runner then checks it.
+  const manifest = await generateFixture(join(root, "javascript"));
+  assert.equal(manifest.profile, "draft");
+  assert.equal(await runFixtures(root), 1);
+  await descriptor(root, "javascript", (value) => {
+    value.profile = "corpus";
+  });
+  await assert.rejects(runFixtures(root), error("COUNT.FLOOR", "counts"));
+});
+
+test("the literal example cannot claim the draft profile", async (t) => {
+  const { root, cleanup } = await copyExample();
+  t.after(cleanup);
+  await descriptor(root, "example", (value) => {
+    value.profile = "draft";
+  });
+  await assert.rejects(
+    discoverFixtures(root),
+    error("DISCOVERY.PROFILE", join(root, "example")),
+  );
 });
 
 test("discovery rejects unknown directory name with stable assertion and path", async (t) => {

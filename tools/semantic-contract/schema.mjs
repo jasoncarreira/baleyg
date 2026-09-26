@@ -435,7 +435,7 @@ export const types = Object.freeze({
   }),
   FixtureV1: object({
     formatVersion: literal(1),
-    profile: enumOf("example", "corpus"),
+    profile: enumOf("example", "corpus", "draft"),
     language: "Language",
     sourceSets: array("SourceSet"),
     producers: array("Producer"),
@@ -758,7 +758,7 @@ export const types = Object.freeze({
   CountsV1: object({
     formatVersion: literal(1),
     language: "Language",
-    profile: enumOf("example", "corpus"),
+    profile: enumOf("example", "corpus", "draft"),
     floorsEnforced: "boolean",
     scenariosTotal: "UInt",
     scenariosByCategory: array("CategoryCount"),
@@ -775,7 +775,7 @@ export const types = Object.freeze({
     contractVersion: literal(1),
     warningsVersion: literal("warnings-v1"),
     language: "Language",
-    profile: enumOf("example", "corpus"),
+    profile: enumOf("example", "corpus", "draft"),
     inputHash: "Hash",
     bundleHash: "Hash",
     records: "FileDigest",
