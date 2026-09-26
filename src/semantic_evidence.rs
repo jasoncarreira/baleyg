@@ -1672,6 +1672,16 @@ pub fn validate_semantic_basis(
             || basis.config_hash.as_str() != digest(&capture.config_bytes)
             || basis.dependency_hash.as_str() != digest(&capture.dependency_bytes)
             || !ordered_unique_or_empty(&basis.lookup_dependencies)
+            || capture
+                .lookup_dependencies
+                .iter()
+                .find(|(key, _)| key == &document.key)
+                .is_none_or(|(_, keys)| {
+                    !keys
+                        .iter()
+                        .map(String::as_str)
+                        .eq(basis.lookup_dependencies.iter().map(Text::as_str))
+                })
         {
             return Err(basis_error(
                 "semantic basis or provenance differs from captured bytes",
@@ -1926,6 +1936,9 @@ pub fn validate_semantic_facts(
                 && reference.roles.contains(&Role::Alias)
             || (reference.site == ReferenceSite::Declaration)
                 != reference.roles.contains(&Role::Definition)
+            || reference.roles.contains(&Role::Alias)
+                && (reference.site != ReferenceSite::Declaration
+                    || !reference.roles.contains(&Role::Definition))
             || crate::semantic_identity::lookup_key(
                 reference.document.language,
                 reference.spelling.as_str(),
@@ -1960,7 +1973,80 @@ pub fn validate_semantic_facts(
             (Resolution::External, Some(Target::External { symbol }), [])
                 if symbol_in_artifact(capture, proof, symbol).is_ok() => {}
             (Resolution::Unresolved, None, []) => {}
-            (Resolution::Ambiguous, None, candidates) if candidates.len() >= 2 => {}
+            (Resolution::Ambiguous, None, candidates)
+                if candidates.len() >= 2
+                    && candidates.windows(2).all(|pair| {
+                        crate::semantic_identity::canonical_json(&pair[0]).ok()
+                            < crate::semantic_identity::canonical_json(&pair[1]).ok()
+                    })
+                    && candidates.iter().all(|target| match target {
+                        Target::Internal {
+                            syntax_id,
+                            document,
+                            revision_id,
+                        } => {
+                            revision_id == &reference.revision_id
+                                && document.source_set_id == reference.document.source_set_id
+                                && evidence.native_files.iter().any(|file| {
+                                    file.document.key == *document
+                                        && file
+                                            .declarations
+                                            .iter()
+                                            .any(|d| d.syntax_id == *syntax_id)
+                                })
+                                && evidence.symbols.iter().any(|symbol| {
+                                    evidence.provenance.iter().any(|symbol_proof| {
+                                        symbol_proof.id == symbol.provenance_id
+                                            && symbol_proof.producer_id == proof.producer_id
+                                    }) && symbol.declarations.contains(target)
+                                        && capture.documents.iter().any(|doc| {
+                                            doc.key == reference.document
+                                                && doc.semantic_positions.iter().any(|position| {
+                                                    position.producer_id
+                                                        == proof.producer_id.as_str()
+                                                        && position.symbol
+                                                            == symbol.key.symbol.as_str()
+                                                        && semantic_span(
+                                                            &doc.bytes,
+                                                            &position.coordinates,
+                                                            evidence
+                                                                .producers
+                                                                .iter()
+                                                                .find(|p| p.id == proof.producer_id)
+                                                                .unwrap()
+                                                                .position_encoding,
+                                                        ) == Some((
+                                                            reference.range.start.get() as usize,
+                                                            reference.range.end.get() as usize,
+                                                        ))
+                                                })
+                                        })
+                                })
+                        }
+                        Target::External { symbol } => {
+                            symbol_in_artifact(capture, proof, symbol).is_ok()
+                                && capture.documents.iter().any(|doc| {
+                                    doc.key == reference.document
+                                        && doc.semantic_positions.iter().any(|position| {
+                                            position.producer_id == proof.producer_id.as_str()
+                                                && position.symbol == symbol.symbol.as_str()
+                                                && semantic_span(
+                                                    &doc.bytes,
+                                                    &position.coordinates,
+                                                    evidence
+                                                        .producers
+                                                        .iter()
+                                                        .find(|p| p.id == proof.producer_id)
+                                                        .unwrap()
+                                                        .position_encoding,
+                                                ) == Some((
+                                                    reference.range.start.get() as usize,
+                                                    reference.range.end.get() as usize,
+                                                ))
+                                        })
+                                })
+                        }
+                    }) => {}
             _ => {
                 return Err(basis_error(
                     "reference target cardinality or assertion invalid",
@@ -2176,12 +2262,20 @@ pub fn validate_semantic_facts(
             .map_err(|_| basis_error("relationship header invalid"))?;
         if relationship.kind == RelationshipKind::Overrides {
             if source.kind != Kind::Method
-                || !header.contains("@Override")
+                || !evidence.native_files.iter().any(|file| {
+                    file.document.key == *document
+                        && file.declarations.iter().any(|owner| {
+                            owner.kind == Kind::Type
+                                && owner.range.start <= source.range.start
+                                && source.range.end <= owner.range.end
+                                && !owner.header.bases.is_empty()
+                        })
+                })
                 || target_name
                     .is_some_and(|name| source.name.as_ref().map(Text::as_str) != Some(name))
             {
                 return Err(basis_error(
-                    "override has no source annotation and directed semantic proof",
+                    "override has no measured heritage and directed semantic proof",
                 ));
             }
             continue;
@@ -2224,7 +2318,11 @@ pub fn validate_semantic_facts(
             RelationshipKind::Implements => "implements",
             RelationshipKind::Overrides => unreachable!(),
         };
-        if !header.contains(keyword)
+        if !(doc.key.language == Language::Python
+            && relationship.kind == RelationshipKind::Extends
+            && header.contains('(')
+            && header.contains(')'))
+            && !header.contains(keyword)
             && !(doc.key.language == Language::Rust
                 && relationship.kind == RelationshipKind::Implements
                 && header.contains(" for "))

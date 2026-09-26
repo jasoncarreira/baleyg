@@ -775,6 +775,7 @@ pub struct CapturedRevision {
     pub dependency_hash: String,
     pub producers: Vec<CapturedProducer>,
     pub dependency_source_sets: Vec<String>,
+    pub lookup_dependencies: Vec<(crate::model::v1::DocumentKey, Vec<String>)>,
 }
 
 // A semantic adapter keeps the producer's original coordinate and encoding;
@@ -977,6 +978,65 @@ fn captured_revision_id(basis: RevisionBasis<'_>) -> Result<String> {
         revision.update(part);
     }
     Ok(format!("rev:v1:{}", hex::encode(revision.finalize())))
+}
+
+fn captured_lookup_dependencies(document: &CapturedDocument) -> Result<Vec<String>> {
+    let source = std::str::from_utf8(&document.bytes)?;
+    let mut keys = std::collections::BTreeSet::new();
+    for position in &document.semantic_positions {
+        let coordinates = &position.coordinates;
+        ensure!(
+            matches!(coordinates.len(), 3 | 4),
+            "invalid lookup position"
+        );
+        let line = coordinates[0] as usize;
+        let end_line = if coordinates.len() == 4 {
+            coordinates[2] as usize
+        } else {
+            line
+        };
+        let start_col = coordinates[1];
+        let end_col = *coordinates.last().unwrap();
+        let offset = |line: usize, col: u64| -> Result<usize> {
+            let mut start = 0;
+            for _ in 0..line {
+                let tail = source.get(start..).context("lookup line out of range")?;
+                start += tail.find('\n').context("lookup line out of range")? + 1;
+            }
+            let text = source
+                .get(start..)
+                .context("lookup line out of range")?
+                .split('\n')
+                .next()
+                .unwrap();
+            let mut units = 0;
+            for (byte, ch) in text.char_indices() {
+                if units == col {
+                    return Ok(start + byte);
+                }
+                units += match position.position_encoding.as_str() {
+                    "utf8" => ch.len_utf8() as u64,
+                    "utf16" => ch.len_utf16() as u64,
+                    "unicodeScalar" => 1,
+                    _ => anyhow::bail!("unsupported lookup encoding"),
+                };
+                ensure!(units <= col, "lookup position splits scalar");
+            }
+            ensure!(units == col, "lookup column out of range");
+            Ok(start + text.len())
+        };
+        let start = offset(line, start_col)?;
+        let end = offset(end_line, end_col)?;
+        ensure!(start < end, "empty lookup occurrence");
+        let spelling = source
+            .get(start..end)
+            .context("invalid lookup source span")?;
+        keys.insert(crate::semantic_identity::lookup_key(
+            document.key.language,
+            spelling,
+        )?);
+    }
+    Ok(keys.into_iter().collect())
 }
 
 pub fn capture_revision(
@@ -1287,6 +1347,10 @@ pub fn capture_revision_with_hook(
     );
     identity.verify()?;
     check(cancel)?;
+    let lookup_dependencies = documents
+        .iter()
+        .map(|d| Ok((d.key.clone(), captured_lookup_dependencies(d)?)))
+        .collect::<Result<Vec<_>>>()?;
     Ok(CapturedRevision {
         source_set_id: admission.source_set_id.clone(),
         root_id: admission.root_id.clone(),
@@ -1302,6 +1366,7 @@ pub fn capture_revision_with_hook(
         dependency_hash,
         producers,
         dependency_source_sets: admission.dependency_source_sets.clone(),
+        lookup_dependencies,
     })
 }
 
