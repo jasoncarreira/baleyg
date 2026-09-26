@@ -841,20 +841,38 @@ fn non_java_header(
         })
         .transpose()?
         .unwrap_or_default();
-    let bases = doc
-        .heritage
-        .iter()
-        .filter(|h| h.class_node_id == node.id)
-        .map(|h| {
-            std::str::from_utf8(
-                doc.bytes
-                    .get(h.base_start..h.base_end)
-                    .ok_or_else(|| native_error("base outside source"))?,
-            )
-            .ok()
-            .and_then(|s| Text::new(s.to_owned()))
-            .ok_or_else(|| native_error("invalid base source"))
-        })
+    let source_bases: Vec<_> = match (doc.key.language, node.kind.as_str()) {
+        (Language::Javascript, "class_declaration" | "class") => children(node.id)
+            .filter(|n| n.kind == "class_heritage")
+            .flat_map(|heritage| children(heritage.id))
+            .filter(|base| base.candidate_kind.is_some())
+            .collect(),
+        (Language::Python, "class_definition") => field(node.id, "superclasses")
+            .into_iter()
+            .flat_map(|arguments| children(arguments.id))
+            .filter(|base| base.candidate_kind.is_some())
+            .collect(),
+        _ => Vec::new(),
+    };
+    if doc.key.language == Language::Javascript {
+        let captured: Vec<_> = doc
+            .heritage
+            .iter()
+            .filter(|h| h.class_node_id == node.id)
+            .collect();
+        if captured.len() != source_bases.len()
+            || captured.iter().zip(&source_bases).any(|(h, base)| {
+                h.base_start != base.start_byte
+                    || h.base_end != base.end_byte
+                    || h.base_bytes != base.source_bytes
+            })
+        {
+            return Err(native_error("JavaScript class heritage differs from AST"));
+        }
+    }
+    let bases = source_bases
+        .into_iter()
+        .map(&text)
         .collect::<Result<Vec<_>, _>>()?;
     Ok((
         key,
@@ -1030,13 +1048,15 @@ pub fn validate_native(
                 },
                 Language::Javascript => match node.kind.as_str() {
                     "class_declaration"
-                    | "class"
                     | "method_definition"
                     | "function_declaration"
                     | "generator_function_declaration"
                     | "function_expression"
                     | "generator_function"
                     | "arrow_function" => Some(NativeCandidateKind::Declaration),
+                    "class" if node.candidate_kind.is_some() => {
+                        Some(NativeCandidateKind::Declaration)
+                    }
                     "call_expression" | "new_expression" => Some(NativeCandidateKind::Invocation),
                     "if_statement"
                     | "for_statement"
@@ -1344,13 +1364,29 @@ pub fn validate_native(
                             .map_err(|_| native_error("invalid heritage bytes"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let expected_bases = if doc.key.language == Language::Java {
+                    measured_bases
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                } else {
+                    non_java_header(doc, witness)?
+                        .1
+                        .bases
+                        .iter()
+                        .map(|base| base.as_str().to_owned())
+                        .collect()
+                };
                 if row
                     .header
                     .bases
                     .iter()
                     .map(Text::as_str)
                     .collect::<Vec<_>>()
-                    != measured_bases
+                    != expected_bases
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
                 {
                     return Err(native_error(
                         "declaration bases differ from measured syntax",

@@ -513,6 +513,83 @@ fn complete_native_file(
         })
         .collect();
     for witness in declaration_witnesses {
+        let node = &doc.syntax[witness.node_id];
+        let field = |id: usize, label: &str| {
+            doc.syntax
+                .iter()
+                .find(|n| n.parent_id == Some(id) && n.field_name.as_deref() == Some(label))
+        };
+        let source_text = |n: &baleyg::indexer::CapturedSyntaxNode| {
+            text(std::str::from_utf8(&n.source_bytes).unwrap())
+        };
+        let parameter_nodes =
+            field(node.id, "parameters").or_else(|| field(node.id, "formal_parameters"));
+        let parameters = parameter_nodes
+            .into_iter()
+            .flat_map(|n| {
+                doc.syntax.iter().filter(move |part| {
+                    part.parent_id == Some(n.id) && part.candidate_kind.is_some()
+                })
+            })
+            .map(|part| Parameter {
+                name: field(part.id, "name").map(&source_text),
+                r#type: field(part.id, "type").map(&source_text),
+                variadic: matches!(part.kind.as_str(), "rest_pattern" | "list_splat_pattern"),
+            })
+            .collect::<Vec<_>>();
+        let result_type = field(node.id, "return_type").map(&source_text);
+        let mut enclosing = node.parent_id;
+        let mut parent_keys = vec![];
+        let mut parent_node_id = None;
+        while let Some(id) = enclosing {
+            if let Some(parent) = doc.native_candidates.iter().find(|candidate| {
+                candidate.node_id == id
+                    && candidate.candidate_kind == baleyg::indexer::NativeCandidateKind::Declaration
+                    && candidate.stable_id.is_some()
+            }) {
+                if let Some(row) = file
+                    .declarations
+                    .iter()
+                    .find(|row| parent.stable_id.as_deref() == Some(row.syntax_id.as_str()))
+                {
+                    parent_keys.push(row.key.clone());
+                    parent_node_id = Some(id);
+                }
+            }
+            enclosing = doc.syntax[id].parent_id;
+        }
+        parent_keys.reverse();
+        let mut function_ancestors =
+            if matches!(doc.key.language, Language::Python | Language::Rust) {
+                vec![]
+            } else {
+                vec![module.clone()]
+            };
+        function_ancestors.extend(parent_keys);
+        let ordinal = doc
+            .native_candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.candidate_kind == baleyg::indexer::NativeCandidateKind::Declaration
+                    && candidate.node_kind == witness.node_kind
+                    && candidate.name_bytes == witness.name_bytes
+                    && candidate.start_byte < witness.start_byte
+            })
+            .filter(|candidate| {
+                let mut parent = doc.syntax[candidate.node_id].parent_id;
+                while let Some(id) = parent {
+                    if doc.native_candidates.iter().any(|p| {
+                        p.node_id == id
+                            && p.candidate_kind == baleyg::indexer::NativeCandidateKind::Declaration
+                            && p.stable_id.is_some()
+                    }) {
+                        return Some(id) == parent_node_id;
+                    }
+                    parent = doc.syntax[id].parent_id;
+                }
+                parent_node_id.is_none()
+            })
+            .count();
         let (kind, name, key, ancestors, header) =
             match (doc.key.language, witness.node_kind.as_str()) {
                 (Language::Java, "class_declaration") => (
@@ -558,6 +635,35 @@ fn complete_native_file(
                         },
                     )
                 }
+                (Language::Javascript, "class_declaration" | "class")
+                | (Language::Python, "class_definition") => {
+                    let name = text("Child");
+                    let key = Key {
+                        kind: Kind::Type,
+                        name: Some(name.clone()),
+                        signature: None,
+                        ordinal: UInt::new(0).unwrap(),
+                    };
+                    (
+                        Kind::Type,
+                        name.clone(),
+                        key,
+                        if doc.key.language == Language::Javascript {
+                            vec![module.clone()]
+                        } else {
+                            vec![]
+                        },
+                        Header {
+                            kind: Kind::Type,
+                            name: Some(name),
+                            modifiers: vec![],
+                            type_parameters: vec![],
+                            parameters: vec![],
+                            result_type: None,
+                            bases: vec![text("Base")],
+                        },
+                    )
+                }
                 (Language::Javascript, "function_declaration")
                 | (Language::Python, "function_definition") => {
                     let name = text("f");
@@ -568,20 +674,16 @@ fn complete_native_file(
                             kind: Kind::Function,
                             name: Some(name.clone()),
                             signature: None,
-                            ordinal: UInt::new(0).unwrap(),
+                            ordinal: UInt::new(ordinal as u64).unwrap(),
                         },
-                        if doc.key.language == Language::Javascript {
-                            vec![module.clone()]
-                        } else {
-                            vec![]
-                        },
+                        function_ancestors.clone(),
                         Header {
                             kind: Kind::Function,
                             name: Some(name),
                             modifiers: vec![],
                             type_parameters: vec![],
-                            parameters: vec![],
-                            result_type: None,
+                            parameters: parameters.clone(),
+                            result_type: result_type.clone(),
                             bases: vec![],
                         },
                     )
@@ -593,16 +695,16 @@ fn complete_native_file(
                         kind: Kind::Function,
                         name: Some(text("b")),
                         signature: None,
-                        ordinal: UInt::new(0).unwrap(),
+                        ordinal: UInt::new(ordinal as u64).unwrap(),
                     },
-                    vec![],
+                    function_ancestors.clone(),
                     Header {
                         kind: Kind::Function,
                         name: Some(text("b")),
                         modifiers: vec![],
                         type_parameters: vec![],
-                        parameters: vec![],
-                        result_type: None,
+                        parameters: parameters.clone(),
+                        result_type: result_type.clone(),
                         bases: vec![],
                     },
                 ),
@@ -673,7 +775,9 @@ fn complete_native_file(
         doc.key.language,
         Language::Javascript | Language::Python | Language::Rust
     ) {
-        let owner = file.declarations[0].syntax_id.clone();
+        let owner = |w: &baleyg::indexer::CapturedNativeWitness| {
+            SyntaxId::new(w.ancestor_ids.last().unwrap().clone()).unwrap()
+        };
         let mut regions: Vec<_> = doc
             .native_candidates
             .iter()
@@ -683,11 +787,20 @@ fn complete_native_file(
             })
             .collect();
         regions.sort_by_key(|w| (w.start_byte, w.end_byte));
-        for (ordinal, region) in regions.iter().enumerate() {
+        for region in &regions {
+            let ordinal = regions
+                .iter()
+                .filter(|previous| {
+                    previous.ancestor_ids.last() == region.ancestor_ids.last()
+                        && (previous.start_byte, previous.end_byte)
+                            < (region.start_byte, region.end_byte)
+                })
+                .count();
             let parent = regions
                 .iter()
                 .filter(|p| {
                     p.node_id != region.node_id
+                        && p.ancestor_ids.last() == region.ancestor_ids.last()
                         && p.start_byte <= region.start_byte
                         && region.end_byte <= p.end_byte
                 })
@@ -698,7 +811,7 @@ fn complete_native_file(
                 .filter(|f| matches!(*f, "consequence" | "alternative" | "right" | "value"));
             file.control_regions.push(ControlRegion {
                 id: OccurrenceId::new(region.stable_id.clone().unwrap()).unwrap(),
-                owner_syntax_id: owner.clone(),
+                owner_syntax_id: owner(region),
                 ordinal: UInt::new(ordinal as u64).unwrap(),
                 document: doc.key.clone(),
                 revision_id: text(&capture.revision_id),
@@ -718,19 +831,28 @@ fn complete_native_file(
             })
             .collect();
         calls.sort_by_key(|w| (w.start_byte, w.end_byte));
-        for (ordinal, call) in calls.iter().enumerate() {
+        for call in &calls {
+            let ordinal = calls
+                .iter()
+                .filter(|previous| {
+                    previous.ancestor_ids.last() == call.ancestor_ids.last()
+                        && (previous.start_byte, previous.end_byte)
+                            < (call.start_byte, call.end_byte)
+                })
+                .count();
             let mut enclosing: Vec<_> = file
                 .control_regions
                 .iter()
                 .filter(|r| {
-                    r.range.start.get() <= call.start_byte as u64
+                    r.owner_syntax_id == owner(call)
+                        && r.range.start.get() <= call.start_byte as u64
                         && call.end_byte as u64 <= r.range.end.get()
                 })
                 .collect();
             enclosing.sort_by_key(|r| (r.range.start.get(), std::cmp::Reverse(r.range.end.get())));
             file.calls.push(Call {
                 id: OccurrenceId::new(call.stable_id.clone().unwrap()).unwrap(),
-                owner_syntax_id: owner.clone(),
+                owner_syntax_id: owner(call),
                 ordinal: UInt::new(ordinal as u64).unwrap(),
                 document: doc.key.clone(),
                 revision_id: text(&capture.revision_id),
@@ -821,6 +943,232 @@ fn native_provenance_is_bound_to_each_captured_document() {
         validate_native(&forged_capture, &evidence),
         Err(EvidenceError::Native(_))
     ));
+}
+
+#[test]
+fn non_java_class_bases_are_complete_against_source() {
+    let (_dir, capture, mut evidence) = fixture_with_sources(
+        Some("class Child extends Base {}\n"),
+        Some("class Child(Base):\n    pass\n"),
+        None,
+    );
+    complete_native_evidence(&capture, &mut evidence);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
+    for language in [Language::Javascript, Language::Python] {
+        let index = capture
+            .documents
+            .iter()
+            .position(|d| d.key.language == language)
+            .unwrap();
+        let mut missing_header = evidence.clone();
+        missing_header.native_files[index].declarations[0]
+            .header
+            .bases
+            .clear();
+        assert!(matches!(
+            validate_native(&capture, &missing_header),
+            Err(EvidenceError::Native(_))
+        ));
+        if language == Language::Javascript {
+            let mut missing_both = missing_header.clone();
+            let mut deleted = capture.clone();
+            deleted.documents[index].heritage.clear();
+            missing_both.native_files[index].declarations[0]
+                .header
+                .bases
+                .clear();
+            assert!(matches!(
+                validate_native(&deleted, &missing_both),
+                Err(EvidenceError::Native(_))
+            ));
+        } else {
+            let mut retarget = evidence.clone();
+            retarget.native_files[index].declarations[0].header.bases[0] = text("Other");
+            assert!(matches!(
+                validate_native(&capture, &retarget),
+                Err(EvidenceError::Native(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn javascript_nested_control_parent_is_exact_ast_parent() {
+    let (_dir, capture, mut evidence) = fixture_with_sources(
+        Some("function f() { if (true) { if (false) { obj.foo(); } } }\n"),
+        None,
+        None,
+    );
+    complete_native_evidence(&capture, &mut evidence);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    let index = capture
+        .documents
+        .iter()
+        .position(|d| d.key.language == Language::Javascript)
+        .unwrap();
+    let regions = &evidence.native_files[index].control_regions;
+    let mut ifs: Vec<_> = regions
+        .iter()
+        .filter(|r| r.kind.as_str() == "if_statement")
+        .collect();
+    ifs.sort_by_key(|r| r.range.start.get());
+    assert_eq!(ifs.len(), 2);
+    let (outer, nested) = (ifs[0], ifs[1]);
+    assert!(outer.range.start <= nested.range.start && nested.range.end <= outer.range.end);
+    assert_ne!(nested.parent_id.as_ref(), Some(&outer.id));
+    let mut wrong = evidence.clone();
+    wrong.native_files[index]
+        .control_regions
+        .iter_mut()
+        .find(|r| r.id == nested.id)
+        .unwrap()
+        .parent_id = Some(outer.id.clone());
+    assert!(matches!(
+        validate_native(&capture, &wrong),
+        Err(EvidenceError::Native(_))
+    ));
+}
+
+#[test]
+fn non_java_typed_and_parameter_headers_are_source_checked() {
+    let (_dir, capture, mut evidence) = fixture_with_sources(
+        Some("function f(a, b) { obj.foo(); }\n"),
+        Some("def f(a: int) -> int:\n    return a\n"),
+        Some("fn b(a: i32) -> i32 { a }\n"),
+    );
+    complete_native_evidence(&capture, &mut evidence);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
+    for language in [Language::Javascript, Language::Python, Language::Rust] {
+        let index = capture
+            .documents
+            .iter()
+            .position(|d| d.key.language == language)
+            .unwrap();
+        let header = &evidence.native_files[index].declarations[0].header;
+        assert!(!header.parameters.is_empty());
+        if language != Language::Javascript {
+            assert!(header.result_type.is_some());
+        }
+        let mut wrong = evidence.clone();
+        wrong.native_files[index].declarations[0]
+            .header
+            .parameters
+            .clear();
+        assert!(matches!(
+            validate_native(&capture, &wrong),
+            Err(EvidenceError::Native(_))
+        ));
+        if language != Language::Javascript {
+            let mut wrong = evidence.clone();
+            wrong.native_files[index].declarations[0].header.result_type = None;
+            assert!(matches!(
+                validate_native(&capture, &wrong),
+                Err(EvidenceError::Native(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn non_member_calls_keep_null_callee_tokens() {
+    let (_dir, capture, mut evidence) = fixture_with_sources(
+        Some("function f() { foo(); }\n"),
+        Some("def f():\n    foo()\n"),
+        Some("fn b() { foo(); }\n"),
+    );
+    complete_native_evidence(&capture, &mut evidence);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    for language in [Language::Javascript, Language::Python, Language::Rust] {
+        let index = capture
+            .documents
+            .iter()
+            .position(|d| d.key.language == language)
+            .unwrap();
+        let call = &evidence.native_files[index].calls[0];
+        assert!(call.callee_range.is_none());
+        let mut forged = capture.clone();
+        let witness = forged.documents[index]
+            .native_candidates
+            .iter_mut()
+            .find(|w| w.stable_id.as_deref() == Some(call.id.as_str()))
+            .unwrap();
+        witness.verified_member_token = true;
+        assert!(matches!(
+            validate_native(&forged, &evidence),
+            Err(EvidenceError::Native(_))
+        ));
+        let mut invented = evidence.clone();
+        invented.native_files[index].calls[0].callee_range = Some(span(0, 1));
+        assert!(matches!(
+            validate_native(&capture, &invented),
+            Err(EvidenceError::Native(_))
+        ));
+    }
+}
+
+#[test]
+fn non_java_sibling_ordinals_and_nested_ancestors_are_source_checked() {
+    let (_dir, capture, mut evidence) = fixture_with_sources(
+        Some("function f() {} function f() {}\n"),
+        Some("def f():\n    pass\ndef f():\n    pass\n"),
+        Some("fn b() {} fn b() {}\n"),
+    );
+    complete_native_evidence(&capture, &mut evidence);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    for language in [Language::Javascript, Language::Python, Language::Rust] {
+        let index = capture
+            .documents
+            .iter()
+            .position(|d| d.key.language == language)
+            .unwrap();
+        assert_eq!(evidence.native_files[index].declarations.len(), 2);
+        assert_eq!(
+            evidence.native_files[index].declarations[1]
+                .key
+                .ordinal
+                .get(),
+            1
+        );
+        let mut wrong = evidence.clone();
+        wrong.native_files[index].declarations[1].key.ordinal = UInt::new(0).unwrap();
+        assert!(matches!(
+            validate_native(&capture, &wrong),
+            Err(EvidenceError::Native(_))
+        ));
+    }
+    let (_dir, capture, mut evidence) = fixture_with_sources(
+        Some("function f() { function f() {} }\n"),
+        Some("def f():\n    def f():\n        pass\n"),
+        Some("fn b() { fn b() {} }\n"),
+    );
+    complete_native_evidence(&capture, &mut evidence);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    for language in [Language::Javascript, Language::Python, Language::Rust] {
+        let index = capture
+            .documents
+            .iter()
+            .position(|d| d.key.language == language)
+            .unwrap();
+        let nested = &evidence.native_files[index].declarations[1];
+        assert_eq!(
+            nested.ancestors.last(),
+            Some(&evidence.native_files[index].declarations[0].key)
+        );
+        let mut wrong = evidence.clone();
+        wrong.native_files[index].declarations[1].ancestors.pop();
+        assert!(matches!(
+            validate_native(&capture, &wrong),
+            Err(EvidenceError::Native(_))
+        ));
+    }
 }
 
 #[test]
