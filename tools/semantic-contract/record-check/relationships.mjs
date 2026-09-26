@@ -98,7 +98,7 @@ export function checkRelationships(loaded, records, C, M, J) {
     });
     return proof;
   }
-  function resolve(ref, context, field, assertion) {
+  function resolve(ref, context, field, assertion, revisionId) {
     if (ref.kind === "external") {
       symbolKey(ref.symbol, field);
       return { kind: "external", symbol: ref.symbol };
@@ -109,6 +109,8 @@ export function checkRelationships(loaded, records, C, M, J) {
       !native ||
       !measured?.syntaxId ||
       ref.revisionId !== native.revisionId ||
+      // v1: an internal target has the revision of the fact that names it.
+      native.revisionId !== revisionId ||
       !same(native.document, measured.document) ||
       native.document.sourceSetId !== context.sourceSetId
     )
@@ -154,7 +156,13 @@ export function checkRelationships(loaded, records, C, M, J) {
             "document-scoped symbol must match its captured document",
           );
         const declarations = fact.record.declarations.map((ref) =>
-          resolve(ref, proof.document, "declarations", "SYMBOL.TARGET"),
+          resolve(
+            ref,
+            proof.document,
+            "declarations",
+            "SYMBOL.TARGET",
+            proof.revisionId,
+          ),
         );
         if (
           declarations.some(
@@ -269,6 +277,7 @@ export function checkRelationships(loaded, records, C, M, J) {
           proof.document,
           "source",
           "RELATIONSHIP.SOURCE",
+          proof.revisionId,
         );
         if (
           !same(source.document, annotation.document) ||
@@ -284,6 +293,7 @@ export function checkRelationships(loaded, records, C, M, J) {
           proof.document,
           "target",
           "RELATIONSHIP.TARGET",
+          proof.revisionId,
         );
         // The captured producer supplies the relationship. Its evidence tuple names the
         // measured source, while the measured target may live in another document.
