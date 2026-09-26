@@ -261,28 +261,15 @@ export function checkBindings(loaded, records, C, M, J) {
             ]),
           )
           ?.documents.find((x) => same(x.key, declaredTarget.document));
-        const selected = loaded.selected.documents.find((x) =>
-          same(x.key, declaredTarget.document),
-        );
-        const current = verifiedDeclarations
-          .get(
-            JSON.stringify([
-              loaded.comparison.sourceSetId,
-              loaded.comparison.revisionId,
-            ]),
-          )
-          ?.get(declaredTarget.syntaxId);
         if (!capturedTarget)
           reject(
             "BINDING.TARGET",
             "declaredTarget",
             "target is outside admitted source snapshot",
           );
-        value.staleTarget =
-          !selected ||
-          selected.contentHash !== capturedTarget.contentHash ||
-          !current ||
-          !same(current, selected.key);
+        // v1: the target shares the binding's revision, so it is never stale
+        // there; positive staleTarget is reserved for later overlays (#11).
+        value.staleTarget = false;
       }
       C.checkTarget(value, proof, verifiedDeclarations);
       validate("CallBinding", value);

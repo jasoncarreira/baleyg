@@ -1146,7 +1146,8 @@ test("an admitted r1 graph projects captured r1 proof and target against r1, not
       (p) => p.id === "r1-call-proof",
     );
     assert.equal(normalized.freshness, changed ? "stale" : "possiblyStale");
-    assert.equal(old.staleTarget, changed);
+    // v1: evaluated at the binding's own revision (#52), so never stale.
+    assert.equal(old.staleTarget, false);
     const request = {
       sourceSetId: "main",
       revisionId: "r1",

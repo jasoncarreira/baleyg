@@ -237,13 +237,7 @@ export function checkFreshness(provenance, loaded) {
 
 // Declaration presence is supplied by the verified normalization layer. Keys are
 // logical tuples, not serialized DocumentKey objects or object insertion order.
-export function expectedStaleTarget(
-  binding,
-  provenance,
-  loaded,
-  declarations,
-  request,
-) {
+export function expectedStaleTarget(binding, provenance, loaded, declarations) {
   validate("CallBinding", binding);
   checkCapturedBasis(provenance, loaded);
   assert(
@@ -274,21 +268,16 @@ export function expectedStaleTarget(
     "declaredTarget",
     "target declaration not present in captured snapshot",
   );
-  const { sourceSetId, revision } = requestedSnapshot(loaded, request);
-  const requested = revision?.documents.find(
-    (x) =>
-      x.key.path === target.document.path &&
-      x.key.language === target.document.language,
+  // v1 (#52): an internal target has its binding's revision, where it was just
+  // verified present, so it is never stale. Positive staleTarget is reserved
+  // for later overlays (#11).
+  assert(
+    target.revisionId === provenance.revisionId,
+    "TARGET_STALENESS.REVISION",
+    "declaredTarget",
+    "internal target must share its binding's revision",
   );
-  const requestedDeclaration = declarations
-    .get(tuple(sourceSetId, revision?.id))
-    ?.get(target.syntaxId);
-  return (
-    !requested ||
-    requested.contentHash !== captured.contentHash ||
-    !requestedDeclaration ||
-    !sameDocument(requestedDeclaration, requested.key)
-  );
+  return false;
 }
 export function checkStaleTarget(binding, provenance, loaded, declarations) {
   const expected = expectedStaleTarget(
