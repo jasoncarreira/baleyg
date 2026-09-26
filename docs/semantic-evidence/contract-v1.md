@@ -157,7 +157,7 @@ Hand-checks:
 | `.declarations` | `Target[]` | Unique targets; empty means external/unlocated, never local evidence. | Duplicate target invalid. |
 | `.provenanceId` | `Text` | Resolves to semantic provenance. | Dangling invalidates artifact. |
 | `Target.kind` | `internal \| external` | Selects exactly one variant. | Mixed/incomplete variant invalid. |
-| internal `.syntaxId` | `SyntaxId` | In answer source set/snapshot. | Dangling or other-source target cannot be internal. |
+| internal `.syntaxId` | `SyntaxId` | In the answer source set, at the revision of the containing fact or binding (the answer snapshot for current facts). | Dangling or other-source target cannot be internal. |
 | internal `.document` | `DocumentKey` | Matches syntax declaration. | Mismatch invalid. |
 | internal `.revisionId` | `Text` | Equals the revision of the fact or binding that contains it (v1); matches answer snapshot when current. | Any other revision is invalid. A historical fact's target keeps that fact's revision, labelled with derived freshness, never promoted. |
 | external `.symbol` | `SymbolKey` | Explicit external boundary, including other source sets in v1. | Missing key invalid. |
@@ -490,7 +490,7 @@ Notation: `N(X,d)` is a node; `E(call,from,to,visit,reason)` is an edge; `F(reas
 5. **Depth.** Chain A→B→C, depth 1: `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none)]`; `frontier=[F(depth,B,null,null,0,1)]`; calls=1; truncated/partial true. Depth 0: `nodes=[N(A,0)]`; `edges=[]`; `frontier=[F(depth,A,null,null,0,1)]`; calls=0.
 6. **Node cap with later seen edge.** A calls in order `a0→B,a1→C,a2→A`, maxNodes=2. `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none),E(a1,A,null,boundary,nodeLimit),E(a2,A,A,seen,none)]`; `frontier=[F(nodeLimit,A,a1,C,null,0)]`; calls=3. The refused C does not stop the later self-loop.
 7. **Global call cap.** A calls `a0→B,a1→C`; B calls `b0→D`; maxCalls=1. After a0: `nodes=[N(A,0),N(B,1)]`; `edges=[E(a0,A,B,new,none)]`; `frontier=[F(callLimit,A,null,null,1,1),F(callLimit,B,null,null,0,1)]`; calls=1. The first frontier is created at A, then B is drained in queue order. With maxCalls=0 and root calls `[a0,a1]`: `nodes=[N(A,0)]`; `edges=[]`; `frontier=[F(callLimit,A,null,null,0,2)]`; calls=0. With maxCalls=1 and A's only call `a0→B`, B empty: arrays are nodes A,B, one new edge, `frontier=[]`; exact cap has no remaining work, so not truncated.
-8. **Dispatch and freshness.** (a) A has c0 with a fresh resolved internal virtual binding and one possible target V: `E(c0,A,null,boundary,dispatch)`. `nodes=[N(A,0)]`; `edges` is that one; `frontier=[]`; calls=1. V is not admitted; possible dispatch remains only in the binding; partial is true. (b) At the same revision A also has c1 with an exact direct internal binding, and the request compares the selected producer P at a different version than P's captured basis (same revision, same occurrences). Every P proof is then `possiblyStale`, and `stale` precedes `dispatch`: `E(c0,A,null,boundary,stale)`, `E(c1,A,null,boundary,stale)`. `nodes=[N(A,0)]`; edges are those two in source order; `frontier=[]`; calls=2. Neither V nor c1's target is admitted; partial is true.
+8. **Dispatch and freshness.** (a) A has c0 with a fresh resolved internal virtual binding and one possible target V: `E(c0,A,null,boundary,dispatch)`. `nodes=[N(A,0)]`; `edges` is that one; `frontier=[]`; calls=1. V is not admitted; possible dispatch remains only in the binding; partial is true. (b) An independent snapshot: A has c0 as in (a) plus c1 with an exact direct internal binding. The request compares the selected producer P at a different version than P's captured basis; within (b) the captured and requested comparisons share its one unchanged revision, source calls and occurrence IDs. Every P proof is then `possiblyStale`, and `stale` precedes `dispatch`: `E(c0,A,null,boundary,stale)`, `E(c1,A,null,boundary,stale)`. `nodes=[N(A,0)]`; edges are those two in source order; `frontier=[]`; calls=2. Neither V nor c1's target is admitted; partial is true.
 
 ## Artifact validity and failure disposition
 
@@ -516,11 +516,11 @@ The independent reviewer must mark every finite item before vectors are authored
 - [ ] Signature, Key, Header, Parameter, DurableAnchor, GroupContinuity, and AnchorResult; required nulls and all digest domains.
 - [ ] GraphRequest defaults/limits and every GraphNode, GraphEdge, Frontier, Warning, GraphResult, and Error field.
 - [ ] Malformed artifact atomic rejection versus valid partial publication.
-- [ ] Two producers/document; partial-fresh; complete-stale; changed dependency/config/producer with same caller; missing basis; stale target; failed refresh.
+- [ ] Two producers/document; partial-fresh; complete-stale; changed dependency/config/producer with same caller; missing basis; v1 rejection of `staleTarget=true` and of wrong-revision internal targets (stale targets deferred to #11); failed refresh.
 - [ ] All four lookup rules, measured spelling versus lookup normalization, seven roles, only Java alias N/A, and the per-language 40-reference-record counting boundary.
 - [ ] Canonical bytes byte-for-byte; NUL is part of each domain; stable declaration input/exclusions; Java signatures; exact sibling grouping/ordinals; revision-local occurrences.
 - [ ] Header projection limitations; group hashes/counts; continuity is independent; all six anchor scenarios and unknown same-count continuity.
-- [ ] FIFO BFS admission/dequeue/local ordering and each explicit graph array: nested/evaluation, callback, cycle, self-loop, queued diamond, depth 0/1, node cap plus later seen, call cap/zero/exact, dispatch, stale target.
+- [ ] FIFO BFS admission/dequeue/local ordering and each explicit graph array: nested/evaluation, callback, cycle, self-loop, queued diamond, depth 0/1, node cap plus later seen, call cap/zero/exact, dispatch, producer-version stale boundary.
 - [ ] Counters, frontier combinations/arithmetic, creation order, exact-cap behavior, boundary precedence, partial/truncated definitions.
 - [ ] Wording never equates syntax, semantic binding, reference, call, or possible dispatch and never promises runtime completeness.
 - [ ] Scope remains prospective: no production ID/API/storage/traversal migration and no executable checker claim in this slice.
