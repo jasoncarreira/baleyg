@@ -24,14 +24,36 @@ fn fixture_with_sources(
     python: Option<&str>,
     rust: Option<&str>,
 ) -> (tempfile::TempDir, CapturedRevision, Evidence) {
+    fixture_with_java_use(javascript, python, rust, false)
+}
+fn fixture_with_java_use(
+    javascript: Option<&str>,
+    python: Option<&str>,
+    rust: Option<&str>,
+    java_use: bool,
+) -> (tempfile::TempDir, CapturedRevision, Evidence) {
+    fixture_with_java_source(javascript, python, rust, java_use, None)
+}
+fn fixture_with_java_source(
+    javascript: Option<&str>,
+    python: Option<&str>,
+    rust: Option<&str>,
+    java_use: bool,
+    java_source: Option<&str>,
+) -> (tempfile::TempDir, CapturedRevision, Evidence) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir_all(root.join("java/src")).unwrap();
     fs::create_dir_all(root.join("rust/src")).unwrap();
     fs::write(
         root.join("java/src/A.java"),
-        "public class Child extends Base { public <T> void foo(int x) { if (true) { é(); } } public <T> void foo(int y) {} }
-",
+        java_source.unwrap_or(if java_use {
+            "public class Child extends Base { public <T> void foo(int x) { if (true) { é(); } } public <T> void foo(int y) { foo(); } }
+"
+        } else {
+            "public class Child extends Base { public <T> void foo(int x) { if (true) { é(); } } public <T> void foo(int y) {} }
+"
+        }),
     )
     .unwrap();
     fs::write(
@@ -75,6 +97,126 @@ fn fixture_with_sources(
     tool.version = "1".into();
     metadata.tool_info = protobuf::MessageField::some(tool);
     index.metadata = protobuf::MessageField::some(metadata);
+    let mut semantic_doc = scip::types::Document::new();
+    semantic_doc.relative_path = "java/src/A.java".into();
+    let mut child = scip::types::Occurrence::new();
+    child.range = vec![0, 13, 18];
+    child.symbol = "scip java fixture Child#".into();
+    child.symbol_roles = 1;
+    semantic_doc.occurrences.push(child);
+    let mut base = scip::types::Occurrence::new();
+    let base_offset = java_source
+        .map(|source| source.find("pkg.good.Base").unwrap_or(27))
+        .unwrap_or(27);
+    base.range = vec![
+        0,
+        base_offset as i32,
+        (base_offset + java_source.map_or(4, |s| if s.contains("pkg.good.Base") { 13 } else { 4 }))
+            as i32,
+    ];
+    base.symbol = "scip java fixture Base#".into();
+    semantic_doc.occurrences.push(base);
+    let mut info = scip::types::SymbolInformation::new();
+    info.symbol = "scip java fixture Child#".into();
+    let mut relation = scip::types::Relationship::new();
+    relation.symbol = "scip java fixture Base#".into();
+    relation.is_implementation = true;
+    info.relationships.push(relation);
+    semantic_doc.symbols.push(info);
+    let mut method_occurrence = scip::types::Occurrence::new();
+    let first_offset = java_source
+        .map(|source| source.find("foo(int x)").unwrap() as i32)
+        .unwrap_or(50);
+    method_occurrence.range = vec![0, first_offset, first_offset + 3];
+    method_occurrence.symbol = "scip java fixture Child#foo().".into();
+    method_occurrence.symbol_roles = 1;
+    semantic_doc.occurrences.push(method_occurrence);
+    let mut second_method = scip::types::Occurrence::new();
+    let second_offset = java_source
+        .map(|source| source.find("foo(int y)").unwrap() as i32)
+        .unwrap_or(101);
+    second_method.range = vec![0, second_offset, second_offset + 3];
+    second_method.symbol = "scip java fixture Child#foo().".into();
+    second_method.symbol_roles = 1;
+    semantic_doc.occurrences.push(second_method);
+    let mut method_use = scip::types::Occurrence::new();
+    method_use.range = vec![0, 114, 117];
+    method_use.symbol = "scip java fixture Child#foo().".into();
+    method_use.symbol_roles = 8;
+    if java_use {
+        semantic_doc.occurrences.push(method_use);
+    }
+    let mut method_info = scip::types::SymbolInformation::new();
+    method_info.symbol = "scip java fixture Child#foo().".into();
+    let mut method_relation = scip::types::Relationship::new();
+    method_relation.symbol = "scip java fixture Base#foo().".into();
+    method_relation.is_implementation = true;
+    method_info.relationships.push(method_relation);
+    let mut unrelated_relation = scip::types::Relationship::new();
+    unrelated_relation.symbol = "scip java fixture Unrelated#foo().".into();
+    unrelated_relation.is_implementation = true;
+    method_info.relationships.push(unrelated_relation);
+    if java_source.is_some_and(|source| source.contains("pkg.good.Base")) {
+        for owner in ["pkg.good.Base", "pkg.other.Base"] {
+            let mut relation = scip::types::Relationship::new();
+            relation.symbol = format!("scip java fixture {owner}#foo().");
+            relation.is_implementation = true;
+            method_info.relationships.push(relation);
+            let mut parent = scip::types::SymbolInformation::new();
+            parent.symbol = format!("scip java fixture {owner}#foo().");
+            semantic_doc.symbols.push(parent);
+        }
+    }
+    semantic_doc.symbols.push(method_info);
+    let mut unrelated_method = scip::types::SymbolInformation::new();
+    unrelated_method.symbol = "scip java fixture Unrelated#foo().".into();
+    semantic_doc.symbols.push(unrelated_method);
+    let mut external_method = scip::types::SymbolInformation::new();
+    external_method.symbol = "scip java fixture Base#foo().".into();
+    semantic_doc.symbols.push(external_method);
+    index.documents.push(semantic_doc);
+    if python.is_some_and(|source| source.starts_with("class Child(Base):")) {
+        let mut python_doc = scip::types::Document::new();
+        python_doc.relative_path = "python/src/D.py".into();
+        for (range, symbol, roles) in [
+            (vec![0, 6, 11], "scip python fixture Child#", 1),
+            (vec![0, 12, 16], "scip python fixture Base#", 0),
+        ] {
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = range;
+            occurrence.symbol = symbol.into();
+            occurrence.symbol_roles = roles;
+            python_doc.occurrences.push(occurrence);
+        }
+        let mut info = scip::types::SymbolInformation::new();
+        info.symbol = "scip python fixture Child#".into();
+        let mut relation = scip::types::Relationship::new();
+        relation.symbol = "scip python fixture Base#".into();
+        relation.is_implementation = true;
+        info.relationships.push(relation);
+        python_doc.symbols.push(info);
+        index.documents.push(python_doc);
+    }
+    if python.is_some_and(|source| source.starts_with("y = 1")) {
+        let mut python_doc = scip::types::Document::new();
+        python_doc.relative_path = "python/src/D.py".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 0, 1];
+        occurrence.symbol = "scip python fixture y.".into();
+        occurrence.symbol_roles = 1;
+        python_doc.occurrences.push(occurrence);
+        index.documents.push(python_doc);
+    }
+    if python.is_some_and(|source| source.starts_with("from m import x as y")) {
+        let mut python_doc = scip::types::Document::new();
+        python_doc.relative_path = "python/src/D.py".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 19, 20];
+        occurrence.symbol = "scip python fixture y.".into();
+        occurrence.symbol_roles = 1;
+        python_doc.occurrences.push(occurrence);
+        index.documents.push(python_doc);
+    }
     fs::write(
         root.join("semantic.artifact"),
         index.write_to_bytes().unwrap(),
@@ -493,12 +635,6 @@ fn complete_native_file(
         signature: None,
         ordinal: UInt::new(0).unwrap(),
     };
-    let class_key = Key {
-        kind: Kind::Type,
-        name: Some(text("Child")),
-        signature: None,
-        ordinal: UInt::new(0).unwrap(),
-    };
     let method_signature = Signature {
         parameter_types: vec![text("int")],
         type_parameter_count: UInt::new(1).unwrap(),
@@ -606,24 +742,52 @@ fn complete_native_file(
             .count();
         let (kind, name, key, ancestors, header) =
             match (doc.key.language, witness.node_kind.as_str()) {
-                (Language::Java, "class_declaration") => (
-                    Kind::Type,
-                    text("Child"),
-                    class_key.clone(),
-                    vec![module.clone()],
-                    Header {
-                        kind: Kind::Type,
-                        name: Some(text("Child")),
-                        modifiers: vec![text("public")],
-                        type_parameters: vec![],
-                        parameters: vec![],
-                        result_type: None,
-                        bases: vec![text("Base")],
-                    },
-                ),
+                (Language::Java, "class_declaration") => {
+                    let name = declared_name.clone().unwrap();
+                    let is_inner = name.as_str() == "Inner";
+                    let bases = if is_inner {
+                        vec![]
+                    } else if doc.bytes.windows(13).any(|w| w == b"pkg.good.Base") {
+                        vec![text("pkg.good.Base")]
+                    } else {
+                        vec![text("Base")]
+                    };
+                    (
+                        Kind::Type,
+                        name.clone(),
+                        Key {
+                            kind: Kind::Type,
+                            name: Some(name.clone()),
+                            signature: None,
+                            ordinal: UInt::new(0).unwrap(),
+                        },
+                        if is_inner {
+                            function_ancestors.clone()
+                        } else {
+                            vec![module.clone()]
+                        },
+                        Header {
+                            kind: Kind::Type,
+                            name: Some(name),
+                            modifiers: if is_inner {
+                                vec![]
+                            } else {
+                                vec![text("public")]
+                            },
+                            type_parameters: vec![],
+                            parameters: vec![],
+                            result_type: None,
+                            bases,
+                        },
+                    )
+                }
                 (Language::Java, "method_declaration") => {
-                    let ordinal = (witness.start_byte > 84) as u64;
-                    let parameter = if ordinal == 0 { "x" } else { "y" };
+                    let parameter = if witness.start_byte > 84 { "y" } else { "x" };
+                    let method_ordinal = if parent_keys.len() > 1 {
+                        0
+                    } else {
+                        ordinal as u64
+                    };
                     (
                         Kind::Method,
                         text("foo"),
@@ -631,9 +795,9 @@ fn complete_native_file(
                             kind: Kind::Method,
                             name: Some(text("foo")),
                             signature: Some(method_signature.clone()),
-                            ordinal: UInt::new(ordinal).unwrap(),
+                            ordinal: UInt::new(method_ordinal).unwrap(),
                         },
-                        vec![module.clone(), class_key.clone()],
+                        function_ancestors.clone(),
                         Header {
                             kind: Kind::Method,
                             name: Some(text("foo")),
@@ -1759,5 +1923,1013 @@ fn native_call_ordinal_owner_and_member_span_are_source_checked() {
     assert!(matches!(
         validate_native(&capture, &wrong),
         Err(EvidenceError::Native(_))
+    ));
+}
+
+fn semantic_provenance(
+    capture: &CapturedRevision,
+    evidence: &Evidence,
+    document_index: usize,
+) -> Provenance {
+    let doc = &capture.documents[document_index];
+    let producer = capture.producers.iter().find(|p| p.id == "S").unwrap();
+    Provenance {
+        id: text(&format!("semantic-{document_index}")),
+        producer_id: text("S"),
+        document: doc.key.clone(),
+        revision_id: text(&capture.revision_id),
+        content_hash: hash(&doc.bytes),
+        evidence_kind: EvidenceKind::SemanticReference,
+        basis: Some(SemanticBasis {
+            producer_id: text("S"),
+            producer_version: text(&producer.version),
+            producer_hash: hash(&producer.executable_bytes),
+            artifact_hash: hash(producer.artifact_bytes.as_ref().unwrap()),
+            language: doc.key.language,
+            source_set_id: evidence.context.source_set.id.clone(),
+            revision_id: text(&capture.revision_id),
+            source_manifest_hash: hash(&capture.manifest_bytes),
+            toolchain_hash: hash(&capture.toolchain_bytes),
+            config_hash: hash(&capture.config_bytes),
+            dependency_hash: hash(&capture.dependency_bytes),
+            lookup_dependencies: capture
+                .lookup_dependencies
+                .iter()
+                .find(|(key, _)| key == &doc.key)
+                .unwrap()
+                .1
+                .iter()
+                .map(|key| text(key))
+                .collect(),
+        }),
+        freshness: Freshness::Fresh,
+    }
+}
+
+#[test]
+fn semantic_basis_proves_independent_artifact_and_components() {
+    let (_dir, capture, mut evidence) = fixture();
+    complete_native_evidence(&capture, &mut evidence);
+    let selected = evidence
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == capture.documents[0].key.path)
+        .unwrap();
+    selected.state = CoverageState::Partial;
+    selected.selected = true;
+    evidence
+        .provenance
+        .push(semantic_provenance(&capture, &evidence, 0));
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_basis(&capture, &evidence, &capture),
+        Ok(())
+    );
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0]
+        .basis
+        .as_mut()
+        .unwrap()
+        .lookup_dependencies
+        .push(text("forged"));
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut forged_capture = capture.clone();
+    let forged_document = &mut forged_capture.lookup_dependencies[0].1;
+    forged_document.push("forged".into());
+    forged_document.sort();
+    let mut forged_basis = evidence.clone();
+    forged_basis.provenance[0]
+        .basis
+        .as_mut()
+        .unwrap()
+        .lookup_dependencies = forged_document.iter().map(|key| text(key)).collect();
+    assert!(matches!(
+        validate_evidence(&forged_capture, &forged_basis, &forged_capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].basis.as_mut().unwrap().artifact_hash = hash(b"forged artifact");
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].basis.as_mut().unwrap().config_hash = hash(b"forged config");
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].basis.as_mut().unwrap().producer_hash = hash(b"forged executable");
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    for component in ["toolchain", "dependency", "manifest"] {
+        let mut wrong = evidence.clone();
+        let basis = wrong.provenance[0].basis.as_mut().unwrap();
+        match component {
+            "toolchain" => basis.toolchain_hash = hash(b"forged toolchain"),
+            "dependency" => basis.dependency_hash = hash(b"forged dependency"),
+            "manifest" => basis.source_manifest_hash = hash(b"forged manifest"),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                validate_evidence(&capture, &wrong, &capture),
+                Err(EvidenceError::Basis(_))
+            ),
+            "{component}"
+        );
+    }
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].basis = None;
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong = evidence.clone();
+    wrong.provenance[0].id = evidence.native_files[0].provenance.id.clone();
+    assert!(matches!(
+        validate_evidence(&capture, &wrong, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+#[test]
+fn semantic_basis_freshness_uses_requested_captured_bytes() {
+    let (_dir, capture, mut evidence) = fixture();
+    complete_native_evidence(&capture, &mut evidence);
+    let selected = evidence
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == capture.documents[0].key.path)
+        .unwrap();
+    selected.state = CoverageState::Partial;
+    selected.selected = true;
+    evidence
+        .provenance
+        .push(semantic_provenance(&capture, &evidence, 0));
+    let mut requested = capture.clone();
+    requested.config_bytes.push(1);
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &requested),
+        Err(EvidenceError::Basis(_))
+    ));
+    evidence.provenance[0].freshness = Freshness::PossiblyStale;
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_basis(&capture, &evidence, &requested),
+        Ok(())
+    );
+    requested.documents[0].bytes.push(b'!');
+    evidence.provenance[0].freshness = Freshness::Stale;
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_basis(&capture, &evidence, &requested),
+        Ok(())
+    );
+}
+
+#[test]
+fn failed_refresh_keeps_old_proof_historical_without_binding_old_occurrence() {
+    let (dir, old, mut historical) = selected_semantic_fixture_with_use();
+    historical.symbols.push(child_symbol(&old, &historical));
+    let use_owner = historical.native_files[0]
+        .declarations
+        .iter()
+        .find(|d| {
+            d.name_range
+                .as_ref()
+                .is_some_and(|range| range.start.get() == 101)
+        })
+        .unwrap();
+    let old_reference = Reference {
+        id: baleyg::semantic_identity::occurrence_id(
+            &text(&old.revision_id),
+            &use_owner.syntax_id,
+            baleyg::semantic_identity::OccurrenceKind::Reference,
+            UInt::new(0).unwrap(),
+        )
+        .unwrap(),
+        owner_syntax_id: use_owner.syntax_id.clone(),
+        ordinal: UInt::new(0).unwrap(),
+        document: old.documents[0].key.clone(),
+        revision_id: text(&old.revision_id),
+        range: span(114, 117),
+        spelling: text("foo"),
+        lookup_key: text("foo"),
+        site: ReferenceSite::Use,
+        roles: vec![Role::Read],
+        resolution: Resolution::Unresolved,
+        declared_target: None,
+        candidates: vec![],
+        provenance_id: historical.provenance[0].id.clone(),
+    };
+    historical.references.push(old_reference.clone());
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&old, &historical),
+        Ok(())
+    );
+    let admission = CaptureAdmission {
+        source_set_id: old.source_set_id.clone(),
+        root_id: old.root_id.clone(),
+        languages: historical.context.source_set.languages.clone(),
+        toolchain: dir.path().join("toolchain.capture"),
+        config: dir.path().join("config.capture"),
+        dependency: dir.path().join("dependency.capture"),
+        dependency_source_sets: vec![],
+        producers: vec![baleyg::indexer::ProducerInput {
+            id: "S".into(),
+            tool_name: "scip-test".into(),
+            version: "1".into(),
+            position_encoding: "utf8".into(),
+            executable: dir.path().join("toolchain.capture"),
+            artifact: Some(dir.path().join("semantic.artifact")),
+        }],
+    };
+    fs::write(dir.path().join("config.capture"), b"r2 config").unwrap();
+    let mut options = IndexOptions::new(dir.path().to_owned());
+    options.scip_path = Some(dir.path().join("semantic.artifact"));
+    let newer = capture_revision(&options, &admission, &Arc::new(AtomicBool::new(false))).unwrap();
+    assert_ne!(old.revision_id, newer.revision_id);
+    let mut failed = historical.clone();
+    failed.provenance.clear();
+    failed.symbols.clear();
+    failed.references.clear();
+    failed.context.revision.id = text(&newer.revision_id);
+    failed.context.revision.config_hash = hash(&newer.config_bytes);
+    for document in &mut failed.context.revision.documents {
+        document.revision_id = text(&newer.revision_id);
+    }
+    for coverage in &mut failed.coverage {
+        coverage.revision_id = text(&newer.revision_id);
+        if coverage.producer_id.as_str() == "S"
+            && coverage.document_path == newer.documents[0].key.path
+        {
+            coverage.state = CoverageState::Failed;
+            coverage.selected = true;
+            coverage.diagnostic = Some(text("refresh failed"));
+        }
+    }
+    failed.native_files.clear();
+    complete_native_evidence(&newer, &mut failed);
+    assert_eq!(validate_capture(&newer, &failed), Ok(()));
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&newer, &failed),
+        Ok(())
+    );
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_basis(&newer, &failed, &newer),
+        Ok(())
+    );
+    historical.provenance[0].freshness = Freshness::PossiblyStale;
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_basis(&old, &historical, &newer),
+        Ok(())
+    );
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&old, &historical),
+        Ok(())
+    );
+    assert_eq!(
+        historical.symbols[0].declarations[0],
+        child_symbol(&old, &historical).declarations[0]
+    );
+    assert_eq!(
+        historical.provenance[0].revision_id.as_str(),
+        old.revision_id
+    );
+    assert_eq!(historical.provenance[0].freshness, Freshness::PossiblyStale);
+    // This r1 occurrence was valid at a captured producer Use position, but the
+    // failed r2 producer has no proof for an r2 occurrence.
+    let mut promoted = failed.clone();
+    promoted.references.push(old_reference.clone());
+    assert!(matches!(
+        baleyg::semantic_evidence::validate_semantic_facts(&newer, &promoted),
+        Err(EvidenceError::Basis(_))
+    ));
+    promoted.provenance.push(historical.provenance[0].clone());
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&newer, &promoted),
+        Err(EvidenceError::Basis(
+            "reference role, spelling or provenance mismatch"
+        ))
+    );
+    assert!(matches!(
+        baleyg::semantic_evidence::validate_semantic_basis(&newer, &promoted, &newer),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+fn selected_semantic_fixture() -> (tempfile::TempDir, CapturedRevision, Evidence) {
+    selected_semantic_fixture_from_capture(fixture())
+}
+fn selected_semantic_fixture_with_use() -> (tempfile::TempDir, CapturedRevision, Evidence) {
+    let (dir, capture, mut evidence) =
+        selected_semantic_fixture_from_capture(fixture_with_java_use(None, None, None, true));
+    let file = evidence
+        .native_files
+        .iter_mut()
+        .find(|f| f.document.key == capture.documents[0].key)
+        .unwrap();
+    let witness = capture.documents[0]
+        .native_candidates
+        .iter()
+        .find(|w| w.node_kind == "method_invocation" && w.token_start_byte == 114)
+        .unwrap();
+    let owner = file
+        .declarations
+        .iter()
+        .find(|d| {
+            d.kind == Kind::Method
+                && d.name_range
+                    .as_ref()
+                    .is_some_and(|range| range.start.get() == 101)
+        })
+        .unwrap();
+    file.calls.push(Call {
+        id: OccurrenceId::new(witness.stable_id.clone().unwrap()).unwrap(),
+        owner_syntax_id: owner.syntax_id.clone(),
+        ordinal: UInt::new(0).unwrap(),
+        document: capture.documents[0].key.clone(),
+        revision_id: text(&capture.revision_id),
+        range: span(witness.start_byte, witness.end_byte),
+        callee_range: witness
+            .verified_member_token
+            .then(|| span(witness.token_start_byte, witness.token_end_byte)),
+        spelling: witness.spelling.as_deref().map(text),
+        region_ids: vec![],
+        provenance_id: file.provenance.id.clone(),
+    });
+    (dir, capture, evidence)
+}
+fn selected_semantic_fixture_from_capture(
+    (dir, capture, mut evidence): (tempfile::TempDir, CapturedRevision, Evidence),
+) -> (tempfile::TempDir, CapturedRevision, Evidence) {
+    complete_native_evidence(&capture, &mut evidence);
+    let selected = evidence
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == capture.documents[0].key.path)
+        .unwrap();
+    selected.state = CoverageState::Partial;
+    selected.selected = true;
+    evidence
+        .provenance
+        .push(semantic_provenance(&capture, &evidence, 0));
+    (dir, capture, evidence)
+}
+fn child_symbol(capture: &CapturedRevision, evidence: &Evidence) -> Symbol {
+    let declaration = evidence.native_files[0]
+        .declarations
+        .iter()
+        .find(|d| d.name.as_ref().is_some_and(|n| n.as_str() == "Child"))
+        .unwrap();
+    Symbol {
+        key: SymbolKey {
+            scheme: SymbolScheme::Scip,
+            symbol: text("scip java fixture Child#"),
+            scope: SymbolScope::Global,
+            document: None,
+        },
+        display_name: Some(text("Child")),
+        declarations: vec![Target::Internal {
+            syntax_id: declaration.syntax_id.clone(),
+            document: capture.documents[0].key.clone(),
+            revision_id: text(&capture.revision_id),
+        }],
+        provenance_id: evidence.provenance[0].id.clone(),
+    }
+}
+#[test]
+fn symbol_fact_needs_source_definition_and_producer_artifact() {
+    let (_dir, capture, mut evidence) = selected_semantic_fixture();
+    evidence.symbols.push(child_symbol(&capture, &evidence));
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Ok(())
+    );
+    assert!(matches!(
+        validate_evidence(&capture, &evidence, &capture),
+        Err(EvidenceError::NotYetValidated(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.symbols[0].key.symbol = text("fabricated");
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.symbols[0].key.scope = SymbolScope::Document;
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut bad = evidence.clone();
+    let duplicate = bad.symbols[0].declarations[0].clone();
+    bad.symbols[0].declarations.push(duplicate);
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+#[test]
+fn reference_fact_requires_exact_original_position_and_source_token() {
+    let (_dir, capture, mut evidence) = selected_semantic_fixture();
+    let symbol = child_symbol(&capture, &evidence);
+    let Target::Internal {
+        syntax_id,
+        document,
+        revision_id,
+    } = symbol.declarations[0].clone()
+    else {
+        unreachable!()
+    };
+    evidence.symbols.push(symbol);
+    evidence.references.push(Reference {
+        id: baleyg::semantic_identity::occurrence_id(
+            &revision_id,
+            &syntax_id,
+            baleyg::semantic_identity::OccurrenceKind::Reference,
+            UInt::new(0).unwrap(),
+        )
+        .unwrap(),
+        owner_syntax_id: syntax_id.clone(),
+        ordinal: UInt::new(0).unwrap(),
+        document: document.clone(),
+        revision_id: revision_id.clone(),
+        range: span(13, 18),
+        spelling: text("Child"),
+        lookup_key: text("Child"),
+        site: ReferenceSite::Declaration,
+        roles: vec![Role::Definition],
+        resolution: Resolution::Resolved,
+        declared_target: Some(Target::Internal {
+            syntax_id,
+            document,
+            revision_id,
+        }),
+        candidates: vec![],
+        provenance_id: evidence.provenance[0].id.clone(),
+    });
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Ok(())
+    );
+    let mut bad = evidence.clone();
+    bad.references[0].resolution = Resolution::Ambiguous;
+    bad.references[0].candidates = vec![
+        bad.references[0].declared_target.take().unwrap(),
+        evidence.references[0].declared_target.clone().unwrap(),
+    ];
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.references[0].resolution = Resolution::Ambiguous;
+    bad.references[0].declared_target = None;
+    bad.references[0].candidates = vec![
+        Target::External {
+            symbol: SymbolKey {
+                scheme: SymbolScheme::Scip,
+                symbol: text("invented"),
+                scope: SymbolScope::Global,
+                document: None,
+            },
+        },
+        evidence.references[0].declared_target.clone().unwrap(),
+    ];
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.references[0].range = span(12, 18);
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.references[0].lookup_key = text("child");
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.references[0].roles = vec![Role::Read];
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+#[test]
+fn python_alias_requires_definition_at_measured_alias_site() {
+    let (_dir, capture, mut evidence) =
+        fixture_with_sources(None, Some("from m import x as y\n"), None);
+    complete_native_evidence(&capture, &mut evidence);
+    let document_index = capture
+        .documents
+        .iter()
+        .position(|d| d.key.language == Language::Python)
+        .unwrap();
+    let document = &capture.documents[document_index];
+    let coverage = evidence
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == document.key.path)
+        .unwrap();
+    coverage.state = CoverageState::Partial;
+    coverage.selected = true;
+    coverage.supported_roles = vec![Role::Definition, Role::Alias];
+    coverage.observed_roles = coverage.supported_roles.clone();
+    let proof = semantic_provenance(&capture, &evidence, document_index);
+    evidence.provenance.push(proof.clone());
+    let module_id = baleyg::semantic_identity::syntax_id(
+        &document.key.source_set_id,
+        &document.key.path,
+        document.key.language,
+        &[],
+        &Key {
+            kind: Kind::Module,
+            name: None,
+            signature: None,
+            ordinal: UInt::new(0).unwrap(),
+        },
+    )
+    .unwrap();
+    let reference = Reference {
+        id: baleyg::semantic_identity::occurrence_id(
+            &text(&capture.revision_id),
+            &module_id,
+            baleyg::semantic_identity::OccurrenceKind::Reference,
+            UInt::new(0).unwrap(),
+        )
+        .unwrap(),
+        owner_syntax_id: module_id,
+        ordinal: UInt::new(0).unwrap(),
+        document: document.key.clone(),
+        revision_id: text(&capture.revision_id),
+        range: span(19, 20),
+        spelling: text("y"),
+        lookup_key: text("y"),
+        site: ReferenceSite::Declaration,
+        roles: vec![Role::Definition, Role::Alias],
+        resolution: Resolution::Unresolved,
+        declared_target: None,
+        candidates: vec![],
+        provenance_id: proof.id,
+    };
+    evidence.references.push(reference);
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Ok(())
+    );
+    let mut bad = evidence.clone();
+    bad.references[0].site = ReferenceSite::Use;
+    bad.references[0].roles = vec![Role::Alias];
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let (_dir, ordinary_capture, mut ordinary) = fixture_with_sources(None, Some("y = 1\n"), None);
+    complete_native_evidence(&ordinary_capture, &mut ordinary);
+    let index = ordinary_capture
+        .documents
+        .iter()
+        .position(|d| d.key.language == Language::Python)
+        .unwrap();
+    let ordinary_doc = &ordinary_capture.documents[index];
+    let coverage = ordinary
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == ordinary_doc.key.path)
+        .unwrap();
+    coverage.state = CoverageState::Partial;
+    coverage.selected = true;
+    coverage.supported_roles = vec![Role::Definition, Role::Alias];
+    coverage.observed_roles = coverage.supported_roles.clone();
+    let ordinary_proof = semantic_provenance(&ordinary_capture, &ordinary, index);
+    ordinary.provenance.push(ordinary_proof.clone());
+    let mut forged = evidence.references[0].clone();
+    forged.owner_syntax_id = baleyg::semantic_identity::syntax_id(
+        &ordinary_doc.key.source_set_id,
+        &ordinary_doc.key.path,
+        ordinary_doc.key.language,
+        &[],
+        &Key {
+            kind: Kind::Module,
+            name: None,
+            signature: None,
+            ordinal: UInt::new(0).unwrap(),
+        },
+    )
+    .unwrap();
+    forged.id = baleyg::semantic_identity::occurrence_id(
+        &text(&ordinary_capture.revision_id),
+        &forged.owner_syntax_id,
+        baleyg::semantic_identity::OccurrenceKind::Reference,
+        UInt::new(0).unwrap(),
+    )
+    .unwrap();
+    forged.document = ordinary_doc.key.clone();
+    forged.revision_id = text(&ordinary_capture.revision_id);
+    forged.range = span(0, 1);
+    forged.provenance_id = ordinary_proof.id;
+    ordinary.references.push(forged);
+    assert!(matches!(
+        validate_evidence(&ordinary_capture, &ordinary, &ordinary_capture),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+#[test]
+fn python_superclass_uses_measured_heritage_and_directed_semantic_relation() {
+    let (_dir, capture, mut evidence) =
+        fixture_with_sources(None, Some("class Child(Base):\n    pass\n"), None);
+    complete_native_evidence(&capture, &mut evidence);
+    let document_index = capture
+        .documents
+        .iter()
+        .position(|d| d.key.language == Language::Python)
+        .unwrap();
+    let document = &capture.documents[document_index];
+    let coverage = evidence
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == document.key.path)
+        .unwrap();
+    coverage.state = CoverageState::Partial;
+    coverage.selected = true;
+    let proof = semantic_provenance(&capture, &evidence, document_index);
+    let source = evidence
+        .native_files
+        .iter()
+        .find(|file| file.document.key == document.key)
+        .unwrap()
+        .declarations
+        .iter()
+        .find(|d| d.name.as_ref().is_some_and(|name| name.as_str() == "Child"))
+        .unwrap();
+    let target = Target::Internal {
+        syntax_id: source.syntax_id.clone(),
+        document: document.key.clone(),
+        revision_id: text(&capture.revision_id),
+    };
+    evidence.symbols.push(Symbol {
+        key: SymbolKey {
+            scheme: SymbolScheme::Scip,
+            symbol: text("scip python fixture Child#"),
+            scope: SymbolScope::Global,
+            document: None,
+        },
+        display_name: Some(text("Child")),
+        declarations: vec![target.clone()],
+        provenance_id: proof.id.clone(),
+    });
+    let mut relation_proof = proof.clone();
+    relation_proof.id = text("python-relationship");
+    relation_proof.evidence_kind = EvidenceKind::TypeRelationship;
+    evidence.provenance.extend([proof, relation_proof.clone()]);
+    evidence.type_relationships.push(TypeRelationship {
+        kind: RelationshipKind::Extends,
+        source: target,
+        target: Target::External {
+            symbol: SymbolKey {
+                scheme: SymbolScheme::Scip,
+                symbol: text("scip python fixture Base#"),
+                scope: SymbolScope::Global,
+                document: None,
+            },
+        },
+        provenance_id: relation_proof.id,
+    });
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Ok(())
+    );
+    let mut reversed = evidence.clone();
+    reversed.type_relationships[0].source = reversed.type_relationships[0].target.clone();
+    assert!(matches!(
+        validate_evidence(&capture, &reversed, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+#[test]
+fn ambiguous_reference_needs_sorted_distinct_producer_supported_targets() {
+    let (_dir, capture, mut evidence) = selected_semantic_fixture_with_use();
+    let methods: Vec<_> = evidence.native_files[0]
+        .declarations
+        .iter()
+        .filter(|d| {
+            d.kind == Kind::Method
+                && d.name.as_ref().is_some_and(|n| n.as_str() == "foo")
+                && d.name_range
+                    .as_ref()
+                    .is_some_and(|r| matches!(r.start.get(), 50 | 101))
+        })
+        .collect();
+    assert_eq!(methods.len(), 2);
+    let mut targets: Vec<_> = methods
+        .iter()
+        .map(|d| Target::Internal {
+            syntax_id: d.syntax_id.clone(),
+            document: capture.documents[0].key.clone(),
+            revision_id: text(&capture.revision_id),
+        })
+        .collect();
+    targets.sort_by_key(|target| baleyg::semantic_identity::canonical_json(target).unwrap());
+    evidence.symbols.push(Symbol {
+        key: SymbolKey {
+            scheme: SymbolScheme::Scip,
+            symbol: text("scip java fixture Child#foo()."),
+            scope: SymbolScope::Global,
+            document: None,
+        },
+        display_name: Some(text("foo")),
+        declarations: targets.clone(),
+        provenance_id: evidence.provenance[0].id.clone(),
+    });
+    let owner = methods
+        .iter()
+        .find(|d| d.name_range.as_ref().is_some_and(|r| r.start.get() == 50))
+        .unwrap();
+    evidence.references.push(Reference {
+        id: baleyg::semantic_identity::occurrence_id(
+            &text(&capture.revision_id),
+            &owner.syntax_id,
+            baleyg::semantic_identity::OccurrenceKind::Reference,
+            UInt::new(0).unwrap(),
+        )
+        .unwrap(),
+        owner_syntax_id: owner.syntax_id.clone(),
+        ordinal: UInt::new(0).unwrap(),
+        document: capture.documents[0].key.clone(),
+        revision_id: text(&capture.revision_id),
+        range: span(50, 53),
+        spelling: text("foo"),
+        lookup_key: text("foo"),
+        site: ReferenceSite::Declaration,
+        roles: vec![Role::Definition],
+        resolution: Resolution::Ambiguous,
+        declared_target: None,
+        candidates: targets,
+        provenance_id: evidence.provenance[0].id.clone(),
+    });
+    let use_owner = evidence.native_files[0]
+        .declarations
+        .iter()
+        .find(|d| d.name_range.as_ref().is_some_and(|r| r.start.get() == 101))
+        .unwrap();
+    let mut use_reference = evidence.references[0].clone();
+    use_reference.owner_syntax_id = use_owner.syntax_id.clone();
+    use_reference.id = baleyg::semantic_identity::occurrence_id(
+        &text(&capture.revision_id),
+        &use_owner.syntax_id,
+        baleyg::semantic_identity::OccurrenceKind::Reference,
+        UInt::new(0).unwrap(),
+    )
+    .unwrap();
+    use_reference.range = span(114, 117);
+    use_reference.site = ReferenceSite::Use;
+    use_reference.roles = vec![Role::Read];
+    evidence.references.push(use_reference);
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Ok(())
+    );
+    for mutation in 0..4 {
+        let mut bad = evidence.clone();
+        let candidates = &mut bad.references[1].candidates;
+        match mutation {
+            0 => candidates[1] = candidates[0].clone(),
+            1 => candidates.reverse(),
+            2 => {
+                if let Target::Internal { syntax_id, .. } = &mut candidates[0] {
+                    *syntax_id = SyntaxId::new("sid:v1:00000000000000000000000000000000").unwrap();
+                }
+            }
+            _ => {
+                if let Target::Internal { document, .. } = &mut candidates[0] {
+                    document.source_set_id = text("foreign");
+                }
+            }
+        }
+        assert!(
+            matches!(
+                validate_evidence(&capture, &bad, &capture),
+                Err(EvidenceError::Basis(_))
+            ),
+            "mutant {mutation}: {:?}",
+            validate_evidence(&capture, &bad, &capture)
+        );
+    }
+}
+
+#[test]
+fn java_unannotated_override_uses_measured_owner_heritage_and_directed_producer() {
+    let (_dir, capture, mut evidence) = selected_semantic_fixture();
+    let source = evidence.native_files[0]
+        .declarations
+        .iter()
+        .find(|d| d.kind == Kind::Method && d.name.as_ref().is_some_and(|n| n.as_str() == "foo"))
+        .unwrap();
+    let target = Target::Internal {
+        syntax_id: source.syntax_id.clone(),
+        document: capture.documents[0].key.clone(),
+        revision_id: text(&capture.revision_id),
+    };
+    evidence.symbols.push(Symbol {
+        key: SymbolKey {
+            scheme: SymbolScheme::Scip,
+            symbol: text("scip java fixture Child#foo()."),
+            scope: SymbolScope::Global,
+            document: None,
+        },
+        display_name: Some(text("foo")),
+        declarations: vec![target.clone()],
+        provenance_id: evidence.provenance[0].id.clone(),
+    });
+    let mut proof = evidence.provenance[0].clone();
+    proof.id = text("override-proof");
+    proof.evidence_kind = EvidenceKind::TypeRelationship;
+    evidence.provenance.push(proof.clone());
+    evidence.type_relationships.push(TypeRelationship {
+        kind: RelationshipKind::Overrides,
+        source: target,
+        target: Target::External {
+            symbol: SymbolKey {
+                scheme: SymbolScheme::Scip,
+                symbol: text("scip java fixture Base#foo()."),
+                scope: SymbolScope::Global,
+                document: None,
+            },
+        },
+        provenance_id: proof.id,
+    });
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Ok(())
+    );
+    let mut reversed = evidence.clone();
+    reversed.type_relationships[0].source = reversed.type_relationships[0].target.clone();
+    assert!(matches!(
+        validate_evidence(&capture, &reversed, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut wrong_parent = evidence.clone();
+    if let Target::External { symbol } = &mut wrong_parent.type_relationships[0].target {
+        symbol.symbol = text("scip java fixture Unrelated#foo().");
+    }
+    assert!(matches!(
+        validate_evidence(&capture, &wrong_parent, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+fn override_with_measured_owner(source: &str, nested: bool) -> (CapturedRevision, Evidence) {
+    let (_dir, capture, mut evidence) =
+        fixture_with_java_source(None, None, None, false, Some(source));
+    complete_native_evidence(&capture, &mut evidence);
+    let selected = evidence
+        .coverage
+        .iter_mut()
+        .find(|c| c.producer_id.as_str() == "S" && c.document_path == capture.documents[0].key.path)
+        .unwrap();
+    selected.state = CoverageState::Partial;
+    selected.selected = true;
+    let proof = semantic_provenance(&capture, &evidence, 0);
+    let source = evidence.native_files[0]
+        .declarations
+        .iter()
+        .filter(|d| d.kind == Kind::Method && d.name.as_ref().is_some_and(|n| n.as_str() == "foo"))
+        .max_by_key(|d| d.range.start.get())
+        .unwrap();
+    let target = Target::Internal {
+        syntax_id: source.syntax_id.clone(),
+        document: capture.documents[0].key.clone(),
+        revision_id: text(&capture.revision_id),
+    };
+    evidence.symbols.push(Symbol {
+        key: SymbolKey {
+            scheme: SymbolScheme::Scip,
+            symbol: text("scip java fixture Child#foo()."),
+            scope: SymbolScope::Global,
+            document: None,
+        },
+        display_name: Some(text("foo")),
+        declarations: vec![target.clone()],
+        provenance_id: proof.id.clone(),
+    });
+    let mut relation_proof = proof.clone();
+    relation_proof.id = text("qualified-override-proof");
+    relation_proof.evidence_kind = EvidenceKind::TypeRelationship;
+    evidence.provenance.extend([proof, relation_proof.clone()]);
+    evidence.type_relationships.push(TypeRelationship {
+        kind: RelationshipKind::Overrides,
+        source: target,
+        target: Target::External {
+            symbol: SymbolKey {
+                scheme: SymbolScheme::Scip,
+                symbol: text(if nested {
+                    "scip java fixture Base#foo()."
+                } else {
+                    "scip java fixture pkg.good.Base#foo()."
+                }),
+                scope: SymbolScope::Global,
+                document: None,
+            },
+        },
+        provenance_id: relation_proof.id,
+    });
+    (capture, evidence)
+}
+
+#[test]
+fn override_rejects_wrong_qualified_parent_even_with_same_simple_name() {
+    let source = "public class Child extends pkg.good.Base { public <T> void foo(int x) { if (true) { é(); } } public <T> void foo(int y) {} }\n";
+    let (capture, evidence) = override_with_measured_owner(source, false);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Ok(())
+    );
+    let mut wrong = evidence.clone();
+    if let Target::External { symbol } = &mut wrong.type_relationships[0].target {
+        symbol.symbol = text("scip java fixture pkg.other.Base#foo().");
+    }
+    assert!(matches!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &wrong),
+        Err(EvidenceError::Basis(_))
+    ));
+}
+
+#[test]
+fn override_rejects_outer_heritage_for_nested_method() {
+    let source = "public class Child extends Base { public <T> void foo(int x) { if (true) { é(); } } class Inner { public <T> void foo(int y) {} } }\n";
+    let (capture, evidence) = override_with_measured_owner(source, true);
+    assert_eq!(validate_native(&capture, &evidence), Ok(()));
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Err(EvidenceError::Basis(
+            "override has no measured heritage and directed semantic proof"
+        ))
+    );
+}
+
+#[test]
+fn relationship_requires_heritage_syntax_and_directed_producer_fact() {
+    let (_dir, capture, mut evidence) = selected_semantic_fixture();
+    let symbol = child_symbol(&capture, &evidence);
+    let source = symbol.declarations[0].clone();
+    evidence.symbols.push(symbol);
+    let mut relation_proof = evidence.provenance[0].clone();
+    relation_proof.id = text("semantic-relationship");
+    relation_proof.evidence_kind = EvidenceKind::TypeRelationship;
+    evidence.provenance.push(relation_proof);
+    evidence.type_relationships.push(TypeRelationship {
+        kind: RelationshipKind::Extends,
+        source,
+        target: Target::External {
+            symbol: SymbolKey {
+                scheme: SymbolScheme::Scip,
+                symbol: text("scip java fixture Base#"),
+                scope: SymbolScope::Global,
+                document: None,
+            },
+        },
+        provenance_id: text("semantic-relationship"),
+    });
+    assert_eq!(
+        baleyg::semantic_evidence::validate_semantic_facts(&capture, &evidence),
+        Ok(())
+    );
+    let mut bad = evidence.clone();
+    bad.type_relationships[0].kind = RelationshipKind::Implements;
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut bad = evidence.clone();
+    bad.type_relationships[0].source = bad.type_relationships[0].target.clone();
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
+    ));
+    let mut bad = evidence.clone();
+    if let Target::External { symbol } = &mut bad.type_relationships[0].target {
+        symbol.symbol = text("scip java fixture Imaginary#");
+    }
+    assert!(matches!(
+        validate_evidence(&capture, &bad, &capture),
+        Err(EvidenceError::Basis(_))
     ));
 }
