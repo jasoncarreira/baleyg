@@ -63,14 +63,22 @@ Java/Python indexing never runs Gradle, Maven, Python imports, decorators or pac
 
 The accepted direction supports agents running directly in a terminal (including terminal tabs in
 Baleyg or optional Herdr panes), and agents connected through ACP, primarily Mimir. Both use the
-same portable MCP tools. MCP, general coding-agent ACP sessions and embedded terminals are
-**not implemented yet**; the existing one-shot ACP answer feature is separate.
+same portable MCP tools. The local `baleyg mcp` stdio protocol layer is shipped; general coding-agent
+ACP sessions and embedded terminals are **not implemented yet**. The existing one-shot ACP answer
+feature and authenticated browser `serve` daemon remain separate.
 
-Agents reach Baleyg through `baleyg mcp`, a stdio server the agent client launches in the checkout
-it works in, with four read-only tools, no grants and real-time native refresh. Add snapshot text
-search, versioned diagram artifacts, the unified terminal workbench and a browser project picker as
-separate slices. Extend SCIP import beyond JavaScript through tested
-language adapters, initially Java; producing semantic artifacts remains explicitly authorized work.
+Run `baleyg mcp --workspace <path>` for the local, read-only stdio protocol. Its four-tool catalog is
+`baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect` and `baleyg_read_source`.
+This is protocol-only: describe reports an unavailable index, and all three evidence tools return
+typed `index_not_ready` until [#17](https://github.com/jasoncarreira/baleyg/issues/17) connects
+eligible snapshots. It does not open a real Store or serve evidence, enroll grants, expose HTTP MCP
+routes or accept authenticated MCP intake. Client interoperability is not certified. Run the native
+protocol fixtures with `cargo test --locked --test mcp_protocol`.
+
+Real-time native refresh, snapshot text search, versioned diagram artifacts, the unified terminal
+workbench and a browser project picker remain separate work. Extend SCIP import beyond JavaScript
+through tested language adapters, initially Java; producing semantic artifacts remains explicitly
+authorized work.
 
 See the [local topology](docs/local-topology.md), [integration plan](docs/agent-integration-plan.md), [MCP contract](docs/mcp-readonly-pilot-contract.md),
 [terminal workbench](docs/terminal-workbench-contract.md), [SCIP roadmap](docs/scip-multilanguage-plan.md),
