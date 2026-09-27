@@ -28,7 +28,7 @@
  * pinned conservative policy, without division. The first fully passing run
  * alone establishes semantic-v1; no later run refreshes it. These are pinned
  * normative descriptions, not an executable benchmark, result gate or baseline.
- * Exclusions:null and small dimensions:null mean unrecorded, not empty/zero.
+ * Exclusions:null means unrecorded, not empty/zero.
  * Hash field names are future binding requirements, not recorded hash evidence.
  * This checker validates policy consistency, never benchmark qualification.
  */
@@ -213,7 +213,7 @@ const EXPECTED = {
     ]
   },
   "synthetic": {
-    "small": {"dimensionStatus": "notSpecifiedByRatification", "files": null, "sourceMiB": null, "minimumNormalizedFacts": null, "factsScope": null},
+    "small": {"files": 100, "sourceBytes": 1677722, "minimumNormalizedFacts": 5000, "factsScope": "perLanguage"},
     "medium": {"files": 1000, "sourceMiB": 16, "minimumNormalizedFacts": 50000, "factsScope": "perLanguage"},
     "large": {"files": 10000, "sourceMiB": 128, "minimumNormalizedFacts": 500000, "factsScope": "overall"},
     "atCap": {"files": 100000, "sourceMiB": 256, "purpose": "boundedFailureSafetyLimits", "sloApplies": false}
