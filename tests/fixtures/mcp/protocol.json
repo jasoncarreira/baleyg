@@ -36,5 +36,412 @@
       "startLine": 1,
       "endLine": 1
     }
-  ]
+  ],
+  "expected": {
+    "describe": {
+      "schemaVersion": 1,
+      "requestId": "$ID",
+      "evidenceBasis": null,
+      "data": {
+        "workspaceLabel": "$LABEL",
+        "indexState": "unavailable",
+        "progress": null,
+        "watcherDegraded": false,
+        "languages": [],
+        "toolVersion": 1,
+        "schemaVersion": 1,
+        "limits": {
+          "requestBytes": 16384,
+          "responseBytes": 65536,
+          "sourceBytes": 16384,
+          "sourceLines": 200,
+          "defaultLimit": 20,
+          "maxLimit": 50,
+          "calleeTextBytes": 1024,
+          "hintWorkMs": 1000,
+          "deadlineMs": 5000,
+          "concurrency": 4
+        }
+      },
+      "warnings": [],
+      "partial": true,
+      "truncated": false,
+      "truncationReason": null
+    },
+    "failures": {
+      "invalid_request": [
+        "Invalid tool arguments",
+        false
+      ],
+      "range_too_large": [
+        "Requested range is too large",
+        false
+      ],
+      "index_not_ready": [
+        "Index is not ready",
+        true
+      ],
+      "root_changed": [
+        "Workspace root changed",
+        false
+      ],
+      "store_unavailable": [
+        "Store is unavailable",
+        false
+      ]
+    }
+  },
+  "idBoundaries": [
+    {
+      "label": "ascii",
+      "unit": "a",
+      "cost": 1,
+      "repeats": 254,
+      "tail": 0
+    },
+    {
+      "label": "quote",
+      "unit": "\"",
+      "cost": 2,
+      "repeats": 126,
+      "tail": 2
+    },
+    {
+      "label": "backslash",
+      "unit": "\\",
+      "cost": 2,
+      "repeats": 126,
+      "tail": 2
+    },
+    {
+      "label": "control-00",
+      "unit": "\u0000",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-01",
+      "unit": "\u0001",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-02",
+      "unit": "\u0002",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-03",
+      "unit": "\u0003",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-04",
+      "unit": "\u0004",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-05",
+      "unit": "\u0005",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-06",
+      "unit": "\u0006",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-07",
+      "unit": "\u0007",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-08",
+      "unit": "\b",
+      "cost": 2,
+      "repeats": 1,
+      "tail": 252
+    },
+    {
+      "label": "control-09",
+      "unit": "\t",
+      "cost": 2,
+      "repeats": 1,
+      "tail": 252
+    },
+    {
+      "label": "control-0a",
+      "unit": "\n",
+      "cost": 2,
+      "repeats": 1,
+      "tail": 252
+    },
+    {
+      "label": "control-0b",
+      "unit": "\u000b",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-0c",
+      "unit": "\f",
+      "cost": 2,
+      "repeats": 1,
+      "tail": 252
+    },
+    {
+      "label": "control-0d",
+      "unit": "\r",
+      "cost": 2,
+      "repeats": 1,
+      "tail": 252
+    },
+    {
+      "label": "control-0e",
+      "unit": "\u000e",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-0f",
+      "unit": "\u000f",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-10",
+      "unit": "\u0010",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-11",
+      "unit": "\u0011",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-12",
+      "unit": "\u0012",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-13",
+      "unit": "\u0013",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-14",
+      "unit": "\u0014",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-15",
+      "unit": "\u0015",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-16",
+      "unit": "\u0016",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-17",
+      "unit": "\u0017",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-18",
+      "unit": "\u0018",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-19",
+      "unit": "\u0019",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-1a",
+      "unit": "\u001a",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-1b",
+      "unit": "\u001b",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-1c",
+      "unit": "\u001c",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-1d",
+      "unit": "\u001d",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-1e",
+      "unit": "\u001e",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "control-1f",
+      "unit": "\u001f",
+      "cost": 6,
+      "repeats": 42,
+      "tail": 2
+    },
+    {
+      "label": "e-acute",
+      "unit": "é",
+      "cost": 2,
+      "repeats": 127,
+      "tail": 0
+    },
+    {
+      "label": "euro",
+      "unit": "€",
+      "cost": 3,
+      "repeats": 84,
+      "tail": 2
+    },
+    {
+      "label": "emoji",
+      "unit": "😀",
+      "cost": 4,
+      "repeats": 63,
+      "tail": 2
+    }
+  ],
+  "transcripts": {
+    "modern": {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "modern-discover",
+        "method": "server/discover",
+        "params": {
+          "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "modern-discover",
+        "result": {
+          "resultType": "complete",
+          "ttlMs": 0,
+          "cacheScope": "private",
+          "supportedVersions": [
+            "2026-07-28",
+            "2025-11-25"
+          ],
+          "capabilities": {
+            "tools": {}
+          },
+          "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+              "name": "baleyg",
+              "version": "$VERSION"
+            }
+          }
+        }
+      }
+    },
+    "legacy": {
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "legacy-initialize",
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "fixture-client",
+            "version": "1"
+          }
+        }
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "legacy-initialize",
+        "result": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "tools": {}
+          },
+          "serverInfo": {
+            "name": "baleyg",
+            "version": "$VERSION"
+          }
+        }
+      },
+      "initialized": {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+      }
+    },
+    "completedCancellation": {
+      "notification": {
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {
+          "requestId": "already-completed",
+          "reason": "finished"
+        }
+      },
+      "responses": []
+    },
+    "incompleteEof": {
+      "input": "{\"jsonrpc\":\"2.0\",\"id\":4",
+      "responses": []
+    }
+  }
 }
