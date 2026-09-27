@@ -3,14 +3,36 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     time::Duration,
 };
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/mcp/protocol.json")).unwrap()
+}
+/// External bounded wait must distinguish an OS timeout kill from natural process rejection.
+fn process_watchdog(pid: u32) -> (Sender<()>, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let (done, receiver) = mpsc::channel();
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_by_watchdog = Arc::clone(&fired);
+    let thread = std::thread::spawn(move || {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(10)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            fired_by_watchdog.store(true, Ordering::Release);
+            // Kill only to bound a hung child. A killed child is never a valid test outcome.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    });
+    (done, fired, thread)
 }
 struct Peer {
     child: Child,
@@ -86,17 +108,14 @@ impl Peer {
     }
     fn finish(mut self) -> (std::process::ExitStatus, String) {
         self.stdin.take();
-        let pid = self.child.id();
-        let (done, timeout) = mpsc::channel();
-        let watchdog = std::thread::spawn(move || {
-            if timeout.recv_timeout(Duration::from_secs(10)).is_err() {
-                // No test-only control exists in the binary; bound a stuck child from outside.
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-            }
-        });
+        let (done, fired, watchdog) = process_watchdog(self.child.id());
         let status = self.child.wait().unwrap();
         let _ = done.send(());
         watchdog.join().unwrap();
+        assert!(
+            !fired.load(Ordering::Acquire),
+            "MCP child timed out and was killed"
+        );
         let mut stderr = String::new();
         self.child
             .stderr
@@ -527,6 +546,10 @@ fn legacy_title_recovery_max_id_and_root_selection() {
         .env("XDG_DATA_HOME", overlap.join("data"));
     let outcome = bounded_output(command);
     assert!(!outcome.status.success());
+    assert!(
+        outcome.status.signal().is_none(),
+        "overlap refusal must exit naturally, not from a signal"
+    );
     assert!(outcome.stdout.is_empty());
     assert!(!overlap.join(".git/baleyg/workspace-id").exists());
     assert!(root.join(".git/baleyg/workspace-id").is_file());
@@ -968,16 +991,14 @@ fn bounded_output(mut command: Command) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let pid = child.id();
-    let (done, timeout) = mpsc::channel();
-    let watchdog = std::thread::spawn(move || {
-        if timeout.recv_timeout(Duration::from_secs(10)).is_err() {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        }
-    });
+    let (done, fired, watchdog) = process_watchdog(child.id());
     let output = child.wait_with_output().unwrap();
     let _ = done.send(());
     watchdog.join().unwrap();
+    assert!(
+        !fired.load(Ordering::Acquire),
+        "subprocess timed out and was killed"
+    );
     output
 }
 fn silent_failure(mut peer: Peer) {
@@ -986,6 +1007,10 @@ fn silent_failure(mut peer: Peer) {
     let lines = std::mem::replace(&mut peer.lines, substitute);
     let (status, stderr) = peer.finish();
     assert!(!status.success(), "expected rejected workspace");
+    assert!(
+        status.signal().is_none(),
+        "startup refusal must exit naturally, not from a signal"
+    );
     assert!(!stderr.is_empty(), "diagnostics belong on stderr");
     assert!(
         lines.recv_timeout(Duration::from_secs(1)).is_err(),
