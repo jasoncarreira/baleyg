@@ -29,86 +29,73 @@ SCIP protobuf `Index` wire hex below has A with three occurrences (legacy defini
 
 ## Exact producer envelopes, canonical bytes and full hashes
 
-For each row, the JSON line is the **complete** #22 `canonicalBytes(E)`; no newline belongs to the digest. Compute `D(E)=SHA-256(UTF8("baleyg.semantic-fact.v1\0")||canonicalBytes(E))`. Compute captured proof ID with `SHA-256(UTF8("baleyg.capture-proof.v1\0")||canonicalBytes(C))`, where `C` is the exact seven-key tuple below. The first five rows are the complete deduplicated envelope inventory of the authenticated 116-byte binary (three occurrences, one symbolInformation, one separate relationship). The final index row belongs only to the separate 129-byte index-level binary in the next section. These rows are not destination records and do not assert a call or relationship classification.
+For each row, the JSON line is the **complete** #22 `canonicalBytes(E)`; no newline belongs to the digest. Compute `D(E)=SHA-256(UTF8("baleyg.semantic-fact.v1\0")||canonicalBytes(E))`. Compute captured proof ID with `SHA-256(UTF8("baleyg.capture-proof.v1\0")||canonicalBytes(C))`, where `C` is the exact seven-key tuple below. These five rows are the complete deduplicated **document-only** envelope inventory of the authenticated 116-byte binary (three occurrences, one symbolInformation, one separate relationship). Index-level external symbols are authenticated binary context and never enter the envelope/proof inventory. These rows are not destination records and do not assert a call or relationship classification.
 ### call-occurrence
 `canonicalBytes(E)`:
 
 ```json
-{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":null,"range":{"encoding":"singleLine","endCharacter":14,"line":0,"startCharacter":13},"symbol":"B#","symbolRoles":0,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js","scope":"document"}
+{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":null,"range":{"encoding":"singleLine","endCharacter":14,"line":0,"startCharacter":13},"symbol":"B#","symbolRoles":0,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js"}
 ```
-`factDigest = 26a1761afd7123e6a3e89587345a14a21dfbb3ddbb7e314b937b703f9168aab0`.
+`factDigest = 5b4024d718d9f810e24a271f437fbecfd17c537901e3795ac795fa8b2d1c7ca1`.
 `canonicalBytes(C)`:
 
 ```json
-{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"26a1761afd7123e6a3e89587345a14a21dfbb3ddbb7e314b937b703f9168aab0","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
+{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"5b4024d718d9f810e24a271f437fbecfd17c537901e3795ac795fa8b2d1c7ca1","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
 ```
-`capturedProofId = 19814b705caecee5379f3a30371346536372847618ae9ffba627f13988888fe0`.
+`capturedProofId = 23cdaaef9a92c7b3f9604d92a1aa17a5eac89f9cdf84be50329fb95f4b02da70`.
 ### reference-occurrence
 `canonicalBytes(E)`:
 
 ```json
-{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":null,"range":{"encoding":"multiLine","endCharacter":14,"endLine":0,"startCharacter":13,"startLine":0},"symbol":"B#","symbolRoles":0,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js","scope":"document"}
+{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":null,"range":{"encoding":"multiLine","endCharacter":14,"endLine":0,"startCharacter":13,"startLine":0},"symbol":"B#","symbolRoles":0,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js"}
 ```
-`factDigest = e11b51d2a31f320d727896a4badbeba4e68df1c206c49db8179d15ba4e489b3c`.
+`factDigest = 511fdbe7560d96039a4ef37aa10ffd1951f507a108a1403e634de835c13cf031`.
 `canonicalBytes(C)`:
 
 ```json
-{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"e11b51d2a31f320d727896a4badbeba4e68df1c206c49db8179d15ba4e489b3c","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
+{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"511fdbe7560d96039a4ef37aa10ffd1951f507a108a1403e634de835c13cf031","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
 ```
-`capturedProofId = d1ca0cc69aed1f6d4b6e009f84d992bf415f4f4f41dc75c4ea7aa6863dfbb9ed`.
+`capturedProofId = fa1d4315786b84842af3dccdaf2ab150eeb0efe5343813d7f4422c4590d9bfe4`.
 ### definition-occurrence
 `canonicalBytes(E)`:
 
 ```json
-{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":null,"range":{"encoding":"legacy","values":[0,9,10]},"symbol":"A#","symbolRoles":1,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js","scope":"document"}
+{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":null,"range":{"encoding":"legacy","values":[0,9,10]},"symbol":"A#","symbolRoles":1,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js"}
 ```
-`factDigest = 2fc0653df4bc9ae7fbee043ce308352135c19feea776adfe14cf151c7831c18b`.
+`factDigest = 4b41fd743975a3275063e522f03db91dcd3b340b97fe28aece54627bb68b569d`.
 `canonicalBytes(C)`:
 
 ```json
-{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"2fc0653df4bc9ae7fbee043ce308352135c19feea776adfe14cf151c7831c18b","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
+{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"4b41fd743975a3275063e522f03db91dcd3b340b97fe28aece54627bb68b569d","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
 ```
-`capturedProofId = 197f20e205f6891df885ef0e022f4e1ecb76074b4b12532cc51b6d1fb719ea03`.
+`capturedProofId = 9b18b59a323c6dc20af8e9e467fdd06c1c217022b7e2aa5dc6b47f00eaca1093`.
 ### symbol-information
 `canonicalBytes(E)`:
 
 ```json
-{"formatVersion":1,"positionEncoding":1,"raw":{"displayName":"f","enclosingSymbol":"","kind":17,"symbol":"A#"},"recordKind":"symbolInformation","relativePath":"src/A.js","scope":"document"}
+{"formatVersion":1,"positionEncoding":1,"raw":{"displayName":"f","enclosingSymbol":"","kind":17,"symbol":"A#"},"recordKind":"symbolInformation","relativePath":"src/A.js"}
 ```
-`factDigest = b1de1d3d59e8e4785b01125b43b689032461749bfe6a94d2104a553ee73aef41`.
+`factDigest = a206320e585f4aa2935ed585564862575a25567748e8d8a18d193f1b61d76b3f`.
 `canonicalBytes(C)`:
 
 ```json
-{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"b1de1d3d59e8e4785b01125b43b689032461749bfe6a94d2104a553ee73aef41","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
+{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"a206320e585f4aa2935ed585564862575a25567748e8d8a18d193f1b61d76b3f","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
 ```
-`capturedProofId = 0167792d9317f3169d5cc5c38f28eee62515f2eefab3eded91031073e77b7082`.
+`capturedProofId = 59331adcb9c1e6f1ebacfe9cbb1aa57425134b00b004ed5311221ac6f4c1fef5`.
 ### relationship
 `canonicalBytes(E)`:
 
 ```json
-{"formatVersion":1,"positionEncoding":1,"raw":{"isDefinition":false,"isImplementation":true,"isReference":true,"isTypeDefinition":false,"sourceSymbol":"A#","targetSymbol":"B#"},"recordKind":"relationship","relativePath":"src/A.js","scope":"document"}
+{"formatVersion":1,"positionEncoding":1,"raw":{"isDefinition":false,"isImplementation":true,"isReference":true,"isTypeDefinition":false,"sourceSymbol":"A#","targetSymbol":"B#"},"recordKind":"relationship","relativePath":"src/A.js"}
 ```
-`factDigest = fd84734141891f294fd4c10668dd2c65118b3c9fd4da65e5af32a0834f08ac9b`.
+`factDigest = 205346a4b0c1c1f95819bdb3113bf488fd0511649990319e3725fb061813282c`.
 `canonicalBytes(C)`:
 
 ```json
-{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"fd84734141891f294fd4c10668dd2c65118b3c9fd4da65e5af32a0834f08ac9b","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
+{"artifactHash":"8e2f72f58e2d6a1cc0f1177522693069a57c36d67b8ca405965de42b3d7afc5b","factDigest":"205346a4b0c1c1f95819bdb3113bf488fd0511649990319e3725fb061813282c","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
 ```
-`capturedProofId = 75c9e5a53eafd5bcc48154d3422513a0c62517e70b027d1781062e8ab4ec56d4`.
-### index-symbol
-`canonicalBytes(E)`:
-
-```json
-{"formatVersion":1,"positionEncoding":null,"raw":{"displayName":"","enclosingSymbol":"","kind":0,"symbol":"external#"},"recordKind":"symbolInformation","relativePath":null,"scope":"index"}
-```
-`factDigest = 0c6d4766288e61f80d873ff458abbf5947ea653b6725f256eee66f181572814f`.
-`canonicalBytes(C)`:
-
-```json
-{"artifactHash":"19d1e39011338e4cae9f73289c851db75beebd69f221e5295c57540eb9afd23f","factDigest":"0c6d4766288e61f80d873ff458abbf5947ea653b6725f256eee66f181572814f","language":null,"producerId":"scip-test","relativePath":null,"sourceRevision":"r1","sourceSetId":"app"}
-```
-`capturedProofId = fca7a765c910b4782690aa62bd1a3b8afff4613b30c882c3b9be279b6f43e82f`.
-## Index-scope and range-branch controls
+`capturedProofId = 637ab05b3f0db562ec74e1dc86c97e272778087c01bc014a494b91f3bac48238`.
+## Index-level context and range-branch controls
 
 An otherwise identical Index with `external_symbols=[{symbol:"external#"}]` appends exactly `1a0b0a0965787465726e616c23` to the 116-byte binary. The complete 129-byte Index wire and SHA-256 are:
 
@@ -116,7 +103,17 @@ An otherwise identical Index with `external_symbols=[{symbol:"external#"}]` appe
 12580a087372632f412e6a73220a6a617661736372697074120b0a0300090a120241231801120c42060800100d180e12024223120e4a080800100d1800200e120242231a130a02412322080a024223100118012811320166300112180a087372632f422e6a73220a6a61766173637269707430011a0b0a0965787465726e616c23
 ```
 
-`19d1e39011338e4cae9f73289c851db75beebd69f221e5295c57540eb9afd23f`. It adds the `index-symbol` envelope/inventory claim above (not a document `Provenance` row), with `scope:"index"`, `language:null,relativePath:null` in its captured claim tuple and `relativePath:null,positionEncoding:null` in its envelope. **Positive:** authenticated capture retains the index symbol even though it has no document. **Negative:** trying to derive a local A declaration/TypeRelationship, A coverage, or an r2 local semantic provenance from it fails; neither attaching it to the first Document nor inferring a language is allowed. Nested index-level relationships likewise are captured raw but cannot make document-local facts.
+`19d1e39011338e4cae9f73289c851db75beebd69f221e5295c57540eb9afd23f`. **Positive:** `scip 0.10.0` parses one index-level `external#` symbol, which is recursively checked (including nested relationships/unknown fields), authenticated by this binary hash, and omitted from envelope/proof inventory. The five document envelopes above have **unchanged fact digests**, but their proof IDs change because the artifact hash in every document claim tuple is now the 129-byte hash. **Negative:** it cannot create a local A declaration/TypeRelationship, A coverage or r2 local provenance; neither attaching it to the first document nor inferring a document language is allowed. If a nested index-level message has an unknown field/enum, reject the entire captured artifact rather than silently ignoring it.
+
+For completeness, the following **changed-artifact proof tuples** bind the 129-byte binary. Each full `C` is shown: `Index.external_symbols` adds **zero** document envelopes/digests, yet changes the authenticated artifact hash and therefore the five document proof IDs.
+
+| Existing document envelope | #22 canonical `C` with 129-byte artifact | new `capturedProofId` |
+|---|---|---|
+| `call-occurrence` | `{"artifactHash":"19d1e39011338e4cae9f73289c851db75beebd69f221e5295c57540eb9afd23f","factDigest":"5b4024d718d9f810e24a271f437fbecfd17c537901e3795ac795fa8b2d1c7ca1","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}` | `22b1e9a3796d7267f8afcb4301803c87cce781a6224c855c4fda31414b9ac63a` |
+| `reference-occurrence` | `{"artifactHash":"19d1e39011338e4cae9f73289c851db75beebd69f221e5295c57540eb9afd23f","factDigest":"511fdbe7560d96039a4ef37aa10ffd1951f507a108a1403e634de835c13cf031","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}` | `6a2249d44c186fc214ba156b95f40412d57c96eaf3c8f40af71d1af89bf55806` |
+| `definition-occurrence` | `{"artifactHash":"19d1e39011338e4cae9f73289c851db75beebd69f221e5295c57540eb9afd23f","factDigest":"4b41fd743975a3275063e522f03db91dcd3b340b97fe28aece54627bb68b569d","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}` | `a72e095bcabe056c37f20a7765932d8b96e57b5e38cbdf97a6f01b0680dced0f` |
+| `symbol-information` | `{"artifactHash":"19d1e39011338e4cae9f73289c851db75beebd69f221e5295c57540eb9afd23f","factDigest":"a206320e585f4aa2935ed585564862575a25567748e8d8a18d193f1b61d76b3f","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}` | `64fa3b67d6cb29717a8fa88ba698eca5cf5af158285de67b9ffbede900422c6d` |
+| `relationship` | `{"artifactHash":"19d1e39011338e4cae9f73289c851db75beebd69f221e5295c57540eb9afd23f","factDigest":"205346a4b0c1c1f95819bdb3113bf488fd0511649990319e3725fb061813282c","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}` | `4d08d5ffe97b4a18a46adfba51420360a244f2947b428de13f2462ae48c1b5a3` |
 
 The corrected **44-byte** legacy-only Index wire is:
 
@@ -124,13 +121,13 @@ The corrected **44-byte** legacy-only Index wire is:
 122a0a087372632f412e6a73220a6a61766173637269707412100a03000a0e12076c6f63616c203018013001
 ```
 
-Its empty-prefix artifact hash is `1f62fd7188854b19ebad46d5d1048193263fcd1b37cfef7fb7d1d6c35d417409`. `scip 0.10.0` decodes one JavaScript `src/A.js` Document, encoding 1 and packed legacy `[0,10,14]` (`local 0`, role 1). For this standalone demonstration the authenticated source is `0123456789call\n` (hex `3031323334353637383963616c6c0a`; hash `09e4f3066833d4d73ff18e98cbb31d0e5674d3bf7619f789b69e916eab49dc9a`). Its canonical envelope and digest after the **new** scope field are:
+Its empty-prefix artifact hash is `1f62fd7188854b19ebad46d5d1048193263fcd1b37cfef7fb7d1d6c35d417409`. `scip 0.10.0` decodes one JavaScript `src/A.js` Document, encoding 1 and packed legacy `[0,10,14]` (`local 0`, role 1). For this standalone demonstration the authenticated source is `0123456789call\n` (hex `3031323334353637383963616c6c0a`; hash `09e4f3066833d4d73ff18e98cbb31d0e5674d3bf7619f789b69e916eab49dc9a`). Its document-only canonical envelope and full digest are:
 
 ```json
-{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":null,"range":{"encoding":"legacy","values":[0,10,14]},"symbol":"local 0","symbolRoles":1,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js","scope":"document"}
+{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":null,"range":{"encoding":"legacy","values":[0,10,14]},"symbol":"local 0","symbolRoles":1,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js"}
 ```
 
-`D(E) = 7a7d3aaa3aeb5b837ba57eae6e89b0e740db0bc284f1e8453c7160a6beb8353b`. This is not the earlier draft digest without `scope`; never mix those domains/shapes or assume `local 0` is a call.
+`D(E) = 62e732ddd555e57b441e29e1badf1be2fbab6c1fcc958854942ba5c0c793f2f5`. This restores the draft digest for this exact envelope shape; it does not reinterpret legacy #26 `SemanticCapture` or assume `local 0` is a call.
 
 The following two additional admitted branch inputs are carried by a separate complete one-document Index. Its admitted document `src/A.js` has exactly the same A source bytes and hash from above; its entire manifest is `[{"contentHash":"8026dced2c17cbbfb8563d8a7f07e250a141be61cd497e6ba88caeb52a6de8f2","document":{"language":"javascript","path":"src/A.js","sourceSetId":"app"}}]` with empty-prefix manifest SHA-256 `52b4124248408e1a37e7ff17b786ff57a998b54b3ebfe252e478330d203506ee`. Its exact 70-byte `scip 0.10.0`-decoded binary (legacy four with typed single-line enclosing; typed single-line primary with typed multi-line enclosing) is:
 
@@ -140,13 +137,69 @@ The following two additional admitted branch inputs are carried by a separate co
 
 `artifactHash = 2b3c07f5e087eecb1b0ccb18627b0b66c60eb2bbde5a083e918323d4034e6d2b`. The other authenticated profile/component bytes are unchanged, but this is **not** the 116-byte artifact and proof tuples must bind this artifact hash. `enclosingRange` is either exactly one validated branch or null. Each typed zero is a present canonical JSON numeric field even where protobuf omitted the zero on the wire.
 
-- `legacy-four` canonical: `{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":{"encoding":"singleLine","endCharacter":16,"line":0,"startCharacter":12},"range":{"encoding":"legacy","values":[0,13,0,14]},"symbol":"B#","symbolRoles":0,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js","scope":"document"}`; `D(E)=50178bf071519261d395005561dab614ac25870048220640ea5c16e5ec6b0a25`.
+- `legacy-four` canonical: `{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":{"encoding":"singleLine","endCharacter":16,"line":0,"startCharacter":12},"range":{"encoding":"legacy","values":[0,13,0,14]},"symbol":"B#","symbolRoles":0,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js"}`; `D(E)=d7f30bb3dc27b0329a86dc17ceee4eefb229243b96cc2d705d38ad1915af744b`.
 
-- `enclosing-multi` canonical: `{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":{"encoding":"multiLine","endCharacter":16,"endLine":0,"startCharacter":12,"startLine":0},"range":{"encoding":"singleLine","endCharacter":14,"line":0,"startCharacter":13},"symbol":"B#","symbolRoles":0,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js","scope":"document"}`; `D(E)=eb3eef61efe5f3aa935b81ba18e79094e4304a36ebe89174e422ae8b318aa7ce`.
+- `enclosing-multi` canonical: `{"formatVersion":1,"positionEncoding":1,"raw":{"enclosingRange":{"encoding":"multiLine","endCharacter":16,"endLine":0,"startCharacter":12,"startLine":0},"range":{"encoding":"singleLine","endCharacter":14,"line":0,"startCharacter":13},"symbol":"B#","symbolRoles":0,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js"}`; `D(E)=58e85dbe2fc863b4fe7fe2d7a87a2c2a406618365e8517ef9b8c89e0e399a6c2`.
 
-Reject primary empty/missing range, legacy length 2 or 5, negative/out-of-int32 coordinate, mixed legacy and typed (including identical-looking values), two competing typed oneof tags even if a protobuf decoder silently overwrites one, and mixed legacy/typed enclosing range. Detect competing oneof tags from authenticated wire before trusting the parsed last value. Reject omitted/0/unknown `Document.position_encoding`; never silently call zero UTF-16. UTF-16 coordinate splitting a surrogate pair, UTF-8 byte coordinate splitting a scalar, UTF-32 coordinate past line end, reversed span, scalar boundary outside source or a CRLF coordinate that includes the `\r` as a phantom part of the next line fails before join. Example source `"😀\r\nx"`: UTF-16 line 0 offset 1 splits the surrogate; UTF-8 line 0 offset 1 splits the four-byte scalar; line 1 starts only after both CRLF bytes and `x` is at line 1 column 0. A typed range with `{line:0,startCharacter:0,endCharacter:0}` is zero-length and cannot support an ordinary nonempty reference anchor. A valid converted primary span with no compatible measured destination candidate is a join failure, not an invalid range.
+Reject primary empty/missing range, legacy length 2 or 5, negative/out-of-int32 coordinate, mixed legacy and typed (including identical-looking values), two competing typed oneof tags even if a protobuf decoder silently overwrites one, and mixed legacy/typed enclosing range. Detect competing oneof tags from authenticated wire before trusting the parsed last value. Reject unknown `Document.position_encoding`; raw 0 is admitted **only** with a valid authenticated producer-version manifest encoding fallback for conversion. Neither a guessed UTF-16 default nor conversion without valid artifact/manifest encoding is allowed. UTF-16 coordinate splitting a surrogate pair, UTF-8 byte coordinate splitting a scalar, UTF-32 coordinate past line end, reversed span, scalar boundary outside source or a CRLF coordinate that includes the `\r` as a phantom part of the next line fails before join. Example source `"😀\r\nx"`: UTF-16 line 0 offset 1 splits the surrogate; UTF-8 line 0 offset 1 splits the four-byte scalar; line 1 starts only after both CRLF bytes and `x` is at line 1 column 0. A typed range with `{line:0,startCharacter:0,endCharacter:0}` is zero-length and cannot support an ordinary nonempty reference anchor. A valid converted primary span with no compatible measured destination candidate is a join failure, not an invalid range.
 
-Duplicate `Document.relative_path=src/A.js` in one Index rejects the entire captured artifact before extraction even when one entry declares another language (it must not overwrite/merge). Change only presentation-only documentation or diagnostic: envelope digest stays the same, binary artifact hash and proof context change; an old artifact manifest hash now fails. Unknown protobuf fields anywhere, including omitted nested diagnostics/signatures/metadata; unknown enum numeric values/role bits (e.g. role 128); nonmatching `Document.text`; fake manifest path/source/producer bytes; or a new semantic extension under an omitted message rejects or requires an explicit envelope/domain version change. No unknown field can vanish in a protobuf round-trip before validation. Changing raw symbol, role, range or encoding changes the envelope digest; doing so without updating binary/manifest/inventory rejects the artifact. Index metadata/display fields remain authenticated via original binary hash, never silently promoted into local semantic facts.
+Duplicate `Document.relative_path=src/A.js` in one Index rejects the entire captured artifact before extraction even when one entry declares another language (it must not overwrite/merge). Change only presentation-only documentation or diagnostic: envelope digest stays the same, binary artifact hash and proof context change; an old artifact manifest hash now fails. Unknown protobuf fields anywhere, including omitted nested diagnostics/signatures/metadata; unknown enum numeric values/role bits (e.g. role 128); nonmatching `Document.text`; fake manifest path/source/producer bytes; or a new unknown semantic extension under an omitted message rejects or requires an explicit envelope/domain version change. Known nonempty `Signature.occurrences` remain presentation-only, verified under the artifact hash and excluded from source joins. No unknown field can vanish in a protobuf round-trip before validation. Changing raw symbol, role, range or encoding changes the envelope digest; doing so without updating binary/manifest/inventory rejects the artifact. Index metadata/display fields remain authenticated via original binary hash, never silently promoted into local semantic facts.
+
+## Raw-zero encoding and nonempty signature-occurrence controls
+
+The next independent one-document captured input uses `src/A.js` and **the same authenticated A source bytes** `66756e6374696f6e206628297b6728293b7d0a` (SHA-256 `8026dced2c17cbbfb8563d8a7f07e250a141be61cd497e6ba88caeb52a6de8f2`). Its complete source manifest is `[{"contentHash":"8026dced2c17cbbfb8563d8a7f07e250a141be61cd497e6ba88caeb52a6de8f2","document":{"language":"javascript","path":"src/A.js","sourceSetId":"app"}}]`, SHA-256 `52b4124248408e1a37e7ff17b786ff57a998b54b3ebfe252e478330d203506ee`. This is a complete logical capture context: the signed/pinned producer profile, original artifact bytes/hash, decoder version and manifest bind the fallback encoding. The exact serialization of the future importer manifest is a separate 11B choice, not a retroactive #26 format change. For this positive example, the authenticated manifest/profile attests this example tuple (the **declared** `positionEncoding:1` means UTF-8 **for conversion**, not a mutation of raw SCIP `0`):
+
+```json
+{"artifactHash":"9bd3ef0f2a6b9aeef556af27a8a424d2cf21a2f18adf8ab567a82b1677a24a59","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","language":"javascript","positionEncoding":1,"producerHash":"f615261a2fb15f6d51cac723cdbe8c3fe3fb495090f43b3cffc226bb3be278ed","producerId":"scip-test","producerVersion":"1.0.0","rootId":"root-app","sourceManifestHash":"52b4124248408e1a37e7ff17b786ff57a998b54b3ebfe252e478330d203506ee","sourceRevision":"r1","sourceSetId":"app"}
+```
+
+The other captured toolchain/config/dependency component bytes and hashes are the ones declared in the complete two-document fixture above; document A's source set/root and hash are the same. The Index wire below is **78 bytes**. Its `Document.position_encoding` field is **omitted on wire**, so `scip 0.10.0` decodes raw value `0`. It includes a source-document definition occurrence `[0,9,10]` and a `SymbolInformation.signature_documentation` with `language="javascript"`, `text="f()"` and **one** separate signature-text occurrence `[0,0,1]` (`A#`). Native `scip 0.10.0` decoded `position_encoding=0`, `Document.occurrences.len()=1`, `Signature.occurrences.len()=1`; that signature occurrence never becomes a second source-document occurrence or a local join anchor.
+
+```text
+124c0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a270a02412328113201663a1c220a6a6176617363726970742a0366282912090a0300000112024123
+```
+
+`artifactHash = 9bd3ef0f2a6b9aeef556af27a8a424d2cf21a2f18adf8ab567a82b1677a24a59`. The exactly two document-only envelopes and complete #22 canonical context/digest/proof vectors are:
+
+### raw-zero occurrence
+
+`canonicalBytes(E)`:
+
+```json
+{"formatVersion":1,"positionEncoding":0,"raw":{"enclosingRange":null,"range":{"encoding":"legacy","values":[0,9,10]},"symbol":"A#","symbolRoles":1,"syntaxKind":0},"recordKind":"occurrence","relativePath":"src/A.js"}
+```
+
+`D(E) = 2a21056ef6dc2f9bcc63451c2f0d66e1f575b51635446e45a79d704ba46e7b66`. Its raw `positionEncoding:0` remains `0` in digest bytes; only conversion consults the authenticated manifest 1.
+
+`canonicalBytes(C)`:
+
+```json
+{"artifactHash":"9bd3ef0f2a6b9aeef556af27a8a424d2cf21a2f18adf8ab567a82b1677a24a59","factDigest":"2a21056ef6dc2f9bcc63451c2f0d66e1f575b51635446e45a79d704ba46e7b66","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
+```
+
+`capturedProofId = 406aae0010a2e060801d84ab6324aada9cc5eaeb4fd22f2fe60a2bf950d1a761`.
+
+### raw-zero symbolInformation
+
+`canonicalBytes(E)`:
+
+```json
+{"formatVersion":1,"positionEncoding":0,"raw":{"displayName":"f","enclosingSymbol":"","kind":17,"symbol":"A#"},"recordKind":"symbolInformation","relativePath":"src/A.js"}
+```
+
+`D(E) = 0a75f86a05a33b238bf6ca7a13daffb7a2be725cc25b84f32767c353c2826f2b`. Its raw `positionEncoding:0` remains `0` in digest bytes; only conversion consults the authenticated manifest 1.
+
+`canonicalBytes(C)`:
+
+```json
+{"artifactHash":"9bd3ef0f2a6b9aeef556af27a8a424d2cf21a2f18adf8ab567a82b1677a24a59","factDigest":"0a75f86a05a33b238bf6ca7a13daffb7a2be725cc25b84f32767c353c2826f2b","language":"javascript","producerId":"scip-test","relativePath":"src/A.js","sourceRevision":"r1","sourceSetId":"app"}
+```
+
+`capturedProofId = 2b82e58ff2cea25d53a519af635af17fd9e447ae09110e7fa2de095bc8caccb8`.
+
+**Signature omission positive:** removing only `signature_documentation` from this Index gives the complete 48-byte wire `122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166`, hash `a4d1f5ce282cd4c3eecc58992c2badafaa4a590a943564345700f07203ac341b`. The **same two envelope canonical bytes and fact digests** remain. Their proof IDs change, solely because the authenticated binary hash changes: occurrence `1d74a5d8fb1d3c75809f9bec0d9875932601ace3cefec790cf3d2c19c071fe99`; symbolInformation `42d3780d5a1fc0c484fd8d674a305990d5c893e4706ea71d4e347cee4acc2499`. An original artifact-hash manifest that still names the 78-byte version **rejects** this modified 48-byte binary until newly authenticated; matching fact digests alone never authenticate it. A presentation-only nonempty signature occurrence is allowed, but malformed unknown nested fields/enums still reject recursively.
+
+**Negative:** the same 78-byte raw-zero binary with no authenticated producer-version position encoding in **either** manifest or producer descriptor, or with both declarations `0`/unknown, has no declared conversion convention and atomically fails admission; do not guess UTF-16. A declared valid encoding inconsistent with a valid artifact value 1/2/3 also fails. A manifest that lies about A source bytes, producer version, root, artifact hash or decoder fails before conversion. A valid raw `0` may produce a different `D(E)` from otherwise identical raw `1` because raw encoding is itself a digest field, even when both convert via the same authenticated UTF-8 convention. An explicitly encoded protobuf zero is equal to omitted zero for this envelope because protobuf field presence does not enter the canonical shape.
 
 ## Measured native anchors and five destination-family gates
 
@@ -195,16 +248,16 @@ This **independent** admitted fixture has the same source set/profile/component 
 `9943b2b703c03c7112edad95a26d99656d106054d2d1ab498bd6edd708473516`. The relation envelope's complete #22 canonical bytes, digest and proof tuple are:
 
 ```json
-{"formatVersion":1,"positionEncoding":1,"raw":{"isDefinition":false,"isImplementation":true,"isReference":true,"isTypeDefinition":false,"sourceSymbol":"A#","targetSymbol":"B#"},"recordKind":"relationship","relativePath":"src/types/A.js","scope":"document"}
+{"formatVersion":1,"positionEncoding":1,"raw":{"isDefinition":false,"isImplementation":true,"isReference":true,"isTypeDefinition":false,"sourceSymbol":"A#","targetSymbol":"B#"},"recordKind":"relationship","relativePath":"src/types/A.js"}
 ```
 
-`factDigest = 0b4a7c80ed964f827deb5ea8fb4fa1150d089920bca0f7e62f3607455afaecfb`.
+`factDigest = 69d11d80b3b6155d1d67769c5790041487912e26e03bf75ccec241e43ec24089`.
 
 ```json
-{"artifactHash":"9943b2b703c03c7112edad95a26d99656d106054d2d1ab498bd6edd708473516","factDigest":"0b4a7c80ed964f827deb5ea8fb4fa1150d089920bca0f7e62f3607455afaecfb","language":"javascript","producerId":"scip-test","relativePath":"src/types/A.js","sourceRevision":"r1","sourceSetId":"app"}
+{"artifactHash":"9943b2b703c03c7112edad95a26d99656d106054d2d1ab498bd6edd708473516","factDigest":"69d11d80b3b6155d1d67769c5790041487912e26e03bf75ccec241e43ec24089","language":"javascript","producerId":"scip-test","relativePath":"src/types/A.js","sourceRevision":"r1","sourceSetId":"app"}
 ```
 
-`capturedProofId = 07e88a555d72a75a90c4dfe18b9d9761678ae980b95625898ca46248e2192aef`. Native parsing **independently** measures A class name byte `[6,7)`, B class name byte `[6,7)`, and A `extends B` type-syntax reference `[16,17)`; the raw flags alone do not prove an `extends` destination kind. Native descriptor inputs and full SHA-256 / stable ID pairs are:
+`capturedProofId = 0e3f891679000ee4297d78d6b96ae33f681a2a6cfb568884ca30cbb44b745f16`. Native parsing **independently** measures A class name byte `[6,7)`, B class name byte `[6,7)`, and A `extends B` type-syntax reference `[16,17)`; the raw flags alone do not prove an `extends` destination kind. Native descriptor inputs and full SHA-256 / stable ID pairs are:
 
 - `{"ancestors":[],"declaration":{"kind":"type","name":"A","ordinal":0,"signature":null},"language":"javascript","path":"src/types/A.js","sourceSet":"app"}` → `c842b1aba16762e894d8304d25c0db4bdcbcd47544c406646e1af46fb3cc9a2a` / `sid:v1:c842b1aba16762e894d8304d25c0db4b`.
 - `{"ancestors":[],"declaration":{"kind":"type","name":"B","ordinal":0,"signature":null},"language":"javascript","path":"src/types/B.js","sourceSet":"app"}` → `5535a303c2d5aeb6df14cb52dcc959bc4c8e0a439b051964d23f751c9ef4cc7d` / `sid:v1:5535a303c2d5aeb6df14cb52dcc959bc`.
