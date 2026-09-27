@@ -70,12 +70,16 @@
     return {expectedRevision: revision, classId: selector.classId, memberName: selector.memberName,
       startByte: selector.startByte, endByte: selector.endByte};
   }
-  function targetLabel(target, actionLabel = target.action === "class" ? "Class" : "Sequence") {
-    const symbol = target.symbol;
-    const identity = symbol.qualifiedName || target.qualifiedName || symbol.name || symbol.id;
-    const column = positive(symbol.range?.startColumn) ? `:${symbol.range.startColumn}` : "";
-    const location = `${text(symbol.path)}:${symbol.range?.startLine || "?"}${column}`;
-    return `${actionLabel} · ${text(identity)} · ${text(target.reason)} · ${text(target.matchKind).replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()} · ${location}`;
+  function sourceWitness(item) {
+    const r = item?.range;
+    return typeof item?.path === "string" && !!item.path.trim() && !!r &&
+      Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
+      Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
+      (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
+      (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
+      (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
+      (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
+      (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
   }
   async function open(event, selector, {isCurrent} = {}) {
     const anchor = capture(event), owner = api, ticket = ++serial;
@@ -125,34 +129,22 @@
       }
       if (!Array.isArray(data.targets)) throw new Error("Invalid navigation response.");
       const actions = [];
-      const candidates = data.targets.slice(0, MAX_TARGETS).filter(target => target &&
-        ["class", "sequence"].includes(target.action) && target.symbol &&
-        typeof target.symbol.id === "string" && target.symbol.id);
-      // Put explicit call targets ahead of enclosing context, preserving the
-      // backend order within both groups and the bounded original symbols.
-      const targets = [...candidates.filter(target => target.reason === "call"),
-        ...candidates.filter(target => target.reason !== "call")];
-      const labels = targets.map(target => targetLabel(target));
-      for (const [index, target] of targets.entries()) {
-        const duplicate = labels.indexOf(labels[index]) !== labels.lastIndexOf(labels[index]);
-        const range = target.symbol.range;
-        const detail = duplicate ? ` · bytes ${range?.startByte ?? "?"}–${range?.endByte ?? "?"} · ${text(target.symbol.id)}` : "";
-        const choice = (label, run) => ({label: label + detail, run: () => {
-          if (!current()) return;
-          // One action consumes every choice, including retained source/sequence callbacks.
-          serial++;
-          return run();
-        }});
-        if (target.action === "sequence" && typeof owner.openSource === "function") {
-          // Preserve the original measured symbol and request snapshot. Merely
-          // displaying these choices must not read source or select a method.
-          actions.push(choice(targetLabel(target, "Go to source"), () => owner.openSource(target.symbol, revision)));
-          actions.push(choice(targetLabel(target, "Open sequence"), () => owner.selectMethod(target.symbol)));
-        } else {
-          actions.push(choice(labels[index], () => target.action === "class" ? owner.openClass(target.symbol) : owner.selectMethod(target.symbol)));
-        }
+      // Old call/type matches are lexical candidates, even when labelled "measured".
+      // Only a declaration on the selected source line witnesses a source-open action.
+      const declarations = data.targets.slice(0, MAX_TARGETS).filter(target =>
+        target?.reason === "declaration" && target.matchKind === "measured" &&
+        body.path && target.symbol?.path === body.path && target.symbol.range?.startLine === body.line &&
+        sourceWitness(target.symbol) &&
+        typeof owner.openSource === "function");
+      const labels = declarations.map(target => `Read declaration source · ${text(target.symbol.name)} · ${text(target.symbol.path)}:${target.symbol.range.startLine}`);
+      for (const [index, target] of declarations.entries()) {
+        const r = target.symbol.range;
+        const suffix = labels.indexOf(labels[index]) !== labels.lastIndexOf(labels[index])
+          ? ` · bytes ${r.startByte ?? "?"}–${r.endByte ?? "?"} · ${text(target.symbol.id)}` : "";
+        actions.push({label: labels[index] + suffix,
+          run: () => { if (current()) { serial++; return owner.openSource(target.symbol, revision); } }});
       }
-      if (!actions.length) actions.push(notice("No indexed target. Built-in or unmatched types are not guessed."));
+      if (!actions.length) actions.push(notice("No measured declaration on this line. Candidate type and call targets cannot be opened as navigation."));
       if (data.requireIndex) actions.push(notice("Index the workspace to populate cached class declarations."));
       for (const warning of (Array.isArray(data.warnings) ? data.warnings : []).slice(0, MAX_NOTICES)) actions.push(notice(warning));
       if (data.truncated || data.targets.length > MAX_TARGETS || data.warnings?.length > MAX_NOTICES) actions.push(notice("Partial index or navigation results; see notices."));
