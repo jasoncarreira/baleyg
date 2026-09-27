@@ -460,9 +460,7 @@ mod tests {
             assert_eq!(s.commit(ready), Some(json!({"ready":true})));
             s = Session::new();
         }
-        let rejected_id = format!(
-            r#"{{"jsonrpc":"2.0","id":9007199254740992,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"x","version":"1"}}}}}}"#
-        );
+        let rejected_id = r#"{"jsonrpc":"2.0","id":9007199254740992,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"1"}}}"#.to_string();
         let err = wire::decode(wire::Frame::Line(rejected_id.into_bytes())).unwrap_err();
         assert_eq!(err.code, -32600);
         assert_eq!(err.id, Value::Null);
