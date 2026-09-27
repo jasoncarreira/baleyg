@@ -127,11 +127,11 @@ test("native SVG preserves nested branch loop try, safe labels, unknown lifeline
   assert.ok(descendants(branch).some(n=>n.attrs?.["data-kind"]==="loop"));
   const attempt=all.find(n=>n.attrs?.["data-kind"]==="try");
   assert.ok(descendants(attempt).some(n=>n.attrs?.["data-step-id"]==="cleanup"));
-  assert.ok(all.some(n=>n.tagName==="svg")); assert.ok(all.some(n=>n.tagName==="line"&&n.attrs?.class==="sequence-arrow"));
+  assert.ok(all.some(n=>n.tagName==="svg")); assert.equal(all.filter(n=>n.attrs?.class==="sequence-arrow").length,0);
   assert.ok(all.some(n=>n.attrs?.["data-presentation"]==="quiet-note"));
   assert.ok(all.every(n=>!["script","img"].includes(n.tagName)));
   assert.doesNotMatch(text(h.get("sequence-diagram")), /hidden-log/);
-  assert.match(text(h.get("sequence-diagram")), /Unknown target/);
+  assert.doesNotMatch(text(h.get("sequence-diagram")), /Unknown target/);
   assert.match(text(h.get("sequence-diagram")), /<script>bad<\/script>/);
   const control=all.find(n=>n.attrs?.role==="button"); let prevented=false;
   control.listeners.keydown({key:"Enter",preventDefault(){prevented=true;}});
@@ -609,7 +609,7 @@ test("navigation source action forwards measured range and snapshot without sele
   assert.equal(requests.length,0);await hooks.openSource(target,h.run("({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1})"));
   assert.equal(requests.length,1);assert.match(requests[0],/^\/api\/source\?path=A.java&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=1$/);
   assert.equal(h.run('selectedMethod.id'),'caller');assert.ok(h.get('source').children[0].children[1].classList.contains('highlight'));
-  h.run(`status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}`);await hooks.openSource(target,h.run("({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1})"));assert.equal(requests.length,1);assert.match(h.get('error').textContent,/older revision/);
+  h.run(`status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}`);await hooks.openSource(target,h.run("({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1})"));assert.equal(requests.length,1);assert.match(h.get('error').textContent,/snapshot|revision/i);
 });
 
 test("same numeric revision with new generation clears browse and source state", async () => {
@@ -837,7 +837,7 @@ test("later tree page cannot mix equal numeric revisions from distinct generatio
 test("same-workspace automatic Pair refresh retains list/save/delete payloads for views and notes", async () => {
  const h=harness(), calls=[];
  let viewsData=[], notesData=[];
- h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}; seed='root'; result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:1}}`);
+ h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}; seed='root'; result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:0,includeCallbacks:false}}`);
  h.context.crypto={randomUUID:(()=>{let n=0;return ()=>`item-${++n}`;})()};
  h.context.fetch=async(url,opts)=>{
    calls.push({url,method:opts.method,body:opts.body && JSON.parse(opts.body)});
@@ -858,7 +858,7 @@ test("same-workspace automatic Pair refresh retains list/save/delete payloads fo
  h.run(`result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:1}}; seed='root'`);
  h.get('view-title').value='Keep';h.get('save-form').listeners.submit({preventDefault(){}}); await new Promise(setImmediate);
  h.get('note').value='Remember';h.get('annotation-form').listeners.submit({preventDefault(){}});await new Promise(setImmediate);
- assert.deepEqual(calls.find(c=>c.url==='/api/views/item-1'&&c.method==='PUT').body,{id:'item-1',title:'Keep',query:{seed:'root',depth:1},pins:{},hidden:[]});
+ assert.deepEqual(calls.find(c=>c.url==='/api/views/item-1'&&c.method==='PUT').body,{id:'item-1',title:'Keep',query:{seed:'root',depth:1,includeCallbacks:false},pins:{},hidden:[]});
  assert.deepEqual(calls.find(c=>c.url==='/api/annotations/item-2'&&c.method==='PUT').body,{id:'item-2',nodeId:'root',body:'Remember'});
  const viewDelete=descendants(h.get('views')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
  const noteDelete=descendants(h.get('annotations')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
@@ -871,42 +871,24 @@ test("same-workspace automatic Pair refresh retains list/save/delete payloads fo
 
 test("request handlers reject bare numeric pins without sending a request", async () => {
  const h=harness(), requests=[];h.context.fetch=async url=>{requests.push(url);throw Error('invalid request was sent');};
- await assert.rejects(h.run("showSource({path:'x',range:{startLine:1,endLine:1}},1)"),/older revision/);
+ await assert.rejects(h.run("showSource({path:'x',range:{startLine:1,endLine:1}},1)"),/snapshot pair|revision/);
  assert.deepEqual(requests,[]);
 });
 
 
-test("expand outgoing calls checks the complete response pair before painting a branch", async () => {
-  for (const mismatch of [false, true]) {
-    const h = harness(), requests = [];
-    const target = {...symbol("target"), kind:"method"};
-    const root = {...symbol("root"), kind:"method"};
-    const call = {id:"entry",caller:"root",target:"target",calleeText:"target",path:"src/a.js",range:{startLine:2,endLine:2},resolution:"resolved"};
-    const child = {id:"child",caller:"target",calleeText:"leaf",path:"src/a.js",range:{startLine:3,endLine:3},resolution:"unresolved"};
-    h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root';`);
-    h.context.result = {revision:oldPair,nodes:[root,target],calls:[call]};
-    h.run("result = globalThis.result; renderResult()");
-    const expand = descendants(h.get("calls")).find(n => n.textContent === "Expand outgoing calls");
-    assert.ok(expand, "renderResult must expose an expandable call without throwing");
-    const branch = descendants(h.get("calls")).find(n => n.tagName === "ul");
-    descendants(h.get("calls")).forEach(n => { n.isConnected = true; });
-    h.context.fetch = async (url, options) => {
-      requests.push({url,method:options.method,body:options.body && JSON.parse(options.body)});
-      if (url === "/api/query") return response({revision:mismatch?newPair:oldPair,nodes:[target],calls:[child]});
-      if (url === "/api/status") return response({revision:newPair,workspaceRoot:"/same",stats:{}});
-      if (url.startsWith("/api/tree")) return response({...treePage("",[]),revision:newPair});
-      if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:newPair,catalogId:null,packages:[],warnings:[]});
-      throw Error(`Unexpected request ${url}`);
-    };
-    expand.listeners.click(); await new Promise(setImmediate); await new Promise(setImmediate);
-    assert.equal(requests[0].url,"/api/query"); assert.equal(requests[0].method,"POST");
-    assert.equal(requests[0].body.seed,"target");
-    assert.equal(requests.filter(r => r.url === "/api/status").length,mismatch?1:0);
-    assert.equal(descendants(branch).some(n => n.textContent === "leaf"),!mismatch);
-    assert.equal(branch.hidden,mismatch);
-    assert.equal(h.run("result") === null,mismatch);
-    assert.ok(requests.every(r => !/questions|answer|provider/.test(r.url)));
-  }
+test("old target IDs never enable follow-up graph queries", async () => {
+  const h = harness(), requests = [];
+  const target = {...symbol("target"), kind:"method"};
+  const root = {...symbol("root"), kind:"method"};
+  const call = {id:"entry",caller:"root",target:"target",candidateSymbols:["target"],calleeText:"target",path:"src/a.js",range:{startLine:2,endLine:2},resolution:"internal"};
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root';`);
+  h.context.result = {revision:oldPair,nodes:[root,target],calls:[call]};
+  h.context.fetch = async url => { requests.push(url); throw Error("Unexpected request " + url); };
+  h.run("result = globalThis.result; renderResult()");
+  assert.equal(descendants(h.get("calls")).some(n => n.textContent === "Expand outgoing calls"), false);
+  assert.equal(descendants(h.get("calls")).some(n => n.textContent === "Read call-site source"), true);
+  assert.equal(descendants(h.get("nodes")).some(n => n.textContent === "target · method"), false);
+  assert.equal(requests.length, 0);
 });
 
 test("failed status reconciliation allows the next unexpected pair to retry", async () => {
@@ -941,4 +923,37 @@ test("failed status reconciliation allows the next unexpected pair to retry", as
     assert.equal(requests.filter(r=>r.url.startsWith('/api/files')).length,2);
     assert.ok(requests.filter(r=>r.url.startsWith('/api/files')).every(r=>r.method==='GET'));
   }
+});
+
+test("new terminal DTO keeps measured call source without candidate traversal", () => {
+  const h=harness(), root={...symbol("root"),kind:"method"};
+  h.context.result={revision:oldPair,nodes:[root],calls:[{id:"terminal",caller:"root",calleeText:"open",path:"src/a.js",range:{startLine:4,endLine:4}}],regions:[]};
+  h.run(`status={revision:${JSON.stringify(oldPair)}};seed='root';result=globalThis.result;renderResult()`);
+  const rows=descendants(h.get("calls"));
+  assert.ok(rows.some(item=>item.textContent==="Read call-site source"));
+  assert.ok(rows.some(item=>item.textContent==="Syntax only · target unverified"));
+  assert.equal(rows.some(item=>item.textContent==="Expand outgoing calls"),false);
+});
+
+test("saved callback setting never reaches an old query endpoint", async () => {
+  const h=harness(), requests=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)}};seed='root';`);
+  h.context.fetch=async(url,opts)=>{requests.push({url,body:opts.body&&JSON.parse(opts.body)});return response({revision:oldPair,nodes:[],calls:[]});};
+  await h.run("runQuery({seed:'root',depth:5,includeCallbacks:true,maxNodes:40,maxCalls:200,excludePaths:[]})");
+  assert.equal(requests[0].url,"/api/query");
+  assert.equal(requests[0].body.depth,1);
+  assert.equal(requests[0].body.includeCallbacks,false);
+});
+
+test("missing or malformed call-site range stays non-actionable on an old DTO",()=>{
+  const h=harness(), root={...symbol("root"),kind:"method"};
+  h.context.result={revision:oldPair,nodes:[root],calls:[
+    {id:"missing",caller:"root",target:"guessed",calleeText:"open",path:"src/a.js"},
+    {id:"invalid",caller:"root",target:"guessed",calleeText:"open",path:"src/a.js",range:{startLine:7,endLine:2}}
+  ],regions:[]};
+  h.run(`status={revision:${JSON.stringify(oldPair)}};seed='root';result=globalThis.result;renderResult()`);
+  const rows=descendants(h.get("calls"));
+  assert.equal(rows.filter(item=>item.textContent==="Read call-site source").length,0);
+  assert.equal(rows.filter(item=>item.textContent==="Expand outgoing calls").length,0);
+  assert.equal(rows.filter(item=>item.textContent==="Call site · source unavailable").length,2);
 });

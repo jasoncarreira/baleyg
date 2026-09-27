@@ -1,7 +1,7 @@
 /* Cached syntax only. No source or provider request occurs on selection. */
 (function () {
   "use strict";
-  const MAX_NODES = 24, MAX_EDGES = 64, MAX_EXPANDED = 12;
+  const MAX_NODES = 24;
   const WIDTH = 300, HEIGHT = 116, OPEN_HEIGHT = 390, STEP_X = 520;
   let api, ui, serial = 0, searchSerial = 0, seed = null, expanded = [], diagram = null;
   let positions = new Map(), cards = new Map(), stage = null, menu = null, menuAnchor = null, warningBox = null;
@@ -10,98 +10,20 @@
   let controls, changeButton, allButton, chooser = null, showAll = false, membersOpen = new Set();
   const currentView = () => snapshot && valid(snapshot) && displayTicket === serial;
   function closeChooser() { if (chooser) chooser.remove(); chooser = null; }
-  const hierarchyEdge = edge => edge.kind === "extends" || edge.kind === "implements";
   function selectedHierarchy(data) {
-    const actual = new Set(data.nodes.slice(0, MAX_NODES).filter(node => node.class).map(node => node.id));
-    const roots = [seed, ...expanded].filter(id => actual.has(id));
-    const edges = data.edges.slice(0, MAX_EDGES).filter(edge => hierarchyEdge(edge) && actual.has(edge.owner) && actual.has(edge.target));
-    // Walk ancestors and descendants separately from the explicit roots. An ancestor's
-    // other subtypes are not descendants of the focus. Hints never bridge actual classes.
-    const walk = (from, to) => {
-      const reached = new Set(roots);
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const edge of edges) if (reached.has(edge[from]) && !reached.has(edge[to])) {
-          reached.add(edge[to]); changed = true;
-        }
-      }
-      return reached;
-    };
-    return new Set([...walk("owner", "target"), ...walk("target", "owner")]);
+    return new Set([seed, ...expanded].filter(id => data.nodes.some(node => node.id === id && node.class)));
   }
   function visibleNodes(data) {
     const selected = selectedHierarchy(data);
-    return data.nodes.slice(0, MAX_NODES).filter(node => showAll || selected.has(node.id) ||
-      (!node.class && ui.unmatched.checked && data.edges.slice(0, MAX_EDGES).some(edge =>
-        (edge.target === node.id && selected.has(edge.owner)) || (edge.owner === node.id && selected.has(edge.target)))));
-  }
-  function shownEdges(data, ids) {
-    const hints = new Set(data.nodes.slice(0, MAX_NODES).filter(node => !node.class).map(node => node.id));
-    return data.edges.slice(0, MAX_EDGES).filter(edge => ids.has(edge.owner) && ids.has(edge.target) &&
-      (showAll || hierarchyEdge(edge) || expanded.includes(edge.owner) || expanded.includes(edge.target) ||
-        (ui.unmatched.checked && (hints.has(edge.owner) || hints.has(edge.target)))));
+    return data.nodes.slice(0, MAX_NODES).filter(node => node.class && (showAll || selected.has(node.id)));
   }
   function updateStatus() {
-    const nodes = visibleNodes(diagram), ids = new Set(nodes.map(node => node.id));
-    const count = shownEdges(diagram, ids).length;
-    const partial = diagram.truncated || diagram.nodes.length > MAX_NODES || diagram.edges.length > MAX_EDGES;
-    state(`${nodes.length} shown · ${count} relationships.${partial ? " Partial diagram; some index or diagram details are omitted. See notices." : ""}${diagram.requireIndex ? " Index workspace to populate class declarations." : ""}`, diagram.requireIndex ? "unindexed" : partial ? "partial" : "ready");
+    const nodes = visibleNodes(diagram);
+    const partial = diagram.truncated || diagram.nodes.length > MAX_NODES;
+    state(`${nodes.length} measured declarations shown · no proven class relationships.${partial ? " Partial diagram; some index or diagram details are omitted. See notices." : ""}${diagram.requireIndex ? " Index workspace to populate class declarations." : ""}`, diagram.requireIndex ? "unindexed" : partial ? "partial" : "ready");
     controls.hidden = false;
-    allButton.textContent = showAll ? "Show hierarchy and selected classes" : "Show all returned classes";
+    allButton.textContent = showAll ? "Show selected classes" : "Show all returned classes";
     allButton.setAttribute("aria-pressed", String(showAll));
-  }
-  function showRelated(node) {
-    closeChooser();
-    const c = snapshot, generation = diagramGeneration;
-    const usable = () => valid(c) && generation === diagramGeneration && displayTicket === serial;
-    const automatic = selectedHierarchy(diagram);
-    const candidates = diagram.nodes.slice(0, MAX_NODES).filter(item => item.class && item.id !== node.id && !automatic.has(item.id) &&
-      diagram.edges.slice(0, MAX_EDGES).some(edge => (edge.owner === node.id && edge.target === item.id) || (edge.target === node.id && edge.owner === item.id)));
-    chooser = el("section", undefined, "classes-chooser");
-    chooser.setAttribute("aria-label", `Related classes for ${node.class.symbol.name}`);
-    chooser.append(el("h3", `Related to ${node.class.symbol.name}`));
-    chooser.append(el("p", "Indexed hierarchy is already shown. Choose other related classes to add.", "classes-choice-note"));
-    const needsAnchor = !automatic.has(node.id);
-    if (needsAnchor) {
-      candidates.unshift(node);
-      chooser.append(el("p", `Include ${node.class.symbol.name} to keep new classes connected to your selection.`));
-    }
-    const choices = [];
-    for (const candidate of candidates) {
-      const label = el("label", undefined, "classes-choice"), check = el("input"); check.type = "checkbox";
-      check.value = candidate.id;
-      if (needsAnchor && candidate.id === node.id) check.checked = true;
-      const relations = diagram.edges.slice(0, MAX_EDGES).filter(edge => candidate.id === node.id
-        ? (edge.owner === node.id && automatic.has(edge.target)) || (edge.target === node.id && automatic.has(edge.owner))
-        : (edge.owner === node.id && edge.target === candidate.id) || (edge.target === node.id && edge.owner === candidate.id));
-      const directions = [...new Set(relations.map(edge => `${edge.owner === node.id ? "outgoing" : "incoming"} ${edge.kind}`))].join(" / ");
-      const info = el("span");
-      info.append(el("strong", candidate.class.symbol.name), el("span", `${directions} · ${candidate.class.qualifiedName || candidate.label} · ${candidate.class.symbol.path}`, "classes-choice-identity"));
-      label.append(check, info); chooser.append(label); choices.push(check);
-    }
-    if (!choices.length) chooser.append(el("p", "No more related classes in this bounded result."));
-    const note = el("p", `Choose up to ${MAX_EXPANDED - expanded.length} classes. Their indexed hierarchy is shown automatically.`, "classes-choice-note");
-    const add = el("button", "Add selected classes"), cancel = el("button", "Cancel");
-    add.type = cancel.type = "button"; add.disabled = true;
-    const refresh = () => {
-      const count = choices.filter(check => check.checked).length;
-      add.disabled = !count || count + expanded.length > MAX_EXPANDED || (needsAnchor && !choices[0].checked);
-      note.textContent = count + expanded.length > MAX_EXPANDED ? `Choose at most ${MAX_EXPANDED - expanded.length} classes.` : `Choose up to ${MAX_EXPANDED - expanded.length} classes. Their indexed hierarchy is shown automatically.`;
-    };
-    for (const check of choices) check.addEventListener("change", refresh);
-    refresh();
-    add.addEventListener("click", () => {
-      if (!usable()) return;
-      const ids = choices.filter(check => check.checked).map(check => check.value);
-      if (!ids.length || ids.length + expanded.length > MAX_EXPANDED || (needsAnchor && !ids.includes(node.id))) return;
-      return loadDiagram(seed, [...expanded, ...ids], false, node.id);
-    });
-    const dismiss = () => { closeChooser(); const anchor = cards.get(node.id); if (anchor) anchor.focus({preventScroll: true}); };
-    cancel.addEventListener("click", dismiss);
-    chooser.addEventListener("keydown", event => { if (event.key === "Escape") { event.preventDefault(); dismiss(); } });
-    chooser.append(note, add, cancel); ui.diagram.before(chooser);
-    (choices[0] || cancel).focus({preventScroll: true});
   }
   const el = (tag, text, cls) => {
     const node = document.createElement(tag);
@@ -341,10 +263,10 @@
     };
     if (api.onChange) api.onChange();
     closeContextMenu(false); closeChooser(); ui.diagram.setAttribute("aria-busy", "true");
-    state("Loading declared relationships…", "loading");
+    state("Loading measured class declarations…", "loading");
     const expansion = [...nextExpanded];
     try {
-      const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: true, includeUnmatched: !!ui.unmatched.checked}});
+      const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: false, includeUnmatched: false}});
       if (ticket !== serial || searchTicket !== searchSerial || !valid(c)) return;
       if (!window.BaleygIndexPin.equal(data.revision, c.revision)) {
         reset(); api.onStale?.("Workspace revision changed. Open the class again.");
@@ -377,8 +299,6 @@
     const c = snapshot, generation = diagramGeneration;
     const guarded = action => () => { if (valid(c) && generation === diagramGeneration && displayTicket === serial) return action(); };
     return [
-      {label: "Show related classes", disabled: !node.expandable || expanded.length >= MAX_EXPANDED,
-        run: guarded(() => showRelated(node))},
       {label: "Read class source", run: guarded(() => api.readSource({path: node.class.symbol.path, range: {...node.class.symbol.range}}, c.revision))},
       {label: "Focus this class", run: guarded(() => loadDiagram(node.id, [], true))}
     ];
@@ -502,64 +422,9 @@
     stage.style.width = `${width}px`; stage.style.height = `${height}px`;
     const coords = id => { const slot = positions.get(id), row = Math.floor(slot / 2); return {x: 24 + (slot % 2) * STEP_X, y: rowTops[row], rowBottom: rowTops[row] + rowHeights[row], height: membersOpen.has(id) ? OPEN_HEIGHT : HEIGHT}; };
     const priorEdges = stage.querySelector(".classes-edges"); if (priorEdges) priorEdges.remove();
-    const edges = svg("svg", {class: "classes-edges", width, height, "aria-hidden": "true"});
-    const defs = svg("defs"), marker = svg("marker", {id: "classes-arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 8, markerHeight: 8, orient: "auto-start-reverse"});
-    marker.append(svg("path", {d: "M 1 1 L 9 5 L 1 9", fill: "none", stroke: "currentColor", "stroke-width": 1.4})); defs.append(marker); edges.append(defs);
     const existingLedger = ui.diagram.querySelector(".classes-relationships"); if (existingLedger) existingLedger.remove();
-    const ledger = el("details", undefined, "classes-relationships"); ledger.open = false;
-    ledger.append(el("summary", "Declared relationships · syntax evidence"));
-    const list = el("ol");
-    const labels = new Map(nodes.map(node => [node.id, node.label]));
-    const visibleEdges = shownEdges(data, ids);
-    const bundles = new Map();
-    visibleEdges.forEach(edge => {
-      const key = JSON.stringify([edge.owner, edge.target]);
-      if (!bundles.has(key)) bundles.set(key, []);
-      bundles.get(key).push(edge);
-      const certainty = edge.matchKind === "syntaxCandidate" ? "syntax candidate" : `${edge.matchKind} hint`;
-      const row = el("li", undefined, "classes-relationship"); row.dataset.edgeId = edge.id;
-      row.append(el("span", `${labels.get(edge.owner)} → ${labels.get(edge.target)}`, "classes-relation-names"), el("span", `${edge.kind} · ${certainty} · ${edge.typeName}`, "classes-relation-evidence"));
-      // The original record, including identity, candidates and source range, is never summarized away.
-      row.append(el("pre", JSON.stringify(edge, null, 2), "classes-relation-record"));
-      list.append(row);
-    });
-    let index = 0;
-    for (const bundle of bundles.values()) {
-      const edge = bundle[0], from = coords(edge.owner), to = coords(edge.target);
-      const kinds = [...new Set(bundle.map(item => item.kind))];
-      const label = kinds.join(" / ");
-      const lane = 20 + (index++ % 4) * 18;
-      const labelWidth = Math.max(48, label.length * 8 + 12);
-      let route, labelCenter, labelY;
-      if (edge.owner === edge.target) {
-        // Self relationships loop in the right gutter and return through the bottom.
-        const right = from.x + WIDTH + 20, bottom = from.y + from.height;
-        labelY = from.rowBottom + 40; labelCenter = from.x + WIDTH / 2;
-        route = `M ${from.x + WIDTH} ${from.y + 40} H ${right} V ${labelY} H ${labelCenter} V ${bottom}`;
-      } else if (from.x === to.x && from.y < to.y) {
-        // Downward same-column edges use only the right gutter.
-        const right = from.x + WIDTH + lane;
-        labelY = from.rowBottom + 30; labelCenter = right - labelWidth / 2;
-        route = `M ${from.x + WIDTH} ${from.y + from.height / 2} H ${right} V ${to.y + to.height / 2} H ${to.x + WIDTH}`;
-      } else if (from.x === to.x) {
-        // Reverse/upward edges use the left gutter, never the downward rail.
-        const left = from.x - 16;
-        labelY = to.rowBottom + 70; labelCenter = left + labelWidth / 2;
-        route = `M ${from.x} ${from.y + from.height / 2} H ${left} V ${to.y + to.height / 2} H ${to.x}`;
-      } else {
-        const sx = from.x + WIDTH, sy = from.y + from.height - 24;
-        const tx = to.x, ty = to.y + 40, right = sx + lane, left = tx - 14;
-        labelY = from.rowBottom + lane; labelCenter = (right + left) / 2;
-        route = `M ${sx} ${sy} H ${right} V ${labelY} H ${left} V ${ty} H ${tx}`;
-      }
-      const path = svg("path", {d: route, class: "classes-edge", "marker-end": "url(#classes-arrow)"});
-      path.append(svg("title", {}, `${labels.get(edge.owner)} → ${labels.get(edge.target)}: ${label}. ${bundle.length} declarations; full evidence below.`)); edges.append(path);
-      const labelX = Math.max(4, Math.min(width - labelWidth - 4, labelCenter - labelWidth / 2));
-      const group = svg("g", {class: "classes-edge-label"});
-      group.append(svg("title", {}, `${labels.get(edge.owner)} → ${labels.get(edge.target)}: ${label}`), svg("rect", {x: labelX, y: labelY - 11, width: labelWidth, height: 22, rx: 3}), svg("text", {x: labelX + 6, y: labelY + 4}, label)); edges.append(group);
-    }
-    if (!list.children.length) list.append(el("li", "No declared relationships in this view."));
-    ledger.append(list); stage.append(edges);
+    const ledger = el("details", undefined, "classes-relationships");
+    ledger.append(el("summary", "No proven class relationships"), el("p", "Class declarations are shown without inferred hierarchy or type targets."));
     for (const node of nodes) {
       const old = cards.get(node.id), fresh = card(node), pos = coords(node.id);
       // Preserve the actual DOM node identity and position, replacing only its contents.

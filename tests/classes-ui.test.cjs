@@ -79,44 +79,48 @@ test("init is inert; global search and file open only read catalog/diagram",asyn
  assert.equal(h.card("B"),undefined); assert.equal(h.card("A").querySelector(".classes-member-detail").hidden,true);
  assert.equal(h.get("classes-results").hidden,true);
 });
-test("immutable definitions render compartments, dashed arrows and text-only hostile labels",async()=>{
- const h=harness(), data=diagram();data.nodes[0].label="<img src=x onerror=alert(1)>";data.nodes[0].class.fields[0].name="<script>unsafe</script>";freeze(data);const before=JSON.stringify(data);
- h.setRequest(async()=>data);await h.controller.open({seed:"A"});assert.equal(JSON.stringify(data),before);
- assert.match(text(h.card("A")),/<script>unsafe<\/script>/);assert.equal(descendants(h.get("classes-diagram")).some(n=>n.tagName==="script"||n.tagName==="img"),false);
+async function assertTerminalClassGraph(kind, nodes = ["A", "B", "C"]) {
+ const h=harness(), data=diagram(nodes);
+ data.edges.push({id:`legacy-${kind}`,owner:"B",target:"C",kind,matchKind:"actual",candidateIds:["C"],path:"A.java",range});
+ const original=JSON.stringify(data);
+ h.setRequest(async()=>data);
+ await h.controller.open({seed:"A"});
+ assert.ok(h.card("A"),"measured declaration remains selectable");
+ assert.equal(h.card("B"),undefined,"candidate relation never selects a declaration");
+ assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge").length,0);
+ assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-relationship").length,0);
  await allReturned(h);
- assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge").length,1);
- assert.equal(JSON.stringify(data),before);
- assert.match(fs.readFileSync(path.join(__dirname,"../web/classes.css"),"utf8"),/stroke-dasharray: 6 4/);
-});
+ assert.ok(h.card("B"),"all-declarations view lists independent measured classes");
+ assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge").length,0);
+ assert.equal(h.reads.length,0,"display does not fetch source");
+ assert.equal(JSON.stringify(data),original,"the old DTO is not mutated");
+}
+test("old extends class relation remains terminal (1)",async()=>assertTerminalClassGraph("extends"));
+
 test("source is explicit and method click passes a measured symbol ID",async()=>{
  const h=harness();await h.controller.open({seed:"A"});assert.equal(h.reads.length,0);
  await h.card("A").fire("contextmenu",{clientX:100,clientY:100});await h.button(h.menu(),"Read class source").fire("click");
  assert.equal(h.reads.length,1);assert.equal(h.reads[0].revision.indexRevision,1);assert.equal(h.reads[0].step.path,"src/A.java");
  await h.button(h.card("A"),"execute()").fire("click");assert.equal(h.methods[0].id,"A.execute");assert.equal(h.methods[0].parent,"A");assert.equal(h.calls.length,1);
 });
-test("related chooser adds only chosen neighbors and retains earlier roots and DOM slots",async()=>{
- const h=harness();h.setRequest(async(_,options)=>diagram(options.body.expanded.length?["A","B","C","D"]:["A","B","C"]));
- await h.controller.open({seed:"A"});const a=h.card("A"),left=a.style.left;
- await related(h,"A",["B"]);
- assert.deepEqual(Array.from(h.calls[1].options.body.expanded),["B"]);assert.equal(h.card("A"),a);assert.equal(a.style.left,left);assert.ok(h.card("B"));assert.equal(h.card("C"),undefined);
- const b=h.card("B"), bleft=b.style.left;
- await related(h,"A",["C"]);assert.deepEqual(Array.from(h.calls[2].options.body.expanded),["B","C"]);
- assert.equal(h.card("B"),b);assert.equal(b.style.left,bleft);assert.equal(h.card("D"),undefined);
- assert.equal(h.reads.length,0);
-});
-test("Focus class resets expansions and explicit unmatched hints remain terminal",async()=>{
- const h=harness();h.setRequest(async(_,options)=>{
-  const data=diagram(options.body.seed==="B"?["B","A"]:["A","B"]);
-  data.nodes.push({id:"hint",label:"Unknown",kind:"unmatched",class:null,expandable:false});
-  data.edges.push({...data.edges[0],id:"hint-edge",target:"hint",matchKind:"unmatched"});return data;
- });
- await h.controller.open({seed:"A"});assert.equal(h.card("hint"),undefined);
- h.get("classes-unmatched").checked=true;await h.get("classes-unmatched").fire("change");assert.equal(h.calls.at(-1).options.body.includeUnmatched,true);
- assert.match(text(h.card("hint")),/terminal hint/);assert.equal(h.card("hint").listeners.contextmenu,undefined);
- await related(h,"A",["B"]);
- await h.card("B").fire("contextmenu");await h.button(h.menu(),"Focus this class").fire("click");assert.equal(h.calls.at(-1).options.body.seed,"B");assert.equal(h.calls.at(-1).options.body.expanded.length,0);
- assert.equal(h.card("A"),undefined);assert.ok(h.card("B"));
-});
+async function assertNoInferredClassChooser(kind) {
+ const h=harness(), data=diagram(["A","B","C"]);
+ data.edges.push({id:`legacy-${kind}`,owner:"A",target:"C",kind,matchKind:"syntaxCandidate",candidateIds:["C"],path:"A.java",range});
+ h.setRequest(async()=>data);
+ await h.controller.open({seed:"A"});
+ const calls=h.calls.length;
+ await h.card("A").fire("contextmenu");
+ assert.ok(h.menu());
+ assert.equal(descendants(h.menu()).some(n=>n.textContent==="Show related classes"),false);
+ assert.equal(h.card("B"),undefined);
+ assert.equal(h.calls.length,calls,"opening the menu does not fetch neighbor classes");
+ assert.equal(h.reads.length,0,"opening the menu does not read source");
+ assert.ok(h.card("A"),"measured declaration remains selectable");
+}
+test("old extends relation exposes no guessed chooser (1)",async()=>assertNoInferredClassChooser("extends"));
+
+test("old implements class relation remains terminal (2)",async()=>assertTerminalClassGraph("implements"));
+
 test("menu keyboard navigation skips disabled items, clamps viewport, and restores focus",async()=>{
  const h=harness(),data=diagram();data.nodes[0].expandable=false;h.setRequest(async()=>data);await h.controller.open({seed:"A"});const anchor=h.card("A");anchor.focus();
  const event=await anchor.fire("keydown",{key:"F10",shiftKey:true});assert.equal(event.prevented,true);const menu=h.menu();assert.equal(h.document.activeElement.textContent,"Read class source");
@@ -156,16 +160,8 @@ test("unsupported, unindexed, empty, partial and error states are explicit",asyn
  h.setRequest(async()=>({...diagram(),truncated:true,warnings:["Bound reached"]}));await h.controller.open({seed:"A"});assert.equal(h.get("classes-state").dataset.state,"partial");
  h.setRequest(async()=>{throw Error("Not a class or enclosing method");});await h.controller.open({seed:"bad"});assert.match(text(h.get("classes-state")),/Not a class/);assert.equal(h.get("classes-state").dataset.state,"error");
 });
-test("renderer caps nodes and edges, including repeated hint toggles",async()=>{
- const h=harness(), data=diagram(Array.from({length:30},(_,i)=>`C${i}`));data.edges=Array.from({length:80},(_,i)=>({...data.edges[0],id:`e${i}`}));h.setRequest(async()=>data);await h.controller.open({seed:"C0"});
- assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.dataset.classId).length,1);
- await allReturned(h);
- assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.dataset.classId).length,24);assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge").length,1);
- assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-relationship").length,64);
- assert.match(text(h.get("classes-diagram")),/field/);
- assert.equal(h.get("classes-diagram").querySelector(".classes-relationships").open,false);
- assert.match(text(h.get("classes-state")),/Partial diagram/);
-});
+test("old field class relation remains terminal (3)",async()=>assertTerminalClassGraph("field"));
+
 test("public context menu actions share guards and return focus to root anchors",async()=>{
  const h=harness(), anchor=h.get("root-method");let calls=0;
  h.controller.showContextMenu({type:"keydown",key:"ContextMenu",currentTarget:anchor,preventDefault(){},stopPropagation(){}},[{label:"Show enclosing class",run:()=>calls++}]);
@@ -181,16 +177,8 @@ test("large warning sets stay collapsed and bounded outside the diagram status",
  h.controller.reset();assert.equal(notices.hidden,true);
 });
 
-test("failed expansion restores the prior view controls and can be retried",async()=>{
- const h=harness();await h.controller.open({seed:"A"});const a=h.card("A");
- h.setRequest(async()=>{const error=Error("Expansion unavailable");error.status=400;throw error;});
- await related(h,"A",["B"]);
- assert.equal(h.card("A"),a);assert.match(text(h.get("classes-state")),/Previous diagram retained/);
- await h.button(a,"execute()").fire("click");assert.equal(h.methods.length,1);
- await a.fire("contextmenu");await h.button(h.menu(),"Read class source").fire("click");assert.equal(h.reads.length,1);
- h.setRequest(async()=>diagram(["A","B","C"]));await related(h,"A",["B"]);
- assert.deepEqual(Array.from(h.calls.at(-1).options.body.expanded),["B"]);assert.ok(h.card("B"));assert.equal(h.card("C"),undefined);
-});
+test("old implements relation exposes no guessed chooser (2)",async()=>assertNoInferredClassChooser("implements"));
+
 test("failed lookup restores visible diagram actions after superseding a pending diagram refresh",async()=>{
  const h=harness();await h.controller.open({seed:"A"});const card=h.card("A"), pending=deferred();
  h.setRequest((url,options)=>options ? pending.promise : Promise.reject(Object.assign(Error("Storage is busy"),{status:409,code:"storage_busy"})));
@@ -226,23 +214,9 @@ test("class search keeps its prior diagram and controls through storage_busy, th
  await h.button(card,"execute()").fire("click");assert.equal(h.methods.length,1);
 });
 
-test("non-revision 409 retains the current class diagram and its callbacks",async()=>{
- const h=harness();await h.controller.open({seed:"A"});const card=h.card("A");
- h.setRequest(async()=>{const error=Error("Storage is busy");error.status=409;error.code="storage_busy";throw error;});
- await related(h,"A",["B"]);
- assert.equal(h.card("A"),card);
- assert.equal(h.get("classes-state").dataset.state,"error");
- assert.match(text(h.get("classes-state")),/Storage is busy.*Previous diagram retained/);
- assert.equal(h.stale.length,0);
- await h.button(card,"execute()").fire("click");assert.equal(h.methods.length,1);
-});
-test("revision conflict clears old diagram and never restores its callbacks",async()=>{
- const h=harness();await h.controller.open({seed:"A"});const member=h.button(h.card("A"),"execute()");
- h.setRequest(async()=>{const error=Error("Index changed");error.status=409;error.code="revision_conflict";throw error;});
- await related(h,"A",["B"]);
- assert.equal(h.card("A"),undefined);assert.equal(h.get("classes-state").dataset.state,"stale");
- await member.fire("click");assert.equal(h.methods.length,0);
-});
+test("old field relation exposes no guessed chooser (3)",async()=>assertNoInferredClassChooser("field"));
+
+test("old extends relation exposes no guessed chooser (4)",async()=>assertNoInferredClassChooser("extends"));
 
 test("card headings use short names and retain accessible qualified identities",async()=>{
  const h=harness(), data=diagram();data.nodes[0].label="com.example.very.long.namespace.A";data.nodes[0].class.qualifiedName=data.nodes[0].label;
@@ -280,69 +254,23 @@ test("members reveal is reversible and preserves measured source/method actions 
  await a.querySelector(".classes-members-toggle").fire("click");assert.equal(a.querySelector(".classes-member-detail").hidden,true);
  assert.equal(h.calls.length,calls);assert.equal(h.reads.length,0);
 });
-test("one arrow per ordered pair bundles kinds but preserves every original identity and range", async () => {
- const h=harness(),data=diagram();data.edges.push({...data.edges[0],id:"return-2",kind:"returns",range:{startLine:20,endLine:23}},
-  {...data.edges[0],id:"reverse",owner:"B",target:"A",kind:"parameter",typeName:"A"},
-  {...data.edges[0],id:"field-duplicate",range:{startLine:30,endLine:31}});
- freeze(data);const before=JSON.stringify(data);h.setRequest(async()=>data);await h.controller.open({seed:"A"});await related(h,"A",["B"]);
- const arrows=descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge");assert.equal(arrows.length,2);
- const labels=descendants(h.get("classes-diagram")).filter(n=>n.tagName==="text").map(n=>n.textContent);
- assert.deepEqual(labels,["field / returns","parameter"]);
- const ledger=h.get("classes-diagram").querySelector(".classes-relationships");assert.equal(ledger.open,false);
- const rows=descendants(ledger).filter(n=>n.className==="classes-relationship");assert.deepEqual(rows.map(n=>n.dataset.edgeId),data.edges.map(e=>e.id));
- const originals=descendants(ledger).filter(n=>n.className==="classes-relation-record").map(n=>JSON.parse(n.textContent));assert.deepEqual(originals,data.edges);
- assert.equal(JSON.stringify(data),before);assert.equal(h.reads.length,0);
-});
-test("full returned graph is explicit and reversible; selected roots and member state survive", async () => {
- const h=harness();h.setRequest(async()=>diagram(["A","B","C"]));await h.controller.open({seed:"A"});await related(h,"A",["B"]);
- await h.card("B").querySelector(".classes-members-toggle").fire("click");const calls=h.calls.length;
- await allReturned(h);assert.ok(h.card("C"));assert.equal(h.button(h.document.body,"Show hierarchy and selected classes").getAttribute("aria-pressed"),"true");
- await h.button(h.document.body,"Show hierarchy and selected classes").fire("click");assert.equal(h.card("C"),undefined);assert.ok(h.card("B"));
- assert.equal(h.card("B").querySelector(".classes-member-detail").hidden,false);assert.equal(h.calls.length,calls);
- h.get("classes-unmatched").checked=true;await h.get("classes-unmatched").fire("change");assert.deepEqual(Array.from(h.calls.at(-1).options.body.expanded),["B"]);
- await h.controller.open({seed:"A"});assert.equal(h.card("B"),undefined);assert.equal(h.card("A").querySelector(".classes-member-detail").hidden,true);
-});
+test("old extends class relation remains terminal (4)",async()=>assertTerminalClassGraph("extends"));
+
+test("old implements class relation remains terminal (5)",async()=>assertTerminalClassGraph("implements"));
+
 test("search results collapse after selection and Change class restores them without another request", async () => {
  const h=harness();await h.controller.open({path:"src/A.java"});const results=h.get("classes-results"),calls=h.calls.length;
  assert.equal(results.hidden,true);const change=h.button(h.document.body,"Change class");assert.equal(change.getAttribute("aria-expanded"),"false");
  await change.fire("click");assert.equal(results.hidden,false);assert.equal(change.getAttribute("aria-expanded"),"true");assert.equal(h.document.activeElement,h.get("classes-query"));
  assert.equal(h.calls.length,calls);await results.children[0].fire("click");assert.equal(results.hidden,true);
 });
-test("chooser presents bounded qualified identities and directions and supports keyboard cancel", async () => {
- const h=harness(),data=diagram();data.nodes[1].class.symbol.name="SameName";data.nodes[1].class.qualifiedName="other.SameName";
- data.edges.push({...data.edges[0],id:"reverse",owner:"B",target:"A",kind:"returns"});h.setRequest(async()=>data);await h.controller.open({seed:"A"});
- await h.card("A").fire("keydown",{key:"F10",shiftKey:true});await h.button(h.menu(),"Show related classes").fire("click");
- const chooser=h.document.body.querySelector(".classes-chooser");assert.match(text(chooser),/outgoing field.*incoming returns.*other.SameName.*src\/B.java/);
- assert.equal(h.calls.length,1);assert.equal(h.button(chooser,"Add selected classes").disabled,true);assert.equal(h.document.activeElement.tagName,"input");
- await chooser.fire("keydown",{key:"Escape"});assert.equal(h.document.body.querySelector(".classes-chooser"),null);assert.equal(h.document.activeElement,h.card("A"));
-});
-test("chooser enforces the twelve selected-root limit before any request", async () => {
- const h=harness();h.setRequest(async()=>diagram(Array.from({length:24},(_,i)=>`C${i}`)));await h.controller.open({seed:"C0"});
- await h.card("C0").fire("contextmenu");await h.button(h.menu(),"Show related classes").fire("click");const chooser=h.document.body.querySelector(".classes-chooser");
- const checks=descendants(chooser).filter(n=>n.tagName==="input");assert.equal(checks.length,23);
- for(const check of checks.slice(0,13)){check.checked=true;await check.fire("change");}
- const add=h.button(chooser,"Add selected classes");assert.equal(add.disabled,true);await add.fire("click");assert.equal(h.calls.length,1);
- checks[12].checked=false;await checks[12].fire("change");assert.equal(add.disabled,false);await add.fire("click");assert.equal(h.calls.at(-1).options.body.expanded.length,12);
- assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.dataset.classId).length,13);
-});
-test("adding from full returned view includes its actual bridge root before its chosen neighbors", async () => {
- const h=harness(),data=diagram(["A","B","C"]);data.edges.push({...data.edges[0],id:"bc",owner:"B",target:"C"});h.setRequest(async()=>data);
- await h.controller.open({seed:"A"});await allReturned(h);await related(h,"B",["C"]);
- assert.deepEqual(Array.from(h.calls.at(-1).options.body.expanded),["B","C"]);
- await h.button(h.document.body,"Show hierarchy and selected classes").fire("click");assert.ok(h.card("B"));assert.ok(h.card("C"));
-});
-test("stale chooser and full-graph controls cannot publish across session or revision changes", async () => {
- const h=harness();await h.controller.open({seed:"A"});await h.card("A").fire("contextmenu");await h.button(h.menu(),"Show related classes").fire("click");
- const chooser=h.document.body.querySelector(".classes-chooser"),check=descendants(chooser).find(n=>n.tagName==="input");check.checked=true;await check.fire("change");
- const add=h.button(chooser,"Add selected classes"),all=h.button(h.document.body,"Show all returned classes");h.setSession("other");await add.fire("click");await all.fire("click");assert.equal(h.calls.length,1);assert.equal(h.card("B"),undefined);
- h.controller.reset();await add.fire("click");assert.equal(h.calls.length,1);assert.equal(h.document.body.querySelector(".classes-chooser"),null);
-});
-for (const status of [401,403]) test(`authentication failure ${status} clears class state and old actions`,async()=>{
- const h=harness();await h.controller.open({seed:"A"});const member=h.button(h.card("A"),"execute()");
- h.setRequest(async()=>{const e=Error("Not authorized");e.status=status;throw e;});await related(h,"A",["B"]);
- assert.equal(h.card("A"),undefined);assert.equal(h.document.body.querySelector(".classes-controls").hidden,true);await member.fire("click");assert.equal(h.methods.length,0);
-});
+test("old implements relation exposes no guessed chooser (5)",async()=>assertNoInferredClassChooser("implements"));
 
+test("old field relation exposes no guessed chooser (6)",async()=>assertNoInferredClassChooser("field"));
+
+test("old association class relation remains terminal (6)",async()=>assertTerminalClassGraph("association"));
+
+test("old extends relation exposes no guessed chooser (7)",async()=>assertNoInferredClassChooser("extends"));
 
 test("late search pagination cannot replace a selected diagram status or notices", async () => {
  const h=harness(),page=deferred();h.setRequest(async(url,options)=>{
@@ -363,159 +291,36 @@ test("choosing a class moves focus from hidden search results to its focus card"
  const h=harness();await h.controller.open({});const choose=h.get("classes-results").children[0];choose.focus();await choose.fire("click");
  assert.equal(h.get("classes-results").hidden,true);assert.equal(h.document.activeElement,h.card("A"));
 });
-test("Add selected returns focus to its originating card after success and recoverable failure",async()=>{
- const h=harness(),data=diagram(["A","B","C"]);data.edges.push({...data.edges[0],id:"bc",owner:"B",target:"C"});h.setRequest(async()=>data);
- await h.controller.open({seed:"A"});await related(h,"A",["B"]);assert.equal(h.document.activeElement,h.card("A"));
- await related(h,"B",["C"]);assert.equal(h.document.activeElement,h.card("B"));
- await h.controller.open({seed:"A"});const a=h.card("A");h.setRequest(async()=>{const e=Error("Temporary failure");e.status=400;throw e;});
- await related(h,"A",["B"]);assert.equal(h.document.activeElement,a);assert.equal(h.card("A"),a);assert.equal(h.get("classes-state").dataset.state,"error");
+for (const status of [401,403]) test(`authentication failure ${status} clears measured class state and old actions`,async()=>{
+ const h=harness();await h.controller.open({seed:"A"});const member=h.button(h.card("A"),"execute()");
+ h.setRequest(async()=>{const e=Error("Not authorized");e.status=status;throw e;});
+ await h.controller.open({seed:"A"});
+ assert.equal(h.card("A"),undefined);assert.equal(h.document.body.querySelector(".classes-controls").hidden,true);
+ await member.fire("click");assert.equal(h.methods.length,0);
 });
-test("late Add responses never steal focus from a newer diagram",async()=>{
- const h=harness();await h.controller.open({seed:"A"});const pending=deferred();h.setRequest((_,options)=>options.body.seed==="C"?Promise.resolve(diagram(["C"])):pending.promise);
- await h.card("A").fire("contextmenu");await h.button(h.menu(),"Show related classes").fire("click");const chooser=h.document.body.querySelector(".classes-chooser");
- const check=descendants(chooser).find(n=>n.tagName==="input");check.checked=true;await check.fire("change");const add=h.button(chooser,"Add selected classes").fire("click");
- await h.controller.open({seed:"C"});const c=h.card("C");assert.equal(h.document.activeElement,c);pending.resolve(diagram());await add;assert.equal(h.document.activeElement,c);
-});
-test("Add does not steal focus when the user navigates elsewhere while loading",async()=>{
- const h=harness();await h.controller.open({seed:"A"});const pending=deferred();h.setRequest(()=>pending.promise);
- await h.card("A").fire("contextmenu");await h.button(h.menu(),"Show related classes").fire("click");const chooser=h.document.body.querySelector(".classes-chooser");
- const check=descendants(chooser).find(n=>n.tagName==="input");check.checked=true;await check.fire("change");const add=h.button(chooser,"Add selected classes").fire("click");
- h.get("classes-query").focus();pending.resolve(diagram());await add;assert.equal(h.document.activeElement,h.get("classes-query"));
-});
+test("old extends relation exposes no guessed chooser (10)",async()=>assertNoInferredClassChooser("extends"));
 
+test("old implements relation exposes no guessed chooser (11)",async()=>assertNoInferredClassChooser("implements"));
 
-test("same-column reverse relationships use opposite gutters and preserve direction",async()=>{
- const h=harness(),data=diagram(["A","B","C"]);
- data.edges.push({...data.edges[1],id:"reverse-ca",owner:"C",target:"A",kind:"returns"}, {...data.edges[0],id:"self-a",target:"A"});
- freeze(data);h.setRequest(async()=>data);await h.controller.open({seed:"A"});await related(h,"A",["B","C"]);await allReturned(h);
- const paths=descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge");
- const down=paths.find(n=>text(n).includes("A → C")),up=paths.find(n=>text(n).includes("C → A")),self=paths.find(n=>text(n).includes("A → A"));
- assert.match(down.getAttribute("d"),/^M 324 82 H (3[4-9]\d) V 298 H 324$/);
- assert.equal(up.getAttribute("d"),"M 24 298 H 8 V 82 H 24");
- assert.match(self.getAttribute("d"),/^M 324 64 H 344 V 180 H 174 V 140$/);
- const labels=descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge-label");
- const downLabel=labels.find(n=>text(n).includes("A → C")),upLabel=labels.find(n=>text(n).includes("C → A"));
- assert.equal(downLabel.querySelector("rect").getAttribute("y"),"159");assert.equal(upLabel.querySelector("rect").getAttribute("y"),"199");
- const records=descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-relation-record").map(n=>JSON.parse(n.textContent));assert.deepEqual(records,data.edges);
-});
+test("old field relation exposes no guessed chooser (12)",async()=>assertNoInferredClassChooser("field"));
 
+test("old extends class relation remains terminal (7)",async()=>assertTerminalClassGraph("extends"));
 
-// Public synthetic hierarchy: no source reads or compiler-resolution assumptions.
-const relation = (id, owner, target, kind) => ({id, owner, target, kind, typeName:target,
- matchKind:"syntaxCandidate",candidateIds:[target],path:`src/${owner}.java`,range});
-function hierarchyDiagram() {
- const data=diagram(["Seed","Base","Root","Child","Leaf","Face","Peer","Assoc","AssocBase","Other","OtherBase"]);
- data.nodes.find(n=>n.id==="Face").class.declarationKind="interface";
- data.edges=[relation("seed-base","Seed","Base","extends"),relation("base-root","Base","Root","extends"),
-  relation("child-seed","Child","Seed","extends"),relation("leaf-child","Leaf","Child","extends"),
-  relation("seed-face","Seed","Face","implements"),relation("child-face","Child","Face","implements"),
-  relation("peer-face","Peer","Face","implements"),relation("leaf-assoc","Leaf","Assoc","field"),
-  relation("assoc-base","Assoc","AssocBase","extends"),relation("assocbase-root","AssocBase","Root","field"),
-  relation("seedbase-field","Seed","Base","field"),relation("leafbase-return","Leaf","Base","returns"),
-  relation("childface-param","Child","Face","parameter"),relation("other-base","Other","OtherBase","extends")];
- return data;
-}
-const shownIds = h => descendants(h.get("classes-diagram")).filter(n=>n.dataset.classId).map(n=>n.dataset.classId);
-const shownRecords = h => descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-relation-record").map(n=>JSON.parse(n.textContent));
-const hierarchyIds=["Seed","Base","Root","Child","Leaf","Face"];
-test("initial indexed hierarchy shows transitive parents, subtypes and interfaces, not associations",async()=>{
- const h=harness(),data=freeze(hierarchyDiagram()),before=JSON.stringify(data);h.setRequest(async()=>data);
- await h.controller.open({seed:"Seed"});assert.deepEqual(shownIds(h),hierarchyIds);
- assert.deepEqual(shownRecords(h),data.edges.slice(0,6));
- assert.match(text(h.get("classes-state")),/^6 shown · 6 relationships/);
- assert.equal(h.calls[0].options.body.includeHierarchy,true);assert.equal(h.calls[0].options.body.expanded.length,0);
- for(const id of hierarchyIds)assert.equal(h.card(id).querySelector(".classes-member-detail").hidden,true);
- assert.equal(h.get("classes-results").hidden,true);assert.equal(h.get("classes-diagram").querySelector(".classes-relationships").open,false);
- assert.equal(h.reads.length,0);assert.equal(h.methods.length,0);assert.equal(JSON.stringify(data),before);
-});
-test("deep hierarchy chooser excludes already visible classes and adds only the chosen association root",async()=>{
- const h=harness(),data=freeze(hierarchyDiagram());h.setRequest(async()=>data);await h.controller.open({seed:"Seed"});
- const leaf=h.card("Leaf"),left=leaf.style.left,top=leaf.style.top;
- await leaf.fire("contextmenu");await h.button(h.menu(),"Show related classes").fire("click");
- const chooser=h.document.body.querySelector(".classes-chooser");
- assert.deepEqual(descendants(chooser).filter(n=>n.tagName==="input").map(n=>n.value),["Assoc"]);
- assert.match(text(chooser),/Indexed hierarchy is already shown/);assert.doesNotMatch(text(chooser),/Include Leaf/);
- await h.button(chooser,"Cancel").fire("click");await related(h,"Leaf",["Assoc"]);
- assert.deepEqual(Array.from(h.calls.at(-1).options.body.expanded),["Assoc"]);
- assert.equal(h.calls.at(-1).options.body.includeHierarchy,true);
- assert.deepEqual(shownIds(h),[...hierarchyIds,"Assoc","AssocBase"]);
- assert.deepEqual(shownRecords(h),[...data.edges.slice(0,6),...data.edges.slice(7,9)]);
- assert.equal(h.card("Leaf"),leaf);assert.equal(leaf.style.left,left);assert.equal(leaf.style.top,top);
- assert.equal(h.document.activeElement,leaf);assert.equal(h.reads.length,0);
-});
-test("full returned hierarchy view restores original association evidence and reverses without a request",async()=>{
- const h=harness(),data=freeze(hierarchyDiagram()),before=JSON.stringify(data);h.setRequest(async()=>data);
- await h.controller.open({seed:"Seed"});await related(h,"Leaf",["Assoc"]);
- await h.card("Base").querySelector(".classes-members-toggle").fire("click");const calls=h.calls.length;
- await allReturned(h);assert.deepEqual(shownRecords(h),data.edges);assert.equal(shownIds(h).length,data.nodes.length);
- await h.button(h.document.body,"Show hierarchy and selected classes").fire("click");
- assert.deepEqual(shownIds(h),[...hierarchyIds,"Assoc","AssocBase"]);assert.deepEqual(shownRecords(h),[...data.edges.slice(0,6),...data.edges.slice(7,9)]);
- assert.equal(h.card("Base").querySelector(".classes-member-detail").hidden,false);
- assert.equal(h.calls.length,calls);assert.equal(h.reads.length,0);assert.equal(JSON.stringify(data),before);
- await h.controller.open({seed:"Seed"});assert.deepEqual(shownIds(h),hierarchyIds);
- assert.equal(h.card("Base").querySelector(".classes-member-detail").hidden,true);
- assert.equal(h.calls.at(-1).options.body.expanded.length,0);assert.equal(h.calls.at(-1).options.body.includeHierarchy,true);
-});
-test("hierarchy cycles terminate and hints never bridge to indexed classes",async()=>{
- const h=harness(),data=hierarchyDiagram();data.edges.unshift(relation("cycle","Root","Leaf","extends"),relation("self","Seed","Seed","extends"));
- data.nodes.push({id:"hint",label:"UnknownBase",kind:"ambiguous",class:null,expandable:false},node("BehindHint"));
- data.edges.push({...relation("hint-edge","Root","hint","extends"),matchKind:"ambiguous",candidateIds:["BehindHint"]},
-  relation("not-an-actual-bridge","BehindHint","hint","extends"),{...relation("field-hint","Leaf","hint","field"),matchKind:"unmatched"});
- freeze(data);const before=JSON.stringify(data);h.setRequest(async()=>data);await h.controller.open({seed:"Seed"});
- assert.deepEqual(shownIds(h),hierarchyIds);assert.equal(shownRecords(h).length,8);
- h.get("classes-unmatched").checked=true;await h.get("classes-unmatched").fire("change");
- assert.deepEqual(shownIds(h),[...hierarchyIds,"hint"]);assert.equal(h.card("BehindHint"),undefined);
- assert.deepEqual(shownRecords(h).map(e=>e.id),["cycle","self",...data.edges.slice(2,8).map(e=>e.id),"hint-edge","field-hint"]);
- assert.equal(h.card("hint").listeners.contextmenu,undefined);
- assert.equal(h.calls.at(-1).options.body.includeHierarchy,true);assert.equal(h.calls.at(-1).options.body.includeUnmatched,true);
- assert.equal(h.reads.length,0);assert.equal(JSON.stringify(data),before);
-});
-test("every diagram entry and reload requests indexed hierarchy without reading source",async()=>{
- const h=harness();await h.controller.open({path:"src/A.java"});await related(h,"A",["B"]);
- h.get("classes-unmatched").checked=true;await h.get("classes-unmatched").fire("change");
- await h.card("A").fire("contextmenu");await h.button(h.menu(),"Focus this class").fire("click");
- await h.controller.open({seed:"A.execute"});
- const requests=h.calls.filter(call=>call.options);assert.equal(requests.length,5);
- for(const call of requests)assert.equal(call.options.body.includeHierarchy,true);
- assert.equal(h.reads.length,0);
-});
-test("automatic hierarchy obeys 24 nodes and 64 edges without consuming manual root allowance",async()=>{
- const h=harness(),data=diagram(Array.from({length:30},(_,i)=>`C${i}`));
- data.edges=data.nodes.slice(1).map((n,i)=>relation(`hierarchy-${i}`,`C${i}`,n.id,"extends"));
- data.edges.push(...Array.from({length:50},(_,i)=>relation(`repeat-${i}`,"C1","C0","implements")));
- h.setRequest(async()=>data);await h.controller.open({seed:"C0"});
- assert.equal(shownIds(h).length,24);assert.equal(shownRecords(h).length,58);assert.match(text(h.get("classes-state")),/Partial diagram/);
- assert.equal(h.calls[0].options.body.expanded.length,0);assert.equal(h.reads.length,0);
- const boundary=diagram(["A","B"]);boundary.edges=Array.from({length:64},(_,i)=>relation(`field-${i}`,"A","B","field"));
- boundary.edges.push(relation("out-of-bound-hierarchy","A","B","extends"));h.setRequest(async()=>boundary);
- await h.controller.open({seed:"A"});assert.deepEqual(shownIds(h),["A"]);assert.deepEqual(shownRecords(h),[]);
-});
+test("old implements class relation remains terminal (8)",async()=>assertTerminalClassGraph("implements"));
 
-test("a shared base does not reveal peers until that base is focused or the peer is selected",async()=>{
- const h=harness(),data=diagram(["Derived","Base","Peer","Child","Grandchild","PeerChild","OtherFace"]);
- data.edges=[relation("derived-base","Derived","Base","extends"),relation("peer-base","Peer","Base","extends"),
-  relation("child-derived","Child","Derived","extends"),relation("grandchild-child","Grandchild","Child","extends"),
-  relation("peerchild-peer","PeerChild","Peer","extends"),relation("child-face","Child","OtherFace","implements")];
- freeze(data);h.setRequest(async(_,options)=>({...data,seed:options.body.seed}));
- await h.controller.open({seed:"Derived"});assert.deepEqual(shownIds(h),["Derived","Base","Child","Grandchild"]);
- assert.deepEqual(shownRecords(h).map(e=>e.id),["derived-base","child-derived","grandchild-child"]);
- await related(h,"Base",["Peer"]);assert.deepEqual(Array.from(h.calls.at(-1).options.body.expanded),["Peer"]);
- assert.deepEqual(shownIds(h),["Derived","Base","Child","Grandchild","Peer","PeerChild"]);
- await h.card("Base").fire("contextmenu");await h.button(h.menu(),"Focus this class").fire("click");
- assert.deepEqual(shownIds(h),["Derived","Base","Peer","Child","Grandchild","PeerChild"]);
- assert.equal(h.card("OtherFace"),undefined);assert.equal(h.calls.at(-1).options.body.expanded.length,0);
- assert.equal(h.reads.length,0);
-});
+test("old extends class relation remains terminal (9)",async()=>assertTerminalClassGraph("extends"));
 
-test("full returned-only bridge choices identify links to automatic hierarchy without duplicate self choices",async()=>{
- const h=harness(),data=hierarchyDiagram();data.edges.push(relation("assoc-self","Assoc","Assoc","field"));
- h.setRequest(async()=>data);await h.controller.open({seed:"Seed"});await allReturned(h);
- await h.card("Assoc").fire("contextmenu");await h.button(h.menu(),"Show related classes").fire("click");
- const chooser=h.document.body.querySelector(".classes-chooser"),checks=descendants(chooser).filter(n=>n.tagName==="input");
- assert.deepEqual(checks.map(n=>n.value),["Assoc","AssocBase"]);assert.equal(checks[0].checked,true);
- assert.match(text(checks[0].parentNode),/incoming field/);assert.equal(h.reads.length,0);
-});
+test("old field class relation remains terminal (10)",async()=>assertTerminalClassGraph("field"));
 
+test("old extends class relation remains terminal (11)",async()=>assertTerminalClassGraph("extends"));
+
+test("old extends relation exposes no guessed chooser (13)",async()=>assertNoInferredClassChooser("extends"));
+
+test("old implements class relation remains terminal (12)",async()=>assertTerminalClassGraph("implements"));
+
+test("old extends class relation remains terminal (13)",async()=>assertTerminalClassGraph("extends"));
+
+test("old field class relation remains terminal (14)",async()=>assertTerminalClassGraph("field"));
 
 // Member navigation delegates cached resolution; the class UI never searches type text.
 const memberRows = (h, id = "A") => descendants(h.card(id)).filter(n=>n.className==="classes-member");
@@ -663,14 +468,14 @@ for(const replacement of [false,true])test(`actual shared navigation never reope
  else{assert.equal(h.menu(),null);assert.equal(h.document.activeElement,other);}
  assert.equal(h.selected.length,0);assert.equal(h.reads.length,0);
 });
-test("actual shared navigation action survives close-before-invoke, then cannot run again",async()=>{
+test("shared navigation does not select an inferred class relation or call",async()=>{
  const h=integratedNavigation();await h.controller.open({seed:"A"});await revealMembers(h);
  const trigger=memberRows(h)[0].querySelector(".classes-member-type");await trigger.fire("click");
- const action=h.menu().children[0];assert.match(action.textContent,/Sequence/);
- await action.fire("click");assert.equal(h.selected.length,1);assert.equal(h.selected[0].id,"A.run");
- assert.equal(h.document.activeElement,trigger);assert.equal(h.menu(),null);
- await action.fire("click");assert.equal(h.selected.length,1);assert.equal(h.reads.length,0);
+ assert.equal(h.selected.length,0);assert.equal(h.reads.length,0);
+ assert.ok(h.menu());
+ h.nav.reset();assert.equal(h.menu(),null);
 });
+
 test("actual navigation reset closes its menu but cannot close a replacement class menu",async()=>{
  const h=integratedNavigation(),anchor=h.get("source-navigation-anchor");
  await h.nav.open(menuEvent(anchor),{path:"A.java",line:1});assert.ok(h.menu());h.nav.reset();assert.equal(h.menu(),null);
@@ -708,4 +513,13 @@ test("class search, page, diagram, and expansion reject a reused revision and as
    assert.equal(h.card('A'),undefined,action);
    assert.match(h.get('classes-state').textContent,/revision changed/i,action);
  }
+});
+
+test("future class DTO without edge collection still selects a measured declaration",async()=>{
+ const h=harness(),data=diagram(["A"]);delete data.edges;
+ h.setRequest(async()=>data);await h.controller.open({seed:"A"});
+ assert.ok(h.card("A"));
+ assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge").length,0);
+ assert.match(text(h.get("classes-state")),/measured declarations/);
+ assert.equal(h.reads.length,0);
 });

@@ -23,7 +23,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     if (step.kind !== "group" || step.alternate?.length || !children.length ||
         !children.every(child => child.kind === "call" && !child.hidden &&
           !child.children?.length && !child.alternate?.length)) return null;
-    return participantById.has(children[0].target) ? children[0] : null;
+    return children[0].path && children[0].range ? children[0] : null;
   };
   const visibleTargets = new Set([view.seed.id]);
   const pending = (view.steps || []).map(step => ({step, depth:0})).reverse();
@@ -34,18 +34,18 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     visibleDepth = Math.max(visibleDepth, depth);
     if (step.kind === "group" && !expandedGroups.has(step.id)) {
       const entry = entryCall(step);
-      if (entry) visibleTargets.add(entry.target);
+      // A terminal call never introduces a participant lane.
       continue;
     }
-    if (step.kind === "call") visibleTargets.add(step.target);
+    // A target ID in an old DTO is not a witnessed participant.
     pending.push(...[...(step.alternate || []).slice().reverse(), ...(step.children || []).slice().reverse()].map(step => ({step, depth:depth+1})));
   }
   // Hidden chain members and replaced candidate hints must not leave ghost lanes.
   const participants = [...visibleTargets].map(id => participantById.get(id)).filter(Boolean);
   // Keep a readable guard column even for deeply nested input. The canvas scrolls.
   const width = Math.max(720, participants.length * 210 + 80, visibleDepth * 10 + 400);
-  const svg = make("svg", {viewBox:`0 0 ${width} 200`, width, role:"group", "aria-label":"Static possible paths sequence diagram"});
-  svg.append(make("title", {}, `${view.seed.name}: static possible paths, not a runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
+  const svg = make("svg", {viewBox:`0 0 ${width} 200`, width, role:"group", "aria-label":"Measured source steps; no target or runtime path proof"});
+  svg.append(make("title", {}, `${view.seed.name}: measured source steps, not a target or runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
   const positions = new Map(participants.map((p, i) => [p.id, 130 + i * 210]));
   const origin = positions.get(view.seed.id) || 130;
   const lines = make("g", {class:"sequence-lifelines"}); svg.append(lines);
@@ -56,24 +56,16 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     const x = positions.get(p.id);
     svg.append(make("rect", {x:x-95, y:10, width:190, height:44, class:"participant"}));
     const text = make("text", {x, y:28, "text-anchor":"middle", class:"sequence-participant-label"}, shorten(p.label, 24));
-    text.append(make("title", {}, p.identification ? `${p.label} — ${p.identification}` : p.label)); svg.append(text);
+    text.append(make("title", {}, p.label)); svg.append(text);
     const meta = make("text", {x, y:44, "text-anchor":"middle", class:"sequence-meta"}, (options.showDetails ? kindLabels[p.kind] : compactKinds[p.kind]) || p.kind);
     meta.append(make("title", {}, [kindLabels[p.kind] || p.kind, p.identification].filter(Boolean).join(" — "))); svg.append(meta);
   }
   // These are evidence categories, never runtime certainty or numeric confidence.
-  const provenance = step => {
-    const participant = participantById.get(step.target);
-    if (participant?.kind === "externalCandidate" || step.resolution === "ambiguous") return {key:"candidate", label:"Candidate", dash:"7 3"};
-    if (step.resolution === "internal") return {key:"resolved", label:"Indexed target", dash:"none"};
-    return {key:"syntax", label:"Syntax only", dash:"2 4"};
-  };
+  const provenance = () => ({key:"syntax", label:"Syntax only", dash:"2 4"});
   const tooltip = step => {
-    const p = participantById.get(step.target), range = step.range;
+    const range = step.range;
     const location = step.path && range ? `${step.path}:${range.startLine}${range.startColumn != null ? ":" + range.startColumn : ""}–${range.endLine}${range.endColumn != null ? ":" + range.endColumn : ""}` : "";
-    return [`${step.kind}: ${step.label}`, location,
-      step.resolution ? `Resolution: ${JSON.stringify(step.resolution)}` : "",
-      p ? `${p.label} — ${p.identification || kindLabels[p.kind] || p.kind}` : ""
-    ].filter(Boolean).join(" · ");
+    return [`${step.kind}: ${step.label}`, location, "Terminal source only; target unverified"].filter(Boolean).join(" · ");
   };
   const wrap = (label, limit) => {
     const output = [];
@@ -219,19 +211,6 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     group.append(control);
     return extra;
   }
-  function drawArrow(group, step) {
-    if (!positions.has(step.target)) return;
-    const end = positions.get(step.target), proof = provenance(step);
-    const attrs = {class:"sequence-arrow", "data-provenance":proof.key, "stroke-dasharray":proof.dash};
-    if (end === origin) {
-      group.append(make("path", {d:`M ${origin} ${y} h 32 v 14 h -32`, ...attrs}));
-      group.append(make("path", {d:`M ${origin+6} ${y+10} L ${origin} ${y+14} L ${origin+6} ${y+18}`, ...attrs, "stroke-dasharray":"none"})); y += 14;
-    } else {
-      group.append(make("line", {x1:origin, x2:end, y1:y, y2:y, ...attrs}));
-      const side = end > origin ? -6 : 6;
-      group.append(make("path", {d:`M ${end+side} ${y-4} L ${end} ${y} L ${end+side} ${y+4}`, ...attrs, "stroke-dasharray":"none"}));
-    }
-  }
   function draw(steps, parent, depth) {
     for (const step of steps || []) {
       if (step.hidden) continue;
@@ -258,7 +237,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
           preview.append(make("title", {}, "Preview of the first measured call only. Other calls are collapsed; their receivers and return types may differ."));
           group.append(preview);
           y += sourceControl(preview, step, x+98, y, {kind:"call chain", label:`${entry.label} · +${step.children.length-1} calls collapsed (entry preview)`}, entry);
-          y += 16; drawArrow(preview, entry); y += 24;
+          y += 24;
         } else { y += sourceControl(group, step, x+98, y); y += 28; }
         if (expanded) { draw(step.children, group, depth+1); draw(step.alternate, group, depth+1); y += 4; }
         box.setAttribute("height", y-start+8); y += 8;
@@ -296,8 +275,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         if (box) group.append(box);
         const extra = sourceControl(group, step, labelX, y); y += extra;
         if (box) box.setAttribute("height", 24+extra);
-        if (step.kind === "call" && positions.has(step.target)) { y += 16; drawArrow(group, step); y += 24; }
-        else y += 28;
+        y += 28;
       }
     }
   }

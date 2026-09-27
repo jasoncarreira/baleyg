@@ -132,7 +132,7 @@ async function refreshStatus(followup = false) {
   if (serial !== statusSerial || session !== epoch || status !== data) return;
   if (result && !IndexPin.equal(result.revision, status.revision)) renderResult();
   const stats = status.stats || {};
-  $("status").textContent = `${status.workspaceRoot} · Revision ${IndexPin.label(status.revision)} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic: ${stats.semanticState ?? "unknown"} · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
+  $("status").textContent = `${status.workspaceRoot} · Revision ${IndexPin.label(status.revision)} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
   $("stale").hidden = true;
   if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax is indexed, but semantic links are disabled. Regenerate SCIP and its paired manifest from unchanged inputs to restore them.`);
@@ -271,13 +271,13 @@ async function selectSymbol(symbol) {
   seed = symbol.id; $("seed").textContent = `${symbol.name} · ${symbol.path}`;
   $("depth").value = "1"; $("callbacks").checked = false; resetNote(); renderNotes(); await runQuery();
 }
-function query() { return {seed, depth: Number($("depth").value), maxNodes: 40, maxCalls: 200, includeCallbacks: $("callbacks").checked, excludePaths: []}; }
+function query() { return {seed, depth: Number($("depth").value), maxNodes: 40, maxCalls: 200, includeCallbacks: false, excludePaths: []}; }
 async function runQuery(savedQuery) {
   if (!seed && !savedQuery?.seed) throw new Error("Select a symbol first.");
   invalidateFocus(); const serial = ++querySerial; clearSource();
   result = null; $("calls").replaceChildren(); $("nodes").replaceChildren();
   $("result-meta").textContent = "Loading interactions…";
-  const data = await api("/api/query", "POST", savedQuery || query());
+  const data = await api("/api/query", "POST", {...(savedQuery || query()), depth: 1, includeCallbacks: false});
   if (serial !== querySerial) return;
   result = requireCurrentPair(data); renderResult();
 }
@@ -289,67 +289,46 @@ function renderResult() {
   if (!view) { $("result-meta").textContent = "Select a symbol to inspect outgoing calls."; return; }
   $("result-meta").textContent = `${view.calls.length} measured call sites · ${view.nodes.length} symbols · revision ${IndexPin.label(view.revision)}${view.truncated ? ` · Truncated: ${view.omittedNodes} nodes omitted` : ""}${view.warnings?.length ? ` · ${view.warnings.map(describe).join(" · ")}` : ""}`;
   if (focused) $("focus-counts").textContent = `Supporting: ${view.supportingCount} · Uncertain: ${view.uncertainCount} · Policy-hidden: ${view.policyHiddenCount} · Omitted: ${view.omittedCount}. Only essential calls that pass display limits are shown. Counts may overlap.`;
-  const rootNode = view.nodes.find(n => n.id === seed);
+  const rootNode = (view.nodes || []).find(n => n.id === seed);
   if (rootNode) {
     const rootRow = element("li", undefined, "hierarchy-root");
     rootRow.append(element("strong", rootNode.name || rootNode.id), element("span", `${rootNode.kind} · ${rootNode.path || ""}`, "detail"));
     if (rootNode.path && rootNode.range) rootRow.append(button("Read root source", () => showSource(rootNode, view.revision)));
     $("calls").append(rootRow);
   }
-  for (const call of view.calls) $("calls").append(callRow(call, view, new Set([seed]), 0, !focused));
+  for (const call of view.calls.filter(call => call.caller === seed)) $("calls").append(callRow(call, view));
   if (!view.calls.length) $("calls").append(element("li", focused ? "No essential calls pass the current display policy. Inspect the raw hierarchy or change your focus terms." : "No outgoing call sites in this view. Depth 0 shows only the seed symbol."));
-  for (const node of view.nodes) {
+  for (const node of (rootNode ? [rootNode] : [])) {
     const li = element("li", `${node.name || node.id} · ${node.kind || "symbol"}`);
     if (node.path && node.range) li.append(button("Read source", () => showSource(node, view.revision)));
     $("nodes").append(li);
   }
 }
-function callRow(call, view, ancestors, level, expandable) {
-  const nodes = new Map(view.nodes.map(n => [n.id, n]));
-  const regions = new Map((view.regions || []).map(r => [r.id, r]));
-  const target = nodes.get(call.target);
+function callRow(call, view) {
+  const nodes = new Map((view.nodes || []).map(node => [node.id, node]));
+  const regions = new Map((view.regions || []).map(region => [region.id, region]));
   const li = element("li", undefined, "call-row");
+  const witness = typeof call?.path === "string" && !!call.path &&
+    Number.isInteger(call.range?.startLine) && call.range.startLine > 0 &&
+    Number.isInteger(call.range?.endLine) && call.range.endLine >= call.range.startLine;
   const heading = element("div", undefined, "call-heading");
-  const name = button(target?.name || call.calleeText, () => showSource(target?.path && target?.range ? target : call, view.revision));
-  name.className = "call-name";
-  heading.append(name, element("span", describe(call.resolution), "badge"));
-  li.append(heading, element("span", `${nodes.get(target?.parent)?.name ? nodes.get(target.parent).name + " · " : ""}${target?.path || call.path} · from ${nodes.get(call.caller)?.name || call.caller}`, "detail"));
+  if (witness) {
+    const name = button(call.calleeText || call.spelling || "Call site", () => showSource(call, view.revision));
+    name.className = "call-name"; name.setAttribute("data-terminal-source", "call"); heading.append(name);
+  } else heading.append(element("span", "Call site · source unavailable", "call-name"));
+  heading.append(element("span", "Syntax only · target unverified", "badge"));
+  li.append(heading);
+  if (witness) li.append(element("span", `${call.path}:${call.range.startLine} · from ${nodes.get(call.caller)?.name || call.caller || "unknown"}`, "detail"));
   const evidence = element("details", undefined, "call-evidence");
-  evidence.append(element("summary", `Evidence · ${call.path}:${call.range.startLine}${call.callbackArguments?.length ? " · callback boundary" : ""}`));
-  evidence.append(element("div", call.target ? `Indexed target: ${target?.name || describe(call.target)}` : "No unique internal target", "detail"));
-  if (call.candidateSymbols?.length) evidence.append(element("div", `Candidates: ${call.candidateSymbols.map(id => nodes.get(id)?.name || describe(id)).join(", ")}`, "detail"));
+  evidence.append(element("summary", witness ? `Measured call site · ${call.path}:${call.range.startLine}` : "No measured call-site source"));
   if (call.regions?.length) evidence.append(element("div", `Control context: ${call.regions.map(id => { const r = regions.get(id); return r ? `${r.kind}: ${r.label}` : id; }).join(" · ")}`, "detail"));
-  if (call.callbackArguments?.length) evidence.append(element("div", `Callback boundaries (not calls): ${call.callbackArguments.map(describe).join(", ")}`, "detail"));
-  evidence.append(button("Read call-site source", () => showSource(call, view.revision)));
+  if (witness) evidence.append(button("Read call-site source", () => showSource(call, view.revision)));
   li.append(evidence);
-  if (expandable && target && ["method", "function", "constructor"].includes(target.kind)) {
-    if (ancestors.has(target.id)) li.append(element("span", "Cycle boundary · already on this branch", "detail"));
-    else if (level >= 7) li.append(element("span", "Branch limit reached. Select this method as a new root to continue.", "detail"));
-    else {
-      const branch = element("ul", undefined, "plain call-branch"); branch.hidden = true;
-      let loaded = false;
-      const expand = button("Expand outgoing calls", async () => {
-        if (!branch.hidden) { branch.hidden = true; expand.textContent = "Expand outgoing calls"; expand.setAttribute("aria-expanded", "false"); return; }
-        if (!loaded) {
-          const serial = querySerial, selection = questionSerial;
-          const data = await api("/api/query", "POST", {seed: target.id, depth: 1, maxNodes: 40, maxCalls: 200, includeCallbacks: false, excludePaths: []});
-          if (serial !== querySerial || selection !== questionSerial || !li.isConnected) return;
-          if (!IndexPin.equal(data.revision, view.revision) || (status && !IndexPin.equal(data.revision, status.revision))) { unexpectedPair("Index changed. Refresh before expanding this branch.", data.revision); return; }
-          const path = new Set(ancestors); path.add(target.id);
-          for (const child of data.calls.filter(c => c.caller === target.id)) branch.append(callRow(child, data, path, level + 1, true));
-          if (!branch.children.length) branch.append(element("li", "No measured outgoing calls."));
-          if (data.truncated || data.warnings?.length) branch.append(element("li", `Partial evidence · ${(data.warnings || []).map(describe).join(" · ") || "query limits reached"}`, "detail"));
-          loaded = true;
-        }
-        branch.hidden = false; expand.textContent = "Collapse outgoing calls"; expand.setAttribute("aria-expanded", "true");
-      });
-      expand.className = "expand-call"; expand.setAttribute("aria-expanded", "false"); li.append(expand, branch);
-    }
-  }
   return li;
 }
 async function showSource(item, revision) {
-  if (status && !IndexPin.equal(revision, status.revision)) throw new Error("This source belongs to an older revision. Refresh the view first.");
+  IndexPin.copy(revision);
+  if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
   const serial = ++sourceSerial; const key = `${IndexPin.key(revision)}:${item.path}`;
   window.BaleygNavigation?.reset();
   $("source-path").textContent = `Loading ${item.path}…`; $("source").replaceChildren();
@@ -387,8 +366,8 @@ function renderViews() {
     const view = state.view; const li = element("li");
     li.append(button(view.title, async () => {
       seed = view.query.seed; $("seed").textContent = `Saved view: ${view.title}`;
-      $("depth").value = String(Math.max(0, Math.min(5, view.query.depth))); $("callbacks").checked = !!view.query.includeCallbacks;
-      resetNote(); renderNotes(); await runQuery({...view.query, depth: Number($("depth").value)});
+      $("depth").value = String(Math.max(0, Math.min(5, view.query.depth))); $("callbacks").checked = false;
+      resetNote(); renderNotes(); await runQuery({...view.query, depth: 1, includeCallbacks: false});
     }), button("Delete", async () => { await api(`/api/views/${encodeURIComponent(view.id)}`, "DELETE"); await loadSaved(); }));
     if (state.orphanedIds?.length) li.append(element("span", `${state.orphanedIds.length} orphaned references`, "detail"));
     $("views").append(li);
@@ -399,7 +378,7 @@ form("save-form", async () => {
   if (focused) throw new Error("Focused selections cannot be saved as raw queries. Return to the raw hierarchy first.");
   if (!result) throw new Error("Run a query before saving a view.");
   const id = crypto.randomUUID();
-  await api(`/api/views/${id}`, "PUT", {id, title: $("view-title").value.trim(), query: result.query, pins: {}, hidden: []});
+  await api(`/api/views/${id}`, "PUT", {id, title: $("view-title").value.trim(), query: {...result.query, depth: 1, includeCallbacks: false}, pins: {}, hidden: []});
   $("view-title").value = ""; await loadSaved();
 });
 function resetNote() { editingNote = null; $("note").value = ""; $("save-note").textContent = "Add note"; $("reset-note").hidden = true; }
@@ -463,15 +442,15 @@ async function refreshJevStatus() {
   syncFocusControls();
 }
 function syncFocusControls() {
-  $("explain-acp").disabled = acpRunning || !packet || !acpStatus?.enabled || !(acpStatus.status?.remainingAttempts > 0);
-  $("run-jev").disabled = jevRunning || !packet || !jevStatus?.enabled || !(jevStatus.budget?.remainingCents >= 10);
+  $("explain-acp").disabled = acpRunning || !safePacket() || !acpStatus?.enabled || !(acpStatus.status?.remainingAttempts > 0);
+  $("run-jev").disabled = jevRunning || !safePacket() || !jevStatus?.enabled || !(jevStatus.budget?.remainingCents >= 10);
 
   $("save-view").disabled = !!focused;
   $("save-view").title = focused ? "Return to the raw hierarchy to save its query" : "Saves raw query settings, not a focused selection";
   $("return-raw").hidden = !focused;
   $("query-form").hidden = !!focused;
   $("focus-counts").hidden = !focused;
-  $("packet-actions").hidden = !packet;
+  $("packet-actions").hidden = !safePacket();
   $("result-title").textContent = focused ? "Focused outgoing calls" : "Outgoing call hierarchy";
 }
 function invalidateFocus(message = "Prepare preview offline first, then explicitly Run Jev with that packet. No automatic provider calls.") {
@@ -494,19 +473,44 @@ form("question-form", async () => {
   const serial = questionSerial, queryAtStart = querySerial, selectedSeed = seed, revision = IndexPin.copy(status.revision);
   const terms = $("focus-terms").value.split(",").map(s => s.trim()).filter(Boolean);
   if (terms.length > 12) throw new Error("Use no more than 12 focus terms.");
+  if (!safeEvidenceFormat()) {
+    packet = null; focused = null;
+    $("focus-state").textContent = "Source-only preview. Packet actions are unavailable without verified terminal status.";
+  }
   $("focus-state").textContent = "Preparing local evidence and offline preview…";
   const data = await api("/api/questions/preview", "POST", {seed, question: $("question").value.trim(), expectedRevision: revision,
     evidenceDepth: Number($("evidence-depth").value), maxVisible: Number($("max-visible").value),
     allowDeeperDisplay: $("allow-deeper").checked, focusTerms: terms});
   if (serial !== questionSerial || queryAtStart !== querySerial || seed !== selectedSeed || !IndexPin.equal(status?.revision, revision)) return;
   if (!IndexPin.equal(data.packet.revision, revision) || !IndexPin.equal(data.view.revision, revision)) { unexpectedPair("Preview revision changed. Refresh and try again.", data.packet.revision); throw new Error("Preview revision changed. Refresh and try again."); }
+  if (!safeEvidenceFormat() || hasLexicalProof(data.packet) || hasLexicalProof(data.view)) {
+    packet = null; focused = null;
+    $("focus-state").textContent = "Packet or preview contains unverified relationship fields. Source-only view remains available.";
+    renderResult(); return;
+  }
   packet = data.packet; focused = data.view;
   $("focus-state").textContent = `Local preview—not Jev/ACP · deterministic term matching · revision ${IndexPin.label(revision)}. ${packet.warnings?.map(describe).join(" · ") || ""}`;
   renderResult();
 });
 $("return-raw").addEventListener("click", () => { focused = null; questionSerial++; clearAnswer(); clearSource(); renderResult(); });
+function safeEvidenceFormat() {
+  // This status marker is an explicit frontend cutover contract. Old indexes omit it.
+  return status?.evidenceFormat === "terminal-native-graph-v1" &&
+    !!status.revision;
+}
+function safePacket() {
+  return !!packet && safeEvidenceFormat() && IndexPin.equal(packet.revision, status.revision) &&
+    !hasLexicalProof(packet) && (!focused || (IndexPin.equal(focused.revision, status.revision) && !hasLexicalProof(focused)));
+}
+function hasLexicalProof(value, seen = new Set()) {
+  if (!value || typeof value !== "object") return false;
+  if (seen.has(value)) return true;
+  seen.add(value);
+  if (Object.keys(value).some(key => ["target", "candidateSymbols", "resolution", "callbackArguments", "includeCallbacks", "candidateIds", "derivedFrom"].includes(key))) return true;
+  return Object.values(value).some(child => hasLexicalProof(child, seen));
+}
 function currentPacket() {
-  if (!packet || !IndexPin.equal(packet.revision, status?.revision) || packet.request.seed !== seed) throw new Error("Evidence packet is stale. Preview again first.");
+  if (!safePacket() || !IndexPin.equal(packet.revision, status?.revision) || packet.request.seed !== seed) throw new Error("Packet actions require a verified terminal snapshot. Reindex before using a provider or export.");
   return packet;
 }
 $("export-jev").addEventListener("click", () => perform(async () => {

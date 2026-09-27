@@ -125,34 +125,18 @@
       }
       if (!Array.isArray(data.targets)) throw new Error("Invalid navigation response.");
       const actions = [];
-      const candidates = data.targets.slice(0, MAX_TARGETS).filter(target => target &&
-        ["class", "sequence"].includes(target.action) && target.symbol &&
-        typeof target.symbol.id === "string" && target.symbol.id);
-      // Put explicit call targets ahead of enclosing context, preserving the
-      // backend order within both groups and the bounded original symbols.
-      const targets = [...candidates.filter(target => target.reason === "call"),
-        ...candidates.filter(target => target.reason !== "call")];
-      const labels = targets.map(target => targetLabel(target));
-      for (const [index, target] of targets.entries()) {
-        const duplicate = labels.indexOf(labels[index]) !== labels.lastIndexOf(labels[index]);
-        const range = target.symbol.range;
-        const detail = duplicate ? ` · bytes ${range?.startByte ?? "?"}–${range?.endByte ?? "?"} · ${text(target.symbol.id)}` : "";
-        const choice = (label, run) => ({label: label + detail, run: () => {
-          if (!current()) return;
-          // One action consumes every choice, including retained source/sequence callbacks.
-          serial++;
-          return run();
-        }});
-        if (target.action === "sequence" && typeof owner.openSource === "function") {
-          // Preserve the original measured symbol and request snapshot. Merely
-          // displaying these choices must not read source or select a method.
-          actions.push(choice(targetLabel(target, "Go to source"), () => owner.openSource(target.symbol, revision)));
-          actions.push(choice(targetLabel(target, "Open sequence"), () => owner.selectMethod(target.symbol)));
-        } else {
-          actions.push(choice(labels[index], () => target.action === "class" ? owner.openClass(target.symbol) : owner.selectMethod(target.symbol)));
-        }
-      }
-      if (!actions.length) actions.push(notice("No indexed target. Built-in or unmatched types are not guessed."));
+      // Old call/type matches are lexical candidates, even when labelled "measured".
+      // Only a declaration on the selected source line witnesses a source-open action.
+      const declarations = data.targets.slice(0, MAX_TARGETS).filter(target =>
+        target?.reason === "declaration" && target.matchKind === "measured" &&
+        target.symbol?.path && target.symbol?.range &&
+        Number.isInteger(target.symbol.range.startLine) && target.symbol.range.startLine > 0 &&
+        typeof owner.openSource === "function");
+      for (const target of declarations) actions.push({
+        label: `Read declaration source · ${text(target.symbol.name)} · ${text(target.symbol.path)}:${target.symbol.range.startLine}`,
+        run: () => { if (current()) { serial++; return owner.openSource(target.symbol, revision); } }
+      });
+      if (!actions.length) actions.push(notice("No measured declaration on this line. Candidate type and call targets cannot be opened as navigation."));
       if (data.requireIndex) actions.push(notice("Index the workspace to populate cached class declarations."));
       for (const warning of (Array.isArray(data.warnings) ? data.warnings : []).slice(0, MAX_NOTICES)) actions.push(notice(warning));
       if (data.truncated || data.targets.length > MAX_TARGETS || data.warnings?.length > MAX_NOTICES) actions.push(notice("Partial index or navigation results; see notices."));

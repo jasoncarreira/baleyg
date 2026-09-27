@@ -34,7 +34,7 @@ function harness() {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},evidenceFormat:'terminal-native-graph-v1'};`);
   const preserveNewFocus = () => {
     run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
       packet = {packetId:'new'}; focused = {marker:'new'};
@@ -314,7 +314,7 @@ for (const change of ['question','packet','revision','session']) {
 test('answer sits above calls with truthful source validation and static-boundary copy', () => {
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   assert.ok(html.indexOf('id="answer"') < html.indexOf('id="calls"'));
-  assert.match(html,/not whether a claim logically follows or is true/);
+  assert.match(html,/do not prove relationships or the truth of a claim/);
   assert.match(html,/Unresolved, external, and callback targets remain boundaries/);
   assert.match(html,/id="max-visible"[^>]*value="5"/);
 });
@@ -399,7 +399,7 @@ const ok=data=>({ok:true,status:200,json:async()=>data});
 test("preview and live provider responses reject reused revisions and refresh authoritative status",async()=>{
  for(const operation of ['preview','jev','acp']) {
    const h=harness(),requests=[];
-   h.run(`status={revision:${JSON.stringify(pairOld)},workspaceRoot:'/same'};
+   h.run(`status={revision:${JSON.stringify(pairOld)},workspaceRoot:'/same',evidenceFormat:'terminal-native-graph-v1'};
      packet={packetId:'p',revision:status.revision,request:{seed:'root'}};
      focused={revision:status.revision,calls:[],nodes:[]};
      jevStatus={enabled:true,budget:{remainingCents:10}};
@@ -441,7 +441,7 @@ test("export and import refuse a stale packet before any provider request", asyn
  h.get('import-jev').files=[{size:10,text:async()=>'{"selection":[]}'}];
  h.get('import-jev').listeners.change();await new Promise(setImmediate);
  assert.deepEqual(requests,[]);
- assert.match(h.get('error').textContent,/stale/);
+ assert.match(h.get('error').textContent,/stale|verified terminal snapshot/);
 });
 
 test("export request GET and import selection POST preserve unchanged wire payloads", async () => {
@@ -470,6 +470,44 @@ test("selection guards fail closed when the seed, question, or generation change
    await h.get('run-jev').listeners.click();
    await h.get('export-jev').listeners.click();
    assert.deepEqual(calls,[]);
-   assert.match(h.get('error').textContent,/stale|first/);
+   assert.match(h.get('error').textContent,/stale|first|verified terminal snapshot/);
  }
+});
+
+test("old authenticated status never releases cached packet or provider actions", async () => {
+  const h = harness(), calls = [];
+  h.run("status={revision:status.revision}; packet={packetId:'old',revision:status.revision,request:{seed:'root'}}; jevStatus={enabled:true,budget:{remainingCents:20}}; acpStatus={enabled:true,status:{remainingAttempts:2}};syncFocusControls()");
+  h.context.fetch = async url => { calls.push(url); throw Error("Unexpected packet request"); };
+  assert.equal(h.get("packet-actions").hidden,true);
+  assert.equal(h.get("run-jev").disabled,true);
+  assert.equal(h.get("explain-acp").disabled,true);
+  await h.get("run-jev").listeners.click();
+  await h.get("export-jev").listeners.click();
+  assert.equal(calls.length,0);
+  assert.match(h.get("error").textContent,/verified terminal snapshot/);
+});
+
+test("future authenticated status cannot validate an old lexical packet or stale pair", () => {
+  const h = harness();
+  h.run("packet={packetId:'old',revision:status.revision,request:{seed:'root'},target:'guessed'};syncFocusControls()");
+  assert.equal(h.get("packet-actions").hidden,true);
+  assert.throws(() => h.run("currentPacket()"),/verified terminal snapshot/);
+  h.run("packet={packetId:'old',revision:{...status.revision,indexRevision:2},request:{seed:'root'}};syncFocusControls()");
+  assert.equal(h.get("packet-actions").hidden,true);
+  assert.throws(() => h.run("currentPacket()"),/verified terminal snapshot/);
+});
+
+test("old cached packet stays denied after a new safe status pair",()=>{
+ const h=harness();
+ h.run("packet={packetId:'old',revision:status.revision,request:{seed:'root'}}; status={...status,revision:{...status.revision,indexRevision:2}};syncFocusControls()");
+ assert.equal(h.get("packet-actions").hidden,true);
+ assert.equal(h.get("run-jev").disabled,true);
+ assert.throws(()=>h.run("currentPacket()"),/verified terminal snapshot/);
+});
+
+test("preview view with legacy lexical proof cannot unlock a structurally clean packet",()=>{
+ const h=harness();
+ h.run("packet={packetId:'clean',revision:status.revision,request:{seed:'root'}};focused={revision:status.revision,calls:[{target:'guessed'}]};syncFocusControls()");
+ assert.equal(h.get("packet-actions").hidden,true);
+ assert.throws(()=>h.run("currentPacket()"),/verified terminal snapshot/);
 });

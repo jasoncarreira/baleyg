@@ -74,13 +74,7 @@
     if (get("inspector-clear")) get("inspector-clear").disabled = true;
     if (get("inspector-title")) get("inspector-title").title = "";
   }
-  function participant(view, target) { return (view.participants || []).find(item => item.id === target); }
-  function targetText(step, view, full = true) {
-    const target = participant(view, step.target);
-    if (!target) return step.target ? `Target reference: ${step.target}` : "No target identified for this step.";
-    const labels = {externalCandidate:"External candidate, not resolved dispatch", unresolvedReceiver:"Receiver type unresolved", unresolvedCallee:"Callee unresolved", boundary:"Unknown target", builtin:"Built-in name, not runtime proof", import:"Imported binding, not runtime proof", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method"};
-    return `${target.label} · ${labels[target.kind] || target.kind}${full && target.identification ? " · " + target.identification : ""}`;
-  }
+  function targetText() { return "Terminal syntax only · no verified target"; }
   function location(step) {
     if (!step.path || !step.range) return "Source range unavailable";
     const r = step.range;
@@ -102,7 +96,7 @@
     text("inspector-target", flat
       ? `First measured entry call only: ${targetText(entry, view, false)}. Other calls may have different receivers and return types.`
       : targetText(step, view, false));
-    text("inspector-evidence", `Static possible path, not a runtime trace. ${entry.resolution == null ? "No resolution evidence supplied." : "Original resolution: " + describe(entry.resolution)}`);
+    text("inspector-evidence", `Measured source steps, not a runtime trace or verified dispatch.`);
     const detail = get("inspector-detail");
     // Every original field and all nested guards, alternates and chain calls remain
     // available as safe text. Never infer equivalent guards or invent confidence.
@@ -110,14 +104,14 @@
       const disclosure = make("details");
       disclosure.append(make("summary", `${label ? label + " · " : ""}${item.kind || "step"}: ${item.label || item.id || "Details"}`));
       disclosure.append(make("p", `${location(item)} · ${targetText(item, view)}`));
-      const fields = Object.fromEntries(Object.entries(item).filter(([key]) => !["children", "alternate"].includes(key)));
+      const fields = Object.fromEntries(Object.entries(item).filter(([key]) => !["children", "alternate", "target", "resolution", "candidateSymbols", "callbackArguments"].includes(key)));
       disclosure.append(make("pre", JSON.stringify(fields, null, 2)));
       for (const child of item.children || []) evidence(child, disclosure, "Child");
       for (const child of item.alternate || []) evidence(child, disclosure, "Alternate");
       parent.append(disclosure);
       return disclosure;
     }
-    if (detail) evidence(step, detail, "Original evidence");
+    if (detail) evidence(step, detail, "Measured syntax");
     openSource = step.path && step.range && typeof callback === "function" ? callback : null;
     if (get("inspector-open-source")) get("inspector-open-source").disabled = !openSource;
     drawer("inspector", true);

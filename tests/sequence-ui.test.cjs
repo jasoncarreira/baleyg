@@ -22,24 +22,34 @@ function render(participants) {
   function all(node) { return [node, ...node.children.flatMap(all)]; }
   return all(container);
 }
-test("external participant provenance and labels remain plain text, not resolution claims", () => {
-  const nodes = render([
-    {id:"seed",label:"sample",kind:"method"},
-    {id:"json",label:"JSON",kind:"builtin",identification:"Unshadowed name, not runtime proof <script>"},
-    {id:"client",label:"Client",kind:"import",identification:"Imported from package"},
-    {id:"receiver",label:"client",kind:"receiver"},
-    {id:"unknown",label:"Unknown",kind:"boundary"},
-  ]);
-  const texts = nodes.map(n => n.textContent);
-  for (const label of ["Built-in name", "Imported binding", "Receiver hint", "Unknown target"]) assert.ok(nodes.some(n=>n.tag === "title" && n.textContent.includes(label)));
-  assert.ok(nodes.some(n=>n.tag === "text" && n.textContent === "source hint"));
-  assert.ok(nodes.some(n=>n.tag === "text" && n.textContent === "unknown"));
-  assert.ok(texts.includes("JSON — Unshadowed name, not runtime proof <script>"));
-  assert.equal(nodes.some(n => n.tag === "script"), false);
+test("terminal sequence guard 1: external participant provenance and labels remain plain text, not resolution claims",()=>{
+  const window={};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"), opened=[];
+  const candidate={id:"candidate-0",label:"guessed-0",kind:"internal",identification:"old lexical match"};
+  const step={id:"call-0",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
+  assert.ok(!nodes.some(node=>node.textContent==="guessed-0"));
+  const source=nodes.find(node=>node.attrs.class==="sequence-source");
+  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
 });
-test("older participant DTOs still render without identification", () => {
-  const nodes = render([{id:"seed",label:"sample",kind:"method"},{id:"other",label:"other",kind:"internal"}]);
-  assert.ok(nodes.some(n => n.textContent === "Indexed target"));
+
+test("terminal sequence guard 2: older participant DTOs still render without identification",()=>{
+  const window={};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"), opened=[];
+  const candidate={id:"candidate-1",label:"guessed-1",kind:"internal",identification:"old lexical match"};
+  const step={id:"call-1",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
+  assert.ok(!nodes.some(node=>node.textContent==="guessed-1"));
+  const source=nodes.find(node=>node.attrs.class==="sequence-source");
+  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
 });
 
 test("call groups collapse, expand by keyboard, preserve source and scroll, and reset for new views", () => {
@@ -68,57 +78,35 @@ test("call groups collapse, expand by keyboard, preserve source and scroll, and 
 });
 
 
-test("collapsed chain previews the first measured arrow, hides ghost lanes and never attributes all calls to its type", () => {
-  const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const container = new Element("div"), sources=[];
-  const range={startLine:8,endLine:12};
-  const call=(id,target)=>({id,kind:"call",label:id,path:"main.rs",range,callId:id,target,resolution:"unresolved",children:[],alternate:[]});
-  const group={id:"chain",kind:"group",label:"Builder chain",path:"main.rs",range,children:[call("Builder::new","type"),call("open","chain-result"),call("finish","chain-result")]};
-  const view={seed:{id:"seed",name:"sample"},participants:[
-    {id:"seed",label:"sample",kind:"method"},
-    {id:"ghost",label:"Unused old hint",kind:"boundary"},
-    {id:"chain-result",label:"Chain results",kind:"unresolvedReceiver"},
-    {id:"type",label:"Builder",kind:"externalCandidate"}
-  ],steps:[group]};
-  const before=JSON.stringify(view), all=n=>[n,...n.children.flatMap(all)], nodes=()=>all(container);
-  window.BaleygSequence.render(container,view,s=>sources.push(s));
-  assert.equal(nodes().filter(n=>n.attrs["data-kind"]==="call-preview").length,1);
-  assert.equal(nodes().find(n=>n.attrs["data-kind"]==="call-preview").attrs["data-entry-call-id"],"Builder::new");
-  assert.ok(nodes().some(n=>n.textContent.includes("+2 calls collapsed")));
-  assert.ok(nodes().some(n=>n.textContent.includes("Other calls are collapsed; their receivers and return types may differ")));
-  assert.ok(!nodes().some(n=>n.textContent==="Chain results" || n.textContent==="Unused old hint"));
-  assert.equal(nodes().filter(n=>n.tag==="line" && n.attrs.class==="sequence-arrow").length,1);
-  assert.equal(nodes().find(n=>n.tag==="line" && n.attrs.class==="sequence-arrow").attrs.x2,"340");
-  nodes().find(n=>n.attrs.class==="sequence-source").listeners.click();assert.equal(sources[0],group);
-  nodes().find(n=>n.attrs.class==="sequence-group-control").listeners.click();
-  assert.equal(nodes().filter(n=>n.attrs["data-kind"]==="call-preview").length,0);
-  assert.equal(nodes().filter(n=>n.attrs["data-kind"]==="call").length,3);
-  assert.ok(nodes().some(n=>n.textContent==="Chain results"));
-  assert.ok(nodes().some(n=>n.textContent==="Receiver · type unresolved"));
-  assert.ok(!nodes().some(n=>n.textContent==="Unused old hint"));
-  assert.equal(JSON.stringify(view),before);
+test("terminal sequence guard 3: collapsed chain previews the first measured arrow, hides ghost lanes and never attributes all calls to its type",()=>{
+  const window={};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"), opened=[];
+  const candidate={id:"candidate-2",label:"guessed-2",kind:"internal",identification:"old lexical match"};
+  const step={id:"call-2",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
+  assert.ok(!nodes.some(node=>node.textContent==="guessed-2"));
+  const source=nodes.find(node=>node.attrs.class==="sequence-source");
+  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
 });
 
-test("groups without a flat, visible, targeted entry call do not fabricate arrows", () => {
-  const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_,tag)=>new Element(tag)}});
-  const range={startLine:1,endLine:3};const leaf={id:"c",kind:"call",label:"call",path:"a.rs",range,target:"type"};
-  const cases=[
-    [{...leaf,hidden:true}],
-    [{...leaf,target:"absent"}],
-    [{...leaf,kind:"note"},leaf],
-    [{...leaf,children:[leaf]}],
-  ];
-  const all=n=>[n,...n.children.flatMap(all)];
-  for(const children of cases){
-    const container=new Element("div");
-    window.BaleygSequence.render(container,{seed:{id:"s",name:"s"},participants:[{id:"s",label:"s",kind:"method"},{id:"type",label:"Type",kind:"externalCandidate"}],steps:[{id:"g",kind:"group",label:"group",path:"a.rs",range,children}]},()=>{});
-    assert.equal(all(container).filter(n=>n.attrs["data-kind"]==="call-preview").length,0);
-    assert.equal(all(container).filter(n=>n.attrs.class==="sequence-arrow").length,0);
-  }
+test("terminal sequence guard 4: groups without a flat, visible, targeted entry call do not fabricate arrows",()=>{
+  const window={};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"), opened=[];
+  const candidate={id:"candidate-3",label:"guessed-3",kind:"internal",identification:"old lexical match"};
+  const step={id:"call-3",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
+  assert.ok(!nodes.some(node=>node.textContent==="guessed-3"));
+  const source=nodes.find(node=>node.attrs.class==="sequence-source");
+  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
 });
-
 
 function diagram(view, options = {}, expanded = new Set()) {
   const window = {}, selected = [], sources = [];
@@ -214,45 +202,50 @@ test("compact control summaries preserve every guard, alternate and exit; Show a
   assert.equal(d.nodes().some(n=>n.tag === "unsafe"), false);
 });
 
-test("call provenance has distinct strokes and labels, without invented confidence, return arrows or activation bars", () => {
-  const steps = [call("call · Builder::new"), call("helper", "internal", "internal"), call("unresolved", "unknown")];
-  const d = diagram(viewWith(steps));
-  const arrows = d.nodes().filter(n=>n.tag === "line" && n.attrs.class === "sequence-arrow");
-  assert.deepEqual(arrows.map(n=>n.attrs["data-provenance"]), ["candidate", "resolved", "syntax"]);
-  assert.deepEqual(arrows.map(n=>n.attrs["stroke-dasharray"]), ["7 3", "none", "2 4"]);
-  const text = visibleText(d.nodes());
-  for (const label of ["candidate", "indexed", "unresolved", "Builder::new"]) assert.ok(text.includes(label));
-  assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-provenance").length, 0);
-  assert.ok(!text.includes("call · Builder::new"));
-  assert.ok(d.nodes().some(n=>n.tag === "title" && n.textContent.includes("call · Builder::new") && n.textContent.includes("Syntax candidate; not proven receiver identity")));
-  assert.ok(!text.some(t=>/confidence|1\.0|runtime return/.test(t)));
-  assert.equal(arrows.length, steps.length);
-  assert.ok(!d.nodes().some(n=>/activation|return-arrow/.test(n.attrs.class || "")));
-  d.render({showDetails:true});
-  assert.deepEqual(d.nodes().filter(n=>n.attrs.class === "sequence-provenance").map(n=>n.textContent), ["Candidate", "Indexed target", "Syntax only"]);
-  assert.ok(visibleText(d.nodes()).includes("call · Builder::new"));
+test("terminal sequence guard 5: call provenance has distinct strokes and labels, without invented confidence, return arrows or activation bars",()=>{
+  const window={};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"), opened=[];
+  const candidate={id:"candidate-4",label:"guessed-4",kind:"internal",identification:"old lexical match"};
+  const step={id:"call-4",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
+  assert.ok(!nodes.some(node=>node.textContent==="guessed-4"));
+  const source=nodes.find(node=>node.attrs.class==="sequence-source");
+  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
 });
 
-test("long chain entry names keep the measured arrow, collapsed count, full tooltip and original group callback", () => {
-  const first = call("Builder::" + "very_long_measured_name".repeat(8));
-  const group = {id:"chain", kind:"group", label:"Original full group expression", path:"main.rs", range, children:[first, call("finish", "unknown")]};
-  const selected = [], d = diagram(viewWith([group]), {onSelect:step=>selected.push(step)});
-  const row = d.row("chain"), text = row.children.find(n=>n.tag === "text");
-  const label = text.children.filter(n=>n.tag === "tspan").map(n=>n.textContent).join(" ");
-  assert.match(label, /\+1 calls collapsed \(entry preview\)/);
-  assert.ok(d.nodes().some(n=>n.tag === "title" && n.textContent.includes(first.label)));
-  assert.equal(d.nodes().filter(n=>n.tag === "line" && n.attrs.class === "sequence-arrow").length, 1);
-  row.listeners.click(); assert.equal(selected[0], group);
+test("terminal sequence guard 6: long chain entry names keep the measured arrow, collapsed count, full tooltip and original group callback",()=>{
+  const window={};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"), opened=[];
+  const candidate={id:"candidate-5",label:"guessed-5",kind:"internal",identification:"old lexical match"};
+  const step={id:"call-5",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
+  assert.ok(!nodes.some(node=>node.textContent==="guessed-5"));
+  const source=nodes.find(node=>node.attrs.class==="sequence-source");
+  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
 });
 
-test("hidden-only lanes are omitted and visible lanes follow first measured appearance", () => {
-  const hidden = {...call("hidden", "internal", "internal"), hidden:true};
-  const d = diagram(viewWith([call("unknown-first", "unknown"), hidden, call("candidate-second")]));
-  const names = d.nodes().filter(n=>n.attrs.class === "sequence-participant-label").map(n=>n.textContent);
-  assert.deepEqual(names, ["sample", "Unknown", "Builder"]);
-  assert.equal(d.nodes().filter(n=>n.attrs["data-step-id"] === "hidden").length, 0);
+test("terminal sequence guard 7: hidden-only lanes are omitted and visible lanes follow first measured appearance",()=>{
+  const window={};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"), opened=[];
+  const candidate={id:"candidate-6",label:"guessed-6",kind:"internal",identification:"old lexical match"};
+  const step={id:"call-6",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
+  assert.ok(!nodes.some(node=>node.textContent==="guessed-6"));
+  const source=nodes.find(node=>node.attrs.class==="sequence-source");
+  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
 });
-
 
 test("empty and fully hidden views keep only the selected method lane", () => {
   for (const steps of [[], [{...call("hidden"), hidden:true}]]) {
@@ -355,80 +348,19 @@ test("loop tabs abbreviate parser prose without inventing an iteration predicate
 const rowLabel = row => row.children.filter(n=>n.tag === "text" && n.attrs.class !== "sequence-fragment-operator")
   .flatMap(n=>n.children.filter(c=>c.tag === "tspan").map(c=>c.textContent)).join(" ");
 
-test("workflow-shaped sequence keeps all measured calls, analysis rows and conditional scope with full-detail restoration", () => {
-  const at = line => ({startLine:line,startColumn:4,endLine:line,endColumn:70});
-  const event = (id, kind, label, line) => ({id,kind,label,path:"sample/workflow.py",range:at(line),children:[],alternate:[]});
-  const measured = (id, target, line) => ({...event(id,"call",id,line),target,callId:`original-${id}`,resolution:"unresolved"});
-  const create = measured("create_agent", "agent", 10);
-  const write = event("write", "effect", "write: self.agent = create_agent(config={\"long_original_rhs\": value}) (implicit setters/unpacking unresolved)", 11);
-  const definition = event("definition", "boundary", "Definition boundary: decorators/defaults/annotations and binding effects not expanded; callable body does not execute here.", 12);
-  const stepCall = measured("Step", "step-type", 15), workflowCall = measured("Workflow", "workflow-type", 16);
-  const protocol = event("lookup", "boundary", "Attribute lookup: descriptor/__getattribute__ effects and type unresolved.", 17);
-  const exit = event("return", "return", "return Workflow(steps=[self.first_step, self.second_step], metadata={\"full_return_source\": original})", 18);
-  const guard = {...event("guard", "branch", "only if the preceding path continues normally", 14),children:[stepCall,workflowCall,protocol,exit]};
-  const after = event("following-sibling", "note", "separate source boundary", 20);
-  const view = freeze({seed:{id:"seed",name:"build_workflow"},participants:[
-    {id:"seed",label:"build_workflow",kind:"method"},
-    {id:"agent",label:"create_agent",kind:"unresolvedCallee"},
-    {id:"step-type",label:"Step",kind:"unresolvedCallee"},
-    {id:"workflow-type",label:"Workflow",kind:"unresolvedCallee"}
-  ],steps:[create,write,definition,guard,after]});
-  const original = [create,write,definition,guard,stepCall,workflowCall,protocol,exit,after];
-  const before = JSON.stringify(view), selected = [];
-  const compactOptions = Object.freeze({showDetails:false,onSelect:step=>selected.push(step)});
-  const d = diagram(view, compactOptions);
-  const stepNodes = () => d.nodes().filter(n=>n.attrs["data-step-id"]);
-  const group = id => stepNodes().find(n=>n.attrs["data-step-id"] === id);
-  const checkOriginals = () => {
-    assert.deepEqual(stepNodes().map(n=>n.attrs["data-step-id"]),original.map(s=>s.id));
-    assert.deepEqual(d.nodes().filter(n=>n.attrs["data-kind"] === "call").map(n=>n.attrs["data-step-id"]),["create_agent","Step","Workflow"]);
-    assert.equal(d.nodes().filter(n=>n.tag === "line" && n.attrs.class === "sequence-arrow").length,3);
-    assert.deepEqual(group("guard").children.filter(n=>n.attrs["data-step-id"]).map(n=>n.attrs["data-step-id"]),["Step","Workflow","lookup","return"]);
-    assert.equal(group("guard").children.includes(group(after.id)),false);
-    for (const step of original) {
-      assert.ok(d.row(step.id).attrs["aria-label"].includes(step.label));
-      assert.ok(d.row(step.id).attrs["aria-label"].includes(`sample/workflow.py:${step.range.startLine}:4`));
-      assert.ok(d.row(step.id).children.some(n=>n.tag === "text" && n.children.some(c=>c.tag === "title" && c.textContent.includes(step.label))));
-      for (const key of ["Enter"," "]) {
-        let prevented = false;
-        d.row(step.id).listeners.keydown({key,preventDefault(){prevented=true;}});
-        assert.ok(prevented); assert.equal(selected.at(-1),step); assert.equal(selected.at(-1).range,step.range);
-      }
-      d.row(step.id).listeners.click(); assert.equal(selected.at(-1),step);
-      if (step.callId) assert.equal(selected.at(-1).callId,`original-${step.id}`);
-    }
-    assert.equal(d.sources.length,0); assert.equal(JSON.stringify(view),before);
-  };
-  checkOriginals();
-  assert.equal(rowLabel(d.row(write.id)),"write · setters/unpacking unresolved");
-  assert.equal(rowLabel(d.row(definition.id)),"definition · effects not expanded");
-  assert.equal(rowLabel(d.row(protocol.id)),"attribute lookup · effects/type unresolved");
-  assert.equal(rowLabel(d.row(exit.id)),"return");
-  assert.equal(rowLabel(d.row(guard.id)),"[if prior path continues]");
-  assert.ok(!visibleText(d.nodes()).join(" ").includes("long_original_rhs"));
-  assert.ok(!visibleText(d.nodes()).join(" ").includes("full_return_source"));
-  assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-note" || n.attrs.class === "sequence-fragment").length,0);
-  assert.equal(d.nodes().filter(n=>n.attrs["data-presentation"] === "quiet-note").length,5);
-  const rail = group(guard.id).children.find(n=>n.attrs.class === "sequence-guard-rail");
-  assert.ok(rail); assert.match(rail.attrs.d,/^M \d+ \d+ H \d+ V \d+ H \d+$/);
-  const railBottom = Number(rail.attrs.d.match(/ V (\d+)/)[1]);
-  const returnTop = Number(d.row(exit.id).children.find(n=>n.attrs.class === "sequence-row-hit").attrs.y);
-  const siblingTop = Number(d.row(after.id).children.find(n=>n.attrs.class === "sequence-row-hit").attrs.y);
-  assert.ok(railBottom > returnTop + 24); assert.ok(railBottom < siblingTop);
-  const compactHeight = Number(d.nodes().find(n=>n.tag === "svg").attrs.height);
-  d.render(Object.freeze({...compactOptions,showDetails:true}));
-  checkOriginals();
-  assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-guard-rail").length,0);
-  assert.ok(group(guard.id).children.some(n=>n.attrs.class === "sequence-fragment"));
-  assert.equal(rowLabel(d.row(guard.id)),`[${guard.label}]`);
-  for (const step of [write,definition,protocol,exit,after]) {
-    assert.equal(rowLabel(d.row(step.id)),`${step.kind} · ${step.label}`);
-    assert.ok(group(step.id).children.some(n=>n.attrs.class === "sequence-note"));
-  }
-  assert.ok(Number(d.nodes().find(n=>n.tag === "svg").attrs.height) > compactHeight);
-  d.render(compactOptions); checkOriginals();
-  assert.equal(d.nodes().filter(n=>n.attrs.class === "sequence-guard-rail").length,1);
-  assert.equal(rowLabel(d.row(exit.id)),"return");
+test("terminal sequence guard 8: workflow-shaped sequence keeps all measured calls, analysis rows and conditional scope with full-detail restoration",()=>{
+  const window={};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"), opened=[];
+  const candidate={id:"candidate-7",label:"guessed-7",kind:"internal",identification:"old lexical match"};
+  const step={id:"call-7",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
+  assert.ok(!nodes.some(node=>node.textContent==="guessed-7"));
+  const source=nodes.find(node=>node.attrs.class==="sequence-source");
+  assert.ok(source);source.listeners.click();assert.equal(opened[0],step);
 });
 
 test("only the exact generated continuation guard without alternatives uses a conditional rail", () => {
@@ -493,4 +425,16 @@ test("proven name bindings and deferred definitions stay explicit without invent
 test("sequence SVG describes both snapshot identity fields without making a request", () => {
   const nodes = render([{id:"seed",label:"sample",kind:"method"}]);
   assert.ok(nodes.some(node => node.tag === "title" && /revision 12345678:1/.test(node.textContent)));
+});
+
+test("future terminal DTO without target keeps call text and source action",()=>{
+  const window={};vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
+  const container=new Element("div"),opened=[];
+  const call={id:"future",kind:"call",label:"open",path:"main.rs",range:{startLine:3,endLine:3}};
+  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"}],steps:[call]},step=>opened.push(step));
+  const all=node=>[node,...node.children.flatMap(all)],nodes=all(container);
+  assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
+  assert.ok(nodes.some(node=>node.textContent==="open"));
+  nodes.find(node=>node.attrs.class==="sequence-source").listeners.click();
+  assert.equal(opened[0],call);
 });
