@@ -70,12 +70,16 @@
     return {expectedRevision: revision, classId: selector.classId, memberName: selector.memberName,
       startByte: selector.startByte, endByte: selector.endByte};
   }
-  function targetLabel(target, actionLabel = target.action === "class" ? "Class" : "Sequence") {
-    const symbol = target.symbol;
-    const identity = symbol.qualifiedName || target.qualifiedName || symbol.name || symbol.id;
-    const column = positive(symbol.range?.startColumn) ? `:${symbol.range.startColumn}` : "";
-    const location = `${text(symbol.path)}:${symbol.range?.startLine || "?"}${column}`;
-    return `${actionLabel} · ${text(identity)} · ${text(target.reason)} · ${text(target.matchKind).replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()} · ${location}`;
+  function sourceWitness(item) {
+    const r = item?.range;
+    return typeof item?.path === "string" && !!item.path.trim() && !!r &&
+      Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
+      Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
+      (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
+      (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
+      (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
+      (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
+      (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
   }
   async function open(event, selector, {isCurrent} = {}) {
     const anchor = capture(event), owner = api, ticket = ++serial;
@@ -129,13 +133,17 @@
       // Only a declaration on the selected source line witnesses a source-open action.
       const declarations = data.targets.slice(0, MAX_TARGETS).filter(target =>
         target?.reason === "declaration" && target.matchKind === "measured" &&
-        target.symbol?.path && target.symbol?.range &&
-        Number.isInteger(target.symbol.range.startLine) && target.symbol.range.startLine > 0 &&
+        body.path && target.symbol?.path === body.path && target.symbol.range?.startLine === body.line &&
+        sourceWitness(target.symbol) &&
         typeof owner.openSource === "function");
-      for (const target of declarations) actions.push({
-        label: `Read declaration source · ${text(target.symbol.name)} · ${text(target.symbol.path)}:${target.symbol.range.startLine}`,
-        run: () => { if (current()) { serial++; return owner.openSource(target.symbol, revision); } }
-      });
+      const labels = declarations.map(target => `Read declaration source · ${text(target.symbol.name)} · ${text(target.symbol.path)}:${target.symbol.range.startLine}`);
+      for (const [index, target] of declarations.entries()) {
+        const r = target.symbol.range;
+        const suffix = labels.indexOf(labels[index]) !== labels.lastIndexOf(labels[index])
+          ? ` · bytes ${r.startByte ?? "?"}–${r.endByte ?? "?"} · ${text(target.symbol.id)}` : "";
+        actions.push({label: labels[index] + suffix,
+          run: () => { if (current()) { serial++; return owner.openSource(target.symbol, revision); } }});
+      }
       if (!actions.length) actions.push(notice("No measured declaration on this line. Candidate type and call targets cannot be opened as navigation."));
       if (data.requireIndex) actions.push(notice("Index the workspace to populate cached class declarations."));
       for (const warning of (Array.isArray(data.warnings) ? data.warnings : []).slice(0, MAX_NOTICES)) actions.push(notice(warning));

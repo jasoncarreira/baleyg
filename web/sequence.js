@@ -4,6 +4,17 @@ function renderSequence(container, view, readSource, expandedGroups = new Set(),
   return drawSequence(container, view, readSource, expandedGroups, options, {id:null});
 }
 
+function sourceWitness(item) {
+  const r = item?.range;
+  return typeof item?.path === "string" && !!item.path.trim() && !!r &&
+    Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
+    Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
+    (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
+    (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
+    (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
+    (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
+    (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
+}
 function drawSequence(container, view, readSource, expandedGroups, options, selection) {
   const groupControls = new Map(), rowControls = [];
   const ns = "http://www.w3.org/2000/svg";
@@ -23,7 +34,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     if (step.kind !== "group" || step.alternate?.length || !children.length ||
         !children.every(child => child.kind === "call" && !child.hidden &&
           !child.children?.length && !child.alternate?.length)) return null;
-    return children[0].path && children[0].range ? children[0] : null;
+    return sourceWitness(step) && sourceWitness(children[0]) && step.path === children[0].path ? children[0] : null;
   };
   const visibleTargets = new Set([view.seed.id]);
   const pending = (view.steps || []).map(step => ({step, depth:0})).reverse();
@@ -154,7 +165,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   if (!options.showDetails) svg.append(make("text", {x:24, y:73, class:"sequence-meta"}, "Compact labels · select for details"));
   let y = options.showDetails ? 78 : 98;
   function sourceControl(group, step, x, top, display = step, evidence = step, operator = null) {
-    const interactive = typeof options.onSelect === "function" || (step.path && step.range && typeof readSource === "function");
+    const interactive = sourceWitness(step) && sourceWitness(evidence) && step.path === evidence.path &&
+      (!options.isCurrent || options.isCurrent()) &&
+      (typeof options.onSelect === "function" || typeof readSource === "function");
     const call = evidence.kind === "call", proof = call ? provenance(evidence) : null;
     const fullLabel = tooltip(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
     const control = make("g", {class:"sequence-source", "data-source-step-id":step.id,
@@ -200,6 +213,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     if (interactive) {
       rowControls.push({control, id:step.id});
       const select = () => {
+        if (!sourceWitness(step) || !sourceWitness(evidence) || step.path !== evidence.path || (options.isCurrent && !options.isCurrent())) return;
         selection.id = step.id;
         for (const row of rowControls) row.control.setAttribute("aria-pressed", String(row.id === selection.id));
         if (typeof options.onSelect === "function") options.onSelect(step);

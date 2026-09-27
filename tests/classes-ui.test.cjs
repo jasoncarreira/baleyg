@@ -523,3 +523,23 @@ test("future class DTO without edge collection still selects a measured declarat
  assert.match(text(h.get("classes-state")),/measured declarations/);
  assert.equal(h.reads.length,0);
 });
+
+test("terminal class list keeps the 24-declaration cap without relation expansion",async()=>{
+ const h=harness(), ids=["A",...Array.from({length:39},(_,i)=>`C${i}`)],data=diagram(ids);
+ h.setRequest(async()=>data);await h.controller.open({seed:"A"});
+ assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.dataset.classId).length,1);
+ await allReturned(h);
+ assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.dataset.classId).length,24);
+ assert.equal(descendants(h.get("classes-diagram")).filter(n=>n.className==="classes-edge").length,0);
+ assert.equal(h.calls[0].options.body.includeHierarchy,false);
+ assert.equal(h.reads.length,0);
+});
+
+test("stale terminal class response cannot replace a newer selected declaration",async()=>{
+ const h=harness(), first=deferred();h.setRequest(async()=>first.promise);
+ const old=h.controller.open({seed:"A"});
+ h.setRequest(async()=>diagram(["B","A"]));await h.controller.open({seed:"B"});
+ first.resolve(diagram(["A","B"]));await old;
+ assert.ok(h.card("B"));assert.equal(h.card("A"),undefined);
+ assert.equal(h.reads.length,0);
+});

@@ -135,7 +135,7 @@ async function refreshStatus(followup = false) {
   $("status").textContent = `${status.workspaceRoot} · Revision ${IndexPin.label(status.revision)} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
   $("stale").hidden = true;
-  if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax is indexed, but semantic links are disabled. Regenerate SCIP and its paired manifest from unchanged inputs to restore them.`);
+  if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax remains source-only; imported SCIP is display metadata, never semantic proof.`);
   if (result && !IndexPin.equal(result.revision, status.revision)) stale("This view is from an older revision. Refresh status & view to update it.");
   // A rejected optional catalog must not recursively request status when status is unchanged.
   if (browseChanged || !pairRefreshPending) void refreshDependencies();
@@ -293,24 +293,46 @@ function renderResult() {
   if (rootNode) {
     const rootRow = element("li", undefined, "hierarchy-root");
     rootRow.append(element("strong", rootNode.name || rootNode.id), element("span", `${rootNode.kind} · ${rootNode.path || ""}`, "detail"));
-    if (rootNode.path && rootNode.range) rootRow.append(button("Read root source", () => showSource(rootNode, view.revision)));
+    if (sourceWitness(rootNode)) rootRow.append(button("Read root source", () => showSource(rootNode, view.revision)));
     $("calls").append(rootRow);
   }
   for (const call of view.calls.filter(call => call.caller === seed)) $("calls").append(callRow(call, view));
   if (!view.calls.length) $("calls").append(element("li", focused ? "No essential calls pass the current display policy. Inspect the raw hierarchy or change your focus terms." : "No outgoing call sites in this view. Depth 0 shows only the seed symbol."));
   for (const node of (rootNode ? [rootNode] : [])) {
     const li = element("li", `${node.name || node.id} · ${node.kind || "symbol"}`);
-    if (node.path && node.range) li.append(button("Read source", () => showSource(node, view.revision)));
+    if (sourceWitness(node)) li.append(button("Read source", () => showSource(node, view.revision)));
     $("nodes").append(li);
   }
+}
+function sourceWitness(item) {
+  const r = item?.range;
+  return typeof item?.path === "string" && !!item.path.trim() && !!r &&
+    Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
+    Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
+    (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
+    (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
+    (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
+    (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
+    (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
+}
+function terminalView(view, selectedSeed, revision) {
+  const root = (view.nodes || []).find(node => node.id === selectedSeed);
+  const nodes = root ? [{id:root.id, name:root.name, kind:root.kind,
+    ...(sourceWitness(root) ? {path:root.path, range:root.range} : {})}] : [];
+  const calls = (view.calls || []).filter(call => call.caller === selectedSeed && sourceWitness(call))
+    .map(call => ({id:call.id, caller:selectedSeed, path:call.path, range:call.range,
+      calleeText:call.calleeText || call.spelling || null,
+      regions:(call.regions || []).filter(id => (view.regions || []).some(r => r.id === id && r.path === call.path && sourceWitness(r)))}));
+  const regions = (view.regions || []).filter(region => sourceWitness(region) && calls.some(call => call.path === region.path && call.regions.includes(region.id)))
+    .map(region => ({id:region.id, kind:region.kind, label:region.label, path:region.path, range:region.range}));
+  return {revision:IndexPin.copy(revision), query:{seed:selectedSeed,depth:1,includeCallbacks:false},
+    nodes,calls,regions,warnings:[],truncated:false,supportingCount:0,uncertainCount:0,policyHiddenCount:0,omittedCount:0};
 }
 function callRow(call, view) {
   const nodes = new Map((view.nodes || []).map(node => [node.id, node]));
   const regions = new Map((view.regions || []).map(region => [region.id, region]));
   const li = element("li", undefined, "call-row");
-  const witness = typeof call?.path === "string" && !!call.path &&
-    Number.isInteger(call.range?.startLine) && call.range.startLine > 0 &&
-    Number.isInteger(call.range?.endLine) && call.range.endLine >= call.range.startLine;
+  const witness = sourceWitness(call);
   const heading = element("div", undefined, "call-heading");
   if (witness) {
     const name = button(call.calleeText || call.spelling || "Call site", () => showSource(call, view.revision));
@@ -328,6 +350,7 @@ function callRow(call, view) {
 }
 async function showSource(item, revision) {
   IndexPin.copy(revision);
+  if (!sourceWitness(item)) throw new Error("Measured source path and range unavailable.");
   if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
   const serial = ++sourceSerial; const key = `${IndexPin.key(revision)}:${item.path}`;
   window.BaleygNavigation?.reset();
@@ -484,11 +507,11 @@ form("question-form", async () => {
   if (serial !== questionSerial || queryAtStart !== querySerial || seed !== selectedSeed || !IndexPin.equal(status?.revision, revision)) return;
   if (!IndexPin.equal(data.packet.revision, revision) || !IndexPin.equal(data.view.revision, revision)) { unexpectedPair("Preview revision changed. Refresh and try again.", data.packet.revision); throw new Error("Preview revision changed. Refresh and try again."); }
   if (!safeEvidenceFormat() || hasLexicalProof(data.packet) || hasLexicalProof(data.view)) {
-    packet = null; focused = null;
-    $("focus-state").textContent = "Packet or preview contains unverified relationship fields. Source-only view remains available.";
+    packet = null; focused = terminalView(data.view, selectedSeed, revision);
+    $("focus-state").textContent = `Source-only terminal preview · revision ${IndexPin.label(revision)}. Packet and provider actions unavailable.`;
     renderResult(); return;
   }
-  packet = data.packet; focused = data.view;
+  packet = data.packet; focused = terminalView(data.view, selectedSeed, revision);
   $("focus-state").textContent = `Local preview—not Jev/ACP · deterministic term matching · revision ${IndexPin.label(revision)}. ${packet.warnings?.map(describe).join(" · ") || ""}`;
   renderResult();
 });
@@ -799,7 +822,7 @@ async function loadSequence() {
     if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
-    const options = {showDetails: !!$("all-steps").checked};
+    const options = {showDetails: !!$("all-steps").checked, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
     if (window.BaleygShell) options.onSelect = step => {
       if (current()) window.BaleygShell?.selectStep(step, data, () => readSource(step));
     };

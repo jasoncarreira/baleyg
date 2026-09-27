@@ -401,7 +401,7 @@ test("measured declaration opens only same-pair source; candidate call and type 
   const h=harness({openSource:true});
   const declaration={...target("sequence","declaration","A.run"),matchKind:"measured"};
   h.request=async()=>response([target("sequence","call","B.run"),target("class","type","B"),declaration]);
-  await h.nav.open(h.event(),selector);
+  await h.nav.open(h.event(),{path:"src/A.java",line:4});
   const choices=h.latest.actions.filter(item=>item.label.startsWith("Read declaration source"));
   assert.equal(choices.length,1);
   assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
@@ -409,4 +409,98 @@ test("measured declaration opens only same-pair source; candidate call and type 
   assert.equal(h.openedSources.length,1);
   assert.equal(h.openedSources[0].symbol,declaration.symbol);
   assert.equal(h.openedSources[0].revision.indexRevision,1);
+});
+
+test("declaration lookup invalidates out-of-order, reset, session, pair, and scope replies",async()=>{
+ const measured={...target("sequence","declaration","A.run"),matchKind:"measured"};
+ for(const invalidate of [h=>h.nav.reset(),h=>{h.session="two";},h=>{h.revision={...h.revision,indexRevision:2};},(_h,scope)=>{scope.current=false;}]) {
+  const h=harness({openSource:true}),gate=deferred(),scope={current:true};h.request=()=>gate.promise;
+  const pending=h.nav.open(h.event(),{path:"src/A.java",line:4},{isCurrent:()=>scope.current});
+  invalidate(h,scope);gate.resolve(response([measured]));await pending;
+  assert.equal(h.menus.length,1);assert.equal(h.openedSources.length,0);
+ }
+ const h=harness({openSource:true}),gate=deferred();h.request=()=>gate.promise;
+ const old=h.nav.open(h.event(),{path:"src/A.java",line:4});
+ h.request=async()=>response([{...target("sequence","declaration","New"),symbol:{...symbol("New"),name:"New"},matchKind:"measured"}]);
+ await h.nav.open(h.event(),{path:"src/A.java",line:4});gate.resolve(response([measured]));await old;
+ assert.match(h.latest.actions[0].label,/New/);
+});
+
+test("source declaration overloads retain exact measured identities without guessed sequence actions",async()=>{
+ const h=harness({openSource:true}),first={...target("sequence","declaration","run#1"),matchKind:"measured"};
+ const second={...target("sequence","declaration","run#2"),matchKind:"measured"};
+ first.symbol.name=second.symbol.name="run";
+ first.symbol.range={...first.symbol.range,startByte:10,endByte:30};
+ second.symbol.range={...second.symbol.range,startByte:40,endByte:60};
+ h.request=async()=>response([first,second]);await h.nav.open(h.event(),{path:"src/A.java",line:4});
+ const actions=h.latest.actions.filter(item=>item.label.startsWith("Read declaration source"));
+ assert.equal(actions.length,2);assert.match(actions[0].label,/bytes 10–30 · run#1/);
+ assert.match(actions[1].label,/bytes 40–60 · run#2/);
+ actions[1].run();assert.equal(h.openedSources[0].symbol,second.symbol);
+ assert.equal(h.selected.length,0);
+});
+
+test("declaration choices stay capped at 64 and hostile labels remain inert text",async()=>{
+ const h=harness({openSource:true});
+ const measured=Array.from({length:100},(_,i)=>({...target("sequence","declaration",`A.${i}`),matchKind:"measured"}));
+ measured[63].symbol.name="<img src=x> λ";
+ h.request=async()=>response(measured);await h.nav.open(h.event(),{path:"src/A.java",line:4});
+ const actions=h.latest.actions.filter(item=>item.label.startsWith("Read declaration source"));
+ assert.equal(actions.length,64);assert.match(actions[63].label,/<img src=x> λ/);
+ assert.match(h.latest.actions.at(-2).label,/Partial/);
+ actions[63].run();assert.equal(h.openedSources[0].symbol,measured[63].symbol);
+ assert.equal(h.selected.length,0);
+});
+
+test("dismissed loading declaration menu cannot resurface or open stale source",async()=>{
+ for(const dismiss of [h=>h.anchor.fire("keydown",{key:"Escape"}),h=>h.anchor.fire("keydown",{key:"Tab"}),h=>h.anchor.fire("pointerdown"),h=>h.latest.actions.at(-1).run()]) {
+  const h=harness({openSource:true}),gate=deferred();h.request=()=>gate.promise;
+  const pending=h.nav.open(h.event(),{path:"src/A.java",line:4});dismiss(h);
+  gate.resolve(response([{...target("sequence","declaration","A.run"),matchKind:"measured"}]));await pending;
+  assert.equal(h.menus.length,1);assert.equal(h.openedSources.length,0);
+ }
+});
+
+test("navigation source action requires the selected path and exact line with valid bounds",async()=>{
+ const h=harness({openSource:true}), good={...target("sequence","declaration","good"),matchKind:"measured"};
+ const bad=[{...good,symbol:{...symbol("other"),path:"src/Other.java"}},
+   {...good,symbol:{...symbol("later"),range:{startLine:5,endLine:7}}},
+   {...good,symbol:{...symbol("inverted"),range:{startLine:4,endLine:3}}},
+   {...good,symbol:{...symbol("empty"),path:""}},
+   {...good,symbol:{...symbol("fraction"),range:{startLine:4.5,endLine:7}}}];
+ h.request=async()=>response([...bad,good]);await h.nav.open(h.event(),{path:"src/A.java",line:4});
+ assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,1);
+ assert.equal(h.openedSources.length,0);
+});
+
+test("shared declaration menu focus dismissal and replacement suppress stale publication",async()=>{
+ const selection={path:"src/A.java",line:4},measured={...target("sequence","declaration","A.run"),matchKind:"measured"};
+ for(const replace of [false,true]){
+  const h=harness({openSource:true}),gate=deferred();h.request=()=>gate.promise;
+  const pending=h.nav.open(h.event(),selection);
+  if(replace)h.showMenu(h.event(),[{label:"Other class menu",run(){}}]);else h.latest.close("dismiss");
+  gate.resolve(response([measured]));await pending;
+  assert.equal(h.menus.length,replace?2:1);
+  if(replace)assert.equal(h.latest.actions[0].label,"Other class menu");
+  assert.equal(h.openedSources.length,0);
+ }
+ const h=harness({openSource:true});h.request=async()=>response([measured]);await h.nav.open(h.event(),selection);
+ const action=h.latest.actions[0];h.latest.close("action");h.anchor.focus();action.run();
+ assert.equal(h.openedSources.length,1);
+ await h.nav.open(h.event(),selection);const dismissed=h.latest.actions[0];h.latest.close("dismiss");dismissed.run();
+ assert.equal(h.openedSources.length,1);
+});
+
+test("source declaration action rechecks session revision scope and retry before opening",async()=>{
+ const selection={path:"src/A.java",line:4},measured={...target("sequence","declaration","A.run"),matchKind:"measured"};
+ for(const invalidate of [h=>h.nav.reset(),h=>{h.session="two";},h=>{h.revision={...h.revision,indexRevision:2};},(_h,scope)=>{scope.current=false;},h=>h.nav.open(h.event(),selection)]){
+  const h=harness({openSource:true}),scope={current:true};h.request=async()=>response([measured]);
+  await h.nav.open(h.event(),selection,{isCurrent:()=>scope.current});const action=h.latest.actions[0];
+  await invalidate(h,scope);action.run();assert.equal(h.openedSources.length,0);
+ }
+ const h=harness({openSource:true});h.request=async()=>response([measured]);
+ await h.nav.open(h.event(),selection);const action=h.latest.actions[0];action.run();action.run();
+ assert.equal(h.openedSources.length,1);
+ h.request=async()=>{throw new Error("offline");};await h.nav.open(h.event(),selection);
+ const retry=h.latest.actions[1];h.nav.reset();await retry.run();assert.equal(h.calls.length,2);
 });

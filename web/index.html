@@ -49,7 +49,7 @@
           </nav>
           <section id="sequence-panel" class="view-panel" role="tabpanel" aria-labelledby="view-sequence">
             <div class="sequence-toolbar"><h2 id="sequence-title">Method sequence</h2><div class="bar"><button id="method-class" type="button" disabled>Class diagram</button><button id="method-source" type="button" disabled>Read method source</button><label><input id="all-steps" type="checkbox"> Show all steps</label></div></div>
-            <div class="sequence-context"><span class="badge">Static paths</span><span>Not a runtime trace</span></div>
+            <div class="sequence-context"><span class="badge">Measured source steps</span><span>Not a runtime trace</span></div>
             <p id="sequence-state" role="status">Expand a file and select a method.</p>
             <div id="sequence-diagram" class="sequence-scroll" tabindex="0" aria-label="Static method sequence"></div>
             <details id="sequence-warning-details" class="warning-disclosure"><summary>Sequence diagnostics <span id="sequence-warning-count"></span></summary><ul id="sequence-warnings" class="plain"></ul></details>
@@ -57,10 +57,10 @@
           <section id="classes-panel" class="view-panel" role="tabpanel" aria-labelledby="view-classes" hidden>
             <div class="sequence-toolbar"><h2>Class diagram</h2><details id="classes-options" class="warning-disclosure"><summary>View options</summary><label><input id="classes-unmatched" type="checkbox" disabled> Unmatched type hints unavailable (no verified relation)</label></details></div>
             <div class="bar class-search"><label for="classes-query">Find a class</label><input id="classes-query" type="search" maxlength="200" placeholder="Class or qualified name…"><button id="classes-search" type="button">Search</button></div>
-            <p class="detail class-intro">Declared structure · links are syntax candidates, not resolved types.</p>
+            <p class="detail class-intro">Measured class declarations only. No class hierarchy or type relationship is verified.</p>
             <p id="classes-state" role="status" aria-live="polite">Search for a class, or right-click an indexed Java/Python file or method.</p>
             <div id="classes-results" aria-label="Matching classes"></div>
-            <div id="classes-diagram" tabindex="0" aria-label="Declared class relationships"></div>
+            <div id="classes-diagram" tabindex="0" aria-label="Measured class declarations"></div>
           </section>
           <section id="dependency-library" hidden role="tabpanel" aria-labelledby="view-libraries"><div class="bar"><h2 id="dependency-title">Libraries</h2><button id="dependency-refresh" type="button">Refresh library status</button></div><p class="detail">Local declaration catalog · Rust/Cargo first. No downloads or project commands. Libraries remain separate from workspace evidence.</p><p aria-live="polite" id="dependency-state" role="status">Connect to load library status.</p><details class="warning-disclosure"><summary>Library diagnostics</summary><ul class="plain" id="dependency-warnings"></ul></details><div class="dependency-layout"><div><h3>Packages</h3><ul class="plain" id="dependency-packages"></ul></div><div><h3>Indexed definitions</h3><form class="bar" id="dependency-search-form"><label for="dependency-filter">Filter definitions</label><input disabled="" id="dependency-filter" maxlength="200" placeholder="Class, type or method…" type="search"/><button disabled="" id="dependency-search" type="submit">Filter</button></form><p id="dependency-symbol-state" role="status">Select a package. No source file knowledge needed.</p><ul class="plain" id="dependency-symbols"></ul><div class="bar"><button disabled="" id="dependency-previous" type="button">Previous definitions</button><button disabled="" id="dependency-next" type="button">Next definitions</button></div></div></div><p class="detail"><span class="badge">Syntax candidates</span><span class="badge">Terminal library boundary</span>Declarations do not prove resolved types, callees or dispatch. Source opens only when you select a definition. The selected method and diagram stay unchanged.</p><details id="external-sources"><summary>Manual Rust source roots · fallback</summary><p class="detail">Browse configured roots only when the automatic catalog cannot find a library.</p><button id="external-load" type="button">Load configured roots</button><p id="external-state" role="status">Not loaded. Load configured roots to browse.</p><ul class="plain external-tree" id="external-roots"></ul></details></section>
           <section id="tools-panel" class="view-panel" role="tabpanel" aria-labelledby="view-tools" hidden><details id="secondary-tools"><summary>Call hierarchy, questions &amp; saved views</summary><div class="layout"><aside><section aria-labelledby="symbols-title"><h2 id="symbols-title">Find a symbol</h2><form class="bar" id="search-form"><label class="sr-only" for="search">Symbol name</label><input id="search" placeholder="Name or path" type="search"/><button>Search</button></form><p class="muted" id="search-state">Search the current index.</p><ul class="plain" id="symbols"></ul></section><section><h2>Saved views</h2><form id="save-form"><label for="view-title">View title</label><div class="bar"><input id="view-title" maxlength="160" required=""/><button id="save-view">Save raw query</button></div></form><ul class="plain" id="views"></ul></section></aside>
@@ -86,18 +86,18 @@
         </div>
         <aside id="call-inspector" class="call-inspector" aria-labelledby="inspector-heading">
           <div class="inspector-header"><h2 id="inspector-heading">Inspector</h2><button id="inspector-clear" type="button" disabled>Clear</button></div>
-          <div id="inspector-empty" class="inspector-empty"><span class="inspector-symbol" aria-hidden="true">↗</span><h3>Follow a call</h3><p>Select a call or control to inspect measured source text. Targets are unverified.</p><p class="detail">Static analysis describes possible paths, not runtime behavior.</p></div>
+          <div id="inspector-empty" class="inspector-empty"><span class="inspector-symbol" aria-hidden="true">↗</span><h3>Inspect a source step</h3><p>Select a call or control to inspect measured source text. Targets are unverified.</p><p class="detail">Source text does not prove a path or runtime behavior.</p></div>
           <div id="inspector-content" hidden>
             <span id="inspector-kind" class="badge"></span><h3 id="inspector-title"></h3>
-            <dl class="inspector-fields"><dt>Target</dt><dd id="inspector-target"></dd><dt>Source location</dt><dd id="inspector-location"></dd><dt>Evidence</dt><dd id="inspector-evidence"></dd></dl>
+            <dl class="inspector-fields"><dt>Relationship</dt><dd id="inspector-target"></dd><dt>Source location</dt><dd id="inspector-location"></dd><dt>Evidence</dt><dd id="inspector-evidence"></dd></dl>
             <button id="inspector-open-source" type="button" disabled>Open call site</button>
-            <h4>Full evidence</h4><div id="inspector-detail"></div>
+            <h4>Measured syntax details</h4><div id="inspector-detail"></div>
           </div>
-          <p class="inspector-footnote">Library and unresolved targets are boundaries. Source candidates do not prove dispatch.</p>
+          <p class="inspector-footnote">Only measured source opens at a matched snapshot. Candidate types and calls do not prove dispatch.</p>
         </aside>
       </div>
     </div>
   </main>
-  <footer><span class="local-indicator">Local inspection</span><details><summary>Privacy &amp; evidence limits</summary><p>Local inspection by default. Only explicit, confirmed Run Jev or Explain with ACP actions send source to a provider. ACP receives the full source evidence, not just displayed calls, using Claude subscription allowance separate from Jev. Static possible paths are not execution traces. Unresolved, external, and callback targets remain boundaries; bounded evidence may omit behavior.</p></details></footer>
+  <footer><span class="local-indicator">Local inspection</span><details><summary>Privacy &amp; evidence limits</summary><p>Local inspection by default. Only explicit, confirmed Run Jev or Explain with ACP actions send source to a provider. ACP receives the full source evidence, not just displayed calls, using Claude subscription allowance separate from Jev. Measured syntax is not a runtime trace or semantic proof. Candidate and callback relationships cannot be traversed.</p></details></footer>
 </body>
 </html>

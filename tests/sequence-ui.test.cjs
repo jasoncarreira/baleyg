@@ -438,3 +438,20 @@ test("future terminal DTO without target keeps call text and source action",()=>
   nodes.find(node=>node.attrs.class==="sequence-source").listeners.click();
   assert.equal(opened[0],call);
 });
+
+test("malformed group preview and source rows remain inert despite onSelect",()=>{
+ const group={id:"group",kind:"group",label:"chain",path:"main.rs",range:{startLine:2,endLine:1},children:[{id:"entry",kind:"call",label:"open",path:"main.rs",range:{startLine:2,endLine:2}}]};
+ const d=diagram(viewWith([group]),{onSelect:()=>{throw Error("unwitnessed selection");}});
+ assert.equal(d.nodes().filter(node=>node.attrs["data-kind"]==="call-preview").length,0);
+ assert.ok(!d.row("group")?.attrs.role);
+ const malformed={id:"bad",kind:"call",label:"bad",path:"",range:{startLine:1,endLine:2}};
+ const more=diagram(viewWith([malformed]),{onSelect:()=>{throw Error("unwitnessed selection");}});
+ assert.ok(!more.row("bad")?.attrs.role);
+});
+
+test("sequence actions recheck matched snapshot at click time",()=>{
+ let current=true, selected=0;const call={id:"call",kind:"call",label:"open",path:"main.rs",range:{startLine:1,endLine:2}};
+ const d=diagram(viewWith([call]),{isCurrent:()=>current,onSelect:()=>selected++});
+ const row=d.row("call");assert.equal(row.attrs.role,"button");current=false;
+ row.listeners.click();assert.equal(selected,0);
+});

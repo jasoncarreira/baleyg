@@ -201,3 +201,16 @@ test("desktop source clears latent drawers before a mobile resize", () => {
   assert.equal(h.document.body.classList.contains("explorer-open"), false);
   assert.equal(h.get("source-dock").hidden, false);
 });
+
+test("inspector refuses source callback for malformed ranges or missing paired snapshot",()=>{
+ const h=harness(),malformed=[{...call("missing"),path:""},
+  {...call("empty"),range:{}},{...call("inverted"),range:{startLine:4,endLine:2}},
+  {...call("fraction"),range:{startLine:1.5,endLine:2}}];
+ let opened=0;
+ for(const step of malformed){h.shell.selectStep(step,view([step]),()=>opened++);
+  assert.equal(h.get("inspector-open-source").disabled,true);
+  h.get("inspector-open-source").listeners.click();}
+ const good=call("good");h.shell.selectStep(good,{...view([good]),revision:null},()=>opened++);
+ assert.equal(h.get("inspector-open-source").disabled,true);
+ assert.equal(opened,0);
+});

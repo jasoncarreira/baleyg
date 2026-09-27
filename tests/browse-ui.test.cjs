@@ -957,3 +957,17 @@ test("missing or malformed call-site range stays non-actionable on an old DTO",(
   assert.equal(rows.filter(item=>item.textContent==="Expand outgoing calls").length,0);
   assert.equal(rows.filter(item=>item.textContent==="Call site · source unavailable").length,2);
 });
+
+test("root and call source actions reject missing, empty, inverted and noninteger witnessed ranges",()=>{
+ const h=harness(), root={...symbol("root"),kind:"method",path:"src/a.js",range:{startLine:3,endLine:2}};
+ h.context.result={revision:oldPair,nodes:[root],calls:[
+   {id:"empty",caller:"root",path:"",range:{startLine:1,endLine:2}},
+   {id:"float",caller:"root",path:"src/a.js",range:{startLine:1.5,endLine:2}},
+   {id:"byte",caller:"root",path:"src/a.js",range:{startLine:1,endLine:2,startByte:8,endByte:3}},
+   {id:"good",caller:"root",path:"src/a.js",range:{startLine:1,endLine:2},calleeText:"measured"}],regions:[]};
+ h.run(`status={revision:${JSON.stringify(oldPair)}};seed='root';result=globalThis.result;renderResult()`);
+ const rows=descendants(h.get("calls"));
+ assert.equal(rows.filter(item=>item.textContent==="Read root source").length,0);
+ assert.equal(rows.filter(item=>item.textContent==="Read call-site source").length,1);
+ assert.equal(rows.filter(item=>item.textContent==="Expand outgoing calls").length,0);
+});

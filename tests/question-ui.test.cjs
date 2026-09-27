@@ -315,7 +315,7 @@ test('answer sits above calls with truthful source validation and static-boundar
   const html = fs.readFileSync(path.join(__dirname,'../web/index.html'),'utf8');
   assert.ok(html.indexOf('id="answer"') < html.indexOf('id="calls"'));
   assert.match(html,/do not prove relationships or the truth of a claim/);
-  assert.match(html,/Unresolved, external, and callback targets remain boundaries/);
+  assert.match(html,/Candidate and callback relationships cannot be traversed/);
   assert.match(html,/id="max-visible"[^>]*value="5"/);
 });
 
@@ -510,4 +510,34 @@ test("preview view with legacy lexical proof cannot unlock a structurally clean 
  h.run("packet={packetId:'clean',revision:status.revision,request:{seed:'root'}};focused={revision:status.revision,calls:[{target:'guessed'}]};syncFocusControls()");
  assert.equal(h.get("packet-actions").hidden,true);
  assert.throws(()=>h.run("currentPacket()"),/verified terminal snapshot/);
+});
+
+test("old preview renders only witnessed seed-owned terminal source without retaining packet",async()=>{
+ const h=harness(), pin={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ h.run("status={revision:status.revision};seed='root'");
+ h.get('question').value='Which call?';h.get('evidence-depth').value='1';h.get('max-visible').value='5';
+ h.context.fetch=async()=>ok({packet:{packetId:'old',revision:pin,request:{seed:'root'},target:'guessed'},view:{revision:pin,
+   nodes:[{id:'root',name:'root',kind:'method',path:'src/a.js',range:{startLine:1,endLine:2}},{id:'guessed',name:'guessed',path:'src/b.js',range:{startLine:1,endLine:2}}],
+   calls:[{id:'owned',caller:'root',path:'src/a.js',range:{startLine:2,endLine:2},calleeText:'open',target:'guessed',resolution:'internal',candidateSymbols:['guessed']},
+     {id:'foreign',caller:'guessed',path:'src/b.js',range:{startLine:2,endLine:2},calleeText:'wrong'},
+     {id:'unwitnessed',caller:'root',path:'src/a.js',range:{startLine:9,endLine:2},calleeText:'bad'}],regions:[]}});
+ await h.get('question-form').listeners.submit({preventDefault(){}});await new Promise(setImmediate);
+ assert.equal(h.run('packet'),null);
+ assert.equal(h.run('focused.calls.length'),1);
+ assert.equal(h.run('focused.calls[0].calleeText'),'open');
+ assert.equal(h.run('focused.calls[0].target'),undefined);
+ assert.equal(h.run('focused.nodes.length'),1);
+ assert.equal(h.get('packet-actions').hidden,true);
+ assert.match(h.get('focus-state').textContent,/Source-only terminal preview/);
+});
+
+test("future terminal preview at same authenticated pair keeps source and a clean packet",async()=>{
+ const h=harness(),pin={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ h.get('question').value='Which call?';h.get('evidence-depth').value='1';h.get('max-visible').value='5';
+ h.context.fetch=async()=>ok({packet:{packetId:'new',revision:pin,request:{seed:'root'}},view:{revision:pin,
+   nodes:[{id:'root',name:'root',kind:'method',path:'src/a.js',range:{startLine:1,endLine:2}}],
+   calls:[{id:'call',caller:'root',path:'src/a.js',range:{startLine:2,endLine:2},calleeText:'open'}],regions:[]}});
+ await h.get('question-form').listeners.submit({preventDefault(){}});await new Promise(setImmediate);
+ assert.equal(h.run('packet.packetId'),'new');assert.equal(h.run('focused.calls.length'),1);
+ assert.equal(h.run('focused.calls[0].target'),undefined);
 });
