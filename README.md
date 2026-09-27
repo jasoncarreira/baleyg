@@ -165,10 +165,11 @@ and the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-fact
 - [Extraction spike](docs/research/EXTRACTION-RESULTS.md)
 - [Jev/Opus exploratory comparison](docs/research/selection/HARD-RESULTS.md)
 
-Next: the semantic-index program ([#8](https://github.com/jasoncarreira/baleyg/issues/8)), including
-per-checkout stdio MCP and multi-language SCIP import, and separately gated snapshot
-search, diagram artifacts and embedded terminal/ACP integration. Continue static sequence coverage
-and library adapters beyond Rust/Cargo; source-backed provider validation still requires authorization
-and working authentication.
+Next: connect eligible evidence snapshots to the already shipped per-checkout stdio MCP protocol
+([#17](https://github.com/jasoncarreira/baleyg/issues/17)) as part of the semantic-index program
+([#8](https://github.com/jasoncarreira/baleyg/issues/8)). Multi-language SCIP import and separately
+gated snapshot search, diagram artifacts and embedded terminal/ACP integration remain future work.
+Continue static sequence coverage and library adapters beyond Rust/Cargo; source-backed provider
+validation still requires authorization and working authentication.
 The local literal preview does not understand questions. TypeScript parsing, file watching (accepted direction, not built),
 terminals, React/Tauri and database diagrams remain outside the current implementation.
