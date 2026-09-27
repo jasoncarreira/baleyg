@@ -756,7 +756,11 @@ fn modern_legacy_client_info_title() {
     let implicit = Peer::start(None);
     let diagnostic = silent_failure(implicit);
     assert!(
-        diagnostic.contains("workspace root overlaps fixed topology"),
+        matches!(
+            diagnostic.trim(),
+            "Error: workspace root overlaps fixed topology"
+                | "Error: implicit home or filesystem root refused"
+        ),
         "{diagnostic}"
     );
 }
