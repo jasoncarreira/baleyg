@@ -17,14 +17,38 @@ fn fixture() -> Value {
 /// cannot be recycled until *after* this owner terminates the group and reaps it.
 fn bounded_group_wait(child: &mut Child) -> (std::process::ExitStatus, bool) {
     let pid = child.id() as libc::pid_t;
-    assert_eq!(
-        unsafe { libc::getpgid(pid) },
-        pid,
-        "test child must own its process group"
-    );
+    // CommandExt::process_group(0) installs a dedicated group before exec.
+    // Darwin may return ESRCH for a promptly exited but still-unreaped leader.
+    let group = unsafe { libc::getpgid(pid) };
+    if group != pid {
+        assert_eq!(group, -1, "test child must own its process group");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { info.assume_init().si_pid() },
+            pid,
+            "only an exited leader may lack a queryable group"
+        );
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut expired = false;
-    loop {
+    let expired = loop {
+        if std::time::Instant::now() >= deadline {
+            break true;
+        }
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         let status = unsafe {
             libc::waitid(
@@ -41,14 +65,11 @@ fn bounded_group_wait(child: &mut Child) -> (std::process::ExitStatus, bool) {
             std::io::Error::last_os_error()
         );
         if unsafe { info.assume_init().si_pid() } == pid {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            expired = true;
-            break;
+            // A late scheduling resume must not make an over-deadline exit valid.
+            break std::time::Instant::now() >= deadline;
         }
         std::thread::yield_now();
-    }
+    };
     // This owner has never reaped the leader. Even if it exited, its PID and
     // process-group identity remain reserved until child.wait() below.
     unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -64,6 +85,30 @@ fn capture_file(path: &Path) -> Vec<u8> {
         "subprocess output exceeded bounded capture"
     );
     bytes
+}
+/// Silence is established only after the reader has closed its sender. Timeout is
+/// inconclusive and must fail, never count as an empty protocol transcript.
+fn drain_stdout(lines: Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut captured = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "stdout reader did not reach EOF within 10 seconds"
+        );
+        match lines.recv_timeout(remaining) {
+            Ok(line) => {
+                assert!(line.len() <= 65_536, "stdout frame exceeds response cap");
+                captured.push(line);
+                assert!(captured.len() <= 16, "too many stdout frames after EOF");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return captured,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("stdout reader did not reach EOF within 10 seconds")
+            }
+        }
+    }
 }
 struct Peer {
     child: Child,
@@ -1065,7 +1110,7 @@ fn silent_failure(mut peer: Peer) -> String {
     );
     assert!(!stderr.is_empty(), "diagnostics belong on stderr");
     assert!(
-        lines.recv_timeout(Duration::from_secs(1)).is_err(),
+        drain_stdout(lines).is_empty(),
         "startup failure emitted stdout"
     );
     stderr
@@ -1267,7 +1312,7 @@ fn exact_frames_split_utf8_crlf_and_eof() {
     let lines = std::mem::replace(&mut incomplete.lines, substitute);
     assert!(incomplete.finish().0.success());
     assert!(
-        lines.recv_timeout(Duration::from_secs(1)).is_err(),
+        drain_stdout(lines).is_empty(),
         "unterminated input cannot be dispatched"
     );
     // A completed request remains silent after its cancellation and at EOF.
@@ -1283,7 +1328,7 @@ fn exact_frames_split_utf8_crlf_and_eof() {
     let lines = std::mem::replace(&mut completed.lines, substitute);
     assert!(completed.finish().0.success());
     assert!(
-        lines.recv_timeout(Duration::from_secs(1)).is_err(),
+        drain_stdout(lines).is_empty(),
         "cancelled completed request/EOF emitted a response"
     );
 }
@@ -1434,7 +1479,7 @@ fn ordinary_cancellation_and_eof_without_private_race_hook() {
         let lines = std::mem::replace(&mut peer.lines, substitute);
         assert!(peer.finish().0.success());
         assert!(
-            lines.recv_timeout(Duration::from_secs(1)).is_err(),
+            drain_stdout(lines).is_empty(),
             "cancellation/EOF emitted an extra response"
         );
     }
@@ -1446,10 +1491,15 @@ fn ordinary_cancellation_and_eof_without_private_race_hook() {
     let (_tx, substitute) = mpsc::channel();
     let lines = std::mem::replace(&mut peer.lines, substitute);
     assert!(peer.finish().0.success());
-    let all: Vec<_> = lines.try_iter().collect();
+    let all = drain_stdout(lines);
     assert!(all.len() <= 1, "EOF cannot cause duplicate outcomes");
     for line in all {
         assert!(line.len() <= 65_536);
+        assert_eq!(
+            line.last(),
+            Some(&b'\n'),
+            "EOF response must be a complete line"
+        );
         let value: Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(value["id"], "eof-request");
     }
