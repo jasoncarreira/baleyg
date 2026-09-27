@@ -28,7 +28,7 @@
  * pinned conservative policy, without division. The first fully passing run
  * alone establishes semantic-v1; no later run refreshes it. These are pinned
  * normative descriptions, not an executable benchmark, result gate or baseline.
- * Exclusions:null and small dimensions:null mean unrecorded, not empty/zero.
+ * Exclusions:null means unrecorded, not empty/zero.
  * Hash field names are future binding requirements, not recorded hash evidence.
  * This checker validates policy consistency, never benchmark qualification.
  */
@@ -213,10 +213,39 @@ const EXPECTED = {
     ]
   },
   "synthetic": {
-    "small": {"dimensionStatus": "notSpecifiedByRatification", "files": null, "sourceMiB": null, "minimumNormalizedFacts": null, "factsScope": null},
+    "small": {"files": 100, "sourceBytes": 1677722, "minimumNormalizedFacts": 5000, "factsScope": "perLanguage"},
     "medium": {"files": 1000, "sourceMiB": 16, "minimumNormalizedFacts": 50000, "factsScope": "perLanguage"},
     "large": {"files": 10000, "sourceMiB": 128, "minimumNormalizedFacts": 500000, "factsScope": "overall"},
-    "atCap": {"files": 100000, "sourceMiB": 256, "purpose": "boundedFailureSafetyLimits", "sloApplies": false}
+    "atCap": {"files": 100000, "sourceMiB": 256, "purpose": "boundedFailureSafetyLimits", "sloApplies": false},
+    "minimumComposition": {
+      "minimumCallableBodiesPerOrdinaryFile": 64,
+      "maximumCallableBodiesPerOrdinaryFile": 80,
+      "maximumJavaMethodsPerFile": 72,
+      "minimumNonLeafCallablePercentPerOrdinaryFile": 90,
+      "minimumBodyCallsPerNonLeafCallable": 2,
+      "minimumIntraFileTargetCallsPerNonLeafCallable": 1,
+      "minimumImportedPeerCallingNonLeafPercentPerOrdinaryFile": 40,
+      "minimumCrossFileCallingBodiesPerOrdinaryFile": 8,
+      "exactSameLanguageImportedPeerFilesPerOrdinaryFile": 2,
+      "minimumOrdinaryFilesPerLocalPeerGroup": 3,
+      "maximumOrdinaryFilesPerLocalPeerGroup": 5,
+      "minimumTypedOrdinaryFilePercentPerLanguageCohort": 10,
+      "minimumMethodBodiesPerTypedFile": 2,
+      "minimumRelationshipTypedFilePercentPerLanguageCohort": 10,
+      "minimumInheritanceInterfaceTraitCasesPerLanguageCohort": 1,
+      "maximumCallFreeBodyStatementBytesPercentPerOrdinaryFile": 15,
+      "maximumRepeatedCallFreeArithmeticAssignmentCopiesPerCallableBody": 0,
+      "maximumIdenticalNormalizedNonLeafBodyShapePercentPerOrdinaryFile": 80,
+      "maximumCommentPaddingPercentPerOrdinaryFile": 10,
+      "maximumCommentPaddingPercentPerCohort": 10,
+      "maximumRustModuleRootFiles": {
+        "small": 1,
+        "medium": 5,
+        "large": 40
+      },
+      "maximumLargeIndexedDeclarationNodes": 900000,
+      "maximumClassDetailRecordsAtLargestIndexScope": 225000
+    }
   }
 },
   'hardware/mac-mini-m5-pro-v1.json': {
