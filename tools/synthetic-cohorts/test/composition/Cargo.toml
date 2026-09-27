@@ -1,0 +1,11 @@
+[package]
+name = "baleyg_synthetic_composition_test"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+tree-sitter = "=0.25.10"
+tree-sitter-java = "=0.23.5"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-python = "=0.25.0"
+tree-sitter-rust = "=0.24.2"

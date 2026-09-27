@@ -1,3 +1,4 @@
+import "./composition.test.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -50,14 +51,24 @@ function verify(root, manifestBytes) {
   const paths = manifest.files.map((entry) => entry.path);
   assert.deepEqual(paths, [...new Set(paths)].sort(), "manifest paths must be sorted and unique");
   const wanted = [];
-  for (const [size, values] of Object.entries(expected))
-    for (const [language, ext] of languages)
-      for (let i = 0; i < values.count; i++)
-        wanted.push(`${size}/${language}/C${size}${String(i).padStart(4, "0")}.${ext}`);
+  for (const [size, values] of Object.entries(expected)) {
+    for (const [language, ext] of languages) {
+      const rootCount = language !== "rust" ? 0 : size === "small" ? 1 : size === "medium" ? 5 : 40;
+      const ordinary = values.count - rootCount;
+      for (let i = 0; i < ordinary; i++) {
+        const group = language === "rust" && size !== "small" ?
+          `g${String(Math.floor(((i + 1) * (rootCount - 1) - 1) / ordinary)).padStart(2, "0")}/` : "";
+        wanted.push(`${size}/${language}/${group}C${size}${String(i).padStart(4, "0")}.${ext}`);
+      }
+      if (rootCount) wanted.push(`${size}/rust/lib.rs`);
+      for (let g = 0; g < rootCount - 1; g++)
+        wanted.push(`${size}/rust/g${String(g).padStart(2, "0")}/mod.rs`);
+    }
+  }
   wanted.sort();
   assert.deepEqual(paths, wanted, "exact source-file inventory");
   assert.deepEqual(inventory(root), [...wanted, "manifest.json"].sort(), "actual disk inventory");
-  assert.deepEqual(readFileSync(join(root, "manifest.json")), manifestBytes);
+  assert.ok(readFileSync(join(root, "manifest.json")).equals(manifestBytes), "manifest bytes");
   const counted = Object.fromEntries(Object.keys(expected).map((size) => [size, { files: 0, sourceBytes: 0, languages: Object.fromEntries(languages.map(([name]) => [name, { files: 0, sourceBytes: 0 }])) }]));
   for (const entry of manifest.files) {
     const [size, language] = entry.path.split("/");
@@ -105,8 +116,8 @@ test("two cohorts match pinned bytes, hashes, inventory and exact per-language t
     const pinned = readFileSync(pin);
     const one = readFileSync(join(first, "manifest.json"));
     const two = readFileSync(join(second, "manifest.json"));
-    assert.deepEqual(one, pinned);
-    assert.deepEqual(two, one);
+    assert.ok(one.equals(pinned), "pinned manifest bytes");
+    assert.ok(two.equals(one), "two-run manifest bytes");
     const manifest = verify(first, pinned);
     verify(second, pinned);
     for (const { path } of manifest.files)
