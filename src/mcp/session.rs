@@ -361,7 +361,7 @@ fn legacy_meta(v: &Value) -> bool {
         &[("progressToken", |v| {
             v.is_string()
                 || v.as_number()
-                    .is_some_and(|n| wire::exact_safe_integer(&n.to_string()).is_some())
+                    .is_some_and(|n| wire::exact_json_integer(&n.to_string()))
         })],
     )
 }
@@ -428,6 +428,47 @@ mod tests {
         }
     }
     #[test]
+    fn legacy_progress_token_integer_boundary_and_recovery() {
+        let mut s = Session::new();
+        let invalid = req(
+            "1",
+            Mode::LegacyReady,
+            "initialize",
+            r#""protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"1"},"_meta":{"progressToken":9007199254740992.5}"#,
+        );
+        rejected(s.accept(invalid, |_| false), -32602, json!(1));
+        assert_eq!(s.mode(), Mode::Unselected);
+        assert_eq!(s.pending_count(), 0);
+        for token in [
+            "9007199254740992",
+            "1000000000000000000000000000000000",
+            "9007199254740992.0",
+        ] {
+            let value = req(
+                "1",
+                Mode::LegacyReady,
+                "initialize",
+                &format!(
+                    r#""protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"x","version":"1"}},"_meta":{{"progressToken":{token}}}"#
+                ),
+            );
+            let admitted = admitted(s.accept(value, |_| false));
+            assert_eq!(admitted.id, json!(1));
+            assert_eq!(admitted.action, Action::Initialize);
+            assert_eq!(s.mode(), Mode::LegacyAwaitInitialized);
+            let ready = s.prepare(admitted.token, json!({"ready":true})).unwrap();
+            assert_eq!(s.commit(ready), Some(json!({"ready":true})));
+            s = Session::new();
+        }
+        let rejected_id = format!(
+            r#"{{"jsonrpc":"2.0","id":9007199254740992,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"x","version":"1"}}}}}}"#
+        );
+        let err = wire::decode(wire::Frame::Line(rejected_id.into_bytes())).unwrap_err();
+        assert_eq!(err.code, -32600);
+        assert_eq!(err.id, Value::Null);
+        assert_eq!(wire::uint(&json!(9007199254740992_u64)), None);
+    }
+    #[test]
     fn client_info_title_validation() {
         let mut s = Session::new();
         let invalid = req(
@@ -467,6 +508,58 @@ mod tests {
         assert_eq!(l.mode(), Mode::LegacyAwaitInitialized);
     }
     #[test]
+    fn oversized_id_does_not_select_or_register() {
+        for legacy in [false, true] {
+            let mut s = Session::new();
+            let request = |id: &str| {
+                if legacy {
+                    req(
+                        id,
+                        Mode::LegacyReady,
+                        "initialize",
+                        r#""protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"1"}"#,
+                    )
+                } else {
+                    req(id, Mode::Unselected, "server/discover", "")
+                }
+            };
+            let attempt = |id: &str| {
+                let mut value = request("1");
+                value.id = Some(json!(id));
+                let frame = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"method":"{}","params":{}}}"#,
+                    serde_json::to_string(id).unwrap(),
+                    value.method,
+                    value.params.unwrap()
+                );
+                wire::decode(wire::Frame::Line(frame.into_bytes()))
+            };
+            let accepted = "a".repeat(254);
+            let oversized = "a".repeat(255);
+            assert_eq!(wire::compact_string_token_len(&accepted), 256);
+            assert_eq!(wire::compact_string_token_len(&oversized), 257);
+            let error = attempt(&oversized).unwrap_err();
+            assert_eq!((error.code, error.id), (-32600, Value::Null));
+            assert_eq!(s.mode(), Mode::Unselected);
+            assert_eq!(s.pending_count(), 0);
+            let admitted = admitted(s.accept(attempt(&accepted).unwrap().unwrap(), |_| false));
+            assert_eq!(admitted.id, json!(accepted));
+            assert_eq!(s.pending_count(), 1);
+            assert_eq!(
+                s.mode(),
+                if legacy {
+                    Mode::LegacyAwaitInitialized
+                } else {
+                    Mode::Modern
+                }
+            );
+            let error = attempt(&oversized).unwrap_err();
+            assert_eq!((error.code, error.id), (-32600, Value::Null));
+            assert_eq!(s.pending_count(), 1);
+            assert_eq!(s.pending(admitted.token).unwrap().id, admitted.id);
+        }
+    }
+    #[test]
     fn normalized_pending_aliases() {
         for (a, b, id) in [
             (r#""a""#, r#""\u0061""#, json!("a")),
@@ -483,44 +576,81 @@ mod tests {
             assert_eq!(s.pending(first.token).unwrap().id, first.id);
         }
     }
+    /// Test-owned dual-content tool result. Catalog construction belongs to the next slice.
+    fn tool_response(id: &Value, tag: &str, is_error: bool, modern: bool) -> Value {
+        let envelope = if is_error {
+            json!({"schemaVersion":1,"requestId":id,"error":{"code":"index_not_ready","message":"Index is not ready","retryable":true,"currentBasis":null,"currentContentHash":null}})
+        } else {
+            json!({"schemaVersion":1,"requestId":id,"evidenceBasis":null,"data":{"tag":tag},"warnings":[],"partial":true,"truncated":false,"truncationReason":null})
+        };
+        let text = serde_json::to_string(&envelope).unwrap();
+        let mut result = json!({"isError":is_error,"structuredContent":envelope,"content":[{"type":"text","text":text}]});
+        if modern {
+            result["resultType"] = json!("complete");
+        }
+        json!({"jsonrpc":"2.0","id":id,"result":result})
+    }
     #[test]
     fn cancel_reuse_stale_completion() {
         for legacy in [false, true] {
             for (old, new) in [(r#""a""#, r#""\u0061""#), ("1", "1e0")] {
-                for error in [false, true] {
+                for old_is_error in [false, true] {
                     let mut s = Session::new();
                     let mode = if legacy {
                         let init=admitted(s.accept(req("99",Mode::LegacyReady,"initialize",r#""protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"1"}"#), |_|false));
-                        let ready = s.prepare(init.token, json!({"init":true})).unwrap();
-                        s.commit(ready);
-                        let n = wire::decode(wire::Frame::Line(
+                        let init_result =
+                            s.prepare(init.token, json!({"initialized":true})).unwrap();
+                        assert!(s.commit(init_result).is_some());
+                        let notification = wire::decode(wire::Frame::Line(
                             br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_vec(),
                         ))
                         .unwrap()
                         .unwrap();
-                        assert!(matches!(s.accept(n, |_| false), Event::Ignore));
+                        assert!(matches!(s.accept(notification, |_| false), Event::Ignore));
                         assert_eq!(s.mode(), Mode::LegacyReady);
                         Mode::LegacyReady
                     } else {
                         Mode::Unselected
                     };
-                    let a = admitted(s.accept(
-                        req(
-                            old,
-                            mode,
-                            "tools/call",
-                            if legacy {
-                                r#""name":"probe","arguments":{"tag":"old"}"#
-                            } else {
-                                r#","name":"probe","arguments":{"tag":"old"}"#
-                            },
-                        ),
-                        |n| n == "probe",
-                    ));
-                    let old_payload =
-                        json!({"jsonrpc":"2.0","id":a.id,"result":{"tag":"old","error":error}});
-                    let queued = s.prepare(a.token, old_payload).unwrap();
+                    let arguments = |tag: &str| {
+                        if legacy {
+                            format!(r#""name":"probe","arguments":{{"tag":"{tag}"}}"#)
+                        } else {
+                            format!(r#", "name":"probe","arguments":{{"tag":"{tag}"}}"#)
+                        }
+                    };
+                    let a = admitted(
+                        s.accept(req(old, mode, "tools/call", &arguments("old")), |name| {
+                            name == "probe"
+                        }),
+                    );
+                    assert_eq!(
+                        a.action,
+                        Action::Call {
+                            name: "probe".into(),
+                            arguments: Some(json!({"tag":"old"}))
+                        }
+                    );
+                    let old_response = tool_response(&a.id, "old", old_is_error, !legacy);
+                    assert_eq!(old_response["result"]["isError"], json!(old_is_error));
+                    assert_eq!(
+                        serde_json::from_str::<Value>(
+                            old_response["result"]["content"][0]["text"]
+                                .as_str()
+                                .unwrap()
+                        )
+                        .unwrap(),
+                        old_response["result"]["structuredContent"]
+                    );
+                    if old_is_error {
+                        assert_eq!(
+                            old_response["result"]["structuredContent"]["error"]["code"],
+                            "index_not_ready"
+                        );
+                    }
+                    let queued = s.prepare(a.token, old_response).unwrap();
                     s.cancel(&a.id);
+                    assert_eq!(s.pending_count(), 0);
                     let b = admitted(s.accept(
                         req(
                             new,
@@ -530,28 +660,40 @@ mod tests {
                                 Mode::Modern
                             },
                             "tools/call",
-                            if legacy {
-                                r#""name":"probe","arguments":{"tag":"new"}"#
-                            } else {
-                                r#","name":"probe","arguments":{"tag":"new"}"#
-                            },
+                            &arguments("new"),
                         ),
-                        |n| n == "probe",
+                        |name| name == "probe",
                     ));
                     assert_ne!(a.token, b.token);
+                    assert_eq!(b.id, a.id);
+                    assert_eq!(
+                        b.action,
+                        Action::Call {
+                            name: "probe".into(),
+                            arguments: Some(json!({"tag":"new"}))
+                        }
+                    );
                     assert_eq!(s.pending(b.token).unwrap().action, b.action);
-                    assert!(s.prepare(a.token, json!({"late":true})).is_none());
+                    assert!(
+                        s.prepare(a.token, tool_response(&a.id, "late", true, !legacy))
+                            .is_none()
+                    );
                     assert!(s.commit(queued.clone()).is_none());
+                    assert_eq!(s.pending_count(), 1);
                     assert_eq!(s.pending(b.token).unwrap().id, b.id);
-                    let own = s
-                        .prepare(
-                            b.token,
-                            json!({"jsonrpc":"2.0","id":b.id,"result":{"tag":"new","error":false}}),
+                    assert_eq!(s.pending(b.token).unwrap().action, b.action);
+                    let expected = tool_response(&b.id, "new", !old_is_error, !legacy);
+                    let own = s.prepare(b.token, expected.clone()).unwrap();
+                    assert_eq!(s.commit(own), Some(expected.clone()));
+                    assert_eq!(expected["id"], b.id);
+                    assert_eq!(expected["result"]["structuredContent"]["requestId"], b.id);
+                    assert_eq!(
+                        serde_json::from_str::<Value>(
+                            expected["result"]["content"][0]["text"].as_str().unwrap()
                         )
-                        .unwrap();
-                    let committed = s.commit(own).unwrap();
-                    assert_eq!(committed["result"]["tag"], "new");
-                    assert_eq!(committed["id"], b.id);
+                        .unwrap(),
+                        expected["result"]["structuredContent"]
+                    );
                     assert!(s.commit(queued).is_none());
                     assert_eq!(s.pending_count(), 0);
                 }

@@ -86,6 +86,33 @@ pub fn exact_safe_integer(raw: &str) -> Option<i64> {
     }
     (value <= SAFE_INTEGER).then_some(if negative { -value } else { value })
 }
+/// JSON Schema integer for opaque protocol fields; unlike RPC IDs, no safe bound.
+pub fn exact_json_integer(raw: &str) -> bool {
+    let text = raw.strip_prefix('-').unwrap_or(raw);
+    let (mantissa, exponent) = text
+        .split_once(['e', 'E'])
+        .map_or((text, "0"), |(a, b)| (a, b));
+    let (whole, fraction) = mantissa
+        .split_once('.')
+        .map_or((mantissa, ""), |(a, b)| (a, b));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let digits = format!("{whole}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return true;
+    }
+    let trailing = significant.len() - significant.trim_end_matches('0').len();
+    let exp = exponent.parse::<i128>();
+    let Ok(exp) = exp else {
+        return !exponent.starts_with('-');
+    };
+    exp.saturating_add(trailing as i128) >= (fraction.len() as i128)
+}
 pub fn uint(value: &Value) -> Option<u64> {
     let number = value.as_number()?;
     exact_safe_integer(&number.to_string()).and_then(|n| u64::try_from(n).ok())
@@ -319,6 +346,97 @@ mod tests {
             let error = decode(Frame::Line(bytes.into_bytes())).unwrap_err();
             assert_eq!(error.code, -32600);
             assert_eq!(error.id, Value::Null);
+        }
+    }
+    /// Spelling independent of serde_json's encoder, including surrogate pairs.
+    fn escaped_token(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\u0022"),
+                '\\' => out.push_str("\\u005c"),
+                c if (c as u32) < 0x80 && !c.is_control() => out.push(c),
+                c if (c as u32) <= 0xffff => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => {
+                    let scalar = (c as u32) - 0x10000;
+                    out.push_str(&format!(
+                        "\\u{:04x}\\u{:04x}",
+                        0xd800 + (scalar >> 10),
+                        0xdc00 + (scalar & 0x3ff)
+                    ));
+                }
+            }
+        }
+        out.push('"');
+        out
+    }
+    #[test]
+    fn id_boundaries() {
+        let mut units: Vec<(char, usize)> = vec![
+            ('a', 1),
+            ('"', 2),
+            ('\\', 2),
+            ('é', 2),
+            ('€', 3),
+            ('😀', 4),
+            ('/', 1),
+            ('\u{2028}', 3),
+        ];
+        for c in ['\u{0008}', '\t', '\n', '\u{000c}', '\r'] {
+            units.push((c, 2));
+        }
+        for n in 0..=31 {
+            let c = char::from_u32(n).unwrap();
+            if !['\u{0008}', '\t', '\n', '\u{000c}', '\r'].contains(&c) {
+                units.push((c, 6));
+            }
+        }
+        for (unit, cost) in units {
+            // The independent cost arithmetic never calls the implementation under test.
+            let repeats = 254 / cost;
+            let tail = 254 - (repeats * cost);
+            let admitted = format!("{}{}", unit.to_string().repeat(repeats), "a".repeat(tail));
+            let rejected = format!("{admitted}a");
+            let expected_valid = 2 + repeats * cost + tail;
+            let expected_invalid = expected_valid + 1;
+            assert_eq!(expected_valid, 256, "{unit:?}");
+            assert_eq!(expected_invalid, 257, "{unit:?}");
+            for (value, expected) in [(&admitted, 256), (&rejected, 257)] {
+                assert_eq!(compact_string_token_len(value), expected, "{unit:?}");
+                for token in [serde_json::to_string(value).unwrap(), escaped_token(value)] {
+                    let bytes = format!(r#"{{"jsonrpc":"2.0","id":{token},"method":"probe"}}"#)
+                        .into_bytes();
+                    assert!(bytes.len() < REQUEST_BYTES);
+                    if expected == 256 {
+                        let admitted = decode(Frame::Line(bytes)).unwrap().unwrap();
+                        assert_eq!(admitted.id, Some(json!(value)), "{unit:?}");
+                        assert_eq!(
+                            admitted.key,
+                            Some(IdKey::String(value.to_owned())),
+                            "{unit:?}"
+                        );
+                    } else {
+                        let err = decode(Frame::Line(bytes)).unwrap_err();
+                        assert_eq!((err.code, err.id), (-32600, Value::Null), "{unit:?}");
+                    }
+                }
+            }
+        }
+        // Mixed spelling: an escaped scalar and literal scalar normalize identically.
+        for (raw, escaped) in [
+            (r#""é😀""#, r#""\u00e9\ud83d\ude00""#),
+            (r#""\"\\""#, r#""\u0022\u005c""#),
+            (r#""\n\u0000""#, r#""\u000a\u0000""#),
+        ] {
+            let frame = |token: &str| {
+                Frame::Line(
+                    format!(r#"{{"jsonrpc":"2.0","id":{token},"method":"probe"}}"#).into_bytes(),
+                )
+            };
+            assert_eq!(
+                decode(frame(raw)).unwrap().unwrap().key,
+                decode(frame(escaped)).unwrap().unwrap().key
+            );
         }
     }
 }
