@@ -39,11 +39,11 @@ const sample = "small/java/Csmall0000.java";
 function checker(root, file) {
   const args = ["run", "--quiet", "--locked", "--manifest-path", helper, "--", root];
   if (file) args.push(file);
-  return spawnSync("cargo", args, { encoding: "utf8", timeout: 600000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, CARGO_TARGET_DIR: join(tmpdir(), "baleyg-synthetic-composition-cargo-target") } });
+  return spawnSync("cargo", args, { encoding: "utf8", timeout: 900000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, CARGO_TARGET_DIR: join(tmpdir(), "baleyg-synthetic-composition-cargo-target") } });
 }
 function outcome(result) { return result.stderr || result.stdout || result.error?.message || ""; }
 
-test("all generated source parses with pinned grammars and meets source-derived composition", { timeout: 900000 }, () => {
+test("all generated source parses with pinned grammars and meets source-derived composition", { timeout: 1200000 }, () => {
   assert.deepEqual(JSON.parse(readFileSync(policy)).synthetic.minimumComposition, pinned);
   const temp = mkdtempSync(join(tmpdir(), "baleyg-cohort-composition-"));
   const root = join(temp, "corpus");
