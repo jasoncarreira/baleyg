@@ -1,0 +1,2931 @@
+[
+  {
+    "name": "baleyg_workspace_describe",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        }
+      },
+      "required": [
+        "schemaVersion"
+      ],
+      "additionalProperties": false,
+      "$defs": {}
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              ]
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "workspaceLabel": {
+                  "$ref": "#/$defs/Text"
+                },
+                "indexState": {
+                  "enum": [
+                    "indexing",
+                    "reconciling",
+                    "ready",
+                    "unavailable"
+                  ]
+                },
+                "progress": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "completed": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "total": {
+                          "anyOf": [
+                            {
+                              "$ref": "#/$defs/UInt"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "completed",
+                        "total"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "watcherDegraded": {
+                  "type": "boolean"
+                },
+                "languages": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  }
+                },
+                "toolVersion": {
+                  "const": 1
+                },
+                "schemaVersion": {
+                  "const": 1
+                },
+                "limits": {
+                  "$ref": "#/$defs/Limits"
+                }
+              },
+              "required": [
+                "workspaceLabel",
+                "indexState",
+                "progress",
+                "watcherDegraded",
+                "languages",
+                "toolVersion",
+                "schemaVersion",
+                "limits"
+              ],
+              "additionalProperties": false
+            },
+            "warnings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Warning"
+              }
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncationReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "response_bytes",
+                    "limit",
+                    "callee_text"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "$ref": "#/$defs/Failure"
+        }
+      ],
+      "$defs": {
+        "Basis": {
+          "type": "object",
+          "properties": {
+            "indexGeneration": {
+              "type": "string",
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "additionalProperties": false
+        },
+        "Failure": {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              ]
+            },
+            "error": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "$ref": "#/$defs/FailureCode"
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "additionalProperties": false
+        },
+        "FailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "root_changed",
+            "store_unavailable"
+          ]
+        },
+        "Hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "Language": {
+          "enum": [
+            "java",
+            "rust",
+            "python",
+            "javascript"
+          ]
+        },
+        "LanguageStatus": {
+          "type": "object",
+          "properties": {
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "coverage": {
+              "type": "object",
+              "properties": {
+                "selected": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "complete": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "partial": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "failed": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "unselected": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "selected",
+                "complete",
+                "partial",
+                "failed",
+                "unselected"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "language",
+            "evidenceTier",
+            "coverage"
+          ],
+          "additionalProperties": false
+        },
+        "Limits": {
+          "type": "object",
+          "properties": {
+            "requestBytes": {
+              "const": 16384
+            },
+            "responseBytes": {
+              "const": 65536
+            },
+            "sourceBytes": {
+              "const": 16384
+            },
+            "sourceLines": {
+              "const": 200
+            },
+            "defaultLimit": {
+              "const": 20
+            },
+            "maxLimit": {
+              "const": 50
+            },
+            "calleeTextBytes": {
+              "const": 1024
+            },
+            "hintWorkMs": {
+              "const": 1000
+            },
+            "deadlineMs": {
+              "const": 5000
+            },
+            "concurrency": {
+              "const": 4
+            }
+          },
+          "required": [
+            "requestBytes",
+            "responseBytes",
+            "sourceBytes",
+            "sourceLines",
+            "defaultLimit",
+            "maxLimit",
+            "calleeTextBytes",
+            "hintWorkMs",
+            "deadlineMs",
+            "concurrency"
+          ],
+          "additionalProperties": false
+        },
+        "Text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "UInt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "Warning": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "coverageIncomplete",
+                "staleEvidence",
+                "staleTarget",
+                "bindingAmbiguous",
+                "syntaxOnly"
+              ]
+            },
+            "message": {
+              "$ref": "#/$defs/Text"
+            },
+            "provenanceId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "provenanceId"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "baleyg_find_symbols",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "expectedBasis": {
+          "$ref": "#/$defs/Basis"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "query"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "Basis": {
+          "type": "object",
+          "properties": {
+            "indexGeneration": {
+              "type": "string",
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "additionalProperties": false
+        },
+        "UInt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              ]
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "symbols": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/Symbol"
+                  }
+                },
+                "coverage": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/Coverage"
+                  }
+                },
+                "provenance": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/Provenance"
+                  }
+                }
+              },
+              "required": [
+                "symbols",
+                "coverage",
+                "provenance"
+              ],
+              "additionalProperties": false
+            },
+            "warnings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Warning"
+              }
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncationReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "response_bytes",
+                    "limit",
+                    "callee_text"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "$ref": "#/$defs/Failure"
+        }
+      ],
+      "$defs": {
+        "Basis": {
+          "type": "object",
+          "properties": {
+            "indexGeneration": {
+              "type": "string",
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "additionalProperties": false
+        },
+        "Coverage": {
+          "type": "object",
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "documentPath": {
+              "$ref": "#/$defs/Path"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "requested": {
+              "type": "boolean"
+            },
+            "selected": {
+              "type": "boolean"
+            },
+            "state": {
+              "enum": [
+                "notRequested",
+                "omitted",
+                "unsupported",
+                "failed",
+                "partial",
+                "complete"
+              ]
+            },
+            "supportedRoles": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Role"
+              }
+            },
+            "observedRoles": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Role"
+              }
+            },
+            "diagnostic": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "sourceSetId",
+            "documentPath",
+            "revisionId",
+            "requested",
+            "selected",
+            "state",
+            "supportedRoles",
+            "observedRoles",
+            "diagnostic"
+          ],
+          "additionalProperties": false
+        },
+        "DerivedFrom": {
+          "type": "object",
+          "properties": {
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "recordKind": {
+              "enum": [
+                "occurrence",
+                "symbolInformation",
+                "relationship"
+              ]
+            },
+            "factDigest": {
+              "$ref": "#/$defs/Hash"
+            }
+          },
+          "required": [
+            "provenanceId",
+            "recordKind",
+            "factDigest"
+          ],
+          "additionalProperties": false
+        },
+        "DocumentKey": {
+          "type": "object",
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        "Failure": {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              ]
+            },
+            "error": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "$ref": "#/$defs/FailureCode"
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "additionalProperties": false
+        },
+        "FailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "root_changed",
+            "store_unavailable"
+          ]
+        },
+        "Hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "Kind": {
+          "enum": [
+            "module",
+            "namespace",
+            "type",
+            "implementation",
+            "function",
+            "method",
+            "constructor",
+            "field",
+            "variable",
+            "parameter",
+            "typeParameter",
+            "alias",
+            "anonymousFunction"
+          ]
+        },
+        "Language": {
+          "enum": [
+            "java",
+            "rust",
+            "python",
+            "javascript"
+          ]
+        },
+        "Path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\\\u0000])[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*(?![\\s\\S])"
+        },
+        "Provenance": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "producerId",
+            "document",
+            "revisionId",
+            "contentHash",
+            "evidenceKind",
+            "basis",
+            "freshness",
+            "derivedFrom"
+          ],
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "evidenceKind": {
+                    "const": "measuredSyntax"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": null
+                  },
+                  "freshness": {
+                    "const": "fresh"
+                  },
+                  "derivedFrom": {
+                    "const": null
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Range": {
+          "type": "object",
+          "properties": {
+            "start": {
+              "$ref": "#/$defs/UInt"
+            },
+            "end": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "additionalProperties": false
+        },
+        "Role": {
+          "enum": [
+            "definition",
+            "read",
+            "write",
+            "call",
+            "type",
+            "import",
+            "alias"
+          ]
+        },
+        "SemanticBasis": {
+          "type": "object",
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "lookupDependencies": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Text"
+              }
+            }
+          },
+          "required": [
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "additionalProperties": false
+        },
+        "Symbol": {
+          "type": "object",
+          "properties": {
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "nameRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "staleBecause": {
+              "type": "array",
+              "maxItems": 0
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "kind",
+            "document",
+            "range",
+            "nameRange",
+            "contentHash",
+            "provenanceId",
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause"
+          ],
+          "additionalProperties": false
+        },
+        "SyntaxId": {
+          "type": "string",
+          "pattern": "^sid:v1:[0-9a-f]{32}$"
+        },
+        "Text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "UInt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "Warning": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "coverageIncomplete",
+                "staleEvidence",
+                "staleTarget",
+                "bindingAmbiguous",
+                "syntaxOnly"
+              ]
+            },
+            "message": {
+              "$ref": "#/$defs/Text"
+            },
+            "provenanceId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "provenanceId"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "baleyg_inspect",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "view": {
+              "const": "declaration"
+            },
+            "expectedBasis": {
+              "$ref": "#/$defs/Basis"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "symbolId",
+            "view"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "view": {
+              "const": "outgoing_calls"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            },
+            "expectedBasis": {
+              "$ref": "#/$defs/Basis"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "symbolId",
+            "view"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "$defs": {
+        "Basis": {
+          "type": "object",
+          "properties": {
+            "indexGeneration": {
+              "type": "string",
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "additionalProperties": false
+        },
+        "SyntaxId": {
+          "type": "string",
+          "pattern": "^sid:v1:[0-9a-f]{32}$"
+        },
+        "UInt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              ]
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "data": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "declaration": {
+                      "$ref": "#/$defs/Declaration"
+                    },
+                    "displayKey": {
+                      "$ref": "#/$defs/Text"
+                    },
+                    "contentHash": {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    "evidence": {
+                      "$ref": "#/$defs/Evidence"
+                    },
+                    "coverage": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/Coverage"
+                      }
+                    },
+                    "provenance": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/Provenance"
+                      }
+                    }
+                  },
+                  "required": [
+                    "declaration",
+                    "displayKey",
+                    "contentHash",
+                    "evidence",
+                    "coverage",
+                    "provenance"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "symbolId": {
+                      "$ref": "#/$defs/SyntaxId"
+                    },
+                    "displayKey": {
+                      "$ref": "#/$defs/Text"
+                    },
+                    "calls": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/CallItem"
+                      }
+                    },
+                    "coverage": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/Coverage"
+                      }
+                    },
+                    "provenance": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/Provenance"
+                      }
+                    }
+                  },
+                  "required": [
+                    "symbolId",
+                    "displayKey",
+                    "calls",
+                    "coverage",
+                    "provenance"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "warnings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Warning"
+              }
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncationReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "response_bytes",
+                    "limit",
+                    "callee_text"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "$ref": "#/$defs/Failure"
+        }
+      ],
+      "$defs": {
+        "Basis": {
+          "type": "object",
+          "properties": {
+            "indexGeneration": {
+              "type": "string",
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "additionalProperties": false
+        },
+        "CallBinding": {
+          "type": "object",
+          "properties": {
+            "callId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OccurrenceId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "join": {
+              "$ref": "#/$defs/Join"
+            },
+            "resolution": {
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved"
+              ]
+            },
+            "declaredTarget": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Target"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "candidates": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Target"
+              }
+            },
+            "dispatch": {
+              "enum": [
+                "direct",
+                "constructor",
+                "virtual",
+                "interface",
+                "dynamic",
+                "unknown"
+              ]
+            },
+            "possibleDispatch": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Target"
+              }
+            },
+            "possibleDispatchComplete": {
+              "const": false
+            },
+            "staleTarget": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "callId",
+            "join",
+            "resolution",
+            "declaredTarget",
+            "candidates",
+            "dispatch",
+            "possibleDispatch",
+            "possibleDispatchComplete",
+            "staleTarget",
+            "provenanceId"
+          ],
+          "additionalProperties": false
+        },
+        "CallItem": {
+          "type": "object",
+          "properties": {
+            "callId": {
+              "$ref": "#/$defs/OccurrenceId"
+            },
+            "ownerSyntaxId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "ordinal": {
+              "$ref": "#/$defs/UInt"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "calleeRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "calleeText": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "calleeTextTruncated": {
+              "type": "boolean"
+            },
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "nativeCandidates": {
+              "$ref": "#/$defs/NativeCandidates"
+            },
+            "binding": {
+              "allOf": [
+                {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/CallBinding"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                {
+                  "const": null
+                }
+              ]
+            },
+            "disposition": {
+              "const": "unresolved"
+            },
+            "targetId": {
+              "const": null
+            },
+            "boundaryReason": {
+              "const": "missingEvidence"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "staleBecause": {
+              "type": "array",
+              "maxItems": 0
+            }
+          },
+          "required": [
+            "callId",
+            "ownerSyntaxId",
+            "ordinal",
+            "document",
+            "revisionId",
+            "range",
+            "calleeRange",
+            "contentHash",
+            "provenanceId",
+            "calleeText",
+            "calleeTextTruncated",
+            "displayKey",
+            "nativeCandidates",
+            "binding",
+            "disposition",
+            "targetId",
+            "boundaryReason",
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause"
+          ],
+          "additionalProperties": false
+        },
+        "Coverage": {
+          "type": "object",
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "documentPath": {
+              "$ref": "#/$defs/Path"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "requested": {
+              "type": "boolean"
+            },
+            "selected": {
+              "type": "boolean"
+            },
+            "state": {
+              "enum": [
+                "notRequested",
+                "omitted",
+                "unsupported",
+                "failed",
+                "partial",
+                "complete"
+              ]
+            },
+            "supportedRoles": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Role"
+              }
+            },
+            "observedRoles": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Role"
+              }
+            },
+            "diagnostic": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "sourceSetId",
+            "documentPath",
+            "revisionId",
+            "requested",
+            "selected",
+            "state",
+            "supportedRoles",
+            "observedRoles",
+            "diagnostic"
+          ],
+          "additionalProperties": false
+        },
+        "Declaration": {
+          "type": "object",
+          "properties": {
+            "syntaxId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "lookupKey": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ancestors": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Key"
+              }
+            },
+            "key": {
+              "$ref": "#/$defs/Key"
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "nameRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "header": {
+              "$ref": "#/$defs/Header"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "syntaxId",
+            "document",
+            "revisionId",
+            "kind",
+            "name",
+            "lookupKey",
+            "ancestors",
+            "key",
+            "range",
+            "nameRange",
+            "header",
+            "provenanceId"
+          ],
+          "additionalProperties": false
+        },
+        "DerivedFrom": {
+          "type": "object",
+          "properties": {
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "recordKind": {
+              "enum": [
+                "occurrence",
+                "symbolInformation",
+                "relationship"
+              ]
+            },
+            "factDigest": {
+              "$ref": "#/$defs/Hash"
+            }
+          },
+          "required": [
+            "provenanceId",
+            "recordKind",
+            "factDigest"
+          ],
+          "additionalProperties": false
+        },
+        "DocumentKey": {
+          "type": "object",
+          "properties": {
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        "Evidence": {
+          "type": "object",
+          "properties": {
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "staleBecause": {
+              "type": "array",
+              "maxItems": 0
+            }
+          },
+          "required": [
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause"
+          ],
+          "additionalProperties": false
+        },
+        "Failure": {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              ]
+            },
+            "error": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "$ref": "#/$defs/FailureCode"
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "additionalProperties": false
+        },
+        "FailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "root_changed",
+            "store_unavailable"
+          ]
+        },
+        "Hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "Header": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "modifiers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Text"
+              }
+            },
+            "typeParameters": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Text"
+              }
+            },
+            "parameters": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Parameter"
+              }
+            },
+            "resultType": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "bases": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Text"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "name",
+            "modifiers",
+            "typeParameters",
+            "parameters",
+            "resultType",
+            "bases"
+          ],
+          "additionalProperties": false
+        },
+        "Join": {
+          "type": "object",
+          "properties": {
+            "anchor": {
+              "$ref": "#/$defs/MeasuredAnchor"
+            },
+            "status": {
+              "enum": [
+                "exact",
+                "ambiguous",
+                "unmatched",
+                "unsupported"
+              ]
+            },
+            "candidateIds": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/SyntaxId"
+                  },
+                  {
+                    "$ref": "#/$defs/OccurrenceId"
+                  }
+                ]
+              }
+            },
+            "diagnostic": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "anchor",
+            "status",
+            "candidateIds",
+            "diagnostic"
+          ],
+          "additionalProperties": false
+        },
+        "Key": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "signature": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Signature"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ordinal": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "kind",
+            "name",
+            "signature",
+            "ordinal"
+          ],
+          "additionalProperties": false
+        },
+        "Kind": {
+          "enum": [
+            "module",
+            "namespace",
+            "type",
+            "implementation",
+            "function",
+            "method",
+            "constructor",
+            "field",
+            "variable",
+            "parameter",
+            "typeParameter",
+            "alias",
+            "anonymousFunction"
+          ]
+        },
+        "Language": {
+          "enum": [
+            "java",
+            "rust",
+            "python",
+            "javascript"
+          ]
+        },
+        "MeasuredAnchor": {
+          "type": "object",
+          "properties": {
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "kind": {
+              "enum": [
+                "declarationName",
+                "callee",
+                "invocation",
+                "reference"
+              ]
+            }
+          },
+          "required": [
+            "document",
+            "revisionId",
+            "contentHash",
+            "range",
+            "kind"
+          ],
+          "additionalProperties": false
+        },
+        "NativeCandidate": {
+          "type": "object",
+          "properties": {
+            "syntaxId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "name": {
+              "$ref": "#/$defs/Text"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "syntaxId",
+            "name",
+            "document",
+            "revisionId",
+            "range",
+            "provenanceId"
+          ],
+          "additionalProperties": false
+        },
+        "NativeCandidates": {
+          "type": "object",
+          "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/NativeCandidate"
+              },
+              "maxItems": 8
+            },
+            "omitted": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UInt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "complete": {
+              "const": false
+            }
+          },
+          "required": [
+            "items",
+            "omitted",
+            "complete"
+          ],
+          "additionalProperties": false
+        },
+        "OccurrenceId": {
+          "type": "string",
+          "pattern": "^occ:v1:[0-9a-f]{32}$"
+        },
+        "Parameter": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "variadic": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "type",
+            "variadic"
+          ],
+          "additionalProperties": false
+        },
+        "Path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\\\u0000])[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*(?![\\s\\S])"
+        },
+        "Provenance": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "producerId",
+            "document",
+            "revisionId",
+            "contentHash",
+            "evidenceKind",
+            "basis",
+            "freshness",
+            "derivedFrom"
+          ],
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "evidenceKind": {
+                    "const": "measuredSyntax"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": null
+                  },
+                  "freshness": {
+                    "const": "fresh"
+                  },
+                  "derivedFrom": {
+                    "const": null
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Range": {
+          "type": "object",
+          "properties": {
+            "start": {
+              "$ref": "#/$defs/UInt"
+            },
+            "end": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "additionalProperties": false
+        },
+        "Role": {
+          "enum": [
+            "definition",
+            "read",
+            "write",
+            "call",
+            "type",
+            "import",
+            "alias"
+          ]
+        },
+        "SemanticBasis": {
+          "type": "object",
+          "properties": {
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "lookupDependencies": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Text"
+              }
+            }
+          },
+          "required": [
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "additionalProperties": false
+        },
+        "Signature": {
+          "type": "object",
+          "properties": {
+            "parameterTypes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Text"
+              }
+            },
+            "typeParameterCount": {
+              "$ref": "#/$defs/UInt"
+            },
+            "variadic": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "parameterTypes",
+            "typeParameterCount",
+            "variadic"
+          ],
+          "additionalProperties": false
+        },
+        "SymbolKey": {
+          "type": "object",
+          "properties": {
+            "scheme": {
+              "const": "scip"
+            },
+            "symbol": {
+              "$ref": "#/$defs/Text"
+            },
+            "scope": {
+              "enum": [
+                "global",
+                "document"
+              ]
+            },
+            "document": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DocumentKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "scheme",
+            "symbol",
+            "scope",
+            "document"
+          ],
+          "additionalProperties": false
+        },
+        "SyntaxId": {
+          "type": "string",
+          "pattern": "^sid:v1:[0-9a-f]{32}$"
+        },
+        "Target": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "internal"
+                },
+                "syntaxId": {
+                  "$ref": "#/$defs/SyntaxId"
+                },
+                "document": {
+                  "$ref": "#/$defs/DocumentKey"
+                },
+                "revisionId": {
+                  "$ref": "#/$defs/Text"
+                }
+              },
+              "required": [
+                "kind",
+                "syntaxId",
+                "document",
+                "revisionId"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "external"
+                },
+                "symbol": {
+                  "$ref": "#/$defs/SymbolKey"
+                }
+              },
+              "required": [
+                "kind",
+                "symbol"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "Text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "UInt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "Warning": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "coverageIncomplete",
+                "staleEvidence",
+                "staleTarget",
+                "bindingAmbiguous",
+                "syntaxOnly"
+              ]
+            },
+            "message": {
+              "$ref": "#/$defs/Text"
+            },
+            "provenanceId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "provenanceId"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "baleyg_read_source",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "path": {
+          "$ref": "#/$defs/ReadSourcePath"
+        },
+        "startLine": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "endLine": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "expectedBasis": {
+          "$ref": "#/$defs/Basis"
+        },
+        "expectedContentHash": {
+          "$ref": "#/$defs/Hash"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "path",
+        "startLine",
+        "endLine"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "Basis": {
+          "type": "object",
+          "properties": {
+            "indexGeneration": {
+              "type": "string",
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "additionalProperties": false
+        },
+        "Hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "UInt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "ReadSourcePath": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\:\\u0000])[^/\\\\:\\u0000]+(?:/[^/\\\\:\\u0000]+)*(?![\\s\\S])"
+        }
+      }
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              ]
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "$ref": "#/$defs/Path"
+                },
+                "contentHash": {
+                  "$ref": "#/$defs/Hash"
+                },
+                "startLine": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "endLine": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "byteRange": {
+                  "$ref": "#/$defs/Range"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "evidence": {
+                  "$ref": "#/$defs/Evidence"
+                }
+              },
+              "required": [
+                "path",
+                "contentHash",
+                "startLine",
+                "endLine",
+                "byteRange",
+                "text",
+                "evidence"
+              ],
+              "additionalProperties": false
+            },
+            "warnings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Warning"
+              }
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncationReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "response_bytes",
+                    "limit",
+                    "callee_text"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "$ref": "#/$defs/Failure"
+        }
+      ],
+      "$defs": {
+        "Basis": {
+          "type": "object",
+          "properties": {
+            "indexGeneration": {
+              "type": "string",
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "additionalProperties": false
+        },
+        "Evidence": {
+          "type": "object",
+          "properties": {
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "staleBecause": {
+              "type": "array",
+              "maxItems": 0
+            }
+          },
+          "required": [
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause"
+          ],
+          "additionalProperties": false
+        },
+        "Failure": {
+          "type": "object",
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              ]
+            },
+            "error": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "$ref": "#/$defs/FailureCode"
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "additionalProperties": false
+        },
+        "FailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "root_changed",
+            "store_unavailable"
+          ]
+        },
+        "Hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "Path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\\\u0000])[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*(?![\\s\\S])"
+        },
+        "Range": {
+          "type": "object",
+          "properties": {
+            "start": {
+              "$ref": "#/$defs/UInt"
+            },
+            "end": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "additionalProperties": false
+        },
+        "Text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "UInt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "Warning": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "coverageIncomplete",
+                "staleEvidence",
+                "staleTarget",
+                "bindingAmbiguous",
+                "syntaxOnly"
+              ]
+            },
+            "message": {
+              "$ref": "#/$defs/Text"
+            },
+            "provenanceId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "provenanceId"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  }
+]

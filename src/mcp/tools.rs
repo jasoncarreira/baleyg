@@ -1,0 +1,616 @@
+//! Closed application DTO validation and protocol-only, read-only unavailable projections.
+use super::{IdentityError, OpenedWorkspace, wire};
+use serde_json::{Value, json};
+
+const TOOLS: [&str; 4] = super::catalog::NAMES;
+#[derive(Debug)]
+pub struct PreparedTool {
+    pub response: Value,
+    /// False for invalid application fields: their errors precede workspace verification.
+    pub valid_arguments: bool,
+    pub id: Value,
+    pub modern: bool,
+}
+fn closed(o: &serde_json::Map<String, Value>, fields: &[&str], required: &[&str]) -> bool {
+    o.keys().all(|k| fields.contains(&k.as_str())) && required.iter().all(|k| o.contains_key(*k))
+}
+fn string(v: Option<&Value>) -> Option<&str> {
+    v?.as_str()
+}
+fn valid_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && [8, 13, 18, 23].iter().all(|i| b[*i] == b'-')
+        && b.iter().enumerate().all(|(i, x)| {
+            [8, 13, 18, 23].contains(&i) || x.is_ascii_digit() || (b'a'..=b'f').contains(x)
+        })
+        && b.iter()
+            .enumerate()
+            .any(|(i, x)| ![8, 13, 18, 23].contains(&i) && *x != b'0')
+}
+fn hash(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn basis(v: &Value) -> bool {
+    let Some(o) = v.as_object() else { return false };
+    closed(
+        o,
+        &["indexGeneration", "indexRevision"],
+        &["indexGeneration", "indexRevision"],
+    ) && string(o.get("indexGeneration")).is_some_and(valid_uuid)
+        && o.get("indexRevision").and_then(wire::uint).is_some()
+}
+fn expected_basis(o: &serde_json::Map<String, Value>) -> bool {
+    o.get("expectedBasis").is_none_or(basis)
+}
+fn limit(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
+    match o.get("limit") {
+        None => Ok(()),
+        Some(v) => match wire::uint(v) {
+            Some(1..=50) => Ok(()),
+            Some(_) => Err("range_too_large"),
+            None => Err("invalid_request"),
+        },
+    }
+}
+fn valid_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 4096
+        && !s.starts_with('/')
+        && !s.contains(['\\', ':', '\0'])
+        && s.split('/').all(|part| !matches!(part, "" | "." | ".."))
+}
+/// Argument validation is independent of workspace state. A malformed UInt is an invalid
+/// request even if its numeric value would exceed a narrower application cap.
+pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
+    if !TOOLS.contains(&name) {
+        return Err("invalid_request");
+    }
+    let Some(o) = args.and_then(Value::as_object) else {
+        return Err("invalid_request");
+    };
+    let (fields, required): (&[&str], &[&str]) = match name {
+        "baleyg_workspace_describe" => (&["schemaVersion"], &["schemaVersion"]),
+        "baleyg_find_symbols" => (
+            &["schemaVersion", "query", "limit", "expectedBasis"],
+            &["schemaVersion", "query"],
+        ),
+        "baleyg_inspect" => (
+            &[
+                "schemaVersion",
+                "symbolId",
+                "view",
+                "limit",
+                "expectedBasis",
+            ],
+            &["schemaVersion", "symbolId", "view"],
+        ),
+        _ => (
+            &[
+                "schemaVersion",
+                "path",
+                "startLine",
+                "endLine",
+                "expectedBasis",
+                "expectedContentHash",
+            ],
+            &["schemaVersion", "path", "startLine", "endLine"],
+        ),
+    };
+    if !closed(o, fields, required)
+        || o.get("schemaVersion").and_then(wire::uint) != Some(1)
+        || !expected_basis(o)
+    {
+        return Err("invalid_request");
+    }
+    match name {
+        "baleyg_workspace_describe" => Ok(()),
+        "baleyg_find_symbols" => {
+            let q = string(o.get("query")).ok_or("invalid_request")?;
+            if q.is_empty() || q.len() > 256 {
+                return Err("invalid_request");
+            }
+            limit(o)
+        }
+        "baleyg_inspect" => {
+            let sid = string(o.get("symbolId")).ok_or("invalid_request")?;
+            if sid.len() > 8192
+                || sid.len() != 39
+                || !sid.starts_with("sid:v1:")
+                || !sid[7..]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("invalid_request");
+            }
+            match string(o.get("view")) {
+                Some("declaration") if !o.contains_key("limit") => Ok(()),
+                Some("outgoing_calls") => limit(o),
+                _ => Err("invalid_request"),
+            }
+        }
+        _ => {
+            let path = string(o.get("path")).ok_or("invalid_request")?;
+            if !valid_path(path)
+                || !o
+                    .get("expectedContentHash")
+                    .is_none_or(|v| string(Some(v)).is_some_and(hash))
+            {
+                return Err("invalid_request");
+            }
+            let start = o
+                .get("startLine")
+                .and_then(wire::uint)
+                .ok_or("invalid_request")?;
+            let end = o
+                .get("endLine")
+                .and_then(wire::uint)
+                .ok_or("invalid_request")?;
+            if start == 0 || end == 0 || end < start {
+                return Err("invalid_request");
+            }
+            if end - start >= 200 {
+                return Err("range_too_large");
+            }
+            Ok(())
+        }
+    }
+}
+fn details(code: &str) -> (&'static str, bool) {
+    match code {
+        "invalid_request" => ("Invalid tool arguments", false),
+        "range_too_large" => ("Requested range is too large", false),
+        "unsupported_encoding" => ("Unsupported source encoding", false),
+        "revision_conflict" => ("Revision conflict", false),
+        "index_not_ready" => ("Index is not ready", true),
+        "not_found" => ("Not found", false),
+        "too_many_requests" => ("Too many requests", true),
+        "deadline_exceeded" => ("Deadline exceeded", true),
+        "root_changed" => ("Workspace root changed", false),
+        "store_unavailable" => ("Store is unavailable", false),
+        _ => ("Store is unavailable", false),
+    }
+}
+pub fn failure(id: &Value, code: &str) -> Value {
+    let (message, retryable) = details(code);
+    json!({"schemaVersion":1,"requestId":id,"error":{
+      "code":code,"message":message,"retryable":retryable,
+      "currentBasis":null,"currentContentHash":null}})
+}
+pub fn describe(id: &Value, label: &str) -> Value {
+    json!({"schemaVersion":1,"requestId":id,"evidenceBasis":null,
+      "data":{"workspaceLabel":label,"indexState":"unavailable","progress":null,
+      "watcherDegraded":false,"languages":[],"toolVersion":1,"schemaVersion":1,
+      "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
+        "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
+        "hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
+      "warnings":[],"partial":true,"truncated":false,"truncationReason":null})
+}
+pub fn result(envelope: Value, modern: bool) -> Value {
+    let text = serde_json::to_string(&envelope).expect("bounded tool envelope");
+    let error = envelope.get("error").is_some();
+    let mut value = json!({"isError":error,"structuredContent":envelope,
+        "content":[{"type":"text","text":text}]});
+    if modern {
+        value["resultType"] = json!("complete")
+    }
+    value
+}
+fn identity_error(error: IdentityError) -> &'static str {
+    match error {
+        IdentityError::RootChanged => "root_changed",
+        IdentityError::StoreUnavailable => "store_unavailable",
+    }
+}
+/// Construct each envelope once and copy that same value to the text representation.
+pub fn prepare(
+    name: &str,
+    args: Option<&Value>,
+    id: &Value,
+    modern: bool,
+    workspace: &OpenedWorkspace,
+) -> PreparedTool {
+    let validation = validate(name, args);
+    let valid_arguments = validation.is_ok();
+    let envelope = match validation {
+        Err(code) => failure(id, code),
+        Ok(()) => match workspace.check() {
+            Err(e) => failure(id, identity_error(e)),
+            Ok(()) if name == "baleyg_workspace_describe" => describe(id, workspace.label()),
+            Ok(()) => failure(id, "index_not_ready"),
+        },
+    };
+    PreparedTool {
+        response: result(envelope, modern),
+        valid_arguments,
+        id: id.clone(),
+        modern,
+    }
+}
+/// Run immediately before a valid known-tool outcome is committed to the wire.
+/// Never override a malformed application's typed validation failure.
+pub fn final_check(prepared: &mut PreparedTool, workspace: &OpenedWorkspace) {
+    if prepared.valid_arguments
+        && let Err(error) = workspace.check()
+    {
+        prepared.response = result(
+            failure(&prepared.id, identity_error(error)),
+            prepared.modern,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::wire::{RESPONSE_BYTES, write_response};
+    use crate::store::topology::WorkspaceIdentity;
+    fn context() -> (tempfile::TempDir, OpenedWorkspace) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("selected");
+        std::fs::create_dir(&root).unwrap();
+        let opened =
+            OpenedWorkspace::new(WorkspaceIdentity::discover(Some(&root), dir.path()).unwrap());
+        (dir, opened)
+    }
+    fn pin() -> Value {
+        json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":9007199254740991_u64})
+    }
+    fn sid() -> String {
+        format!("sid:v1:{}", "a".repeat(32))
+    }
+    fn good(name: &str) -> Value {
+        match name {
+            "baleyg_workspace_describe" => json!({"schemaVersion":1}),
+            "baleyg_find_symbols" => json!({"schemaVersion":1,"query":"a"}),
+            "baleyg_inspect" => json!({"schemaVersion":1,"symbolId":sid(),"view":"declaration"}),
+            _ => json!({"schemaVersion":1,"path":"src/a.rs","startLine":1,"endLine":1}),
+        }
+    }
+    fn check(name: &str, v: &Value, code: &str) {
+        assert_eq!(validate(name, Some(v)), Err(code), "{name} {v}");
+    }
+    #[test]
+    fn closed_application_objects_and_pins() {
+        let n = TOOLS[0];
+        assert_eq!(validate(n, Some(&good(n))), Ok(()));
+        for v in [
+            json!({}),
+            json!({"schemaVersion":0}),
+            json!({"schemaVersion":1,"other":true}),
+            json!({"schemaVersion":1.1}),
+            json!({"schemaVersion":null}),
+        ] {
+            check(n, &v, "invalid_request")
+        }
+        for n in TOOLS {
+            assert_eq!(validate(n, None), Err("invalid_request"));
+            for v in [json!(null), json!([]), json!(true), json!("x")] {
+                assert_eq!(validate(n, Some(&v)), Err("invalid_request"));
+            }
+            let mut v = good(n);
+            v["schemaVersion"] = json!(2);
+            check(n, &v, "invalid_request");
+            let mut v = good(n);
+            v["unknown"] = json!(true);
+            check(n, &v, "invalid_request");
+            if n == TOOLS[0] {
+                continue;
+            }
+            for wrong in [
+                json!(null),
+                json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000"}),
+                json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1,"extra":0}),
+                json!({"indexGeneration":"00000000-0000-0000-0000-000000000000","indexRevision":1}),
+                json!({"indexGeneration":"123E4567-e89b-42d3-a456-426614174000","indexRevision":1}),
+                json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":-1}),
+                json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":9007199254740992_u64}),
+            ] {
+                let mut v = good(n);
+                v["expectedBasis"] = wrong;
+                check(n, &v, "invalid_request");
+            }
+            let mut v = good(n);
+            v["expectedBasis"] = pin();
+            assert_eq!(validate(n, Some(&v)), Ok(()));
+        }
+    }
+    #[test]
+    fn find_and_inspect_boundaries() {
+        let n = TOOLS[1];
+        for q in ["", &"é".repeat(129), &"x".repeat(257)] {
+            let mut v = good(n);
+            v["query"] = json!(q);
+            check(n, &v, "invalid_request");
+        }
+        for q in [&"x".repeat(256), &"é".repeat(128), "  a  "] {
+            let mut v = good(n);
+            v["query"] = json!(q);
+            assert_eq!(validate(n, Some(&v)), Ok(()));
+        }
+        let mut v = good(n);
+        v["query"] = json!(null);
+        check(n, &v, "invalid_request");
+        for name in [TOOLS[1], TOOLS[2]] {
+            let original = if name == TOOLS[2] {
+                let mut v = good(name);
+                v["view"] = json!("outgoing_calls");
+                v
+            } else {
+                good(name)
+            };
+            for (number, expected) in [
+                (json!(0), Some("range_too_large")),
+                (json!(1), None),
+                (json!(50), None),
+                (json!(51), Some("range_too_large")),
+                (json!(null), Some("invalid_request")),
+                (json!(1.5), Some("invalid_request")),
+                (json!(-1), Some("invalid_request")),
+                (json!(9007199254740992_u64), Some("invalid_request")),
+                (json!("1"), Some("invalid_request")),
+            ] {
+                let mut v = original.clone();
+                v["limit"] = number;
+                assert_eq!(validate(name, Some(&v)).err(), expected, "{name} {v}");
+            }
+        }
+        let n = TOOLS[2];
+        for view in [
+            "incoming_calls",
+            "call_paths",
+            "usages",
+            "type_hierarchy",
+            "implementations",
+            "coverage",
+            "other",
+        ] {
+            let mut v = good(n);
+            v["view"] = json!(view);
+            check(n, &v, "invalid_request");
+        }
+        let mut v = good(n);
+        v["limit"] = json!(1);
+        check(n, &v, "invalid_request");
+        for wrong in [
+            "sid:v1:ABCDEF0123456789abcdef0123456789",
+            "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag",
+            "occ:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let mut v = good(n);
+            v["symbolId"] = json!(wrong);
+            check(n, &v, "invalid_request");
+        }
+    }
+    #[test]
+    fn source_path_hash_and_line_matrix() {
+        let n = TOOLS[3];
+        for path in [
+            "",
+            "/a",
+            "../a",
+            "a/../b",
+            "a/./b",
+            "./a",
+            "a//b",
+            "a/",
+            "a\\b",
+            "a:b",
+            "a\0b",
+            &"x".repeat(4097),
+        ] {
+            let mut v = good(n);
+            v["path"] = json!(path);
+            check(n, &v, "invalid_request");
+        }
+        for path in [&"x".repeat(4096), ".hidden/file", "a/é"] {
+            let mut v = good(n);
+            v["path"] = json!(path);
+            assert_eq!(validate(n, Some(&v)), Ok(()));
+        }
+        for hash in ["A".repeat(64), "z".repeat(64), "a".repeat(63)] {
+            let mut v = good(n);
+            v["expectedContentHash"] = json!(hash);
+            check(n, &v, "invalid_request");
+        }
+        let mut v = good(n);
+        v["expectedContentHash"] = json!("a".repeat(64));
+        v["expectedBasis"] = pin();
+        assert_eq!(validate(n, Some(&v)), Ok(()));
+        for field in ["startLine", "endLine"] {
+            for wrong in [
+                json!(0),
+                json!(-1),
+                json!(null),
+                json!(1.1),
+                json!(9007199254740992_u64),
+                json!("1"),
+            ] {
+                let mut v = good(n);
+                v[field] = wrong;
+                check(n, &v, "invalid_request");
+            }
+        }
+        let mut v = good(n);
+        v["endLine"] = json!(200);
+        assert_eq!(validate(n, Some(&v)), Ok(()));
+        v["endLine"] = json!(201);
+        check(n, &v, "range_too_large");
+        v["startLine"] = json!(202);
+        check(n, &v, "invalid_request");
+    }
+    #[test]
+    fn exact_envelopes_identity_precedence_and_complete_wire_bound() {
+        let (dir, workspace) = context();
+        let max_ids = [
+            json!("\u{0000}".repeat(42) + "aa"),
+            json!(9007199254740991_i64),
+            json!(-9007199254740991_i64),
+        ];
+        let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":1,"schemaVersion":1,
+            "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
+            "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
+        assert_eq!(describe(&json!(7), workspace.label()), describe_expected);
+        for modern in [false, true] {
+            for id in &max_ids {
+                for name in TOOLS {
+                    let good = good(name);
+                    let prepared = prepare(name, Some(&good), id, modern, &workspace);
+                    let result = &prepared.response;
+                    assert_eq!(result.get("resultType").is_some(), modern);
+                    assert_eq!(result["isError"], name != TOOLS[0]);
+                    assert_eq!(
+                        serde_json::from_str::<Value>(
+                            result["content"][0]["text"].as_str().unwrap()
+                        )
+                        .unwrap(),
+                        result["structuredContent"]
+                    );
+                    assert_eq!(result["structuredContent"]["requestId"], *id);
+                    if name != TOOLS[0] {
+                        assert_eq!(
+                            result["structuredContent"]["error"]["code"],
+                            "index_not_ready"
+                        );
+                    }
+                    let mut response = Vec::new();
+                    write_response(
+                        &mut response,
+                        &json!({"jsonrpc":"2.0","id":id,"result":result}),
+                    )
+                    .unwrap();
+                    assert!(response.len() <= RESPONSE_BYTES);
+                    let invalid = prepare(
+                        name,
+                        Some(&json!({"schemaVersion":1,"unknown":0})),
+                        id,
+                        modern,
+                        &workspace,
+                    );
+                    assert_eq!(
+                        invalid.response["structuredContent"]["error"]["code"],
+                        "invalid_request"
+                    );
+                    for code in [
+                        "invalid_request",
+                        "range_too_large",
+                        "unsupported_encoding",
+                        "revision_conflict",
+                        "index_not_ready",
+                        "not_found",
+                        "too_many_requests",
+                        "deadline_exceeded",
+                        "root_changed",
+                        "store_unavailable",
+                    ] {
+                        let tool = super::result(super::failure(id, code), modern);
+                        assert_eq!(
+                            serde_json::from_str::<Value>(
+                                tool["content"][0]["text"].as_str().unwrap()
+                            )
+                            .unwrap(),
+                            tool["structuredContent"]
+                        );
+                        let mut wire = Vec::new();
+                        write_response(&mut wire, &json!({"jsonrpc":"2.0","id":id,"result":tool}))
+                            .unwrap();
+                        assert!(wire.len() <= RESPONSE_BYTES);
+                        assert_eq!(
+                            tool["structuredContent"]["error"]["currentBasis"],
+                            Value::Null
+                        );
+                        assert_eq!(
+                            tool["structuredContent"]["error"]["currentContentHash"],
+                            Value::Null
+                        );
+                    }
+                }
+            }
+        }
+        let mut unsent = prepare(
+            TOOLS[0],
+            Some(&good(TOOLS[0])),
+            &json!("pending"),
+            true,
+            &workspace,
+        );
+        assert_eq!(unsent.response["isError"], false);
+        let root = dir.path().join("selected");
+        std::fs::rename(&root, dir.path().join("moved")).unwrap();
+        final_check(&mut unsent, &workspace);
+        assert_eq!(
+            unsent.response["structuredContent"]["error"]["code"],
+            "root_changed"
+        );
+        for name in TOOLS {
+            let valid = good(name);
+            let mut prepared = prepare(name, Some(&valid), &json!(2), true, &workspace);
+            assert_eq!(
+                prepared.response["structuredContent"]["error"]["code"],
+                "root_changed"
+            );
+            final_check(&mut prepared, &workspace);
+            assert_eq!(
+                prepared.response["structuredContent"]["error"]["code"],
+                "root_changed"
+            );
+            let mut invalid = prepare(
+                name,
+                Some(&json!({"schemaVersion":1,"unknown":0})),
+                &json!(2),
+                true,
+                &workspace,
+            );
+            final_check(&mut invalid, &workspace);
+            assert_eq!(
+                invalid.response["structuredContent"]["error"]["code"],
+                "invalid_request"
+            );
+        }
+    }
+    #[test]
+    fn marker_verification_error_is_sanitized_and_does_not_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("git-selected");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let workspace =
+            OpenedWorkspace::new(WorkspaceIdentity::discover(Some(&root), temp.path()).unwrap());
+        let mut prepared = prepare(
+            TOOLS[0],
+            Some(&good(TOOLS[0])),
+            &json!(5),
+            false,
+            &workspace,
+        );
+        assert_eq!(prepared.response["isError"], false);
+        let marker = root.join(".git/baleyg/workspace-id");
+        std::fs::remove_file(&marker).unwrap();
+        final_check(&mut prepared, &workspace);
+        assert_eq!(
+            prepared.response["structuredContent"],
+            failure(&json!(5), "store_unavailable")
+        );
+        assert!(!marker.exists());
+        let valid = prepare(TOOLS[1], Some(&good(TOOLS[1])), &json!(6), true, &workspace);
+        assert_eq!(
+            valid.response["structuredContent"]["error"]["code"],
+            "store_unavailable"
+        );
+        let invalid = prepare(
+            TOOLS[1],
+            Some(&json!({"schemaVersion":1,"query":""})),
+            &json!(7),
+            true,
+            &workspace,
+        );
+        assert_eq!(
+            invalid.response["structuredContent"]["error"]["code"],
+            "invalid_request"
+        );
+    }
+}
