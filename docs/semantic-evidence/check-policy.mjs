@@ -238,12 +238,12 @@ const EXPECTED = {
     "nodeVersion": "24.11.1"
   },
   "semanticProducers": [
-    {"name": "scip-java", "status": "notRecorded", "version": null, "installedAtCapture": false},
-    {"name": "scip-typescript", "status": "notRecorded", "version": null, "installedAtCapture": false},
-    {"name": "scip-python", "status": "notRecorded", "version": null, "installedAtCapture": false},
-    {"name": "rust-analyzer", "status": "notRecorded", "version": null, "installedAtCapture": false}
+    {"name": "scip-java", "status": "recorded", "version": "0.12.3", "installedAtCapture": true, "capturedOn": "2026-09-27", "installMethod": "coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3", "artifactDigest": "sha256:5bef376c8960f1b25fcbf1156bb3f61b4d3f338d94b6bbd1a474d2db957a36ff", "runtime": "coursier-managed Temurin javac selected by the build config jvm field: 17.0.20.1 by default, 25.0.4.1 verified with jvm 25; system OpenJDK 25.0.3"},
+    {"name": "scip-typescript", "status": "recorded", "version": "0.4.0", "installedAtCapture": true, "capturedOn": "2026-09-27", "installMethod": "npm install -g @sourcegraph/scip-typescript@0.4.0", "artifactDigest": "sha512-k+AtsrqmS41Sd5qjkZlHcmvoSQIvBOonRj4jpgp0KNFM6aqvMGpdSuPUqrUcg8ENTKjUbfaUVszgQwq3bCOvwA==", "runtime": "Node 24.11.1"},
+    {"name": "scip-python", "status": "recorded", "version": "0.6.6", "installedAtCapture": true, "capturedOn": "2026-09-27", "installMethod": "npm install -g @sourcegraph/scip-python@0.6.6", "artifactDigest": "sha512-qoKL1Rggg0o5newAFbCFAKlS0AjWxG5MA+mC28BtgxOv0DhO4zdL8u7151FxEppDpXMVvm7+yXSjXotoVH9cMQ==", "runtime": "Node 24.11.1"},
+    {"name": "rust-analyzer", "status": "recorded", "version": "1.98.1 (48a229ce 2026-09-01)", "installedAtCapture": true, "capturedOn": "2026-09-27", "installMethod": "rustup component add rust-analyzer (stable-aarch64-apple-darwin)", "artifactDigest": "sha256:78082ea1a96a008751767bd35f43738b5d4565cbef06ee5b31ad742a316133b5", "runtime": "Rust 1.98.1 toolchain"}
   ],
-  "qualification": {"producerInventoryComplete": false, "readyForAuthoritativeBaseline": false, "benchmarkEvidence": null, "passingBenchmarkClaim": false}
+  "qualification": {"producerInventoryComplete": true, "readyForAuthoritativeBaseline": true, "benchmarkEvidence": null, "passingBenchmarkClaim": false}
 },
 };
 
