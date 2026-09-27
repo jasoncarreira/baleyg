@@ -17,33 +17,9 @@ fn fixture() -> Value {
 /// cannot be recycled until *after* this owner terminates the group and reaps it.
 fn bounded_group_wait(child: &mut Child) -> (std::process::ExitStatus, bool) {
     let pid = child.id() as libc::pid_t;
-    // CommandExt::process_group(0) installs a dedicated group before exec.
-    // Darwin may return ESRCH for a promptly exited but still-unreaped leader.
-    let group = unsafe { libc::getpgid(pid) };
-    if group != pid {
-        assert_eq!(group, -1, "test child must own its process group");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        assert_eq!(
-            unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    info.as_mut_ptr(),
-                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-                )
-            },
-            0
-        );
-        assert_eq!(
-            unsafe { info.assume_init().si_pid() },
-            pid,
-            "only an exited leader may lack a queryable group"
-        );
-    }
+    // Both spawn sites use CommandExt::process_group(0); a failed group setup
+    // fails spawn. Do not probe getpgid here: Darwin can transiently report
+    // ESRCH before a nonblocking waitid observes a fast child's exit.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let expired = loop {
         if std::time::Instant::now() >= deadline {
