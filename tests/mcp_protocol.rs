@@ -3,41 +3,74 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
-    os::unix::process::ExitStatusExt,
+    os::unix::process::{CommandExt, ExitStatusExt},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
+    sync::mpsc::{self, Receiver},
     time::Duration,
 };
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/mcp/protocol.json")).unwrap()
 }
-/// External bounded wait must distinguish an OS timeout kill from natural process rejection.
-fn process_watchdog(pid: u32) -> (Sender<()>, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
-    let (done, receiver) = mpsc::channel();
-    let fired = Arc::new(AtomicBool::new(false));
-    let fired_by_watchdog = Arc::clone(&fired);
-    let thread = std::thread::spawn(move || {
-        if matches!(
-            receiver.recv_timeout(Duration::from_secs(10)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ) {
-            fired_by_watchdog.store(true, Ordering::Release);
-            // Kill only to bound a hung child. A killed child is never a valid test outcome.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+/// Single-owner waitid(WNOWAIT) observes exit without reaping. The original PID/PGID
+/// cannot be recycled until *after* this owner terminates the group and reaps it.
+fn bounded_group_wait(child: &mut Child) -> (std::process::ExitStatus, bool) {
+    let pid = child.id() as libc::pid_t;
+    assert_eq!(
+        unsafe { libc::getpgid(pid) },
+        pid,
+        "test child must own its process group"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut expired = false;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let status = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        assert_eq!(
+            status,
+            0,
+            "non-reaping waitid failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if unsafe { info.assume_init().si_pid() } == pid {
+            break;
         }
-    });
-    (done, fired, thread)
+        if std::time::Instant::now() >= deadline {
+            expired = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    // This owner has never reaped the leader. Even if it exited, its PID and
+    // process-group identity remain reserved until child.wait() below.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let status = child.wait().unwrap();
+    (status, expired)
+}
+fn capture_file(path: &Path) -> Vec<u8> {
+    let file = fs::File::open(path).unwrap();
+    let mut bytes = Vec::new();
+    file.take(65_537).read_to_end(&mut bytes).unwrap();
+    assert!(
+        bytes.len() <= 65_536,
+        "subprocess output exceeded bounded capture"
+    );
+    bytes
 }
 struct Peer {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: Receiver<Vec<u8>>,
+    stderr_path: PathBuf,
+    reaped: bool,
     _home: tempfile::TempDir,
 }
 impl Peer {
@@ -46,29 +79,46 @@ impl Peer {
     }
     fn start_in(workspace: Option<&Path>, cwd: Option<&Path>) -> Self {
         let home = tempfile::tempdir().unwrap();
+        let stderr_path = home.path().join("mcp-stderr.log");
+        let stderr = fs::File::create(&stderr_path).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
         cmd.arg("mcp")
             .current_dir(cwd.unwrap_or(home.path()))
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
             .env("XDG_DATA_HOME", home.path().join("data"))
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::from(stderr));
         if let Some(path) = workspace {
             cmd.arg("--workspace").arg(path);
         }
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(16);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
             loop {
-                let mut line = Vec::new();
-                if reader.read_until(b'\n', &mut line).unwrap() == 0 {
+                let available = reader.fill_buf().unwrap();
+                if available.is_empty() {
+                    if !line.is_empty() {
+                        let _ = tx.send(line);
+                    }
                     break;
                 }
-                if tx.send(line).is_err() {
+                let end = available.iter().position(|&b| b == b'\n');
+                let take = end.map_or(available.len(), |at| at + 1);
+                if line.len() + take > 65_536 {
+                    // Treat an unbounded line as a failed protocol response, never
+                    // allocate an attacker-controlled amount of captured stdout.
+                    let _ = tx.send(vec![0; 65_537]);
+                    break;
+                }
+                line.extend_from_slice(&available[..take]);
+                reader.consume(take);
+                if end.is_some() && tx.send(std::mem::take(&mut line)).is_err() {
                     break;
                 }
             }
@@ -77,6 +127,8 @@ impl Peer {
             stdin: Some(child.stdin.take().unwrap()),
             child,
             lines: rx,
+            stderr_path,
+            reaped: false,
             _home: home,
         }
     }
@@ -108,28 +160,20 @@ impl Peer {
     }
     fn finish(mut self) -> (std::process::ExitStatus, String) {
         self.stdin.take();
-        let (done, fired, watchdog) = process_watchdog(self.child.id());
-        let status = self.child.wait().unwrap();
-        let _ = done.send(());
-        watchdog.join().unwrap();
-        assert!(
-            !fired.load(Ordering::Acquire),
-            "MCP child timed out and was killed"
-        );
-        let mut stderr = String::new();
-        self.child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
+        let (status, expired) = bounded_group_wait(&mut self.child);
+        self.reaped = true;
+        assert!(!expired, "MCP subprocess exceeded 10-second deadline");
+        let stderr = String::from_utf8_lossy(&capture_file(&self.stderr_path)).into_owned();
         (status, stderr)
     }
 }
 impl Drop for Peer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !self.reaped {
+            // No previous wait/reap occurred: this PID/PGID cannot be recycled.
+            unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = self.child.wait();
+        }
     }
 }
 fn checkout(base: &Path) -> PathBuf {
@@ -665,7 +709,11 @@ fn modern_legacy_client_info_title() {
         assert!(peer.finish().0.success());
     }
     let implicit = Peer::start(None);
-    assert!(!implicit.finish().0.success());
+    let diagnostic = silent_failure(implicit);
+    assert!(
+        diagnostic.contains("workspace root overlaps fixed topology"),
+        "{diagnostic}"
+    );
 }
 
 fn alternate_token(s: &str) -> String {
@@ -985,23 +1033,27 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
 }
 
 fn bounded_output(mut command: Command) -> std::process::Output {
-    let child = command
+    let capture = tempfile::tempdir().unwrap();
+    let stdout_path = capture.path().join("stdout.log");
+    let stderr_path = capture.path().join("stderr.log");
+    let stdout = fs::File::create(&stdout_path).unwrap();
+    let stderr = fs::File::create(&stderr_path).unwrap();
+    let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap();
-    let (done, fired, watchdog) = process_watchdog(child.id());
-    let output = child.wait_with_output().unwrap();
-    let _ = done.send(());
-    watchdog.join().unwrap();
-    assert!(
-        !fired.load(Ordering::Acquire),
-        "subprocess timed out and was killed"
-    );
-    output
+    let (status, expired) = bounded_group_wait(&mut child);
+    assert!(!expired, "subprocess exceeded 10-second deadline");
+    std::process::Output {
+        status,
+        stdout: capture_file(&stdout_path),
+        stderr: capture_file(&stderr_path),
+    }
 }
-fn silent_failure(mut peer: Peer) {
+fn silent_failure(mut peer: Peer) -> String {
     peer.stdin.take();
     let (_tx, substitute) = mpsc::channel();
     let lines = std::mem::replace(&mut peer.lines, substitute);
@@ -1016,6 +1068,7 @@ fn silent_failure(mut peer: Peer) {
         lines.recv_timeout(Duration::from_secs(1)).is_err(),
         "startup failure emitted stdout"
     );
+    stderr
 }
 #[test]
 fn workspace_selection_startup_side_effects_and_final_identity() {
