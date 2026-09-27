@@ -169,6 +169,20 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
     }
     assert_eq!(*v, json!({"jsonrpc":"2.0","id":v["id"],"result":result}));
 }
+fn exact_tool_for_id(
+    v: &Value,
+    expected_id: &Value,
+    code: Option<&str>,
+    modern: bool,
+    label: &str,
+) {
+    assert_eq!(&v["id"], expected_id, "outer JSON-RPC ID must echo sent ID");
+    assert_eq!(
+        &v["result"]["structuredContent"]["requestId"], expected_id,
+        "typed requestId must echo sent ID"
+    );
+    exact_tool(v, code, modern, label);
+}
 fn ready_legacy(peer: &mut Peer) {
     let init = peer.ask(request(
         json!(1),
@@ -187,28 +201,33 @@ fn call(legacy: bool, id: Value, name: &str, arguments: Value) -> Value {
     }
 }
 fn no_db_under(root: &Path) {
-    fn walk(dir: &Path) {
-        if !dir.exists() {
-            return;
-        }
+    no_db_under_except(root, &[]);
+}
+fn no_db_under_except(root: &Path, allowed: &[PathBuf]) {
+    fn walk(dir: &Path, allowed: &[PathBuf]) {
+        assert!(
+            dir.is_dir(),
+            "isolated HOME must exist during DB inspection: {}",
+            dir.display()
+        );
         for entry in fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
             if path.is_dir() {
-                walk(&path)
+                walk(&path, allowed)
             } else {
                 assert!(
                     !matches!(
                         entry.file_name().to_str(),
                         Some("index.db" | "workspace.db" | "requests.db")
-                    ),
+                    ) || allowed.contains(&path),
                     "unexpected DB: {}",
                     path.display()
                 );
             }
         }
     }
-    walk(root);
+    walk(root, allowed);
 }
 
 #[test]
@@ -246,21 +265,43 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             modern(json!("catalog"), "tools/list", json!({}))
         };
         let response = peer.ask(list);
-        assert_eq!(
-            response["result"]["tools"],
-            serde_json::from_str::<Value>(include_str!("fixtures/mcp/catalog.json")).unwrap()
-        );
-        assert_eq!(response["result"].get("resultType").is_some(), !legacy);
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 4);
-        let max_id = "a".repeat(254);
-        let max_list = if legacy {
-            request(json!(max_id), "tools/list", json!({}))
-        } else {
-            modern(json!(max_id), "tools/list", json!({}))
+        let catalog: Value =
+            serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
+        assert_eq!(catalog.as_array().unwrap().len(), 4);
+        let expected_list = |id: Value| {
+            let result = if legacy {
+                json!({"tools":catalog})
+            } else {
+                json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":catalog})
+            };
+            json!({"jsonrpc":"2.0","id":id,"result":result})
         };
-        let max_reply = peer.ask(max_list);
-        assert_eq!(max_reply["id"], max_id);
-        assert_eq!(max_reply["result"]["tools"], response["result"]["tools"]);
+        assert_eq!(
+            response,
+            expected_list(json!("catalog")),
+            "entire catalog wrapper must be exact"
+        );
+        let max_control_id = format!(
+            "{}{}{}{}",
+            "\"".repeat(80),
+            "\\".repeat(20),
+            "\u{0000}".repeat(7),
+            "a".repeat(12)
+        );
+        assert_eq!(2 + 80 * 2 + 20 * 2 + 7 * 6 + 12, 256);
+        for max_id in ["a".repeat(254), max_control_id] {
+            let max_list = if legacy {
+                request(json!(max_id), "tools/list", json!({}))
+            } else {
+                modern(json!(max_id), "tools/list", json!({}))
+            };
+            let max_reply = peer.ask(max_list);
+            assert_eq!(
+                max_reply,
+                expected_list(json!(max_id)),
+                "max-ID entire catalog wrapper must be exact"
+            );
+        }
         let names = &fixture()["names"];
         for (i, name) in names.as_array().unwrap().iter().enumerate() {
             let fields = json!({"name":name,"arguments":fixture()["validArguments"][i]});
@@ -476,16 +517,15 @@ fn legacy_title_recovery_max_id_and_root_selection() {
     // Topology overlap is refused before marker attachment.
     let overlap = tmp.path().join("managed-home");
     fs::create_dir_all(overlap.join(".git")).unwrap();
-    let outcome = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    command
         .arg("mcp")
         .arg("--workspace")
         .arg(&overlap)
         .env("HOME", &overlap)
         .env("XDG_CACHE_HOME", overlap.join("cache"))
-        .env("XDG_DATA_HOME", overlap.join("data"))
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+        .env("XDG_DATA_HOME", overlap.join("data"));
+    let outcome = bounded_output(command);
     assert!(!outcome.status.success());
     assert!(outcome.stdout.is_empty());
     assert!(!overlap.join(".git/baleyg/workspace-id").exists());
@@ -829,11 +869,12 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 let name = name.as_str().unwrap();
                 let bad = json!({"schemaVersion":1,"unknown":"rejected"});
                 let invalid = peer.ask(call(legacy, id.clone(), name, bad));
-                exact_tool(&invalid, Some("invalid_request"), !legacy, "checkout");
+                exact_tool_for_id(&invalid, &id, Some("invalid_request"), !legacy, "checkout");
                 let args = fixture()["validArguments"][index].clone();
                 let accepted = peer.ask(call(legacy, id.clone(), name, args));
-                exact_tool(
+                exact_tool_for_id(
                     &accepted,
+                    &id,
                     if index == 0 {
                         None
                     } else {
@@ -847,8 +888,9 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
         for name in &names {
             let name = name.as_str().unwrap();
             for args in [json!([]), json!(42), Value::Null] {
-                exact_tool(
+                exact_tool_for_id(
                     &peer.ask(call(legacy, json!(heavy_id), name, args)),
+                    &json!(heavy_id),
                     Some("invalid_request"),
                     !legacy,
                     "checkout",
@@ -870,8 +912,9 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 json!({"schemaVersion":1,"path":"src-sentinel.txt","startLine":1,"endLine":200,"expectedBasis":pin,"expectedContentHash":"a".repeat(64)}),
             ),
         ] {
-            exact_tool(
+            exact_tool_for_id(
                 &peer.ask(call(legacy, json!(heavy_id), name, args)),
+                &json!(heavy_id),
                 Some("index_not_ready"),
                 !legacy,
                 "checkout",
@@ -879,8 +922,9 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
         }
         let mut wrong = fixture()["validArguments"][1].clone();
         wrong["limit"] = json!(51);
-        exact_tool(
+        exact_tool_for_id(
             &peer.ask(call(legacy, json!(heavy_id), "baleyg_find_symbols", wrong)),
+            &json!(heavy_id),
             Some("range_too_large"),
             !legacy,
             "checkout",
@@ -897,9 +941,8 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
             });
             error(&response, -32602, json!(heavy_id));
         }
-        let home = peer._home.path().to_owned();
+        no_db_under(peer._home.path());
         assert!(peer.finish().0.success());
-        no_db_under(&home);
     }
     assert_eq!(
         fs::read(root.join("src-sentinel.txt")).unwrap(),
@@ -908,8 +951,9 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
     fs::write(root.join("src-sentinel.txt"), b"changed source contents").unwrap();
     let mut peer = Peer::start(Some(&root));
     let args = json!({"schemaVersion":1,"path":"src-sentinel.txt","startLine":1,"endLine":1,"expectedContentHash":"a".repeat(64)});
-    exact_tool(
+    exact_tool_for_id(
         &peer.ask(call(false, json!(heavy_id), "baleyg_read_source", args)),
+        &json!(heavy_id),
         Some("index_not_ready"),
         true,
         "checkout",
@@ -917,6 +961,25 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
     assert!(peer.finish().0.success());
 }
 
+fn bounded_output(mut command: Command) -> std::process::Output {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (done, timeout) = mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if timeout.recv_timeout(Duration::from_secs(10)).is_err() {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    });
+    let output = child.wait_with_output().unwrap();
+    let _ = done.send(());
+    watchdog.join().unwrap();
+    output
+}
 fn silent_failure(mut peer: Peer) {
     peer.stdin.take();
     let (_tx, substitute) = mpsc::channel();
@@ -1077,6 +1140,23 @@ fn exact_frames_split_utf8_crlf_and_eof() {
     oversized.push(b'\r');
     peer.send_raw(&oversized);
     error(&peer.reply(), -32600, Value::Null);
+    // Exactly 16,383 JSON bytes plus CR are 16,384 bytes before LF: admitted.
+    req["params"]["_meta"]["padding"] = json!("a".repeat(16_383 - empty.len()));
+    let mut exact_crlf = serde_json::to_vec(&req).unwrap();
+    assert_eq!(exact_crlf.len(), 16_383);
+    exact_crlf.push(b'\r');
+    peer.send_raw(&exact_crlf);
+    assert_eq!(peer.reply()["id"], 50);
+    let mut invalid_utf8 = br#"{"jsonrpc":"2.0","id":"x","method":"server/discover"}"#.to_vec();
+    let marker = invalid_utf8.windows(3).position(|p| p == b"\"x\"").unwrap();
+    invalid_utf8[marker + 1] = 0xff;
+    peer.send_raw(&invalid_utf8);
+    error(&peer.reply(), -32700, Value::Null);
+    assert_eq!(
+        peer.ask(modern(json!(53), "server/discover", json!({})))["id"],
+        53,
+        "bad UTF-8 must not poison the next frame"
+    );
     let mut crlf = serde_json::to_vec(&modern(json!(51), "server/discover", json!({}))).unwrap();
     crlf.push(b'\r');
     peer.send_raw(&crlf);
@@ -1179,6 +1259,7 @@ fn unusable_index_sentinels_do_not_change_unavailable_projection_or_get_repaired
         ));
         exact_tool(&response, Some("index_not_ready"), true, "checkout");
     }
+    no_db_under_except(peer._home.path(), &sentinels);
     for index in sentinels {
         assert_eq!(fs::read(&index).unwrap(), b"unusable-index-DO-NOT-OPEN");
         assert!(!index.with_extension("db-wal").exists());
@@ -1294,4 +1375,107 @@ fn ordinary_cancellation_and_eof_without_private_race_hook() {
         let value: Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(value["id"], "eof-request");
     }
+}
+
+#[test]
+fn linked_git_worktrees_get_distinct_selected_markers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("main-checkout");
+    fn git(cwd: &Path, home: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        command
+            .current_dir(cwd)
+            .args(args)
+            .env("HOME", home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", Path::new("/dev/null"))
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
+        let result = bounded_output(command);
+        assert!(
+            result.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    git(
+        tmp.path(),
+        tmp.path(),
+        &["init", "--quiet", repo.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        tmp.path(),
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture root"],
+    );
+    let one = tmp.path().join("linked-one");
+    let two = tmp.path().join("linked-two");
+    for path in [&one, &two] {
+        git(
+            &repo,
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+    }
+    fn gitdir(root: &Path) -> PathBuf {
+        let pointer = fs::read_to_string(root.join(".git")).unwrap();
+        assert!(pointer.starts_with("gitdir: "));
+        let relative = pointer.trim_end().strip_prefix("gitdir: ").unwrap();
+        fs::canonicalize(root.join(relative)).unwrap()
+    }
+    let git_one = gitdir(&one);
+    let git_two = gitdir(&two);
+    assert_ne!(
+        git_one, git_two,
+        "different linked worktrees need distinct Git dirs"
+    );
+    let mut ids = Vec::new();
+    for (root, label, git) in [
+        (&one, "linked-one", &git_one),
+        (&two, "linked-two", &git_two),
+    ] {
+        let mut peer = Peer::start(Some(root));
+        let result = peer.ask(call(
+            false,
+            json!(1),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1}),
+        ));
+        exact_tool_for_id(&result, &json!(1), None, true, label);
+        let marker = git.join("baleyg/workspace-id");
+        ids.push(fs::read(&marker).unwrap());
+        assert!(
+            !root.join(".git/baleyg/workspace-id").exists(),
+            "pointer file must not be treated as directory"
+        );
+        no_db_under(peer._home.path());
+        assert!(peer.finish().0.success());
+        let mut reopened = Peer::start_in(None, Some(root));
+        let result = reopened.ask(call(
+            false,
+            json!(2),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1}),
+        ));
+        exact_tool_for_id(&result, &json!(2), None, true, label);
+        assert!(reopened.finish().0.success());
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            *ids.last().unwrap(),
+            "restart must adopt selected pointer marker"
+        );
+    }
+    assert_ne!(
+        ids[0], ids[1],
+        "two real linked worktrees must not share a workspace UUID marker"
+    );
 }
