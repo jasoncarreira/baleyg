@@ -46,6 +46,8 @@ depends entirely on the identity checks; a failed read is not the signal.
 
 ### 1. Post-interrupt connection reusability — RESOLVED, no amendment needed
 
+> **Historical interpretation only.** Contract conclusions, enrollment instructions and slice recommendations in this section refer to the superseded grant-based pilot, not requirements for the current [stdio MCP contract](mcp-readonly-pilot-contract.md). The recorded SQLite measurements remain historical evidence.
+
 An interrupted read returns `SQLITE_INTERRUPT` (extended code 9). The explicit transaction stays
 open (`autocommit` remains false), but **the connection is immediately reusable — a subsequent read
 succeeded before any rollback**. `ROLLBACK` then succeeds, `autocommit` returns to true, `HAS_MOVED`
@@ -62,6 +64,8 @@ implementation should still scope interrupts to a known in-flight request rather
 
 ### 2. Cold-start sidecar permissions — CONFIRMED as specified
 
+> **Historical interpretation only.** Contract conclusions, enrollment instructions and slice recommendations in this section refer to the superseded grant-based pilot, not requirements for the current [stdio MCP contract](mcp-readonly-pilot-contract.md). The recorded SQLite measurements remain historical evidence.
+
 A read-only main connection performs auxiliary writes: opening a WAL database with no sidecars
 present creates `-wal` and `-shm`. With the containing directory non-writable, enrollment is refused
 with a clear error rather than silently degrading. The daemon's own 0700 state directory
@@ -72,6 +76,8 @@ filesystem writes, nor that every WAL read always requires writable sidecars" �
 and should stay. Both halves were observed.
 
 ### 3. File-control availability — SUPPORTED on both platforms
+
+> **Historical interpretation only.** Contract conclusions, enrollment instructions and slice recommendations in this section refer to the superseded grant-based pilot, not requirements for the current [stdio MCP contract](mcp-readonly-pilot-contract.md). The recorded SQLite measurements remain historical evidence.
 
 `SQLITE_FCNTL_HAS_MOVED` returned `SQLITE_OK` on every call on both platforms with the bundled
 SQLite. The `SQLITE_NOTFOUND` branch cannot be reached naturally here and must be covered by
@@ -102,6 +108,8 @@ a non-writable directory; the second applies to any cancellation test of a SQLit
 - Only the bundled SQLite was exercised, which is what the project ships.
 
 ## Consequences for slices 1–5
+
+> **Historical interpretation only.** Contract conclusions, enrollment instructions and slice recommendations in this section refer to the superseded grant-based pilot, not requirements for the current [stdio MCP contract](mcp-readonly-pilot-contract.md). The recorded SQLite measurements remain historical evidence.
 
 No slice boundary moves. Slice 1 gains a concrete recovery policy — interrupt, expect
 `SQLITE_INTERRUPT`, roll back, keep the connection — instead of an open question, and its enrollment

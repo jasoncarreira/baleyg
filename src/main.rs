@@ -2,6 +2,7 @@ use anyhow::{Context, Result, ensure};
 use baleyg::{
     auth, http,
     indexer::{IndexOptions, index_workspace},
+    mcp,
     model::{CancelFlag, ViewQuery},
     store::{
         Store,
@@ -33,6 +34,8 @@ struct Cli {
 enum Command {
     /// Build and atomically publish a complete index. Does not execute repository code.
     Index(IndexArgs),
+    /// Serve one read-only MCP connection on line-framed stdin/stdout.
+    Mcp(WorkspaceArgs),
     /// Serve the authenticated loopback API and browser inspector. Refresh is explicit.
     Serve(Box<ServeArgs>),
     /// Print the current published index status.
@@ -219,6 +222,10 @@ async fn main() -> Result<()> {
         )
         .init();
     match Cli::parse().command {
+        Command::Mcp(args) => {
+            let (_, identity) = args.resolve()?;
+            mcp::run_stdio(mcp::OpenedWorkspace::new(identity))?;
+        }
         Command::Gc(_) => print_json(&TopologyRoots::production()?.gc_report()?)?,
         Command::Forget(args) => {
             use std::io::{self, Write};

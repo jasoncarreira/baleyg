@@ -1,0 +1,254 @@
+//! Closed, ordered protocol-only MCP catalog. No store-derived schemas or remote references.
+use serde_json::{Value, json};
+
+/// Keep the full catalog in this module; the separately reviewed fixture checks the exact value.
+const CATALOG: &str = r###"[{"annotations":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true},"inputSchema":{"$defs":{},"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"schemaVersion":{"const":1}},"required":["schemaVersion"],"type":"object"},"name":"baleyg_workspace_describe","outputSchema":{"$defs":{"Basis":{"additionalProperties":false,"properties":{"indexGeneration":{"pattern":"^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])","type":"string"},"indexRevision":{"$ref":"#/$defs/UInt"}},"required":["indexGeneration","indexRevision"],"type":"object"},"Failure":{"additionalProperties":false,"properties":{"error":{"additionalProperties":false,"properties":{"code":{"$ref":"#/$defs/FailureCode"},"currentBasis":{"anyOf":[{"$ref":"#/$defs/Basis"},{"type":"null"}]},"currentContentHash":{"anyOf":[{"$ref":"#/$defs/Hash"},{"type":"null"}]},"message":{"$ref":"#/$defs/Text"},"retryable":{"type":"boolean"}},"required":["code","message","retryable","currentBasis","currentContentHash"],"type":"object"},"requestId":{"oneOf":[{"type":"string"},{"maximum":9007199254740991,"minimum":-9007199254740991,"type":"integer"}]},"schemaVersion":{"const":1}},"required":["schemaVersion","requestId","error"],"type":"object"},"FailureCode":{"enum":["invalid_request","range_too_large","unsupported_encoding","revision_conflict","index_not_ready","not_found","too_many_requests","deadline_exceeded","root_changed","store_unavailable"]},"Hash":{"pattern":"^[0-9a-f]{64}$","type":"string"},"Language":{"enum":["java","rust","python","javascript"]},"LanguageStatus":{"additionalProperties":false,"properties":{"coverage":{"additionalProperties":false,"properties":{"complete":{"$ref":"#/$defs/UInt"},"failed":{"$ref":"#/$defs/UInt"},"partial":{"$ref":"#/$defs/UInt"},"selected":{"$ref":"#/$defs/UInt"},"unselected":{"$ref":"#/$defs/UInt"}},"required":["selected","complete","partial","failed","unselected"],"type":"object"},"evidenceTier":{"const":"syntax"},"language":{"$ref":"#/$defs/Language"}},"required":["language","evidenceTier","coverage"],"type":"object"},"Limits":{"additionalProperties":false,"properties":{"calleeTextBytes":{"const":1024},"concurrency":{"const":4},"deadlineMs":{"const":5000},"defaultLimit":{"const":20},"hintWorkMs":{"const":1000},"maxLimit":{"const":50},"requestBytes":{"const":16384},"responseBytes":{"const":65536},"sourceBytes":{"const":16384},"sourceLines":{"const":200}},"required":["requestBytes","responseBytes","sourceBytes","sourceLines","defaultLimit","maxLimit","calleeTextBytes","hintWorkMs","deadlineMs","concurrency"],"type":"object"},"Text":{"minLength":1,"type":"string"},"UInt":{"maximum":9007199254740991,"minimum":0,"type":"integer"},"Warning":{"additionalProperties":false,"properties":{"code":{"enum":["coverageIncomplete","staleEvidence","staleTarget","bindingAmbiguous","syntaxOnly"]},"message":{"$ref":"#/$defs/Text"},"provenanceId":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]}},"required":["code","message","provenanceId"],"type":"object"}},"$schema":"https://json-schema.org/draft/2020-12/schema","oneOf":[{"additionalProperties":false,"properties":{"data":{"additionalProperties":false,"properties":{"indexState":{"enum":["indexing","reconciling","ready","unavailable"]},"languages":{"items":{"$ref":"#/$defs/LanguageStatus"},"type":"array"},"limits":{"$ref":"#/$defs/Limits"},"progress":{"anyOf":[{"additionalProperties":false,"properties":{"completed":{"$ref":"#/$defs/UInt"},"total":{"anyOf":[{"$ref":"#/$defs/UInt"},{"type":"null"}]}},"required":["completed","total"],"type":"object"},{"type":"null"}]},"schemaVersion":{"const":1},"toolVersion":{"const":1},"watcherDegraded":{"type":"boolean"},"workspaceLabel":{"$ref":"#/$defs/Text"}},"required":["workspaceLabel","indexState","progress","watcherDegraded","languages","toolVersion","schemaVersion","limits"],"type":"object"},"evidenceBasis":{"anyOf":[{"$ref":"#/$defs/Basis"},{"type":"null"}]},"partial":{"type":"boolean"},"requestId":{"oneOf":[{"type":"string"},{"maximum":9007199254740991,"minimum":-9007199254740991,"type":"integer"}]},"schemaVersion":{"const":1},"truncated":{"type":"boolean"},"truncationReason":{"anyOf":[{"enum":["response_bytes","limit","callee_text"]},{"type":"null"}]},"warnings":{"items":{"$ref":"#/$defs/Warning"},"type":"array"}},"required":["schemaVersion","requestId","evidenceBasis","data","warnings","partial","truncated","truncationReason"],"type":"object"},{"$ref":"#/$defs/Failure"}]}},{"annotations":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true},"inputSchema":{"$defs":{"Basis":{"additionalProperties":false,"properties":{"indexGeneration":{"pattern":"^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])","type":"string"},"indexRevision":{"$ref":"#/$defs/UInt"}},"required":["indexGeneration","indexRevision"],"type":"object"},"UInt":{"maximum":9007199254740991,"minimum":0,"type":"integer"}},"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"expectedBasis":{"$ref":"#/$defs/Basis"},"limit":{"maximum":50,"minimum":1,"type":"integer"},"query":{"minLength":1,"type":"string"},"schemaVersion":{"const":1}},"required":["schemaVersion","query"],"type":"object"},"name":"baleyg_find_symbols","outputSchema":{"$defs":{"Basis":{"additionalProperties":false,"properties":{"indexGeneration":{"pattern":"^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])","type":"string"},"indexRevision":{"$ref":"#/$defs/UInt"}},"required":["indexGeneration","indexRevision"],"type":"object"},"Coverage":{"additionalProperties":false,"properties":{"diagnostic":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"documentPath":{"$ref":"#/$defs/Path"},"language":{"$ref":"#/$defs/Language"},"observedRoles":{"items":{"$ref":"#/$defs/Role"},"type":"array"},"producerId":{"$ref":"#/$defs/Text"},"requested":{"type":"boolean"},"revisionId":{"$ref":"#/$defs/Text"},"selected":{"type":"boolean"},"sourceSetId":{"$ref":"#/$defs/Text"},"state":{"enum":["notRequested","omitted","unsupported","failed","partial","complete"]},"supportedRoles":{"items":{"$ref":"#/$defs/Role"},"type":"array"}},"required":["producerId","language","sourceSetId","documentPath","revisionId","requested","selected","state","supportedRoles","observedRoles","diagnostic"],"type":"object"},"DerivedFrom":{"additionalProperties":false,"properties":{"factDigest":{"$ref":"#/$defs/Hash"},"provenanceId":{"$ref":"#/$defs/Text"},"recordKind":{"enum":["occurrence","symbolInformation","relationship"]}},"required":["provenanceId","recordKind","factDigest"],"type":"object"},"DocumentKey":{"additionalProperties":false,"properties":{"language":{"$ref":"#/$defs/Language"},"path":{"$ref":"#/$defs/Path"},"sourceSetId":{"$ref":"#/$defs/Text"}},"required":["sourceSetId","language","path"],"type":"object"},"Failure":{"additionalProperties":false,"properties":{"error":{"additionalProperties":false,"properties":{"code":{"$ref":"#/$defs/FailureCode"},"currentBasis":{"anyOf":[{"$ref":"#/$defs/Basis"},{"type":"null"}]},"currentContentHash":{"anyOf":[{"$ref":"#/$defs/Hash"},{"type":"null"}]},"message":{"$ref":"#/$defs/Text"},"retryable":{"type":"boolean"}},"required":["code","message","retryable","currentBasis","currentContentHash"],"type":"object"},"requestId":{"oneOf":[{"type":"string"},{"maximum":9007199254740991,"minimum":-9007199254740991,"type":"integer"}]},"schemaVersion":{"const":1}},"required":["schemaVersion","requestId","error"],"type":"object"},"FailureCode":{"enum":["invalid_request","range_too_large","unsupported_encoding","revision_conflict","index_not_ready","not_found","too_many_requests","deadline_exceeded","root_changed","store_unavailable"]},"Hash":{"pattern":"^[0-9a-f]{64}$","type":"string"},"Kind":{"enum":["module","namespace","type","implementation","function","method","constructor","field","variable","parameter","typeParameter","alias","anonymousFunction"]},"Language":{"enum":["java","rust","python","javascript"]},"Path":{"minLength":1,"pattern":"^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\\\u0000])[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*(?![\\s\\S])","type":"string"},"Provenance":{"additionalProperties":false,"allOf":[{"if":{"properties":{"evidenceKind":{"const":"measuredSyntax"}}},"then":{"properties":{"basis":{"const":null},"derivedFrom":{"const":null},"freshness":{"const":"fresh"}}}}],"properties":{"basis":{"anyOf":[{"$ref":"#/$defs/SemanticBasis"},{"type":"null"}]},"contentHash":{"$ref":"#/$defs/Hash"},"derivedFrom":{"anyOf":[{"$ref":"#/$defs/DerivedFrom"},{"type":"null"}]},"document":{"$ref":"#/$defs/DocumentKey"},"evidenceKind":{"enum":["measuredSyntax","declarationBinding","semanticReference","typeRelationship"]},"freshness":{"enum":["fresh","possiblyStale","stale"]},"id":{"$ref":"#/$defs/Text"},"producerId":{"$ref":"#/$defs/Text"},"revisionId":{"$ref":"#/$defs/Text"}},"required":["id","producerId","document","revisionId","contentHash","evidenceKind","basis","freshness","derivedFrom"],"type":"object"},"Range":{"additionalProperties":false,"properties":{"end":{"$ref":"#/$defs/UInt"},"start":{"$ref":"#/$defs/UInt"}},"required":["start","end"],"type":"object"},"Role":{"enum":["definition","read","write","call","type","import","alias"]},"SemanticBasis":{"additionalProperties":false,"properties":{"artifactHash":{"$ref":"#/$defs/Hash"},"configHash":{"$ref":"#/$defs/Hash"},"dependencyHash":{"$ref":"#/$defs/Hash"},"language":{"$ref":"#/$defs/Language"},"lookupDependencies":{"items":{"$ref":"#/$defs/Text"},"type":"array"},"producerHash":{"$ref":"#/$defs/Hash"},"producerId":{"$ref":"#/$defs/Text"},"producerVersion":{"$ref":"#/$defs/Text"},"revisionId":{"$ref":"#/$defs/Text"},"sourceManifestHash":{"$ref":"#/$defs/Hash"},"sourceSetId":{"$ref":"#/$defs/Text"},"toolchainHash":{"$ref":"#/$defs/Hash"}},"required":["producerId","producerVersion","producerHash","artifactHash","language","sourceSetId","revisionId","sourceManifestHash","toolchainHash","configHash","dependencyHash","lookupDependencies"],"type":"object"},"Symbol":{"additionalProperties":false,"properties":{"contentHash":{"$ref":"#/$defs/Hash"},"displayKey":{"$ref":"#/$defs/Text"},"document":{"$ref":"#/$defs/DocumentKey"},"evidenceTier":{"const":"syntax"},"freshness":{"const":"fresh"},"kind":{"$ref":"#/$defs/Kind"},"name":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"nameRange":{"anyOf":[{"$ref":"#/$defs/Range"},{"type":"null"}]},"provenanceId":{"$ref":"#/$defs/Text"},"range":{"$ref":"#/$defs/Range"},"semanticBasis":{"const":null},"staleBecause":{"maxItems":0,"type":"array"},"symbolId":{"$ref":"#/$defs/SyntaxId"}},"required":["symbolId","name","displayKey","kind","document","range","nameRange","contentHash","provenanceId","evidenceTier","semanticBasis","freshness","staleBecause"],"type":"object"},"SyntaxId":{"pattern":"^sid:v1:[0-9a-f]{32}$","type":"string"},"Text":{"minLength":1,"type":"string"},"UInt":{"maximum":9007199254740991,"minimum":0,"type":"integer"},"Warning":{"additionalProperties":false,"properties":{"code":{"enum":["coverageIncomplete","staleEvidence","staleTarget","bindingAmbiguous","syntaxOnly"]},"message":{"$ref":"#/$defs/Text"},"provenanceId":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]}},"required":["code","message","provenanceId"],"type":"object"}},"$schema":"https://json-schema.org/draft/2020-12/schema","oneOf":[{"additionalProperties":false,"properties":{"data":{"additionalProperties":false,"properties":{"coverage":{"items":{"$ref":"#/$defs/Coverage"},"type":"array"},"provenance":{"items":{"$ref":"#/$defs/Provenance"},"type":"array"},"symbols":{"items":{"$ref":"#/$defs/Symbol"},"type":"array"}},"required":["symbols","coverage","provenance"],"type":"object"},"evidenceBasis":{"anyOf":[{"$ref":"#/$defs/Basis"},{"type":"null"}]},"partial":{"type":"boolean"},"requestId":{"oneOf":[{"type":"string"},{"maximum":9007199254740991,"minimum":-9007199254740991,"type":"integer"}]},"schemaVersion":{"const":1},"truncated":{"type":"boolean"},"truncationReason":{"anyOf":[{"enum":["response_bytes","limit","callee_text"]},{"type":"null"}]},"warnings":{"items":{"$ref":"#/$defs/Warning"},"type":"array"}},"required":["schemaVersion","requestId","evidenceBasis","data","warnings","partial","truncated","truncationReason"],"type":"object"},{"$ref":"#/$defs/Failure"}]}},{"annotations":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true},"inputSchema":{"$defs":{"Basis":{"additionalProperties":false,"properties":{"indexGeneration":{"pattern":"^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])","type":"string"},"indexRevision":{"$ref":"#/$defs/UInt"}},"required":["indexGeneration","indexRevision"],"type":"object"},"SyntaxId":{"pattern":"^sid:v1:[0-9a-f]{32}$","type":"string"},"UInt":{"maximum":9007199254740991,"minimum":0,"type":"integer"}},"$schema":"https://json-schema.org/draft/2020-12/schema","oneOf":[{"additionalProperties":false,"properties":{"expectedBasis":{"$ref":"#/$defs/Basis"},"schemaVersion":{"const":1},"symbolId":{"$ref":"#/$defs/SyntaxId"},"view":{"const":"declaration"}},"required":["schemaVersion","symbolId","view"],"type":"object"},{"additionalProperties":false,"properties":{"expectedBasis":{"$ref":"#/$defs/Basis"},"limit":{"maximum":50,"minimum":1,"type":"integer"},"schemaVersion":{"const":1},"symbolId":{"$ref":"#/$defs/SyntaxId"},"view":{"const":"outgoing_calls"}},"required":["schemaVersion","symbolId","view"],"type":"object"}]},"name":"baleyg_inspect","outputSchema":{"$defs":{"Basis":{"additionalProperties":false,"properties":{"indexGeneration":{"pattern":"^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])","type":"string"},"indexRevision":{"$ref":"#/$defs/UInt"}},"required":["indexGeneration","indexRevision"],"type":"object"},"CallBinding":{"additionalProperties":false,"properties":{"callId":{"anyOf":[{"$ref":"#/$defs/OccurrenceId"},{"type":"null"}]},"candidates":{"items":{"$ref":"#/$defs/Target"},"type":"array"},"declaredTarget":{"anyOf":[{"$ref":"#/$defs/Target"},{"type":"null"}]},"dispatch":{"enum":["direct","constructor","virtual","interface","dynamic","unknown"]},"join":{"$ref":"#/$defs/Join"},"possibleDispatch":{"items":{"$ref":"#/$defs/Target"},"type":"array"},"possibleDispatchComplete":{"const":false},"provenanceId":{"$ref":"#/$defs/Text"},"resolution":{"enum":["resolved","external","ambiguous","unresolved"]},"staleTarget":{"anyOf":[{"type":"boolean"},{"type":"null"}]}},"required":["callId","join","resolution","declaredTarget","candidates","dispatch","possibleDispatch","possibleDispatchComplete","staleTarget","provenanceId"],"type":"object"},"CallItem":{"additionalProperties":false,"properties":{"binding":{"allOf":[{"anyOf":[{"$ref":"#/$defs/CallBinding"},{"type":"null"}]},{"const":null}]},"boundaryReason":{"const":"missingEvidence"},"callId":{"$ref":"#/$defs/OccurrenceId"},"calleeRange":{"anyOf":[{"$ref":"#/$defs/Range"},{"type":"null"}]},"calleeText":{"anyOf":[{"type":"string"},{"type":"null"}]},"calleeTextTruncated":{"type":"boolean"},"contentHash":{"$ref":"#/$defs/Hash"},"displayKey":{"$ref":"#/$defs/Text"},"disposition":{"const":"unresolved"},"document":{"$ref":"#/$defs/DocumentKey"},"evidenceTier":{"const":"syntax"},"freshness":{"const":"fresh"},"nativeCandidates":{"$ref":"#/$defs/NativeCandidates"},"ordinal":{"$ref":"#/$defs/UInt"},"ownerSyntaxId":{"$ref":"#/$defs/SyntaxId"},"provenanceId":{"$ref":"#/$defs/Text"},"range":{"$ref":"#/$defs/Range"},"revisionId":{"$ref":"#/$defs/Text"},"semanticBasis":{"const":null},"staleBecause":{"maxItems":0,"type":"array"},"targetId":{"const":null}},"required":["callId","ownerSyntaxId","ordinal","document","revisionId","range","calleeRange","contentHash","provenanceId","calleeText","calleeTextTruncated","displayKey","nativeCandidates","binding","disposition","targetId","boundaryReason","evidenceTier","semanticBasis","freshness","staleBecause"],"type":"object"},"Coverage":{"additionalProperties":false,"properties":{"diagnostic":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"documentPath":{"$ref":"#/$defs/Path"},"language":{"$ref":"#/$defs/Language"},"observedRoles":{"items":{"$ref":"#/$defs/Role"},"type":"array"},"producerId":{"$ref":"#/$defs/Text"},"requested":{"type":"boolean"},"revisionId":{"$ref":"#/$defs/Text"},"selected":{"type":"boolean"},"sourceSetId":{"$ref":"#/$defs/Text"},"state":{"enum":["notRequested","omitted","unsupported","failed","partial","complete"]},"supportedRoles":{"items":{"$ref":"#/$defs/Role"},"type":"array"}},"required":["producerId","language","sourceSetId","documentPath","revisionId","requested","selected","state","supportedRoles","observedRoles","diagnostic"],"type":"object"},"Declaration":{"additionalProperties":false,"properties":{"ancestors":{"items":{"$ref":"#/$defs/Key"},"type":"array"},"document":{"$ref":"#/$defs/DocumentKey"},"header":{"$ref":"#/$defs/Header"},"key":{"$ref":"#/$defs/Key"},"kind":{"$ref":"#/$defs/Kind"},"lookupKey":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"name":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"nameRange":{"anyOf":[{"$ref":"#/$defs/Range"},{"type":"null"}]},"provenanceId":{"$ref":"#/$defs/Text"},"range":{"$ref":"#/$defs/Range"},"revisionId":{"$ref":"#/$defs/Text"},"syntaxId":{"$ref":"#/$defs/SyntaxId"}},"required":["syntaxId","document","revisionId","kind","name","lookupKey","ancestors","key","range","nameRange","header","provenanceId"],"type":"object"},"DerivedFrom":{"additionalProperties":false,"properties":{"factDigest":{"$ref":"#/$defs/Hash"},"provenanceId":{"$ref":"#/$defs/Text"},"recordKind":{"enum":["occurrence","symbolInformation","relationship"]}},"required":["provenanceId","recordKind","factDigest"],"type":"object"},"DocumentKey":{"additionalProperties":false,"properties":{"language":{"$ref":"#/$defs/Language"},"path":{"$ref":"#/$defs/Path"},"sourceSetId":{"$ref":"#/$defs/Text"}},"required":["sourceSetId","language","path"],"type":"object"},"Evidence":{"additionalProperties":false,"properties":{"evidenceTier":{"const":"syntax"},"freshness":{"const":"fresh"},"semanticBasis":{"const":null},"staleBecause":{"maxItems":0,"type":"array"}},"required":["evidenceTier","semanticBasis","freshness","staleBecause"],"type":"object"},"Failure":{"additionalProperties":false,"properties":{"error":{"additionalProperties":false,"properties":{"code":{"$ref":"#/$defs/FailureCode"},"currentBasis":{"anyOf":[{"$ref":"#/$defs/Basis"},{"type":"null"}]},"currentContentHash":{"anyOf":[{"$ref":"#/$defs/Hash"},{"type":"null"}]},"message":{"$ref":"#/$defs/Text"},"retryable":{"type":"boolean"}},"required":["code","message","retryable","currentBasis","currentContentHash"],"type":"object"},"requestId":{"oneOf":[{"type":"string"},{"maximum":9007199254740991,"minimum":-9007199254740991,"type":"integer"}]},"schemaVersion":{"const":1}},"required":["schemaVersion","requestId","error"],"type":"object"},"FailureCode":{"enum":["invalid_request","range_too_large","unsupported_encoding","revision_conflict","index_not_ready","not_found","too_many_requests","deadline_exceeded","root_changed","store_unavailable"]},"Hash":{"pattern":"^[0-9a-f]{64}$","type":"string"},"Header":{"additionalProperties":false,"properties":{"bases":{"items":{"$ref":"#/$defs/Text"},"type":"array"},"kind":{"$ref":"#/$defs/Kind"},"modifiers":{"items":{"$ref":"#/$defs/Text"},"type":"array"},"name":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"parameters":{"items":{"$ref":"#/$defs/Parameter"},"type":"array"},"resultType":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"typeParameters":{"items":{"$ref":"#/$defs/Text"},"type":"array"}},"required":["kind","name","modifiers","typeParameters","parameters","resultType","bases"],"type":"object"},"Join":{"additionalProperties":false,"properties":{"anchor":{"$ref":"#/$defs/MeasuredAnchor"},"candidateIds":{"items":{"oneOf":[{"$ref":"#/$defs/SyntaxId"},{"$ref":"#/$defs/OccurrenceId"}]},"type":"array"},"diagnostic":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"status":{"enum":["exact","ambiguous","unmatched","unsupported"]}},"required":["anchor","status","candidateIds","diagnostic"],"type":"object"},"Key":{"additionalProperties":false,"properties":{"kind":{"$ref":"#/$defs/Kind"},"name":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"ordinal":{"$ref":"#/$defs/UInt"},"signature":{"anyOf":[{"$ref":"#/$defs/Signature"},{"type":"null"}]}},"required":["kind","name","signature","ordinal"],"type":"object"},"Kind":{"enum":["module","namespace","type","implementation","function","method","constructor","field","variable","parameter","typeParameter","alias","anonymousFunction"]},"Language":{"enum":["java","rust","python","javascript"]},"MeasuredAnchor":{"additionalProperties":false,"properties":{"contentHash":{"$ref":"#/$defs/Hash"},"document":{"$ref":"#/$defs/DocumentKey"},"kind":{"enum":["declarationName","callee","invocation","reference"]},"range":{"$ref":"#/$defs/Range"},"revisionId":{"$ref":"#/$defs/Text"}},"required":["document","revisionId","contentHash","range","kind"],"type":"object"},"NativeCandidate":{"additionalProperties":false,"properties":{"document":{"$ref":"#/$defs/DocumentKey"},"name":{"$ref":"#/$defs/Text"},"provenanceId":{"$ref":"#/$defs/Text"},"range":{"$ref":"#/$defs/Range"},"revisionId":{"$ref":"#/$defs/Text"},"syntaxId":{"$ref":"#/$defs/SyntaxId"}},"required":["syntaxId","name","document","revisionId","range","provenanceId"],"type":"object"},"NativeCandidates":{"additionalProperties":false,"properties":{"complete":{"const":false},"items":{"items":{"$ref":"#/$defs/NativeCandidate"},"maxItems":8,"type":"array"},"omitted":{"anyOf":[{"$ref":"#/$defs/UInt"},{"type":"null"}]}},"required":["items","omitted","complete"],"type":"object"},"OccurrenceId":{"pattern":"^occ:v1:[0-9a-f]{32}$","type":"string"},"Parameter":{"additionalProperties":false,"properties":{"name":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"type":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]},"variadic":{"type":"boolean"}},"required":["name","type","variadic"],"type":"object"},"Path":{"minLength":1,"pattern":"^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\\\u0000])[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*(?![\\s\\S])","type":"string"},"Provenance":{"additionalProperties":false,"allOf":[{"if":{"properties":{"evidenceKind":{"const":"measuredSyntax"}}},"then":{"properties":{"basis":{"const":null},"derivedFrom":{"const":null},"freshness":{"const":"fresh"}}}}],"properties":{"basis":{"anyOf":[{"$ref":"#/$defs/SemanticBasis"},{"type":"null"}]},"contentHash":{"$ref":"#/$defs/Hash"},"derivedFrom":{"anyOf":[{"$ref":"#/$defs/DerivedFrom"},{"type":"null"}]},"document":{"$ref":"#/$defs/DocumentKey"},"evidenceKind":{"enum":["measuredSyntax","declarationBinding","semanticReference","typeRelationship"]},"freshness":{"enum":["fresh","possiblyStale","stale"]},"id":{"$ref":"#/$defs/Text"},"producerId":{"$ref":"#/$defs/Text"},"revisionId":{"$ref":"#/$defs/Text"}},"required":["id","producerId","document","revisionId","contentHash","evidenceKind","basis","freshness","derivedFrom"],"type":"object"},"Range":{"additionalProperties":false,"properties":{"end":{"$ref":"#/$defs/UInt"},"start":{"$ref":"#/$defs/UInt"}},"required":["start","end"],"type":"object"},"Role":{"enum":["definition","read","write","call","type","import","alias"]},"SemanticBasis":{"additionalProperties":false,"properties":{"artifactHash":{"$ref":"#/$defs/Hash"},"configHash":{"$ref":"#/$defs/Hash"},"dependencyHash":{"$ref":"#/$defs/Hash"},"language":{"$ref":"#/$defs/Language"},"lookupDependencies":{"items":{"$ref":"#/$defs/Text"},"type":"array"},"producerHash":{"$ref":"#/$defs/Hash"},"producerId":{"$ref":"#/$defs/Text"},"producerVersion":{"$ref":"#/$defs/Text"},"revisionId":{"$ref":"#/$defs/Text"},"sourceManifestHash":{"$ref":"#/$defs/Hash"},"sourceSetId":{"$ref":"#/$defs/Text"},"toolchainHash":{"$ref":"#/$defs/Hash"}},"required":["producerId","producerVersion","producerHash","artifactHash","language","sourceSetId","revisionId","sourceManifestHash","toolchainHash","configHash","dependencyHash","lookupDependencies"],"type":"object"},"Signature":{"additionalProperties":false,"properties":{"parameterTypes":{"items":{"$ref":"#/$defs/Text"},"type":"array"},"typeParameterCount":{"$ref":"#/$defs/UInt"},"variadic":{"type":"boolean"}},"required":["parameterTypes","typeParameterCount","variadic"],"type":"object"},"SymbolKey":{"additionalProperties":false,"properties":{"document":{"anyOf":[{"$ref":"#/$defs/DocumentKey"},{"type":"null"}]},"scheme":{"const":"scip"},"scope":{"enum":["global","document"]},"symbol":{"$ref":"#/$defs/Text"}},"required":["scheme","symbol","scope","document"],"type":"object"},"SyntaxId":{"pattern":"^sid:v1:[0-9a-f]{32}$","type":"string"},"Target":{"oneOf":[{"additionalProperties":false,"properties":{"document":{"$ref":"#/$defs/DocumentKey"},"kind":{"const":"internal"},"revisionId":{"$ref":"#/$defs/Text"},"syntaxId":{"$ref":"#/$defs/SyntaxId"}},"required":["kind","syntaxId","document","revisionId"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"external"},"symbol":{"$ref":"#/$defs/SymbolKey"}},"required":["kind","symbol"],"type":"object"}]},"Text":{"minLength":1,"type":"string"},"UInt":{"maximum":9007199254740991,"minimum":0,"type":"integer"},"Warning":{"additionalProperties":false,"properties":{"code":{"enum":["coverageIncomplete","staleEvidence","staleTarget","bindingAmbiguous","syntaxOnly"]},"message":{"$ref":"#/$defs/Text"},"provenanceId":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]}},"required":["code","message","provenanceId"],"type":"object"}},"$schema":"https://json-schema.org/draft/2020-12/schema","oneOf":[{"additionalProperties":false,"properties":{"data":{"oneOf":[{"additionalProperties":false,"properties":{"contentHash":{"$ref":"#/$defs/Hash"},"coverage":{"items":{"$ref":"#/$defs/Coverage"},"type":"array"},"declaration":{"$ref":"#/$defs/Declaration"},"displayKey":{"$ref":"#/$defs/Text"},"evidence":{"$ref":"#/$defs/Evidence"},"provenance":{"items":{"$ref":"#/$defs/Provenance"},"type":"array"}},"required":["declaration","displayKey","contentHash","evidence","coverage","provenance"],"type":"object"},{"additionalProperties":false,"properties":{"calls":{"items":{"$ref":"#/$defs/CallItem"},"type":"array"},"coverage":{"items":{"$ref":"#/$defs/Coverage"},"type":"array"},"displayKey":{"$ref":"#/$defs/Text"},"provenance":{"items":{"$ref":"#/$defs/Provenance"},"type":"array"},"symbolId":{"$ref":"#/$defs/SyntaxId"}},"required":["symbolId","displayKey","calls","coverage","provenance"],"type":"object"}]},"evidenceBasis":{"anyOf":[{"$ref":"#/$defs/Basis"},{"type":"null"}]},"partial":{"type":"boolean"},"requestId":{"oneOf":[{"type":"string"},{"maximum":9007199254740991,"minimum":-9007199254740991,"type":"integer"}]},"schemaVersion":{"const":1},"truncated":{"type":"boolean"},"truncationReason":{"anyOf":[{"enum":["response_bytes","limit","callee_text"]},{"type":"null"}]},"warnings":{"items":{"$ref":"#/$defs/Warning"},"type":"array"}},"required":["schemaVersion","requestId","evidenceBasis","data","warnings","partial","truncated","truncationReason"],"type":"object"},{"$ref":"#/$defs/Failure"}]}},{"annotations":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":true},"inputSchema":{"$defs":{"Basis":{"additionalProperties":false,"properties":{"indexGeneration":{"pattern":"^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])","type":"string"},"indexRevision":{"$ref":"#/$defs/UInt"}},"required":["indexGeneration","indexRevision"],"type":"object"},"Hash":{"pattern":"^[0-9a-f]{64}$","type":"string"},"ReadSourcePath":{"minLength":1,"pattern":"^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\:\\u0000])[^/\\\\:\\u0000]+(?:/[^/\\\\:\\u0000]+)*(?![\\s\\S])","type":"string"},"UInt":{"maximum":9007199254740991,"minimum":0,"type":"integer"}},"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"endLine":{"maximum":9007199254740991,"minimum":1,"type":"integer"},"expectedBasis":{"$ref":"#/$defs/Basis"},"expectedContentHash":{"$ref":"#/$defs/Hash"},"path":{"$ref":"#/$defs/ReadSourcePath"},"schemaVersion":{"const":1},"startLine":{"maximum":9007199254740991,"minimum":1,"type":"integer"}},"required":["schemaVersion","path","startLine","endLine"],"type":"object"},"name":"baleyg_read_source","outputSchema":{"$defs":{"Basis":{"additionalProperties":false,"properties":{"indexGeneration":{"pattern":"^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])","type":"string"},"indexRevision":{"$ref":"#/$defs/UInt"}},"required":["indexGeneration","indexRevision"],"type":"object"},"Evidence":{"additionalProperties":false,"properties":{"evidenceTier":{"const":"syntax"},"freshness":{"const":"fresh"},"semanticBasis":{"const":null},"staleBecause":{"maxItems":0,"type":"array"}},"required":["evidenceTier","semanticBasis","freshness","staleBecause"],"type":"object"},"Failure":{"additionalProperties":false,"properties":{"error":{"additionalProperties":false,"properties":{"code":{"$ref":"#/$defs/FailureCode"},"currentBasis":{"anyOf":[{"$ref":"#/$defs/Basis"},{"type":"null"}]},"currentContentHash":{"anyOf":[{"$ref":"#/$defs/Hash"},{"type":"null"}]},"message":{"$ref":"#/$defs/Text"},"retryable":{"type":"boolean"}},"required":["code","message","retryable","currentBasis","currentContentHash"],"type":"object"},"requestId":{"oneOf":[{"type":"string"},{"maximum":9007199254740991,"minimum":-9007199254740991,"type":"integer"}]},"schemaVersion":{"const":1}},"required":["schemaVersion","requestId","error"],"type":"object"},"FailureCode":{"enum":["invalid_request","range_too_large","unsupported_encoding","revision_conflict","index_not_ready","not_found","too_many_requests","deadline_exceeded","root_changed","store_unavailable"]},"Hash":{"pattern":"^[0-9a-f]{64}$","type":"string"},"Path":{"minLength":1,"pattern":"^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\\\u0000])[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*(?![\\s\\S])","type":"string"},"Range":{"additionalProperties":false,"properties":{"end":{"$ref":"#/$defs/UInt"},"start":{"$ref":"#/$defs/UInt"}},"required":["start","end"],"type":"object"},"Text":{"minLength":1,"type":"string"},"UInt":{"maximum":9007199254740991,"minimum":0,"type":"integer"},"Warning":{"additionalProperties":false,"properties":{"code":{"enum":["coverageIncomplete","staleEvidence","staleTarget","bindingAmbiguous","syntaxOnly"]},"message":{"$ref":"#/$defs/Text"},"provenanceId":{"anyOf":[{"$ref":"#/$defs/Text"},{"type":"null"}]}},"required":["code","message","provenanceId"],"type":"object"}},"$schema":"https://json-schema.org/draft/2020-12/schema","oneOf":[{"additionalProperties":false,"properties":{"data":{"additionalProperties":false,"properties":{"byteRange":{"$ref":"#/$defs/Range"},"contentHash":{"$ref":"#/$defs/Hash"},"endLine":{"$ref":"#/$defs/UInt"},"evidence":{"$ref":"#/$defs/Evidence"},"path":{"$ref":"#/$defs/Path"},"startLine":{"$ref":"#/$defs/UInt"},"text":{"type":"string"}},"required":["path","contentHash","startLine","endLine","byteRange","text","evidence"],"type":"object"},"evidenceBasis":{"anyOf":[{"$ref":"#/$defs/Basis"},{"type":"null"}]},"partial":{"type":"boolean"},"requestId":{"oneOf":[{"type":"string"},{"maximum":9007199254740991,"minimum":-9007199254740991,"type":"integer"}]},"schemaVersion":{"const":1},"truncated":{"type":"boolean"},"truncationReason":{"anyOf":[{"enum":["response_bytes","limit","callee_text"]},{"type":"null"}]},"warnings":{"items":{"$ref":"#/$defs/Warning"},"type":"array"}},"required":["schemaVersion","requestId","evidenceBasis","data","warnings","partial","truncated","truncationReason"],"type":"object"},{"$ref":"#/$defs/Failure"}]}}]"###;
+
+pub const NAMES: [&str; 4] = [
+    "baleyg_workspace_describe",
+    "baleyg_find_symbols",
+    "baleyg_inspect",
+    "baleyg_read_source",
+];
+pub fn known(name: &str) -> bool {
+    NAMES.contains(&name)
+}
+pub fn entries() -> Vec<Value> {
+    serde_json::from_str(CATALOG).expect("static catalog must parse")
+}
+pub fn discover(version: &str) -> Value {
+    json!({"resultType":"complete","ttlMs":0,"cacheScope":"private",
+        "supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{}},
+        "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"baleyg","version":version}}})
+}
+pub fn initialize(version: &str) -> Value {
+    json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},
+        "serverInfo":{"name":"baleyg","version":version}})
+}
+pub fn list(modern: bool) -> Value {
+    if modern {
+        json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":entries()})
+    } else {
+        json!({"tools":entries()})
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::wire::{RESPONSE_BYTES, write_response};
+    #[test]
+    fn exact_full_catalog_and_bounds() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/mcp/catalog.json")).unwrap();
+        assert_eq!(entries(), golden.as_array().unwrap().to_vec());
+        assert_eq!(
+            NAMES.map(str::to_owned).to_vec(),
+            entries()
+                .iter()
+                .map(|e| e["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        );
+        for modern in [false, true] {
+            let result = list(modern);
+            assert_eq!(result["tools"], golden);
+            assert_eq!(result.get("resultType").is_some(), modern);
+            for id in [
+                json!("\u{0000}".repeat(42) + "aa"),
+                json!(9007199254740991_i64),
+                json!(-9007199254740991_i64),
+            ] {
+                let mut wire = Vec::new();
+                write_response(&mut wire, &json!({"jsonrpc":"2.0","id":id,"result":result}))
+                    .unwrap();
+                assert!(wire.len() <= RESPONSE_BYTES);
+                assert_eq!(wire.last(), Some(&b'\n'));
+            }
+        }
+        assert_eq!(
+            discover("0.1.0"),
+            json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"baleyg","version":"0.1.0"}}})
+        );
+        assert_eq!(
+            initialize("0.1.0"),
+            json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"baleyg","version":"0.1.0"}})
+        );
+        for value in [discover("0.1.0"), initialize("0.1.0")] {
+            for id in [
+                json!("\u{0000}".repeat(42) + "aa"),
+                json!(9007199254740991_i64),
+                json!(-9007199254740991_i64),
+            ] {
+                let mut wire = Vec::new();
+                write_response(&mut wire, &json!({"jsonrpc":"2.0","id":id,"result":value}))
+                    .unwrap();
+                assert!(wire.len() <= RESPONSE_BYTES);
+            }
+        }
+    }
+    #[test]
+    fn every_reference_closed_and_enums_present() {
+        fn walk(v: &Value, defs: &serde_json::Map<String, Value>) {
+            if let Some(reference) = v.get("$ref").and_then(Value::as_str) {
+                assert!(reference.starts_with("#/$defs/"));
+                assert!(defs.contains_key(&reference[8..]));
+            }
+            if v.get("type").and_then(Value::as_str) == Some("object") {
+                assert_eq!(v["additionalProperties"], false);
+                let properties = v["properties"].as_object().unwrap();
+                let required = v["required"].as_array().unwrap();
+                for field in required {
+                    assert!(properties.contains_key(field.as_str().unwrap()));
+                }
+            }
+            match v {
+                Value::Array(a) => {
+                    for x in a {
+                        walk(x, defs)
+                    }
+                }
+                Value::Object(o) => {
+                    for (k, x) in o {
+                        if k != "$defs" {
+                            walk(x, defs)
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        for e in entries() {
+            for side in ["inputSchema", "outputSchema"] {
+                let s = &e[side];
+                let defs = s["$defs"].as_object().unwrap();
+                walk(s, defs);
+                for definition in defs.values() {
+                    walk(definition, defs);
+                }
+            }
+            let d = &e["outputSchema"]["$defs"];
+            assert_eq!(
+                d["FailureCode"]["enum"],
+                json!([
+                    "invalid_request",
+                    "range_too_large",
+                    "unsupported_encoding",
+                    "revision_conflict",
+                    "index_not_ready",
+                    "not_found",
+                    "too_many_requests",
+                    "deadline_exceeded",
+                    "root_changed",
+                    "store_unavailable"
+                ])
+            );
+            assert_eq!(
+                d["Warning"]["properties"]["code"]["enum"],
+                json!([
+                    "coverageIncomplete",
+                    "staleEvidence",
+                    "staleTarget",
+                    "bindingAmbiguous",
+                    "syntaxOnly"
+                ])
+            );
+            if e["name"] == "baleyg_find_symbols" || e["name"] == "baleyg_inspect" {
+                assert!(
+                    d["Provenance"]["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("derivedFrom"))
+                );
+            }
+        }
+    }
+    #[test]
+    fn advertised_path_and_basis_patterns_match_contract_cases() {
+        // Exercise the catalog's published ECMAScript patterns, not a second Rust
+        // approximation or only an equality check against a copied golden.
+        let catalog = entries();
+        let read = catalog
+            .iter()
+            .find(|e| e["name"] == "baleyg_read_source")
+            .unwrap();
+        assert_eq!(
+            read["inputSchema"]["properties"]["path"],
+            json!({"$ref":"#/$defs/ReadSourcePath"})
+        );
+        assert_eq!(
+            read["outputSchema"]["oneOf"][0]["properties"]["data"]["properties"]["path"],
+            json!({"$ref":"#/$defs/Path"})
+        );
+        let mut inputs = Vec::new();
+        let paths = json!([
+            "src/a:b.rs", // #22 native paths permit colon; read_source input does not.
+            "src/a.rs",
+            "src/",
+            "src//a",
+            "./a",
+            "src/../a",
+            "/a",
+            "src/a\\b",
+            "src/a\u{0000}b",
+            "src\n/../a",
+            "src\n/./a",
+            "a\r/../b",
+            "a\u{2028}/../b",
+            "src/a\n/b.rs",
+            "src/é\u{2028}/😀.rs",
+            "src/.\n",
+            "src/..\r",
+            "src/a.rs/\n/../b", // Forbidden segment need not follow the first terminator.
+            "src/a.rs\n"        // Newline in an ordinary filename is permitted.
+        ]);
+        let native_expected = json!([
+            true, true, false, false, false, false, false, false, false, false, false, false,
+            false, true, true, true, true, false, true
+        ]);
+        let read_expected = json!([
+            false, true, false, false, false, false, false, false, false, false, false, false,
+            false, true, true, true, true, false, true
+        ]);
+        for tool in &catalog {
+            for side in ["inputSchema", "outputSchema"] {
+                let defs = &tool[side]["$defs"];
+                for (definition, expected) in [
+                    ("Path", &native_expected),
+                    ("ReadSourcePath", &read_expected),
+                ] {
+                    if let Some(pattern) = defs[definition]["pattern"].as_str() {
+                        inputs.push(json!({"pattern":pattern,"values":paths,"expected":expected,
+                            "where":format!("{} {side} {definition}",tool["name"])}));
+                    }
+                }
+                if let Some(pattern) =
+                    defs["Basis"]["properties"]["indexGeneration"]["pattern"].as_str()
+                {
+                    inputs.push(json!({"pattern":pattern,"values":[
+                        "00000000-0000-0000-0000-000000000000",
+                        "123e4567-e89b-42d3-a456-426614174000",
+                        "123E4567-e89b-42d3-a456-426614174000",
+                        "123e4567-e89b-42d3-a456-42661417400g",
+                        "123e4567-e89b-42d3-a456-426614174000\n"],
+                        "expected":[false,true,false,false,false],
+                        "where":format!("{} {side} Basis",tool["name"])}));
+                }
+            }
+        }
+        assert_eq!(inputs.len(), 11); // Three native output Paths, one stricter input Path, seven Basis definitions.
+        let script = r#"const rows=JSON.parse(process.argv[1]);
+          process.stdout.write(JSON.stringify(rows.map(row=>row.values.map(value=>new RegExp(row.pattern).test(value)))));"#;
+        let output = std::process::Command::new("node")
+            .args(["-e", script, &serde_json::to_string(&inputs).unwrap()])
+            .output()
+            .expect("Node is required by tools/verify");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+        for (row, result) in inputs.iter().zip(actual.as_array().unwrap()) {
+            assert_eq!(&row["expected"], result, "{}", row["where"]);
+        }
+    }
+}
