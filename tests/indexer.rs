@@ -99,7 +99,7 @@ fn discovery_ignores_secrets_builds_and_symlinks() {
     }
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(p.join("keep.js"), p.join("linked.js")).unwrap();
+        std::os::unix::fs::symlink(p.join("keep.js"), p.join("linked.txt")).unwrap();
         std::os::unix::fs::symlink(p, p.join("linked-dir")).unwrap();
     }
     let g = run(&IndexOptions::new(p.to_owned()));
@@ -230,9 +230,12 @@ fn cancellation_and_size_limits() {
         .is_err()
     );
     o.max_file_bytes = 2;
-    let g = run(&o);
-    assert!(g.files.is_empty());
-    assert!(g.diagnostics.iter().any(|d| d.code == "source-skipped"));
+    assert!(
+        index_workspace(&o, &cancel(), |_| {})
+            .unwrap_err()
+            .to_string()
+            .contains("oversized input")
+    );
 }
 #[test]
 fn checked_local_scip_regression_when_present() {
@@ -370,14 +373,11 @@ fn direct_symlink_artifacts_and_config_are_never_read() {
     let (_d, mut o) = semantic_fixture();
     let p = &o.workspace_root;
     std::os::unix::fs::symlink(p.join("main.js"), p.join("package.json")).unwrap();
-    let g = run(&o);
-    assert_eq!(g.stats.semantic_state, SemanticState::Stale);
-    assert!(g.diagnostics.iter().any(|d| d.code == "config-skipped"));
+    assert!(index_workspace(&o, &cancel(), |_| {}).is_err());
+    fs::remove_file(p.join("package.json")).unwrap();
     std::os::unix::fs::symlink(p.join("index.scip"), p.join("linked.scip")).unwrap();
     o.scip_path = Some(p.join("linked.scip"));
-    let g = run(&o);
-    assert_eq!(g.stats.semantic_state, SemanticState::Unavailable);
-    assert!(g.diagnostics.iter().any(|d| d.code == "scip-unavailable"));
+    assert!(index_workspace(&o, &cancel(), |_| {}).is_err());
 }
 
 #[test]
@@ -408,6 +408,14 @@ fn java_python_discovery_respects_ignored_environments_and_source_symlinks() {
         std::os::unix::fs::symlink(p.join("example.py"), p.join("link.py")).unwrap();
         std::os::unix::fs::symlink(p.join("Example.java"), p.join("Link.java")).unwrap();
     }
+    assert!(
+        index_workspace(&IndexOptions::new(p.to_owned()), &cancel(), |_| {})
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe source")
+    );
+    fs::remove_file(p.join("link.py")).unwrap();
+    fs::remove_file(p.join("Link.java")).unwrap();
     let g = run(&IndexOptions::new(p.to_owned()));
     assert_eq!(
         g.files
@@ -536,4 +544,107 @@ fn conventional_java_source_packages_are_not_confused_with_build_outputs() {
             "src/test/java/com/example/target/TargetTest.java",
         ]
     );
+}
+
+#[test]
+fn capture_rejects_cutoff_source_and_directory_inventory_drift() {
+    for scenario in [
+        "write",
+        "add",
+        "delete",
+        "rename",
+        "add-dir",
+        "delete-dir",
+        "config",
+        "ignore",
+        "same-size-mtime",
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write(root, "main.js", "f();");
+        fs::create_dir(root.join("visited")).unwrap();
+        write(root, "visited/other.py", "pass\n");
+        let err = index_workspace(&IndexOptions::new(root.to_owned()), &cancel(), |p| {
+            if p.phase != "parse" || p.completed != 1 {
+                return;
+            }
+            match scenario {
+                "write" => write(root, "main.js", "g();"),
+                "add" => write(root, "new.py", "pass"),
+                "delete" => fs::remove_file(root.join("main.js")).unwrap(),
+                "rename" => fs::rename(root.join("main.js"), root.join("renamed.js")).unwrap(),
+                "add-dir" => fs::create_dir(root.join("another")).unwrap(),
+                "delete-dir" => {
+                    fs::remove_file(root.join("visited/other.py")).unwrap();
+                    fs::remove_dir(root.join("visited")).unwrap();
+                }
+                "config" => write(root, "package.json", "{}"),
+                "ignore" => write(root, "visited/.ignore", "*.js\n"),
+                "same-size-mtime" => {
+                    use std::os::unix::fs::MetadataExt;
+                    let path = root.join("main.js");
+                    let before = fs::metadata(&path).unwrap();
+                    write(root, "main.js", "g();");
+                    let times = [
+                        libc::timespec {
+                            tv_sec: before.atime(),
+                            tv_nsec: before.atime_nsec(),
+                        },
+                        libc::timespec {
+                            tv_sec: before.mtime(),
+                            tv_nsec: before.mtime_nsec(),
+                        },
+                    ];
+                    use std::os::unix::ffi::OsStrExt;
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(
+                        unsafe {
+                            libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0)
+                        },
+                        0
+                    );
+                    assert_eq!(fs::metadata(path).unwrap().mtime(), before.mtime());
+                }
+                _ => unreachable!(),
+            }
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("drift"), "{scenario}: {err:#}");
+    }
+}
+
+#[test]
+fn capture_rejects_absent_present_and_cancellation_but_accepts_empty_root() {
+    let d = tempfile::tempdir().unwrap();
+    let empty = run(&IndexOptions::new(d.path().to_owned()));
+    assert!(empty.files.is_empty());
+    for initially_present in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write(root, "main.js", "f();");
+        if initially_present {
+            write(root, "Cargo.toml", "[package]\n");
+        }
+        let error = index_workspace(&IndexOptions::new(root.to_owned()), &cancel(), |p| {
+            if p.phase == "parse" {
+                if initially_present {
+                    fs::remove_file(root.join("Cargo.toml")).unwrap();
+                } else {
+                    write(root, "Cargo.toml", "[package]\n");
+                }
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("drift"), "{error:#}");
+    }
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "main.js", "f();");
+    let flag = cancel();
+    let error = index_workspace(&IndexOptions::new(d.path().to_owned()), &flag, |p| {
+        if p.phase == "parse" {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
 }

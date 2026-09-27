@@ -149,3 +149,40 @@ fn preexisting_corrupt_index_is_not_reinitialized() {
     );
     assert_eq!(fs::metadata(index).unwrap().len(), 0);
 }
+
+#[test]
+fn failed_capture_leaves_existing_index_revision_unchanged() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace},
+        model::CancelFlag,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let (state, workspace) = fixture();
+    fs::write(workspace.path().join("main.js"), "f();").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let before = store.status().unwrap().revision;
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let error = index_workspace(
+        &IndexOptions::new(workspace.path().to_owned()),
+        &cancel,
+        |progress| {
+            if progress.phase == "parse" {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(store.status().unwrap().revision, before);
+    assert_eq!(
+        Store::open_for_tests(state.path(), workspace.path())
+            .unwrap()
+            .status()
+            .unwrap()
+            .revision,
+        before
+    );
+}

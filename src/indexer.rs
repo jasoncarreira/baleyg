@@ -27,11 +27,10 @@
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
 use protobuf::Message;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::atomic::Ordering,
 };
 use tree_sitter::Node;
@@ -57,9 +56,6 @@ fn check(cancel: &CancelFlag) -> Result<()> {
     ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
     Ok(())
 }
-fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
 fn diag(g: &mut Graph, path: Option<String>, code: &str, message: impl Into<String>) {
     g.diagnostics.push(Diagnostic {
         path,
@@ -67,204 +63,38 @@ fn diag(g: &mut Graph, path: Option<String>, code: &str, message: impl Into<Stri
         message: message.into(),
     });
 }
-// Discovery never follows directory symlinks; reads also reject file symlinks.
-fn safe_read(path: &Path, cap: u64) -> Result<Vec<u8>> {
-    let meta = fs::symlink_metadata(path)?;
-    ensure!(
-        meta.is_file() && meta.len() <= cap,
-        "not a regular file or exceeds byte limit: {}",
-        path.display()
-    );
-    use std::io::Read;
-    let mut open = fs::OpenOptions::new();
-    open.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Do not follow a final-component symlink inserted after metadata inspection.
-        // NONBLOCK also prevents a concurrent replacement with a FIFO from hanging.
-        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = open.open(path)?;
-    let opened = file.metadata()?;
-    ensure!(
-        opened.is_file() && opened.len() <= cap,
-        "opened input is not a regular file or exceeds byte limit: {}",
-        path.display()
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        ensure!(
-            meta.dev() == opened.dev() && meta.ino() == opened.ino(),
-            "input changed during open: {}",
-            path.display()
-        );
-    }
-    let mut bytes = Vec::new();
-    file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= cap, "file grew beyond byte limit");
-    Ok(bytes)
-}
 pub fn index_workspace(
     options: &IndexOptions,
     cancel: &CancelFlag,
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<Graph> {
-    check(cancel)?;
-    ensure!(
-        options.workspace_root.is_dir(),
-        "workspace root is not a directory"
-    );
-    ensure!(
-        !fs::symlink_metadata(&options.workspace_root)?
-            .file_type()
-            .is_symlink(),
-        "workspace root is a symlink"
-    );
-    let workspace_root = fs::canonicalize(&options.workspace_root)?;
-    let mut g = Graph::default();
-    let mut paths = Vec::new();
-    let mut walk = ignore::WalkBuilder::new(&workspace_root);
-    let filter_root = workspace_root.clone();
-    walk.require_git(false)
-        .follow_links(false)
-        .hidden(true)
-        .filter_entry(move |e| {
-            if e.depth() == 0 {
-                return true;
-            }
-            match e.file_name().to_str() {
-                Some(".git" | "node_modules" | ".venv" | ".baleyg") => false,
-                Some("target" | "dist" | "build") => {
-                    // These are legal Java package names inside conventional source
-                    // trees, not build-output roots. Earlier artifact ancestors and
-                    // .gitignore rules still exclude generated/dependency trees.
-                    e.path()
-                        .strip_prefix(&filter_root)
-                        .ok()
-                        .is_some_and(|relative| {
-                            let parts: Vec<_> = relative.components().collect();
-                            parts.windows(3).any(|p| {
-                                p[0].as_os_str() == "src"
-                                    && matches!(
-                                        p[1].as_os_str().to_str(),
-                                        Some("main" | "test" | "testFixtures")
-                                    )
-                                    && p[2].as_os_str() == "java"
-                            })
-                        })
-                }
-                _ => true,
-            }
-        });
-    for entry in walk.build() {
-        check(cancel)?;
-        match entry {
-            Ok(e)
-                if e.file_type().is_some_and(|t| t.is_file())
-                    && matches!(
-                        e.path().extension().and_then(|x| x.to_str()),
-                        Some("js" | "mjs" | "cjs" | "rs" | "java" | "py")
-                    ) =>
-            {
-                paths.push(e.into_path())
-            }
-            Err(e) => diag(&mut g, None, "scan-error", e.to_string()),
-            _ => {}
-        }
-        ensure!(
-            paths.len() <= 100_000,
-            "workspace exceeds 100000 source files"
-        );
-    }
-    paths.sort();
-    let total = paths.len();
-    let mut bytes_total = 0usize;
-    let mut hashes = BTreeMap::new();
-    for (i, path) in paths.into_iter().enumerate() {
-        check(cancel)?;
-        let rel = path
-            .strip_prefix(&workspace_root)?
-            .to_str()
-            .context("non-UTF8 source path")?
-            .replace('\\', "/");
-        match safe_read(&path, options.max_file_bytes.min(256 * 1024 * 1024))
-            .and_then(|b| Ok((digest(&b), String::from_utf8(b)?)))
-        {
-            Ok((hash, text)) => {
-                bytes_total += text.len();
-                ensure!(
-                    bytes_total <= 256 * 1024 * 1024,
-                    "workspace source exceeds 256 MiB"
-                );
-                hashes.insert(rel.clone(), hash.clone());
-                g.files.push(SourceFile {
-                    path: rel,
-                    hash,
-                    language: match path.extension().and_then(|ext| ext.to_str()) {
-                        Some("rs") => "rust",
-                        Some("java") => "java",
-                        Some("py") => "python",
-                        _ => "javascript",
-                    }
-                    .into(),
-                    text,
-                });
-            }
-            Err(e) => diag(&mut g, Some(rel), "source-skipped", e.to_string()),
-        }
-        progress(IndexProgress {
-            phase: "scan".into(),
-            completed: i + 1,
-            total,
-        });
-    }
-    for config in [
-        "package.json",
-        "tsconfig.json",
-        "jsconfig.json",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "bun.lock",
-        "bun.lockb",
-        "Cargo.toml",
-        "Cargo.lock",
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "gradle.properties",
-        "pyproject.toml",
-        "requirements.txt",
-        "uv.lock",
-        "poetry.lock",
-        "Pipfile",
-        "Pipfile.lock",
-    ] {
-        let p = workspace_root.join(config);
-        if fs::symlink_metadata(&p).is_ok() {
-            match safe_read(&p, options.max_file_bytes.min(16 * 1024 * 1024)) {
-                Ok(b) => {
-                    hashes.insert(config.into(), digest(&b));
-                }
-                Err(e) => diag(&mut g, Some(config.into()), "config-skipped", e.to_string()),
-            }
+    let capture = crate::capture::Capture::admit(options, cancel, &progress)?;
+    let workspace_root = std::fs::canonicalize(&options.workspace_root)?;
+    let mut g = Graph {
+        files: capture.files.clone(),
+        ..Graph::default()
+    };
+    let mut hashes = capture.hashes.clone();
+    for name in &crate::capture::ROOT_INPUTS[..22] {
+        if let Some(bytes) = capture.bytes(&workspace_root.join(name)) {
+            hashes.insert((*name).into(), hex::encode(sha2::Sha256::digest(bytes)));
         }
     }
     check(cancel)?;
     let mut documents = BTreeMap::new();
     let mut semantic = SemanticState::Unavailable;
     if let Some(path) = &options.scip_path {
-        match safe_read(path, 256 * 1024 * 1024)
-            .and_then(|b| Ok(scip::types::Index::parse_from_bytes(&b)?))
+        match capture
+            .bytes(path)
+            .context("SCIP input unavailable")
+            .and_then(|b| Ok(scip::types::Index::parse_from_bytes(b)?))
         {
             Ok(index) => {
                 if let Some(manifest) = &options.manifest_path {
-                    match safe_read(manifest, 16 * 1024 * 1024)
-                        .and_then(|b| Ok(serde_json::from_slice::<BTreeMap<String, String>>(&b)?))
+                    match capture
+                        .bytes(manifest)
+                        .context("manifest input unavailable")
+                        .and_then(|b| Ok(serde_json::from_slice::<BTreeMap<String, String>>(b)?))
                     {
                         Ok(prior) => {
                             let keys: BTreeSet<_> =
@@ -424,13 +254,13 @@ pub fn index_workspace(
     }
     g.diagnostics
         .sort_by(|a, b| (&a.path, &a.code, &a.message).cmp(&(&b.path, &b.code, &b.message)));
-    check(cancel)?;
+    capture.verify(cancel)?;
     progress(IndexProgress {
         phase: "complete".into(),
         completed: g.files.len(),
         total: g.files.len(),
     });
-    check(cancel)?;
+    capture.verify(cancel)?;
     Ok(g)
 }
 fn range(n: Node<'_>) -> SourceRange {
