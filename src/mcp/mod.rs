@@ -1,5 +1,7 @@
-//! Pure MCP protocol core. The stdio entry point and tool catalog are later slices.
+//! MCP protocol core and closed read-only tool contract. The stdio entry point is a later slice.
+pub mod catalog;
 pub mod session;
+pub mod tools;
 pub mod wire;
 
 use crate::store::topology::WorkspaceIdentity;
