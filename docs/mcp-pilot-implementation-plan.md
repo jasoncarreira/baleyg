@@ -18,12 +18,16 @@ identifiers. Each was checked against the working tree rather than assumed.
 
 ## Scope
 
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
 Phase 1 of the [agent integration plan](agent-integration-plan.md): four read-only MCP tools against
 one already-running, already-indexed daemon, behind owner-issued scoped grants. Snapshot text search,
 diagram artifacts, the Mimir provider profile, Herdr discovery, the project registry and embedded
 terminals are separate later contracts and appear in no slice below.
 
 ## Module layout
+
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
 New code lives under `src/mcp/`, keeping the contract's separations visible in the tree:
 
@@ -39,6 +43,8 @@ Keeping enrollment separate from `store::Store` is deliberate. The contract requ
 `Store` does not provide, and the two must not become confusable at a call site.
 
 ## Why pilot reads cannot call existing `Store` entry points
+
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
 Verified in the working tree:
 
@@ -64,6 +70,8 @@ the SQL should not.
 
 ### Slice 0 — storage and cancellation spike (throwaway)
 
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
 Answer the questions the contract marks "qualify this" before any product code exists. Disposable
 fixture databases only.
 
@@ -88,6 +96,8 @@ Available without new dependencies: rusqlite 0.40.2 re-exports `libsqlite3_sys a
 
 ### Slice 1 — enrollment and identity service
 
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
 **Deliverable:** `src/mcp/enrollment.rs`. Retained no-follow directory and file FDs, recorded
 device/inode identities, one persistent read-only connection, identity checks before and after
 connection setup and around every read, the in-memory generation epoch, and the lifetime
@@ -98,6 +108,8 @@ post-interrupt recovery policy decided in slice 0.
 **Not in this slice:** HTTP, grants, tools.
 
 ### Slice 2 — grant model, budgets and owner control routes
+
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
 **Deliverable:** digest-only in-memory grant table, monotonic TTL, capability set, `sourceApproved`,
 server ceilings, budget reservation and atomic settlement, expiry/revocation checks and
@@ -113,6 +125,8 @@ would turn a destroyed cache into a friendly `no_published_index` instead of an 
 
 ### Slice 3 — principal split and default-deny dispatch
 
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
 **Deliverable:** the guard at `src/http.rs:424` grows distinct owner and limited-grant principals
 with default-deny dispatch. A limited grant is rejected on every pre-existing route in the table at
 `src/http.rs:488` — status, source, query, index, jobs, views, annotations, question and provider
@@ -126,6 +140,8 @@ rather than a sampled subset. Preserve the existing single-`Host`, single-`Origi
 
 ### Slice 4 — `baleyg_workspace_describe` end to end
 
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
 **Deliverable:** the first real vertical over HTTP, exercised with a plain client: enrolled
 connection, real grant, real principal check, budget consumption and final-response admission, one
 tool. Proves the three preceding layers compose.
@@ -137,6 +153,8 @@ owner bearer and hiding tools is not this design" — so there is no shortcut wo
 **Not in this slice:** MCP framing.
 
 ### Slice 5 — the three evidence tools
+
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
 **Deliverable:** `baleyg_find_symbols`, `baleyg_inspect`, `baleyg_read_source` as SQL patterns on
 the enrolled connection with mandatory `expectedRevision` equality against both the admitted
@@ -157,6 +175,8 @@ no incoming hierarchy to expose.
 
 ### Slice 6 — stdio MCP adapter
 
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
 **Deliverable:** `baleyg mcp --binding-file`, added beside the existing `index`/`serve`/`status`/
 `symbols`/`query`/`export` subcommands (`src/main.rs:32`). Protocol-only stdout with diagnostics on
 stderr, `tools/list` filtered to granted capabilities, structured errors returned as `isError`,
@@ -166,6 +186,8 @@ cancellation that suppresses late responses, EOF teardown, and the consumed-gran
 **Gates:** acceptance tests 2 (peer catalog) and 10 (lifecycle).
 
 ### Slice 7 — owner helper and handoff hygiene
+
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
 **Deliverable:** `baleyg mcp-grant issue`. Operator-controlled 0700 directory with symlink-free
 resolution, refusal when a configured path lies inside an agent-readable root, exclusive no-follow
@@ -177,6 +199,8 @@ case in test 3.
 
 ### Slice 8 — adversarial sweep
 
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
+
 **Deliverable:** all ten acceptance groups run as a suite rather than as leftovers — fake clock, a
 second fixture daemon with colliding symbol IDs and revision numbers, an injected inconsistent grant
 policy proving the backend checks source approval independently of issuance, concurrent calls racing
@@ -185,6 +209,8 @@ the lifetime and concurrency ceilings, and a swap injected between path checking
 Ship only after these pass.
 
 ## Sequencing
+
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
 Slice 0 blocks slice 1; slice 1 blocks everything after it. Slices 1 and 2 can proceed alongside
 slice 3, which touches a different file and shares only a principal type. Slices 6 and 7 pair
@@ -195,6 +221,8 @@ Expect surprises in slice 0 (unknown until run), slice 3 (the existing guard is 
 slice 6 (per-client launcher and restart behavior varies more than a specification can anticipate).
 
 ## Open questions for slice 0
+
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
 1. **Post-interrupt connection reusability.** The contract forbids lazily replacing a connection or
    rebinding after an error. If an interrupted read leaves the enrolled connection unusable, the
@@ -208,6 +236,8 @@ slice 6 (per-client launcher and restart behavior varies more than a specificati
    platforms, and what an unsupported or erroring result must map to.
 
 ## Authorization boundary
+
+> **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
 The first implementation authorization covers **slice 0 only**: disposable fixture databases, no
 inspected repositories, no provider calls, no changes to a running daemon, no credential access. Its
