@@ -1,0 +1,40 @@
+{
+  "modernMeta": {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {}
+  },
+  "legacyInitialize": {
+    "protocolVersion": "2025-11-25",
+    "capabilities": {},
+    "clientInfo": {
+      "name": "fixture-client",
+      "version": "1"
+    }
+  },
+  "names": [
+    "baleyg_workspace_describe",
+    "baleyg_find_symbols",
+    "baleyg_inspect",
+    "baleyg_read_source"
+  ],
+  "validArguments": [
+    {
+      "schemaVersion": 1
+    },
+    {
+      "schemaVersion": 1,
+      "query": "symbol"
+    },
+    {
+      "schemaVersion": 1,
+      "symbolId": "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "view": "declaration"
+    },
+    {
+      "schemaVersion": 1,
+      "path": "src/main.rs",
+      "startLine": 1,
+      "endLine": 1
+    }
+  ]
+}

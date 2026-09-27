@@ -1,4 +1,4 @@
-//! MCP protocol core and closed read-only tool contract. The stdio entry point is a later slice.
+//! Bounded read-only MCP protocol and single-connection stdio transport.
 pub mod catalog;
 pub mod session;
 pub mod tools;
@@ -78,5 +78,168 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
         assert_eq!(context.check(), Err(IdentityError::StoreUnavailable));
         assert!(!marker.exists());
+    }
+}
+
+/// Run the line-framed transport. The reader owns stdin; this coordinator alone owns stdout.
+/// Input already waiting in the bounded channel is applied before any queued outcome commits.
+pub fn run_stdio(workspace: OpenedWorkspace) -> std::io::Result<()> {
+    use std::collections::VecDeque;
+    use std::io::{self, BufReader};
+    use std::sync::mpsc::{self, TryRecvError};
+    let (sender, receiver) = mpsc::sync_channel::<wire::Frame>(16);
+    std::thread::Builder::new()
+        .name("mcp-stdin".into())
+        .spawn(move || {
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            loop {
+                match wire::read_frame(&mut reader) {
+                    Ok(wire::Frame::Eof) => {
+                        let _ = sender.send(wire::Frame::Eof);
+                        break;
+                    }
+                    Ok(frame) => {
+                        if sender.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("MCP stdin read failed: {error}");
+                        let _ = sender.send(wire::Frame::Eof);
+                        break;
+                    }
+                }
+            }
+        })?;
+    let mut session = session::Session::new();
+    let mut outcomes = VecDeque::new();
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    loop {
+        // A blocked coordinator waits for one input event. Once there is pending work,
+        // observe all input currently waiting before committing even the first result.
+        if outcomes.is_empty() {
+            let Ok(frame) = receiver.recv() else {
+                session.eof();
+                break;
+            };
+            if receive(frame, &mut session, &mut outcomes) {
+                break;
+            }
+        }
+        loop {
+            match receiver.try_recv() {
+                Ok(frame) => {
+                    if receive(frame, &mut session, &mut outcomes) {
+                        return Ok(());
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    session.eof();
+                    return Ok(());
+                }
+            }
+        }
+        let Some(outcome) = outcomes.pop_front() else {
+            continue;
+        };
+        match outcome {
+            impl_receive::Outcome::Error(error) => {
+                wire::write_response(&mut writer, &error.response())?
+            }
+            impl_receive::Outcome::Request(admission) => {
+                // Cancellation may have invalidated the token while its outcome waited.
+                if session.pending(admission.token).is_none() {
+                    continue;
+                }
+                let modern = session.mode() == session::Mode::Modern;
+                let mut prepared_tool = None;
+                let result = match &admission.action {
+                    session::Action::Discover => catalog::discover(workspace.build_version()),
+                    session::Action::Initialize => catalog::initialize(workspace.build_version()),
+                    session::Action::List => catalog::list(modern),
+                    session::Action::Call { name, arguments } => {
+                        let tool = tools::prepare(
+                            name,
+                            arguments.as_ref(),
+                            &admission.id,
+                            modern,
+                            &workspace,
+                        );
+                        let result = tool.response.clone();
+                        prepared_tool = Some(tool);
+                        result
+                    }
+                    session::Action::Unknown => {
+                        wire::ProtocolError::new(-32601, admission.id.clone()).response()
+                    }
+                };
+                let response = if matches!(admission.action, session::Action::Unknown) {
+                    result
+                } else {
+                    serde_json::json!({"jsonrpc":"2.0","id":admission.id,"result":result})
+                };
+                let Some(mut prepared) = session.prepare(admission.token, response) else {
+                    continue;
+                };
+                // A final nonblocking input pass takes precedence over the unsent result.
+                loop {
+                    match receiver.try_recv() {
+                        Ok(frame) => {
+                            if receive(frame, &mut session, &mut outcomes) {
+                                return Ok(());
+                            }
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            session.eof();
+                            return Ok(());
+                        }
+                    }
+                }
+                if let Some(mut tool) = prepared_tool {
+                    tools::final_check(&mut tool, &workspace);
+                    prepared.response["result"] = tool.response;
+                }
+                if let Some(value) = session.commit(prepared) {
+                    wire::write_response(&mut writer, &value)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn receive(
+    frame: wire::Frame,
+    session: &mut session::Session,
+    outcomes: &mut std::collections::VecDeque<impl_receive::Outcome>,
+) -> bool {
+    if frame == wire::Frame::Eof {
+        session.eof();
+        return true;
+    }
+    match wire::decode(frame) {
+        Err(error) => outcomes.push_back(impl_receive::Outcome::Error(error)),
+        Ok(None) => {
+            session.eof();
+            return true;
+        }
+        Ok(Some(request)) => match session.accept(request, catalog::known) {
+            session::Event::Error(error) => outcomes.push_back(impl_receive::Outcome::Error(error)),
+            session::Event::Admitted(admission) => {
+                outcomes.push_back(impl_receive::Outcome::Request(admission))
+            }
+            session::Event::Ignore => (),
+        },
+    }
+    false
+}
+mod impl_receive {
+    pub(super) enum Outcome {
+        Error(super::wire::ProtocolError),
+        Request(super::session::Admission),
     }
 }
