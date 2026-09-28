@@ -4795,7 +4795,9 @@ mod sqlite_schema_race_tests {
             fs::read(&path).unwrap(),
             after_external.into_inner().unwrap()
         );
-        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(store.index_baseline().unwrap(), pin);
+        let closed = store.status().unwrap_err();
+        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
     }
 
     #[test]

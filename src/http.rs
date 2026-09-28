@@ -2196,15 +2196,10 @@ mod live_tests {
                 |_| {},
             )
             .unwrap();
+            let expected = store.status().unwrap().revision;
+            let leader = store.leader().unwrap();
             store
-                .publish_native(
-                    &updated,
-                    &captured,
-                    &native,
-                    &store.leader().unwrap(),
-                    store.status().unwrap().revision,
-                    &cancel,
-                )
+                .publish_native(&updated, &captured, &native, &leader, expected, &cancel)
                 .unwrap();
         }
         release.notify_one();

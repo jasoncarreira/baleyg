@@ -156,6 +156,8 @@ mod tests {
         assert!(error.to_string().contains("cancelled"), "{error:#}");
         let (files, ops) = cancelled.expect("capture observed before cancel");
         assert_eq!(ops, expected(&files));
-        assert_eq!(store.status().unwrap().revision, first);
+        assert_eq!(store.index_baseline().unwrap(), first);
+        let closed = store.status().unwrap_err();
+        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
     }
 }
