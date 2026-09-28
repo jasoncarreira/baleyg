@@ -2480,9 +2480,9 @@ async fn saved_items_real_index_matrix() {
     let original_note_payload = stored_payload(&record_db, "annotations", "real-note");
     let original_view_anchor = raw_anchor(&original_view_payload).unwrap();
     let original_note_anchor = raw_anchor(&original_note_payload).unwrap();
-    for (payload, anchor, target) in [
-        (&original_view_payload, &original_view_anchor, &seed),
-        (&original_note_payload, &original_note_anchor, &seed),
+    for (payload, target) in [
+        (&original_view_payload, &seed),
+        (&original_note_payload, &seed),
     ] {
         let value: Value = serde_json::from_str(payload).unwrap();
         let fields = value["anchor"].as_object().unwrap();

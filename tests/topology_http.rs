@@ -103,6 +103,10 @@ async fn durable_crud_matrix() {
     )
     .unwrap();
     let view = json!({"id":"view","title":"Keep","query":{"seed":seed},"pins":{},"hidden":[]});
+    let canonical = serde_json::to_value(
+        serde_json::from_value::<baleyg::model::SavedView>(view.clone()).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         call(&app, "PUT", "/api/views/view", view.clone()).await.0,
         400
@@ -111,7 +115,7 @@ async fn durable_crud_matrix() {
     assert_eq!(status, 200, "{saved}");
     assert_eq!(saved["view"]["id"], "view");
     assert_eq!(saved["view"]["title"], "Keep");
-    assert_eq!(saved["view"]["query"], view["query"]);
+    assert_eq!(saved["view"]["query"], canonical["query"]);
     assert_eq!(saved["view"]["anchor"]["syntaxId"], seed);
     assert_eq!(saved["indexGeneration"], pin.index_generation.to_string());
     assert_eq!(saved["indexRevision"], pin.index_revision);
