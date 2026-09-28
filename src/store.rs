@@ -4700,9 +4700,7 @@ mod sqlite_schema_race_tests {
         assert!(clone.status().is_err());
         let separately_opened = Store::open_for_tests(state.path(), work.path()).unwrap();
         assert_eq!(separately_opened.index_baseline().unwrap(), pin);
-        assert!(
-            !separately_opened.recovery_required.load(Ordering::Acquire)
-        );
+        assert!(!separately_opened.recovery_required.load(Ordering::Acquire));
     }
 
     #[test]

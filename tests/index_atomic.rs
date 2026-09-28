@@ -247,6 +247,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
+    use sha2::{Digest, Sha256};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -269,6 +270,37 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     let (old_pin, old_file) = store.source_at("main.js", Some(first)).unwrap().unwrap();
     assert_eq!(old_pin, first);
     let original = old_file.text;
+    let original_hash = hex::encode(Sha256::digest(original.as_bytes()));
+    let assert_public_closed = || {
+        let status_error = store.status().unwrap_err();
+        assert!(
+            status_error.to_string().contains("index_not_ready"),
+            "{status_error:#}"
+        );
+        let source_error = store.source_at("main.js", Some(first)).unwrap_err();
+        assert!(
+            source_error.to_string().contains("index_not_ready"),
+            "{source_error:#}"
+        );
+    };
+    let index = index_dir(state.path()).join("index.db");
+    let persisted_source = || {
+        let db = rusqlite::Connection::open(&index).unwrap();
+        let (payload, native_bytes, native_hash): (String, Vec<u8>, String) = db
+            .query_row(
+                "SELECT f.payload,d.source_bytes,d.content_hash FROM files f JOIN native_documents d ON d.path=f.path WHERE f.path='main.js'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        (
+            serde_json::from_str::<baleyg::model::SourceFile>(&payload)
+                .unwrap()
+                .text,
+            native_bytes,
+            native_hash,
+        )
+    };
     let cancelled = IndexJobCoordinator::prepare(&store, Some(first)).unwrap();
     cancel.store(true, Ordering::Release);
     assert!(
@@ -279,7 +311,16 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
             .contains("cancelled")
     );
     cancel.store(false, Ordering::Release);
-    assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(store.index_baseline().unwrap(), first);
+    assert_public_closed();
+    assert_eq!(
+        persisted_source(),
+        (
+            original.clone(),
+            original.as_bytes().to_vec(),
+            original_hash.clone()
+        )
+    );
 
     // Cancellation after admission and projection, before publication, also rolls back.
     fs::write(root.join("main.js"), "function late() {}\n").unwrap();
@@ -301,15 +342,15 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         "cancel must follow capture: {phases:?}"
     );
     cancel.store(false, Ordering::Release);
-    assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(store.index_baseline().unwrap(), first);
+    assert_public_closed();
     assert_eq!(
-        store
-            .source_at("main.js", Some(first))
-            .unwrap()
-            .unwrap()
-            .1
-            .text,
-        original
+        persisted_source(),
+        (
+            original.clone(),
+            original.as_bytes().to_vec(),
+            original_hash.clone()
+        )
     );
     fs::write(root.join("main.js"), &original).unwrap();
 
@@ -327,15 +368,15 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         })
         .unwrap_err();
     assert!(error.to_string().contains("drift"), "{error:#}");
-    assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(store.index_baseline().unwrap(), first);
+    assert_public_closed();
     assert_eq!(
-        store
-            .source_at("main.js", Some(first))
-            .unwrap()
-            .unwrap()
-            .1
-            .text,
-        original
+        persisted_source(),
+        (
+            original.clone(),
+            original.as_bytes().to_vec(),
+            original_hash.clone()
+        )
     );
     let stale = IndexJobCoordinator::prepare(
         &store,
@@ -348,7 +389,16 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         matches!(stale, Err(error) if error.to_string().contains("revision conflict")),
         "stale pair must refuse before work"
     );
-    assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(store.index_baseline().unwrap(), first);
+    assert_public_closed();
+    assert_eq!(
+        persisted_source(),
+        (
+            original.clone(),
+            original.as_bytes().to_vec(),
+            original_hash.clone()
+        )
+    );
     let next = IndexJobCoordinator::prepare(&store, Some(first))
         .unwrap()
         .run(&options, &cancel, |_| {})
