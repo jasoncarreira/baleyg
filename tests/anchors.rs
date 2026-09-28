@@ -272,7 +272,8 @@ fn full_ordered_group_vectors_and_golden_fixture() {
     let unique = declaration(id, "r1", 0, 10, "unique");
     let unique_anchor = capture_anchor(&unique, std::slice::from_ref(&unique)).unwrap();
     let current_unique = declaration(id, "r2", 0, 10, "unique");
-    let other = declaration(sibling_id, "r2", 1, 30, "unique");
+    let mut other = declaration(sibling_id, "r2", 1, 30, "unique");
+    other.header.result_type = Some("String".into());
     assert_eq!(
         audit_anchor(
             &unique_anchor,
