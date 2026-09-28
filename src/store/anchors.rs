@@ -33,13 +33,13 @@ fn measured_group<'a>(focused: &Declaration, declarations: &'a [Declaration]) ->
 
 pub fn capture_anchor(focused: &Declaration, declarations: &[Declaration]) -> Result<DurableAnchor> {
     let group = measured_group(focused, declarations)?;
-    let header_hash = header_hash(&focused.header)?;
+    let focused_header_hash = header_hash(&focused.header)?;
     let headers = group.iter().map(|row| header_hash(&row.header)).collect::<Result<Vec<_>>>()?;
     let anchor = DurableAnchor {
         syntax_id: focused.syntax_id.clone(), document: focused.document.clone(),
-        captured_revision_id: focused.revision_id.clone(), header_hash: header_hash.clone(),
+        captured_revision_id: focused.revision_id.clone(), header_hash: focused_header_hash.clone(),
         sibling_group_hash: sibling_group_hash(&headers)?, sibling_count: headers.len(),
-        identical_header_count: headers.iter().filter(|hash| **hash == header_hash).count(),
+        identical_header_count: headers.iter().filter(|hash| **hash == focused_header_hash).count(),
     };
     anchor.validate()?;
     Ok(anchor)

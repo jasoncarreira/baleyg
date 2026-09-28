@@ -370,7 +370,7 @@ impl AnchorResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SavedViewRecord {
     pub id: String,
@@ -382,6 +382,11 @@ pub struct SavedViewRecord {
     pub hidden: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<Box<serde_json::value::RawValue>>,
+}
+impl PartialEq for SavedViewRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.base() == other.base() && self.anchor.as_deref().map(|raw| raw.get()) == other.anchor.as_deref().map(|raw| raw.get())
+    }
 }
 impl PartialEq<SavedView> for SavedViewRecord { fn eq(&self, other: &SavedView) -> bool { self.base() == *other } }
 impl PartialEq<SavedViewRecord> for SavedView { fn eq(&self, other: &SavedViewRecord) -> bool { *self == other.base() } }
@@ -400,7 +405,7 @@ impl SavedViewRecord {
     pub fn validate(&self) -> anyhow::Result<()> { self.base().validate()?; self.typed_anchor()?; Ok(()) }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AnnotationRecord {
     pub id: String,
@@ -411,6 +416,13 @@ pub struct AnnotationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<Box<serde_json::value::RawValue>>,
 }
+impl PartialEq for AnnotationRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.base() == other.base() && self.title == other.title
+            && self.anchor.as_deref().map(|raw| raw.get()) == other.anchor.as_deref().map(|raw| raw.get())
+    }
+}
+impl Eq for AnnotationRecord {}
 impl PartialEq<Annotation> for AnnotationRecord { fn eq(&self, other: &Annotation) -> bool { self.base() == *other } }
 impl PartialEq<AnnotationRecord> for Annotation { fn eq(&self, other: &AnnotationRecord) -> bool { *self == other.base() } }
 impl AnnotationRecord {

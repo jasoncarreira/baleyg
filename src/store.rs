@@ -1943,7 +1943,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .collect();
         for lookup_key in keys {
             let mut actual =
-                Self::read_native_declarations(db, &file.language, lookup_key, Some(path))?;
+                Self::read_native_declarations(db, &file.language, lookup_key, Some(path), false)?;
             let mut expected: Vec<_> = witness
                 .declarations
                 .iter()
@@ -3389,6 +3389,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let record = self.records().annotation_record(&request.id)?.context("saved annotation missing after write")?;
         Self::resolve_annotation(&tx, self, record, Some(pin))
     }
+    pub fn delete_annotation(&self, id: &str) -> Result<bool> { self.records().delete_annotation(id) }
 
 }
 
