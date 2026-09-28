@@ -21,22 +21,8 @@ fn fixture(code: &str) -> (TempDir, TempDir, Store, Graph, QuestionRequest) {
     }
     std::fs::write(work.path().join("a.js"), code).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut graph =
-        index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
-    // Explicit synthetic semantic links for policy tests only. Native lexical
-    // extraction deliberately does not resolve these names. Keep its canonical
-    // IDs, source spans, regions and file snapshots; publish through Store validation.
-    for call in &mut graph.calls {
-        if matches!(call.callee_text.as_str(), "helper" | "leaf") {
-            let target = graph
-                .nodes
-                .iter()
-                .find(|n| n.name == call.callee_text)
-                .unwrap();
-            call.target = Some(target.id.clone());
-            call.resolution = Resolution::Internal;
-        }
-    }
+    let graph = index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
+    // Native measured calls cannot acquire lexical targets from matching names.
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
     let revision = store
         .publish(
@@ -75,7 +61,7 @@ fn packet_snapshot_unique_candidates_complete_source_and_stable_hash() {
     assert_eq!(packet.packet_id.len(), 64);
     assert_eq!(packet.source_files.len(), 1);
     assert_eq!(packet.source_files[0].text, CODE);
-    assert_eq!(packet.context.calls.len(), 4);
+    assert_eq!(packet.context.calls.len(), 3);
     assert_eq!(
         packet
             .context
@@ -84,7 +70,7 @@ fn packet_snapshot_unique_candidates_complete_source_and_stable_hash() {
             .map(|c| &c.id)
             .collect::<BTreeSet<_>>()
             .len(),
-        4
+        3
     );
     assert_eq!(packet.context.query.max_nodes, 80);
     assert_eq!(packet.context.query.max_calls, 300);
@@ -143,7 +129,7 @@ fn direct_default_source_order_budget_and_actual_regions() {
     let p = prepare(&store, request.clone()).unwrap();
     let v = assemble(&p, &all(&p, Relevance::Essential), "manual").unwrap();
     assert_eq!(v.calls.len(), 3);
-    assert_eq!(v.policy_hidden_count, 1);
+    assert_eq!(v.policy_hidden_count, 0);
     assert!(
         v.calls
             .iter()
@@ -161,16 +147,19 @@ fn direct_default_source_order_budget_and_actual_regions() {
     let mut selection = all(&p, Relevance::Essential);
     selection.decisions.reverse();
     let v = assemble(&p, &selection, "manual").unwrap();
-    assert_eq!(v.calls[0].callee_text, "helper");
+    assert_eq!(v.calls[0].callee_text.as_deref(), Some("helper"));
     assert_eq!(v.calls.len(), 1);
-    assert_eq!(v.policy_hidden_count, 3);
+    assert_eq!(v.policy_hidden_count, 2);
     request.allow_deeper_display = true;
     request.max_visible = 12;
     let p = prepare(&store, request).unwrap();
     let v = assemble(&p, &all(&p, Relevance::Essential), "manual").unwrap();
-    assert_eq!(v.calls.len(), 4);
+    assert_eq!(v.calls.len(), 3);
     assert_eq!(v.policy_hidden_count, 0);
-    assert_eq!(v.calls.first().unwrap().callee_text, "leaf");
+    assert_eq!(
+        v.calls.first().unwrap().callee_text.as_deref(),
+        Some("helper")
+    );
 }
 #[test]
 fn local_literal_only_uncertainty_and_no_budget_filling() {
@@ -180,14 +169,14 @@ fn local_literal_only_uncertainty_and_no_budget_filling() {
     let s = preview(&p).unwrap();
     let v = assemble(&p, &s, "localPreview").unwrap();
     assert!(v.calls.is_empty());
-    assert_eq!(v.supporting_count, 1);
+    assert_eq!(v.supporting_count, 0);
     assert_eq!(v.uncertain_count, 3);
     assert_eq!(v.nodes.len(), 1);
     assert!(v.regions.is_empty());
     request.focus_terms = vec!["businessMeaningNotInNames".into()];
     let p = prepare(&store, request).unwrap();
     let v = assemble(&p, &preview(&p).unwrap(), "localPreview").unwrap();
-    assert_eq!(v.uncertain_count, 4);
+    assert_eq!(v.uncertain_count, 3);
     assert!(v.calls.is_empty());
     assert!(
         v.warnings
@@ -255,7 +244,7 @@ fn candidate_limit_reports_incomplete_evidence() {
 #[test]
 fn assembly_preserves_boundaries_and_never_expands_callbacks() {
     let code = "class Runner {}\nfunction cb() { console.log('callback'); }\nfunction seed(flag) { if (flag) { while (flag) { new Runner(); external(cb); } } }";
-    let (_w, _s, store, mut graph, mut request) = fixture(code);
+    let (_w, _s, store, graph, mut request) = fixture(code);
     let class_id = graph
         .nodes
         .iter()
@@ -270,16 +259,6 @@ fn assembly_preserves_boundaries_and_never_expands_callbacks() {
         .unwrap()
         .id
         .clone();
-    for call in &mut graph.calls {
-        if call.callee_text == "Runner" {
-            // Explicit synthetic semantic constructor link, not inferred by planning.
-            call.resolution = Resolution::Internal;
-            call.target = Some(class_id.clone());
-        } else if call.callee_text == "external" {
-            call.resolution = Resolution::External;
-            call.callback_arguments = vec![callback_id.clone()];
-        }
-    }
     request.expected_revision = store
         .publish(
             &graph,
@@ -293,7 +272,7 @@ fn assembly_preserves_boundaries_and_never_expands_callbacks() {
     let v = assemble(&p, &all(&p, Relevance::Essential), "manual").unwrap();
     assert_eq!(v.calls.len(), 2);
     assert!(v.calls.iter().all(|c| graph.calls.contains(c)));
-    assert!(v.nodes.iter().any(|n| n.id == class_id));
+    assert!(!v.nodes.iter().any(|n| n.id == class_id));
     assert!(!v.nodes.iter().any(|n| n.id == callback_id));
     assert!(v.regions.len() >= 2);
     for region in &v.regions {
@@ -301,8 +280,11 @@ fn assembly_preserves_boundaries_and_never_expands_callbacks() {
             assert!(v.regions.iter().any(|r| &r.id == parent));
         }
     }
-    assert!(v.calls.iter().any(|c| c.resolution == Resolution::External
-        && c.callback_arguments == vec![callback_id.clone()]));
+    assert!(
+        v.calls
+            .iter()
+            .all(|c| serde_json::to_value(c).unwrap().get("target").is_none())
+    );
 }
 
 #[test]
@@ -319,7 +301,7 @@ fn display_scores_rank_membership_but_output_stays_in_source_order() {
             .iter()
             .find(|c| c.id == d.candidate_id)
             .unwrap();
-        d.display_score = Some(match c.callee_text.as_str() {
+        d.display_score = Some(match c.callee_text.as_deref().unwrap_or("") {
             "resolve" => 0.52,
             "open" => 0.44,
             "rename" => 0.96,
@@ -331,7 +313,7 @@ fn display_scores_rank_membership_but_output_stays_in_source_order() {
     assert_eq!(
         v.calls
             .iter()
-            .map(|c| c.callee_text.as_str())
+            .map(|c| c.callee_text.as_deref().unwrap_or(""))
             .collect::<Vec<_>>(),
         vec!["resolve", "rename"]
     );
@@ -352,7 +334,7 @@ fn display_scores_rank_membership_but_output_stays_in_source_order() {
     assert_eq!(
         v.calls
             .iter()
-            .map(|c| c.callee_text.as_str())
+            .map(|c| c.callee_text.as_deref().unwrap_or(""))
             .collect::<Vec<_>>(),
         vec!["resolve", "open"]
     );
@@ -420,7 +402,7 @@ fn scores_never_promote_lower_labels_or_override_direct_display_policy() {
         let v = assemble(&p, &s, "manual").unwrap();
         assert_eq!(v.calls.len(), 1);
         assert_eq!(v.calls[0].caller, request.seed);
-        assert_eq!(v.policy_hidden_count, 3);
+        assert_eq!(v.policy_hidden_count, 2);
     }
     request.allow_deeper_display = false;
     request.max_visible = 12;
@@ -445,6 +427,6 @@ fn scores_never_promote_lower_labels_or_override_direct_display_policy() {
         }
         let v = assemble(&p, &s, "manual").unwrap();
         assert!(v.calls.is_empty());
-        assert_eq!(v.policy_hidden_count, 1);
+        assert_eq!(v.policy_hidden_count, 0);
     }
 }

@@ -25,22 +25,8 @@ fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
     std::fs::write(workspace.join("a.js"), format!("function leaf() {{}}\nfunction helper() {{ leaf(); }}\nfunction seed(flag) {{ if (flag) helper(); console.log(flag); }}\n//{}", "x".repeat(padding))).unwrap();
     let options = IndexOptions::new(workspace.clone());
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut graph = index_workspace(&options, &cancel, |_| {}).unwrap();
-    // Synthetic internal links exercise deeper-display policy; lexical indexing does not infer them.
-    for call in &mut graph.calls {
-        if matches!(call.callee_text.as_str(), "helper" | "leaf") {
-            call.target = Some(
-                graph
-                    .nodes
-                    .iter()
-                    .find(|n| n.name == call.callee_text)
-                    .unwrap()
-                    .id
-                    .clone(),
-            );
-            call.resolution = Resolution::Internal;
-        }
-    }
+    let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
+    // Even locally named calls remain terminal, with no inferred graph edge.
     let seed = graph
         .nodes
         .iter()
@@ -193,7 +179,14 @@ async fn offline_roundtrip_is_stable_and_preserves_display_policy() {
     .await;
     assert_eq!(status, 200, "{imported}");
     assert_eq!(imported["view"]["selectionSource"], "importedJev");
-    assert_eq!(imported["view"]["policyHiddenCount"], 1);
+    assert_eq!(imported["view"]["policyHiddenCount"], 0);
+    assert!(
+        imported["view"]["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c.get("target").is_none())
+    );
     assert!(
         imported["view"]["calls"]
             .as_array()

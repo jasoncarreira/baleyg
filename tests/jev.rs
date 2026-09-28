@@ -26,28 +26,8 @@ fn packet_with_links(code: &str, question: &str, synthetic_links: bool) -> Quest
     }
     std::fs::write(work.path().join("a.js"), code).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut graph =
-        index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
-    if synthetic_links {
-        // Protocol coverage only; these deliberately synthetic references do not claim resolution quality.
-        let target = graph
-            .nodes
-            .iter()
-            .find(|n| n.name == "callback")
-            .unwrap()
-            .id
-            .clone();
-        for (index, call) in graph.calls.iter_mut().enumerate() {
-            call.callback_arguments = vec![target.clone()];
-            call.candidate_symbols = vec![target.clone()];
-            if index == 0 {
-                call.target = Some(target.clone());
-                call.resolution = baleyg::model::Resolution::Internal;
-            } else {
-                call.resolution = baleyg::model::Resolution::Ambiguous;
-            }
-        }
-    }
+    let graph = index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
+    let _ = synthetic_links; // Saved legacy option cannot add semantic links.
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
     let revision = store
         .publish(
@@ -307,7 +287,10 @@ fn probability_sum_tolerance() {
 fn rejects_tampered_packets_and_answers_for_another_question_with_same_calls() {
     let packet = packet();
     let other = packet_with(CODE, "Where does the callback go?");
-    assert_eq!(packet.context.calls, other.context.calls);
+    assert_eq!(packet.context.calls.len(), other.context.calls.len());
+    for (a, b) in packet.context.calls.iter().zip(&other.context.calls) {
+        assert_eq!((&a.range, &a.callee_text), (&b.range, &b.callee_text));
+    }
     assert_ne!(packet.packet_id, other.packet_id);
     let response = synthetic_response(&packet);
     assert!(parse_response(&other, &response).is_err());
@@ -348,27 +331,13 @@ fn lossless_tables_preserve_all_reference_fields_and_nested_region_parents() {
         "How is checking guarded?",
         true,
     );
-    assert!(
-        packet
-            .context
-            .calls
-            .iter()
-            .any(|call| call.target.is_some())
-    );
-    assert!(
-        packet
-            .context
-            .calls
-            .iter()
-            .any(|call| !call.callback_arguments.is_empty())
-    );
-    assert!(
-        packet
-            .context
-            .calls
-            .iter()
-            .any(|call| !call.candidate_symbols.is_empty())
-    );
+    assert!(packet.context.calls.iter().all(|call| {
+        let row = serde_json::to_value(call).unwrap();
+        row.get("target").is_none()
+            && row.get("resolution").is_none()
+            && row.get("candidateSymbols").is_none()
+            && row.get("callbackArguments").is_none()
+    }));
     assert!(
         packet
             .context
@@ -387,9 +356,6 @@ fn lossless_tables_preserve_all_reference_fields_and_nested_region_parents() {
     for call in &packet.context.calls {
         for id in std::iter::once(&call.id)
             .chain(std::iter::once(&call.caller))
-            .chain(call.target.iter())
-            .chain(call.candidate_symbols.iter())
-            .chain(call.callback_arguments.iter())
             .chain(call.regions.iter())
         {
             assert!(unique.contains(id.as_str()));

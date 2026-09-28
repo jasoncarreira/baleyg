@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
     path::Path,
     sync::Arc,
@@ -19,8 +19,11 @@ pub struct Store {
     identity: Arc<topology::WorkspaceIdentity>,
     workspace_root: String,
 }
-const DATABASE_SCHEMA_VERSION: u32 = 4;
-const EXTRACTOR_VERSION: &str = "native-v1";
+const DATABASE_SCHEMA_VERSION: u32 = 5;
+const EXTRACTOR_VERSION: &str = "native-no-lexical-v1";
+const LEGACY_SCHEMA_VERSION: u32 = 4;
+const LEGACY_EXTRACTOR_VERSION: &str = "native-v1";
+const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
 const CLASS_SCHEMA: &str = "
 CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
 CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
@@ -158,7 +161,7 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     ensure!(mode == "delete", "incompatible_index: journal mode");
     let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     ensure!(
-        version == DATABASE_SCHEMA_VERSION,
+        version == DATABASE_SCHEMA_VERSION || version == LEGACY_SCHEMA_VERSION,
         "incompatible_index: schema version {version}"
     );
     storage_result(db.prepare(
@@ -171,6 +174,52 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     storage_result(db.prepare("SELECT warnings,truncated FROM class_catalog"))?;
     storage_result(db.prepare("SELECT id,name,qualified_name,path,payload FROM classes"))?;
     storage_result(db.prepare("SELECT id,owner,target,payload FROM class_relations"))?;
+    let tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let expected: BTreeSet<String> = [
+        "index_metadata",
+        "files",
+        "nodes",
+        "calls",
+        "regions",
+        "class_catalog",
+        "classes",
+        "class_relations",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    ensure!(
+        tables == expected,
+        "incompatible_index: unknown cache table shape"
+    );
+    let defined = db.prepare("SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let expected_sql: BTreeSet<String> = format!("{CACHE_SCHEMA}{CLASS_SCHEMA}")
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ensure!(
+        defined == expected_sql,
+        "incompatible_index: unknown cache column or index shape"
+    );
+    let metadata: (i64, String) = db.query_row(
+        "SELECT schema_version,extractor_version FROM index_metadata WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        (version == LEGACY_SCHEMA_VERSION && metadata == (4, LEGACY_EXTRACTOR_VERSION.into()))
+            || (version == DATABASE_SCHEMA_VERSION && metadata == (5, EXTRACTOR_VERSION.into())),
+        "incompatible_index: schema and metadata mismatch"
+    );
+    let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
+    ensure!(count == 1, "incompatible_index: metadata cardinality");
     Ok(db)
 }
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
@@ -327,28 +376,10 @@ fn validate_graph(graph: &Graph, cancel: &CancelFlag) -> Result<IndexStats> {
             nodes.contains_key(call.caller.as_str()),
             "dangling call caller"
         );
-        match call.resolution {
-            Resolution::Internal => {
-                ensure!(
-                    call.target
-                        .as_ref()
-                        .is_some_and(|t| nodes.contains_key(t.as_str())),
-                    "dangling internal call target"
-                );
-                stats.internal += 1;
-            }
-            Resolution::External => stats.external += 1,
-            Resolution::Unresolved => stats.unresolved += 1,
-            Resolution::Ambiguous => stats.ambiguous += 1,
-        }
-        // Candidate strings include external SCIP identities and unresolved lexical
-        // bindings. They are evidence, not guaranteed graph node references.
-        for target in &call.callback_arguments {
-            ensure!(
-                nodes.contains_key(target.as_str()),
-                "dangling callback target"
-            );
-        }
+        // A call is a source-witnessed terminal occurrence, never a graph edge.
+        // Production indexers project validated native IDs; shape-only Store
+        // fixtures exercise graph integrity without replaying the extractor.
+        stats.unresolved += 1;
         for region in &call.regions {
             ensure!(
                 regions
@@ -433,16 +464,6 @@ fn presentation_class(
     // Pathological non-member metadata cannot fit without changing identity.
     Ok(None)
 }
-fn presentation_relation(
-    db: &Connection,
-    id: &str,
-) -> Result<Option<crate::classes::ClassRelation>> {
-    let payload: Option<String> = db.query_row("SELECT CASE WHEN length(CAST(payload AS BLOB))<=?2 THEN payload ELSE NULL END FROM class_relations WHERE id=?1",
-        params![id, crate::class_diagram::RELATION_BYTES as i64], |r| r.get(0)).optional()?.flatten();
-    payload
-        .map(|payload| Ok(serde_json::from_str(&payload)?))
-        .transpose()
-}
 fn resolve_class_id(db: &Connection, id: &str) -> Result<String> {
     use crate::class_diagram::InvalidRequest;
     let mut current = id.to_owned();
@@ -481,359 +502,6 @@ fn resolve_class(db: &Connection, id: &str) -> Result<(crate::classes::ClassDefi
     Ok((class, clipped))
 }
 
-// Hierarchy planning reads only indexed relationship IDs/endpoints. It does not
-// deserialize a catalog or load class members until a bounded plan is selected.
-const HIERARCHY_QUERIES: usize = 48;
-const HIERARCHY_RECORDS: usize = 256;
-const HIERARCHY_DEPTH: usize = 24;
-const HIERARCHY_NOTICE: &str = "Hierarchy is partial: depth (24), adjacency query (48), representative row (64 per query), planning edge (256), or relationship-load (256) limits were reached.";
-#[derive(Clone)]
-struct ClassLink {
-    id: String,
-    owner: String,
-    target: Option<String>,
-    occurrences: i64,
-}
-fn class_links(db: &Connection, seed: &str, kind: &str) -> Result<Vec<ClassLink>> {
-    // Filter inheritance BEFORE grouping/capping, so arbitrarily many field,
-    // parameter or return references cannot starve extends/implements evidence.
-    let filter = match kind {
-        "ancestors" => {
-            "target IS NOT NULL AND owner=?1 AND json_extract(payload,'$.kind') IN ('extends','implements')"
-        }
-        "descendants" => {
-            "target IS NOT NULL AND target=?1 AND json_extract(payload,'$.kind') IN ('extends','implements')"
-        }
-        "hints" => "owner=?1 AND target IS NULL",
-        _ => {
-            "target IS NOT NULL AND (owner=?1 OR target=?1) AND json_extract(payload,'$.kind') NOT IN ('extends','implements')"
-        }
-    };
-    let sql = format!("SELECT r.id,r.owner,r.target,g.occurrences FROM class_relations r JOIN (
-        SELECT min(id) AS representative,count(*) AS occurrences,
-            CASE WHEN owner=?1 THEN 0 ELSE 1 END AS direction FROM class_relations
-        WHERE {filter}
-        GROUP BY owner,target,CASE WHEN target IS NULL THEN json_extract(payload,'$.typeName') ELSE '' END,
-            json_extract(payload,'$.kind'),json_extract(payload,'$.matchKind')
-        ORDER BY direction,representative LIMIT 65
-        ) g ON r.id=g.representative ORDER BY g.direction,r.id");
-    Ok(db
-        .prepare(&sql)?
-        .query_map([seed], |r| {
-            Ok(ClassLink {
-                id: r.get(0)?,
-                owner: r.get(1)?,
-                target: r.get(2)?,
-                occurrences: r.get(3)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-/// Undirected reachability over actual recorded links, with a shortest real
-/// predecessor edge. The bounded thin graph can include disconnected roots;
-/// they are never considered connected merely because the user supplied them.
-fn class_paths(seed: &str, links: &[ClassLink]) -> BTreeMap<String, Option<(String, usize)>> {
-    let mut paths = BTreeMap::from([(seed.to_owned(), None)]);
-    let mut queue = VecDeque::from([seed.to_owned()]);
-    while let Some(node) = queue.pop_front() {
-        for (index, link) in links.iter().enumerate() {
-            let Some(target) = &link.target else { continue };
-            let next = if link.owner == node {
-                target
-            } else if target == &node {
-                &link.owner
-            } else {
-                continue;
-            };
-            if !paths.contains_key(next) {
-                paths.insert(next.clone(), Some((node.clone(), index)));
-                queue.push_back(next.clone());
-            }
-        }
-    }
-    paths
-}
-
-#[allow(clippy::too_many_arguments)]
-fn hierarchy_diagram(
-    db: &Connection,
-    revision: IndexPin,
-    request: &crate::class_diagram::ClassDiagramRequest,
-    mut seeds: Vec<String>,
-    mut classes: BTreeMap<String, crate::classes::ClassDefinition>,
-    mut warnings: Vec<String>,
-    mut truncated: bool,
-    mut byte_limited: bool,
-) -> Result<crate::class_diagram::ClassDiagram> {
-    use crate::class_diagram::{self, InvalidRequest, MAX_EDGES, MAX_NODES};
-    // Resolve IDs first, deduplicating even method/class aliases before loading
-    // members. All manual roots count against the same 24 class-load budget.
-    for id in &request.expanded {
-        let id = resolve_class_id(db, id)?;
-        if !seeds.contains(&id) {
-            seeds.push(id);
-        }
-    }
-    // Do not descend again from an ancestor: Derived -> Base <- Peer must not
-    // pull Peer into Derived's diagram merely because they share a base.
-    let mut queue: VecDeque<_> = seeds
-        .iter()
-        .flat_map(|id| [(id.clone(), 0, "ancestors"), (id.clone(), 0, "descendants")])
-        .collect();
-    let mut queued: BTreeSet<_> = queue
-        .iter()
-        .map(|(id, _, direction)| (id.clone(), *direction))
-        .collect();
-    let mut hierarchy = Vec::new();
-    let mut link_ids = BTreeSet::new();
-    let mut queries = 0;
-    let mut hierarchy_limited = false;
-    let mut grouped = false;
-    while let Some((id, depth, direction)) = queue.pop_front() {
-        if queries >= HIERARCHY_QUERIES || hierarchy.len() >= HIERARCHY_RECORDS {
-            hierarchy_limited = true;
-            break;
-        }
-        queries += 1;
-        let links = class_links(db, &id, direction)?;
-        hierarchy_limited |= links.len() > MAX_EDGES;
-        for link in links.into_iter().take(MAX_EDGES) {
-            grouped |= link.occurrences > 1;
-            if hierarchy.len() >= HIERARCHY_RECORDS {
-                hierarchy_limited = true;
-                break;
-            }
-            let target = link.target.as_ref().expect("hierarchy target");
-            let next = if link.owner == id {
-                target
-            } else {
-                &link.owner
-            };
-            if !queued.contains(&(next.clone(), direction)) {
-                if depth >= HIERARCHY_DEPTH {
-                    hierarchy_limited = true;
-                    continue;
-                }
-                queued.insert((next.clone(), direction));
-                queue.push_back((next.clone(), depth + 1, direction));
-            }
-            if link_ids.insert(link.id.clone()) {
-                hierarchy.push(link);
-            }
-        }
-    }
-    // Validate expansions against the actual seed-connected hierarchy, in user
-    // order. A field neighbor of a deep automatic class needs no manual anchor.
-    let mut connections = hierarchy.clone();
-    let mut mandatory_indices = BTreeSet::new();
-    let mut mandatory = Vec::new();
-    for root in seeds.iter().skip(1) {
-        let mut paths = class_paths(&seeds[0], &connections);
-        if !paths.contains_key(root) {
-            let connected = serde_json::to_string(&paths.keys().collect::<Vec<_>>())?;
-            let bridge = db
-                .query_row(
-                    "SELECT id,owner,target FROM class_relations
-                WHERE (owner=?1 AND target IN (SELECT value FROM json_each(?2)))
-                   OR (target=?1 AND owner IN (SELECT value FROM json_each(?2)))
-                ORDER BY id LIMIT 1",
-                    params![root, connected],
-                    |r| {
-                        Ok(ClassLink {
-                            id: r.get(0)?,
-                            owner: r.get(1)?,
-                            target: r.get(2)?,
-                            occurrences: 1,
-                        })
-                    },
-                )
-                .optional()?;
-            let bridge = bridge.ok_or(InvalidRequest(
-                "Expand a related class connected to the visible hierarchy. The connection may exceed the bounded hierarchy search; choose a nearer class.",
-            ))?;
-            connections.push(bridge);
-            paths = class_paths(&seeds[0], &connections);
-        }
-        let mut current = root.clone();
-        let mut path = Vec::new();
-        while let Some(Some((previous, index))) = paths.get(&current) {
-            path.push(*index);
-            current = previous.clone();
-        }
-        for index in path.into_iter().rev() {
-            if mandatory_indices.insert(index) {
-                mandatory.push(connections[index].clone());
-            }
-        }
-    }
-    let mut required: BTreeSet<_> = seeds.iter().cloned().collect();
-    for link in &mandatory {
-        required.insert(link.owner.clone());
-        required.extend(link.target.iter().cloned());
-    }
-    ensure!(
-        required.len() <= MAX_NODES && mandatory.len() <= MAX_EDGES,
-        InvalidRequest(
-            "Selected class connections exceed the 24 node or 64 edge limit. Remove an expansion or choose a nearer class.",
-        )
-    );
-    let mut loaded: BTreeSet<_> = classes.keys().cloned().collect();
-    for id in required {
-        if loaded.insert(id.clone()) {
-            let (class, _, clipped) = presentation_class(db, &id)?.ok_or(InvalidRequest(
-                "A selected class connection exceeds the presentation byte limit.",
-            ))?;
-            byte_limited |= clipped;
-            classes.insert(id, class);
-        }
-    }
-    let mut bridges = Vec::new();
-    let mut shown = BTreeSet::new();
-    for link in mandatory {
-        let relation = presentation_relation(db, &link.id)?.ok_or(InvalidRequest(
-            "A selected class connection exceeds the presentation byte limit.",
-        ))?;
-        shown.insert(link.id);
-        bridges.push(relation);
-    }
-    // BFS from the reserved connected subgraph; each optional edge attaches to
-    // it. Members are loaded at most once, including failed oversize records.
-    let mut relations = Vec::new();
-    let mut frontier: VecDeque<_> = classes.keys().cloned().collect();
-    let mut visited = BTreeSet::new();
-    let mut relation_loads = bridges.len();
-    while let Some(node) = frontier.pop_front() {
-        if !visited.insert(node.clone()) {
-            continue;
-        }
-        for link in &hierarchy {
-            if link.owner != node && link.target.as_ref() != Some(&node) {
-                continue;
-            }
-            if shown.contains(&link.id) {
-                continue;
-            }
-            if shown.len() >= MAX_EDGES {
-                truncated = true;
-                continue;
-            }
-            let target = link.target.as_ref().expect("hierarchy target");
-            let next = if link.owner == node {
-                target
-            } else {
-                &link.owner
-            };
-            if !classes.contains_key(next) {
-                if loaded.len() >= MAX_NODES {
-                    truncated = true;
-                    continue;
-                }
-                if !loaded.insert(next.clone()) {
-                    continue;
-                }
-                if let Some((class, _, clipped)) = presentation_class(db, next)? {
-                    byte_limited |= clipped;
-                    classes.insert(next.clone(), class);
-                } else {
-                    byte_limited = true;
-                    continue;
-                }
-            }
-            if relation_loads >= HIERARCHY_RECORDS {
-                hierarchy_limited = true;
-                continue;
-            }
-            relation_loads += 1;
-            if let Some(relation) = presentation_relation(db, &link.id)? {
-                shown.insert(link.id.clone());
-                relations.push(relation);
-                frontier.push_back(next.clone());
-            } else {
-                byte_limited = true;
-            }
-        }
-    }
-    // Offer one-hop associations from all automatic hierarchy classes, but only
-    // after hierarchy reservation. These never become recursive hierarchy roots.
-    // Use reached endpoints, not all loaded classes (a relation can be oversize).
-    let mut neighborhood: BTreeSet<_> = seeds.iter().cloned().collect();
-    for edge in bridges.iter().chain(&relations) {
-        neighborhood.insert(edge.owner.clone());
-        neighborhood.extend(edge.target.iter().cloned());
-    }
-    for kind in ["associations", "hints"] {
-        if kind == "hints" && !request.include_unmatched {
-            continue;
-        }
-        for node in &neighborhood {
-            let links = class_links(db, node, kind)?;
-            if links.len() > MAX_EDGES {
-                truncated = true;
-            }
-            for link in links.into_iter().take(MAX_EDGES) {
-                grouped |= link.occurrences > 1;
-                if shown.contains(&link.id) {
-                    continue;
-                }
-                if shown.len() >= MAX_EDGES {
-                    truncated = true;
-                    continue;
-                }
-                let mut present = true;
-                for id in std::iter::once(&link.owner).chain(link.target.iter()) {
-                    if classes.contains_key(id) {
-                        continue;
-                    }
-                    if loaded.len() >= MAX_NODES {
-                        truncated = true;
-                        present = false;
-                        break;
-                    }
-                    if !loaded.insert(id.clone()) {
-                        present = false;
-                        break;
-                    }
-                    if let Some((class, _, clipped)) = presentation_class(db, id)? {
-                        byte_limited |= clipped;
-                        classes.insert(id.clone(), class);
-                    } else {
-                        byte_limited = true;
-                        present = false;
-                    }
-                }
-                if !present {
-                    continue;
-                }
-                if relation_loads >= HIERARCHY_RECORDS {
-                    hierarchy_limited = true;
-                    continue;
-                }
-                relation_loads += 1;
-                if let Some(relation) = presentation_relation(db, &link.id)? {
-                    shown.insert(link.id);
-                    relations.push(relation);
-                } else {
-                    byte_limited = true;
-                }
-            }
-        }
-    }
-    if hierarchy_limited {
-        truncated = true;
-        warnings.push(HIERARCHY_NOTICE.into());
-    }
-    if byte_limited {
-        truncated = true;
-        warnings.push(class_diagram::BYTE_NOTICE.into());
-    }
-    if grouped {
-        warnings.push("Repeated same-kind references are grouped; each diagram edge shows one representative source range.".into());
-    }
-    class_diagram::project(
-        revision, &seeds, &classes, bridges, relations, warnings, truncated,
-    )
-}
-
 impl Store {
     pub fn open(
         roots: topology::TopologyRoots,
@@ -861,7 +529,8 @@ impl Store {
             let leader = store.roots.leader(&store.identity)?;
             store.initialize(&leader, before_publish)?;
         }
-        store.status()?;
+        let db = store.cache()?;
+        store.read_control_status(&db)?;
         Ok(store)
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
@@ -925,7 +594,7 @@ impl Store {
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
             db.execute(
-                "INSERT INTO index_metadata VALUES(1,4,?1,?2,?3,?4,?5,0,?6,'',?7,?8)",
+                "INSERT INTO index_metadata VALUES(1,5,?1,?2,?3,?4,?5,0,?6,'',?7,?8)",
                 params![
                     EXTRACTOR_VERSION,
                     self.workspace_root,
@@ -949,7 +618,7 @@ impl Store {
         before_publish(&staged.path)?;
         verify_index_file(&staged.path)?;
         let checked = open_index(&staged.path, true)?;
-        self.read_status(&checked)?;
+        self.read_control_status(&checked)?;
         let integrity: String =
             storage_result(checked.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
         ensure!(
@@ -981,15 +650,20 @@ impl Store {
     pub fn leader(&self) -> Result<topology::LeaderGuard> {
         drop(self.cache()?);
         let leader = self.roots.leader(&self.identity)?;
+        // Acquiring the leader must not mutate legacy cache bytes: a failed
+        // rebaseline leaves the old schema-4 database intact and unreadable.
         let mut db = self.cache_write()?;
-        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
-        storage_result(tx.execute(
-            "UPDATE index_metadata SET last_opened_at=?1 WHERE singleton=1",
-            [age as i64],
-        ))?;
-        storage_result(tx.commit())?;
+        if self.read_control_status(&db)?.evidence_format.is_some() {
+            let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
+            storage_result(tx.execute(
+                "UPDATE index_metadata SET last_opened_at=?1 WHERE singleton=1",
+                [age as i64],
+            ))?;
+            storage_result(tx.commit())?;
+        }
+        drop(db);
         leader.verify()?;
         self.identity.verify()?;
         Ok(leader)
@@ -1014,12 +688,13 @@ impl Store {
     fn records(&self) -> topology::DurableRecords<'_> {
         topology::DurableRecords::new(&self.roots, &self.identity)
     }
-    fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
+    fn read_control_status(&self, db: &Connection) -> Result<IndexStatus> {
         let row: (i64,String,String,String,String,String,i64,String,String,String) = storage_result(db.query_row(
             "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata WHERE singleton=1",
             [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))))?;
         ensure!(
-            row.0 == 4 && row.1 == EXTRACTOR_VERSION,
+            (row.0 == i64::from(LEGACY_SCHEMA_VERSION) && row.1 == LEGACY_EXTRACTOR_VERSION)
+                || (row.0 == i64::from(DATABASE_SCHEMA_VERSION) && row.1 == EXTRACTOR_VERSION),
             "incompatible_index: extractor or schema"
         );
         ensure!(
@@ -1039,7 +714,22 @@ impl Store {
             indexed_at: if row.7.is_empty() { None } else { Some(row.7) },
             stats: serde_json::from_str(&row.8)?,
             diagnostics: serde_json::from_str(&row.9)?,
+            evidence_format: (row.0 == i64::from(DATABASE_SCHEMA_VERSION))
+                .then(|| EVIDENCE_FORMAT.to_owned()),
         })
+    }
+    fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
+        let status = self.read_control_status(db)?;
+        ensure!(
+            status.evidence_format.is_some(),
+            "index_not_ready: reindex required"
+        );
+        Ok(status)
+    }
+    /// Internal control baseline, never returned by public status or evidence reads.
+    pub fn index_baseline(&self) -> Result<IndexPin> {
+        let db = self.cache()?;
+        Ok(self.read_control_status(&db)?.revision)
     }
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
@@ -1055,6 +745,26 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        self.publish_inner(graph, None, leader, expected_revision, cancel)
+    }
+    pub fn publish_captured(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        leader: &topology::LeaderGuard,
+        expected_revision: IndexPin,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_inner(graph, Some(capture), leader, expected_revision, cancel)
+    }
+    fn publish_inner(
+        &self,
+        graph: &Graph,
+        capture: Option<&crate::capture::Capture>,
+        leader: &topology::LeaderGuard,
+        expected_revision: IndexPin,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
         ensure!(
             graph.schema_version == SCHEMA_VERSION,
             "unsupported graph schema"
@@ -1064,18 +774,36 @@ impl Store {
         // Parse cached source before taking the writer lock. Projection and graph
         // still publish in one transaction with the same CAS/cancellation guard.
         let classes = crate::classes::Catalog::build(&graph.files, &graph.nodes, cancel)?;
+        ensure!(
+            classes.relations.iter().all(|r| r.target.is_none()
+                && r.candidate_ids.is_empty()
+                && r.match_kind == "unmatched"),
+            "unsafe_index: lexical class relationship"
+        );
         check_cancel(cancel)?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
         let mut db = self.cache_write()?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let old = self.read_status(&tx)?.revision;
+        let baseline = self.read_control_status(&tx)?;
+        let old = baseline.revision;
         ensure!(
             expected_revision == old,
             "revision conflict: expected {expected_revision:?}, found {old:?}"
         );
+        let rebaseline = baseline.evidence_format.is_none();
+        if rebaseline {
+            ensure!(
+                capture.is_some(),
+                "index_not_ready: rebaseline needs verified capture"
+            );
+        }
         let revision = IndexPin {
-            index_generation: old.index_generation,
+            index_generation: if rebaseline {
+                uuid::Uuid::new_v4()
+            } else {
+                old.index_generation
+            },
             index_revision: old
                 .index_revision
                 .checked_add(1)
@@ -1104,7 +832,7 @@ impl Store {
             check_cancel(cancel)?;
             tx.execute(
                 "INSERT INTO calls VALUES(?1,?2,?3,?4,?5)",
-                params![c.id, c.caller, c.target, c.path, json(c)?],
+                params![c.id, c.caller, Option::<String>::None, c.path, json(c)?],
             )?;
         }
         for r in &graph.regions {
@@ -1147,9 +875,15 @@ impl Store {
             .duration_since(UNIX_EPOCH)?
             .as_millis()
             .to_string();
-        tx.execute("UPDATE index_metadata SET index_revision=?1,indexed_at=?2,stats=?3,diagnostics=?4 WHERE singleton=1",
-            params![revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?])?;
+        tx.execute("UPDATE index_metadata SET schema_version=5,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6 WHERE singleton=1",
+            params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?])?;
+        if rebaseline {
+            tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
+        }
         check_cancel(cancel)?;
+        if let Some(capture) = capture {
+            capture.verify(cancel)?;
+        }
         leader.verify()?;
         self.identity.verify()?;
         storage_result(tx.commit())?;
@@ -1274,151 +1008,42 @@ impl Store {
         &self,
         request: &crate::class_diagram::ClassDiagramRequest,
     ) -> Result<crate::class_diagram::ClassDiagram> {
-        use crate::class_diagram::{self, InvalidRequest, MAX_EDGES};
+        use crate::class_diagram::{self, InvalidRequest};
         request.validate()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(revision == request.expected_revision, "revision conflict");
-        let Some((mut warnings, mut truncated)) = class_metadata(&tx)? else {
+        let Some((warnings, truncated)) = class_metadata(&tx)? else {
             return Ok(class_diagram::ClassDiagram::unindexed(
                 revision,
                 request.seed.clone(),
             ));
         };
-        let (seed, mut byte_limited) = resolve_class(&tx, &request.seed)?;
+        let (seed, clipped) = resolve_class(&tx, &request.seed)?;
+        // Explicitly selected measured declarations are independent roots, never
+        // connected by lexical type-name matches or candidate relationships.
         let mut seeds = vec![seed.symbol.id.clone()];
         let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
-        if request.include_hierarchy {
-            return hierarchy_diagram(
-                &tx,
-                revision,
-                request,
-                seeds,
-                classes,
-                warnings,
-                truncated,
-                byte_limited,
-            );
-        }
-        let mut bridges = Vec::new();
-        for id in &request.expanded {
-            let (class, clipped) = resolve_class(&tx, id)?;
-            byte_limited |= clipped;
-            let id = &class.symbol.id;
-            if seeds.contains(id) {
-                continue;
+        for expanded in &request.expanded {
+            let (class, _) = resolve_class(&tx, expanded)?;
+            if !classes.contains_key(&class.symbol.id) {
+                ensure!(
+                    classes.len() < class_diagram::MAX_NODES,
+                    InvalidRequest("Too many selected classes.")
+                );
+                seeds.push(class.symbol.id.clone());
+                classes.insert(class.symbol.id.clone(), class);
             }
-            // Expansion is permitted only from the connected session history.
-            // Reserve its bridge before neighbors, so node/edge caps cannot strand it.
-            let mut bridge = None;
-            for previous in &seeds {
-                bridge = tx
-                    .query_row(
-                        "SELECT id FROM class_relations
-                    WHERE (owner=?1 AND target=?2) OR (owner=?2 AND target=?1) ORDER BY id LIMIT 1",
-                        params![previous, id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()?
-                    .map(|id| presentation_relation(&tx, &id))
-                    .transpose()?
-                    .flatten();
-                if bridge.is_some() {
-                    break;
-                }
-            }
-            let bridge = bridge.ok_or(InvalidRequest(
-                "Expand a related class with evidence within the presentation byte limit.",
-            ))?;
-            bridges.push(bridge);
-            seeds.push(id.clone());
-            classes.insert(id.clone(), class);
-        }
-        let mut relations = Vec::new();
-        let mut relation_ids: BTreeSet<String> =
-            bridges.iter().map(|relation| relation.id.clone()).collect();
-        let mut grouped_references = false;
-        // Process real class links for ALL seeds before optional terminal hints.
-        for hints in [false, true] {
-            if hints && !request.include_unmatched {
-                continue;
-            }
-            for seed in &seeds {
-                // Group BEFORE the row cap so repeated field/parameter references
-                // cannot crowd out a different related class. The source catalog
-                // is bounded at build time; owner/target indexes restrict this scan.
-                // Join back by the minimum actual ID: range and certainty belong
-                // to that one recorded occurrence, never an invented union range.
-                let filter = if hints {
-                    "owner=?1 AND target IS NULL"
-                } else {
-                    "target IS NOT NULL AND (owner=?1 OR target=?1)"
-                };
-                let sql = format!("SELECT r.id,g.occurrences FROM class_relations r JOIN (
-                    SELECT min(id) AS representative,count(*) AS occurrences,
-                        CASE WHEN owner=?1 THEN 0 ELSE 1 END AS direction FROM class_relations
-                    WHERE {filter}
-                    GROUP BY owner,target,CASE WHEN target IS NULL THEN json_extract(payload,'$.typeName') ELSE '' END,
-                        json_extract(payload,'$.kind'),json_extract(payload,'$.matchKind')
-                    ORDER BY direction,representative LIMIT ?2
-                    ) g ON r.id=g.representative ORDER BY g.direction,r.id");
-                let mut stmt = tx.prepare(&sql)?;
-                let candidates = stmt
-                    .query_map(params![seed, (MAX_EDGES + 1) as i64], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                if candidates.len() > MAX_EDGES {
-                    truncated = true;
-                }
-                for (id, occurrences) in candidates.into_iter().take(MAX_EDGES) {
-                    grouped_references |= occurrences > 1;
-                    if relation_ids.contains(&id) {
-                        continue;
-                    }
-                    if relations.len() >= MAX_EDGES {
-                        truncated = true;
-                        break;
-                    }
-                    relation_ids.insert(id.clone());
-                    let Some(relation) = presentation_relation(&tx, &id)? else {
-                        byte_limited = true;
-                        continue;
-                    };
-                    let mut endpoints_present = true;
-                    for id in std::iter::once(&relation.owner).chain(relation.target.iter()) {
-                        if classes.contains_key(id) {
-                            continue;
-                        }
-                        if classes.len() >= class_diagram::MAX_NODES {
-                            truncated = true;
-                            endpoints_present = false;
-                            break;
-                        }
-                        if let Some((class, _, clipped)) = presentation_class(&tx, id)? {
-                            byte_limited |= clipped;
-                            classes.insert(id.clone(), class);
-                        } else {
-                            byte_limited = true;
-                            endpoints_present = false;
-                        }
-                    }
-                    if endpoints_present {
-                        relations.push(relation);
-                    }
-                }
-            }
-        }
-        if byte_limited {
-            truncated = true;
-            warnings.push(class_diagram::BYTE_NOTICE.into());
-        }
-        if grouped_references {
-            warnings.push("Repeated same-kind references are grouped; each diagram edge shows one representative source range.".into());
         }
         class_diagram::project(
-            revision, &seeds, &classes, bridges, relations, warnings, truncated,
+            revision,
+            &seeds,
+            &classes,
+            vec![],
+            vec![],
+            warnings,
+            truncated || clipped,
         )
     }
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
@@ -1619,73 +1244,32 @@ impl Store {
         let revision = self.read_status(&tx)?.revision;
         let seed: Option<Symbol> = one(&tx, "SELECT payload FROM nodes WHERE id=?1", &query.seed)?;
         let Some(seed) = seed else { return Ok(None) };
-        let excluded = |path: &str| query.exclude_paths.iter().any(|p| path.starts_with(p));
-        let mut nodes = BTreeMap::from([(seed.id.clone(), seed)]);
-        let mut queue = VecDeque::from([(query.seed.clone(), 0usize)]);
-        let mut calls = BTreeMap::new();
+        let mut calls = Vec::new();
         let mut region_ids = BTreeSet::new();
-        let mut omitted = BTreeSet::new();
         let mut truncated = false;
-        while let Some((id, depth)) = queue.pop_front() {
-            if depth >= query.depth {
-                continue;
-            }
-            let mut stmt =
-                tx.prepare("SELECT payload FROM calls WHERE caller=?1 ORDER BY path,json_extract(payload,'$.range.startByte'),json_extract(payload,'$.range.endByte') DESC,id")?;
-            let values = stmt.query_map([&id], |r| r.get::<_, String>(0))?;
-            for value in values {
-                let call: CallSite = serde_json::from_str(&value?)?;
-                if excluded(&call.path) {
+        if !query.exclude_paths.iter().any(|p| seed.path.starts_with(p)) {
+            let mut stmt = tx.prepare("SELECT payload FROM calls WHERE caller=?1 ORDER BY path,json_extract(payload,'$.range.startByte'),json_extract(payload,'$.range.endByte') DESC,id LIMIT ?2")?;
+            let rows = stmt.query_map(params![seed.id, (query.max_calls + 1) as i64], |r| {
+                r.get::<_, String>(0)
+            })?;
+            for payload in rows {
+                let call: CallSite = serde_json::from_str(&payload?)?;
+                if query.exclude_paths.iter().any(|p| call.path.starts_with(p)) {
                     continue;
                 }
                 if calls.len() >= query.max_calls {
                     truncated = true;
                     break;
                 }
-                let mut targets = Vec::new();
-                if call.resolution == Resolution::Internal
-                    && let Some(t) = &call.target
-                {
-                    targets.push(t.clone());
-                }
-                if query.include_callbacks {
-                    targets.extend(call.callback_arguments.iter().cloned());
-                }
-                targets.sort();
-                targets.dedup();
-                for target in targets {
-                    if nodes.contains_key(&target) {
-                        continue;
-                    }
-                    let node: Option<Symbol> =
-                        one(&tx, "SELECT payload FROM nodes WHERE id=?1", &target)?;
-                    let Some(node) = node else { continue };
-                    if excluded(&node.path) {
-                        continue;
-                    }
-                    if nodes.len() >= query.max_nodes {
-                        truncated = true;
-                        omitted.insert(target);
-                        continue;
-                    }
-                    queue.push_back((target.clone(), depth + 1));
-                    nodes.insert(target, node);
-                }
                 region_ids.extend(call.regions.iter().cloned());
-                calls.insert(call.id.clone(), call);
+                calls.push(call);
             }
         }
         let mut regions = BTreeMap::new();
         while let Some(id) = region_ids.pop_first() {
-            if regions.contains_key(&id) {
-                continue;
-            }
             let region: Option<ControlRegion> =
                 one(&tx, "SELECT payload FROM regions WHERE id=?1", &id)?;
             if let Some(region) = region {
-                if excluded(&region.path) {
-                    continue;
-                }
                 if let Some(parent) = &region.parent {
                     region_ids.insert(parent.clone());
                 }
@@ -1696,30 +1280,13 @@ impl Store {
         Ok(Some(ViewResult {
             revision,
             query: query.clone(),
-            nodes: nodes.into_values().collect(),
-            calls: {
-                let mut sites: Vec<CallSite> = calls.into_values().collect();
-                sites.sort_by(|a, b| {
-                    (
-                        &a.path,
-                        a.range.start_byte,
-                        std::cmp::Reverse(a.range.end_byte),
-                        &a.id,
-                    )
-                        .cmp(&(
-                            &b.path,
-                            b.range.start_byte,
-                            std::cmp::Reverse(b.range.end_byte),
-                            &b.id,
-                        ))
-                });
-                sites
-            },
+            nodes: vec![seed],
+            calls,
             regions: regions.into_values().collect(),
             truncated,
-            omitted_nodes: omitted.len(),
+            omitted_nodes: 0,
             warnings: if truncated {
-                vec!["View truncated by node or call limits; omittedNodes counts discovered omitted targets only.".into()]
+                vec!["Measured calls truncated at the request limit.".into()]
             } else {
                 vec![]
             },
@@ -1752,6 +1319,18 @@ impl Store {
         let views = self.records().views()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
+        if self.read_control_status(&tx)?.evidence_format.is_none() {
+            return Ok(views
+                .into_iter()
+                .map(|view| SavedViewState {
+                    orphaned_ids: std::iter::once(view.query.seed.clone())
+                        .chain(view.pins.keys().cloned())
+                        .chain(view.hidden.iter().cloned())
+                        .collect(),
+                    view,
+                })
+                .collect());
+        }
         views
             .into_iter()
             .map(|v| Self::resolve_view(&tx, v))
@@ -1761,6 +1340,15 @@ impl Store {
         let view = self.records().view(id)?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
+        if self.read_control_status(&tx)?.evidence_format.is_none() {
+            return Ok(view.map(|view| SavedViewState {
+                orphaned_ids: std::iter::once(view.query.seed.clone())
+                    .chain(view.pins.keys().cloned())
+                    .chain(view.hidden.iter().cloned())
+                    .collect(),
+                view,
+            }));
+        }
         view.map(|v| Self::resolve_view(&tx, v)).transpose()
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
@@ -1775,6 +1363,15 @@ impl Store {
         let annotations = self.records().annotations()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
+        if self.read_control_status(&tx)?.evidence_format.is_none() {
+            return Ok(annotations
+                .into_iter()
+                .map(|annotation| AnnotationState {
+                    annotation,
+                    orphaned: true,
+                })
+                .collect());
+        }
         annotations
             .into_iter()
             .map(|annotation| {

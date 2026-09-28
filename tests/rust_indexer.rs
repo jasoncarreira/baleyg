@@ -36,6 +36,13 @@ fn configured() { opaque!(not_a_call()); let c = || separate(); after(); }
     assert_eq!(g, run(&o));
     assert_eq!(g.stats.files, 2);
     assert_eq!(g.stats.parse_error_files, 0);
+    assert!(
+        g.diagnostics
+            .iter()
+            .any(|d| d.path.as_deref() == Some("lib.rs")
+                && d.code == "native-coverage-partial"
+                && d.message.contains("opaque Rust"))
+    );
     assert_eq!(
         g.files
             .iter()
@@ -54,21 +61,26 @@ fn configured() { opaque!(not_a_call()); let c = || separate(); after(); }
     assert_eq!(
         calls
             .iter()
-            .map(|c| (c.callee_text.as_str(), c.ordinal))
+            .map(|c| c.callee_text.as_deref())
             .collect::<Vec<_>>(),
-        [("outer", 1), ("inner", 2)]
+        [Some("outer"), Some("inner")]
     );
-    let methods: Vec<_> = g
-        .nodes
-        .iter()
-        .filter(|n| n.kind == SymbolKind::Method)
-        .collect();
-    assert_eq!(methods.len(), 2); // no callable fabricated for bodyless trait signature
-    assert_eq!(methods.iter().filter(|n| n.name == "signature").count(), 1);
+    assert_eq!(calls.iter().map(|c| c.ordinal).collect::<Vec<_>>(), [0, 1]);
+    // #22 retains source-measured function signatures, without inferring a call edge.
+    assert!(
+        g.nodes
+            .iter()
+            .any(|n| n.name == "signature" && n.kind == SymbolKind::Method)
+    );
+    assert!(
+        !g.calls
+            .iter()
+            .any(|c| c.callee_text.as_deref() == Some("signature"))
+    );
     let closure_call = g
         .calls
         .iter()
-        .find(|c| c.callee_text == "closure_call")
+        .find(|c| c.callee_text.as_deref() == Some("closure_call"))
         .unwrap();
     let closure = g
         .nodes
@@ -79,30 +91,33 @@ fn configured() { opaque!(not_a_call()); let c = || separate(); after(); }
         &source[closure.range.start_byte..closure.range.end_byte],
         "|x| closure_call(x)"
     );
-    let invoke = g.calls.iter().find(|c| c.callee_text == "invoke").unwrap();
-    assert_eq!(invoke.callback_arguments, std::slice::from_ref(&closure.id));
+    let invoke = g
+        .calls
+        .iter()
+        .find(|c| c.callee_text.as_deref() == Some("invoke"))
+        .unwrap();
+    assert_ne!(invoke.caller, closure.id);
     assert_ne!(invoke.caller, closure_call.caller);
     assert!(!g.nodes.iter().any(|n| n.name == "invisible"));
-    assert!(
-        !g.calls
-            .iter()
-            .any(|c| matches!(c.callee_text.as_str(), "hidden" | "not_a_call" | "opaque"))
-    );
+    assert!(!g.calls.iter().any(|c| matches!(
+        c.callee_text.as_deref(),
+        Some("hidden" | "not_a_call" | "opaque")
+    )));
     let separate = g
         .calls
         .iter()
-        .find(|c| c.callee_text == "separate")
+        .find(|c| c.callee_text.as_deref() == Some("separate"))
         .unwrap();
-    let after = g.calls.iter().find(|c| c.callee_text == "after").unwrap();
+    let after = g
+        .calls
+        .iter()
+        .find(|c| c.callee_text.as_deref() == Some("after"))
+        .unwrap();
     assert_ne!(separate.caller, after.caller);
-    assert!(
-        g.calls
-            .iter()
-            .filter(|c| c.path == "lib.rs")
-            .all(|c| c.resolution == Resolution::Unresolved
-                && c.provenance.semantic == SemanticState::Unavailable)
-    );
-    assert!(g.diagnostics.iter().any(|d| d.code == "rust-lexical-only"));
+    assert!(g.calls.iter().filter(|c| c.path == "lib.rs").all(
+        |c| c.id.starts_with("occ:v1:") && c.provenance.semantic == SemanticState::Unavailable
+    ));
+    assert!(g.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
 }
 #[test]
 fn recovered_rust_retains_syntax_and_cached_source() {
@@ -156,10 +171,12 @@ fn cargo_hash_inputs_and_fresh_scip_do_not_resolve_rust() {
     o.scip_path = Some(d.path().join("index.scip"));
     o.manifest_path = Some(d.path().join("manifest.json"));
     let g = run(&o);
-    assert_eq!(g.stats.semantic_state, SemanticState::Fresh);
-    assert!(g.calls.iter().all(|c| c.candidate_symbols.is_empty()
-        && c.target.is_none()
-        && c.provenance.semantic == SemanticState::Unavailable));
+    assert_eq!(g.stats.semantic_state, SemanticState::Unavailable);
+    assert!(
+        g.calls
+            .iter()
+            .all(|c| c.provenance.semantic == SemanticState::Unavailable)
+    );
     assert!(
         g.nodes
             .iter()
@@ -168,8 +185,9 @@ fn cargo_hash_inputs_and_fresh_scip_do_not_resolve_rust() {
     fs::write(d.path().join("Cargo.lock"), "changed").unwrap();
     fs::write(d.path().join("Cargo.toml"), "changed").unwrap();
     let stale = run(&o);
-    assert_eq!(stale.stats.semantic_state, SemanticState::Stale);
-    assert_eq!(stale.stats.changed_files, ["Cargo.lock", "Cargo.toml"]);
+    assert_eq!(stale.stats.semantic_state, SemanticState::Unavailable);
+    assert_eq!(stale.calls.len(), g.calls.len());
+    assert_ne!(stale.calls[0].id, g.calls[0].id);
 }
 
 #[test]

@@ -1208,16 +1208,35 @@ fn inspect_index(dir: &Path, key: &str, now_secs: i64) -> Result<(&'static str, 
     private_dir(dir)?;
     let db = readonly_db(&dir.join("index.db"))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version == 4, "incompatible index schema");
-    let (schema, spelling, dev, ino, age): (i64, String, String, String, rusqlite::types::Value) = db.query_row(
-        "SELECT schema_version,root_spelling,root_device,root_inode,last_opened_at FROM index_metadata WHERE singleton=1", [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+    ensure!(matches!(version, 4 | 5), "incompatible index schema");
+    // GC may classify only the two exact cache formats this binary knows.
+    // The same structural and extractor-marker check applies before it can
+    // declare an index eligible for deletion or report it as recently opened.
+    let defined = db.prepare("SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+    let expected: std::collections::BTreeSet<String> =
+        format!("{}{}", super::CACHE_SCHEMA, super::CLASS_SCHEMA)
+            .split(';')
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+            .map(str::to_owned)
+            .collect();
+    ensure!(defined == expected, "incompatible index shape");
+    let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
+    ensure!(count == 1, "incompatible index metadata cardinality");
+    let (schema, extractor, spelling, dev, ino, age): (i64, String, String, String, String, rusqlite::types::Value) = db.query_row(
+        "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,last_opened_at FROM index_metadata WHERE singleton=1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
     ensure!(
-        schema == 4
+        ((version == 4 && schema == 4 && extractor == "native-v1")
+            || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1"))
             && Path::new(&spelling).is_absolute()
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"
     );
+    let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    ensure!(integrity == "ok", "incompatible index integrity");
     let device: u64 = dev.parse()?;
     let inode: u64 = ino.parse()?;
     ensure!(device > 0 && inode > 0, "invalid root identity");

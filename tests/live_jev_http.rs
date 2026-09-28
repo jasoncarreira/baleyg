@@ -24,22 +24,8 @@ mod offline {
         std::fs::write(workspace.join("a.js"), format!("function leaf() {{}}\nfunction helper() {{ leaf(); }}\nfunction seed(flag) {{ if (flag) helper(); console.log(flag); }}\n//{}", "x".repeat(padding))).unwrap();
         let options = IndexOptions::new(workspace.clone());
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut graph = index_workspace(&options, &cancel, |_| {}).unwrap();
-        // Synthetic internal links exercise deeper-display policy; lexical indexing does not infer them.
-        for call in &mut graph.calls {
-            if matches!(call.callee_text.as_str(), "helper" | "leaf") {
-                call.target = Some(
-                    graph
-                        .nodes
-                        .iter()
-                        .find(|n| n.name == call.callee_text)
-                        .unwrap()
-                        .id
-                        .clone(),
-                );
-                call.resolution = Resolution::Internal;
-            }
-        }
+        let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
+        // Named calls remain measured terminal sites; they do not link to sibling declarations.
         let seed = graph
             .nodes
             .iter()

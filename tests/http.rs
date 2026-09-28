@@ -374,3 +374,197 @@ async fn local_design_assets_preserve_same_origin_guards() {
         404
     );
 }
+
+#[tokio::test]
+async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_comparison() {
+    use baleyg::indexer::index_workspace_with_capture;
+    let (dir, store, _state, app) = setup();
+    let workspace = dir.path().join("workspace");
+    std::fs::write(workspace.join("a.js"), "function go() { console.log(1); }").unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, capture) = index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+    let pin = store
+        .publish_captured(
+            &graph,
+            &capture,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let seed = graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "go")
+        .unwrap()
+        .id
+        .clone();
+    let (code, preview) = call(
+        &app,
+        "POST",
+        "/api/questions/preview",
+        json!({"seed":seed,"question":"what happens?","expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{preview}");
+    let packet = preview["packet"]["packetId"].as_str().unwrap();
+    let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    {
+        let db = rusqlite::Connection::open(&index).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+    }
+    let same_old_pair = json!(pin).to_string();
+    let unauthenticated = Request::builder()
+        .method("POST")
+        .uri("/api/index")
+        .header("host", "127.0.0.1:7331")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unauthenticated).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for (method, path, body) in [
+        ("GET", "/api/status".to_owned(), Value::Null),
+        ("GET", "/api/symbols?q=go".to_owned(), Value::Null),
+        ("GET", "/api/source?path=a.js".to_owned(), Value::Null),
+        ("GET", "/api/classes".to_owned(), Value::Null),
+        ("GET", "/api/tree".to_owned(), Value::Null),
+        ("GET", "/api/files".to_owned(), Value::Null),
+        ("GET", "/api/dependencies".to_owned(), Value::Null),
+        (
+            "POST",
+            "/api/navigation".to_owned(),
+            json!({"expectedRevision":pin,"path":"a.js","line":1}),
+        ),
+        (
+            "POST",
+            "/api/sequence".to_owned(),
+            json!({"seed":seed,"expectedRevision":pin}),
+        ),
+        (
+            "POST",
+            "/api/class-diagram".to_owned(),
+            json!({"seed":seed,"expectedRevision":pin}),
+        ),
+        (
+            "POST",
+            "/api/query".to_owned(),
+            json!({"seed":seed,"includeCallbacks":true}),
+        ),
+        (
+            "POST",
+            "/api/questions/preview".to_owned(),
+            json!({"seed":seed,"question":"what?","expectedRevision":pin}),
+        ),
+        (
+            "GET",
+            format!("/api/questions/{packet}/jev-request"),
+            Value::Null,
+        ),
+        (
+            "POST",
+            format!("/api/questions/{packet}/selection"),
+            json!({"packetId":packet,"decisions":[]}),
+        ),
+        (
+            "POST",
+            format!("/api/questions/{packet}/jev-response"),
+            json!({}),
+        ),
+        (
+            "POST",
+            format!("/api/questions/{packet}/jev-run"),
+            json!({}),
+        ),
+        (
+            "POST",
+            format!("/api/questions/{packet}/acp-answer"),
+            json!({}),
+        ),
+    ] {
+        let (status, response) = call(&app, method, &path, body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {path}: {response}"
+        );
+        assert_eq!(response["error"]["code"], "index_not_ready");
+        assert!(
+            !response.to_string().contains(&same_old_pair),
+            "old pin escaped {path}"
+        );
+    }
+    assert_eq!(
+        call(&app, "GET", "/api/jobs/current", Value::Null).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/acp/status", Value::Null).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/jev/status", Value::Null).await.0,
+        StatusCode::OK
+    );
+    let (code, job) = call(&app, "POST", "/api/index", json!({"expectedRevision":pin})).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    let id = job["id"].as_str().unwrap();
+    let done = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, current) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            if !current["finishedAt"].is_null() {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(done["state"], "completed", "{done}");
+    let (status, ready) = call(&app, "GET", "/api/status", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["evidenceFormat"], "terminal-native-graph-v1");
+    assert_ne!(
+        ready["revision"]["indexGeneration"],
+        json!(pin)["indexGeneration"]
+    );
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            &format!("/api/questions/{packet}/jev-request"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, graph_result) = call(
+        &app,
+        "POST",
+        "/api/query",
+        json!({"seed":seed,"includeCallbacks":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{graph_result}");
+    assert_eq!(graph_result["nodes"].as_array().unwrap().len(), 1);
+    assert!(
+        graph_result["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|call| call.get("target").is_none())
+    );
+}

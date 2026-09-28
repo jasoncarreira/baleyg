@@ -1,4 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -96,6 +104,9 @@ pub struct Provenance {
 pub struct Symbol {
     pub id: String,
     pub name: String,
+    /// Untrusted SCIP display metadata, never a node ID or semantic relation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
     pub kind: SymbolKind,
     pub path: String,
     pub range: SourceRange,
@@ -112,19 +123,20 @@ pub enum Resolution {
     Ambiguous,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CallSite {
     pub id: String,
     pub caller: String,
-    pub callee_text: String,
+    /// Source-witnessed spelling, or explicit null when no expression is provable.
+    #[serde(deserialize_with = "required_nullable")]
+    pub callee_text: Option<String>,
     pub path: String,
     pub range: SourceRange,
-    pub target: Option<String>,
-    pub candidate_symbols: Vec<String>,
-    pub resolution: Resolution,
+    /// Exact measured callee token when provable; independent from spelling nullability.
+    #[serde(deserialize_with = "required_nullable")]
+    pub callee_range: Option<SourceRange>,
     pub ordinal: usize,
     pub regions: Vec<String>,
-    pub callback_arguments: Vec<String>,
     pub provenance: Provenance,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,6 +209,8 @@ pub struct IndexStatus {
     pub workspace_root: String,
     pub revision: IndexPin,
     pub indexed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_format: Option<String>,
     pub stats: IndexStats,
     pub diagnostics: Vec<Diagnostic>,
 }

@@ -56,13 +56,14 @@ fn node(id: &str) -> Symbol {
             source: "syntax".into(),
             semantic: SemanticState::Unavailable,
         },
+        display_label: None,
     }
 }
 fn call(id: &str, from: &str, to: &str) -> CallSite {
     CallSite {
         id: id.into(),
         caller: from.into(),
-        callee_text: to.into(),
+        callee_text: Some(to.into()),
         path: "a.js".into(),
         range: SourceRange {
             start_line: 1,
@@ -71,12 +72,9 @@ fn call(id: &str, from: &str, to: &str) -> CallSite {
             end_column: 1,
             ..SourceRange::default()
         },
-        target: Some(to.into()),
-        candidate_symbols: vec![],
-        resolution: Resolution::Internal,
+        callee_range: None,
         ordinal: 0,
         regions: vec![],
-        callback_arguments: vec![],
         provenance: node("").provenance,
     }
 }
@@ -292,10 +290,7 @@ fn traversal_cycles_bounds_callbacks_and_boundaries() {
     let mut graph = graph();
     graph.nodes.push(node("callback"));
     graph.nodes.push(node("external"));
-    let mut external = call("ae", "a", "external");
-    external.resolution = Resolution::External;
-    external.callback_arguments.push("callback".into());
-    graph.calls.push(external.clone());
+    graph.calls.push(call("ae", "a", "external"));
     store
         .publish(
             &graph,
@@ -305,33 +300,33 @@ fn traversal_cycles_bounds_callbacks_and_boundaries() {
         )
         .unwrap();
     let mut q = query();
-    let view = store.query_view(&q).unwrap().unwrap();
+    let seed = store.query_view(&q).unwrap().unwrap();
     assert_eq!(
-        view.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
-        vec!["a", "b"]
+        seed.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+        vec!["a"]
     );
-    assert_eq!(view.calls.len(), 2);
+    assert_eq!(seed.calls.len(), 2);
     q.include_callbacks = true;
-    let view = store.query_view(&q).unwrap().unwrap();
-    assert!(view.nodes.iter().any(|n| n.id == "callback"));
-    assert!(!view.nodes.iter().any(|n| n.id == "external"));
-    assert_eq!(view.calls.iter().find(|c| c.id == "ae"), Some(&external));
     q.depth = 5;
-    assert_eq!(store.query_view(&q).unwrap().unwrap().nodes.len(), 4);
+    let inert = store.query_view(&q).unwrap().unwrap();
+    assert_eq!(inert.nodes, seed.nodes);
+    assert_eq!(inert.calls, seed.calls);
+    assert!(
+        !inert
+            .nodes
+            .iter()
+            .any(|n| matches!(n.id.as_str(), "callback" | "external"))
+    );
     q.max_nodes = 1;
-    let bounded = store.query_view(&q).unwrap().unwrap();
-    assert_eq!(bounded.nodes.len(), 1);
-    assert!(bounded.truncated);
-    assert!(!bounded.warnings.is_empty());
-    q.max_nodes = 150;
+    assert!(!store.query_view(&q).unwrap().unwrap().truncated);
     q.max_calls = 1;
     let bounded = store.query_view(&q).unwrap().unwrap();
     assert_eq!(bounded.calls.len(), 1);
     assert!(bounded.truncated);
     q.exclude_paths.push("a.js".into());
-    let view = store.query_view(&q).unwrap().unwrap();
-    assert_eq!(view.nodes.len(), 1);
-    assert!(view.calls.is_empty());
+    let excluded = store.query_view(&q).unwrap().unwrap();
+    assert_eq!(excluded.nodes.len(), 1);
+    assert!(excluded.calls.is_empty());
     q.seed = "missing".into();
     assert!(store.query_view(&q).unwrap().is_none());
     q.depth = 6;
@@ -525,14 +520,15 @@ fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
         .unwrap();
     let baseline = store.graph().unwrap();
     assert_eq!(baseline.stats.symbols, 3);
-    assert_eq!(baseline.stats.internal, 3);
+    assert_eq!(baseline.stats.internal, 0);
+    assert_eq!(baseline.stats.unresolved, 3);
     for kind in 0..7 {
         let mut bad = graph();
         match kind {
             0 => bad.calls[0].caller = "missing".into(),
-            1 => bad.calls[0].target = Some("missing".into()),
+            1 => bad.calls[0].id = bad.calls[1].id.clone(),
             2 => bad.calls[0].regions.push("missing".into()),
-            3 => bad.calls[0].callback_arguments.push("missing".into()),
+            3 => bad.calls[0].range.end_byte = usize::MAX,
             4 => bad.nodes[0].parent = Some("missing".into()),
             5 => bad.nodes[0].range.end_byte = usize::MAX,
             _ => bad.nodes[0].range.start_line = 0,
@@ -613,25 +609,22 @@ fn refuses_unversioned_existing_index_without_migration() {
 }
 
 #[test]
-fn unresolved_candidate_evidence_need_not_be_a_graph_node() {
-    let (_state, _work, store) = fixture();
-    let mut graph = graph();
-    graph.calls[0].candidate_symbols = vec![
-        "external package symbol".into(),
-        "local callback parameter".into(),
-    ];
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            store.status().unwrap().revision,
-            &cancel(),
-        )
-        .unwrap();
-    assert_eq!(
-        store.graph().unwrap().calls[0].candidate_symbols,
-        graph.calls[0].candidate_symbols
-    );
+fn graph_call_dto_rejects_lexical_proof_fields() {
+    let call = call("ab", "a", "b");
+    let mut value = serde_json::to_value(call).unwrap();
+    for field in [
+        "target",
+        "candidateSymbols",
+        "resolution",
+        "callbackArguments",
+    ] {
+        value[field] = serde_json::json!("unsupported");
+        assert!(
+            serde_json::from_value::<CallSite>(value.clone()).is_err(),
+            "{field}"
+        );
+        value.as_object_mut().unwrap().remove(field);
+    }
 }
 
 #[test]
@@ -690,4 +683,108 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
             .contains("recovery_required")
     );
     assert!(journal.exists());
+}
+
+#[test]
+fn legacy_cache_is_control_only_until_lock_safe_rebaseline_rotates_full_pair() {
+    use baleyg::indexer::{IndexOptions, index_workspace_with_capture};
+    let (state, work, store) = fixture();
+    std::fs::write(
+        work.path().join("a.js"),
+        "function one() { console.log('measured'); }",
+    )
+    .unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let (graph, capture) = index_workspace_with_capture(&options, &cancel(), |_| {}).unwrap();
+    let first = store
+        .publish_captured(
+            &graph,
+            &capture,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel(),
+        )
+        .unwrap();
+    let path = index_db(state.path());
+    drop(store);
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        // This old cached row contains a lexical proof field that MUST never escape.
+        db.execute("UPDATE calls SET payload=json_set(payload, '$.target', 'guessed-node', '$.resolution','internal')", []).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    assert_eq!(store.index_baseline().unwrap(), first);
+    for result in [
+        store.status().map(|_| ()),
+        store.graph().map(|_| ()),
+        store.symbols_at("", 10).map(|_| ()),
+        store.source("a.js").map(|_| ()),
+        store
+            .query_view(&ViewQuery {
+                seed: graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.name == "one")
+                    .unwrap()
+                    .id
+                    .clone(),
+                depth: 1,
+                max_nodes: 40,
+                max_calls: 200,
+                include_callbacks: true,
+                exclude_paths: vec![],
+            })
+            .map(|_| ()),
+    ] {
+        assert!(result.unwrap_err().to_string().contains("index_not_ready"));
+    }
+    let old_bytes = std::fs::read(&path).unwrap();
+    let rejected = store.publish_captured(
+        &graph,
+        &capture,
+        &store.leader().unwrap(),
+        first,
+        &Arc::new(AtomicBool::new(true)),
+    );
+    assert!(rejected.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+    assert!(store.status().is_err());
+    // The captured source, root, use and leader locks, and full expected pair all
+    // participate in the same SQLite transaction before the new marker appears.
+    let next = store
+        .publish_captured(&graph, &capture, &store.leader().unwrap(), first, &cancel())
+        .unwrap();
+    assert_ne!(next.index_generation, first.index_generation);
+    assert_eq!(next.index_revision, first.index_revision + 1);
+    assert_eq!(
+        store.status().unwrap().evidence_format.as_deref(),
+        Some("terminal-native-graph-v1")
+    );
+    assert!(
+        store
+            .source_at("a.js", Some(first))
+            .unwrap_err()
+            .to_string()
+            .contains("revision conflict")
+    );
+    let saved = store.graph().unwrap();
+    assert_eq!(saved.calls, graph.calls);
+    assert!(
+        !serde_json::to_string(&saved)
+            .unwrap()
+            .contains("guessed-node")
+    );
+    assert!(
+        store
+            .publish_captured(&graph, &capture, &store.leader().unwrap(), first, &cancel())
+            .unwrap_err()
+            .to_string()
+            .starts_with("revision conflict")
+    );
 }

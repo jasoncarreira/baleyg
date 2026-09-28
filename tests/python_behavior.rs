@@ -63,7 +63,7 @@ fn evaluation_order_source_evidence_and_no_constructor_guess() {
             .unwrap();
         assert_eq!(step.range, call.range);
         assert_eq!(step.path, call.path);
-        assert_eq!(step.resolution, Some(Resolution::Unresolved));
+        assert!(step.resolution.is_none() && step.target.is_none());
     }
     assert!(
         view.participants
@@ -175,13 +175,13 @@ fn nested_definitions_class_execution_and_lambda_invocation_are_separate() {
             .iter()
             .any(|w| w.contains("Definition boundary"))
     );
-    let lambda = graph
-        .nodes
-        .iter()
-        .find(|n| n.name.starts_with("<lambda@"))
-        .unwrap();
-    let view = build_sequence(test_pin(9), lambda, &graph.files[0], &graph.calls, true).unwrap();
-    assert_eq!(calls(&view.steps), ["lambda_call"]);
+    assert!(!calls(&view.steps).contains(&"lambda_call"));
+    assert!(graph.calls.iter().all(|call| {
+        !view
+            .steps
+            .iter()
+            .any(|step| step.call_id.as_ref() == Some(&call.id) && call.path != view.seed.path)
+    }));
 }
 #[test]
 fn unsupported_forms_are_boundaries_not_unconditional_calls() {
@@ -316,11 +316,12 @@ fn local_annotations_never_execute_and_valued_targets_keep_assignment_order() {
         ]
     );
     assert!(
-        !graph
+        graph
             .calls
             .iter()
-            .any(|c| c.callee_text == "annotation_call")
+            .any(|c| c.callee_text.as_deref() == Some("annotation_call"))
     );
+    assert!(!calls(&view.steps).contains(&"annotation_call"));
     assert_eq!(
         flatten(&view.steps)
             .iter()
@@ -374,10 +375,10 @@ fn future_annotations_does_not_change_local_assignment_execution() {
             ["rhs", "other", "obj", "last", "target", "key"]
         );
         assert!(
-            !graph
+            graph
                 .calls
                 .iter()
-                .any(|c| c.callee_text == "annotation_call")
+                .any(|c| c.callee_text.as_deref() == Some("annotation_call"))
         );
         assert!(!flatten(&view.steps).iter().any(|s| s.kind == "boundary"));
     }
@@ -408,11 +409,20 @@ fn postponed_nested_async_factory_is_straight_and_body_stays_deferred() {
         build_sequence(test_pin(8), callback, &graph.files[0], &graph.calls, false).unwrap();
     assert_eq!(calls(&selected.steps), ["callback"]);
     assert!(flatten(&selected.steps).iter().any(|s| s.kind == "await"));
+    assert!(graph.calls.iter().any(|c| {
+        c.callee_text
+            .as_deref()
+            .is_some_and(|name| name.contains("annotation"))
+    }));
     assert!(
-        !graph
-            .calls
+        !calls(&view.steps)
             .iter()
-            .any(|c| c.callee_text.contains("annotation"))
+            .any(|name| name.contains("annotation"))
+    );
+    assert!(
+        !calls(&selected.steps)
+            .iter()
+            .any(|name| name.contains("annotation"))
     );
 }
 

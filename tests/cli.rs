@@ -94,7 +94,8 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     let view: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(view["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(view["calls"].as_array().unwrap().len(), 1);
-    assert_eq!(view["calls"][0]["resolution"], "unresolved");
+    assert!(view["calls"][0].get("resolution").is_none());
+    assert!(view["calls"][0].get("target").is_none());
     let path = temp.path().join("graph.json");
     assert!(
         command(&root, &state, "export")
@@ -667,4 +668,77 @@ fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
     assert_eq!(fs::read(&path).unwrap(), before);
     assert_eq!(fs::read(&lock).unwrap(), lock_before);
     assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+}
+
+#[test]
+fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function go() { foo(); }").unwrap();
+    let first = command(&root, &home, "index").output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let old_pin = first["status"]["revision"].clone();
+    let cached = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let path = fs::read_dir(cached)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        db.execute("UPDATE calls SET payload=json_set(payload,'$.target','lexical-guess','$.resolution','internal')",[]).unwrap();
+    }
+    for sub in ["status", "symbols", "query", "export"] {
+        let mut cmd = command(&root, &home, sub);
+        if sub == "query" {
+            cmd.arg("--seed").arg("sid:v1:untrusted");
+        }
+        let result = cmd.output().unwrap();
+        assert!(
+            !result.status.success(),
+            "{sub} unexpectedly read old index"
+        );
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(visible.contains("index_not_ready"), "{sub}: {visible}");
+        assert!(!visible.contains(old_pin["indexGeneration"].as_str().unwrap()));
+        assert!(!visible.contains("lexical-guess"));
+    }
+    let next = command(&root, &home, "index").output().unwrap();
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let next: Value = serde_json::from_slice(&next.stdout).unwrap();
+    assert_ne!(
+        next["status"]["revision"]["indexGeneration"],
+        old_pin["indexGeneration"]
+    );
+    assert_eq!(next["status"]["evidenceFormat"], "terminal-native-graph-v1");
+    let exported = command(&root, &home, "export").output().unwrap();
+    assert!(exported.status.success());
+    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert!(!graph.to_string().contains("lexical-guess"));
 }

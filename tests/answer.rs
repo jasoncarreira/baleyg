@@ -189,10 +189,10 @@ fn prompt_preserves_full_graph_and_each_complete_source_once() {
     assert_eq!(p, before);
     for phrase in [
         "untrusted DATA",
-        "STATIC graph",
+        "bounded source evidence",
         "callback",
         "precise branch",
-        "No inferred execution timeline",
+        "not a semantic graph or execution timeline",
         "unverified model caveats",
     ] {
         assert!(prompt.contains(phrase), "{phrase}");

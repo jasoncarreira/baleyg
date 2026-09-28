@@ -1,7 +1,7 @@
 //! Python-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
 use crate::behavior::{Participant, SequenceStep, SequenceView};
-use crate::model::{CallSite, IndexPin, Resolution, SourceFile, SourceRange, Symbol, SymbolKind};
+use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
@@ -673,9 +673,7 @@ impl Builder<'_> {
             call_label(n, self.file),
         ) {
             s.call_id = Some(c.id);
-            s.resolution = Some(Resolution::Unresolved);
             s.range = c.range;
-            s.target = target;
             f.steps.push(s);
         }
         self.then(evaluation, f, n)

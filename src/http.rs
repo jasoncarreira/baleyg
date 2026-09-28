@@ -3,7 +3,7 @@ use crate::{
     acp::Acp,
     auth::valid_token,
     dependencies::{Catalog, CatalogOptions},
-    indexer::{IndexOptions, index_workspace},
+    indexer::IndexOptions,
     jev,
     live_jev::LiveJev,
     model::*,
@@ -407,6 +407,11 @@ impl From<anyhow::Error> for ApiError {
                     "workspace_id_changed",
                 ),
                 ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
+                (
+                    "index_not_ready",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "index_not_ready",
+                ),
                 (
                     "incompatible_index",
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1217,7 +1222,9 @@ async fn sequence(
         )
     })?
     .map_err(|e| {
-        if e.to_string().starts_with("revision conflict") {
+        if e.to_string().starts_with("revision conflict")
+            || e.to_string().starts_with("index_not_ready")
+        {
             e.into()
         } else {
             browse_invalid()
@@ -1312,7 +1319,7 @@ async fn start_index(
         }
         serde_json::from_value(value).map_err(|_| invalid())?
     };
-    let baseline = db(s.clone(), |s| s.status()).await?.revision;
+    let baseline = db(s.clone(), |s| s.index_baseline()).await?;
     if request.expected_revision.is_some_and(|r| r != baseline) {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1380,14 +1387,18 @@ async fn start_index(
         let worker_id = id.clone();
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let graph = index_workspace(&worker.options, &worker_cancel, |p| {
-                if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
-                    j.progress = p;
-                }
-            })?;
+            let (graph, capture) = crate::indexer::index_workspace_with_capture(
+                &worker.options,
+                &worker_cancel,
+                |p| {
+                    if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
+                        j.progress = p;
+                    }
+                },
+            )?;
             worker
                 .store
-                .publish(&graph, &leader, baseline, &worker_cancel)
+                .publish_captured(&graph, &capture, &leader, baseline, &worker_cancel)
         })
         .await;
         let mut jobs = s.jobs.lock().unwrap();
@@ -1419,6 +1430,7 @@ async fn start_index(
         let completed = j.state == "completed";
         drop(jobs);
         if completed {
+            *s.packets.lock().unwrap() = PacketCache::default();
             s.start_dependency_index();
         }
     });
@@ -1616,7 +1628,7 @@ async fn delete_annotation(
 // These endpoints only transform locally indexed evidence. They never contact a provider.
 fn question_error(e: anyhow::Error) -> ApiError {
     let message = e.to_string();
-    if message.starts_with("revision conflict") {
+    if message.starts_with("revision conflict") || message.starts_with("index_not_ready") {
         e.into()
     } else if message == "question seed not found" {
         missing()
@@ -1687,6 +1699,8 @@ async fn question_preview(
     Ok(Json(result))
 }
 async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPacket>, ApiError> {
+    // Gate readiness before touching cached evidence, including stale packets.
+    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await?;
     let packet = {
         let cache = s.packets.lock().unwrap();
         cache
@@ -1696,7 +1710,6 @@ async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPa
             .map(|(p, _)| p.clone())
             .ok_or_else(missing)?
     };
-    let revision = db(s, |store| Ok(store.status()?.revision)).await?;
     if revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1812,6 +1825,7 @@ async fn question_answer(
     if !request.as_object().is_some_and(|object| object.is_empty()) {
         return Err(invalid());
     }
+    db(s.clone(), |store| store.status().map(|_| ())).await?;
     let provider = s.acp.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "acp_disabled",
@@ -1893,6 +1907,7 @@ async fn question_run(
     if !body.is_empty() && body.as_ref() != b"{}" {
         return Err(invalid());
     }
+    db(s.clone(), |store| store.status().map(|_| ())).await?;
     let provider = s.provider.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "jev_disabled",
@@ -1922,6 +1937,7 @@ async fn question_run(
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    use crate::indexer::index_workspace;
     use tower::ServiceExt;
 
     #[test]

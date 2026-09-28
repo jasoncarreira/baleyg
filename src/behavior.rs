@@ -33,7 +33,9 @@ pub struct SequenceStep {
     pub path: String,
     pub range: SourceRange,
     pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<Resolution>,
     pub children: Vec<SequenceStep>,
     pub alternate: Vec<SequenceStep>,
