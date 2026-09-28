@@ -141,7 +141,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     let measured = graph
         .calls
         .iter()
-        .find(|c| c.caller == seed && c.callee_text == "save")
+        .find(|c| c.caller == seed && c.callee_text.as_deref() == Some("save"))
         .unwrap();
     assert!(sequence.to_string().contains(&measured.id));
     let (code, source) = request(

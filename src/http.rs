@@ -3,7 +3,7 @@ use crate::{
     acp::Acp,
     auth::valid_token,
     dependencies::{Catalog, CatalogOptions},
-    indexer::{IndexOptions, index_workspace},
+    indexer::IndexOptions,
     jev,
     live_jev::LiveJev,
     model::*,
@@ -407,6 +407,11 @@ impl From<anyhow::Error> for ApiError {
                     "workspace_id_changed",
                 ),
                 ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
+                (
+                    "index_not_ready",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "index_not_ready",
+                ),
                 (
                     "incompatible_index",
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1217,7 +1222,9 @@ async fn sequence(
         )
     })?
     .map_err(|e| {
-        if e.to_string().starts_with("revision conflict") {
+        if e.to_string().starts_with("revision conflict")
+            || e.to_string().starts_with("index_not_ready")
+        {
             e.into()
         } else {
             browse_invalid()
@@ -1312,7 +1319,7 @@ async fn start_index(
         }
         serde_json::from_value(value).map_err(|_| invalid())?
     };
-    let baseline = db(s.clone(), |s| s.status()).await?.revision;
+    let baseline = db(s.clone(), |s| s.index_baseline()).await?;
     if request.expected_revision.is_some_and(|r| r != baseline) {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1380,49 +1387,64 @@ async fn start_index(
         let worker_id = id.clone();
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let graph = index_workspace(&worker.options, &worker_cancel, |p| {
-                if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
-                    j.progress = p;
-                }
-            })?;
+            let (graph, capture) = crate::indexer::index_workspace_with_capture(
+                &worker.options,
+                &worker_cancel,
+                |p| {
+                    if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
+                        j.progress = p;
+                    }
+                },
+            )?;
             worker
                 .store
-                .publish(&graph, &leader, baseline, &worker_cancel)
+                .publish_captured(&graph, &capture, &leader, baseline, &worker_cancel)
         })
         .await;
-        let mut jobs = s.jobs.lock().unwrap();
-        let j = jobs.jobs.get_mut(&id).unwrap();
-        match result {
-            Ok(Ok(revision)) => {
-                j.state = "completed".into();
-                j.revision = Some(revision)
-            }
-            Ok(Err(e)) => {
-                if cancel.load(Ordering::Acquire) {
-                    j.state = "cancelled".into()
-                } else {
-                    j.state = "failed".into();
-                    let code = if e.to_string().starts_with("revision conflict") {
-                        "revision_conflict"
-                    } else {
-                        "index_failed"
-                    };
-                    j.error = Some(json!({"code":code,"message":"Index job failed"}));
-                }
-            }
-            Err(_) => {
-                j.state = "failed".into();
-                j.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
-            }
-        }
-        j.finished_at = Some(now());
-        let completed = j.state == "completed";
-        drop(jobs);
-        if completed {
-            s.start_dependency_index();
-        }
+        let outcome = match result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("index worker failed")),
+        };
+        finish_index_job(&s, &id, outcome, &cancel);
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
+}
+// A failed publication cannot release cached packet ownership. Only a committed
+// revision transition clears packets; old barriers still block their public reads.
+fn finish_index_job(
+    s: &Arc<DaemonState>,
+    id: &str,
+    result: anyhow::Result<IndexPin>,
+    cancel: &CancelFlag,
+) {
+    let mut jobs = s.jobs.lock().unwrap();
+    let job = jobs.jobs.get_mut(id).expect("started index job");
+    match result {
+        Ok(revision) => {
+            job.state = "completed".into();
+            job.revision = Some(revision);
+        }
+        Err(error) if cancel.load(Ordering::Acquire) => {
+            let _ = error;
+            job.state = "cancelled".into();
+        }
+        Err(error) => {
+            job.state = "failed".into();
+            let code = if error.to_string().starts_with("revision conflict") {
+                "revision_conflict"
+            } else {
+                "index_failed"
+            };
+            job.error = Some(json!({"code":code,"message":"Index job failed"}));
+        }
+    }
+    job.finished_at = Some(now());
+    let completed = job.state == "completed";
+    drop(jobs);
+    if completed {
+        *s.packets.lock().unwrap() = PacketCache::default();
+        s.start_dependency_index();
+    }
 }
 async fn current_job(State(s): State<Arc<DaemonState>>) -> Json<Option<IndexJob>> {
     let jobs = s.jobs.lock().unwrap();
@@ -1616,7 +1638,7 @@ async fn delete_annotation(
 // These endpoints only transform locally indexed evidence. They never contact a provider.
 fn question_error(e: anyhow::Error) -> ApiError {
     let message = e.to_string();
-    if message.starts_with("revision conflict") {
+    if message.starts_with("revision conflict") || message.starts_with("index_not_ready") {
         e.into()
     } else if message == "question seed not found" {
         missing()
@@ -1687,6 +1709,8 @@ async fn question_preview(
     Ok(Json(result))
 }
 async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPacket>, ApiError> {
+    // Gate readiness before touching cached evidence, including stale packets.
+    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await?;
     let packet = {
         let cache = s.packets.lock().unwrap();
         cache
@@ -1696,7 +1720,6 @@ async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPa
             .map(|(p, _)| p.clone())
             .ok_or_else(missing)?
     };
-    let revision = db(s, |store| Ok(store.status()?.revision)).await?;
     if revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1812,6 +1835,7 @@ async fn question_answer(
     if !request.as_object().is_some_and(|object| object.is_empty()) {
         return Err(invalid());
     }
+    db(s.clone(), |store| store.status().map(|_| ())).await?;
     let provider = s.acp.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "acp_disabled",
@@ -1893,6 +1917,7 @@ async fn question_run(
     if !body.is_empty() && body.as_ref() != b"{}" {
         return Err(invalid());
     }
+    db(s.clone(), |store| store.status().map(|_| ())).await?;
     let provider = s.provider.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "jev_disabled",
@@ -1922,6 +1947,7 @@ async fn question_run(
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    use crate::indexer::index_workspace;
     use tower::ServiceExt;
 
     #[test]
@@ -2270,5 +2296,134 @@ mod dependency_lifecycle_tests {
         let generation = state.dependencies.lock().unwrap().generation;
         state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
         assert!(state.catalog_snapshot(pin1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rebaseline_packet_cache_tests {
+    use super::*;
+    use crate::indexer::index_workspace_with_capture;
+    use std::{fs, sync::atomic::AtomicBool};
+
+    #[test]
+    fn failed_known_old_commit_keeps_private_packet_cache_success_clears_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("one.js"), "function go() { measured(); }\n").unwrap();
+        let options = IndexOptions::new(workspace.clone());
+        let ready = Arc::new(AtomicBool::new(false));
+        let (graph, capture) = index_workspace_with_capture(&options, &ready, |_| {}).unwrap();
+        let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+        let old = store
+            .publish_captured(
+                &graph,
+                &capture,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &ready,
+            )
+            .unwrap();
+        let db_path = fs::read_dir(temp.path().join("state/cache/indexes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap()
+            .join("index.db");
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        drop(db);
+        let old_bytes = fs::read(&db_path).unwrap();
+        let state = new(
+            store.clone(),
+            options,
+            "0123456789abcdef".repeat(4),
+            "127.0.0.1:7332".parse().unwrap(),
+        )
+        .unwrap();
+        let seed = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "go")
+            .unwrap()
+            .id
+            .clone();
+        let packet = Arc::new(QuestionPacket {
+            packet_id: "cached-before-old".into(),
+            revision: old,
+            request: QuestionRequest {
+                seed: seed.clone(),
+                question: "what?".into(),
+                expected_revision: old,
+                evidence_depth: 0,
+                max_visible: 1,
+                allow_deeper_display: false,
+                focus_terms: vec![],
+            },
+            context: ViewResult {
+                revision: old,
+                query: ViewQuery {
+                    seed,
+                    depth: 0,
+                    max_nodes: 1,
+                    max_calls: 1,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                nodes: vec![],
+                calls: vec![],
+                regions: vec![],
+                truncated: false,
+                omitted_nodes: 0,
+                warnings: vec![],
+            },
+            source_files: vec![],
+            warnings: vec![],
+        });
+        state.packets.lock().unwrap().remember(packet, 128);
+        let register = |id: &str| {
+            state.jobs.lock().unwrap().jobs.insert(
+                id.into(),
+                IndexJob {
+                    id: id.into(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            )
+        };
+        register("failed");
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = store
+            .publish_captured(&graph, &capture, &store.leader().unwrap(), old, &cancelled)
+            .unwrap_err();
+        finish_index_job(&state, "failed", Err(error), &cancelled);
+        assert_eq!(state.jobs.lock().unwrap().jobs["failed"].state, "cancelled");
+        assert_eq!(state.packets.lock().unwrap().packets.len(), 1);
+        assert_eq!(state.packets.lock().unwrap().bytes, 128);
+        assert_eq!(fs::read(&db_path).unwrap(), old_bytes);
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
+        register("committed");
+        let revision = store
+            .publish_captured(&graph, &capture, &store.leader().unwrap(), old, &ready)
+            .unwrap();
+        finish_index_job(&state, "committed", Ok(revision), &ready);
+        assert_ne!(revision.index_generation, old.index_generation);
+        assert_eq!(state.packets.lock().unwrap().packets.len(), 0);
+        assert_eq!(state.packets.lock().unwrap().bytes, 0);
     }
 }

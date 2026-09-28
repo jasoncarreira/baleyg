@@ -2,8 +2,6 @@ use baleyg::{
     indexer::{IndexOptions, index_workspace},
     model::*,
 };
-use protobuf::Message;
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::Path,
@@ -18,9 +16,6 @@ fn run(options: &IndexOptions) -> Graph {
 fn write(root: &Path, path: &str, text: &str) {
     fs::write(root.join(path), text).unwrap();
 }
-fn hash(text: &str) -> String {
-    hex::encode(Sha256::digest(text.as_bytes()))
-}
 fn fixture(name: &str) -> IndexOptions {
     IndexOptions::new(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -30,45 +25,48 @@ fn fixture(name: &str) -> IndexOptions {
 }
 #[test]
 fn pure_fixture_and_determinism() {
-    let o = fixture("fixture");
-    let g = run(&o);
-    assert_eq!(g.stats.semantic_state, SemanticState::Unavailable);
-    assert_eq!(g.calls.len(), 12);
-    assert_eq!(g.stats.parse_error_files, 0);
-    assert_eq!(g, run(&o));
-    assert!(g.calls.iter().all(|c| c.target.is_none()));
-    let owner = g.nodes.iter().find(|n| n.name == "repeated").unwrap();
-    let calls: Vec<_> = g.calls.iter().filter(|c| c.caller == owner.id).collect();
-    assert_eq!(calls.len(), 2);
-    assert_ne!(calls[0].id, calls[1].id);
-    assert_eq!((calls[0].ordinal, calls[1].ordinal), (1, 2));
-    let owner = g.nodes.iter().find(|n| n.name == "branchLoop").unwrap();
-    let kinds: Vec<Vec<_>> = g
-        .calls
-        .iter()
-        .filter(|c| c.caller == owner.id)
-        .map(|c| {
-            c.regions
-                .iter()
-                .map(|id| {
-                    g.regions
-                        .iter()
-                        .find(|r| &r.id == id)
-                        .unwrap()
-                        .kind
-                        .as_str()
-                })
-                .collect()
-        })
-        .collect();
-    assert_eq!(
-        kinds,
-        vec![
-            vec!["if", "if"],
-            vec!["if", "else"],
-            vec!["else"],
-            vec!["loop"]
-        ]
+    let options = fixture("fixture");
+    let graph = run(&options);
+    assert_eq!(graph, run(&options));
+    assert_eq!(graph.stats.semantic_state, SemanticState::Unavailable);
+    assert!(graph.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
+    assert!(graph.calls.iter().all(|c| c.id.starts_with("occ:v1:")));
+    assert!(graph.regions.iter().all(|r| r.id.starts_with("occ:v1:")));
+    assert!(
+        graph
+            .calls
+            .iter()
+            .all(|c| c.provenance.semantic == SemanticState::Unavailable)
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|n| n.provenance.semantic == SemanticState::Unavailable)
+    );
+    assert!(
+        serde_json::to_string(&graph)
+            .unwrap()
+            .find("candidateSymbols")
+            .is_none()
+    );
+    assert!(
+        serde_json::to_string(&graph)
+            .unwrap()
+            .find("callbackArguments")
+            .is_none()
+    );
+    assert!(
+        serde_json::to_string(&graph)
+            .unwrap()
+            .find("\"target\"")
+            .is_none()
+    );
+    assert!(
+        serde_json::to_string(&graph)
+            .unwrap()
+            .find("\"resolution\"")
+            .is_none()
     );
 }
 #[test]
@@ -109,107 +107,404 @@ fn discovery_ignores_secrets_builds_and_symlinks() {
     );
 }
 #[test]
-fn callback_and_computed_method_boundaries() {
-    let g = run(&fixture("edge-fixture"));
-    let owner = |id: &str| g.nodes.iter().find(|n| n.id == id).unwrap();
-    let key = g.calls.iter().find(|c| c.callee_text == "key").unwrap();
-    assert_eq!(owner(&key.caller).kind, SymbolKind::Module);
-    let callbacks: Vec<_> = g
-        .calls
-        .iter()
-        .filter(|c| owner(&c.caller).name == "callbacks")
-        .collect();
-    assert_eq!(callbacks.len(), 2);
-    assert_eq!(callbacks[0].callback_arguments.len(), 1);
-    assert!(
-        g.calls
-            .iter()
-            .any(|c| c.caller == callbacks[0].callback_arguments[0])
-    );
-    let branch: Vec<_> = g
-        .calls
-        .iter()
-        .filter(|c| owner(&c.caller).name == "branching")
-        .collect();
-    let kinds = |c: &CallSite| {
-        c.regions
-            .iter()
-            .map(|id| {
-                g.regions
-                    .iter()
-                    .find(|r| &r.id == id)
-                    .unwrap()
-                    .kind
-                    .as_str()
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(kinds(branch[0]), ["conditional-true"]);
-    assert_eq!(kinds(branch[1]), ["conditional-false"]);
-    assert_eq!(kinds(branch[2]), ["short-circuit"]);
-    assert!(branch[3].regions.is_empty());
-    assert_eq!(kinds(branch[4]), ["loop"]);
-}
-fn semantic_fixture() -> (tempfile::TempDir, IndexOptions) {
+fn measured_callees_are_terminal_not_targets() {
     let d = tempfile::tempdir().unwrap();
-    let p = d.path();
-    let text = "function f() {}\nconst emoji = '😀'; f();\n";
-    write(p, "main.js", text);
-    let mut doc = scip::types::Document::new();
-    doc.relative_path = "main.js".into();
-    // TS SCIP emits UTF16 offsets, even with UTF8 text_document_encoding.
-    for (range, roles) in [(vec![0, 9, 10], 1), (vec![1, 20, 21], 0)] {
-        let mut o = scip::types::Occurrence::new();
-        o.range = range;
-        o.symbol_roles = roles;
-        o.symbol = "scip-typescript npm test 1 main.js/f().".into();
-        doc.occurrences.push(o);
+    let examples = [
+        ("T.java", "class T { void go() { obj.foo(); } }", "foo"),
+        ("t.js", "function go() { obj.foo(); }", "foo"),
+        ("t.py", "def go():\n    obj.foo()\n", "foo"),
+        ("t.rs", "fn go() { obj.foo(); }", "foo"),
+    ];
+    for (path, source, _) in examples {
+        write(d.path(), path, source);
     }
-    let mut index = scip::types::Index::new();
-    index.documents.push(doc);
-    fs::write(p.join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-    fs::write(
-        p.join("index.hashes.json"),
-        serde_json::to_vec(&serde_json::json!({"main.js":hash(text)})).unwrap(),
+    let graph = run(&IndexOptions::new(d.path().to_owned()));
+    for (path, source, token) in examples {
+        let call = graph.calls.iter().find(|c| c.path == path).unwrap();
+        assert_eq!(call.callee_text.as_deref(), Some(token), "{path}");
+        let r = call.callee_range.as_ref().expect("measured exact token");
+        assert_eq!(&source[r.start_byte..r.end_byte], token, "{path}");
+        assert!(graph.nodes.iter().any(|n| n.id == call.caller));
+    }
+}
+
+#[test]
+fn declaration_ids_survive_body_only_change_but_calls_are_revision_local() {
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("main.rs");
+    write(d.path(), "main.rs", "fn same() { foo(); }\n");
+    let first = run(&IndexOptions::new(d.path().to_owned()));
+    write(d.path(), "main.rs", "fn same() { bar(); }\n");
+    let second = run(&IndexOptions::new(d.path().to_owned()));
+    let id = |graph: &Graph| {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "same")
+            .unwrap()
+            .id
+            .clone()
+    };
+    assert_eq!(id(&first), id(&second));
+    assert_ne!(first.calls[0].id, second.calls[0].id);
+    assert_ne!(first.files[0].hash, second.files[0].hash);
+    assert_eq!(file.file_name().unwrap(), "main.rs");
+}
+
+#[test]
+fn graph_ids_and_ranges_are_exact_native_artifact_projection() {
+    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    let d = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        ("T.java", "class T { void go() { obj.foo(); } }"),
+        ("t.js", "function go() { obj.foo(); }"),
+        ("t.py", "def go():\n    obj.foo()\n"),
+        ("t.rs", "fn go() { obj.foo(); }"),
+    ] {
+        write(d.path(), path, source);
+    }
+    let identity = WorkspaceIdentity::discover(Some(d.path()), d.path()).unwrap();
+    let (graph, native) = index_workspace_with_native(
+        &IndexOptions::new(d.path().to_owned()),
+        &identity.record_id,
+        &cancel(),
+        |_| {},
     )
     .unwrap();
-    let mut o = IndexOptions::new(p.to_owned());
-    o.scip_path = Some(p.join("index.scip"));
-    o.manifest_path = Some(p.join("index.hashes.json"));
-    (d, o)
-}
-#[test]
-fn utf16_occurrences_match_native_byte_offsets() {
-    let (_d, o) = semantic_fixture();
-    let g = run(&o);
-    assert_eq!(g.stats.semantic_state, SemanticState::Fresh);
-    assert_eq!(g.calls.len(), 1);
-    assert_eq!(g.calls[0].resolution, Resolution::Internal);
-    assert_eq!(
-        g.calls[0].target,
-        g.nodes.iter().find(|n| n.name == "f").map(|n| n.id.clone())
-    );
-    assert_eq!(g.calls[0].range.start_column, 23);
-}
-#[test]
-fn semantic_requires_manifest_and_invalidates_on_all_input_drift() {
-    for scenario in ["add", "delete", "source", "config", "manifest", "scip"] {
-        let (_d, mut o) = semantic_fixture();
-        let p = &o.workspace_root;
-        match scenario {
-            "add" => write(p, "new.mjs", "f()"),
-            "delete" => fs::remove_file(p.join("main.js")).unwrap(),
-            "source" => write(p, "main.js", "function f() {} f();"),
-            "config" => write(p, "package.json", "{}"),
-            "manifest" => o.manifest_path = None,
-            "scip" => write(p, "index.scip", "invalid binary"),
-            _ => unreachable!(),
-        }
-        let g = run(&o);
-        assert_ne!(g.stats.semantic_state, SemanticState::Fresh, "{scenario}");
-        assert!(g.calls.iter().all(|c| c.target.is_none()), "{scenario}");
+    assert_eq!(graph.calls.len(), native.calls.len());
+    assert_eq!(graph.regions.len(), native.control_regions.len());
+    assert_eq!(graph.nodes.len(), native.declarations.len());
+    for call in &graph.calls {
+        let native_call = native.calls.iter().find(|c| c.id == call.id).unwrap();
+        assert_eq!(call.caller, native_call.owner_syntax_id);
+        assert_eq!(call.regions, native_call.region_ids);
+        assert_eq!(call.range.start_byte, native_call.range.start);
+        assert_eq!(call.range.end_byte, native_call.range.end);
+        assert_eq!(call.callee_text.as_deref(), native_call.spelling.as_deref());
+        assert_eq!(
+            call.callee_range
+                .as_ref()
+                .map(|r| (r.start_byte, r.end_byte)),
+            native_call.callee_range.as_ref().map(|r| (r.start, r.end))
+        );
+    }
+    let graph_text = serde_json::to_string(&graph).unwrap();
+    for forbidden in [
+        "\"target\"",
+        "candidateSymbols",
+        "callbackArguments",
+        "\"resolution\"",
+    ] {
+        assert!(
+            !graph_text.contains(forbidden),
+            "unsafe graph field: {forbidden}"
+        );
     }
 }
+
+#[test]
+fn scip_label_requires_exact_captured_hash_and_name_token_and_never_supplies_identity() {
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    let d = tempfile::tempdir().unwrap();
+    let source = "function f() {}\nf();\n";
+    write(d.path(), "main.js", source);
+    let mut index = scip::types::Index::new();
+    let mut document = scip::types::Document::new();
+    document.relative_path = "main.js".into();
+    let mut occurrence = scip::types::Occurrence::new();
+    occurrence.range = vec![0, 9, 10];
+    occurrence.symbol_roles = 1; // exact declaration-name token, not a call target
+    occurrence.symbol = "scip npm display 1 main.js/f().".into();
+    document.occurrences.push(occurrence);
+    index.documents.push(document);
+    fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    fs::write(
+        d.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"main.js":source_hash})).unwrap(),
+    )
+    .unwrap();
+    let base = run(&IndexOptions::new(d.path().to_owned()));
+    let mut options = IndexOptions::new(d.path().to_owned());
+    options.scip_path = Some(d.path().join("index.scip"));
+    options.manifest_path = Some(d.path().join("manifest.json"));
+    let with_label = run(&options);
+    let declaration = with_label.nodes.iter().find(|n| n.name == "f").unwrap();
+    assert_eq!(
+        declaration.display_label.as_deref(),
+        Some("scip npm display 1 main.js/f().")
+    );
+    assert_eq!(
+        base.nodes.iter().map(|n| &n.id).collect::<Vec<_>>(),
+        with_label.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+    );
+    assert_eq!(base.calls, with_label.calls);
+    assert_eq!(declaration.provenance.semantic, SemanticState::Unavailable);
+    write(d.path(), "manifest.json", "{\"main.js\":\"stale\"}");
+    assert!(
+        run(&options)
+            .nodes
+            .iter()
+            .all(|n| n.display_label.is_none())
+    );
+    fs::write(
+        d.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"main.js":source_hash})).unwrap(),
+    )
+    .unwrap();
+    index.documents[0].occurrences[0].range = vec![1, 0, 1]; // call site, not definition
+    fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
+    assert!(
+        run(&options)
+            .nodes
+            .iter()
+            .all(|n| n.display_label.is_none())
+    );
+    index.documents[0].occurrences[0].range = vec![0, 9, 10];
+    index.documents[0].occurrences[0].symbol = "scip npm display 1 other().".into();
+    fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
+    assert!(
+        run(&options)
+            .nodes
+            .iter()
+            .all(|n| n.display_label.is_none())
+    );
+}
+
+#[test]
+fn root_dependency_drift_changes_native_revision_not_stable_declaration_ids() {
+    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "main.js", "function same() { foo(); }");
+    let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path())
+        .unwrap()
+        .record_id;
+    let options = IndexOptions::new(d.path().to_owned());
+    let (before, first) =
+        index_workspace_with_native(&options, &root_id, &cancel(), |_| {}).unwrap();
+    write(
+        d.path(),
+        "Cargo.lock",
+        "changed immutable dependency selector",
+    );
+    let (after, second) =
+        index_workspace_with_native(&options, &root_id, &cancel(), |_| {}).unwrap();
+    assert_ne!(first.revision.id, second.revision.id);
+    assert_eq!(before.nodes, after.nodes);
+    assert_ne!(before.calls[0].id, after.calls[0].id);
+    assert_eq!(before.files, after.files);
+    assert!(
+        after
+            .calls
+            .iter()
+            .all(|c| c.provenance.semantic == SemanticState::Unavailable)
+    );
+}
+
+#[test]
+fn python_assignment_rhs_calls_remain_owned_by_enclosing_function() {
+    let d = tempfile::tempdir().unwrap();
+    write(
+        d.path(),
+        "main.py",
+        "def run():\n    agent = make_agent()\n    x: annotation_call() = rhs()\n",
+    );
+    let graph = run(&IndexOptions::new(d.path().to_owned()));
+    let function = graph.nodes.iter().find(|n| n.name == "run").unwrap();
+    let variable = graph.nodes.iter().find(|n| n.name == "agent").unwrap();
+    assert_eq!(variable.parent.as_deref(), Some(function.id.as_str()));
+    for name in ["make_agent", "rhs"] {
+        let call = graph
+            .calls
+            .iter()
+            .find(|c| c.callee_text.as_deref() == Some(name))
+            .unwrap();
+        assert_eq!(
+            call.caller, function.id,
+            "{name} must execute in defining scope"
+        );
+    }
+}
+
+#[test]
+fn rust_impl_and_trait_methods_keep_measured_method_kind_and_free_functions() {
+    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    let d = tempfile::tempdir().unwrap();
+    let source = "trait Work { fn required(&self); fn defaulted(&self) { fallback(); } }\nstruct T; impl Work for T { fn required(&self) { helper(); } }\nfn free() { helper(); }\n";
+    write(d.path(), "main.rs", source);
+    let identity = WorkspaceIdentity::discover(Some(d.path()), d.path()).unwrap();
+    let (graph, native) = index_workspace_with_native(
+        &IndexOptions::new(d.path().to_owned()),
+        &identity.record_id,
+        &cancel(),
+        |_| {},
+    )
+    .unwrap();
+    let methods: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|n| ["required", "defaulted"].contains(&n.name.as_str()))
+        .collect();
+    assert_eq!(methods.len(), 3);
+    assert!(methods.iter().all(|node| node.kind == SymbolKind::Method));
+    for node in methods {
+        assert_eq!(
+            native
+                .declarations
+                .iter()
+                .find(|d| d.syntax_id == node.id)
+                .unwrap()
+                .kind,
+            "method"
+        );
+        assert!(
+            node.parent
+                .as_ref()
+                .is_some_and(|id| graph.nodes.iter().any(|n| n.id == *id))
+        );
+    }
+    let free = graph.nodes.iter().find(|n| n.name == "free").unwrap();
+    assert_eq!(free.kind, SymbolKind::Function);
+    assert_eq!(
+        native
+            .declarations
+            .iter()
+            .find(|d| d.syntax_id == free.id)
+            .unwrap()
+            .kind,
+        "function"
+    );
+    for name in ["fallback", "helper"] {
+        assert!(
+            graph
+                .calls
+                .iter()
+                .any(|c| c.callee_text.as_deref() == Some(name))
+        );
+    }
+}
+
+#[test]
+fn initializer_calls_keep_executable_owner_and_control_guard_in_four_languages() {
+    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    let d = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        (
+            "T.java",
+            "class T { void run() { if (true) { int x = rhs(); } } }",
+        ),
+        ("t.js", "function run() { if (true) { let x = rhs(); } }"),
+        ("t.py", "def run():\n    if True:\n        x = rhs()\n"),
+        ("t.rs", "fn run() { if true { let x = rhs(); } }"),
+    ] {
+        write(d.path(), path, source);
+    }
+    let identity = WorkspaceIdentity::discover(Some(d.path()), d.path()).unwrap();
+    let (graph, native) = index_workspace_with_native(
+        &IndexOptions::new(d.path().to_owned()),
+        &identity.record_id,
+        &cancel(),
+        |_| {},
+    )
+    .unwrap();
+    for path in ["T.java", "t.js", "t.py", "t.rs"] {
+        let function = graph
+            .nodes
+            .iter()
+            .find(|n| n.path == path && n.name == "run")
+            .unwrap();
+        let call = graph
+            .calls
+            .iter()
+            .find(|c| c.path == path && c.callee_text.as_deref() == Some("rhs"))
+            .unwrap();
+        assert_eq!(
+            call.caller, function.id,
+            "initializer call owner for {path}"
+        );
+        let native_call = native.calls.iter().find(|c| c.id == call.id).unwrap();
+        assert_eq!(
+            native_call.owner_syntax_id, function.id,
+            "native owner for {path}"
+        );
+        assert!(
+            !native_call.region_ids.is_empty(),
+            "guard region for {path}"
+        );
+        assert_eq!(call.regions, native_call.region_ids);
+        for id in &call.regions {
+            assert!(
+                graph
+                    .regions
+                    .iter()
+                    .any(|region| region.id == *id && region.owner == function.id)
+            );
+        }
+    }
+}
+
+#[test]
+fn native_null_callee_spelling_remains_explicit_json_null() {
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "T.java", "class T { void f() { new T(); } }");
+    let graph = run(&IndexOptions::new(d.path().to_owned()));
+    let call = graph.calls.iter().find(|c| c.path == "T.java").unwrap();
+    assert_eq!(call.callee_text, None);
+    assert_eq!(call.callee_range, None);
+    let serialized = serde_json::to_value(call).unwrap();
+    assert!(serialized.get("calleeText").unwrap().is_null());
+    assert!(serialized.get("calleeRange").unwrap().is_null());
+    let mut missing = serialized.as_object().unwrap().clone();
+    missing.remove("calleeText");
+    assert!(serde_json::from_value::<CallSite>(serde_json::Value::Object(missing)).is_err());
+}
+
+#[test]
+fn old_lexical_callsite_fields_are_rejected_on_deserialization() {
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "main.js", "function f() { foo(); }");
+    let call = run(&IndexOptions::new(d.path().to_owned())).calls.remove(0);
+    let mut value = serde_json::to_value(&call).unwrap();
+    for unsafe_field in [
+        "target",
+        "candidateSymbols",
+        "resolution",
+        "callbackArguments",
+    ] {
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(unsafe_field.into(), serde_json::Value::Null);
+        assert!(
+            serde_json::from_value::<CallSite>(value.clone()).is_err(),
+            "accepted {unsafe_field}"
+        );
+        value.as_object_mut().unwrap().remove(unsafe_field);
+    }
+}
+
+#[test]
+fn untrusted_display_metadata_never_promotes_graph_edges_or_ids() {
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "main.js", "function same() {} same();");
+    let base = run(&IndexOptions::new(d.path().to_owned()));
+    write(d.path(), "metadata.scip", "not a valid scip artifact");
+    write(d.path(), "metadata.hashes", "{\"main.js\":\"forged\"}");
+    let mut options = IndexOptions::new(d.path().to_owned());
+    options.scip_path = Some(d.path().join("metadata.scip"));
+    options.manifest_path = Some(d.path().join("metadata.hashes"));
+    let with_metadata = run(&options);
+    assert_eq!(base.nodes, with_metadata.nodes);
+    assert_eq!(base.calls, with_metadata.calls);
+    assert!(
+        with_metadata
+            .calls
+            .iter()
+            .all(|c| c.provenance.semantic == SemanticState::Unavailable)
+    );
+}
+
 #[test]
 fn cancellation_and_size_limits() {
     let d = tempfile::tempdir().unwrap();
@@ -238,38 +533,6 @@ fn cancellation_and_size_limits() {
     );
 }
 #[test]
-fn checked_local_scip_regression_when_present() {
-    // Generated indexes are optional; all required semantic tests above generate their own protobuf.
-    for name in ["fixture", "edge-fixture"] {
-        let mut o = fixture(name);
-        let base = o.workspace_root.parent().unwrap();
-        let scip = base.join(format!("{name}.scip"));
-        let manifest = base.join(format!("{name}.hashes.json"));
-        if !scip.is_file() || !manifest.is_file() {
-            continue;
-        }
-        o.scip_path = Some(scip);
-        o.manifest_path = Some(manifest);
-        let g = run(&o);
-        assert_eq!(g.stats.semantic_state, SemanticState::Fresh);
-        if name == "fixture" {
-            assert_eq!(g.stats.internal, 11);
-            assert_eq!(g.stats.unresolved, 1);
-        } else {
-            let c = g.calls.iter().find(|c| c.callee_text == "obj.f").unwrap();
-            assert_eq!(c.resolution, Resolution::Unresolved);
-            let owner = g.nodes.iter().find(|n| n.name == "callbacks").unwrap();
-            assert!(
-                g.calls
-                    .iter()
-                    .filter(|c| c.caller == owner.id)
-                    .all(|c| c.callback_arguments.len() == 1)
-            );
-        }
-    }
-}
-
-#[test]
 fn nested_calls_have_unique_ids_and_parse_errors_are_visible() {
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "nested.js", "factory()(); new (factory())();\n");
@@ -281,97 +544,14 @@ fn nested_calls_have_unique_ids_and_parse_errors_are_visible() {
     assert_eq!(g.stats.parse_error_files, 1);
     assert!(g.diagnostics.iter().any(|d| d.code == "parse-error"));
 }
-#[test]
-fn semantic_candidates_distinguish_external_ambiguous_and_noncall_refs() {
-    let d = tempfile::tempdir().unwrap();
-    let p = d.path();
-    let text = "function f() {}\nf(); external(); maybe(); f;\n";
-    write(p, "main.js", text);
-    let mut doc = scip::types::Document::new();
-    doc.relative_path = "main.js".into();
-    for (range, roles, symbol) in [
-        (vec![0, 9, 10], 1, "scip npm x 1 main.js/f()."),
-        (vec![1, 0, 1], 0, "scip npm x 1 main.js/f()."),
-        (vec![1, 5, 13], 0, "scip npm lib 1 external()."),
-        (vec![1, 17, 22], 0, "scip npm x 1 main.js/f()."),
-        (vec![1, 17, 22], 0, "scip npm lib 1 other()."),
-        (vec![1, 26, 27], 0, "scip npm x 1 main.js/f()."),
-    ] {
-        let mut o = scip::types::Occurrence::new();
-        o.range = range;
-        o.symbol_roles = roles;
-        o.symbol = symbol.into();
-        doc.occurrences.push(o);
-    }
-    let mut index = scip::types::Index::new();
-    index.documents.push(doc);
-    fs::write(p.join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-    fs::write(
-        p.join("index.hashes.json"),
-        serde_json::to_vec(&serde_json::json!({"main.js":hash(text)})).unwrap(),
-    )
-    .unwrap();
-    let mut o = IndexOptions::new(p.to_owned());
-    o.scip_path = Some(p.join("index.scip"));
-    o.manifest_path = Some(p.join("index.hashes.json"));
-    let g = run(&o);
-    assert_eq!(g.calls.len(), 3);
-    assert_eq!(
-        g.calls.iter().map(|c| c.resolution).collect::<Vec<_>>(),
-        [
-            Resolution::Internal,
-            Resolution::External,
-            Resolution::Ambiguous
-        ]
-    );
-    assert!(g.calls[2].target.is_none());
-}
-
-#[test]
-fn lockfile_drift_invalidates_semantics() {
-    for lock in [
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "bun.lock",
-        "bun.lockb",
-    ] {
-        let (_d, o) = semantic_fixture();
-        write(&o.workspace_root, lock, "changed");
-        let g = run(&o);
-        assert_eq!(g.stats.semantic_state, SemanticState::Stale);
-        assert_eq!(g.stats.changed_files, [lock]);
-        assert!(g.calls.iter().all(|c| c.target.is_none()));
-    }
-}
-#[test]
-fn recovered_parse_errors_do_not_inherit_semantic_evidence() {
-    let (_d, o) = semantic_fixture();
-    let p = &o.workspace_root;
-    let mut text = fs::read_to_string(p.join("main.js")).unwrap();
-    text.push_str("function broken(\n");
-    write(p, "main.js", &text);
-    fs::write(
-        p.join("index.hashes.json"),
-        serde_json::to_vec(&serde_json::json!({"main.js":hash(&text)})).unwrap(),
-    )
-    .unwrap();
-    let g = run(&o);
-    assert_eq!(g.stats.parse_error_files, 1);
-    assert!(g.calls.iter().all(|c| c.target.is_none()
-        && c.candidate_symbols.is_empty()
-        && c.provenance.semantic == SemanticState::Unavailable));
-    assert!(
-        g.nodes
-            .iter()
-            .all(|n| n.provenance.semantic == SemanticState::Unavailable)
-    );
-}
 #[cfg(unix)]
 #[test]
 fn direct_symlink_artifacts_and_config_are_never_read() {
-    let (_d, mut o) = semantic_fixture();
-    let p = &o.workspace_root;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path();
+    write(p, "main.js", "f();");
+    write(p, "index.scip", "captured optional metadata");
+    let mut o = IndexOptions::new(p.to_owned());
     std::os::unix::fs::symlink(p.join("main.js"), p.join("package.json")).unwrap();
     assert!(index_workspace(&o, &cancel(), |_| {}).is_err());
     fs::remove_file(p.join("package.json")).unwrap();
@@ -424,101 +604,6 @@ fn java_python_discovery_respects_ignored_environments_and_source_symlinks() {
             .collect::<Vec<_>>(),
         [("Example.java", "java"), ("example.py", "python")]
     );
-}
-
-#[test]
-fn java_python_never_borrow_fresh_javascript_scip_evidence() {
-    let (_d, o) = semantic_fixture();
-    let p = &o.workspace_root;
-    let java = "class J { void g() {} void f() { g(); } }\n";
-    let python = "def g():\n    pass\ndef f():\n    g()\n";
-    write(p, "J.java", java);
-    write(p, "module.py", python);
-    let mut index =
-        scip::types::Index::parse_from_bytes(&fs::read(p.join("index.scip")).unwrap()).unwrap();
-    for (path, definition, invocation) in [
-        (
-            "J.java",
-            vec![
-                0,
-                java.find("g()").unwrap() as i32,
-                java.find("g()").unwrap() as i32 + 1,
-            ],
-            vec![
-                0,
-                java.rfind("g()").unwrap() as i32,
-                java.rfind("g()").unwrap() as i32 + 1,
-            ],
-        ),
-        ("module.py", vec![0, 4, 5], vec![3, 4, 5]),
-    ] {
-        let mut document = scip::types::Document::new();
-        document.relative_path = path.into();
-        for (range, role) in [(definition, 1), (invocation, 0)] {
-            let mut occurrence = scip::types::Occurrence::new();
-            occurrence.range = range;
-            occurrence.symbol_roles = role;
-            occurrence.symbol = "scip-typescript npm unsupported 1 foreign/g().".into();
-            document.occurrences.push(occurrence);
-        }
-        index.documents.push(document);
-    }
-    fs::write(p.join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-    let js = fs::read_to_string(p.join("main.js")).unwrap();
-    fs::write(p.join("index.hashes.json"), serde_json::to_vec(&serde_json::json!({"main.js":hash(&js), "J.java":hash(java), "module.py":hash(python)})).unwrap()).unwrap();
-    let g = run(&o);
-    assert_eq!(g.stats.semantic_state, SemanticState::Fresh);
-    for path in ["J.java", "module.py"] {
-        let calls = g
-            .calls
-            .iter()
-            .filter(|c| c.path == path)
-            .collect::<Vec<_>>();
-        assert!(!calls.is_empty());
-        assert!(calls.iter().all(|c| c.resolution == Resolution::Unresolved
-            && c.target.is_none()
-            && c.candidate_symbols.is_empty()
-            && c.provenance.semantic == SemanticState::Unavailable));
-        assert!(
-            g.nodes
-                .iter()
-                .filter(|n| n.path == path)
-                .all(|n| n.provenance.semantic == SemanticState::Unavailable)
-        );
-    }
-    assert!(
-        g.calls
-            .iter()
-            .any(|c| c.path == "main.js" && c.resolution == Resolution::Internal)
-    );
-}
-
-#[test]
-fn root_java_python_configuration_drift_invalidates_imported_manifest() {
-    for config in [
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "gradle.properties",
-        "pyproject.toml",
-        "requirements.txt",
-        "uv.lock",
-        "poetry.lock",
-        "Pipfile",
-        "Pipfile.lock",
-    ] {
-        let (_d, o) = semantic_fixture();
-        write(
-            &o.workspace_root,
-            config,
-            "changed; this file is never executed",
-        );
-        let g = run(&o);
-        assert_eq!(g.stats.semantic_state, SemanticState::Stale, "{config}");
-        assert_eq!(g.stats.changed_files, [config], "{config}");
-    }
 }
 
 #[test]
@@ -787,4 +872,218 @@ fn hard_linked_nonsource_inputs_share_immutable_bytes() {
         capture.bytes(&root.join("package.json"))
     );
     capture.verify(&flag).unwrap();
+}
+
+#[test]
+fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_executable() {
+    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    let d = tempfile::tempdir().unwrap();
+    let samples = [
+        (
+            "main.js",
+            "class Js { field = 1; method(arg) { const local = arg; return local; } }\nfunction jsFun(arg) { return arg; }\n",
+        ),
+        (
+            "Main.java",
+            "class JavaThing { int field; void method(int arg) { int local = arg; } }\n",
+        ),
+        (
+            "main.py",
+            "class PythonThing:\n    field = 1\n    def method(self, arg):\n        local = arg\n        return local\n",
+        ),
+        (
+            "main.rs",
+            "type Alias = u32;\nstruct RustThing { field: Alias }\nfn rust_fun(arg: Alias) { let local = arg; }\n",
+        ),
+    ];
+    for (path, text) in samples {
+        write(d.path(), path, text);
+    }
+    let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path())
+        .unwrap()
+        .record_id;
+    let (graph, native) = index_workspace_with_native(
+        &IndexOptions::new(d.path().to_owned()),
+        &root_id,
+        &cancel(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        graph.nodes.len(),
+        native.declarations.len(),
+        "native declarations must remain visible"
+    );
+    for declaration in &native.declarations {
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| n.id == declaration.syntax_id)
+            .unwrap();
+        let source = graph.files.iter().find(|f| f.path == node.path).unwrap();
+        assert_eq!(
+            (node.range.start_byte, node.range.end_byte),
+            (declaration.range.start, declaration.range.end)
+        );
+        assert_eq!(
+            &source.text[node.range.start_byte..node.range.end_byte],
+            &source.text[declaration.range.start..declaration.range.end]
+        );
+        let expected = match declaration.kind.as_str() {
+            "module" | "namespace" => SymbolKind::Module,
+            "type" | "implementation" => SymbolKind::Class,
+            "function" | "anonymousFunction" => SymbolKind::Function,
+            "method" | "constructor" => SymbolKind::Method,
+            "field" => SymbolKind::Field,
+            "variable" => SymbolKind::Variable,
+            "parameter" => SymbolKind::Parameter,
+            "typeParameter" => SymbolKind::TypeParameter,
+            "alias" => SymbolKind::Alias,
+            other => panic!("unexpected native declaration kind: {other}"),
+        };
+        assert_eq!(node.kind, expected, "{} {}", node.path, node.name);
+        assert_eq!(node.provenance.semantic, SemanticState::Unavailable);
+    }
+    // These are witnessed #22 declarations, not names inferred from the graph.
+    for (path, expected) in [
+        (
+            "main.js",
+            [
+                ("field", SymbolKind::Field),
+                ("local", SymbolKind::Variable),
+                ("method", SymbolKind::Method),
+            ],
+        ),
+        (
+            "Main.java",
+            [
+                ("field", SymbolKind::Field),
+                ("arg", SymbolKind::Parameter),
+                ("local", SymbolKind::Variable),
+            ],
+        ),
+        (
+            "main.py",
+            [
+                ("field", SymbolKind::Variable),
+                ("local", SymbolKind::Variable),
+                ("method", SymbolKind::Function),
+            ],
+        ),
+        (
+            "main.rs",
+            [
+                ("Alias", SymbolKind::Alias),
+                ("field", SymbolKind::Field),
+                ("arg", SymbolKind::Parameter),
+            ],
+        ),
+    ] {
+        for (name, kind) in expected {
+            let declaration = native
+                .declarations
+                .iter()
+                .find(|d| d.document.path == path && d.name.as_deref() == Some(name))
+                .unwrap();
+            let node = graph
+                .nodes
+                .iter()
+                .find(|n| n.id == declaration.syntax_id)
+                .unwrap();
+            assert_eq!(node.kind, kind, "{path} {name}");
+        }
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.path == path
+                    && matches!(n.kind, SymbolKind::Function | SymbolKind::Method)),
+            "{path}: real callable"
+        );
+    }
+    let state = tempfile::tempdir().unwrap();
+    let store = baleyg::store::Store::open_for_tests(state.path(), d.path()).unwrap();
+    let pin = store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel(),
+        )
+        .unwrap();
+    let saved = store.graph().unwrap();
+    assert_eq!(saved.nodes, graph.nodes);
+    assert_eq!(saved.calls, graph.calls);
+    for (path, text) in samples {
+        let methods = store.methods_at(path, Some(pin)).unwrap().unwrap();
+        let items = methods["items"].as_array().unwrap();
+        let expected: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.path == path && matches!(n.kind, SymbolKind::Function | SymbolKind::Method)
+            })
+            .collect();
+        assert_eq!(items.len(), expected.len(), "{path}");
+        let files = store.files_at(Some(pin), 0, 100).unwrap();
+        let file = files["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["path"] == path)
+            .unwrap();
+        assert_eq!(file["methodCount"], expected.len());
+        for n in graph.nodes.iter().filter(|n| {
+            n.path == path
+                && matches!(
+                    n.kind,
+                    SymbolKind::Field
+                        | SymbolKind::Variable
+                        | SymbolKind::Parameter
+                        | SymbolKind::Alias
+                        | SymbolKind::TypeParameter
+                )
+        }) {
+            assert_eq!(store.symbol(&n.id).unwrap().unwrap().kind, n.kind);
+            assert!(
+                store
+                    .symbols(&n.name, 150)
+                    .unwrap()
+                    .iter()
+                    .any(|candidate| candidate.id == n.id && candidate.kind == n.kind)
+            );
+            assert!(
+                !items.iter().any(|item| item["symbol"]["id"] == n.id),
+                "{path}: {} is not a method",
+                n.name
+            );
+            assert!(
+                store.sequence_at(&n.id, pin, false).is_err(),
+                "{path}: {} is not executable",
+                n.name
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "seed": n.id, "question": "Which exact source declares this name?", "expectedRevision": pin
+            })).unwrap();
+            let packet = baleyg::planning::prepare(&store, request).unwrap();
+            assert_eq!(
+                packet.context.nodes,
+                vec![n.clone()],
+                "{path}: source-only declaration"
+            );
+            assert!(
+                packet.context.calls.is_empty() && packet.context.regions.is_empty(),
+                "{path}: no executable call evidence"
+            );
+            assert_eq!(packet.source_files.len(), 1);
+            assert_eq!(packet.source_files[0].text, text);
+            assert!(
+                packet
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("source-only") && w.contains("noncallable"))
+            );
+        }
+        assert_eq!(store.source(path).unwrap().unwrap().text, text);
+    }
 }

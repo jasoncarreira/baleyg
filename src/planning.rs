@@ -164,6 +164,18 @@ pub fn prepare(store: &Store, request: QuestionRequest) -> Result<QuestionPacket
         context.revision == request.expected_revision,
         "revision conflict: graph changed during question preparation"
     );
+    let noncallable = context
+        .nodes
+        .first()
+        .is_some_and(|node| !matches!(node.kind, SymbolKind::Function | SymbolKind::Method));
+    // A variable/field/parameter/alias is a measured declaration, not an entry
+    // point. Retain its exact source, but refuse any supposed execution evidence.
+    if noncallable {
+        ensure!(
+            context.nodes.len() == 1 && context.calls.is_empty() && context.regions.is_empty(),
+            "noncallable question seed cannot carry executable evidence"
+        );
+    }
     let paths: BTreeSet<_> = context
         .nodes
         .iter()
@@ -189,7 +201,11 @@ pub fn prepare(store: &Store, request: QuestionRequest) -> Result<QuestionPacket
         "revision conflict: graph changed during question preparation"
     );
     let mut warnings = context.warnings.clone();
-    warnings.push(format!("Bounded evidence only: depth {}, at most 80 nodes and 300 calls; callbacks are not expanded. This is not a complete program or answer.", request.evidence_depth));
+    warnings.push(if noncallable {
+        "Bounded source-only evidence: selected noncallable declaration, with no executable calls, target, or callback traversal. This is not a complete program or answer."
+    } else {
+        "Bounded terminal evidence only: selected declaration and its measured calls/regions; no target or callback traversal. This is not a complete program or answer."
+    }.into());
     let mut packet = QuestionPacket {
         packet_id: String::new(),
         revision: context.revision,
@@ -244,7 +260,7 @@ fn terms(request: &QuestionRequest) -> Vec<String> {
         .collect()
 }
 fn literal_match(call: &CallSite, terms: &[String]) -> bool {
-    let text = call.callee_text.to_lowercase();
+    let text = call.callee_text.as_deref().unwrap_or("").to_lowercase();
     terms.iter().any(|term| text.contains(term))
 }
 /// LOCAL literal callee-name matching only. Does not interpret the question or source semantics.
@@ -370,11 +386,6 @@ pub fn assemble(
         .collect();
     for call in &calls {
         node_ids.insert(call.caller.as_str());
-        if call.resolution == Resolution::Internal
-            && let Some(target) = &call.target
-        {
-            node_ids.insert(target.as_str());
-        }
         for id in &call.regions {
             let mut current = Some(id.as_str());
             while let Some(id) = current {
@@ -394,18 +405,20 @@ pub fn assemble(
         warnings
             .push("Relative display scores are ranking hints, not calibrated confidence".into());
     }
-    warnings.push("Selection is relevance evidence, not proof of an answer; unresolved, external, class and callback boundaries remain unchanged.".into());
+    warnings.push("Selection is relevance display, not proof of a target, class relation, callback execution, or answer.".into());
     if source == "localPreview" || source == "local" || source == "preview" {
         warnings.push("Local preview—not Jev/ACP: deterministic literal callee-name matching only; no question understanding or semantic completeness claim.".into());
         let terms = terms(&packet.request);
         let unmatched: Vec<_> = terms
             .iter()
             .filter(|t| {
-                !packet
-                    .context
-                    .calls
-                    .iter()
-                    .any(|c| c.callee_text.to_lowercase().contains(t.as_str()))
+                !packet.context.calls.iter().any(|c| {
+                    c.callee_text
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(t.as_str())
+                })
             })
             .cloned()
             .collect();

@@ -940,3 +940,79 @@ fn source_grounded_four_language_headers_owners_and_control_regions() {
         assert_eq!(call.callee_range.as_ref().unwrap().start, call_at + 4);
     }
 }
+
+#[test]
+fn direct_native_opaque_macro_does_not_overflow_or_invent_calls() {
+    use baleyg::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let source = format!(
+        "macro_rules! generated {{ () => {{ fn invented() {{ hidden(); }} }}; }}\n#[cfg(feature = \"unknown\")]\nfn run() {{ opaque!({} Fake::new().a().b() {}); actual(); }}",
+        "(".repeat(512),
+        ")".repeat(512)
+    );
+    fs::write(root.path().join("a.rs"), source).unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id).unwrap();
+    artifact
+        .validate(&capture, root.path(), &identity.record_id)
+        .unwrap();
+    let spellings: Vec<_> = artifact
+        .calls
+        .iter()
+        .filter_map(|call| call.spelling.as_deref())
+        .collect();
+    assert_eq!(spellings, ["actual"]);
+    assert_eq!(artifact.coverage.len(), 1);
+    let coverage = &artifact.coverage[0];
+    assert!(coverage.requested && coverage.selected);
+    assert_eq!(coverage.state, "partial");
+    assert_eq!(coverage.supported_roles, ["definition", "call"]);
+    assert_eq!(coverage.observed_roles, ["definition", "call"]);
+    assert!(
+        coverage
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("opaque Rust")
+    );
+}
+
+#[test]
+fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
+    use baleyg::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let source = format!(
+        "fn run() {{ {} actual(); {} }}",
+        "{".repeat(150),
+        "}".repeat(150)
+    );
+    fs::write(root.path().join("deep.rs"), source).unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let error = from_capture(&capture, root.path(), &identity.record_id).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("native extraction work budget exceeded"),
+        "{error:#}"
+    );
+}

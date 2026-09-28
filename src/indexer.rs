@@ -1,35 +1,10 @@
-//! Native lexical JavaScript, Rust, Java and Python extraction. SCIP is optional JS-only evidence.
-//!
-//! A paired flat hash manifest is trusted user input, not proof that an artifact was
-//! generated from those inputs or by any particular SCIP tool/version. Freshness
-//! compares discovered sources and supported root config/lock files only. Regions
-//! describe lexical guards, not execution order, dispatch, exceptions, or points-to
-//! analysis. Invalid JavaScript retains recovered syntax but no semantic evidence.
-//!
-//! Regions cover if/else, ternary arms, short-circuit RHS, loops (excluding their
-//! once-only initializer/iterable expression), try/catch/finally, and switch/cases.
-//! Callback bodies have separate owners; computed method keys retain the outer
-//! caller. Accessor reads are never treated as calls to a getter. Dynamic property
-//! calls and injected parameters remain unresolved unless explicit callable SCIP
-//! evidence exists; this module never infers points-to targets.
-//!
-//! Root hash scope: package.json, tsconfig.json, jsconfig.json, package-lock.json,
-//! yarn.lock, pnpm-lock.yaml, bun.lock, bun.lockb, Cargo.toml, Cargo.lock, plus
-//! discovered JS/MJS/CJS/Rust/Java/Python files and supported root Maven/Gradle/Python
-//! config/lock files below. Non-JavaScript extraction never consumes SCIP evidence.
-//! Transitive configs, dependencies, environment, and indexer tool versions are not
-//! attested. Aggregate semantic_state measures manifest freshness; recovered files
-//! have Unavailable provenance even when that manifest is Fresh.
-//!
-//! Discovery skips symlinks. Unix reads use O_NOFOLLOW and validate the opened
-//! regular file and inode; malicious concurrent replacement of ancestor directories
-//! is not a security boundary (there is no capability-scoped filesystem sandbox).
-use crate::model::*;
+//! Native-only graph projection from one immutable capture and validated #22 evidence.
+//! Syntax never supplies a target, candidate edge, dispatch resolution or callback traversal.
+use crate::{capture::Capture, model::*, native_evidence};
 use anyhow::{Context, Result, ensure};
 use protobuf::Message;
-use sha2::Digest;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::atomic::Ordering,
 };
@@ -52,613 +27,370 @@ impl IndexOptions {
         }
     }
 }
-fn check(cancel: &CancelFlag) -> Result<()> {
-    ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
-    Ok(())
+
+fn root_id(root: &std::path::Path) -> Result<String> {
+    Ok(crate::store::topology::WorkspaceIdentity::discover(Some(root), root)?.record_id)
 }
-fn diag(g: &mut Graph, path: Option<String>, code: &str, message: impl Into<String>) {
-    g.diagnostics.push(Diagnostic {
-        path,
-        code: code.into(),
-        message: message.into(),
-    });
-}
+
 pub fn index_workspace(
     options: &IndexOptions,
     cancel: &CancelFlag,
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<Graph> {
-    let capture = crate::capture::Capture::admit(options, cancel, &progress)?;
-    index_captured(options, cancel, progress, &capture)
+    let (graph, _) = index_workspace_with_capture(options, cancel, progress)?;
+    Ok(graph)
 }
-/// Build native evidence from the same immutable bytes as the graph; no Store write occurs here.
+
+/// Return the original admitted descriptor for verification at the publication cutoff.
+pub fn index_workspace_with_capture(
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+) -> Result<(Graph, Capture)> {
+    let capture = Capture::admit(options, cancel, &progress)?;
+    let root = std::fs::canonicalize(&options.workspace_root)?;
+    let native = native_evidence::from_capture(&capture, &root, &root_id(&root)?)?;
+    let graph = project_native(options, &capture, &native, cancel, &progress)?;
+    capture.verify(cancel)?;
+    Ok((graph, capture))
+}
+
+/// Both views are built from the identical validated immutable capture.
 pub fn index_workspace_with_native(
     options: &IndexOptions,
     root_id: &str,
     cancel: &CancelFlag,
     progress: impl Fn(IndexProgress) + Sync,
-) -> Result<(Graph, crate::native_evidence::Artifact)> {
-    let capture = crate::capture::Capture::admit(options, cancel, &progress)?;
+) -> Result<(Graph, native_evidence::Artifact)> {
+    let capture = Capture::admit(options, cancel, &progress)?;
     let root = std::fs::canonicalize(&options.workspace_root)?;
-    let native = crate::native_evidence::from_capture(&capture, &root, root_id)?;
-    let graph = index_captured(options, cancel, progress, &capture)?;
+    let native = native_evidence::from_capture(&capture, &root, root_id)?;
+    let graph = project_native(options, &capture, &native, cancel, &progress)?;
     capture.verify(cancel)?;
     Ok((graph, native))
 }
-fn index_captured(
+
+fn location(text: &str, byte: usize) -> Result<(usize, usize)> {
+    ensure!(
+        byte <= text.len() && text.is_char_boundary(byte),
+        "invalid measured graph range"
+    );
+    let prefix = &text[..byte];
+    Ok((
+        prefix.bytes().filter(|c| *c == b'\n').count() + 1,
+        byte - prefix.rfind('\n').map_or(0, |i| i + 1) + 1,
+    ))
+}
+fn measured_range(file: &SourceFile, range: &native_evidence::Range) -> Result<SourceRange> {
+    let (start_line, start_column) = location(&file.text, range.start)?;
+    let (end_line, end_column) = location(&file.text, range.end)?;
+    ensure!(range.start <= range.end, "inverted measured graph range");
+    Ok(SourceRange {
+        start_byte: range.start,
+        end_byte: range.end,
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+    })
+}
+fn graph_kind(kind: &str) -> Result<SymbolKind> {
+    // Exhaust the validated #22 declaration vocabulary. Unknown kinds must fail closed,
+    // rather than silently inventing a callable graph node.
+    Ok(match kind {
+        "module" | "namespace" => SymbolKind::Module,
+        "type" | "implementation" => SymbolKind::Class,
+        "method" | "constructor" => SymbolKind::Method,
+        "function" | "anonymousFunction" => SymbolKind::Function,
+        "field" => SymbolKind::Field,
+        "variable" => SymbolKind::Variable,
+        "parameter" => SymbolKind::Parameter,
+        "typeParameter" => SymbolKind::TypeParameter,
+        "alias" => SymbolKind::Alias,
+        _ => anyhow::bail!("unknown native declaration kind: {kind}"),
+    })
+}
+fn graph_provenance() -> Provenance {
+    Provenance {
+        source: "native-measuredSyntax".into(),
+        semantic: SemanticState::Unavailable,
+    }
+}
+/// A SCIP symbol is strictly untrusted UI copy, keyed only to a captured native SyntaxId.
+/// A malformed/missing/stale optional display artifact contributes no labels.
+fn measured_display_labels(
     options: &IndexOptions,
+    capture: &Capture,
+    native: &native_evidence::Artifact,
+) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    let (Some(scip_path), Some(manifest_path)) = (&options.scip_path, &options.manifest_path)
+    else {
+        return labels;
+    };
+    let Some((index, manifest)) = capture
+        .bytes(scip_path)
+        .and_then(|bytes| scip::types::Index::parse_from_bytes(bytes).ok())
+        .zip(
+            capture
+                .bytes(manifest_path)
+                .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, String>>(bytes).ok()),
+        )
+    else {
+        return labels;
+    };
+    if index.documents.len() > 1_000 {
+        return labels;
+    }
+    let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut declarations: BTreeMap<&str, Vec<&native_evidence::Declaration>> = BTreeMap::new();
+    for d in &native.declarations {
+        declarations.entry(&d.document.path).or_default().push(d);
+    }
+    let mut seen = BTreeSet::new();
+    for doc in index.documents {
+        if !seen.insert(doc.relative_path.clone()) {
+            continue;
+        }
+        let Some(file) = files.get(doc.relative_path.as_str()) else {
+            continue;
+        };
+        // Optional SCIP is a JavaScript presentation hint only; foreign-language metadata
+        // never lends authority to Java/Rust/Python native facts.
+        if file.language != "javascript"
+            || manifest.get(&file.path) != Some(&file.hash)
+            || doc.occurrences.len() > 10_000
+        {
+            continue;
+        }
+        let encoding = doc.position_encoding.value();
+        if !matches!(encoding, 0..=3) {
+            continue;
+        }
+        let measured = declarations
+            .get(file.path.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if measured.len() > 1_000 {
+            continue;
+        }
+        let mut ranges: BTreeMap<Vec<i32>, Vec<&native_evidence::Declaration>> = BTreeMap::new();
+        for d in measured {
+            let Some(range) = d.name_range.as_ref() else {
+                continue;
+            };
+            if file.text.get(range.start..range.end) != d.name.as_deref() {
+                continue;
+            }
+            let Some(start) = scip_coordinate(&file.text, range.start, encoding) else {
+                continue;
+            };
+            let Some(end) = scip_coordinate(&file.text, range.end, encoding) else {
+                continue;
+            };
+            let coordinates = if start.0 == end.0 {
+                vec![start.0, start.1, end.1]
+            } else {
+                vec![start.0, start.1, end.0, end.1]
+            };
+            ranges.entry(coordinates).or_default().push(d);
+        }
+        let mut matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for occurrence in doc.occurrences {
+            if occurrence.symbol_roles & 1 == 0
+                || occurrence.symbol.is_empty()
+                || occurrence.symbol.len() > 256
+                || occurrence.symbol.chars().any(char::is_control)
+            {
+                continue;
+            }
+            let Some(ds) = ranges.get(&occurrence.range) else {
+                continue;
+            };
+            for d in ds {
+                // A symbol's text is never a source name; require it at least spells
+                // the exact witnessed name before allowing an unauthenticated label.
+                if d.name
+                    .as_ref()
+                    .is_some_and(|name| occurrence.symbol.contains(name))
+                {
+                    matches
+                        .entry(d.syntax_id.clone())
+                        .or_default()
+                        .push(occurrence.symbol.clone());
+                }
+            }
+        }
+        for (id, candidates) in matches {
+            if candidates.len() == 1 {
+                labels.insert(id, candidates[0].clone());
+            }
+        }
+    }
+    labels
+}
+
+fn scip_coordinate(text: &str, byte: usize, encoding: i32) -> Option<(i32, i32)> {
+    let prefix = text.get(..byte)?;
+    let line = i32::try_from(prefix.bytes().filter(|b| *b == b'\n').count()).ok()?;
+    let part = prefix.rsplit('\n').next()?;
+    let column = match encoding {
+        1 => part.len(),                      // UTF-8
+        3 => part.chars().count(),            // UTF-32
+        0 | 2 => part.encode_utf16().count(), // SCIP default UTF-16
+        _ => return None,
+    };
+    Some((line, i32::try_from(column).ok()?))
+}
+
+fn project_native(
+    options: &IndexOptions,
+    capture: &Capture,
+    native: &native_evidence::Artifact,
     cancel: &CancelFlag,
-    progress: impl Fn(IndexProgress) + Sync,
-    capture: &crate::capture::Capture,
+    progress: &impl Fn(IndexProgress),
 ) -> Result<Graph> {
-    let workspace_root = std::fs::canonicalize(&options.workspace_root)?;
-    let mut g = Graph {
+    ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
+    let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut graph = Graph {
         files: capture.files.clone(),
         ..Graph::default()
     };
-    let mut hashes = capture.hashes.clone();
-    for name in &crate::capture::ROOT_INPUTS[..22] {
-        if let Some(bytes) = capture.bytes(&workspace_root.join(name)) {
-            hashes.insert((*name).into(), hex::encode(sha2::Sha256::digest(bytes)));
-        }
-    }
-    check(cancel)?;
-    let mut documents = BTreeMap::new();
-    let mut semantic = SemanticState::Unavailable;
-    if let Some(path) = &options.scip_path {
-        match capture
-            .bytes(path)
-            .context("SCIP input unavailable")
-            .and_then(|b| Ok(scip::types::Index::parse_from_bytes(b)?))
-        {
-            Ok(index) => {
-                if let Some(manifest) = &options.manifest_path {
-                    match capture
-                        .bytes(manifest)
-                        .context("manifest input unavailable")
-                        .and_then(|b| Ok(serde_json::from_slice::<BTreeMap<String, String>>(b)?))
-                    {
-                        Ok(prior) => {
-                            let keys: BTreeSet<_> =
-                                prior.keys().chain(hashes.keys()).cloned().collect();
-                            g.stats.changed_files = keys
-                                .into_iter()
-                                .filter(|p| prior.get(p) != hashes.get(p))
-                                .collect();
-                            semantic =
-                                if g.stats.changed_files.is_empty() && g.diagnostics.is_empty() {
-                                    SemanticState::Fresh
-                                } else {
-                                    SemanticState::Stale
-                                };
-                        }
-                        Err(e) => diag(&mut g, None, "manifest-unavailable", e.to_string()),
-                    }
-                } else {
-                    diag(
-                        &mut g,
-                        None,
-                        "manifest-unavailable",
-                        "SCIP requires a matching source hash manifest",
-                    );
-                }
-                if semantic == SemanticState::Fresh {
-                    for doc in index.documents {
-                        documents.insert(doc.relative_path.clone(), doc);
-                    }
-                }
-            }
-            Err(e) => diag(&mut g, None, "scip-unavailable", e.to_string()),
-        }
-    }
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
-    for i in 0..g.files.len() {
-        check(cancel)?;
-        // Temporarily move the text, rather than duplicate every source buffer.
-        let file = g.files[i].clone();
-        if file.language != "javascript" {
-            match file.language.as_str() {
-                "rust" => crate::indexer_rust::extract(&mut g, &file, cancel)?,
-                "java" => crate::indexer_java::extract(&mut g, &file, cancel)?,
-                "python" => crate::indexer_python::extract(&mut g, &file, cancel)?,
-                _ => unreachable!("source discovery returned an unsupported language"),
-            }
-            progress(IndexProgress {
-                phase: "parse".into(),
-                completed: i + 1,
-                total: g.files.len(),
-            });
-            continue;
-        }
-        let mut cancelled = |_: &tree_sitter::ParseState| cancel.load(Ordering::Relaxed);
-        let tree = parser.parse_with_options(
-            &mut |offset, _| &file.text.as_bytes()[offset..],
-            None,
-            Some(tree_sitter::ParseOptions::new().progress_callback(&mut cancelled)),
-        );
-        check(cancel)?;
-        let tree = tree.context("JavaScript parser failed")?;
-        if tree.root_node().has_error() {
-            g.stats.parse_error_files += 1;
-            diag(
-                &mut g,
-                Some(file.path.clone()),
-                "parse-error",
-                "Tree-sitter recovered from invalid JavaScript; results may be incomplete",
-            );
-        }
-        let mut ex = Extractor {
-            g: &mut g,
-            file: &file,
-            doc: if tree.root_node().has_error() {
-                None
-            } else {
-                documents.get(&file.path)
-            },
-            semantic: if tree.root_node().has_error() {
-                SemanticState::Unavailable
-            } else {
-                semantic
-            },
-            functions: HashMap::new(),
-            classes: HashMap::new(),
-            cancel,
+    let display_labels = measured_display_labels(options, capture, native);
+    let mut owners: BTreeMap<(String, String), String> = BTreeMap::new();
+    // Parent is the measured #22 ancestor chain, never a name-based match.
+    for d in &native.declarations {
+        let file = files
+            .get(d.document.path.as_str())
+            .context("missing graph source")?;
+        let key = serde_json::to_string(&d.ancestors)?;
+        let parent = if d.ancestors.is_empty() {
+            None
+        } else {
+            let prefix = serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?;
+            let last = serde_json::to_string(&d.ancestors[d.ancestors.len() - 1])?;
+            owners
+                .get(&(d.document.path.clone(), format!("{prefix}/{last}")))
+                .cloned()
         };
-        let module = format!("module:{}", file.path);
-        ex.g.nodes.push(Symbol {
-            id: module.clone(),
-            name: file.path.clone(),
-            kind: SymbolKind::Module,
-            path: file.path.clone(),
-            range: range(tree.root_node()),
-            parent: None,
-            accessor: false,
-            provenance: ex.provenance(false),
+        ensure!(
+            d.ancestors.is_empty() || parent.is_some(),
+            "native declaration parent missing"
+        );
+        let current = serde_json::to_string(&d.key)?;
+        owners.insert(
+            (d.document.path.clone(), format!("{key}/{current}")),
+            d.syntax_id.clone(),
+        );
+        graph.nodes.push(Symbol {
+            id: d.syntax_id.clone(),
+            name: d.name.clone().unwrap_or_else(|| {
+                if d.kind == "module" {
+                    file.path.clone()
+                } else {
+                    format!("<{}@{}>", d.kind, d.range.start)
+                }
+            }),
+            display_label: display_labels.get(&d.syntax_id).cloned(),
+            kind: graph_kind(&d.kind)?,
+            path: d.document.path.clone(),
+            range: measured_range(file, &d.range)?,
+            parent,
+            accessor: d.header.modifiers.iter().any(|m| m == "get" || m == "set"),
+            provenance: graph_provenance(),
         });
-        ex.declarations(tree.root_node(), &module, 0)?;
-        ex.walk(tree.root_node(), &module, &[], 0)?;
+    }
+    for r in &native.control_regions {
+        let file = files
+            .get(r.document.path.as_str())
+            .context("missing region source")?;
+        let text = file
+            .text
+            .get(r.range.start..r.range.end)
+            .context("invalid region text")?;
+        graph.regions.push(ControlRegion {
+            id: r.id.clone(),
+            kind: r.kind.clone(),
+            label: text.chars().take(140).collect(),
+            parent: r.parent_id.clone(),
+            owner: r.owner_syntax_id.clone(),
+            path: r.document.path.clone(),
+            range: measured_range(file, &r.range)?,
+        });
+    }
+    for c in &native.calls {
+        let file = files
+            .get(c.document.path.as_str())
+            .context("missing call source")?;
+        graph.calls.push(CallSite {
+            id: c.id.clone(),
+            caller: c.owner_syntax_id.clone(),
+            callee_text: c.spelling.clone(),
+            path: c.document.path.clone(),
+            range: measured_range(file, &c.range)?,
+            callee_range: c
+                .callee_range
+                .as_ref()
+                .map(|r| measured_range(file, r))
+                .transpose()?,
+            ordinal: c.ordinal,
+            regions: c.region_ids.clone(),
+            provenance: graph_provenance(),
+        });
+    }
+    for coverage in &native.coverage {
+        if coverage.state != "complete" {
+            let recovered = coverage
+                .diagnostic
+                .as_deref()
+                .is_some_and(|message| message.contains("parser recovered"));
+            if recovered {
+                graph.stats.parse_error_files += 1;
+            }
+            graph.diagnostics.push(Diagnostic {
+                path: Some(coverage.document_path.clone()),
+                code: if recovered {
+                    "parse-error"
+                } else {
+                    "native-coverage-partial"
+                }
+                .into(),
+                message: coverage
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "Native extraction is incomplete".into()),
+            });
+        }
+    }
+    graph.nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    graph.calls.sort_by(|a, b| {
+        (&a.path, a.range.start_byte, a.range.end_byte).cmp(&(
+            &b.path,
+            b.range.start_byte,
+            b.range.end_byte,
+        ))
+    });
+    graph.regions.sort_by(|a, b| a.id.cmp(&b.id));
+    graph.stats.files = graph.files.len();
+    graph.stats.symbols = graph.nodes.len();
+    graph.stats.calls = graph.calls.len();
+    graph.stats.regions = graph.regions.len();
+    graph.stats.unresolved = graph.calls.len();
+    for i in 0..graph.files.len() {
+        ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         progress(IndexProgress {
             phase: "parse".into(),
             completed: i + 1,
-            total: ex.g.files.len(),
+            total: graph.files.len(),
         });
     }
-    let by_id: HashMap<_, _> = g
-        .nodes
-        .iter()
-        .map(|n| (n.id.clone(), (n.kind, n.accessor)))
-        .collect();
-    for c in &mut g.calls {
-        check(cancel)?;
-        if c.candidate_symbols.len() > 1 {
-            c.resolution = Resolution::Ambiguous;
-        } else if let Some(id) = c.candidate_symbols.first() {
-            if by_id
-                .get(id)
-                .is_some_and(|(k, a)| *k != SymbolKind::Module && !a)
-            {
-                c.target = Some(id.clone());
-                c.resolution = Resolution::Internal;
-            } else if !by_id.contains_key(id) && id.ends_with("().") {
-                c.target = Some(id.clone());
-                c.resolution = Resolution::External;
-            }
-        }
-        c.callback_arguments.retain(|id| {
-            by_id
-                .get(id)
-                .is_some_and(|(k, a)| *k != SymbolKind::Module && !a)
-        });
-    }
-    g.nodes.sort_by(|a, b| a.id.cmp(&b.id));
-    g.regions.sort_by(|a, b| a.id.cmp(&b.id));
-    g.calls
-        .sort_by(|a, b| (&a.path, a.range.start_byte).cmp(&(&b.path, b.range.start_byte)));
-    let mut ordinals = HashMap::new();
-    for c in &mut g.calls {
-        let n = ordinals.entry(c.caller.clone()).or_insert(0);
-        *n += 1;
-        c.ordinal = *n;
-    }
-    g.stats.files = g.files.len();
-    g.stats.symbols = g.nodes.len();
-    g.stats.calls = g.calls.len();
-    g.stats.regions = g.regions.len();
-    g.stats.semantic_state = semantic;
-    for c in &g.calls {
-        match c.resolution {
-            Resolution::Internal => g.stats.internal += 1,
-            Resolution::External => g.stats.external += 1,
-            Resolution::Unresolved => g.stats.unresolved += 1,
-            Resolution::Ambiguous => g.stats.ambiguous += 1,
-        }
-    }
-    g.diagnostics
-        .sort_by(|a, b| (&a.path, &a.code, &a.message).cmp(&(&b.path, &b.code, &b.message)));
-    capture.verify(cancel)?;
+    ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
     progress(IndexProgress {
         phase: "complete".into(),
-        completed: g.files.len(),
-        total: g.files.len(),
+        completed: graph.files.len(),
+        total: graph.files.len(),
     });
-    capture.verify(cancel)?;
-    Ok(g)
-}
-fn range(n: Node<'_>) -> SourceRange {
-    SourceRange {
-        start_byte: n.start_byte(),
-        end_byte: n.end_byte(),
-        start_line: n.start_position().row + 1,
-        start_column: n.start_position().column + 1,
-        end_line: n.end_position().row + 1,
-        end_column: n.end_position().column + 1,
-    }
-}
-fn children(n: Node<'_>) -> Vec<Node<'_>> {
-    let mut c = n.walk();
-    n.named_children(&mut c).collect()
-}
-fn unwrap(mut n: Node<'_>) -> Node<'_> {
-    while n.kind() == "parenthesized_expression" && n.named_child_count() == 1 {
-        n = n.named_child(0).unwrap();
-    }
-    n
-}
-fn is_function(n: Node<'_>) -> bool {
-    matches!(
-        n.kind(),
-        "function_declaration"
-            | "function_expression"
-            | "arrow_function"
-            | "generator_function_declaration"
-            | "generator_function"
-            | "method_definition"
-    )
-}
-struct Extractor<'a> {
-    g: &'a mut Graph,
-    file: &'a SourceFile,
-    doc: Option<&'a scip::types::Document>,
-    semantic: SemanticState,
-    functions: HashMap<usize, String>,
-    classes: HashMap<usize, String>,
-    cancel: &'a CancelFlag,
-}
-impl Extractor<'_> {
-    fn text(&self, n: Node<'_>) -> &str {
-        &self.file.text[n.byte_range()]
-    }
-    fn provenance(&self, scip: bool) -> Provenance {
-        Provenance {
-            source: if scip {
-                "scip+tree-sitter"
-            } else {
-                "tree-sitter"
-            }
-            .into(),
-            semantic: self.semantic,
-        }
-    }
-    fn symbols(&self, n: Option<Node<'_>>, definition: bool) -> Vec<String> {
-        let (Some(n), Some(doc)) = (n, self.doc) else {
-            return vec![];
-        };
-        let coord = |byte: usize| {
-            let prefix = &self.file.text[..byte];
-            let start = prefix.rfind('\n').map_or(0, |i| i + 1);
-            let line = prefix.bytes().filter(|b| *b == b'\n').count() as i32;
-            let s = &self.file.text[start..byte];
-            let col = match doc.position_encoding.value() {
-                1 => s.len(),
-                3 => s.chars().count(),
-                _ => s.encode_utf16().count(),
-            };
-            (line, col as i32)
-        };
-        let (sr, sc) = coord(n.start_byte());
-        let (er, ec) = coord(n.end_byte());
-        doc.occurrences
-            .iter()
-            .filter(|o| {
-                (o.symbol_roles & 1 != 0) == definition
-                    && !o.symbol.is_empty()
-                    && match o.range.as_slice() {
-                        [a, b, c] => *a == sr && *b == sc && sr == er && *c == ec,
-                        [a, b, c, d] => [*a, *b, *c, *d] == [sr, sc, er, ec],
-                        _ => false,
-                    }
-            })
-            .map(|o| {
-                if o.symbol.starts_with("local ") {
-                    format!("local:{}:{}:{}", self.file.path, self.file.hash, o.symbol)
-                } else {
-                    o.symbol.clone()
-                }
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-    fn declarations(&mut self, n: Node<'_>, parent: &str, depth: usize) -> Result<()> {
-        check(self.cancel)?;
-        ensure!(depth < 512, "JavaScript nesting exceeds 512 levels");
-        let mut owner = parent.to_owned();
-        if is_function(n) || matches!(n.kind(), "class_declaration" | "class") {
-            let mut name = n.child_by_field_name("name");
-            if name.is_none()
-                && let Some(p) = n.parent()
-            {
-                name = match p.kind() {
-                    "variable_declarator" => p.child_by_field_name("name"),
-                    "pair" => p.child_by_field_name("key"),
-                    _ => None,
-                };
-            }
-            let ids = self.symbols(name, true);
-            let semantic = ids.len() == 1 && !self.g.nodes.iter().any(|node| node.id == ids[0]);
-            let id = if semantic {
-                ids[0].clone()
-            } else {
-                format!(
-                    "syntax:{}:{}:{}:{}",
-                    self.file.path,
-                    self.file.hash,
-                    n.start_byte(),
-                    n.kind()
-                )
-            };
-            let label = name.map(|v| self.text(v).to_owned()).unwrap_or_else(|| {
-                format!(
-                    "<callback@{}:{}>",
-                    n.start_position().row + 1,
-                    n.start_position().column + 1
-                )
-            });
-            let accessor = n.kind() == "method_definition" && {
-                let mut cur = n.walk();
-                n.children(&mut cur)
-                    .any(|c| matches!(c.kind(), "get" | "set"))
-            };
-            let kind = if n.kind() == "method_definition" {
-                SymbolKind::Method
-            } else if is_function(n) {
-                SymbolKind::Function
-            } else {
-                SymbolKind::Class
-            };
-            self.g.nodes.push(Symbol {
-                id: id.clone(),
-                name: label,
-                kind,
-                path: self.file.path.clone(),
-                range: range(n),
-                parent: Some(parent.into()),
-                accessor,
-                provenance: self.provenance(semantic),
-            });
-            if is_function(n) {
-                self.functions.insert(n.id(), id.clone());
-            } else {
-                self.classes.insert(n.id(), id.clone());
-            }
-            owner = id;
-        }
-        for child in children(n) {
-            self.declarations(child, &owner, depth + 1)?;
-        }
-        Ok(())
-    }
-    fn region(&mut self, n: Node<'_>, kind: &str, context: &[String], owner: &str) -> Vec<String> {
-        let id = format!(
-            "region:{}:{}:{}:{}",
-            self.file.path,
-            self.file.hash,
-            n.start_byte(),
-            kind
-        );
-        self.g.regions.push(ControlRegion {
-            id: id.clone(),
-            kind: kind.into(),
-            label: self.text(n).chars().take(140).collect(),
-            parent: context.last().cloned(),
-            owner: owner.into(),
-            path: self.file.path.clone(),
-            range: range(n),
-        });
-        let mut result = context.to_vec();
-        result.push(id);
-        result
-    }
-    fn walk(&mut self, n: Node<'_>, caller: &str, context: &[String], depth: usize) -> Result<()> {
-        check(self.cancel)?;
-        ensure!(depth < 512, "JavaScript nesting exceeds 512 levels");
-        let mut caller = caller.to_owned();
-        let mut context = context.to_vec();
-        let mut skip = None;
-        if let Some(id) = self.functions.get(&n.id()).cloned() {
-            if n.kind() == "method_definition" {
-                skip = n.child_by_field_name("name");
-                if let Some(key) = skip {
-                    self.walk(key, &caller, &context, depth + 1)?;
-                }
-            }
-            caller = id;
-            context.clear();
-        }
-        // Computed field keys and static initializers run at class definition.
-        // Instance values run later, during construction: retain that evidence on
-        // the class with a boundary region, never as a call from the enclosing fn.
-        if n.kind() == "field_definition" {
-            if let Some(key) = n.child_by_field_name("property") {
-                self.walk(key, &caller, &context, depth + 1)?;
-            }
-            if let Some(value) = n.child_by_field_name("value") {
-                let mut cursor = n.walk();
-                let is_static = n.children(&mut cursor).any(|c| c.kind() == "static");
-                if is_static {
-                    self.walk(value, &caller, &context, depth + 1)?;
-                } else if let Some(owner) = n
-                    .parent()
-                    .and_then(|body| body.parent())
-                    .and_then(|class| self.classes.get(&class.id()))
-                    .cloned()
-                {
-                    let region = self.region(value, "instance-initializer", &[], &owner);
-                    self.walk(value, &owner, &region, depth + 1)?;
-                    diag(
-                        self.g,
-                        Some(self.file.path.clone()),
-                        "instance-initializer-boundary",
-                        format!(
-                            "Instance field at line {} is owned by the class; construction timing is not modeled",
-                            n.start_position().row + 1
-                        ),
-                    );
-                } else {
-                    diag(
-                        self.g,
-                        Some(self.file.path.clone()),
-                        "unsupported-field-owner",
-                        "Instance field has no class owner; initializer omitted rather than attributed to enclosing code",
-                    );
-                }
-            }
-            return Ok(());
-        }
-        if matches!(n.kind(), "if_statement" | "ternary_expression") {
-            if let Some(c) = n.child_by_field_name("condition") {
-                self.walk(c, &caller, &context, depth + 1)?;
-            }
-            for (field, kind) in if n.kind() == "if_statement" {
-                [("consequence", "if"), ("alternative", "else")]
-            } else {
-                [
-                    ("consequence", "conditional-true"),
-                    ("alternative", "conditional-false"),
-                ]
-            } {
-                if let Some(c) = n.child_by_field_name(field) {
-                    let region = self.region(c, kind, &context, &caller);
-                    self.walk(c, &caller, &region, depth + 1)?;
-                }
-            }
-            return Ok(());
-        }
-        if n.kind() == "binary_expression"
-            && n.child_by_field_name("operator")
-                .is_some_and(|o| matches!(self.text(o), "&&" | "||" | "??"))
-        {
-            if let Some(c) = n.child_by_field_name("left") {
-                self.walk(c, &caller, &context, depth + 1)?;
-            }
-            if let Some(c) = n.child_by_field_name("right") {
-                let r = self.region(c, "short-circuit", &context, &caller);
-                self.walk(c, &caller, &r, depth + 1)?;
-            }
-            return Ok(());
-        }
-        if matches!(
-            n.kind(),
-            "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
-        ) {
-            skip = n.child_by_field_name(if n.kind() == "for_in_statement" {
-                "right"
-            } else {
-                "initializer"
-            });
-            if let Some(c) = skip {
-                self.walk(c, &caller, &context, depth + 1)?;
-            }
-            context = self.region(n, "loop", &context, &caller);
-        }
-        if matches!(
-            n.kind(),
-            "try_statement"
-                | "catch_clause"
-                | "finally_clause"
-                | "switch_statement"
-                | "switch_case"
-                | "switch_default"
-        ) {
-            context = self.region(n, n.kind(), &context, &caller);
-        }
-        if matches!(n.kind(), "call_expression" | "new_expression") {
-            let callee = n
-                .child_by_field_name(if n.kind() == "new_expression" {
-                    "constructor"
-                } else {
-                    "function"
-                })
-                .map(unwrap);
-            let token = callee.and_then(|c| {
-                if c.kind() == "member_expression" {
-                    c.child_by_field_name("property")
-                } else {
-                    Some(c)
-                }
-            });
-            let candidates = self.symbols(token, false);
-            if callee.is_some_and(|c| {
-                c.kind() == "subscript_expression" || matches!(self.text(c), "eval" | "import")
-            }) {
-                diag(
-                    self.g,
-                    Some(self.file.path.clone()),
-                    "dynamic-call",
-                    format!(
-                        "Dynamic call at line {} is a lexical site, not runtime target inference",
-                        n.start_position().row + 1
-                    ),
-                );
-            }
-            let mut callbacks = Vec::new();
-            if let Some(args) = n.child_by_field_name("arguments") {
-                for arg in children(args).into_iter().map(unwrap) {
-                    if let Some(id) = self.functions.get(&arg.id()) {
-                        callbacks.push(id.clone());
-                    } else if matches!(arg.kind(), "identifier" | "member_expression") {
-                        callbacks.extend(self.symbols(
-                            if arg.kind() == "member_expression" {
-                                arg.child_by_field_name("property")
-                            } else {
-                                Some(arg)
-                            },
-                            false,
-                        ));
-                    }
-                }
-            }
-            self.g.calls.push(CallSite {
-                id: format!(
-                    "call:{}:{}:{}:{}",
-                    self.file.path,
-                    self.file.hash,
-                    n.start_byte(),
-                    n.end_byte()
-                ),
-                caller: caller.clone(),
-                callee_text: callee
-                    .map(|v| self.text(v).to_owned())
-                    .unwrap_or_else(|| "<unknown>".into()),
-                path: self.file.path.clone(),
-                range: range(n),
-                target: None,
-                candidate_symbols: candidates,
-                resolution: Resolution::Unresolved,
-                ordinal: 0,
-                regions: context.clone(),
-                callback_arguments: callbacks,
-                provenance: self.provenance(self.doc.is_some()),
-            });
-        }
-        for child in children(n) {
-            if skip.is_none_or(|s| s.id() != child.id()) {
-                self.walk(child, &caller, &context, depth + 1)?;
-            }
-        }
-        Ok(())
-    }
+    Ok(graph)
 }
 
 /// Closed #22 syntax categories measured by the JavaScript adapter.

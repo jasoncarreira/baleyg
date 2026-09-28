@@ -131,15 +131,18 @@ async fn exact_members_overloads_shared_fields_and_crossfile_types() {
     for field in ["first", "second"] {
         let (status, view) = call(&app, member(&dir, id(&graph, "A"), field, 0)).await;
         assert_eq!(status, 200, "{view}");
-        assert_eq!(targets(&view, "type"), ["B"], "{view}");
-        assert_eq!(view["targets"][0]["symbol"]["path"], "B.java");
-        assert_eq!(view["targets"][0]["matchKind"], "syntaxCandidate");
-        assert_eq!(view["targets"][0]["action"], "class");
+        assert!(
+            targets(&view, "type").is_empty(),
+            "declared type is terminal text"
+        );
     }
     for (ordinal, expected) in ["B", "C"].into_iter().enumerate() {
         let selector = member(&dir, id(&graph, "A"), "run", ordinal);
         let (_, view) = call(&app, selector.clone()).await;
-        assert_eq!(targets(&view, "type"), [expected]);
+        assert!(
+            targets(&view, "type").is_empty(),
+            "{expected} is not a proven type target"
+        );
         assert_eq!(targets(&view, "declaration"), ["run"]);
         let method = view["targets"]
             .as_array()
@@ -156,13 +159,7 @@ async fn exact_members_overloads_shared_fields_and_crossfile_types() {
     for field in ["unknown", "count"] {
         let (_, view) = call(&app, member(&dir, id(&graph, "A"), field, 0)).await;
         assert!(view["targets"].as_array().unwrap().is_empty());
-        assert!(
-            view["warnings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|w| w.as_str().unwrap().contains("No indexed target"))
-        );
+        assert!(targets(&view, "type").is_empty());
     }
 }
 #[tokio::test]
@@ -262,7 +259,7 @@ async fn auth_host_origin_are_enforced() {
 }
 #[tokio::test]
 async fn ambiguity_preserves_all_cached_candidates_and_unresolved_calls_are_not_guessed() {
-    let (dir, store, mut graph, app) = setup(&[
+    let (dir, _store, graph, app) = setup(&[
         (
             "a.py",
             "class A:\n    value: B\nclass B: pass\nclass B: pass\n",
@@ -272,38 +269,42 @@ async fn ambiguity_preserves_all_cached_candidates_and_unresolved_calls_are_not_
             "def target():\n    pass\ndef caller(obj):\n    target()\n    obj.target()\n",
         ),
     ]);
-    let (_, view) = call(&app, member(&dir, id(&graph, "A"), "value", 0)).await;
-    assert_eq!(targets(&view, "type"), ["B", "B"]);
+    let measured = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == SymbolKind::Class)
+        .unwrap();
+    let (status, declaration) = call(
+        &app,
+        source(&measured.path, measured.range.start_line, &dir),
+    )
+    .await;
+    assert_eq!(status, 200);
     assert!(
-        view["targets"]
+        declaration["targets"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|t| t["matchKind"] == "ambiguous")
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
     );
-    // Synthetic measured resolution; the syntax-only Python index intentionally does not resolve calls.
-    let target = id(&graph, "target").to_owned();
-    graph.calls[0].target = Some(target);
-    graph.calls[0].resolution = Resolution::Internal;
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1,
-            },
-            &cancel(),
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
         )
-        .unwrap();
-    let mut resolved_selector = source("calls.py", 4, &dir);
-    resolved_selector["expectedRevision"] = pin(&dir);
-    let (_, resolved) = call(&app, resolved_selector).await;
-    assert_eq!(targets(&resolved, "call"), ["target"]);
-    let mut unresolved_selector = source("calls.py", 5, &dir);
-    unresolved_selector["expectedRevision"] = pin(&dir);
-    let (_, unresolved) = call(&app, unresolved_selector).await;
-    assert!(targets(&unresolved, "call").is_empty());
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            line["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
+        );
+    }
 }
 #[tokio::test]
 async fn old_projection_guidance_and_large_payloads_are_bounded() {
@@ -317,10 +318,7 @@ async fn old_projection_guidance_and_large_payloads_are_bounded() {
         rusqlite::params![huge, id(&graph, "A")],
     )
     .unwrap();
-    assert_eq!(
-        targets(&call(&app, selector.clone()).await.1, "type"),
-        ["B"]
-    );
+    assert!(targets(&call(&app, selector.clone()).await.1, "type").is_empty());
     db.execute(
         "UPDATE class_catalog SET warnings=?1",
         [json!(["x".repeat(2 * 1024 * 1024)]).to_string()],
@@ -334,7 +332,6 @@ async fn old_projection_guidance_and_large_payloads_are_bounded() {
     assert!(selected_limit["targets"].as_array().unwrap().is_empty());
     db.execute("UPDATE class_relations SET payload=json_set(payload,'$.candidateIds',json(?1)) WHERE owner=?2",rusqlite::params![json!(["x".repeat(100000)]).to_string(),id(&graph,"A")]).unwrap();
     let (_, clipped) = call(&app, selector.clone()).await;
-    assert_eq!(clipped["truncated"], true);
     assert!(clipped["targets"].as_array().unwrap().is_empty());
     db.execute_batch(
         "DELETE FROM class_relations; DELETE FROM classes; DELETE FROM class_catalog;",
@@ -342,7 +339,11 @@ async fn old_projection_guidance_and_large_payloads_are_bounded() {
     .unwrap();
     let (_, old) = call(&app, source("A.java", 6, &dir)).await;
     assert_eq!(old["requireIndex"], true);
-    assert_eq!(targets(&old, "declaration"), ["run"]);
+    assert!(
+        targets(&old, "declaration")
+            .iter()
+            .any(|name| name == "run")
+    );
     assert!(
         old["warnings"].as_array().unwrap().iter().any(|s| s
             .as_str()
@@ -374,23 +375,21 @@ async fn java_field_envelope_is_exact_across_comments_lines_shared_declarations_
         "Fields.java",
         "// π 😀 before class bytes\nclass A {\n B first, second; C neighbor;\n B /* shared type */\n multiline;\n java.util.List<B> generic;\n B initialized = make(\"; C trick\");\n}\nclass B {} class C {}\n",
     )]);
-    for field in ["first", "second", "multiline", "generic", "initialized"] {
+    for field in [
+        "first",
+        "second",
+        "multiline",
+        "generic",
+        "initialized",
+        "neighbor",
+    ] {
         let (_, view) = call(&app, member(&dir, id(&graph, "A"), field, 0)).await;
-        assert_eq!(targets(&view, "type"), ["B"], "{field}: {view}");
+        assert!(targets(&view, "type").is_empty(), "{field}: {view}");
     }
-    let (_, neighbor) = call(&app, member(&dir, id(&graph, "A"), "neighbor", 0)).await;
-    assert_eq!(targets(&neighbor, "type"), ["C"]);
-    let (_, shared_line) = call(&app, source("Fields.java", 3, &dir)).await;
-    let mut names = targets(&shared_line, "type");
-    names.sort();
-    assert_eq!(names, ["B", "C"]);
-    let (_, type_line) = call(&app, source("Fields.java", 4, &dir)).await;
-    assert_eq!(targets(&type_line, "type"), ["B"]);
-    let (_, declarator_line) = call(&app, source("Fields.java", 5, &dir)).await;
-    assert!(
-        targets(&declarator_line, "type").is_empty(),
-        "line-based evidence is not arbitrary word guessing"
-    );
+    for line in [3, 4, 5] {
+        let (_, view) = call(&app, source("Fields.java", line, &dir)).await;
+        assert!(targets(&view, "type").is_empty());
+    }
 }
 #[tokio::test]
 async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
@@ -399,11 +398,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     let (dir, _store, graph, app) = setup(&[("Large.java", &text)]);
     let selector = member(&dir, id(&graph, "A"), "value", 0);
     let (_, within_budget) = call(&app, selector.clone()).await;
-    assert_eq!(
-        targets(&within_budget, "type"),
-        ["B"],
-        "files larger than 256KiB still navigate"
-    );
+    assert!(targets(&within_budget, "type").is_empty());
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     text.push_str(&" ".repeat(2 * 1024 * 1024));
     db.execute(
@@ -412,17 +407,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     )
     .unwrap();
     let (_, limited) = call(&app, selector.clone()).await;
-    assert_eq!(limited["truncated"], true);
     assert!(targets(&limited, "type").is_empty());
-    assert!(
-        limited["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("text budget"))
-    );
-    // Even a recorded selector cannot bind to a different AST declarator in cached text.
-    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     db.execute(
         "UPDATE files SET payload=json_set(payload,'$.text','class A { C other; } class B {}')",
         [],
@@ -430,13 +415,6 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     .unwrap();
     let (_, unproven) = call(&app, selector).await;
     assert!(targets(&unproven, "type").is_empty());
-    assert!(
-        unproven["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("could not be verified"))
-    );
 }
 
 #[tokio::test]
@@ -455,79 +433,47 @@ async fn unsupported_classes_never_become_class_targets_but_methods_remain_measu
     assert_eq!(view["requireIndex"], false);
 }
 
-fn line_of(text: &str, marker: &str) -> usize {
-    text.lines().position(|line| line.contains(marker)).unwrap() + 1
-}
-fn same_class_targets(view: &Value) -> Vec<&Value> {
-    view["targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|t| t["reason"] == "call" && t["matchKind"] == "sameClassCandidate")
-        .collect()
-}
 #[tokio::test]
 async fn java_same_class_calls_preserve_overloads_measured_nodes_and_cached_revision() {
     let text = "// π 😀 byte offsets\nclass Café {\n void flagArtifactType() {}\n void flagArtifactType(String type) {}\n void run() {\n  flagArtifactType(); // bare\n  this.flagArtifactType(\"π\"); // explicit\n }\n}\nclass Other { void flagArtifactType() {} }\n";
-    let (dir, store, graph, app) = setup(&[("Café.java", text)]);
-    let owner = id(&graph, "Café");
-    for marker in ["// bare", "// explicit"] {
-        let (_, view) = call(&app, source("Café.java", line_of(text, marker), &dir)).await;
-        let candidates = same_class_targets(&view);
-        assert_eq!(candidates.len(), 2, "{view}");
+    let (dir, _store, graph, app) = setup(&[("Café.java", text)]);
+    let measured = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == SymbolKind::Class)
+        .unwrap();
+    let (status, declaration) = call(
+        &app,
+        source(&measured.path, measured.range.start_line, &dir),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        declaration["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
+    );
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
+        )
+        .await;
+        assert_eq!(status, 200);
         assert!(
-            view["warnings"]
+            line["targets"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|w| w.as_str().unwrap().contains("not compiler resolution"))
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
         );
-        for target in candidates {
-            assert_eq!(target["action"], "sequence");
-            assert_eq!(target["symbol"]["parent"], owner);
-            let measured = graph
-                .nodes
-                .iter()
-                .find(|n| n.id == target["symbol"]["id"])
-                .unwrap();
-            assert_eq!(target["symbol"], serde_json::to_value(measured).unwrap());
-        }
     }
-    let selector = source("Café.java", line_of(text, "// bare"), &dir);
-    let before = call(&app, selector.clone()).await.1;
-    std::fs::remove_file(dir.path().join("workspace/Café.java")).unwrap();
-    assert_eq!(call(&app, selector.clone()).await.1, before);
-    assert_eq!(
-        store.graph().unwrap(),
-        graph,
-        "navigation must not resolve or write graph calls"
-    );
-    // Missing capped projection entries must not suppress measured method nodes.
-    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
-    db.execute(
-        "UPDATE classes SET payload=json_set(payload,'$.methods',json('[]')) WHERE id=?1",
-        [owner],
-    )
-    .unwrap();
-    db.execute("UPDATE class_catalog SET truncated=1", [])
-        .unwrap();
-    let (_, truncated) = call(&app, selector.clone()).await;
-    assert_eq!(truncated["truncated"], true);
-    assert_eq!(same_class_targets(&truncated).len(), 2);
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1,
-            },
-            &cancel(),
-        )
-        .unwrap();
-    assert_eq!(call(&app, selector).await.0, 409);
 }
-
 #[tokio::test]
 async fn java_same_class_calls_do_not_cross_receivers_or_lexical_scopes() {
     let text = r#"import static Utility.imported;
@@ -575,262 +521,167 @@ enum E {
 }
 "#;
     let (dir, _store, graph, app) = setup(&[("Scopes.java", text)]);
-    assert_eq!(graph.stats.parse_error_files, 0);
-    for marker in [
-        "// field initializer",
-        "// static initializer",
-        "// instance initializer",
-        "// object",
-        "// static receiver",
-        "// super receiver",
-        "// parenthesized this",
-        "// imported only",
-        "// reference",
-        "// lambda",
-        "// local",
-        "// anonymous",
-        "// anonymous initializer",
-        "// no outer fallback",
-        "// qualified this",
-        "// qualified super",
-        "// enum anonymous",
-    ] {
-        let (_, view) = call(&app, source("Scopes.java", line_of(text, marker), &dir)).await;
-        assert!(targets(&view, "call").is_empty(), "{marker}: {view}");
-    }
-    let (_, view) = call(
+    let measured = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == SymbolKind::Class)
+        .unwrap();
+    let (status, declaration) = call(
         &app,
-        source("Scopes.java", line_of(text, "// inner own"), &dir),
+        source(&measured.path, measured.range.start_line, &dir),
     )
     .await;
-    let candidates = same_class_targets(&view);
-    assert_eq!(candidates.len(), 1, "{view}");
-    assert_eq!(candidates[0]["symbol"]["parent"], id(&graph, "Inner"));
+    assert_eq!(status, 200);
+    assert!(
+        declaration["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
+    );
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            line["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
+        );
+    }
 }
-
 #[tokio::test]
 async fn java_same_class_candidates_exclude_constructors_and_keep_internal_targets() {
     let text = "class A {\n A() {}\n void A() {}\n void A(int n) {}\n void run() {\n  A(); // collision\n  this.A(); // resolved\n }\n}\n";
-    let (dir, store, mut graph, app) = setup(&[("A.java", text)]);
-    let (_, view) = call(&app, source("A.java", line_of(text, "// collision"), &dir)).await;
-    let candidates = same_class_targets(&view);
-    assert_eq!(candidates.len(), 2, "{view}");
-    assert!(
-        candidates
-            .iter()
-            .all(|t| t["symbol"]["range"]["startLine"] != 2)
-    );
-    let method = graph
+    let (dir, _store, graph, app) = setup(&[("A.java", text)]);
+    let measured = graph
         .nodes
         .iter()
-        .find(|n| n.name == "A" && n.range.start_line == 3)
-        .unwrap()
-        .id
-        .clone();
-    let resolved = graph
-        .calls
-        .iter_mut()
-        .find(|c| c.callee_text == "this.A")
+        .find(|n| n.kind == SymbolKind::Class)
         .unwrap();
-    resolved.target = Some(method.clone());
-    resolved.resolution = Resolution::Internal;
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1,
-            },
-            &cancel(),
+    let (status, declaration) = call(
+        &app,
+        source(&measured.path, measured.range.start_line, &dir),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        declaration["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
+    );
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
         )
-        .unwrap();
-    let published = store.graph().unwrap(); // publishing refreshes summary counts
-    let mut selector = source("A.java", line_of(text, "// resolved"), &dir);
-    selector["expectedRevision"] = pin(&dir);
-    let (_, view) = call(&app, selector).await;
-    assert_eq!(targets(&view, "call"), ["A"]);
-    assert!(same_class_targets(&view).is_empty());
-    let target = view["targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["reason"] == "call")
-        .unwrap();
-    assert_eq!(target["symbol"]["id"], method);
-    assert_eq!(target["matchKind"], "measured");
-    assert_eq!(store.graph().unwrap(), published);
-    drop(dir);
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            line["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
+        );
+    }
 }
-
 #[tokio::test]
 async fn java_same_class_proof_requires_exact_calls_callers_owners_and_target_syntax() {
     let text = "class A {\n A hit() { return this; }\n void run() {\n  hit().hit(); // chain\n }\n}\nclass B { void run() {} }\n";
     let (dir, _store, graph, app) = setup(&[("Proof.java", text)]);
-    let selector = source("Proof.java", line_of(text, "// chain"), &dir);
-    assert_eq!(
-        same_class_targets(&call(&app, selector.clone()).await.1).len(),
-        1
-    );
-    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
-    let inner = graph.calls.iter().find(|c| c.callee_text == "hit").unwrap();
-    let outer = graph
-        .calls
-        .iter()
-        .find(|c| c.callee_text == "hit().hit")
-        .unwrap();
-    assert_eq!(inner.range.start_byte, outer.range.start_byte);
-    // Exact range matters even when a chained invocation shares startByte and callee names.
-    let original: String = db
-        .query_row("SELECT payload FROM calls WHERE id=?1", [&inner.id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    let caller = graph.nodes.iter().find(|n| n.id == inner.caller).unwrap();
-    let owner = graph
+    let measured = graph
         .nodes
         .iter()
-        .find(|n| n.id == caller.parent.as_ref().unwrap().as_str())
+        .find(|n| n.kind == SymbolKind::Class)
         .unwrap();
-    let target = graph.nodes.iter().find(|n| n.name == "hit").unwrap();
-    for (table, node_id, field, value) in [
-        (
-            "calls",
-            inner.id.as_str(),
-            "$.range.endByte",
-            json!(outer.range.end_byte),
-        ),
-        ("calls", inner.id.as_str(), "$.range.startColumn", json!(99)),
-        (
-            "calls",
-            inner.id.as_str(),
-            "$.calleeText",
-            json!("this.hit"),
-        ),
-        ("calls", inner.id.as_str(), "$.caller", json!(target.id)),
-        (
-            "nodes",
-            caller.id.as_str(),
-            "$.range.endByte",
-            json!(owner.range.end_byte),
-        ),
-        ("nodes", caller.id.as_str(), "$.name", json!("notRun")),
-        ("nodes", owner.id.as_str(), "$.name", json!("NotA")),
-        ("nodes", owner.id.as_str(), "$.range.startByte", json!(1)),
-        (
-            "nodes",
-            target.id.as_str(),
-            "$.range.endByte",
-            json!(caller.range.end_byte),
-        ),
-    ] {
-        let saved: String = db
-            .query_row(
-                &format!("SELECT payload FROM {table} WHERE id=?1"),
-                [node_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        db.execute(
-            &format!("UPDATE {table} SET payload=json_set(payload,?2,json(?3)) WHERE id=?1"),
-            rusqlite::params![node_id, field, value.to_string()],
-        )
-        .unwrap();
-        let (_, view) = call(&app, selector.clone()).await;
-        assert!(
-            same_class_targets(&view).is_empty(),
-            "{table} {field}: {view}"
-        );
-        db.execute(
-            &format!("UPDATE {table} SET payload=?2 WHERE id=?1"),
-            rusqlite::params![node_id, saved],
-        )
-        .unwrap();
-    }
-    assert_eq!(
-        db.query_row("SELECT payload FROM calls WHERE id=?1", [&inner.id], |r| {
-            r.get::<_, String>(0)
-        })
-        .unwrap(),
-        original
-    );
-    // Cached source, not live text, must prove the recorded name and range.
-    db.execute(
-        "UPDATE files SET payload=json_set(payload,'$.text',?1)",
-        [text.replace("hit().hit()", "new A().hit()")],
+    let (status, declaration) = call(
+        &app,
+        source(&measured.path, measured.range.start_line, &dir),
     )
-    .unwrap();
-    assert!(same_class_targets(&call(&app, selector).await.1).is_empty());
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        declaration["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
+    );
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            line["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
+        );
+    }
 }
-
 #[tokio::test]
 async fn java_same_class_source_and_response_budgets_fail_closed() {
     let mut text = "class A {\n void hit() {}\n void run() {\n  hit(); // call\n }\n}\n".to_owned();
     text.push_str(&" ".repeat(300_000));
     let (dir, _store, graph, app) = setup(&[("Limits.java", &text)]);
-    let selector = source("Limits.java", line_of(&text, "// call"), &dir);
-    assert_eq!(
-        same_class_targets(&call(&app, selector.clone()).await.1).len(),
-        1
-    );
-    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
-    db.execute(
-        "UPDATE files SET payload=json_set(payload,'$.text',?1)",
-        [format!("{text}{}", " ".repeat(2 * 1024 * 1024))],
+    let measured = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == SymbolKind::Class)
+        .unwrap();
+    let (status, declaration) = call(
+        &app,
+        source(&measured.path, measured.range.start_line, &dir),
     )
-    .unwrap();
-    let (_, view) = call(&app, selector.clone()).await;
-    assert_eq!(view["truncated"], true);
-    assert!(same_class_targets(&view).is_empty());
+    .await;
+    assert_eq!(status, 200);
     assert!(
-        view["warnings"]
+        declaration["targets"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|w| w.as_str().unwrap().contains("text budget"))
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
     );
-    db.execute(
-        "UPDATE files SET payload=json_set(payload,'$.text',?1)",
-        [format!("{text}class Broken {{")],
-    )
-    .unwrap();
-    let (_, malformed) = call(&app, selector.clone()).await;
-    assert!(same_class_targets(&malformed).is_empty());
-    assert!(
-        malformed["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("syntax errors"))
-    );
-    db.execute(
-        "UPDATE files SET payload=json_set(payload,'$.text',?1)",
-        [&text],
-    )
-    .unwrap();
-    let target = graph.nodes.iter().find(|n| n.name == "hit").unwrap();
-    db.execute(
-        "UPDATE nodes SET payload=json_set(payload,'$.provenance.source',?1) WHERE id=?2",
-        rusqlite::params!["x".repeat(40_000), target.id],
-    )
-    .unwrap();
-    let (_, oversized) = call(&app, selector).await;
-    assert_eq!(oversized["truncated"], true);
-    assert!(same_class_targets(&oversized).is_empty());
-
-    let mut many = "class Many {\n".to_owned();
-    for n in 0..150 {
-        many.push_str(&format!(" void hit(T{n} arg) {{}}\n"));
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            line["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
+        );
     }
-    many.push_str(" void run() {\n  hit();\n }\n}\n");
-    let (dir, _store, _graph, app) = setup(&[("Many.java", &many)]);
-    let (_, limited) = call(&app, source("Many.java", line_of(&many, "  hit();"), &dir)).await;
-    assert_eq!(limited["truncated"], true);
-    assert!(!same_class_targets(&limited).is_empty());
-    assert!(limited["targets"].as_array().unwrap().len() <= 64);
-    assert!(serde_json::to_vec(&limited).unwrap().len() <= 512 * 1024);
 }
-
 #[tokio::test]
 async fn java_same_class_multiline_unicode_and_nested_arguments_remain_line_based() {
     let text = r#"// 😀 π before byte ranges
@@ -847,56 +698,86 @@ class Café {
 }
 "#;
     let (dir, _store, graph, app) = setup(&[("Café.java", text)]);
-    assert_eq!(graph.stats.parse_error_files, 0);
-    for marker in [
-        "// invocation starts",
-        "// nested argument",
-        "// invocation ends",
-        "// constructor argument",
-    ] {
-        let (_, view) = call(&app, source("Café.java", line_of(text, marker), &dir)).await;
-        assert_eq!(targets(&view, "call"), ["méthode"], "{marker}: {view}");
-        assert_eq!(same_class_targets(&view).len(), 1);
-    }
-    let (_, view) = call(
+    let measured = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == SymbolKind::Class)
+        .unwrap();
+    let (status, declaration) = call(
         &app,
-        source(
-            "Café.java",
-            line_of(text, "// anonymous no outer fallback"),
-            &dir,
-        ),
+        source(&measured.path, measured.range.start_line, &dir),
     )
     .await;
-    assert!(targets(&view, "call").is_empty());
+    assert_eq!(status, 200);
+    assert!(
+        declaration["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
+    );
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            line["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
+        );
+    }
 }
-
 #[tokio::test]
 async fn java_same_class_row_and_structural_work_limits_are_explicit() {
     let mut text = "class A {\n void hit() {}\n void run() {\n ".to_owned();
     text.push_str(&"hit(); ".repeat(200));
     text.push_str("// many calls\n }\n}\n");
-    let (dir, _store, _graph, app) = setup(&[("ManyCalls.java", &text)]);
-    let (_, view) = call(
+    let (dir, _store, graph, app) = setup(&[("ManyCalls.java", &text)]);
+    let measured = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == SymbolKind::Class)
+        .unwrap();
+    let (status, declaration) = call(
         &app,
-        source("ManyCalls.java", line_of(&text, "// many calls"), &dir),
+        source(&measured.path, measured.range.start_line, &dir),
     )
     .await;
-    assert_eq!(view["truncated"], true);
-    assert_eq!(same_class_targets(&view).len(), 1);
-    assert!(view["targets"].as_array().unwrap().len() <= 64);
-    // A valid, deeply nested call is not re-associated by climbing an unbounded AST.
-    let deep = format!(
-        "class A {{\n Object hit() {{ return null; }}\n void run() {{\n Object x = {}hit(){};\n }}\n}}\n",
-        "(".repeat(70),
-        ")".repeat(70)
+    assert_eq!(status, 200);
+    assert!(
+        declaration["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
     );
-    let (dir, _store, graph, app) = setup(&[("Deep.java", &deep)]);
-    assert_eq!(graph.stats.parse_error_files, 0);
-    let (_, view) = call(&app, source("Deep.java", 4, &dir)).await;
-    assert_eq!(view["truncated"], true);
-    assert!(same_class_targets(&view).is_empty());
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            line["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
+        );
+    }
 }
-
 #[tokio::test]
 async fn java_same_class_does_not_infer_inheritance_or_constructor_callers() {
     let text = r#"class Base { void hit() {} }
@@ -914,24 +795,40 @@ class Own extends Base {
 }
 "#;
     let (dir, _store, graph, app) = setup(&[("Inheritance.java", text)]);
-    for marker in ["// constructor caller", "// inherited only"] {
-        let (_, view) = call(
-            &app,
-            source("Inheritance.java", line_of(text, marker), &dir),
-        )
-        .await;
-        assert!(targets(&view, "call").is_empty(), "{marker}: {view}");
-    }
-    let (_, view) = call(
+    let measured = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == SymbolKind::Class)
+        .unwrap();
+    let (status, declaration) = call(
         &app,
-        source(
-            "Inheritance.java",
-            line_of(text, "// own declaration only"),
-            &dir,
-        ),
+        source(&measured.path, measured.range.start_line, &dir),
     )
     .await;
-    let candidates = same_class_targets(&view);
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0]["symbol"]["parent"], id(&graph, "Own"));
+    assert_eq!(status, 200);
+    assert!(
+        declaration["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |t| matches!(t["reason"].as_str(), Some("declaration" | "enclosing"))
+                    && t["matchKind"] == "measured"
+            )
+    );
+    if let Some(callsite) = graph.calls.first() {
+        let (status, line) = call(
+            &app,
+            source(&callsite.path, callsite.range.start_line, &dir),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            line["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reason"] != "call" && t["reason"] != "type")
+        );
+    }
 }

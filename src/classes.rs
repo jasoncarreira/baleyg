@@ -21,7 +21,6 @@ const RECORDS: usize = 250_000;
 const TEXT: usize = 2_048;
 const OUTPUT_TEXT: usize = 64 * 1024 * 1024;
 const REGISTRY_TEXT: usize = 32 * 1024 * 1024;
-const CANDIDATE_TEXT: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -75,10 +74,6 @@ struct Scope {
 }
 struct Pending {
     relation: ClassRelation,
-    scope: usize,
-    blocked: BTreeSet<String>,
-    module: String,
-    language: String,
 }
 struct Builder<'a> {
     catalog: Catalog,
@@ -268,12 +263,11 @@ impl Catalog {
         });
         b.catalog.relations.dedup_by(|a, b| a.id == b.id);
         if !b.catalog.classes.is_empty() {
-            b.catalog.warnings.push("Links are scoped syntax candidates, not compiler resolution. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
+            b.catalog.warnings.push("Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
         }
         if !b.registry_complete {
             b.catalog.warnings.push(
-                "Incomplete class declaration registry: candidate linking is disabled to avoid false unique matches."
-                    .into(),
+                "Incomplete class declaration registry: some declarations may be absent.".into(),
             );
         }
         check(cancel)?;
@@ -343,102 +337,16 @@ impl Builder<'_> {
             .push(value);
     }
     fn resolve(&mut self) -> Result<()> {
-        let mut by_name: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-        for c in &self.catalog.classes {
-            by_name
-                .entry((c.language.clone(), c.qualified_name.clone()))
-                .or_default()
-                .push(c.symbol.id.clone());
-        }
-        let mut candidate_bytes = 0usize;
-        let mut candidates_clipped = false;
-        for p in &mut self.pending {
-            check(self.cancel)?;
-            if self.registry_complete {
-                let name = &p.relation.type_name;
-                let (head, tail) = name
-                    .split_once('.')
-                    .map(|(a, b)| (a, format!(".{b}")))
-                    .unwrap_or((name.as_str(), String::new()));
-                let mut scope = Some(p.scope);
-                let mut names = vec![];
-                let mut bound = p.blocked.contains(head);
-                let mut unsafe_binding = bound;
-                while !bound {
-                    let Some(i) = scope else { break };
-                    let s = &self.scopes[i];
-                    if s.blocked.contains(head) || s.wildcard {
-                        bound = true;
-                        unsafe_binding = true;
-                    } else if let Some(bindings) = s.bindings.get(head) {
-                        bound = true;
-                        for binding in bindings {
-                            match binding {
-                                Some(v) => names.push(format!("{v}{tail}")),
-                                None => unsafe_binding = true,
-                            }
-                        }
-                        // A rebinding is not a unique syntax candidate even if values happen to agree.
-                        if bindings.len() > 1 {
-                            unsafe_binding = true;
-                        }
-                    }
-                    scope = s.parent;
-                }
-                if !bound && p.language == "java" {
-                    names.push(join(&p.module, name));
-                    if name.contains('.') {
-                        names.push(name.clone());
-                    }
-                }
-                let mut ids = BTreeSet::new();
-                for name in names {
-                    if let Some(found) = by_name.get(&(p.language.clone(), name)) {
-                        for id in found {
-                            ids.insert(id.clone());
-                            if ids.len() > 32 {
-                                break;
-                            }
-                        }
-                    }
-                    if ids.len() > 32 {
-                        break;
-                    }
-                }
-                if ids.len() > 32 {
-                    candidates_clipped = true;
-                }
-                let ids = ids.into_iter().take(32).collect::<Vec<_>>();
-                let bytes = ids.iter().map(String::len).sum::<usize>() * 2;
-                if candidate_bytes.saturating_add(bytes) > CANDIDATE_TEXT {
-                    candidates_clipped = true;
-                    // Retain safe earlier matches. Remaining references stay terminal hints.
-                    break;
-                }
-                candidate_bytes += bytes;
-                p.relation.candidate_ids = ids;
-                if p.relation.candidate_ids.len() == 1 && !unsafe_binding {
-                    p.relation.target = p.relation.candidate_ids.first().cloned();
-                    p.relation.match_kind = "syntaxCandidate".into();
-                } else if !p.relation.candidate_ids.is_empty() {
-                    p.relation.match_kind = "ambiguous".into();
-                }
-            }
-        }
-        if candidates_clipped {
-            self.limit("Class candidate limit reached (32/reference or 32 MiB text); some candidate details omitted");
-        }
-        if !self.registry_complete {
-            for p in &mut self.pending {
-                check(self.cancel)?;
-                p.relation.candidate_ids.clear();
-                p.relation.target = None;
-                p.relation.match_kind = "unmatched".into();
-            }
-        }
+        // A declared type name is source text, not a type relationship. Do not
+        // turn scoped name matches into a target or candidate graph edge.
         self.catalog.relations = std::mem::take(&mut self.pending)
             .into_iter()
-            .map(|p| p.relation)
+            .map(|mut pending| {
+                pending.relation.target = None;
+                pending.relation.candidate_ids.clear();
+                pending.relation.match_kind = "unmatched".into();
+                pending.relation
+            })
             .collect();
         Ok(())
     }
@@ -890,13 +798,13 @@ impl Extractor<'_, '_> {
             ("superclasses", "extends"),
         ] {
             if let Some(ty) = n.child_by_field_name(field) {
-                self.types(ty, index, base_scope, &BTreeSet::new(), kind, depth + 1)?;
+                self.types(ty, index, base_scope, kind, depth + 1)?;
             }
         }
         // Java interfaces have an unnamed extends_interfaces child.
         for c in self.children(n, depth + 1)? {
             if c.kind() == "extends_interfaces" {
-                self.types(c, index, scope, &BTreeSet::new(), "extends", depth + 1)?;
+                self.types(c, index, scope, "extends", depth + 1)?;
             }
         }
         if n.kind() == "record_declaration"
@@ -997,7 +905,7 @@ impl Extractor<'_, '_> {
         }
         let ty = n.child_by_field_name("type");
         if let Some(ty) = ty {
-            self.types(ty, index, scope, &BTreeSet::new(), "field", depth + 1)?;
+            self.types(ty, index, scope, "field", depth + 1)?;
         }
         if n.kind() == "assignment" {
             if let Some(left) = n.child_by_field_name("left")
@@ -1045,14 +953,13 @@ impl Extractor<'_, '_> {
             ..Scope::default()
         });
         let scope = method_scope;
-        let blocked = BTreeSet::new();
         if let Some(ty) = ty {
-            self.types(ty, index, scope, &blocked, "returns", depth + 1)?;
+            self.types(ty, index, scope, "returns", depth + 1)?;
         }
         if let Some(params) = n.child_by_field_name("parameters") {
             for p in self.detail_children(params, index, depth + 1)? {
                 if let Some(ty) = p.child_by_field_name("type") {
-                    self.types(ty, index, scope, &blocked, "parameter", depth + 2)?;
+                    self.types(ty, index, scope, "parameter", depth + 2)?;
                 } else if p.kind() == "spread_parameter" {
                     for ty in self.detail_children(p, index, depth + 2)? {
                         if matches!(
@@ -1062,7 +969,7 @@ impl Extractor<'_, '_> {
                                 | "generic_type"
                                 | "array_type"
                         ) {
-                            self.types(ty, index, scope, &blocked, "parameter", depth + 2)?;
+                            self.types(ty, index, scope, "parameter", depth + 2)?;
                         }
                     }
                 }
@@ -1099,7 +1006,6 @@ impl Extractor<'_, '_> {
         n: Node<'_>,
         index: usize,
         scope: usize,
-        blocked: &BTreeSet<String>,
         kind: &str,
         depth: usize,
     ) -> Result<()> {
@@ -1115,7 +1021,7 @@ impl Extractor<'_, '_> {
         if atom {
             let text = self.text(n).to_owned();
             if dotted(&text) {
-                self.reference(n, &text, index, scope, blocked, kind)?;
+                self.reference(n, &text, index, kind)?;
             }
             return Ok(());
         }
@@ -1127,7 +1033,7 @@ impl Extractor<'_, '_> {
                 .and_then(|s| s.strip_suffix('"'))
                 .or_else(|| text.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')));
             if let Some(inner) = inner.filter(|s| dotted(s)).map(str::to_owned) {
-                self.reference(n, &inner, index, scope, blocked, kind)?;
+                self.reference(n, &inner, index, kind)?;
             }
             return Ok(());
         }
@@ -1137,7 +1043,7 @@ impl Extractor<'_, '_> {
             && matches!(n.kind(), "generic_type" | "subscript")
         {
             if let Some(first) = self.detail_children(n, index, depth + 1)?.first().copied() {
-                self.types(first, index, scope, blocked, kind, depth + 1)?;
+                self.types(first, index, scope, kind, depth + 1)?;
             }
             return Ok(());
         }
@@ -1168,14 +1074,14 @@ impl Extractor<'_, '_> {
                         if let Some(first) =
                             self.detail_children(c, index, depth + 1)?.first().copied()
                         {
-                            self.types(first, index, scope, blocked, kind, depth + 1)?;
+                            self.types(first, index, scope, kind, depth + 1)?;
                         }
                     } else if i == 1 {
-                        self.types(c, index, scope, blocked, kind, depth + 1)?;
+                        self.types(c, index, scope, kind, depth + 1)?;
                     }
                     break;
                 }
-                self.types(c, index, scope, blocked, kind, depth + 1)?;
+                self.types(c, index, scope, kind, depth + 1)?;
             }
             return Ok(());
         }
@@ -1208,20 +1114,12 @@ impl Extractor<'_, '_> {
         };
         if container {
             for c in self.detail_children(n, index, depth + 1)? {
-                self.types(c, index, scope, blocked, kind, depth + 1)?;
+                self.types(c, index, scope, kind, depth + 1)?;
             }
         }
         Ok(())
     }
-    fn reference(
-        &mut self,
-        n: Node<'_>,
-        name: &str,
-        index: usize,
-        scope: usize,
-        blocked: &BTreeSet<String>,
-        kind: &str,
-    ) -> Result<()> {
+    fn reference(&mut self, n: Node<'_>, name: &str, index: usize, kind: &str) -> Result<()> {
         if !self.details(index)? {
             return Ok(());
         }
@@ -1259,13 +1157,7 @@ impl Extractor<'_, '_> {
             self.b.catalog.classes[index].truncated = true;
             return Ok(());
         }
-        self.b.pending.push(Pending {
-            relation,
-            scope,
-            blocked: blocked.clone(),
-            module: self.module.clone(),
-            language: self.file.language.clone(),
-        });
+        self.b.pending.push(Pending { relation });
         self.refs += 1;
         self.b.records += 1;
         Ok(())
@@ -1275,7 +1167,6 @@ impl Extractor<'_, '_> {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
-    use crate::model::Graph;
     use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
@@ -1287,10 +1178,16 @@ mod budget_tests {
             (0, 0, VISITS - 3),
         ] {
             let cancel = Arc::new(AtomicBool::new(false));
-            let file=SourceFile {path:"A.java".into(),hash:"synthetic".into(),language:"java".into(),
-                text:"package p; class Target {} class Early { <Target, U, V, W> Target method(Target p) { return p; } Target value; class Nested {} } class Target {}".into()};
-            let mut graph = Graph::default();
-            crate::indexer_java::extract(&mut graph, &file, &cancel).unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::write(workspace.path().join("A.java"),
+                "package p; class Target {} class Early { <Target, U, V, W> Target method(Target p) { return p; } Target value; class Nested {} } class Target {}").unwrap();
+            let graph = crate::indexer::index_workspace(
+                &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
+            let file = &graph.files[0];
             let mut parser = tree_sitter::Parser::new();
             parser
                 .set_language(&tree_sitter_java::LANGUAGE.into())
@@ -1320,7 +1217,7 @@ mod budget_tests {
             };
             Extractor {
                 b: &mut b,
-                file: &file,
+                file,
                 module: String::new(),
                 visits: 0,
                 classes: 0,
@@ -1356,15 +1253,11 @@ mod budget_tests {
                     candidate_ids: vec![],
                     match_kind: "unmatched".into(),
                 },
-                scope: 0,
-                blocked: BTreeSet::new(),
-                module: "p".into(),
-                language: "java".into(),
             });
             b.resolve().unwrap();
             let relation = &b.catalog.relations[0];
-            assert_eq!(relation.match_kind, "ambiguous");
-            assert_eq!(relation.candidate_ids.len(), 2);
+            assert_eq!(relation.match_kind, "unmatched");
+            assert!(relation.candidate_ids.is_empty());
             assert!(relation.target.is_none());
         }
     }

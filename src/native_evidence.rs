@@ -769,6 +769,7 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         proof_id,
         seen: BTreeSet::new(),
         visits: 0,
+        opaque_rust: false,
     };
     state.walk(tree.root_node(), &module_id, &[], &[], 0)?;
     state.finish_occurrences()?;
@@ -801,7 +802,7 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         revision_id: state.artifact.revision.id.clone(),
         requested: true,
         selected: true,
-        state: if tree.root_node().has_error() {
+        state: if tree.root_node().has_error() || state.opaque_rust {
             "partial"
         } else {
             "complete"
@@ -809,10 +810,12 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         .into(),
         supported_roles: vec!["definition".into(), "call".into()],
         observed_roles,
-        diagnostic: tree
-            .root_node()
-            .has_error()
-            .then(|| "parser recovered from invalid source".into()),
+        diagnostic: match (tree.root_node().has_error(), state.opaque_rust) {
+            (true, true) => Some("parser recovered from invalid source; opaque Rust macro/attribute token trees skipped".into()),
+            (true, false) => Some("parser recovered from invalid source".into()),
+            (false, true) => Some("opaque Rust macro/attribute token trees skipped; calls and definitions inside were not measured".into()),
+            (false, false) => None,
+        },
     });
     Ok(())
 }
@@ -824,6 +827,7 @@ struct ParserState<'a> {
     proof_id: String,
     seen: BTreeSet<(String, String, usize, usize)>,
     visits: usize,
+    opaque_rust: bool,
 }
 impl ParserState<'_> {
     fn finish_occurrences(&mut self) -> Result<()> {
@@ -897,10 +901,26 @@ impl ParserState<'_> {
         depth: usize,
     ) -> Result<()> {
         ensure!(
-            depth < 512 && self.visits < 1_000_000,
+            depth < 128 && self.visits < 1_000_000,
             "native extraction work budget exceeded"
         );
         self.visits += 1;
+        // Rust token trees and attributes are opaque source syntax. A call-shaped token
+        // inside a macro is not a measured call, and expanding it is outside #22 native
+        // extraction. Still count this subtree root against the bounded visit budget.
+        if self.file.language == "rust"
+            && matches!(
+                n.kind(),
+                "macro_invocation"
+                    | "macro_definition"
+                    | "token_tree"
+                    | "attribute_item"
+                    | "inner_attribute_item"
+            )
+        {
+            self.opaque_rust = true;
+            return Ok(());
+        }
         let mut owner = owner.to_owned();
         let mut ancestry = ancestors.to_vec();
         let mut regions = regions.to_vec();
@@ -941,9 +961,23 @@ impl ParserState<'_> {
                 header: header(n, self.file, &key),
                 provenance_id: self.proof_id.clone(),
             });
-            owner = id;
+            // A lexical declaration key may nest syntax, but its initializer runs in
+            // the enclosing executable scope. Only executable containers own calls.
+            if matches!(
+                k,
+                "module"
+                    | "namespace"
+                    | "type"
+                    | "implementation"
+                    | "function"
+                    | "method"
+                    | "constructor"
+                    | "anonymousFunction"
+            ) {
+                owner = id;
+                regions.clear();
+            }
             ancestry.push(key);
-            regions.clear();
         }
         if is_region(n) {
             let ordinal = self

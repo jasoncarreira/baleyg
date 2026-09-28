@@ -296,9 +296,13 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
             assert_eq!(measured.caller, seed.id, "no foreign method body calls");
             assert_eq!(step.range, measured.range);
             assert_eq!(step.path, measured.path);
-            assert_eq!(step.resolution, Some(measured.resolution));
-            assert!(measured.target.is_none(), "no semantic target was proven");
-            assert_eq!(measured.resolution, baleyg::model::Resolution::Unresolved);
+            assert!(step.resolution.is_none() && step.target.is_none());
+            assert!(
+                serde_json::to_value(measured)
+                    .unwrap()
+                    .get("target")
+                    .is_none()
+            );
             if let Some(target) = &step.target {
                 let participant = sequence
                     .participants
@@ -357,7 +361,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         let mut all_steps = Vec::new();
         flatten(&all.steps, &mut all_steps);
         for step in all_steps.iter().filter(|s| s.call_id.is_some()) {
-            assert_eq!(step.resolution, Some(baleyg::model::Resolution::Unresolved));
+            assert!(step.resolution.is_none() && step.target.is_none());
             assert!(step.children.is_empty() && step.alternate.is_empty());
             if let Some(target) = &step.target {
                 let participant = all.participants.iter().find(|p| &p.id == target).unwrap();
