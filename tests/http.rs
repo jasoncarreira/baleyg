@@ -459,6 +459,9 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         for table in native_tables {
             db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
         }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],

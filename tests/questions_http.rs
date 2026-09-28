@@ -23,6 +23,7 @@ fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     std::fs::write(workspace.join("a.js"), format!("function leaf() {{}}\nfunction helper() {{ leaf(); }}\nfunction seed(flag) {{ if (flag) helper(); console.log(flag); }}\n//{}", "x".repeat(padding))).unwrap();
+    std::fs::write(workspace.join("unrelated.js"), "function unrelated() {}\n").unwrap();
     let options = IndexOptions::new(workspace.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
@@ -528,6 +529,9 @@ async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_termina
         for table in native_tables {
             db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
         }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],
@@ -650,4 +654,120 @@ fn publish_bundle(
         "published graph must match captured source"
     );
     store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
+}
+
+#[tokio::test]
+async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
+    let (dir, store, _graph, app, request) = setup(0);
+    let (status, preview) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let (status, export) = call(&app, "GET", &path(&preview, "jev-request"), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{export}");
+    assert!(
+        preview["packet"]["sourceFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["path"] != "unrelated.js")
+    );
+
+    let index_root = dir.path().join("state/cache/indexes");
+    let db_path = std::fs::read_dir(index_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    let corrupt = |path: &str| {
+        let mut bytes: Vec<u8> = db
+            .query_row(
+                "SELECT source_bytes FROM native_documents WHERE path=?1",
+                [path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        bytes[0] ^= 1;
+        assert_eq!(
+            db.execute(
+                "UPDATE native_documents SET source_bytes=?1 WHERE path=?2",
+                rusqlite::params![bytes, path],
+            )
+            .unwrap(),
+            1
+        );
+    };
+    corrupt("unrelated.js");
+    assert_eq!(
+        store.status().unwrap().revision,
+        serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
+    );
+    let (status, fresh) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{fresh}");
+    assert_eq!(fresh["packet"], preview["packet"]);
+    for (method, action, body) in [
+        ("GET", "jev-request", Value::Null),
+        ("POST", "selection", preview["selection"].clone()),
+        ("POST", "jev-response", response(&export)),
+    ] {
+        let (status, result) = call(&app, method, &path(&preview, action), body).await;
+        assert_eq!(status, StatusCode::OK, "{action}: {result}");
+    }
+
+    corrupt("a.js");
+    assert_eq!(
+        store.status().unwrap().revision,
+        serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
+    );
+    let (status, fresh) = call(&app, "POST", "/api/questions/preview", request).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{fresh}");
+    assert_eq!(fresh["error"]["code"], "incompatible_index");
+    for (method, action, body) in [
+        ("GET", "jev-request", Value::Null),
+        ("POST", "selection", preview["selection"].clone()),
+        ("POST", "jev-response", response(&export)),
+    ] {
+        let (status, result) = call(&app, method, &path(&preview, action), body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{action}: {result}"
+        );
+        assert_eq!(result["error"]["code"], "incompatible_index");
+        assert!(!result.to_string().contains("function seed"));
+    }
+}
+
+#[tokio::test]
+async fn cached_packet_refuses_changed_selected_graph_call_under_same_pin() {
+    let (dir, store, _graph, app, request) = setup(0);
+    let (status, preview) = call(&app, "POST", "/api/questions/preview", request).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let id = preview["packet"]["context"]["calls"][0]["id"]
+        .as_str()
+        .unwrap();
+    let index_root = dir.path().join("state/cache/indexes");
+    let db_path = std::fs::read_dir(index_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE calls SET payload=json_set(payload,'$.calleeText','forged') WHERE id=?1",
+            [id],
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.status().unwrap().revision,
+        serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
+    );
+    let (status, result) = call(&app, "GET", &path(&preview, "jev-request"), Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{result}");
+    assert_eq!(result["error"]["code"], "incompatible_index");
+    assert!(!result.to_string().contains("forged"));
 }

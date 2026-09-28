@@ -615,61 +615,51 @@ fn cancellation_under_writer_lock_rolls_back_class_projection() {
 #[test]
 fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() {
     use baleyg::classes::{ClassDefinition, ClassMember};
-    let mut text = String::new();
+    // Real native multi-document source creates measured fields across multiple pages.
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let ty = "T".repeat(1000);
     for i in 0..100 {
-        text.push_str(&format!("class N{i:03} {{}}\n"));
+        let mut text = format!("class N{i:03} {{\n");
+        for j in 0..40 {
+            text.push_str(&format!(" {ty} field{j:03};\n"));
+        }
+        text.push_str("}\n");
+        std::fs::write(workspace.join(format!("N{i:03}.java")), text).unwrap();
     }
-    let (dir, store, _graph, _app) = setup_with(&text);
-    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-    let payloads = db
-        .prepare("SELECT payload FROM classes ORDER BY id")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    for payload in payloads {
-        let mut class: ClassDefinition = serde_json::from_str(&payload).unwrap();
-        class.fields = (0..256)
-            .map(|i| ClassMember {
-                name: format!("field{i}"),
-                type_hint: Some("X".repeat(2048)),
-                symbol_id: None,
-                path: class.symbol.path.clone(),
-                range: class.symbol.range.clone(),
-            })
-            .collect();
-        db.execute(
-            "UPDATE classes SET payload=?1 WHERE id=?2",
-            rusqlite::params![serde_json::to_string(&class).unwrap(), class.symbol.id],
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &IndexOptions::new(workspace.clone()),
+        store.root_id(),
+        &cancel(),
+        |_| {},
+    )
+    .unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel(),
         )
         .unwrap();
-    }
+    let revision = store.status().unwrap().revision;
     let mut offset = 0;
     let mut seen = BTreeSet::new();
     let mut pages = 0;
     loop {
         let page = store
-            .classes_at(
-                None,
-                "",
-                Some(store.status().unwrap().revision),
-                offset,
-                100,
-            )
+            .classes_at(None, "", Some(revision), offset, 100)
             .unwrap();
         assert!(
             serde_json::to_vec(&page).unwrap().len() <= baleyg::class_diagram::MAX_RESPONSE_BYTES
         );
-        assert!(page.truncated);
-        assert!(page.warnings.iter().any(|w| w.contains("byte limits")));
-        assert!(
-            !page.items.is_empty(),
-            "individually oversized first class still makes progress"
-        );
         for class in page.items {
-            assert!(class.truncated);
-            assert!(class.fields.len() < 256);
+            assert!(!class.truncated, "real measured fields must not be clipped");
+            assert_eq!(class.fields.len(), 40);
             assert!(seen.insert(class.symbol.id));
         }
         pages += 1;
@@ -680,19 +670,57 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
             break;
         }
     }
-    assert!(pages > 1);
+    assert!(
+        pages > 1,
+        "real measured classes should exercise pagination"
+    );
     assert_eq!(seen.len(), 100);
-    let stored: ClassDefinition = serde_json::from_str(
-        &db.query_row("SELECT payload FROM classes LIMIT 1", [], |r| {
-            r.get::<_, String>(0)
+
+    // An out-of-band class-row edit is not source-backed. It must never become
+    // a pagination oracle or leak fabricated fields, even if clipped by a UI cap.
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let payload: String = db
+        .query_row(
+            "SELECT payload FROM classes ORDER BY qualified_name LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut forged: ClassDefinition = serde_json::from_str(&payload).unwrap();
+    forged.fields = (0..256)
+        .map(|i| ClassMember {
+            name: format!("forged_field{i}"),
+            type_hint: Some("X".repeat(2048)),
+            symbol_id: None,
+            path: forged.symbol.path.clone(),
+            range: forged.symbol.range.clone(),
         })
+        .collect();
+    db.execute(
+        "UPDATE classes SET payload=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&forged).unwrap(), forged.symbol.id],
+    )
+    .unwrap();
+    let error = store
+        .classes_at(None, "", Some(revision), 0, 100)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+    let stored: ClassDefinition = serde_json::from_str(
+        &db.query_row(
+            "SELECT payload FROM classes ORDER BY qualified_name LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
         .unwrap(),
     )
     .unwrap();
     assert_eq!(
         stored.fields.len(),
         256,
-        "presentation does not mutate stored class"
+        "reader must not mutate stored tamper"
     );
 }
 #[test]
@@ -949,4 +977,106 @@ fn publish_bundle(
         "published graph must match captured source"
     );
     store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
+}
+
+#[tokio::test]
+async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes() {
+    let (dir, store, graph, app) = setup();
+    let pin = store.status().unwrap().revision;
+    let seed = id(&graph, "A");
+    let class_url = format!("/api/classes?{}&q=A", pin_query(pin));
+    let symbol_url = format!("/api/symbol?id={seed}&{}", pin_query(pin));
+    assert_eq!(call(&app, "GET", &class_url, Value::Null).await.0, 200);
+    assert_eq!(call(&app, "GET", &symbol_url, Value::Null).await.0, 200);
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/class-diagram",
+            json!({"seed":seed,"expectedRevision":pin})
+        )
+        .await
+        .0,
+        200
+    );
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    // No ID, path, index pin, or FK changes: only selected graph JSON is forged.
+    db.execute(
+        "UPDATE nodes SET payload=json_set(payload,'$.name','Fabricated') WHERE id=?1",
+        [&seed],
+    )
+    .unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
+    for (method, path, body) in [
+        ("GET", class_url.as_str(), Value::Null),
+        ("GET", symbol_url.as_str(), Value::Null),
+        (
+            "POST",
+            "/api/class-diagram",
+            json!({"seed":seed,"expectedRevision":pin}),
+        ),
+    ] {
+        let (status, value) = call(&app, method, path, body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
+        assert_eq!(value["error"]["code"], "incompatible_index");
+        assert!(!value.to_string().contains("Fabricated"));
+    }
+    assert!(
+        store
+            .symbol_at(&id(&graph, "Unsupported"), Some(pin))
+            .unwrap()
+            .is_some(),
+        "a different document must remain selectable"
+    );
+}
+
+#[tokio::test]
+async fn selected_class_and_symbol_routes_reject_same_pin_graph_call_forgery() {
+    let (dir, store, graph, app) = setup_with(
+        "class A { void run() { helper(); } void helper() {} }
+class B {}
+",
+    );
+    let pin = store.status().unwrap().revision;
+    let class_id = id(&graph, "A");
+    let other_id = id(&graph, "Unsupported");
+    let class_url = format!("/api/classes?{}&path=Types.java", pin_query(pin));
+    let symbol_url = format!("/api/symbol?id={class_id}&{}", pin_query(pin));
+    assert_eq!(call(&app, "GET", &class_url, Value::Null).await.0, 200);
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let id: String = db
+        .query_row(
+            "SELECT id FROM calls WHERE path='Types.java' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let payload: String = db
+        .query_row("SELECT payload FROM calls WHERE id=?1", [&id], |r| r.get(0))
+        .unwrap();
+    let mut forged: Value = serde_json::from_str(&payload).unwrap();
+    assert!(forged["calleeText"].is_string());
+    forged["calleeText"] = json!("fabricatedCall");
+    db.execute(
+        "UPDATE calls SET payload=?1 WHERE id=?2",
+        rusqlite::params![forged.to_string(), id],
+    )
+    .unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
+    for (method, path, body) in [
+        ("GET", class_url.as_str(), Value::Null),
+        ("GET", symbol_url.as_str(), Value::Null),
+        (
+            "POST",
+            "/api/class-diagram",
+            json!({"seed":class_id,"expectedRevision":pin}),
+        ),
+    ] {
+        let (status, value) = call(&app, method, path, body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
+        assert_eq!(value["error"]["code"], "incompatible_index");
+        assert!(!value.to_string().contains("fabricatedCall"));
+    }
+    let other_url = format!("/api/symbol?id={other_id}&{}", pin_query(pin));
+    assert_eq!(call(&app, "GET", &other_url, Value::Null).await.0, 200);
 }

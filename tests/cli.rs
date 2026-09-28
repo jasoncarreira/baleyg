@@ -718,6 +718,9 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         for table in native_tables {
             db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
         }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],

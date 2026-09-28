@@ -491,3 +491,354 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
     };
     assert!(store.native_source_at(pin, &key).is_err());
 }
+
+fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::PathBuf {
+    state
+        .join("cache/indexes")
+        .join(
+            baleyg::store::topology::WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .root_key,
+        )
+        .join("index.db")
+}
+
+#[test]
+fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let key = baleyg::native_evidence::DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "javascript".into(),
+        path: "flow.js".into(),
+    };
+    let owner: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !store
+            .native_declarations_at(pin, "javascript", "hello")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!store.native_calls_at(pin, &owner).unwrap().is_empty());
+    assert!(
+        !store
+            .native_control_regions_at(pin, &owner)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.native_coverage_at(pin, &key).unwrap().is_some());
+    // Every edit preserves row identity, pin, ordinals, ranges and FK constraints.
+    let cases = [
+        (
+            "native_headers",
+            "result_type",
+            "UPDATE native_headers SET result_type='Fabricated' WHERE syntax_id=(SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello')",
+        ),
+        (
+            "native_calls",
+            "spelling",
+            "UPDATE native_calls SET spelling='fabricated' WHERE path='flow.js'",
+        ),
+        (
+            "native_control_regions",
+            "arm",
+            "UPDATE native_control_regions SET arm='fabricated' WHERE path='flow.js'",
+        ),
+        (
+            "native_coverage",
+            "selected",
+            "UPDATE native_coverage SET selected=0 WHERE document_path='flow.js'",
+        ),
+    ];
+    for (table, column, sql) in cases {
+        let old: rusqlite::types::Value = db.query_row(
+            &format!("SELECT {column} FROM {table} WHERE {} LIMIT 1", if table == "native_headers" {
+                "syntax_id=(SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello')"
+            } else if table == "native_coverage" { "document_path='flow.js'" } else { "path='flow.js'" }),
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(db.execute(sql, []).unwrap() > 0, "{table} fixture row");
+        assert_eq!(
+            store.status().unwrap().revision,
+            pin,
+            "pin must not explain refusal"
+        );
+        let read = match table {
+            "native_headers" => store
+                .native_declarations_at(pin, "javascript", "hello")
+                .map(|_| ()),
+            "native_calls" => store.native_calls_at(pin, &owner).map(|_| ()),
+            "native_control_regions" => store.native_control_regions_at(pin, &owner).map(|_| ()),
+            _ => store.native_coverage_at(pin, &key).map(|_| ()),
+        };
+        assert!(
+            read.is_err(),
+            "{table}.{column} forged selected row was returned"
+        );
+        // A different selected document must stay usable (not a whole-index scan).
+        let java = baleyg::native_evidence::DocumentKey {
+            source_set_id: key.source_set_id.clone(),
+            language: "java".into(),
+            path: "flow.java".into(),
+        };
+        assert!(store.native_source_at(pin, &java).unwrap().is_some());
+        let predicate = if table == "native_headers" {
+            "syntax_id=(SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello')"
+        } else if table == "native_coverage" {
+            "document_path='flow.js'"
+        } else {
+            "path='flow.js'"
+        };
+        db.execute(
+            &format!("UPDATE {table} SET {column}=?1 WHERE {predicate}"),
+            [old],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
+    use sha2::{Digest, Sha256};
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let key = baleyg::native_evidence::DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "javascript".into(),
+        path: "flow.js".into(),
+    };
+    let (original, bytes) = store.native_source_at(pin, &key).unwrap().unwrap();
+    let mut forged = bytes.clone();
+    let offset = forged.iter().position(|b| *b == b'o').unwrap();
+    forged[offset] = b'x';
+    let forged_hash = hex::encode(Sha256::digest(&forged));
+    db.execute_batch("BEGIN").unwrap();
+    db.execute(
+        "UPDATE native_documents SET source_bytes=?1, content_hash=?2 WHERE path='flow.js'",
+        rusqlite::params![forged, forged_hash],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE native_provenance SET content_hash=?1 WHERE path='flow.js'",
+        [&forged_hash],
+    )
+    .unwrap();
+    db.execute_batch("COMMIT").unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert!(
+        store.native_source_at(pin, &key).is_err(),
+        "valid forged digest is not a graph witness"
+    );
+    assert!(store.source_at("flow.js", Some(pin)).is_err());
+    assert!(store.source_at("flow.java", Some(pin)).unwrap().is_some());
+    db.execute_batch("BEGIN").unwrap();
+    db.execute(
+        "UPDATE native_documents SET source_bytes=?1, content_hash=?2 WHERE path='flow.js'",
+        rusqlite::params![bytes, original.content_hash],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE native_provenance SET content_hash=?1 WHERE path='flow.js'",
+        [&original.content_hash],
+    )
+    .unwrap();
+    db.execute_batch("COMMIT").unwrap();
+    let original_payload: String = db
+        .query_row("SELECT payload FROM files WHERE path='flow.js'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut altered: serde_json::Value = serde_json::from_str(&original_payload).unwrap();
+    altered["path"] = serde_json::json!("forged.js");
+    db.execute(
+        "UPDATE files SET payload=?1 WHERE path='flow.js'",
+        [altered.to_string()],
+    )
+    .unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert!(
+        store.source_at("flow.js", Some(pin)).is_err(),
+        "graph payload path differs from selected key"
+    );
+    assert!(store.source_at("flow.java", Some(pin)).unwrap().is_some());
+}
+
+#[test]
+fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let owner: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let key = baleyg::native_evidence::DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "javascript".into(),
+        path: "flow.js".into(),
+    };
+    let original_end: i64 = db
+        .query_row(
+            "SELECT end_byte FROM native_declarations WHERE syntax_id=?1",
+            [&owner],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE native_declarations SET end_byte=end_byte+1 WHERE syntax_id=?1",
+        [&owner],
+    )
+    .unwrap();
+    assert!(
+        store
+            .native_declarations_at(pin, "javascript", "hello")
+            .is_err()
+    );
+    db.execute(
+        "UPDATE native_declarations SET end_byte=?1 WHERE syntax_id=?2",
+        rusqlite::params![original_end, owner],
+    )
+    .unwrap();
+    let original_kind: String = db
+        .query_row(
+            "SELECT kind FROM native_control_regions WHERE path='flow.js' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE native_control_regions SET kind='while_statement' WHERE path='flow.js'",
+        [],
+    )
+    .unwrap();
+    assert!(store.native_control_regions_at(pin, &owner).is_err());
+    db.execute(
+        "UPDATE native_control_regions SET kind=?1 WHERE path='flow.js'",
+        [&original_kind],
+    )
+    .unwrap();
+    let original: (String, Option<String>) = db
+        .query_row(
+            "SELECT state,diagnostic FROM native_coverage WHERE document_path='flow.js'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    db.execute("UPDATE native_coverage SET state='partial',diagnostic='fabricated' WHERE document_path='flow.js'", []).unwrap();
+    assert!(store.native_coverage_at(pin, &key).is_err());
+    assert!(
+        store
+            .native_coverage_at(
+                pin,
+                &baleyg::native_evidence::DocumentKey {
+                    source_set_id: key.source_set_id,
+                    language: "java".into(),
+                    path: "flow.java".into(),
+                }
+            )
+            .unwrap()
+            .is_some()
+    );
+    db.execute(
+        "UPDATE native_coverage SET state=?1,diagnostic=?2 WHERE document_path='flow.js'",
+        rusqlite::params![original.0, original.1],
+    )
+    .unwrap();
+}
+
+#[test]
+fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let owner: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let query: baleyg::model::ViewQuery =
+        serde_json::from_value(serde_json::json!({"seed":owner})).unwrap();
+    assert!(!store.query_view(&query).unwrap().unwrap().calls.is_empty());
+    assert!(store.sequence_at(&owner, pin, true).unwrap().is_some());
+    let call_id: String = db
+        .query_row(
+            "SELECT id FROM calls WHERE path='flow.js' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let original: String = db
+        .query_row("SELECT payload FROM calls WHERE id=?1", [&call_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let original_value: serde_json::Value = serde_json::from_str(&original).unwrap();
+    assert!(
+        original_value["calleeText"].is_string(),
+        "fixture must contain measured calleeText"
+    );
+    let mut forged = original_value.clone();
+    forged["calleeText"] = serde_json::json!("fabricatedCallee");
+    db.execute(
+        "UPDATE calls SET payload=?1 WHERE id=?2",
+        rusqlite::params![forged.to_string(), call_id],
+    )
+    .unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert!(
+        store.query_view(&query).is_err(),
+        "forged graph call reached question context"
+    );
+    assert!(
+        store.sequence_at(&owner, pin, true).is_err(),
+        "forged graph call reached sequence"
+    );
+    let java: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.java' AND name='go'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let unaffected: baleyg::model::ViewQuery =
+        serde_json::from_value(serde_json::json!({"seed":java})).unwrap();
+    assert!(store.query_view(&unaffected).unwrap().is_some());
+    assert!(store.sequence_at(&java, pin, true).unwrap().is_some());
+}

@@ -696,6 +696,37 @@ fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
         None,
     )
 }
+/// Reparse only a selected stored source snapshot. This does not admit or reread
+/// workspace files and does not project a second whole-workspace graph.
+pub(crate) fn selected_source_witness(
+    file: &SourceFile,
+    producer: Producer,
+    source_set: SourceSet,
+    revision: Revision,
+) -> Result<Artifact> {
+    ensure!(
+        revision.source_set_id == source_set.id
+            && revision.documents.len() == 1
+            && revision.documents[0].key.path == file.path
+            && revision.documents[0].content_hash == file.hash,
+        "selected native source header mismatch"
+    );
+    // The revision carries only this selected document here. Its ID and hashes
+    // are read from the pinned persisted header, never invented or republished.
+    let mut artifact = Artifact {
+        producer,
+        source_set,
+        revision,
+        coverage: vec![],
+        provenance: vec![],
+        declarations: vec![],
+        calls: vec![],
+        control_regions: vec![],
+    };
+    extract(&mut artifact, file, &mut IdentityRegistry::default())?;
+    Ok(artifact)
+}
+
 fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Result<()> {
     language_order(&f.language)?;
     safe_path(&f.path)?;

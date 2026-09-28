@@ -697,7 +697,7 @@ async fn java_same_class_proof_requires_exact_calls_callers_owners_and_target_sy
         source(&measured.path, measured.range.start_line, &dir),
     )
     .await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{declaration}");
     assert!(
         declaration["targets"]
             .as_array()
@@ -936,4 +936,29 @@ fn publish_bundle(
         "published graph must match captured source"
     );
     store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
+}
+
+#[tokio::test]
+async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_documents() {
+    let (dir, store, _graph, app) = fixture();
+    assert_eq!(
+        call(&app, source("A.java", 3, &dir)).await.0,
+        StatusCode::OK
+    );
+    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
+    let pin_before = store.status().unwrap().revision;
+    db.execute(
+        "UPDATE files SET payload=json_set(payload,'$.path','forged.java') WHERE path='A.java'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(store.status().unwrap().revision, pin_before);
+    let (status, result) = call(&app, source("A.java", 3, &dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{result}");
+    assert_eq!(result["error"]["code"], "incompatible_index");
+    assert_eq!(
+        call(&app, source("B.java", 1, &dir)).await.0,
+        StatusCode::OK,
+        "unselected B.java stays usable despite A.java tamper"
+    );
 }

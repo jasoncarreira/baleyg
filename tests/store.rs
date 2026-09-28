@@ -39,6 +39,9 @@ fn downgrade_to_legacy(db: &rusqlite::Connection) {
     for table in tables {
         db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
     }
+    for index in ["nodes_path", "calls_path", "regions_path"] {
+        db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+    }
     db.execute(
         "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
         [],

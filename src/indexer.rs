@@ -421,7 +421,17 @@ pub fn validate_native_graph(
         graph.files == capture.files,
         "native_evidence_required: graph source differs from capture"
     );
-    let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    validate_native_graph_records(graph, native, cancel)
+}
+
+/// Cross-witness only the supplied graph rows against native facts. A read may
+/// supply one selected document; this never projects a second whole graph.
+pub(crate) fn validate_native_graph_records(
+    graph: &Graph,
+    native: &native_evidence::Artifact,
+    cancel: &CancelFlag,
+) -> Result<()> {
+    let files: BTreeMap<_, _> = graph.files.iter().map(|f| (f.path.as_str(), f)).collect();
     let mut declaration_keys = BTreeMap::new();
     for d in &native.declarations {
         let key = (

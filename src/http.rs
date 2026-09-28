@@ -1737,6 +1737,14 @@ async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPa
             "The index revision changed",
         ));
     }
+    // A packet hash authenticates only the in-memory copy. Recheck its exact
+    // selected graph and source witnesses under one pinned SQLite snapshot
+    // before exporting, displaying, or sending cached evidence to a provider.
+    let witness = packet.clone();
+    db(s, move |store| {
+        store.validate_selected_view(&witness.context, &witness.source_files)
+    })
+    .await?;
     Ok(packet)
 }
 async fn question_export(
@@ -1988,6 +1996,11 @@ mod live_tests {
     }
 
     #[tokio::test]
+    async fn corrupt_selected_cached_source_prevents_live_provider_call() {
+        mock_run(false, "selected_corruption").await;
+    }
+
+    #[tokio::test]
     async fn context_exceeded_is_actionable_and_retains_reservation() {
         mock_run(false, "context_exceeded").await;
     }
@@ -2148,6 +2161,46 @@ mod live_tests {
             "/api/questions/{}/jev-run",
             preview["packet"]["packetId"].as_str().unwrap()
         );
+        if scenario == "selected_corruption" {
+            let index_root = dir.path().join("state/cache/indexes");
+            let db_path = std::fs::read_dir(index_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.is_dir())
+                .unwrap()
+                .join("index.db");
+            let db = rusqlite::Connection::open(db_path).unwrap();
+            let mut bytes: Vec<u8> = db
+                .query_row(
+                    "SELECT source_bytes FROM native_documents WHERE path='a.js'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            bytes[0] ^= 1;
+            assert_eq!(
+                db.execute(
+                    "UPDATE native_documents SET source_bytes=?1 WHERE path='a.js'",
+                    [bytes],
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                store.status().unwrap().revision,
+                serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
+            );
+            let attempts = provider.budget().unwrap().attempts;
+            let response = app.oneshot(request(&path, json!({}))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "incompatible_index");
+            assert_eq!(provider.budget().unwrap().attempts, attempts);
+            server.abort();
+            return;
+        }
         let run = tokio::spawn(app.oneshot(request(&path, json!({}))));
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
             .await
@@ -2389,6 +2442,9 @@ mod rebaseline_packet_cache_tests {
         };
         for table in tables {
             db.execute(&format!("DROP TABLE \"{table}\""), []).unwrap();
+        }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
         }
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
