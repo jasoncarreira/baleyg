@@ -2354,8 +2354,8 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         assert_expected_storage_busy(loser.as_ref().unwrap_err());
         let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
         let retried = DurableRecords::new(&roots, &identity)
-            .update_view_record(&make_view(**loser_hash), || {
-                Ok(test_anchor_raw(target, **loser_hash))
+            .update_view_record(&make_view(*loser_hash), || {
+                Ok(test_anchor_raw(target, *loser_hash))
             })
             .unwrap();
         assert_eq!(retried.anchor.as_ref().unwrap().get(), winner_raw);
