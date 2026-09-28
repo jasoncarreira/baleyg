@@ -69,6 +69,28 @@ pub fn index_workspace(
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<Graph> {
     let capture = crate::capture::Capture::admit(options, cancel, &progress)?;
+    index_captured(options, cancel, progress, &capture)
+}
+/// Build native evidence from the same immutable bytes as the graph; no Store write occurs here.
+pub fn index_workspace_with_native(
+    options: &IndexOptions,
+    root_id: &str,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+) -> Result<(Graph, crate::native_evidence::Artifact)> {
+    let capture = crate::capture::Capture::admit(options, cancel, &progress)?;
+    let root = std::fs::canonicalize(&options.workspace_root)?;
+    let native = crate::native_evidence::from_capture(&capture, &root, root_id)?;
+    let graph = index_captured(options, cancel, progress, &capture)?;
+    capture.verify(cancel)?;
+    Ok((graph, native))
+}
+fn index_captured(
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+    capture: &crate::capture::Capture,
+) -> Result<Graph> {
     let workspace_root = std::fs::canonicalize(&options.workspace_root)?;
     let mut g = Graph {
         files: capture.files.clone(),
@@ -637,4 +659,21 @@ impl Extractor<'_> {
         }
         Ok(())
     }
+}
+
+/// Closed #22 syntax categories measured by the JavaScript adapter.
+pub(crate) fn native_js_kind(n: Node<'_>) -> Option<&'static str> {
+    Some(match n.kind() {
+        "class_declaration" | "class" => "type",
+        "method_definition" => "method",
+        "function_declaration"
+        | "function_expression"
+        | "generator_function_declaration"
+        | "generator_function" => "function",
+        "arrow_function" => "anonymousFunction",
+        "variable_declarator" => "variable",
+        "field_definition" => "field",
+        "formal_parameter" => "parameter",
+        _ => return None,
+    })
 }

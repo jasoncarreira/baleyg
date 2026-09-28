@@ -251,6 +251,22 @@ impl Extractor<'_> {
     }
 }
 
+/// Closed #22 syntax categories measured by the Rust adapter, without cfg expansion.
+pub(crate) fn native_kind(n: Node<'_>) -> Option<&'static str> {
+    Some(match n.kind() {
+        "struct_item" | "enum_item" | "trait_item" | "union_item" => "type",
+        "impl_item" => "implementation",
+        "mod_item" => "namespace",
+        "function_item" | "function_signature_item" => "function",
+        "closure_expression" => "anonymousFunction",
+        "field_declaration" => "field",
+        "type_item" => "alias",
+        "const_item" | "static_item" => "variable",
+        "parameter" => "parameter",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod extraction_budget_tests {
     use super::*;
