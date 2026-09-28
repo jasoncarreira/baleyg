@@ -826,6 +826,121 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
     assert!(!graph.to_string().contains("lexical-guess"));
 }
 
+// Read the normalized publication, including every native row, from the real daemon's database.
+fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
+    fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "index.db") {
+                return Some(path);
+            }
+            if path.is_dir()
+                && let Some(db) = find(&path)
+            {
+                return Some(db);
+            }
+        }
+        None
+    }
+    find(home).expect("published native database")
+}
+fn real_native_snapshot(home: &std::path::Path) -> Value {
+    use rusqlite::types::ValueRef;
+    let db = rusqlite::Connection::open(real_index_db(home)).unwrap();
+    let source_set: (String, String) = db
+        .query_row("SELECT id,root_id FROM native_source_sets", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    let revision: (String, String, String, String, String) = db.query_row(
+        "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions", [],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
+    ).unwrap();
+    let mut documents = Vec::new();
+    let mut stmt = db.prepare(
+        "SELECT source_set_id,language,path,revision_id,content_hash,byte_length,source_bytes FROM native_documents ORDER BY path"
+    ).unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Vec<u8>>(6)?,
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (set, language, path, revision, hash, length, bytes) = row.unwrap();
+        documents.push(serde_json::json!({"sourceSetId":set,"language":language,"path":path,
+            "revisionId":revision,"contentHash":hash,"byteLength":length,"bytesHex":hex::encode(bytes)}));
+    }
+    let mut all_rows = serde_json::Map::new();
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%' ORDER BY name").unwrap();
+    for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+        let name = name.unwrap();
+        let mut table = db
+            .prepare(&format!("SELECT * FROM {name} ORDER BY rowid"))
+            .unwrap();
+        let columns = table.column_count();
+        let records = table
+            .query_map([], |row| {
+                let mut cells = Vec::new();
+                for i in 0..columns {
+                    let cell = match row.get_ref(i)? {
+                        ValueRef::Null => Value::Null,
+                        ValueRef::Integer(n) => serde_json::json!(n),
+                        ValueRef::Real(n) => serde_json::json!(n),
+                        ValueRef::Text(bytes) => serde_json::json!(String::from_utf8_lossy(bytes)),
+                        ValueRef::Blob(bytes) => serde_json::json!({"blobHex":hex::encode(bytes)}),
+                    };
+                    cells.push(cell);
+                }
+                Ok(cells)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        all_rows.insert(name, serde_json::json!(records));
+    }
+    serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
+        "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
+            "configHash":revision.3,"dependencyHash":revision.4},
+        "documents":documents,"allRows":all_rows})
+}
+
+fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
+    let output = command(root, home, "export").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+async fn real_api(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    method: reqwest::Method,
+    route: &str,
+    body: Option<Value>,
+) -> (reqwest::StatusCode, Value) {
+    let mut request = client
+        .request(method, format!("{url}{route}"))
+        .header("Origin", url)
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap())
+}
+
 // Exercise the actual executable on both sides of the coordinator, not an in-process router.
 #[tokio::test]
 async fn real_cli_and_authenticated_daemon_share_native_pair_for_every_language_and_empty_root() {
@@ -837,34 +952,6 @@ async fn real_cli_and_authenticated_daemon_share_native_pair_for_every_language_
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
-    }
-    fn paired_native(home: &std::path::Path) -> (String, String, usize) {
-        fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-            for entry in fs::read_dir(dir).ok()?.flatten() {
-                let path = entry.path();
-                if path.file_name().is_some_and(|name| name == "index.db") {
-                    return Some(path);
-                }
-                if path.is_dir()
-                    && let Some(db) = find(&path)
-                {
-                    return Some(db);
-                }
-            }
-            None
-        }
-        let db =
-            rusqlite::Connection::open(find(home).expect("published native database")).unwrap();
-        let set: String = db
-            .query_row("SELECT id FROM native_source_sets", [], |r| r.get(0))
-            .unwrap();
-        let revision: String = db
-            .query_row("SELECT id FROM native_revisions", [], |r| r.get(0))
-            .unwrap();
-        let count: i64 = db
-            .query_row("SELECT count(*) FROM native_documents", [], |r| r.get(0))
-            .unwrap();
-        (set, revision, count.try_into().unwrap())
     }
     for (name, file, source) in [
         (
@@ -912,8 +999,13 @@ def sink():
         let first: Value = serde_json::from_slice(&indexed.stdout).unwrap();
         let old_pin = first["publishedRevision"].clone();
         assert_eq!(first["status"]["revision"], old_pin, "{name}");
-        let native_before = paired_native(&home);
-        assert_eq!(native_before.2, usize::from(!file.is_empty()), "{name}");
+        let native_before = real_native_snapshot(&home);
+        let graph_before = real_export(&root, &home);
+        assert_eq!(
+            native_before["documents"].as_array().unwrap().len(),
+            usize::from(!file.is_empty()),
+            "{name}"
+        );
 
         let token_file = tmp.path().join("token");
         fs::write(&token_file, TOKEN).unwrap();
@@ -1036,27 +1128,163 @@ def sink():
             usize::from(!file.is_empty()),
             "{name}"
         );
+        use sha2::{Digest, Sha256};
+        let native_after = real_native_snapshot(&home);
+        let graph_after = real_export(&root, &home);
         assert_eq!(
-            paired_native(&home),
-            native_before,
-            "{name}: identical inputs must retain native source-set and revision IDs"
+            native_after, native_before,
+            "{name}: complete normalized native rows must be stable"
         );
-        if !file.is_empty() {
-            let source_at: Value = client
-                .get(format!(
-                    "{url}/api/source?path={file}&indexGeneration={}&indexRevision={}",
-                    pin["indexGeneration"].as_str().unwrap(),
-                    pin["indexRevision"].as_u64().unwrap()
-                ))
-                .bearer_auth(TOKEN)
-                .send()
-                .await
+        assert_eq!(
+            graph_after, graph_before,
+            "{name}: identical bytes must reproduce graph"
+        );
+        let root_id =
+            baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
                 .unwrap()
-                .json()
-                .await
-                .unwrap();
+                .record_id;
+        assert_eq!(native_after["sourceSet"]["rootId"], root_id, "{name}");
+        assert_eq!(
+            native_after["revision"]["sourceSetId"], native_after["sourceSet"]["id"],
+            "{name}"
+        );
+        for field in ["toolchainHash", "configHash", "dependencyHash"] {
+            assert_eq!(
+                native_after["revision"][field].as_str().unwrap().len(),
+                64,
+                "{name}: {field}"
+            );
+        }
+        let documents = native_after["documents"].as_array().unwrap();
+        let graph_files = graph_after["files"].as_array().unwrap();
+        assert_eq!(
+            documents.len(),
+            graph_files.len(),
+            "{name}: every graph source needs native bytes"
+        );
+        for doc in documents {
+            let path = doc["path"].as_str().unwrap();
+            let graph_file = graph_files.iter().find(|row| row["path"] == path).unwrap();
+            let bytes = graph_file["text"].as_str().unwrap().as_bytes();
+            let digest = hex::encode(Sha256::digest(bytes));
+            assert_eq!(
+                doc["sourceSetId"], native_after["sourceSet"]["id"],
+                "{name}"
+            );
+            assert_eq!(doc["revisionId"], native_after["revision"]["id"], "{name}");
+            assert_eq!(doc["language"], graph_file["language"], "{name}");
+            assert_eq!(doc["contentHash"], digest, "{name}");
+            assert_eq!(doc["contentHash"], graph_file["hash"], "{name}");
+            assert_eq!(doc["byteLength"], bytes.len(), "{name}");
+            assert_eq!(doc["bytesHex"], hex::encode(bytes), "{name}");
+            let route = format!(
+                "/api/source?path={path}&indexGeneration={}&indexRevision={}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            );
+            let (code, source_at) =
+                real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+            assert_eq!(code, 200, "{name}: {source_at}");
             assert_eq!(source_at["revision"], pin, "{name}");
-            assert_eq!(source_at["file"]["text"], source, "{name}");
+            assert_eq!(
+                source_at["file"], *graph_file,
+                "{name}: pinned source equals graph and native bytes"
+            );
+        }
+        if !file.is_empty() {
+            assert_eq!(documents[0]["path"], file, "{name}");
+            assert_eq!(graph_files[0]["text"], source, "{name}");
+            let pinned = format!(
+                "indexGeneration={}&indexRevision={}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            );
+            let (code, classes) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/classes?{pinned}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {classes}");
+            assert_eq!(classes["revision"], pin, "{name}");
+            let (code, symbols) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                "/api/symbols?q=seed",
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {symbols}");
+            assert_eq!(symbols["revision"], pin, "{name}");
+            let seed = symbols["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "seed")
+                .expect("measured seed declaration")["id"]
+                .as_str()
+                .unwrap();
+            for (route, body) in [
+                (
+                    "/api/navigation",
+                    serde_json::json!({"expectedRevision":pin,"path":file,"line":1}),
+                ),
+                (
+                    "/api/sequence",
+                    serde_json::json!({"expectedRevision":pin,"seed":seed}),
+                ),
+            ] {
+                let (code, result) = real_api(
+                    &client,
+                    &url,
+                    TOKEN,
+                    reqwest::Method::POST,
+                    route,
+                    Some(body),
+                )
+                .await;
+                assert_eq!(code, 200, "{name}: {route}: {result}");
+                assert_eq!(result["revision"], pin, "{name}: {route}");
+                assert!(
+                    !result.to_string().contains("lexical-guess"),
+                    "{name}: {route}"
+                );
+                assert!(
+                    !result.to_string().contains(r#""resolution":"internal""#),
+                    "{name}: {route}"
+                );
+            }
+            let (code, preview) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::POST,
+                "/api/questions/preview",
+                Some(serde_json::json!({
+                    "seed":seed,"question":"what happens?","expectedRevision":pin
+                })),
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {preview}");
+            assert_eq!(preview["packet"]["revision"], pin, "{name}");
+            assert!(!preview.to_string().contains("lexical-guess"), "{name}");
+            let packet = preview["packet"]["packetId"].as_str().unwrap();
+            let (code, export) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/questions/{packet}/jev-request"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {export}");
+            assert!(!export.to_string().contains("lexical-guess"), "{name}");
         }
         let stale = request().bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(
@@ -1064,7 +1292,354 @@ def sink():
             409,
             "{name}: stale entire pair refused before work"
         );
-        assert_eq!(paired_native(&home), native_before, "{name}");
+        assert_eq!(real_native_snapshot(&home), native_before, "{name}");
         drop(server);
     }
+}
+
+#[tokio::test]
+async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached_packet() {
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct Writer(rusqlite::Connection);
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.0.execute_batch("ROLLBACK");
+        }
+    }
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("workspace");
+    let home = tmp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    let original = "function seed() { sink(); } function sink() {}
+";
+    fs::write(root.join("flow.js"), original).unwrap();
+    let initial = command(&root, &home, "index").output().unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let token_file = tmp.path().join("token");
+    fs::write(&token_file, TOKEN).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let server = Server(
+        isolated_command(&home)
+            .arg("serve")
+            .arg("--workspace")
+            .arg(&root)
+            .arg("--bind")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--token-file")
+            .arg(&token_file)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(
+                fs::File::create(tmp.path().join("daemon-stderr")).unwrap(),
+            ))
+            .spawn()
+            .unwrap(),
+    );
+    let url = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("{url}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real daemon readiness");
+    let (code, status) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{status}");
+    let pin = status["revision"].clone();
+    let native_before = real_native_snapshot(&home);
+    let graph_before = real_export(&root, &home);
+    let pinned_source = format!(
+        "/api/source?path=flow.js&indexGeneration={}&indexRevision={}",
+        pin["indexGeneration"].as_str().unwrap(),
+        pin["indexRevision"].as_u64().unwrap()
+    );
+    let (code, source_before) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &pinned_source,
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{source_before}");
+    let (code, symbols) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/symbols?q=seed",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{symbols}");
+    let seed = symbols["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "seed")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let (code, preview) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        "/api/questions/preview",
+        Some(serde_json::json!({"seed":seed,"question":"what happens?","expectedRevision":pin})),
+    )
+    .await;
+    assert_eq!(code, 200, "{preview}");
+    let packet_id = preview["packet"]["packetId"].as_str().unwrap();
+    let packet_route = format!("/api/questions/{packet_id}/jev-request");
+    let (code, packet_before) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &packet_route,
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{packet_before}");
+
+    // A bounded multi-file scan lets the client acquire a real SQLite writer lock
+    // after the HTTP job is accepted but before projection completes.
+    let padding = "x".repeat(48 * 1024);
+    for i in 0..80 {
+        fs::write(
+            root.join(format!("extra{i:03}.js")),
+            format!("// {padding}\nfunction extra{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let (code, accepted) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        "/api/index",
+        Some(serde_json::json!({"expectedRevision":pin})),
+    )
+    .await;
+    assert_eq!(code, 202, "{accepted}");
+    let id = accepted["id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (code, job) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{job}");
+            assert!(
+                job["finishedAt"].is_null(),
+                "job finished before lock: {job}"
+            );
+            if job["progress"]["phase"] == "scan"
+                && job["progress"]["completed"].as_u64().unwrap() < 81
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("scan progress before SQLite lock");
+    let writer = Writer(rusqlite::Connection::open(real_index_db(&home)).unwrap());
+    writer.0.busy_timeout(Duration::from_secs(1)).unwrap();
+    writer.0.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let after_capture = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let (code, job) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{job}");
+            if job["progress"]["phase"] == "complete" {
+                break job;
+            }
+            assert!(
+                job["finishedAt"].is_null(),
+                "failed before captured graph: {job}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("captured graph must complete before cancellation");
+    assert_eq!(after_capture["progress"]["completed"], 81);
+    let (code, _) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        &format!("/api/jobs/{id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(code, 200);
+    drop(writer); // Always rolls back the external writer lock, including on panic.
+    let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (code, job) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{job}");
+            if !job["finishedAt"].is_null() {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("failed or cancelled job terminal");
+    assert!(
+        matches!(terminal["state"].as_str(), Some("failed" | "cancelled")),
+        "{terminal}"
+    );
+    assert_eq!(terminal["progress"]["phase"], "complete");
+    let (code, current) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{current}");
+    assert_eq!(
+        current["revision"], pin,
+        "failed job may not advance full pair"
+    );
+    assert_eq!(
+        real_native_snapshot(&home),
+        native_before,
+        "all native rows remain unchanged"
+    );
+    assert_eq!(
+        real_export(&root, &home),
+        graph_before,
+        "all graph rows remain unchanged"
+    );
+    let (code, source_after) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &pinned_source,
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{source_after}");
+    assert_eq!(
+        source_after, source_before,
+        "previous pinned source remains usable"
+    );
+    let (code, packet_after) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &packet_route,
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{packet_after}");
+    assert_eq!(
+        packet_after, packet_before,
+        "cached packet must remain usable after failed publication"
+    );
+    let (code, retry) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        "/api/index",
+        Some(serde_json::json!({"expectedRevision":pin})),
+    )
+    .await;
+    assert_eq!(code, 202, "{retry}");
+    let retry_id = retry["id"].as_str().unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let (code, job) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{retry_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{job}");
+            if !job["finishedAt"].is_null() {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("later successful job");
+    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(
+        completed["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(
+        completed["revision"]["indexRevision"],
+        pin["indexRevision"].as_u64().unwrap() + 1
+    );
+    drop(server);
 }
