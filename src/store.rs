@@ -3456,12 +3456,11 @@ mod rebaseline_fault_tests {
         next_native
             .validate(&next_capture, work.path(), store.root_id())
             .unwrap();
-        ensure!(
+        assert!(
             next_capture.graph_projection_count() == 1,
             "capture must contain exactly one graph projection"
-        )
-        .unwrap();
-        ensure!(
+        );
+        assert!(
             next_capture.source_operations.len() == next_capture.files.len()
                 && next_capture
                     .source_operations
@@ -3470,8 +3469,7 @@ mod rebaseline_fault_tests {
                         && counts.complete_reads == 1
                         && counts.hashes == 1),
             "each captured source must open/read/hash exactly once"
-        )
-        .unwrap();
+        );
         crate::indexer::validate_native_graph(&next, &next_capture, &next_native, &initial_cancel)
             .unwrap();
 
