@@ -1196,6 +1196,11 @@ impl Store {
     fn records(&self) -> topology::DurableRecords<'_> {
         topology::DurableRecords::new(&self.roots, &self.identity)
     }
+    fn saved_cache_exists(&self) -> Result<bool> {
+        self.identity.verify()?;
+        self.roots.reject_root_overlap(&self.identity)?;
+        Ok(self.roots.index_db(&self.identity).try_exists()?)
+    }
     fn read_control_status(&self, db: &Connection) -> Result<IndexStatus> {
         // This check must run INSIDE the caller's read snapshot or writer lock.
         // The open_index admission check alone cannot protect against later DDL.
@@ -3188,10 +3193,22 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
     }
 
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
+        self.query_view_at(query, None)
+    }
+
+    pub fn query_view_at(
+        &self,
+        query: &ViewQuery,
+        expected_pin: Option<&IndexPin>,
+    ) -> Result<Option<ViewResult>> {
         query.validate()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
+        ensure!(
+            expected_pin.is_none_or(|expected| *expected == revision),
+            "revision conflict: stale native pin"
+        );
         let selected_path: Option<String> = tx
             .query_row("SELECT path FROM nodes WHERE id=?1", [&query.seed], |r| {
                 r.get(0)
@@ -3385,6 +3402,16 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
 
     pub fn saved_views_at(&self, expected_pin: Option<IndexPin>) -> Result<Vec<SavedViewState>> {
         let views = self.records().view_records()?;
+        if views.is_empty() && expected_pin.is_none() {
+            return Ok(vec![]);
+        }
+        if !self.saved_cache_exists()? {
+            ensure!(
+                expected_pin.is_none(),
+                "revision conflict: native evidence unavailable"
+            );
+            return Ok(views.into_iter().map(Self::unavailable_view).collect());
+        }
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         let control = self.read_control_status(&tx)?;
@@ -3416,8 +3443,32 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
     ) -> Result<Option<SavedViewState>> {
         let view = self.records().view_record(id)?;
         let Some(view) = view else {
+            if let Some(expected) = expected_pin {
+                ensure!(
+                    self.saved_cache_exists()?,
+                    "revision conflict: native evidence unavailable"
+                );
+                let mut db = self.cache()?;
+                let tx = storage_result(db.transaction())?;
+                let status = self.read_control_status(&tx)?;
+                ensure!(
+                    status.evidence_format.is_some(),
+                    "revision conflict: native evidence unavailable"
+                );
+                ensure!(
+                    status.revision == expected,
+                    "revision conflict: stale native pin"
+                );
+            }
             return Ok(None);
         };
+        if !self.saved_cache_exists()? {
+            ensure!(
+                expected_pin.is_none(),
+                "revision conflict: native evidence unavailable"
+            );
+            return Ok(Some(Self::unavailable_view(view)));
+        }
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         let control = self.read_control_status(&tx)?;
@@ -3443,8 +3494,13 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         view.validate()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
+        let status = self.read_control_status(&tx)?;
         ensure!(
-            self.read_status(&tx)?.revision == pin,
+            status.evidence_format.is_some(),
+            "revision conflict: native evidence unavailable"
+        );
+        ensure!(
+            status.revision == pin,
             "revision conflict: stale native pin"
         );
         let record = self.records().update_view_record(
@@ -3506,6 +3562,19 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         expected_pin: Option<IndexPin>,
     ) -> Result<Vec<AnnotationState>> {
         let annotations = self.records().annotation_records()?;
+        if annotations.is_empty() && expected_pin.is_none() {
+            return Ok(vec![]);
+        }
+        if !self.saved_cache_exists()? {
+            ensure!(
+                expected_pin.is_none(),
+                "revision conflict: native evidence unavailable"
+            );
+            return Ok(annotations
+                .into_iter()
+                .map(Self::unavailable_annotation)
+                .collect());
+        }
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         let control = self.read_control_status(&tx)?;
@@ -3541,8 +3610,13 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         request.validate()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
+        let status = self.read_control_status(&tx)?;
         ensure!(
-            self.read_status(&tx)?.revision == pin,
+            status.evidence_format.is_some(),
+            "revision conflict: native evidence unavailable"
+        );
+        ensure!(
+            status.revision == pin,
             "revision conflict: stale native pin"
         );
         let title = request

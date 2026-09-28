@@ -392,6 +392,13 @@ impl From<anyhow::Error> for ApiError {
                 "revision_conflict",
                 "The index revision changed",
             )
+        } else if matches!(
+            e.to_string().as_str(),
+            "saved view target replacement is not allowed"
+                | "saved annotation target replacement is not allowed"
+                | "native declaration target missing"
+        ) {
+            invalid()
         } else {
             let text = e.to_string();
             for (prefix, status, code) in [
@@ -1543,45 +1550,57 @@ async fn source(
 }
 async fn query(
     State(s): State<Arc<DaemonState>>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
     body: Result<Json<ViewQuery>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ViewResult>, ApiError> {
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let expected = pin.pin()?;
     let Json(q) = body.map_err(|_| invalid())?;
     q.validate().map_err(|_| invalid())?;
     Ok(Json(
-        db(s, move |s| s.query_view(&q))
+        db(s, move |s| s.query_view_at(&q, expected.as_ref()))
             .await?
             .ok_or_else(missing)?,
     ))
 }
-async fn views(State(s): State<Arc<DaemonState>>) -> Result<Json<Vec<SavedViewState>>, ApiError> {
-    Ok(Json(db(s, |s| s.views()).await?))
+async fn views(
+    State(s): State<Arc<DaemonState>>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<Vec<SavedViewState>>, ApiError> {
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let expected = pin.pin()?;
+    Ok(Json(
+        db(s, move |s| s.saved_views_at(expected)).await?,
+    ))
 }
 async fn view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<SavedViewState>, ApiError> {
     validate_record_id(&id).map_err(|_| invalid())?;
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let expected = pin.pin()?;
     Ok(Json(
-        db(s, move |s| s.view(&id)).await?.ok_or_else(missing)?,
+        db(s, move |s| s.saved_view_at(&id, expected))
+            .await?
+            .ok_or_else(missing)?,
     ))
 }
 async fn save_view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-    Json(v): Json<SavedView>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
+    body: Result<Json<SavedViewRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<SavedViewState>, ApiError> {
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let pin = pin.pin()?.ok_or_else(invalid)?;
+    let Json(v) = body.map_err(|_| invalid())?;
     if v.id != id {
         return Err(invalid());
     }
     v.validate().map_err(|_| invalid())?;
-    Ok(Json(
-        db(s, move |s| {
-            s.put_view(&v)?;
-            s.view(&id)?
-                .ok_or_else(|| anyhow::anyhow!("saved view missing"))
-        })
-        .await?,
-    ))
+    Ok(Json(db(s, move |s| s.save_view_at(pin, &v)).await?))
 }
 async fn delete_view(
     State(s): State<Arc<DaemonState>>,
@@ -1593,27 +1612,29 @@ async fn delete_view(
 }
 async fn annotations(
     State(s): State<Arc<DaemonState>>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<Vec<AnnotationState>>, ApiError> {
-    Ok(Json(db(s, |s| s.annotations()).await?))
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let expected = pin.pin()?;
+    Ok(Json(
+        db(s, move |s| s.saved_annotations_at(expected)).await?,
+    ))
 }
 async fn save_annotation(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-    Json(a): Json<Annotation>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
+    body: Result<Json<AnnotationRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<AnnotationState>, ApiError> {
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let pin = pin.pin()?.ok_or_else(invalid)?;
+    let Json(a) = body.map_err(|_| invalid())?;
     if a.id != id {
         return Err(invalid());
     }
     a.validate().map_err(|_| invalid())?;
     Ok(Json(
-        db(s, move |s| {
-            s.put_annotation(&a)?;
-            s.annotations()?
-                .into_iter()
-                .find(|v| v.annotation.id == id)
-                .ok_or_else(|| anyhow::anyhow!("saved annotation missing"))
-        })
-        .await?,
+        db(s, move |s| s.save_annotation_at(pin, &a)).await?,
     ))
 }
 async fn delete_annotation(
