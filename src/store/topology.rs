@@ -1082,14 +1082,16 @@ impl<'a> DurableRecords<'a> {
         result
     }
     pub fn view_records(&self) -> Result<Vec<crate::model::SavedViewRecord>> {
-        let records = self.list("SELECT payload FROM views ORDER BY id")?;
+        let records: Vec<crate::model::SavedViewRecord> =
+            self.list("SELECT payload FROM views ORDER BY id")?;
         for record in &records {
             record.validate()?;
         }
         Ok(records)
     }
     pub fn annotation_records(&self) -> Result<Vec<crate::model::AnnotationRecord>> {
-        let records = self.list("SELECT payload FROM annotations ORDER BY id")?;
+        let records: Vec<crate::model::AnnotationRecord> =
+            self.list("SELECT payload FROM annotations ORDER BY id")?;
         for record in &records {
             record.validate()?;
         }
