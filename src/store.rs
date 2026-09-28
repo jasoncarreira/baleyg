@@ -963,14 +963,152 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ScanComparison {
+    examined: usize,
+    added: usize,
+    deleted: usize,
+    stat_changed: usize,
+    hash_changed: usize,
+}
+impl ScanComparison {
+    fn changed(self) -> bool {
+        self.added + self.deleted + self.stat_changed + self.hash_changed > 0
+    }
+}
+
+fn compare_capture_snapshot(
+    db: &Connection,
+    capture: &crate::capture::Capture,
+) -> Result<ScanComparison> {
+    let mut previous_sources = BTreeMap::new();
+    let mut statement = db.prepare("SELECT path,hash,capture_stat FROM files ORDER BY path")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (path, hash, stat) = row?;
+        let stat: crate::capture::CaptureStat = serde_json::from_str(&stat)?;
+        ensure!(
+            previous_sources.insert(path, (hash, stat)).is_none(),
+            "incompatible_index: duplicate captured source observation"
+        );
+    }
+    let mut current_sources = BTreeMap::new();
+    for source in &capture.files {
+        current_sources.insert(
+            source.path.clone(),
+            (source.hash.clone(), capture.source_stat(&source.path)?),
+        );
+    }
+
+    let mut previous_inputs = BTreeMap::new();
+    let mut statement =
+        db.prepare("SELECT input_key,payload FROM capture_inputs ORDER BY input_key")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (key, payload) = row?;
+        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)?;
+        ensure!(
+            previous_inputs.insert(key, observation).is_none(),
+            "incompatible_index: duplicate captured input observation"
+        );
+    }
+    let current_inputs = capture.persisted_inputs()?;
+    let mut comparison = ScanComparison::default();
+    let source_keys: BTreeSet<_> = previous_sources
+        .keys()
+        .chain(current_sources.keys())
+        .cloned()
+        .collect();
+    for key in &source_keys {
+        comparison.examined += 1;
+        match (previous_sources.get(key), current_sources.get(key)) {
+            (None, Some(_)) => comparison.added += 1,
+            (Some(_), None) => comparison.deleted += 1,
+            (Some((old_hash, old_stat)), Some((new_hash, new_stat))) => {
+                comparison.stat_changed += usize::from(old_stat != new_stat);
+                comparison.hash_changed += usize::from(old_hash != new_hash);
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    let input_keys: BTreeSet<_> = previous_inputs
+        .keys()
+        .chain(current_inputs.keys())
+        .cloned()
+        .collect();
+    for key in &input_keys {
+        comparison.examined += 1;
+        match (previous_inputs.get(key), current_inputs.get(key)) {
+            (None, Some(_)) => comparison.added += 1,
+            (Some(_), None) => comparison.deleted += 1,
+            (Some(old), Some(new)) => match (old, new) {
+                (
+                    crate::capture::CaptureInputObservation::Present {
+                        stat: old_stat,
+                        hash: old_hash,
+                    },
+                    crate::capture::CaptureInputObservation::Present {
+                        stat: new_stat,
+                        hash: new_hash,
+                    },
+                ) => {
+                    comparison.stat_changed += usize::from(old_stat != new_stat);
+                    comparison.hash_changed += usize::from(old_hash != new_hash);
+                }
+                (
+                    crate::capture::CaptureInputObservation::Directory { stat: old },
+                    crate::capture::CaptureInputObservation::Directory { stat: new },
+                )
+                | (
+                    crate::capture::CaptureInputObservation::Root { stat: old },
+                    crate::capture::CaptureInputObservation::Root { stat: new },
+                ) => comparison.stat_changed += usize::from(old != new),
+                (
+                    crate::capture::CaptureInputObservation::Absent,
+                    crate::capture::CaptureInputObservation::Absent,
+                ) => {}
+                _ => comparison.stat_changed += 1,
+            },
+            (None, None) => unreachable!(),
+        }
+    }
+    Ok(comparison)
+}
+
 fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str) -> Result<()> {
+    let nanos = |value: Option<i64>| value.is_some_and(|n| (0..1_000_000_000).contains(&n));
     ensure!(
         stat.version == 1
             && stat.kind == expected_kind
             && stat.device.is_some() == stat.inode.is_some()
             && stat.mtime_seconds.is_some() == stat.mtime_nanoseconds.is_some()
-            && stat.ctime_seconds.is_some() == stat.ctime_nanoseconds.is_some(),
+            && stat.ctime_seconds.is_some() == stat.ctime_nanoseconds.is_some()
+            && stat.mtime_seconds.is_some() == stat.ctime_seconds.is_some(),
         "incompatible_index: invalid capture stat"
+    );
+    #[cfg(unix)]
+    ensure!(
+        stat.device.is_some_and(|n| n > 0)
+            && stat.inode.is_some_and(|n| n > 0)
+            && nanos(stat.mtime_nanoseconds)
+            && nanos(stat.ctime_nanoseconds),
+        "incompatible_index: incomplete Unix capture stat"
+    );
+    #[cfg(not(unix))]
+    ensure!(
+        stat.device.is_none()
+            && stat.inode.is_none()
+            && stat.mtime_seconds.is_none()
+            && stat.ctime_seconds.is_none(),
+        "incompatible_index: invalid portable capture stat"
     );
     Ok(())
 }
@@ -988,13 +1126,29 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     let decoded: crate::indexer::ReconcileOptions =
         serde_json::from_str(&options).context("incompatible_index: invalid reconcile options")?;
     ensure!(
-        json(&decoded)? == options,
-        "incompatible_index: noncanonical reconcile options"
+        json(&decoded)? == options
+            && decoded.version == 1
+            && decoded.max_file_bytes > 0
+            && decoded.max_file_bytes <= 256 * 1024 * 1024,
+        "incompatible_index: unsupported reconcile options"
     );
-    let mut file_statement = db.prepare("SELECT capture_stat FROM files")?;
+
+    let mut source_paths = BTreeSet::new();
+    let mut file_statement = db.prepare("SELECT path,capture_stat FROM files ORDER BY path")?;
     let mut files = file_statement.query([])?;
     while let Some(row) = files.next()? {
-        let payload: String = row.get(0)?;
+        let path: String = row.get(0)?;
+        ensure!(
+            !path.is_empty()
+                && !Path::new(&path).is_absolute()
+                && !path.split('/').any(|part| part.is_empty() || part == ".."),
+            "incompatible_index: invalid captured source path"
+        );
+        ensure!(
+            source_paths.insert(path.clone()),
+            "incompatible_index: duplicate captured source path"
+        );
+        let payload: String = row.get(1)?;
         let decoded: crate::capture::CaptureStat =
             serde_json::from_str(&payload).context("incompatible_index: invalid capture stat")?;
         validate_capture_stat(&decoded, "file")?;
@@ -1003,54 +1157,144 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             "incompatible_index: invalid capture stat"
         );
     }
+
     let mut input_statement =
         db.prepare("SELECT input_key,payload FROM capture_inputs ORDER BY input_key")?;
     let mut inputs = input_statement.query([])?;
-    let mut saw_root = false;
-    let mut saw_executable = false;
+    let mut actual = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    let mut executable = None;
     while let Some(row) = inputs.next()? {
         let key: String = row.get(0)?;
         let payload: String = row.get(1)?;
         ensure!(
-            !key.is_empty() && key.len() <= 8192,
+            !key.is_empty() && key.len() <= 8192 && actual.insert(key.clone()),
             "incompatible_index: invalid capture input key"
         );
-        let decoded: crate::capture::CaptureInputObservation =
+        let observation: crate::capture::CaptureInputObservation =
             serde_json::from_str(&payload).context("incompatible_index: invalid capture input")?;
         ensure!(
-            json(&decoded)? == payload,
+            json(&observation)? == payload,
             "incompatible_index: noncanonical capture input"
         );
-        match (&key[..], &decoded) {
+        match (&key[..], &observation) {
             ("root:.", crate::capture::CaptureInputObservation::Root { stat }) => {
                 validate_capture_stat(stat, "directory")?;
-                saw_root = true;
             }
             (key, crate::capture::CaptureInputObservation::Directory { stat })
                 if key.starts_with("directory:") =>
             {
                 validate_capture_stat(stat, "directory")?;
+                let relative = key.trim_start_matches("directory:");
+                ensure!(
+                    relative.is_empty()
+                        || (!Path::new(relative).is_absolute()
+                            && !relative
+                                .split('/')
+                                .any(|part| part.is_empty() || part == "..")),
+                    "incompatible_index: invalid captured directory"
+                );
+                directories.insert(relative.to_owned());
             }
             (key, crate::capture::CaptureInputObservation::Present { stat, hash })
-                if !key.starts_with("root:") && !key.starts_with("directory:") =>
+                if key.starts_with("config:")
+                    || key.starts_with("toolchain:")
+                    || key.starts_with("ignore:")
+                    || key.starts_with("presentation-scip:")
+                    || key.starts_with("presentation-manifest:")
+                    || key.starts_with("executable:") =>
             {
                 validate_capture_stat(stat, "file")?;
                 ensure!(
-                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
                     "incompatible_index: invalid capture input hash"
                 );
-                saw_executable |= key.starts_with("executable:");
+                if key.starts_with("executable:") {
+                    ensure!(
+                        executable.replace(key.clone()).is_none(),
+                        "incompatible_index: duplicate executable input"
+                    );
+                }
             }
             (key, crate::capture::CaptureInputObservation::Absent)
-                if !key.starts_with("executable:")
-                    && !key.starts_with("root:")
-                    && !key.starts_with("directory:") => {}
+                if key.starts_with("config:")
+                    || key.starts_with("toolchain:")
+                    || key.starts_with("ignore:")
+                    || key.starts_with("presentation-scip:")
+                    || key.starts_with("presentation-manifest:") => {}
             _ => anyhow::bail!("incompatible_index: capture input role mismatch"),
         }
     }
+
     ensure!(
-        saw_root && saw_executable,
-        "incompatible_index: incomplete capture inventory"
+        directories.contains(""),
+        "incompatible_index: missing root directory inventory"
+    );
+    for source in &source_paths {
+        let mut parent = Path::new(source).parent();
+        while let Some(path) = parent {
+            let relative = path
+                .to_str()
+                .context("incompatible_index: non-UTF8 source parent")?
+                .replace('\\', "/");
+            ensure!(
+                directories.contains(&relative),
+                "incompatible_index: missing source directory inventory"
+            );
+            parent = path.parent();
+        }
+    }
+    let mut expected = BTreeSet::from(["root:.".to_owned()]);
+    for name in &crate::capture::ROOT_INPUTS[..22] {
+        expected.insert(format!("config:{name}"));
+    }
+    for name in &crate::capture::ROOT_INPUTS[22..] {
+        expected.insert(format!("toolchain:{name}"));
+    }
+    for directory in &directories {
+        for name in [".gitignore", ".ignore"] {
+            expected.insert(if directory.is_empty() {
+                format!("ignore:{name}")
+            } else {
+                format!("ignore:{directory}/{name}")
+            });
+        }
+        expected.insert(format!("directory:{directory}"));
+    }
+    expected.insert(executable.context("incompatible_index: missing executable input")?);
+    match &decoded.scip_path {
+        Some(path) => {
+            ensure!(!path.is_empty(), "incompatible_index: empty SCIP option");
+            expected.insert(format!("presentation-scip:{path}"));
+        }
+        None => ensure!(
+            !actual
+                .iter()
+                .any(|key| key.starts_with("presentation-scip:")),
+            "incompatible_index: unconfigured SCIP input"
+        ),
+    }
+    match &decoded.manifest_path {
+        Some(path) => {
+            ensure!(
+                !path.is_empty(),
+                "incompatible_index: empty manifest option"
+            );
+            expected.insert(format!("presentation-manifest:{path}"));
+        }
+        None => ensure!(
+            !actual
+                .iter()
+                .any(|key| key.starts_with("presentation-manifest:")),
+            "incompatible_index: unconfigured manifest input"
+        ),
+    }
+    ensure!(
+        actual == expected,
+        "incompatible_index: incomplete or unknown capture inventory"
     );
     Ok(())
 }
@@ -1138,8 +1382,10 @@ impl Store {
         let tx = storage_result(db.transaction())?;
         let (_, compatible) = store.recovery_baseline(&tx)?;
         if compatible {
-            store.read_control_status(&tx)?;
-            validate_paired_rows(&tx)?;
+            // A current-format index may still contain invalid derived rows. Recovery
+            // admission keeps the topology usable for a verified owner, while every
+            // evidence read remains closed until a complete rebuild succeeds.
+            let _ = store.read_control_status(&tx)?;
         }
         drop(tx);
         drop(db);
@@ -1277,14 +1523,14 @@ impl Store {
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         before_write(&db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let status = self.read_control_status(&tx)?;
+        let (_, compatible) = self.recovery_baseline(&tx)?;
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
             locked_version == admitted_version,
             "incompatible_index: cache changed after admission"
         );
-        if status.evidence_format.is_some() {
+        if compatible {
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
             storage_result(tx.execute(
@@ -1344,7 +1590,15 @@ impl Store {
             (0..=9_007_199_254_740_991).contains(&row.6),
             "incompatible_index: invalid revision"
         );
-        let compatible = schema == DATABASE_SCHEMA_VERSION && row.1 == EXTRACTOR_VERSION;
+        let compatible = if schema == DATABASE_SCHEMA_VERSION && row.1 == EXTRACTOR_VERSION {
+            match validate_paired_rows(db) {
+                Ok(()) => true,
+                Err(error) if error.downcast_ref::<rusqlite::Error>().is_none() => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
         Ok((
             IndexPin {
                 index_generation: generation,
@@ -1408,7 +1662,8 @@ impl Store {
             status.evidence_format.is_some(),
             "index_not_ready: reindex required"
         );
-        // Every public schema-6 derived read needs the same bounded catalog
+        validate_paired_rows(db).context("index_not_ready: invalid reconciled snapshot")?;
+        // Every public schema-7 derived read needs the same bounded catalog
         // singleton. Missing/oversized live metadata is corruption, never an
         // old-index "requireIndex" fallback. This is one indexed metadata row.
         let warnings_bytes: Option<i64> = db
@@ -1694,6 +1949,16 @@ impl Store {
         );
         let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         let rebaseline = schema != DATABASE_SCHEMA_VERSION || !compatible;
+        let prior_scan = compatible
+            .then(|| compare_capture_snapshot(&tx, capture))
+            .transpose()?;
+        if let Some(comparison) = prior_scan {
+            ensure!(
+                comparison.examined > 0,
+                "incompatible_index: empty prior scan comparison"
+            );
+            let _changed = comparison.changed();
+        }
         ensure!(
             graph.files.len() == native.revision.documents.len(),
             "graph/native document cardinality mismatch"

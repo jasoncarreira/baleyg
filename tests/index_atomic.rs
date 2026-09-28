@@ -509,3 +509,343 @@ fn schema_six_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     assert_eq!(store.status().unwrap().revision, rebuilt);
 }
+
+fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
+    use rusqlite::types::Value;
+    let db = rusqlite::Connection::open(path).unwrap();
+    let tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let escaped = table.replace('"', "\"\"");
+            let mut statement = db.prepare(&format!("SELECT * FROM \"{escaped}\"")).unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| match row.get::<_, Value>(column)? {
+                            Value::Null => Ok("null".to_owned()),
+                            Value::Integer(value) => Ok(format!("i:{value}")),
+                            Value::Real(value) => Ok(format!("r:{value:?}")),
+                            Value::Text(value) => Ok(format!("t:{value}")),
+                            Value::Blob(value) => Ok(format!("b:{}", hex::encode(value))),
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+#[test]
+fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore_change() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    for (name, source) in [
+        ("keep.js", "function keep() { oldCall(); }\n"),
+        ("delete.js", "function deleted() {}\n"),
+        ("rename-old.js", "function renamed() {}\n"),
+        ("ignored.js", "function admittedAfterRuleChange() {}\n"),
+    ] {
+        fs::write(workspace.path().join(name), source).unwrap();
+    }
+    fs::write(workspace.path().join(".gitignore"), "ignored.js\n").unwrap();
+    fs::write(
+        workspace.path().join("package.json"),
+        "{\"name\":\"before\"}\n",
+    )
+    .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let first = IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+
+    fs::write(
+        workspace.path().join("keep.js"),
+        "function keep() { newCall(); }\n",
+    )
+    .unwrap();
+    fs::remove_file(workspace.path().join("delete.js")).unwrap();
+    fs::rename(
+        workspace.path().join("rename-old.js"),
+        workspace.path().join("rename-new.js"),
+    )
+    .unwrap();
+    fs::write(workspace.path().join("added.rs"), "fn added() {}\n").unwrap();
+    fs::write(workspace.path().join(".gitignore"), "delete.js\n").unwrap();
+    fs::write(
+        workspace.path().join("package.json"),
+        "{\"name\":\"after!\"}\n",
+    )
+    .unwrap();
+    IndexJobCoordinator::prepare(&store, Some(first))
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+
+    let fresh_state = tempfile::tempdir().unwrap();
+    fs::set_permissions(fresh_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let fresh = Store::open_for_tests(fresh_state.path(), workspace.path()).unwrap();
+    IndexJobCoordinator::prepare(&fresh, None)
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let reconciled_path = index_dir(state.path()).join("index.db");
+    let fresh_path = index_dir(fresh_state.path()).join("index.db");
+    assert_eq!(
+        sqlite_snapshot(&reconciled_path),
+        sqlite_snapshot(&fresh_path)
+    );
+    let metadata = |path: &Path| {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.query_row(
+            "SELECT reconcile_options,stats,diagnostics FROM index_metadata",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(metadata(&reconciled_path), metadata(&fresh_path));
+}
+
+#[cfg(unix)]
+#[test]
+fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::{
+        os::unix::{ffi::OsStrExt, fs::MetadataExt},
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let (state, workspace) = fixture();
+    let source = workspace.path().join("same.js");
+    fs::write(&source, "function same() { aa(); }\n").unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let first = IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let path = index_dir(state.path()).join("index.db");
+    let read_stat = || {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let payload: String = db
+            .query_row(
+                "SELECT capture_stat FROM files WHERE path='same.js'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&payload).unwrap()
+    };
+    let before = read_stat();
+    let metadata = fs::metadata(&source).unwrap();
+    fs::write(&source, "function same() { bb(); }\n").unwrap();
+    let path_bytes = source.as_os_str().as_bytes();
+    let c_path = std::ffi::CString::new(path_bytes).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: metadata.atime(),
+            tv_nsec: metadata.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: metadata.mtime(),
+            tv_nsec: metadata.mtime_nsec(),
+        },
+    ];
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+        0
+    );
+    let second = IndexJobCoordinator::prepare(&store, Some(first))
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let after = read_stat();
+    assert_eq!(before["size"], after["size"]);
+    assert_eq!(before["mtimeSeconds"], after["mtimeSeconds"]);
+    assert_eq!(before["mtimeNanoseconds"], after["mtimeNanoseconds"]);
+    assert_ne!(
+        (
+            before["ctimeSeconds"].clone(),
+            before["ctimeNanoseconds"].clone()
+        ),
+        (
+            after["ctimeSeconds"].clone(),
+            after["ctimeNanoseconds"].clone()
+        )
+    );
+    assert_eq!(second.index_generation, first.index_generation);
+    assert_eq!(second.index_revision, first.index_revision + 1);
+    assert!(
+        store
+            .source_at("same.js", Some(second))
+            .unwrap()
+            .unwrap()
+            .1
+            .text
+            .contains("bb()")
+    );
+}
+
+#[test]
+fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    let (state, workspace) = fixture();
+    fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let first = IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let path = index_dir(state.path()).join("index.db");
+    let inode = fs::metadata(&path).unwrap().ino();
+    drop(store);
+
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET extractor_version='obsolete-extractor'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("extractor")
+    );
+    let rebuilt = IndexJobCoordinator::prepare(&store, Some(first))
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(rebuilt.index_revision, 1);
+    assert_ne!(rebuilt.index_generation, first.index_generation);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    drop(store);
+
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE files SET payload='not-json' WHERE path='one.js'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(store.status().is_err());
+    let failed_cancel: CancelFlag = Arc::new(AtomicBool::new(true));
+    let failure = IndexJobCoordinator::prepare(&store, Some(rebuilt))
+        .unwrap()
+        .run(&options, &failed_cancel, |_| {})
+        .unwrap_err();
+    assert!(failure.to_string().contains("cancelled"));
+    assert!(
+        store.status().is_err(),
+        "failed recovery must not expose invalid prior bytes"
+    );
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    failed_cancel.store(false, Ordering::Release);
+    let recovered = IndexJobCoordinator::prepare(&store, Some(rebuilt))
+        .unwrap()
+        .run(&options, &failed_cancel, |_| {})
+        .unwrap();
+    assert_eq!(recovered.index_revision, 1);
+    assert_ne!(recovered.index_generation, rebuilt.index_generation);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(store.status().unwrap().revision, recovered);
+}
+
+#[test]
+fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_state() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    for mutation in [
+        "DELETE FROM capture_inputs WHERE input_key='config:package.json'",
+        "INSERT INTO capture_inputs(input_key,payload) VALUES('unknown:slot','{\"state\":\"absent\"}')",
+        "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',2)",
+    ] {
+        let (state, workspace) = fixture();
+        fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
+        let scip = workspace.path().join("labels.scip");
+        let manifest = workspace.path().join("labels.json");
+        fs::write(&scip, b"captured presentation bytes").unwrap();
+        fs::write(&manifest, b"{}").unwrap();
+        let mut options = IndexOptions::new(workspace.path().to_owned());
+        options.scip_path = Some(scip.clone());
+        options.manifest_path = Some(manifest.clone());
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let pin = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        let path = index_dir(state.path()).join("index.db");
+        drop(store);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(mutation).unwrap();
+        drop(db);
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        assert!(
+            store.status().is_err(),
+            "invalid inventory was publicly readable: {mutation}"
+        );
+        let repaired = IndexJobCoordinator::prepare(&store, Some(pin))
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        assert_eq!(repaired.index_revision, 1);
+        assert_ne!(repaired.index_generation, pin.index_generation);
+        assert_eq!(store.status().unwrap().revision, repaired);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let keys = db
+            .prepare("SELECT input_key FROM capture_inputs ORDER BY input_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(keys.contains(&format!("presentation-scip:{}", scip.display())));
+        assert!(keys.contains(&format!("presentation-manifest:{}", manifest.display())));
+        assert!(keys.contains(&"config:package.json".to_owned()));
+        assert!(!keys.iter().any(|key| key.starts_with("unknown:")));
+    }
+}

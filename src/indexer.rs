@@ -30,7 +30,7 @@ impl From<&IndexOptions> for ReconcileOptions {
     fn from(options: &IndexOptions) -> Self {
         Self {
             version: 1,
-            max_file_bytes: options.max_file_bytes,
+            max_file_bytes: options.max_file_bytes.min(256 * 1024 * 1024),
             scip_path: options
                 .scip_path
                 .as_ref()
