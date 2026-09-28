@@ -1569,9 +1569,7 @@ async fn views(
 ) -> Result<Json<Vec<SavedViewState>>, ApiError> {
     let Query(pin) = pin.map_err(|_| invalid())?;
     let expected = pin.pin()?;
-    Ok(Json(
-        db(s, move |s| s.saved_views_at(expected)).await?,
-    ))
+    Ok(Json(db(s, move |s| s.saved_views_at(expected)).await?))
 }
 async fn view(
     State(s): State<Arc<DaemonState>>,
@@ -1633,9 +1631,7 @@ async fn save_annotation(
         return Err(invalid());
     }
     a.validate().map_err(|_| invalid())?;
-    Ok(Json(
-        db(s, move |s| s.save_annotation_at(pin, &a)).await?,
-    ))
+    Ok(Json(db(s, move |s| s.save_annotation_at(pin, &a)).await?))
 }
 async fn delete_annotation(
     State(s): State<Arc<DaemonState>>,

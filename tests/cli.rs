@@ -2353,7 +2353,6 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     drop(server);
 }
 
-
 #[tokio::test]
 async fn saved_items_real_index_matrix() {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -2378,15 +2377,8 @@ async fn saved_items_real_index_matrix() {
     let (server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
 
     for route in ["/api/views", "/api/views/absent", "/api/annotations"] {
-        let (status, response) = real_api(
-            &client,
-            &url,
-            TOKEN,
-            reqwest::Method::GET,
-            route,
-            None,
-        )
-        .await;
+        let (status, response) =
+            real_api(&client, &url, TOKEN, reqwest::Method::GET, route, None).await;
         if route.ends_with("absent") {
             assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{response}");
         } else {
@@ -2546,7 +2538,10 @@ async fn saved_items_real_index_matrix() {
     .await;
     assert_eq!(status, reqwest::StatusCode::OK, "{edited_note}");
     assert_eq!(edited_note["annotation"]["title"], "First title");
-    assert_eq!(edited_note["annotation"]["anchor"], saved_note["annotation"]["anchor"]);
+    assert_eq!(
+        edited_note["annotation"]["anchor"],
+        saved_note["annotation"]["anchor"]
+    );
     assert_eq!(
         raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
         Some(original_view_anchor.as_str())
@@ -2618,15 +2613,8 @@ async fn saved_items_real_index_matrix() {
         saved_pin_route("/api/annotations", &next),
     ];
     for route in routes {
-        let (status, response) = real_api(
-            &client,
-            &url,
-            TOKEN,
-            reqwest::Method::GET,
-            &route,
-            None,
-        )
-        .await;
+        let (status, response) =
+            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
         assert_eq!(status, reqwest::StatusCode::OK, "{route}: {response}");
         let state = if route.contains("/real-view") {
             &response
@@ -2651,11 +2639,13 @@ async fn saved_items_real_index_matrix() {
             assert!(state["orphaned"].as_bool().unwrap());
         } else {
             assert_eq!(state["view"]["query"]["seed"], seed);
-            assert!(state["orphanedIds"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|id| id == &serde_json::json!(seed)));
+            assert!(
+                state["orphanedIds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == &serde_json::json!(seed))
+            );
         }
     }
     assert_eq!(
@@ -2672,19 +2662,15 @@ async fn saved_items_real_index_matrix() {
         saved_pin_route("/api/views", &pin),
         saved_pin_route("/api/annotations", &pin),
     ] {
-        let (status, error) = real_api(
-            &client,
-            &url,
-            TOKEN,
-            reqwest::Method::GET,
-            &route,
-            None,
-        )
-        .await;
+        let (status, error) =
+            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
         assert_eq!(status, reqwest::StatusCode::CONFLICT, "{route}: {error}");
     }
     for (route, body) in [
-        (saved_pin_route("/api/views/real-view", &pin), edited_view_body),
+        (
+            saved_pin_route("/api/views/real-view", &pin),
+            edited_view_body,
+        ),
         (
             saved_pin_route("/api/annotations/real-note", &pin),
             edited_note_body,
@@ -2754,7 +2740,10 @@ async fn saved_items_real_index_matrix() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK, "{orphan_view}");
-    assert_eq!(orphan_view["attachment"]["result"]["reason"], "headerMismatch");
+    assert_eq!(
+        orphan_view["attachment"]["result"]["reason"],
+        "headerMismatch"
+    );
     let orphan_note_edit = serde_json::json!({
         "id":"real-note","nodeId":seed,"body":"Edited while orphaned","title":"New title"
     });
@@ -2768,7 +2757,10 @@ async fn saved_items_real_index_matrix() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK, "{orphan_note}");
-    assert_eq!(orphan_note["attachment"]["result"]["reason"], "headerMismatch");
+    assert_eq!(
+        orphan_note["attachment"]["result"]["reason"],
+        "headerMismatch"
+    );
     assert_eq!(
         raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
         Some(original_view_anchor.as_str())
@@ -2797,8 +2789,7 @@ async fn saved_items_real_index_matrix() {
         rusqlite::params![
             "legacy-note",
             seed,
-            serde_json::json!({"id":"legacy-note","nodeId":seed,"body":"Legacy body"})
-                .to_string()
+            serde_json::json!({"id":"legacy-note","nodeId":seed,"body":"Legacy body"}).to_string()
         ],
     )
     .unwrap();
@@ -2891,11 +2882,7 @@ async fn saved_items_real_index_matrix() {
     assert!(legacy_note["annotation"].get("anchor").is_none());
     assert_eq!(legacy_note["annotation"]["title"], "Legacy title");
     assert_eq!(legacy_note["attachment"]["availability"], "anchorless");
-    assert!(
-        raw_anchor(&stored_payload(&record_db, "views", "legacy-view")).is_none()
-    );
-    assert!(
-        raw_anchor(&stored_payload(&record_db, "annotations", "legacy-note")).is_none()
-    );
+    assert!(raw_anchor(&stored_payload(&record_db, "views", "legacy-view")).is_none());
+    assert!(raw_anchor(&stored_payload(&record_db, "annotations", "legacy-note")).is_none());
     drop(server);
 }

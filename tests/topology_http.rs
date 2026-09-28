@@ -103,7 +103,10 @@ async fn durable_crud_matrix() {
     )
     .unwrap();
     let view = json!({"id":"view","title":"Keep","query":{"seed":seed},"pins":{},"hidden":[]});
-    assert_eq!(call(&app, "PUT", "/api/views/view", view.clone()).await.0, 400);
+    assert_eq!(
+        call(&app, "PUT", "/api/views/view", view.clone()).await.0,
+        400
+    );
     let (status, saved) = call(&app, "PUT", &pinned("/api/views/view", &pin), view.clone()).await;
     assert_eq!(status, 200, "{saved}");
     assert_eq!(saved["view"]["id"], "view");
@@ -144,14 +147,9 @@ async fn durable_crud_matrix() {
         saved_note["annotation"]
     );
     assert_eq!(
-        call(
-            &app,
-            "PUT",
-            &pinned("/api/views/wrong", &pin),
-            view.clone()
-        )
-        .await
-        .0,
+        call(&app, "PUT", &pinned("/api/views/wrong", &pin), view.clone())
+            .await
+            .0,
         400
     );
     assert_eq!(
@@ -266,13 +264,8 @@ async fn saved_read_pin_and_ownership_matrix() {
     )
     .unwrap();
     let view = json!({"id":"owned","title":"Original","query":{"seed":seed}});
-    let (status, created) = call(
-        &app,
-        "PUT",
-        &pinned("/api/views/owned", &pin),
-        view.clone(),
-    )
-    .await;
+    let (status, created) =
+        call(&app, "PUT", &pinned("/api/views/owned", &pin), view.clone()).await;
     assert_eq!(status, 200, "{created}");
     let view_anchor = created["view"]["anchor"].clone();
     assert_eq!(created["attachment"]["result"]["targetId"], seed);
@@ -294,33 +287,29 @@ async fn saved_read_pin_and_ownership_matrix() {
         "/api/views?1".to_owned(),
         format!("/api/annotations?indexRevision={}", pin.index_revision),
     ] {
-        assert_eq!(call(&app, "GET", &route, Value::Null).await.0, 400, "{route}");
+        assert_eq!(
+            call(&app, "GET", &route, Value::Null).await.0,
+            400,
+            "{route}"
+        );
     }
     let (status, listed) = call(&app, "GET", &pinned("/api/views", &pin), Value::Null).await;
     assert_eq!(status, 200, "{listed}");
     assert_eq!(listed[0]["view"]["anchor"], view_anchor);
-    assert_eq!(listed[0]["indexGeneration"], pin.index_generation.to_string());
+    assert_eq!(
+        listed[0]["indexGeneration"],
+        pin.index_generation.to_string()
+    );
     assert_eq!(listed[0]["indexRevision"], pin.index_revision);
-    let (status, opened) = call(
-        &app,
-        "GET",
-        &pinned("/api/views/owned", &pin),
-        Value::Null,
-    )
-    .await;
+    let (status, opened) = call(&app, "GET", &pinned("/api/views/owned", &pin), Value::Null).await;
     assert_eq!(status, 200, "{opened}");
     assert_eq!(opened["view"]["anchor"], view_anchor);
 
     let replacement = json!({"id":"owned","title":"No","query":{"seed":other}});
     assert_eq!(
-        call(
-            &app,
-            "PUT",
-            &pinned("/api/views/owned", &pin),
-            replacement
-        )
-        .await
-        .0,
+        call(&app, "PUT", &pinned("/api/views/owned", &pin), replacement)
+            .await
+            .0,
         400
     );
     let note_replacement = json!({"id":"owned-note","nodeId":other,"body":"No"});
@@ -372,13 +361,7 @@ async fn saved_read_pin_and_ownership_matrix() {
     );
 
     let edit = json!({"id":"owned","title":"Edited","query":{"seed":seed}});
-    let (status, edited) = call(
-        &app,
-        "PUT",
-        &pinned("/api/views/owned", &pin),
-        edit,
-    )
-    .await;
+    let (status, edited) = call(&app, "PUT", &pinned("/api/views/owned", &pin), edit).await;
     assert_eq!(status, 200, "{edited}");
     assert_eq!(edited["view"]["anchor"], created["view"]["anchor"]);
     let note_edit = json!({"id":"owned-note","nodeId":seed,"body":"edited"});
@@ -401,29 +384,21 @@ async fn saved_read_pin_and_ownership_matrix() {
     }))
     .unwrap();
     store.put_view(&legacy).unwrap();
-    let (status, legacy_state) = call(
-        &app,
-        "GET",
-        &pinned("/api/views/legacy", &pin),
-        Value::Null,
-    )
-    .await;
+    let (status, legacy_state) =
+        call(&app, "GET", &pinned("/api/views/legacy", &pin), Value::Null).await;
     assert_eq!(status, 200, "{legacy_state}");
     assert!(legacy_state["view"].get("anchor").is_none());
     assert_eq!(legacy_state["attachment"]["availability"], "anchorless");
-    assert!(legacy_state["orphanedIds"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|id| id == &json!(seed)));
+    assert!(
+        legacy_state["orphanedIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == &json!(seed))
+    );
     let legacy_edit = json!({"id":"legacy","title":"Still legacy","query":{"seed":seed}});
-    let (status, legacy_edited) = call(
-        &app,
-        "PUT",
-        &pinned("/api/views/legacy", &pin),
-        legacy_edit,
-    )
-    .await;
+    let (status, legacy_edited) =
+        call(&app, "PUT", &pinned("/api/views/legacy", &pin), legacy_edit).await;
     assert_eq!(status, 200, "{legacy_edited}");
     assert!(legacy_edited["view"].get("anchor").is_none());
     assert_eq!(legacy_edited["attachment"]["availability"], "anchorless");
@@ -442,14 +417,9 @@ async fn saved_read_pin_and_ownership_matrix() {
         assert_eq!(status, 409, "{route}: {error}");
     }
     assert_eq!(
-        call(
-            &app,
-            "PUT",
-            &pinned("/api/views/owned", &pin),
-            view
-        )
-        .await
-        .0,
+        call(&app, "PUT", &pinned("/api/views/owned", &pin), view)
+            .await
+            .0,
         409
     );
     let (status, current) = call(&app, "GET", &pinned("/api/views", &next), Value::Null).await;
@@ -485,13 +455,7 @@ async fn schema5_is_not_native_anchor_evidence() {
     .await;
     assert_eq!(status, 409, "{error}");
     let body = json!({"id":"new","title":"No capture","query":{"seed":seed}});
-    let (status, error) = call(
-        &app,
-        "PUT",
-        &pinned("/api/views/new", &legacy_pin),
-        body,
-    )
-    .await;
+    let (status, error) = call(&app, "PUT", &pinned("/api/views/new", &legacy_pin), body).await;
     assert_eq!(status, 409, "{error}");
 }
 
