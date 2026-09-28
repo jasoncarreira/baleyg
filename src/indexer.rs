@@ -49,7 +49,7 @@ pub fn index_workspace_with_capture(
 ) -> Result<(Graph, Capture)> {
     let capture = Capture::admit(options, cancel, &progress)?;
     let root = std::fs::canonicalize(&options.workspace_root)?;
-    let native = native_evidence::from_capture(&capture, &root, &root_id(&root)?)?;
+    let native = native_evidence::from_capture(&capture, &root, &root_id(&root)?, cancel)?;
     let graph = project_native(options, &capture, &native, cancel, &progress)?;
     capture.verify(cancel)?;
     Ok((graph, capture))
@@ -64,7 +64,7 @@ pub fn index_workspace_with_native(
 ) -> Result<(Graph, native_evidence::Artifact)> {
     let capture = Capture::admit(options, cancel, &progress)?;
     let root = std::fs::canonicalize(&options.workspace_root)?;
-    let native = native_evidence::from_capture(&capture, &root, root_id)?;
+    let native = native_evidence::from_capture(&capture, &root, root_id, cancel)?;
     let graph = project_native(options, &capture, &native, cancel, &progress)?;
     capture.verify(cancel)?;
     Ok((graph, native))
@@ -79,7 +79,7 @@ pub fn index_workspace_bundle(
 ) -> Result<(Graph, native_evidence::Artifact, Capture)> {
     let capture = Capture::admit(options, cancel, &progress)?;
     let root = std::fs::canonicalize(&options.workspace_root)?;
-    let native = native_evidence::from_capture(&capture, &root, root_id)?;
+    let native = native_evidence::from_capture(&capture, &root, root_id, cancel)?;
     let graph = project_native(options, &capture, &native, cancel, &progress)?;
     capture.verify(cancel)?;
     Ok((graph, native, capture))

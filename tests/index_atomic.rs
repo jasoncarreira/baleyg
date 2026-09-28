@@ -281,6 +281,38 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     cancel.store(false, Ordering::Release);
     assert_eq!(store.status().unwrap().revision, first);
 
+    // Cancellation after admission and projection, before publication, also rolls back.
+    fs::write(root.join("main.js"), "function late() {}\n").unwrap();
+    let late = IndexJobCoordinator::prepare(&store, Some(first)).unwrap();
+    let late_cancel = cancel.clone();
+    let mut phases = Vec::new();
+    let phase_log = std::sync::Mutex::new(&mut phases);
+    let error = late
+        .run(&options, &cancel, |p| {
+            phase_log.lock().unwrap().push(p.phase.clone());
+            if p.phase == "complete" {
+                late_cancel.store(true, Ordering::Release);
+            }
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    assert!(
+        phases.iter().any(|p| p == "scan") && phases.iter().any(|p| p == "complete"),
+        "cancel must follow capture: {phases:?}"
+    );
+    cancel.store(false, Ordering::Release);
+    assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(
+        store
+            .source_at("main.js", Some(first))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        original
+    );
+    fs::write(root.join("main.js"), &original).unwrap();
+
     let drift = IndexJobCoordinator::prepare(&store, Some(first)).unwrap();
     let error = drift
         .run(&options, &cancel, |p| {

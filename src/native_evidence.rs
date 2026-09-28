@@ -1,7 +1,7 @@
 //! Closed native-only in-memory evidence, derived from the admitted immutable capture.
 use crate::{
     capture::Capture,
-    model::SourceFile,
+    model::{CancelFlag, SourceFile},
     native_ids::{IdentityRegistry, canonical, digest},
 };
 use anyhow::{Context, Result, ensure};
@@ -290,9 +290,14 @@ fn entry(root: &Path, path: &Path, bytes: Option<&[u8]>) -> Result<Value> {
     })
 }
 
-pub fn from_capture(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
+pub fn from_capture(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    cancel: &CancelFlag,
+) -> Result<Artifact> {
     let artifact = build_native(capture, root, root_id)?;
-    artifact.validate(capture, root, root_id)?;
+    artifact.validate(capture, root, root_id, cancel)?;
     Ok(artifact)
 }
 
@@ -1079,17 +1084,23 @@ impl ParserState<'_> {
 impl Artifact {
     /// Reconstruct the native syntax from already-admitted immutable buffers; no source file
     /// is opened or hashed again. Comparison forbids well-shaped fabricated evidence.
-    pub fn validate(&self, capture: &Capture, root: &Path, root_id: &str) -> Result<()> {
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        capture.verify(&cancel)?;
+    /// Honors the caller's cancellation before and after the re-derivation.
+    pub fn validate(
+        &self,
+        capture: &Capture,
+        root: &Path,
+        root_id: &str,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        capture.verify(cancel)?;
         self.validate_structure(&capture.files)?;
         let expected = build_native(capture, root, root_id)?;
+        capture.verify(cancel)?;
         expected.validate_structure(&capture.files)?;
         ensure!(
             self == &expected,
             "native evidence differs from captured source or inputs"
         );
-        capture.verify(&cancel)?;
         Ok(())
     }
     fn validate_structure(&self, files: &[SourceFile]) -> Result<()> {
@@ -1458,9 +1469,11 @@ mod cached_executable_digest_tests {
                 .values()
                 .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1)
         );
-        native.validate(&capture, &root, store.root_id()).unwrap();
+        native
+            .validate(&capture, &root, store.root_id(), &cancel)
+            .unwrap();
         assert_eq!(
-            from_capture(&capture, &root, store.root_id()).unwrap(),
+            from_capture(&capture, &root, store.root_id(), &cancel).unwrap(),
             native
         );
         let pin = store

@@ -1322,6 +1322,7 @@ impl Store {
             capture,
             Path::new(&self.workspace_root),
             &self.identity.record_id,
+            cancel,
         )?;
         ensure!(
             capture.graph_projection_count() == 1,
@@ -3455,7 +3456,12 @@ mod rebaseline_fault_tests {
         // wrapper admission check on this genuine immutable captured bundle.
         let canonical_work = fs::canonicalize(work.path()).unwrap();
         next_native
-            .validate(&next_capture, &canonical_work, store.root_id())
+            .validate(
+                &next_capture,
+                &canonical_work,
+                store.root_id(),
+                &initial_cancel,
+            )
             .unwrap();
         assert!(
             next_capture.graph_projection_count() == 1,
@@ -3708,7 +3714,12 @@ mod rebaseline_fault_tests {
         // captured-source and graph parity check explicitly before the worker.
         let canonical_work = fs::canonicalize(work.path()).unwrap();
         next_native
-            .validate(&next_capture, &canonical_work, store.root_id())
+            .validate(
+                &next_capture,
+                &canonical_work,
+                store.root_id(),
+                &initial_cancel,
+            )
             .unwrap();
         assert_eq!(next_capture.graph_projection_count(), 1);
         assert_eq!(
