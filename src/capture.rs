@@ -358,7 +358,7 @@ impl Capture {
         }
         // The linked native extractor is part of the running executable, not ambient PATH.
         admit_input(
-            exe,
+            exe.clone(),
             512 * 1024 * 1024,
             cancel,
             &source_identities,
@@ -366,6 +366,14 @@ impl Capture {
             &mut inputs,
             &mut input_bytes,
         )?;
+        ensure!(
+            input_bytes
+                .get(&exe)
+                .and_then(Option::as_ref)
+                .is_some_and(|b| !b.is_empty()),
+            "running executable bytes unavailable: {}",
+            exe.display()
+        );
         for path in [options.scip_path.as_ref(), options.manifest_path.as_ref()]
             .into_iter()
             .flatten()
@@ -472,6 +480,53 @@ impl Capture {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
+    #[test]
+    fn missing_executable_refuses_admission() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("one.js"), "f();").unwrap();
+        let missing = root.path().join("not-running-bin");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = Capture::admit_with_executable(
+            &IndexOptions::new(root.path().to_owned()),
+            &cancel,
+            &|_| {},
+            missing,
+        )
+        .err()
+        .expect("missing executable must fail admission");
+        assert!(
+            error.to_string().contains("running executable"),
+            "{error:#}"
+        );
+    }
+    #[test]
+    fn nonregular_or_empty_executable_refuses_admission() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("one.js"), "f();").unwrap();
+        let exe = root.path().join("fake-native-bin");
+        fs::write(&exe, "").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(
+            Capture::admit_with_executable(
+                &IndexOptions::new(root.path().to_owned()),
+                &cancel,
+                &|_| {},
+                exe.clone(),
+            )
+            .is_err()
+        );
+        fs::remove_file(&exe).unwrap();
+        std::os::unix::fs::symlink(root.path().join("one.js"), &exe).unwrap();
+        assert!(
+            Capture::admit_with_executable(
+                &IndexOptions::new(root.path().to_owned()),
+                &cancel,
+                &|_| {},
+                exe,
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn executable_cutoff_and_stable_source_operation_counts() {
         let root = tempfile::tempdir().unwrap();
