@@ -1147,3 +1147,18 @@ fn legacy_rebaseline_capture_drift_after_partial_write_preserves_old_bytes() {
             .contains("index_not_ready")
     );
 }
+
+
+#[test]
+fn saved_reads_without_records_are_conservative_and_write_nothing() {
+    let (state, work, store) = fixture();
+    let cache = index_db(state.path());
+    let before = std::fs::read(&cache).unwrap();
+    assert!(store.views().unwrap().is_empty());
+    assert!(store.annotations().unwrap().is_empty());
+    assert!(store.view("missing").unwrap().is_none());
+    assert_eq!(std::fs::read(&cache).unwrap(), before, "saved reads changed the cache database");
+    let identity = baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    assert!(!roots.record_db(&identity).exists(), "saved reads created a durable database");
+}

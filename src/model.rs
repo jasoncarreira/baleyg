@@ -331,11 +331,24 @@ impl DurableAnchor {
             "invalid durable anchor syntaxId"
         );
         anyhow::ensure!(
-            !self.document.source_set_id.is_empty()
-                && !self.document.language.is_empty()
-                && !self.document.path.is_empty()
-                && !self.captured_revision_id.is_empty(),
+            !self.document.source_set_id.is_empty() && !self.captured_revision_id.is_empty(),
             "invalid durable anchor document/revision"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.document.language.as_str(),
+                "java" | "rust" | "python" | "javascript"
+            ),
+            "invalid durable anchor document language"
+        );
+        let path = &self.document.path;
+        anyhow::ensure!(
+            !path.is_empty()
+                && !path.starts_with('/')
+                && !path.contains('\\')
+                && !path.contains('\0')
+                && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
+            "invalid durable anchor document path"
         );
         anyhow::ensure!(hash(&self.header_hash) && hash(&self.sibling_group_hash), "invalid durable anchor hash");
         anyhow::ensure!(

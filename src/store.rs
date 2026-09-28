@@ -3334,12 +3334,10 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         ensure!(self.read_status(&tx)?.revision == pin, "revision conflict: stale native pin");
-        let existing = self.records().view_record(&view.id)?;
-        let raw = if existing.is_none() {
-            Some(serde_json::value::to_raw_value(&Self::selected_anchor_in(&tx, self, &view.query.seed)?)?)
-        } else { None };
-        self.records().put_view_record(&SavedViewRecord::from_base(view.clone(), raw))?;
-        let record = self.records().view_record(&view.id)?.context("saved view missing after write")?;
+        let record = self.records().update_view_record(
+            &SavedViewRecord::from_base(view.clone(), None),
+            || serde_json::value::to_raw_value(&Self::selected_anchor_in(&tx, self, &view.query.seed)?).map_err(Into::into),
+        )?;
         Self::resolve_view(&tx, self, record, Some(pin))
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> { self.records().delete_view(id) }
@@ -3379,14 +3377,12 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         ensure!(self.read_status(&tx)?.revision == pin, "revision conflict: stale native pin");
-        let existing = self.records().annotation_record(&request.id)?;
-        let raw = if existing.is_none() {
-            Some(serde_json::value::to_raw_value(&Self::selected_anchor_in(&tx, self, &request.node_id)?)?)
-        } else { None };
         let title = request.title.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()).map(str::to_owned);
-        let record = AnnotationRecord::from_base(request.base(), title, raw);
-        self.records().put_annotation_record(&record, request.title.is_none())?;
-        let record = self.records().annotation_record(&request.id)?.context("saved annotation missing after write")?;
+        let record = self.records().update_annotation_record(
+            &AnnotationRecord::from_base(request.base(), title, None),
+            request.title.is_none(),
+            || serde_json::value::to_raw_value(&Self::selected_anchor_in(&tx, self, &request.node_id)?).map_err(Into::into),
+        )?;
         Self::resolve_annotation(&tx, self, record, Some(pin))
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> { self.records().delete_annotation(id) }
