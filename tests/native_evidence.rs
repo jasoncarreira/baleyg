@@ -86,7 +86,6 @@ fn four_languages_and_empty_workspace_share_closed_native_memory() {
     )
     .unwrap();
     assert_eq!(graph.files.len(), 4);
-    native.validate(&graph.files).unwrap();
     assert_eq!(native.coverage.len(), 4);
     assert_eq!(native.provenance.len(), 4);
     for lang in ["java", "javascript", "python", "rust"] {
@@ -185,14 +184,13 @@ fn unverifiable_expression_keeps_independent_nullable_callee() {
         .unwrap();
     fs::write(root.path().join("a.js"), "function go() { obj[key](); }").unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let (graph, native) = index_workspace_with_native(
+    let (_graph, native) = index_workspace_with_native(
         &IndexOptions::new(root.path().into()),
         &id.record_id,
         &cancel,
         |_| {},
     )
     .unwrap();
-    native.validate(&graph.files).unwrap();
     let call = native
         .calls
         .iter()
@@ -202,4 +200,550 @@ fn unverifiable_expression_keeps_independent_nullable_callee() {
     assert_eq!(call.region_ids.len(), 0);
     assert!(!serde_json::to_string(call).unwrap().contains("target"));
     assert!(!serde_json::to_string(call).unwrap().contains("receiver"));
+}
+
+#[test]
+fn nested_occurrences_sort_before_hashing_and_unverifiable_callees_remain_nullable() {
+    use baleyg::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    for (path, source) in [
+        (
+            "A.java",
+            "class A { A() { this(1); } A(int n) {} void go() { obj.foo(); new A(); } }",
+        ),
+        (
+            "a.js",
+            "function go() { obj.foo(); obj[key](); foo()(); if (true) { foo(); } }",
+        ),
+        (
+            "a.py",
+            "def go():\n    obj.foo()\n    (foo())()\n    if True:\n        foo()\n",
+        ),
+        ("a.rs", "fn go() { obj.foo(); foo()(); if true { foo(); } }"),
+    ] {
+        fs::write(root.path().join(path), source).unwrap();
+    }
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id).unwrap();
+    artifact
+        .validate(&capture, root.path(), &identity.record_id)
+        .unwrap();
+    for lang in ["java", "javascript", "python", "rust"] {
+        assert!(
+            artifact.calls.iter().any(|c| c.document.language == lang
+                && c.spelling.as_deref() == Some("foo")
+                && c.callee_range.is_some()),
+            "missing measured {lang} foo"
+        );
+        let unverified = artifact
+            .calls
+            .iter()
+            .find(|c| c.document.language == lang && c.callee_range.is_none());
+        assert!(
+            unverified.is_some(),
+            "missing unverifiable expression {lang}"
+        );
+    }
+    let js: Vec<_> = artifact
+        .calls
+        .iter()
+        .filter(|c| {
+            c.document.language == "javascript"
+                && c.owner_syntax_id
+                    == artifact
+                        .declarations
+                        .iter()
+                        .find(|d| {
+                            d.document.language == "javascript" && d.name.as_deref() == Some("go")
+                        })
+                        .unwrap()
+                        .syntax_id
+        })
+        .collect();
+    let nested: Vec<_> = js
+        .iter()
+        .filter(|c| {
+            c.range.start
+                == js
+                    .iter()
+                    .find(|c| c.spelling.as_deref() == Some("foo()"))
+                    .unwrap()
+                    .range
+                    .start
+        })
+        .collect();
+    assert_eq!(nested.len(), 2);
+    assert!(nested[0].range.end != nested[1].range.end);
+    let a = nested.iter().min_by_key(|c| c.range.end).unwrap();
+    let b = nested.iter().max_by_key(|c| c.range.end).unwrap();
+    assert!(
+        a.ordinal < b.ordinal,
+        "inner call must sort before outer at equal start"
+    );
+}
+
+#[test]
+fn every_nullable_native_field_requires_presence_even_when_null() {
+    use baleyg::native_evidence::*;
+    use serde::{Serialize, de::DeserializeOwned};
+    fn check<T: Serialize + DeserializeOwned>(row: &T, fields: &[&str]) {
+        let baseline = serde_json::to_value(row).unwrap();
+        assert!(serde_json::from_value::<T>(baseline.clone()).is_ok());
+        for field in fields {
+            let mut missing = baseline.clone();
+            missing.as_object_mut().unwrap().remove(*field).unwrap();
+            assert!(
+                serde_json::from_value::<T>(missing).is_err(),
+                "missing {field} accepted"
+            );
+            let mut explicit_null = baseline.clone();
+            explicit_null[*field] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<T>(explicit_null).is_ok(),
+                "explicit null {field} rejected"
+            );
+        }
+    }
+    let doc = DocumentKey {
+        source_set_id: "s".into(),
+        language: "rust".into(),
+        path: "a.rs".into(),
+    };
+    check(
+        &Coverage {
+            producer_id: "p".into(),
+            language: "rust".into(),
+            source_set_id: "s".into(),
+            document_path: "a.rs".into(),
+            revision_id: "r".into(),
+            requested: true,
+            selected: true,
+            state: "complete".into(),
+            supported_roles: vec![],
+            observed_roles: vec![],
+            diagnostic: None,
+        },
+        &["diagnostic"],
+    );
+    check(
+        &Provenance {
+            id: "proof".into(),
+            producer_id: "p".into(),
+            document: doc.clone(),
+            revision_id: "r".into(),
+            content_hash: "h".into(),
+            evidence_kind: "measuredSyntax".into(),
+            basis: None,
+            freshness: "fresh".into(),
+            derived_from: None,
+        },
+        &["basis", "derivedFrom"],
+    );
+    let key = Key {
+        kind: "module".into(),
+        name: None,
+        signature: None,
+        ordinal: 0,
+    };
+    check(&key, &["name", "signature"]);
+    check(
+        &Parameter {
+            name: None,
+            type_name: None,
+            variadic: false,
+        },
+        &["name", "type"],
+    );
+    let header = Header {
+        kind: "module".into(),
+        name: None,
+        modifiers: vec![],
+        type_parameters: vec![],
+        parameters: vec![],
+        result_type: None,
+        bases: vec![],
+    };
+    check(&header, &["name", "resultType"]);
+    check(
+        &Declaration {
+            syntax_id: "id".into(),
+            document: doc.clone(),
+            revision_id: "r".into(),
+            kind: "module".into(),
+            name: None,
+            lookup_key: None,
+            ancestors: vec![],
+            key,
+            range: Range { start: 0, end: 0 },
+            name_range: None,
+            header,
+            provenance_id: "proof".into(),
+        },
+        &["name", "lookupKey", "nameRange"],
+    );
+    check(
+        &Call {
+            id: "id".into(),
+            owner_syntax_id: "owner".into(),
+            ordinal: 0,
+            document: doc.clone(),
+            revision_id: "r".into(),
+            range: Range { start: 0, end: 1 },
+            callee_range: None,
+            spelling: None,
+            region_ids: vec![],
+            provenance_id: "proof".into(),
+        },
+        &["calleeRange", "spelling"],
+    );
+    check(
+        &ControlRegion {
+            id: "id".into(),
+            owner_syntax_id: "owner".into(),
+            ordinal: 0,
+            document: doc,
+            revision_id: "r".into(),
+            kind: "if_statement".into(),
+            range: Range { start: 0, end: 1 },
+            parent_id: None,
+            arm: None,
+            provenance_id: "proof".into(),
+        },
+        &["parentId", "arm"],
+    );
+}
+
+#[test]
+fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
+    use baleyg::{
+        capture::Capture,
+        indexer::IndexOptions,
+        model::CancelFlag,
+        native_evidence::{Artifact, from_capture},
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        .unwrap();
+    fs::write(
+        root.path().join("A.java"),
+        "class A { void go(int n) { obj.foo(); } }",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("a.js"),
+        "function go() { if (true) obj.foo(); }",
+    )
+    .unwrap();
+    fs::write(root.path().join("a.py"), "def go():\n    obj.foo()\n").unwrap();
+    fs::write(root.path().join("a.rs"), "fn go() { obj.foo(); }").unwrap();
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname='fixture'\n",
+    )
+    .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &id.record_id).unwrap();
+    let bad_hash = "a".repeat(64);
+    type Mutation = (&'static str, Box<dyn Fn(&mut Artifact)>);
+    let mut mutations: Vec<Mutation> = vec![
+        (
+            "producer executable hash",
+            Box::new({
+                let h = bad_hash.clone();
+                move |a| a.producer.executable_hash = h.clone()
+            }),
+        ),
+        (
+            "producer languages",
+            Box::new(|a| a.producer.languages.swap(0, 1)),
+        ),
+        (
+            "source set root",
+            Box::new(|a| a.source_set.root_id = "forged".into()),
+        ),
+        (
+            "source set dependencies",
+            Box::new(|a| a.source_set.dependencies.push("forged".into())),
+        ),
+        (
+            "revision id",
+            Box::new({
+                let h = bad_hash.clone();
+                move |a| a.revision.id = format!("revision:v1:{h}")
+            }),
+        ),
+        (
+            "toolchain hash",
+            Box::new({
+                let h = bad_hash.clone();
+                move |a| a.revision.toolchain_hash = h.clone()
+            }),
+        ),
+        (
+            "config hash",
+            Box::new({
+                let h = bad_hash.clone();
+                move |a| a.revision.config_hash = h.clone()
+            }),
+        ),
+        (
+            "dependency hash",
+            Box::new({
+                let h = bad_hash.clone();
+                move |a| a.revision.dependency_hash = h.clone()
+            }),
+        ),
+        (
+            "document content hash",
+            Box::new({
+                let h = bad_hash.clone();
+                move |a| a.revision.documents[0].content_hash = h.clone()
+            }),
+        ),
+        (
+            "document bytes length",
+            Box::new(|a| a.revision.documents[0].byte_length += 1),
+        ),
+        (
+            "document order",
+            Box::new(|a| a.revision.documents.swap(0, 1)),
+        ),
+        (
+            "coverage complete roles",
+            Box::new(|a| a.coverage[0].observed_roles.clear()),
+        ),
+        (
+            "coverage failed with diagnostic",
+            Box::new(|a| {
+                a.coverage[0].state = "failed".into();
+                a.coverage[0].diagnostic = Some("failed".into());
+            }),
+        ),
+        (
+            "coverage partial with diagnostic",
+            Box::new(|a| {
+                a.coverage[0].state = "partial".into();
+                a.coverage[0].diagnostic = Some("partial".into());
+            }),
+        ),
+        (
+            "provenance proof document",
+            Box::new(|a| a.provenance[0].document = a.provenance[1].document.clone()),
+        ),
+        (
+            "provenance content hash",
+            Box::new({
+                let h = bad_hash.clone();
+                move |a| a.provenance[0].content_hash = h.clone()
+            }),
+        ),
+        (
+            "provenance basis",
+            Box::new(|a| a.provenance[0].basis = Some(serde_json::json!({}))),
+        ),
+        (
+            "declaration modifier",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .header
+                    .modifiers
+                    .push("public".into())
+            }),
+        ),
+        (
+            "declaration result type",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.document.language == "java" && d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .header
+                    .result_type = Some("String".into())
+            }),
+        ),
+        (
+            "declaration signature",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.document.language == "java" && d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .key
+                    .signature
+                    .as_mut()
+                    .unwrap()
+                    .parameter_types[0] = "String".into()
+            }),
+        ),
+        (
+            "declaration ancestor",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.document.language == "java" && d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .ancestors
+                    .clear()
+            }),
+        ),
+        (
+            "declaration name range",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .name_range
+                    .as_mut()
+                    .unwrap()
+                    .start += 1
+            }),
+        ),
+        (
+            "declaration source range",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .range
+                    .end -= 1
+            }),
+        ),
+        (
+            "call unverified spelling",
+            Box::new(|a| {
+                let c = a
+                    .calls
+                    .iter_mut()
+                    .find(|c| c.document.language == "javascript")
+                    .unwrap();
+                c.spelling = Some("guessed".into());
+                c.callee_range = None;
+            }),
+        ),
+        (
+            "call proof from other document",
+            Box::new(|a| {
+                a.calls
+                    .iter_mut()
+                    .find(|c| c.document.language == "javascript")
+                    .unwrap()
+                    .provenance_id = a.provenance[0].id.clone()
+            }),
+        ),
+        ("call ordinal", Box::new(|a| a.calls[0].ordinal += 1)),
+        (
+            "call region",
+            Box::new(|a| a.calls[0].region_ids.push("not-a-region".into())),
+        ),
+        (
+            "control kind",
+            Box::new(|a| a.control_regions[0].kind = "for_statement".into()),
+        ),
+        (
+            "control arm",
+            Box::new(|a| a.control_regions[0].arm = Some("fabricated".into())),
+        ),
+        (
+            "control owner",
+            Box::new(|a| {
+                a.control_regions[0].owner_syntax_id = a.declarations[0].syntax_id.clone()
+            }),
+        ),
+        (
+            "control range",
+            Box::new(|a| a.control_regions[0].range.end += 1),
+        ),
+    ];
+    for (label, mutator) in mutations.drain(..) {
+        let mut changed = artifact.clone();
+        mutator(&mut changed);
+        assert!(
+            changed
+                .validate(&capture, root.path(), &id.record_id)
+                .is_err(),
+            "forged {label} accepted"
+        );
+    }
+    artifact
+        .validate(&capture, root.path(), &id.record_id)
+        .unwrap();
+    for ops in capture.source_operations.values() {
+        assert_eq!((ops.opens, ops.complete_reads, ops.hashes), (1, 1, 1));
+    }
+}
+
+#[test]
+fn parser_recovery_reports_partial_not_false_complete() {
+    use baleyg::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        .unwrap();
+    fs::write(root.path().join("broken.js"), "function broken( { foo(); }").unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &id.record_id).unwrap();
+    assert_eq!(artifact.coverage.len(), 1);
+    assert_eq!(artifact.coverage[0].state, "partial");
+    assert!(artifact.coverage[0].diagnostic.is_some());
+    let mut forged = artifact.clone();
+    forged.coverage[0].state = "complete".into();
+    forged.coverage[0].diagnostic = None;
+    assert!(
+        forged
+            .validate(&capture, root.path(), &id.record_id)
+            .is_err()
+    );
+}
+
+#[test]
+fn validation_refuses_cutoff_drift_without_source_reread() {
+    use baleyg::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        .unwrap();
+    let source = root.path().join("a.js");
+    fs::write(&source, "function f() { foo(); }").unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &id.record_id).unwrap();
+    fs::write(&source, "function f() { bar(); }").unwrap();
+    assert!(
+        artifact
+            .validate(&capture, root.path(), &id.record_id)
+            .is_err()
+    );
+    assert_eq!(capture.source_operations["a.js"].complete_reads, 1);
+    assert_eq!(capture.source_operations["a.js"].hashes, 1);
 }

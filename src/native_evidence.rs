@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use icu_normalizer::ComposingNormalizerBorrowed;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,6 +14,14 @@ use std::{
     path::Path,
 };
 use tree_sitter::Node;
+
+fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 const PRODUCER: &str = "baleyg.native.syntax";
@@ -114,6 +122,7 @@ pub struct Coverage {
     pub state: String,
     pub supported_roles: Vec<String>,
     pub observed_roles: Vec<String>,
+    #[serde(deserialize_with = "required_nullable")]
     pub diagnostic: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,8 +134,10 @@ pub struct Provenance {
     pub revision_id: String,
     pub content_hash: String,
     pub evidence_kind: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub basis: Option<Value>,
     pub freshness: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub derived_from: Option<Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,15 +167,19 @@ pub struct Signature {
 #[serde(deny_unknown_fields)]
 pub struct Key {
     pub kind: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub name: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
     pub signature: Option<Signature>,
     pub ordinal: usize,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Parameter {
+    #[serde(deserialize_with = "required_nullable")]
     pub name: Option<String>,
     #[serde(rename = "type")]
+    #[serde(deserialize_with = "required_nullable")]
     pub type_name: Option<String>,
     pub variadic: bool,
 }
@@ -172,10 +187,12 @@ pub struct Parameter {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Header {
     pub kind: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub name: Option<String>,
     pub modifiers: Vec<String>,
     pub type_parameters: Vec<String>,
     pub parameters: Vec<Parameter>,
+    #[serde(deserialize_with = "required_nullable")]
     pub result_type: Option<String>,
     pub bases: Vec<String>,
 }
@@ -186,11 +203,14 @@ pub struct Declaration {
     pub document: DocumentKey,
     pub revision_id: String,
     pub kind: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub name: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
     pub lookup_key: Option<String>,
     pub ancestors: Vec<Key>,
     pub key: Key,
     pub range: Range,
+    #[serde(deserialize_with = "required_nullable")]
     pub name_range: Option<Range>,
     pub header: Header,
     pub provenance_id: String,
@@ -204,7 +224,9 @@ pub struct Call {
     pub document: DocumentKey,
     pub revision_id: String,
     pub range: Range,
+    #[serde(deserialize_with = "required_nullable")]
     pub callee_range: Option<Range>,
+    #[serde(deserialize_with = "required_nullable")]
     pub spelling: Option<String>,
     pub region_ids: Vec<String>,
     pub provenance_id: String,
@@ -219,7 +241,9 @@ pub struct ControlRegion {
     pub revision_id: String,
     pub kind: String,
     pub range: Range,
+    #[serde(deserialize_with = "required_nullable")]
     pub parent_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
     pub arm: Option<String>,
     pub provenance_id: String,
 }
@@ -267,6 +291,12 @@ fn entry(root: &Path, path: &Path, bytes: Option<&[u8]>) -> Result<Value> {
 }
 
 pub fn from_capture(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
+    let artifact = build_native(capture, root, root_id)?;
+    artifact.validate(capture, root, root_id)?;
+    Ok(artifact)
+}
+
+fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
     text(root_id)?;
     let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root)?;
     ensure!(
@@ -371,7 +401,6 @@ pub fn from_capture(capture: &Capture, root: &Path, root_id: &str) -> Result<Art
     for f in files {
         extract(&mut artifact, f, &mut ids)?;
     }
-    artifact.validate(&capture.files)?;
     Ok(artifact)
 }
 
@@ -687,6 +716,7 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         visits: 0,
     };
     state.walk(tree.root_node(), &module_id, &[], &[], 0)?;
+    state.finish_occurrences()?;
     let observed_roles = [
         (
             !state
@@ -741,6 +771,68 @@ struct ParserState<'a> {
     visits: usize,
 }
 impl ParserState<'_> {
+    fn finish_occurrences(&mut self) -> Result<()> {
+        let mut replacements = BTreeMap::new();
+        let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, region) in self.artifact.control_regions.iter().enumerate() {
+            if region.document == self.document {
+                by_owner
+                    .entry(region.owner_syntax_id.clone())
+                    .or_default()
+                    .push(i);
+            }
+        }
+        for indexes in by_owner.values_mut() {
+            indexes.sort_by_key(|i| {
+                let r = &self.artifact.control_regions[*i].range;
+                (r.start, r.end)
+            });
+            for (ordinal, i) in indexes.iter().enumerate() {
+                let region = &mut self.artifact.control_regions[*i];
+                let id=self.ids.occurrence(&json!({"revisionId":region.revision_id,"ownerSyntaxId":region.owner_syntax_id,"kind":"control","ordinal":ordinal}))?;
+                replacements.insert(std::mem::replace(&mut region.id, id.clone()), id);
+                region.ordinal = ordinal;
+            }
+        }
+        for region in &mut self.artifact.control_regions {
+            if region.document == self.document
+                && let Some(parent) = &mut region.parent_id
+            {
+                *parent = replacements
+                    .get(parent)
+                    .context("native region parent not measured")?
+                    .clone();
+            }
+        }
+        let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, call) in self.artifact.calls.iter().enumerate() {
+            if call.document == self.document {
+                by_owner
+                    .entry(call.owner_syntax_id.clone())
+                    .or_default()
+                    .push(i);
+            }
+        }
+        for indexes in by_owner.values_mut() {
+            indexes.sort_by_key(|i| {
+                let r = &self.artifact.calls[*i].range;
+                (r.start, r.end)
+            });
+            for (ordinal, i) in indexes.iter().enumerate() {
+                let call = &mut self.artifact.calls[*i];
+                call.ordinal = ordinal;
+                call.id=self.ids.occurrence(&json!({"revisionId":call.revision_id,"ownerSyntaxId":call.owner_syntax_id,"kind":"call","ordinal":ordinal}))?;
+                for region in &mut call.region_ids {
+                    *region = replacements
+                        .get(region)
+                        .context("native call region not measured")?
+                        .clone();
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn walk(
         &mut self,
         n: Node<'_>,
@@ -811,7 +903,10 @@ impl ParserState<'_> {
                     .insert((owner.clone(), "control".into(), range.start, range.end)),
                 "duplicate native control range"
             );
-            let id=self.ids.occurrence(&json!({"revisionId":self.artifact.revision.id,"ownerSyntaxId":owner,"kind":"control","ordinal":ordinal}))?;
+            let id = format!(
+                "pending:control:{}:{}:{}:{}",
+                self.file.path, owner, range.start, range.end
+            );
             self.artifact.control_regions.push(ControlRegion {
                 id: id.clone(),
                 owner_syntax_id: owner.clone(),
@@ -839,7 +934,7 @@ impl ParserState<'_> {
                     .insert((owner.clone(), "call".into(), range.start, range.end)),
                 "duplicate native call range"
             );
-            let id=self.ids.occurrence(&json!({"revisionId":self.artifact.revision.id,"ownerSyntaxId":owner,"kind":"call","ordinal":ordinal}))?;
+            let id = String::new();
             let (spelling, callee_range) = callee(n, self.file);
             self.artifact.calls.push(Call {
                 id,
@@ -862,7 +957,22 @@ impl ParserState<'_> {
 }
 
 impl Artifact {
-    pub fn validate(&self, files: &[SourceFile]) -> Result<()> {
+    /// Reconstruct the native syntax from already-admitted immutable buffers; no source file
+    /// is opened or hashed again. Comparison forbids well-shaped fabricated evidence.
+    pub fn validate(&self, capture: &Capture, root: &Path, root_id: &str) -> Result<()> {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        capture.verify(&cancel)?;
+        self.validate_structure(&capture.files)?;
+        let expected = build_native(capture, root, root_id)?;
+        expected.validate_structure(&capture.files)?;
+        ensure!(
+            self == &expected,
+            "native evidence differs from captured source or inputs"
+        );
+        capture.verify(&cancel)?;
+        Ok(())
+    }
+    fn validate_structure(&self, files: &[SourceFile]) -> Result<()> {
         ensure!(
             self.producer.id == PRODUCER
                 && self.producer.kind == "native"
@@ -912,7 +1022,7 @@ impl Artifact {
                 d.key.source_set_id == self.source_set.id
                     && d.revision_id == self.revision.id
                     && d.byte_length == file.text.len()
-                    && d.content_hash == hash(file.text.as_bytes())
+                    && d.content_hash == file.hash
                     && valid_hash(&d.content_hash),
                 "native document bytes/hash mismatch"
             );
