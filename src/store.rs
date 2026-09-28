@@ -88,7 +88,8 @@ SELECT COALESCE(length(CAST(a.call_id AS BLOB)),0)+COALESCE(length(CAST(a.region
 UNION ALL
 SELECT COALESCE(length(CAST(c.id AS BLOB)),0)+COALESCE(length(CAST(c.owner_syntax_id AS BLOB)),0)+COALESCE(length(CAST(c.source_set_id AS BLOB)),0)+COALESCE(length(CAST(c.language AS BLOB)),0)+COALESCE(length(CAST(c.path AS BLOB)),0)+COALESCE(length(CAST(c.revision_id AS BLOB)),0)+COALESCE(length(CAST(c.kind AS BLOB)),0)+COALESCE(length(CAST(c.parent_id AS BLOB)),0)+COALESCE(length(CAST(c.arm AS BLOB)),0)+COALESCE(length(CAST(c.provenance_id AS BLOB)),0) AS row_bytes FROM native_control_regions c WHERE c.source_set_id=?2 AND c.language=?3 AND c.revision_id=?4 AND c.path=?1
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 6;
+const DATABASE_SCHEMA_VERSION: u32 = 7;
+const PREVIOUS_SCHEMA_VERSION: u32 = 6;
 const EXTRACTOR_VERSION: &str = "native-paired-v1";
 const GRAPH_SCHEMA_VERSION: u32 = 5;
 const GRAPH_EXTRACTOR_VERSION: &str = "native-no-lexical-v1";
@@ -103,7 +104,7 @@ CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES
 CREATE INDEX class_relations_owner ON class_relations(owner,id);
 CREATE INDEX class_relations_target ON class_relations(target,id);
 ";
-const CACHE_SCHEMA: &str = "
+const CACHE_SCHEMA_V6: &str = "
 CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
 CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
@@ -111,6 +112,12 @@ CREATE INDEX nodes_name ON nodes(name);
 CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
 CREATE INDEX calls_caller ON calls(caller);
 CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+";
+const CACHE_SCHEMA_V7_ADDITIONS: &str = "
+ALTER TABLE index_metadata ADD COLUMN reconciled_incarnation TEXT;
+ALTER TABLE index_metadata ADD COLUMN reconcile_options TEXT;
+ALTER TABLE files ADD COLUMN capture_stat TEXT;
+CREATE TABLE capture_inputs(input_key TEXT PRIMARY KEY, payload TEXT NOT NULL);
 ";
 
 const NATIVE_SCHEMA: &str = "
@@ -258,10 +265,13 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA)?;
-    expected.execute_batch(CLASS_SCHEMA)?;
     let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    expected.execute_batch(CACHE_SCHEMA_V6)?;
     if version == DATABASE_SCHEMA_VERSION {
+        expected.execute_batch(CACHE_SCHEMA_V7_ADDITIONS)?;
+    }
+    expected.execute_batch(CLASS_SCHEMA)?;
+    if matches!(version, PREVIOUS_SCHEMA_VERSION | DATABASE_SCHEMA_VERSION) {
         expected.execute_batch(NATIVE_SCHEMA)?;
     } else {
         ensure!(
@@ -269,8 +279,19 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
             "incompatible_index: unknown schema version"
         );
     }
+    let actual = objects(db)?;
+    let exact = actual == objects(&expected)?;
+    let known_recovery_hybrid = if matches!(version, LEGACY_SCHEMA_VERSION | GRAPH_SCHEMA_VERSION) {
+        let hybrid = Connection::open_in_memory()?;
+        hybrid.execute_batch(CACHE_SCHEMA_V6)?;
+        hybrid.execute_batch(CACHE_SCHEMA_V7_ADDITIONS)?;
+        hybrid.execute_batch(CLASS_SCHEMA)?;
+        actual == objects(&hybrid)?
+    } else {
+        false
+    };
     ensure!(
-        objects(db)? == objects(&expected)?,
+        exact || known_recovery_hybrid,
         "incompatible_index: unknown cache object type, name or shape"
     );
     Ok(())
@@ -299,7 +320,10 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     ensure!(
         matches!(
             version,
-            LEGACY_SCHEMA_VERSION | GRAPH_SCHEMA_VERSION | DATABASE_SCHEMA_VERSION
+            LEGACY_SCHEMA_VERSION
+                | GRAPH_SCHEMA_VERSION
+                | PREVIOUS_SCHEMA_VERSION
+                | DATABASE_SCHEMA_VERSION
         ),
         "incompatible_index: schema version {version}"
     );
@@ -320,9 +344,10 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(
-        (version == LEGACY_SCHEMA_VERSION && metadata == (4, LEGACY_EXTRACTOR_VERSION.into()))
-            || (version == GRAPH_SCHEMA_VERSION && metadata == (5, GRAPH_EXTRACTOR_VERSION.into()))
-            || (version == DATABASE_SCHEMA_VERSION && metadata == (6, EXTRACTOR_VERSION.into())),
+        metadata.0 == i64::from(version)
+            && !metadata.1.is_empty()
+            && metadata.1.len() <= 256
+            && !metadata.1.chars().any(char::is_control),
         "incompatible_index: schema and metadata mismatch"
     );
     let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
@@ -938,6 +963,98 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str) -> Result<()> {
+    ensure!(
+        stat.version == 1
+            && stat.kind == expected_kind
+            && stat.device.is_some() == stat.inode.is_some()
+            && stat.mtime_seconds.is_some() == stat.mtime_nanoseconds.is_some()
+            && stat.ctime_seconds.is_some() == stat.ctime_nanoseconds.is_some(),
+        "incompatible_index: invalid capture stat"
+    );
+    Ok(())
+}
+
+fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
+    let (incarnation, options): (Option<String>, Option<String>) = db.query_row(
+        "SELECT reconciled_incarnation,reconcile_options FROM index_metadata WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let incarnation = incarnation.context("incompatible_index: missing reconciled incarnation")?;
+    uuid::Uuid::parse_str(&incarnation)
+        .context("incompatible_index: invalid reconciled incarnation")?;
+    let options = options.context("incompatible_index: missing reconcile options")?;
+    let decoded: crate::indexer::ReconcileOptions =
+        serde_json::from_str(&options).context("incompatible_index: invalid reconcile options")?;
+    ensure!(
+        json(&decoded)? == options,
+        "incompatible_index: noncanonical reconcile options"
+    );
+    let mut file_statement = db.prepare("SELECT capture_stat FROM files")?;
+    let mut files = file_statement.query([])?;
+    while let Some(row) = files.next()? {
+        let payload: String = row.get(0)?;
+        let decoded: crate::capture::CaptureStat =
+            serde_json::from_str(&payload).context("incompatible_index: invalid capture stat")?;
+        validate_capture_stat(&decoded, "file")?;
+        ensure!(
+            json(&decoded)? == payload,
+            "incompatible_index: invalid capture stat"
+        );
+    }
+    let mut input_statement =
+        db.prepare("SELECT input_key,payload FROM capture_inputs ORDER BY input_key")?;
+    let mut inputs = input_statement.query([])?;
+    let mut saw_root = false;
+    let mut saw_executable = false;
+    while let Some(row) = inputs.next()? {
+        let key: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+        ensure!(
+            !key.is_empty() && key.len() <= 8192,
+            "incompatible_index: invalid capture input key"
+        );
+        let decoded: crate::capture::CaptureInputObservation =
+            serde_json::from_str(&payload).context("incompatible_index: invalid capture input")?;
+        ensure!(
+            json(&decoded)? == payload,
+            "incompatible_index: noncanonical capture input"
+        );
+        match (&key[..], &decoded) {
+            ("root:.", crate::capture::CaptureInputObservation::Root { stat }) => {
+                validate_capture_stat(stat, "directory")?;
+                saw_root = true;
+            }
+            (key, crate::capture::CaptureInputObservation::Directory { stat })
+                if key.starts_with("directory:") =>
+            {
+                validate_capture_stat(stat, "directory")?;
+            }
+            (key, crate::capture::CaptureInputObservation::Present { stat, hash })
+                if !key.starts_with("root:") && !key.starts_with("directory:") =>
+            {
+                validate_capture_stat(stat, "file")?;
+                ensure!(
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "incompatible_index: invalid capture input hash"
+                );
+                saw_executable |= key.starts_with("executable:");
+            }
+            (key, crate::capture::CaptureInputObservation::Absent)
+                if !key.starts_with("executable:")
+                    && !key.starts_with("root:")
+                    && !key.starts_with("directory:") => {}
+            _ => anyhow::bail!("incompatible_index: capture input role mismatch"),
+        }
+    }
+    ensure!(
+        saw_root && saw_executable,
+        "incompatible_index: incomplete capture inventory"
+    );
+    Ok(())
+}
+
 fn validate_paired_rows(db: &Connection) -> Result<()> {
     let count = |table: &str| -> Result<i64> {
         Ok(db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
@@ -984,6 +1101,10 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
             .is_none(),
         "incompatible_index: native foreign key mismatch"
     );
+    let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if schema == DATABASE_SCHEMA_VERSION {
+        validate_reconcile_inventory(db)?;
+    }
     Ok(())
 }
 impl Store {
@@ -1015,11 +1136,13 @@ impl Store {
         }
         let mut db = store.cache()?;
         let tx = storage_result(db.transaction())?;
-        store.read_control_status(&tx)?;
-        let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if schema == DATABASE_SCHEMA_VERSION {
+        let (_, compatible) = store.recovery_baseline(&tx)?;
+        if compatible {
+            store.read_control_status(&tx)?;
             validate_paired_rows(&tx)?;
         }
+        drop(tx);
+        drop(db);
         Ok(store)
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
@@ -1078,7 +1201,7 @@ impl Store {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
-            db.execute_batch(CACHE_SCHEMA)?;
+            db.execute_batch(CACHE_SCHEMA_V6)?;
             db.execute_batch(CLASS_SCHEMA)?;
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
@@ -1195,6 +1318,42 @@ impl Store {
     fn records(&self) -> topology::DurableRecords<'_> {
         topology::DurableRecords::new(&self.roots, &self.identity)
     }
+    fn recovery_baseline(&self, db: &Connection) -> Result<(IndexPin, bool)> {
+        validate_cache_shape(db)?;
+        let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let row: (i64, String, String, String, String, String, i64) = db.query_row(
+            "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )?;
+        ensure!(
+            row.0 == i64::from(schema),
+            "incompatible_index: schema and metadata mismatch"
+        );
+        ensure!(
+            row.2 == self.workspace_root,
+            "root_key_collision: index belongs to a different spelling"
+        );
+        ensure!(
+            row.3 == self.identity.device.to_string() && row.4 == self.identity.inode.to_string(),
+            "root_changed: index root identity mismatch"
+        );
+        let generation =
+            uuid::Uuid::parse_str(&row.5).context("incompatible_index: invalid generation")?;
+        ensure!(
+            (0..=9_007_199_254_740_991).contains(&row.6),
+            "incompatible_index: invalid revision"
+        );
+        let compatible = schema == DATABASE_SCHEMA_VERSION && row.1 == EXTRACTOR_VERSION;
+        Ok((
+            IndexPin {
+                index_generation: generation,
+                index_revision: row.6 as u64,
+            },
+            compatible,
+        ))
+    }
+
     fn read_control_status(&self, db: &Connection) -> Result<IndexStatus> {
         // This check must run INSIDE the caller's read snapshot or writer lock.
         // The open_index admission check alone cannot protect against later DDL.
@@ -1211,6 +1370,9 @@ impl Store {
                 || (schema_version == i64::from(GRAPH_SCHEMA_VERSION)
                     && row.0 == schema_version
                     && row.1 == GRAPH_EXTRACTOR_VERSION)
+                || (schema_version == i64::from(PREVIOUS_SCHEMA_VERSION)
+                    && row.0 == schema_version
+                    && row.1 == EXTRACTOR_VERSION)
                 || (schema_version == i64::from(DATABASE_SCHEMA_VERSION)
                     && row.0 == schema_version
                     && row.1 == EXTRACTOR_VERSION),
@@ -1266,7 +1428,7 @@ impl Store {
     pub fn index_baseline(&self) -> Result<IndexPin> {
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        Ok(self.read_control_status(&tx)?.revision)
+        Ok(self.recovery_baseline(&tx)?.0)
     }
     pub fn root_id(&self) -> &str {
         &self.identity.record_id
@@ -1519,20 +1681,19 @@ impl Store {
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         during_tx(PublishStage::BeforeTransaction, &db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let baseline = self.read_control_status(&tx)?;
+        let (old, compatible) = self.recovery_baseline(&tx)?;
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
             locked_version == admitted_version,
             "incompatible_index: cache changed after admission"
         );
-        let old = baseline.revision;
         ensure!(
             expected_revision == old,
             "revision conflict: expected {expected_revision:?}, found {old:?}"
         );
         let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        let rebaseline = schema != DATABASE_SCHEMA_VERSION;
+        let rebaseline = schema != DATABASE_SCHEMA_VERSION || !compatible;
         ensure!(
             graph.files.len() == native.revision.documents.len(),
             "graph/native document cardinality mismatch"
@@ -1557,24 +1718,43 @@ impl Store {
             } else {
                 old.index_generation
             },
-            index_revision: old
-                .index_revision
-                .checked_add(1)
-                .filter(|n| *n <= 9_007_199_254_740_991)
-                .context("revision overflow")?,
+            index_revision: if rebaseline {
+                1
+            } else {
+                old.index_revision
+                    .checked_add(1)
+                    .filter(|n| *n <= 9_007_199_254_740_991)
+                    .context("revision overflow")?
+            },
         };
-        if rebaseline {
-            tx.execute_batch(NATIVE_SCHEMA)?;
+        if rebaseline && schema != DATABASE_SCHEMA_VERSION {
+            let has_inventory: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='capture_inputs')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_inventory {
+                tx.execute_batch(CACHE_SCHEMA_V7_ADDITIONS)?;
+            }
+            if schema != PREVIOUS_SCHEMA_VERSION {
+                tx.execute_batch(NATIVE_SCHEMA)?;
+            }
         }
         tx.execute_batch(
             "DELETE FROM class_relations; DELETE FROM classes; DELETE FROM class_catalog;
-             DELETE FROM calls; DELETE FROM regions; DELETE FROM nodes; DELETE FROM files;",
+             DELETE FROM calls; DELETE FROM regions; DELETE FROM nodes; DELETE FROM files;
+             DELETE FROM capture_inputs;",
         )?;
         for f in &graph.files {
             check_cancel(cancel)?;
             tx.execute(
-                "INSERT INTO files VALUES(?1,?2,?3)",
-                params![f.path, f.hash, json(f)?],
+                "INSERT INTO files(path,hash,payload,capture_stat) VALUES(?1,?2,?3,?4)",
+                params![
+                    f.path,
+                    f.hash,
+                    json(f)?,
+                    json(&capture.source_stat(&f.path)?)?
+                ],
             )?;
             during_tx(PublishStage::AfterFile, &tx)?;
         }
@@ -1625,6 +1805,13 @@ impl Store {
             )?;
         }
         write_native(&tx, native, capture, cancel)?;
+        for (key, observation) in capture.persisted_inputs()? {
+            check_cancel(cancel)?;
+            tx.execute(
+                "INSERT INTO capture_inputs(input_key,payload) VALUES(?1,?2)",
+                params![key, json(&observation)?],
+            )?;
+        }
         tx.execute(
             "INSERT INTO class_catalog VALUES(1,?1,?2)",
             params![json(&classes.warnings)?, classes.truncated],
@@ -1633,8 +1820,8 @@ impl Store {
             .duration_since(UNIX_EPOCH)?
             .as_millis()
             .to_string();
-        tx.execute("UPDATE index_metadata SET schema_version=6,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6 WHERE singleton=1",
-            params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?])?;
+        tx.execute("UPDATE index_metadata SET schema_version=7,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconciled_incarnation=?7,reconcile_options=?8 WHERE singleton=1",
+            params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,leader.incarnation.to_string(),json(capture.reconcile_options())?])?;
         if rebaseline {
             tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
         }
@@ -4104,7 +4291,7 @@ mod rebaseline_fault_tests {
                                 PublishStage::AfterFile => {
                                     // Real SQLite UNIQUE error after DELETEs and one inserted file.
                                     tx.execute(
-                                        "INSERT INTO files VALUES(?1,'duplicate','{}')",
+                                        "INSERT INTO files(path,hash,payload,capture_stat) VALUES(?1,'duplicate','{}','{}')",
                                         [&graph.files[0].path],
                                     )?;
                                 }
@@ -4254,7 +4441,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                6,
+                7,
                 "native-paired-v1",
                 old.index_generation.to_string(),
                 old.index_revision as i64
@@ -4263,7 +4450,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         let forged: i64 = db
             .query_row(
@@ -4369,7 +4556,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                6,
+                7,
                 "native-paired-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64

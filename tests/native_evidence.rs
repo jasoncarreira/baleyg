@@ -1037,3 +1037,43 @@ fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
         "{error:#}"
     );
 }
+
+#[test]
+fn max_file_bytes_and_previously_absent_required_input_change_native_basis() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let first_options = IndexOptions::new(root.path().to_owned());
+    let (_, first) =
+        index_workspace_with_native(&first_options, &identity.record_id, &cancel, |_| {}).unwrap();
+    let mut changed_cap = first_options.clone();
+    changed_cap.max_file_bytes += 1;
+    let (_, second) =
+        index_workspace_with_native(&changed_cap, &identity.record_id, &cancel, |_| {}).unwrap();
+    assert_ne!(first.revision.config_hash, second.revision.config_hash);
+    assert_ne!(first.revision.id, second.revision.id);
+    assert_eq!(
+        first.revision.dependency_hash,
+        second.revision.dependency_hash
+    );
+
+    fs::write(root.path().join("package.json"), "{\"name\":\"new\"}\n").unwrap();
+    let (_, third) =
+        index_workspace_with_native(&changed_cap, &identity.record_id, &cancel, |_| {}).unwrap();
+    assert_ne!(
+        second.revision.dependency_hash,
+        third.revision.dependency_hash
+    );
+    assert_ne!(second.revision.id, third.revision.id);
+}

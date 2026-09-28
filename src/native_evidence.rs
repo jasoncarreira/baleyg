@@ -345,6 +345,9 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
     for p in &selectors {
         config.push(entry(root, p, capture.bytes(p))?);
     }
+    config.push(
+        json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
+    );
     for (p, b) in capture.admitted_inputs() {
         if p.file_name()
             .is_some_and(|n| n == ".gitignore" || n == ".ignore")

@@ -3,6 +3,7 @@
 use crate::{capture::Capture, model::*, native_evidence};
 use anyhow::{Context, Result, ensure};
 use protobuf::Message;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -17,6 +18,31 @@ pub struct IndexOptions {
     pub manifest_path: Option<PathBuf>,
     pub max_file_bytes: u64,
 }
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ReconcileOptions {
+    pub version: u8,
+    pub max_file_bytes: u64,
+    pub scip_path: Option<String>,
+    pub manifest_path: Option<String>,
+}
+impl From<&IndexOptions> for ReconcileOptions {
+    fn from(options: &IndexOptions) -> Self {
+        Self {
+            version: 1,
+            max_file_bytes: options.max_file_bytes,
+            scip_path: options
+                .scip_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            manifest_path: options
+                .manifest_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 impl IndexOptions {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {

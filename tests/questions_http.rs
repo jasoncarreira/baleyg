@@ -532,6 +532,13 @@ async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_termina
         for index in ["nodes_path", "calls_path", "regions_path"] {
             db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
         }
+        db.execute_batch(
+            "DROP TABLE capture_inputs;
+             ALTER TABLE files DROP COLUMN capture_stat;
+             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+        )
+        .unwrap();
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],

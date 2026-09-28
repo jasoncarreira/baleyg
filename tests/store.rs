@@ -42,6 +42,13 @@ fn downgrade_to_legacy(db: &rusqlite::Connection) {
     for index in ["nodes_path", "calls_path", "regions_path"] {
         db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
     }
+    db.execute_batch(
+        "DROP TABLE capture_inputs;
+         ALTER TABLE files DROP COLUMN capture_stat;
+         ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+         ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+    )
+    .unwrap();
     db.execute(
         "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
         [],
@@ -846,7 +853,7 @@ fn legacy_cache_is_control_only_until_lock_safe_rebaseline_rotates_full_pair() {
         )
         .unwrap();
     assert_ne!(next.index_generation, first.index_generation);
-    assert_eq!(next.index_revision, first.index_revision + 1);
+    assert_eq!(next.index_revision, 1);
     assert_eq!(
         store.status().unwrap().evidence_format.as_deref(),
         Some("terminal-native-graph-v1")

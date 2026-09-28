@@ -462,6 +462,13 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         for index in ["nodes_path", "calls_path", "regions_path"] {
             db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
         }
+        db.execute_batch(
+            "DROP TABLE capture_inputs;
+             ALTER TABLE files DROP COLUMN capture_stat;
+             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+        )
+        .unwrap();
         // An old index holds lexical class adjacency and lexical call targets.
         let base: String = db
             .query_row("SELECT id FROM classes WHERE name='Base'", [], |row| {

@@ -367,3 +367,145 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
 "
     );
 }
+
+#[test]
+fn full_reconcile_replaces_persisted_source_and_input_inventory() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
+    fs::write(
+        workspace.path().join("package.json"),
+        "{\"name\":\"first\"}\n",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let first = IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    fs::remove_file(workspace.path().join("one.js")).unwrap();
+    fs::write(workspace.path().join("two.js"), "function two() {}\n").unwrap();
+    fs::write(
+        workspace.path().join("package.json"),
+        "{\"name\":\"second\"}\n",
+    )
+    .unwrap();
+    let second = IndexJobCoordinator::prepare(&store, Some(first))
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(second.index_generation, first.index_generation);
+    assert_eq!(second.index_revision, first.index_revision + 1);
+
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    let files = db
+        .prepare("SELECT path FROM files ORDER BY path")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(files, vec!["two.js"]);
+    let capture_stat: String = db
+        .query_row(
+            "SELECT capture_stat FROM files WHERE path='two.js'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&capture_stat).unwrap()["version"],
+        1
+    );
+    let package: String = db
+        .query_row(
+            "SELECT payload FROM capture_inputs WHERE input_key='config:package.json'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&package).unwrap()["state"],
+        "present"
+    );
+    let absent: i64 = db
+        .query_row(
+            "SELECT count(*) FROM capture_inputs WHERE payload='{\"state\":\"absent\"}'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(absent > 0);
+    let options_json: String = db
+        .query_row("SELECT reconcile_options FROM index_metadata", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&options_json).unwrap()["maxFileBytes"],
+        2 * 1024 * 1024
+    );
+}
+
+#[test]
+fn schema_six_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let (state, workspace) = fixture();
+    fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let current = IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let path = index_dir(state.path()).join("index.db");
+    let inode = fs::metadata(&path).unwrap().ino();
+    drop(store);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "DROP TABLE capture_inputs;
+        ALTER TABLE files DROP COLUMN capture_stat;
+        ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+        ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+    )
+    .unwrap();
+    db.execute("UPDATE index_metadata SET schema_version=6", [])
+        .unwrap();
+    db.pragma_update(None, "user_version", 6).unwrap();
+    drop(db);
+
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert_eq!(store.index_baseline().unwrap(), current);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    let rebuilt = IndexJobCoordinator::prepare(&store, Some(current))
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_ne!(rebuilt.index_generation, current.index_generation);
+    assert_eq!(rebuilt.index_revision, 1);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(store.status().unwrap().revision, rebuilt);
+}
