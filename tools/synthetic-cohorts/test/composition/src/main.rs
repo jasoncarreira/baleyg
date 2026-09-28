@@ -1,8 +1,9 @@
 //! Independent source-AST checks; never reads generator counters or manifest composition labels.
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env, fs, panic,
     path::{Path, PathBuf},
+    thread,
 };
 use tree_sitter::{Node, Parser};
 
@@ -585,7 +586,21 @@ fn check(root: &Path, selection: Option<&str>) {
         .filter(|p| selection.is_none_or(|wanted| wanted == p.as_str()))
         .collect();
     assert!(!selected.is_empty(), "no generated files selected");
-    let facts: Vec<_> = selected.iter().map(|p| inspect(root, p)).collect();
+    // Each file parses independently; fan out in order-preserving chunks.
+    let workers = thread::available_parallelism().map_or(1, usize::from);
+    let facts: Vec<_> = thread::scope(|scope| {
+        let parts: Vec<_> = selected
+            .chunks(selected.len().div_ceil(workers))
+            .map(|part| scope.spawn(|| part.iter().map(|p| inspect(root, p)).collect::<Vec<_>>()))
+            .collect();
+        parts
+            .into_iter()
+            .flat_map(|part| {
+                part.join()
+                    .unwrap_or_else(|panic| panic::resume_unwind(panic))
+            })
+            .collect()
+    });
     let existing: HashSet<_> = files.iter().map(String::as_str).collect();
     let by_path: HashMap<_, _> = facts.iter().map(|f| (f.path.as_str(), f)).collect();
     for fact in &facts {
