@@ -2086,3 +2086,43 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
         .unwrap();
     assert_eq!(inspect(), ("eligible", "root_replaced"));
 }
+
+
+#[test]
+fn saved_anchor_raw_bytes_survive_edits() {
+    use baleyg::{
+        model::{Annotation, AnnotationRecord},
+        store::topology::DurableRecords,
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let raw = serde_json::value::RawValue::from_string(
+        r#"{ "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef", "document":{"sourceSetId":"set","language":"rust","path":"src/lib.rs"}, "capturedRevisionId":"rev", "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "siblingGroupHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "siblingCount":1, "identicalHeaderCount":1 }"#.into(),
+    ).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    records.put_annotation_record(&AnnotationRecord::from_base(Annotation {
+        id: "note".into(), node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(), body: "first".into(),
+    }, Some("Title".into()), Some(raw)), false).unwrap();
+    let before = records.annotation_record("note").unwrap().unwrap().anchor.unwrap().get().to_owned();
+    records.put_annotation(&Annotation {
+        id: "note".into(), node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(), body: "edited".into(),
+    }).unwrap();
+    let after = records.annotation_record("note").unwrap().unwrap();
+    assert_eq!(after.anchor.unwrap().get(), before);
+    assert_eq!(after.title.as_deref(), Some("Title"));
+    assert_eq!(after.body, "edited");
+}
+
+#[test]
+fn saved_anchor_rejects_target_replacement() {
+    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    records.put_annotation(&Annotation { id: "note".into(), node_id: "old".into(), body: "first".into() }).unwrap();
+    let error = records.put_annotation(&Annotation { id: "note".into(), node_id: "new".into(), body: "second".into() }).unwrap_err();
+    assert!(error.to_string().contains("target replacement"));
+    assert_eq!(records.annotation("note").unwrap().unwrap().node_id, "old");
+}

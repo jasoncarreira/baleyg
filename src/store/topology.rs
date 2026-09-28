@@ -896,8 +896,8 @@ impl<'a> DurableRecords<'a> {
         self.identity.verify()?;
         Ok(db)
     }
-    fn save(&self, table: &str, id: &str, node: Option<&str>, payload: String) -> Result<()> {
-        self.save_with_first_save_hook(table, id, node, payload, |_| Ok(()))
+    fn save(&self, table: &str, id: &str, node: Option<&str>, payload: String, preserve_title: bool) -> Result<()> {
+        self.save_with_first_save_hook(table, id, node, payload, preserve_title, |_| Ok(()))
     }
     fn save_with_first_save_hook(
         &self,
@@ -905,6 +905,7 @@ impl<'a> DurableRecords<'a> {
         id: &str,
         node: Option<&str>,
         payload: String,
+        preserve_title: bool,
         mut hook: impl FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         use rusqlite::{Connection, TransactionBehavior};
@@ -916,7 +917,7 @@ impl<'a> DurableRecords<'a> {
             // Another process may have completed creation before the lock was acquired.
             if self.roots.record_dir(self.identity).exists() {
                 drop(guard);
-                return self.save(table, id, node, payload);
+                return self.save(table, id, node, payload, preserve_title);
             }
             make_private(&self.roots.record_dir(self.identity))?;
             let path = self.roots.record_db(self.identity);
@@ -938,6 +939,7 @@ impl<'a> DurableRecords<'a> {
                 "INSERT INTO record_metadata VALUES(1,1,?1,1)",
                 [&self.identity.record_id],
             )?;
+            let payload = Self::merge_item(&tx, table, &payload, preserve_title)?;
             Self::write_item(&tx, table, id, node, &payload)?;
             self.write_root(&tx)?;
             self.identity.verify()?;
@@ -955,6 +957,7 @@ impl<'a> DurableRecords<'a> {
         let guard = self.lock_existing()?;
         let mut db = self.db(true)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload = Self::merge_item(&tx, table, &payload, preserve_title)?;
         Self::write_item(&tx, table, id, node, &payload)?;
         self.write_root(&tx)?;
         self.identity.verify()?;
@@ -962,6 +965,34 @@ impl<'a> DurableRecords<'a> {
         tx.commit()?;
         Ok(())
     }
+    fn merge_item(db: &rusqlite::Transaction<'_>, table: &str, payload: &str, preserve_title: bool) -> Result<String> {
+        use rusqlite::OptionalExtension;
+        if table == "views" {
+            let mut incoming: crate::model::SavedViewRecord = serde_json::from_str(payload)?;
+            incoming.validate()?;
+            if let Some(old) = db.query_row("SELECT payload FROM views WHERE id=?1", [&incoming.id], |r| r.get::<_, String>(0)).optional()? {
+                let old: crate::model::SavedViewRecord = serde_json::from_str(&old)?;
+                old.validate()?;
+                ensure!(old.query.seed == incoming.query.seed, "saved view target replacement is not allowed");
+                incoming.anchor = old.anchor;
+            }
+            incoming.validate()?;
+            Ok(serde_json::to_string(&incoming)?)
+        } else {
+            let mut incoming: crate::model::AnnotationRecord = serde_json::from_str(payload)?;
+            incoming.validate()?;
+            if let Some(old) = db.query_row("SELECT payload FROM annotations WHERE id=?1", [&incoming.id], |r| r.get::<_, String>(0)).optional()? {
+                let old: crate::model::AnnotationRecord = serde_json::from_str(&old)?;
+                old.validate()?;
+                ensure!(old.node_id == incoming.node_id, "saved annotation target replacement is not allowed");
+                incoming.anchor = old.anchor;
+                if preserve_title && incoming.title.is_none() { incoming.title = old.title; }
+            }
+            incoming.validate()?;
+            Ok(serde_json::to_string(&incoming)?)
+        }
+    }
+
     fn write_item(
         db: &rusqlite::Transaction<'_>,
         table: &str,
@@ -1000,21 +1031,41 @@ impl<'a> DurableRecords<'a> {
         guard.verify()?;
         result
     }
-    pub fn views(&self) -> Result<Vec<crate::model::SavedView>> {
+    pub fn view_records(&self) -> Result<Vec<crate::model::SavedViewRecord>> {
         self.list("SELECT payload FROM views ORDER BY id")
     }
-    pub fn annotations(&self) -> Result<Vec<crate::model::Annotation>> {
+    pub fn annotation_records(&self) -> Result<Vec<crate::model::AnnotationRecord>> {
         self.list("SELECT payload FROM annotations ORDER BY id")
     }
+    pub fn views(&self) -> Result<Vec<crate::model::SavedView>> {
+        Ok(self.view_records()?.into_iter().map(|record| record.base()).collect())
+    }
+    pub fn annotations(&self) -> Result<Vec<crate::model::Annotation>> {
+        Ok(self.annotation_records()?.into_iter().map(|record| record.base()).collect())
+    }
+    pub fn view_record(&self, id: &str) -> Result<Option<crate::model::SavedViewRecord>> {
+        Ok(self.view_records()?.into_iter().find(|v| v.id == id))
+    }
+    pub fn annotation_record(&self, id: &str) -> Result<Option<crate::model::AnnotationRecord>> {
+        Ok(self.annotation_records()?.into_iter().find(|a| a.id == id))
+    }
     pub fn view(&self, id: &str) -> Result<Option<crate::model::SavedView>> {
-        Ok(self.views()?.into_iter().find(|v| v.id == id))
+        Ok(self.view_record(id)?.map(|record| record.base()))
     }
     pub fn annotation(&self, id: &str) -> Result<Option<crate::model::Annotation>> {
-        Ok(self.annotations()?.into_iter().find(|a| a.id == id))
+        Ok(self.annotation_record(id)?.map(|record| record.base()))
+    }
+    pub fn put_view_record(&self, record: &crate::model::SavedViewRecord) -> Result<()> {
+        record.validate()?;
+        self.save("views", &record.id, None, serde_json::to_string(record)?, false)
     }
     pub fn put_view(&self, view: &crate::model::SavedView) -> Result<()> {
         view.validate()?;
-        self.save("views", &view.id, None, serde_json::to_string(view)?)
+        self.put_view_record(&crate::model::SavedViewRecord::from_base(view.clone(), None))
+    }
+    pub fn put_annotation_record(&self, record: &crate::model::AnnotationRecord, preserve_title: bool) -> Result<()> {
+        record.validate()?;
+        self.save("annotations", &record.id, Some(&record.node_id), serde_json::to_string(record)?, preserve_title)
     }
     pub fn put_annotation(&self, annotation: &crate::model::Annotation) -> Result<()> {
         self.put_annotation_with_first_save_hook(annotation, |_| Ok(()))
@@ -1026,12 +1077,9 @@ impl<'a> DurableRecords<'a> {
         hook: impl FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         annotation.validate()?;
+        let record = crate::model::AnnotationRecord::from_base(annotation.clone(), None, None);
         self.save_with_first_save_hook(
-            "annotations",
-            &annotation.id,
-            Some(&annotation.node_id),
-            serde_json::to_string(annotation)?,
-            hook,
+            "annotations", &annotation.id, Some(&annotation.node_id), serde_json::to_string(&record)?, true, hook,
         )
     }
     fn delete(&self, table: &str, id: &str) -> Result<bool> {
