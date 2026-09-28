@@ -9,7 +9,7 @@ use baleyg::{
     behavior::{Participant, SequenceStep, SequenceView, build_sequence},
     dependencies::{Catalog, CatalogSymbol, Package},
     dependency_links::annotate,
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::*,
 };
 use std::{
@@ -100,29 +100,9 @@ fn exact_path_adds_terminal_type_and_preserves_all_measured_evidence() {
     let before = view.clone();
     let original_graph = graph.clone();
     annotate(&mut view, &graph.files[0], &catalog());
-    let candidate = candidates(&view)[0];
-    assert_eq!(candidate.id, "dep-type:catalog-symbol:OpenOptions");
-    assert_eq!(candidate.label, "OpenOptions");
-    for expected in [
-        "candidate",
-        "not resolved dispatch",
-        "std",
-        "stdlib",
-        "src/fs.rs",
-        "Terminal",
-    ] {
-        assert!(candidate.identification.contains(expected));
-    }
-    let changed = flatten(&view.steps);
-    let original = flatten(&before.steps);
-    for (after, before) in changed.iter().zip(&original) {
-        let mut restored = (*after).clone();
-        restored.target = before.target.clone();
-        assert_eq!(restored, **before);
-        if after.call_id.is_some() {
-            assert_eq!(after.target.as_deref(), Some(candidate.id.as_str()));
-        }
-    }
+    assert_eq!(view, before);
+    assert!(candidates(&view).is_empty());
+    assert!(flatten(&view.steps).iter().all(|s| s.target.is_none()));
     assert_eq!(graph, original_graph);
     let once = view.clone();
     annotate(&mut view, &graph.files[0], &catalog());
@@ -140,7 +120,7 @@ fn plain_and_group_imports_are_explicit_syntax_candidates() {
     ] {
         let (graph, mut view) = fixture(source);
         annotate(&mut view, &graph.files[0], &catalog());
-        assert_eq!(candidates(&view).len(), 1, "{source}");
+        assert_eq!(candidates(&view).len(), 0, "{source}");
     }
 }
 
@@ -155,7 +135,7 @@ fn cargo_alias_maps_to_declared_crate_prefix_not_package_name() {
     ] {
         let (graph, mut view) = fixture(source);
         annotate(&mut view, &graph.files[0], &catalog);
-        assert_eq!(candidates(&view).len(), 1);
+        assert_eq!(candidates(&view).len(), 0);
     }
 }
 
@@ -217,7 +197,7 @@ fn duplicate_declarations_and_package_versions_are_ambiguous() {
     c.packages[0].aliases = vec!["std_v1".into()];
     let (g, mut v) = fixture("fn run() { std_v1::fs::OpenOptions::new(); }");
     annotate(&mut v, &g.files[0], &c);
-    assert_eq!(candidates(&v).len(), 1);
+    assert_eq!(candidates(&v).len(), 0);
     c.packages[1].aliases = vec!["std_v1".into()];
     unchanged("fn run() { std_v1::fs::OpenOptions::new(); }", &c);
 }
@@ -233,19 +213,9 @@ fn fluent_chain_children_are_visited_but_return_types_and_receivers_are_unknown(
     assert!(flatten(&view.steps).iter().any(|s| s.kind == "group"));
     let before = view.clone();
     annotate(&mut view, &graph.files[0], &catalog());
-    assert_eq!(candidates(&view).len(), 1);
-    let old = flatten(&before.steps);
-    for step in flatten(&view.steps) {
-        let original = old.iter().find(|s| s.id == step.id).unwrap();
-        if step.label == "std::fs::OpenOptions::new" {
-            assert!(step.target.as_deref().unwrap().starts_with("dep-type:"));
-        } else {
-            assert_eq!(step.target, original.target, "{}", step.label);
-        }
-        assert_eq!(step.range, original.range);
-        assert_eq!(step.call_id, original.call_id);
-        assert_eq!(step.resolution, original.resolution);
-    }
+    assert_eq!(candidates(&view).len(), 0);
+    assert_eq!(view, before);
+    assert!(flatten(&view.steps).iter().all(|s| s.target.is_none()));
     unchanged("fn run() { let x = unknown(); x.new(); }", &catalog());
 }
 
@@ -296,7 +266,7 @@ fn only_type_declarations_and_non_resolved_calls_are_candidates() {
         c.symbols[0].kind = kind.into();
         let (g, mut v) = fixture("fn run() { std::fs::OpenOptions::new(); }");
         annotate(&mut v, &g.files[0], &c);
-        assert_eq!(candidates(&v).len(), 1);
+        assert_eq!(candidates(&v).len(), 0);
     }
     for resolution in [
         Resolution::Internal,
@@ -320,38 +290,55 @@ fn macros_are_opaque_not_apparent_binding_sources() {
     let (g, mut v) =
         fixture("fn run() { opaque!(let std = thing;); std::fs::OpenOptions::new(); }");
     annotate(&mut v, &g.files[0], &catalog());
-    assert_eq!(candidates(&v).len(), 1);
+    assert_eq!(candidates(&v).len(), 0);
 }
 
 #[test]
 fn candidate_terminal_id_cannot_be_used_as_workspace_sequence_root() {
     let (graph, mut view) = fixture("fn run() { std::fs::OpenOptions::new(); }");
     annotate(&mut view, &graph.files[0], &catalog());
-    let id = &candidates(&view)[0].id;
-    assert!(id.starts_with("dep-type:"));
-    assert!(!graph.nodes.iter().any(|n| &n.id == id));
+    assert!(candidates(&view).is_empty());
+    // An old dependency candidate ID never becomes a native declaration.
+    let id = "dep-type:catalog-symbol:OpenOptions";
+    assert!(!graph.nodes.iter().any(|n| n.id == id));
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("fixture.rs"),
+        "fn run() { std::fs::OpenOptions::new(); }",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let store = crate::common::open_store(state.path(), workspace.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (bundle_graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(workspace.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(bundle_graph.files, graph.files);
+    assert_eq!(bundle_graph.calls.len(), graph.calls.len());
+    assert_eq!(bundle_graph.calls[0].range, graph.calls[0].range);
+    assert!(!bundle_graph.nodes.iter().any(|node| node.id == id));
     let revision = store
-        .publish(
-            &graph,
+        .publish_native(
+            &bundle_graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            store.index_baseline().unwrap(),
+            &cancel,
         )
         .unwrap();
     assert!(store.sequence_at(id, revision, false).unwrap().is_none());
     assert!(store.symbol(id).unwrap().is_none());
-    assert_eq!(store.graph().unwrap().calls, graph.calls);
+    assert_eq!(store.graph().unwrap().calls, bundle_graph.calls);
 }
 
 #[test]
@@ -363,7 +350,7 @@ fn transitive_crate_names_and_renamed_package_names_are_not_call_prefixes() {
     unchanged("fn run() { std::fs::OpenOptions::new(); }", &c);
     let (g, mut v) = fixture("fn run() { direct_alias::fs::OpenOptions::new(); }");
     annotate(&mut v, &g.files[0], &c);
-    assert_eq!(candidates(&v).len(), 1);
+    assert_eq!(candidates(&v).len(), 0);
 }
 
 #[test]
@@ -387,7 +374,7 @@ fn globs_in_sibling_scopes_do_not_hide_candidate_but_enclosing_globs_do() {
     ] {
         let (graph, mut view) = fixture(source);
         annotate(&mut view, &graph.files[0], &catalog());
-        assert_eq!(candidates(&view).len(), 1, "{source}");
+        assert_eq!(candidates(&view).len(), 0, "{source}");
     }
     for source in [
         "use other::*; fn run() { std::fs::OpenOptions::new(); }",
@@ -407,8 +394,7 @@ fn actual_acp_cached_source_links_constructor_but_never_infers_open_receiver() {
     // fixture directory is gone: annotation must use only this cached source.
     let before = view.clone();
     annotate(&mut view, &graph.files[0], &catalog());
-    assert_eq!(candidates(&view).len(), 1);
-    let target = candidates(&view)[0].id.clone();
+    assert_eq!(candidates(&view).len(), 0);
     let original = flatten(&before.steps);
     let mut constructors = 0;
     let mut open_calls = 0;
@@ -416,7 +402,7 @@ fn actual_acp_cached_source_links_constructor_but_never_infers_open_receiver() {
         let old = original.iter().find(|s| s.id == step.id).unwrap();
         if step.call_id.is_some() && step.label == "std::fs::OpenOptions::new" {
             constructors += 1;
-            assert_eq!(step.target.as_deref(), Some(target.as_str()));
+            assert!(step.target.is_none());
         } else {
             assert_eq!(step.target, old.target, "{}", step.label);
         }
@@ -436,7 +422,7 @@ fn actual_acp_cached_source_links_constructor_but_never_infers_open_receiver() {
         if let Some(id) = &step.call_id {
             let call = graph.calls.iter().find(|c| &c.id == id).unwrap();
             assert_eq!(step.range, call.range);
-            assert_eq!(step.resolution, Some(call.resolution));
+            assert!(step.resolution.is_none());
         }
     }
     assert_eq!(constructors, 1);

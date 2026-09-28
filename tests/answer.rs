@@ -1,7 +1,7 @@
 mod common;
 use baleyg::{
     answer::*,
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace_bundle},
     planning::*,
 };
 use serde_json::{Value, json};
@@ -18,16 +18,21 @@ fn packet(code: &str) -> QuestionPacket {
     }
     std::fs::write(work.path().join("a.js"), code).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let graph = index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(work.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
     let revision = store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
+            store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
@@ -189,10 +194,10 @@ fn prompt_preserves_full_graph_and_each_complete_source_once() {
     assert_eq!(p, before);
     for phrase in [
         "untrusted DATA",
-        "STATIC graph",
+        "bounded source evidence",
         "callback",
         "precise branch",
-        "No inferred execution timeline",
+        "not a semantic graph or execution timeline",
         "unverified model caveats",
     ] {
         assert!(prompt.contains(phrase), "{phrase}");
@@ -240,4 +245,146 @@ fn prompt_keeps_pair() {
     assert_eq!(evidence["revision"], json!(packet.revision));
     assert!(evidence["revision"]["indexGeneration"].as_str().is_some());
     assert_eq!(evidence["revision"]["indexRevision"], 1);
+}
+
+#[tokio::test]
+async fn first_question_preview_rejects_same_pin_forged_graph_callee_before_packet_creation() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use baleyg::{http, indexer::index_workspace_bundle};
+    use tower::ServiceExt;
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("a.js"),
+        "function seed() { helper(); }
+function helper() {}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("unrelated.js"),
+        "function unaffected() { other(); }
+",
+    )
+    .unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let seed = graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "seed")
+        .unwrap()
+        .id
+        .clone();
+    let other = graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "unaffected")
+        .unwrap()
+        .id
+        .clone();
+    let app = http::router(
+        http::new(
+            store.clone(),
+            options,
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let preview = |seed: &str| {
+        let body =
+            json!({"seed":seed,"question":"What calls are measured?","expectedRevision":pin});
+        Request::builder()
+            .method("POST")
+            .uri("/api/questions/preview")
+            .header("host", "127.0.0.1:7331")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    // Do not prime a packet for this seed: the tampered request must be a first preview.
+    let db_path = std::fs::read_dir(dir.path().join("state/cache/indexes"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    let id: String = db
+        .query_row("SELECT id FROM calls WHERE path='a.js' LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let payload: String = db
+        .query_row("SELECT payload FROM calls WHERE id=?1", [&id], |r| r.get(0))
+        .unwrap();
+    let mut forged: Value = serde_json::from_str(&payload).unwrap();
+    assert!(forged["calleeText"].is_string());
+    forged["calleeText"] = json!("sqlInventedCallee");
+    db.execute(
+        "UPDATE calls SET payload=?1 WHERE id=?2",
+        rusqlite::params![forged.to_string(), id],
+    )
+    .unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
+    let response = app.clone().oneshot(preview(&seed)).await.unwrap();
+    assert_eq!(response.status(), 503);
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let refused: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(refused["error"]["code"], "incompatible_index");
+    assert!(!refused.to_string().contains("sqlInventedCallee"));
+    let sequence_request = |seed: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/sequence")
+            .header("host", "127.0.0.1:7331")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"seed":seed,"expectedRevision":pin}).to_string(),
+            ))
+            .unwrap()
+    };
+    let sequence = app.clone().oneshot(sequence_request(&seed)).await.unwrap();
+    assert_eq!(
+        sequence.status(),
+        503,
+        "forged call must not enter sequence HTTP"
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(sequence_request(&other))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let unrelated = app.clone().oneshot(preview(&other)).await.unwrap();
+    assert_eq!(
+        unrelated.status(),
+        200,
+        "unrelated selected document remains readable"
+    );
 }

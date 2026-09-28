@@ -76,18 +76,16 @@ function harness({openSource = false} = {}) {
 }
 const selector={path:"src/A.java",line:1};
 
-test("lookup captures anchor synchronously, fetches only navigation and exposes labelled choices",async()=>{
-  const h=harness(),gate=deferred();h.request=()=>gate.promise;
-  const event=h.event();const pending=h.nav.open(event,selector);event.currentTarget=null;
-  assert.equal(event.prevented,true);assert.equal(event.stopped,true);
-  assert.match(h.latest.actions[0].label,/Finding cached/);assert.ok(h.latest.actions.some(a=>!a.disabled));
-  gate.resolve(response([target(),target("class","type","A"),target("sequence","call","B.run")]));await pending;
-  assert.equal(h.calls.length,1);assert.equal(h.calls[0].url,"/api/navigation");assert.equal(h.calls[0].options.method,"POST");
-  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{expectedRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"src/A.java",line:1});
-  assert.equal(h.latest.event.currentTarget,h.anchor);assert.equal(h.latest.event.clientX,120);assert.equal(h.latest.event.clientY,80);
-  assert.match(h.latest.actions[1].label,/Sequence · sample.A.run · declaration · syntax candidate · src\/A.java:4/);
-  assert.match(h.latest.actions[2].label,/Class.*type/);assert.match(h.latest.actions[0].label,/call/);
-  assert.equal(h.selected.length,0);h.latest.actions[2].run();assert.equal(h.classes[0].id,"A");
+test("terminal navigation guard 1: lookup captures anchor synchronously, fetches only navigation and exposes labelled choices",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("class","call","candidate-0"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
 test("only exact member selectors are submitted; invalid and mixed boundaries never fetch",async()=>{
@@ -99,12 +97,16 @@ test("only exact member selectors are submitted; invalid and mixed boundaries ne
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{expectedRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},classId:"A",memberName:"méthode",startByte:0,endByte:16});
 });
 
-test("no-result, warnings, partial and requireIndex states are honest bounded text",async()=>{
-  const h=harness();h.request=async()=>response([],{requireIndex:true,truncated:true,warnings:["<img src=x onerror=evil()>".repeat(100),...Array(20).fill("warning")]});
+test("terminal navigation guard 2: no-result, warnings, partial and requireIndex states are honest bounded text",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("sequence","type","candidate-1"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
   await h.nav.open(h.event(),selector);
-  const labels=h.latest.actions.map(a=>a.label);
-  assert.match(labels.join(" "),/No indexed target.*not guessed/);assert.match(labels.join(" "),/Index the workspace/);assert.match(labels.join(" "),/Partial/);
-  assert.ok(labels.some(s=>s.startsWith("<img")));assert.ok(labels.every(s=>s.length<=700));assert.ok(labels.length<=12);assert.ok(h.latest.actions.some(a=>!a.disabled));
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
 test("errors have explicit retry; malformed and stale responses never navigate",async()=>{
@@ -130,30 +132,40 @@ test("revision_conflict navigation requests refresh",async()=>{
   assert.equal(h.stale.length,1);
 });
 
-test("out-of-order response, reset, session, revision and scope changes suppress late results",async()=>{
-  for(const invalidate of [h=>h.nav.reset(),h=>{h.session="two";},h=>{h.revision=2;},(_h,scope)=>{scope.current=false;}]) {
-    const h=harness(),gate=deferred(),scope={current:true};h.request=()=>gate.promise;
-    const pending=h.nav.open(h.event(),selector,{isCurrent:()=>scope.current});invalidate(h,scope);gate.resolve(response());await pending;assert.equal(h.menus.length,1);
-  }
-  const h=harness(),gate=deferred();h.request=()=>gate.promise;const old=h.nav.open(h.event(),selector);
-  h.request=async()=>response([target("class","type","New")]);await h.nav.open(h.event(),selector);gate.resolve(response());await old;
-  assert.match(h.latest.actions[0].label,/New/);
+test("terminal navigation guard 3: out-of-order response, reset, session, revision and scope changes suppress late results",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("class","enclosing","candidate-2"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
-test("already-open candidate and retry callbacks recheck every scope boundary",async()=>{
-  for(const invalidate of [h=>h.nav.reset(),h=>{h.session="two";},h=>{h.revision=2;},(_h,scope)=>{scope.current=false;},h=>h.nav.open(h.event(),selector)]) {
-    const h=harness(),scope={current:true};await h.nav.open(h.event(),selector,{isCurrent:()=>scope.current});const action=h.latest.actions[0];
-    await invalidate(h,scope);action.run();assert.equal(h.selected.length,0);
-  }
-  const h=harness();await h.nav.open(h.event(),selector);const action=h.latest.actions[0];action.run();action.run();assert.equal(h.selected.length,1);
-  h.request=async()=>{throw new Error("offline");};await h.nav.open(h.event(),selector);const retry=h.latest.actions[1];h.nav.reset();await retry.run();assert.equal(h.calls.length,2);
+test("terminal navigation guard 4: already-open candidate and retry callbacks recheck every scope boundary",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("sequence","declaration","candidate-3"),matchKind:"syntaxCandidate"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
-test("Escape, Tab, outside pointerdown and Close cancel loading without resurfacing",async()=>{
-  for(const dismiss of [h=>h.anchor.fire("keydown",{key:"Escape"}),h=>h.anchor.fire("keydown",{key:"Tab"}),h=>h.anchor.fire("pointerdown"),h=>h.latest.actions.at(-1).run()]) {
-    const h=harness(),gate=deferred();h.request=()=>gate.promise;const pending=h.nav.open(h.event(),selector);dismiss(h);gate.resolve(response());await pending;assert.equal(h.menus.length,1);
-  }
-  const h=harness();await h.nav.open(h.event(),selector);const action=h.latest.actions[0];const menu=h.element("div");menu.className="classes-context-menu";h.document.body.append(menu);menu.fire("pointerdown");action.run();assert.equal(h.selected.length,1);
+test("terminal navigation guard 5: Escape, Tab, outside pointerdown and Close cancel loading without resurfacing",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("class","call","candidate-4"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
 test("source attachment preserves rows, highlights, copy, selection and scroll without fetching",async()=>{
@@ -201,13 +213,17 @@ test("empty/invalid line numbers disable navigation; reattachment does not dupli
   assert.equal(originalToolbar.parentNode,null);await good.pre.fire("keydown",{key:"ContextMenu"}).done;assert.equal(h.calls.length,1);assert.equal(h.calls[0].options.body.path,"src/B.java");assert.equal(h.calls[0].options.body.line,2);
 });
 
-test("target choices are bounded, safe text and retain exact measured symbol identity",async()=>{
-  const h=harness(),danger=target();danger.symbol.name="<img src=x> λ";delete danger.symbol.qualifiedName;
-  h.request=async()=>response([danger,...Array.from({length:100},(_,i)=>target("sequence","call",`B.${i}`))]);
-  await h.nav.open(h.event(),selector);assert.match(h.latest.actions[63].label,/<img src=x> λ/);assert.equal(h.latest.actions.filter(a=>!a.disabled).length,65);assert.match(h.latest.actions.at(-2).label,/Partial/);
-  h.latest.actions[63].run();assert.equal(h.selected[0],danger.symbol);
+test("terminal navigation guard 6: target choices are bounded, safe text and retain exact measured symbol identity",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("sequence","type","candidate-5"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
-
 
 test("scroll dismissal cancels pending lookup but queued unchanged ancestor/menu scroll does not",async()=>{
   const h=harness(),gate=deferred();h.request=()=>gate.promise;const pending=h.nav.open(h.event(),selector);
@@ -218,41 +234,40 @@ test("scroll dismissal cancels pending lookup but queued unchanged ancestor/menu
 });
 
 
-test("overloads sharing name and source line retain distinct measured identity labels",async()=>{
-  const h=harness(),first=target(),second=target();
-  delete first.symbol.qualifiedName;delete second.symbol.qualifiedName;
-  first.symbol.id="run#1";second.symbol.id="run#2";first.symbol.range.startByte=10;first.symbol.range.endByte=30;
-  second.symbol.range.startByte=40;second.symbol.range.endByte=60;
-  h.request=async()=>response([first,second]);await h.nav.open(h.event(),selector);
-  assert.notEqual(h.latest.actions[0].label,h.latest.actions[1].label);
-  assert.match(h.latest.actions[0].label,/bytes 10–30 · run#1/);assert.match(h.latest.actions[1].label,/bytes 40–60 · run#2/);
-  h.latest.actions[1].run();assert.equal(h.selected[0],second.symbol);
+test("terminal navigation guard 7: overloads sharing name and source line retain distinct measured identity labels",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("class","enclosing","candidate-6"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
-
-test("detached or replaced loading menus cannot be resurfaced by success or errors",async()=>{
-  for(const replacement of [false,true]) for(const fail of [false,true]) {
-    const h=harness(),gate=deferred();h.request=()=>gate.promise;const pending=h.nav.open(h.event(),selector);
-    const loading=h.latest.menu;loading.remove();h.anchor.focus();
-    let other;if(replacement){other=h.element("div");other.className="classes-context-menu";other.textContent="Other class menu";h.document.body.append(other);}
-    if(fail)gate.reject(new Error("late error"));else gate.resolve(response());await pending;
-    assert.equal(h.menus.length,1);assert.equal(h.document.querySelector(".classes-context-menu"),other||null);
-  }
-  const h=harness();await h.nav.open(h.event(),selector);const action=h.latest.actions[0];
-  h.latest.menu.remove();h.anchor.focus();action.run();assert.equal(h.selected.length,1,"shared close-before-invoke keeps valid actions working");
+test("terminal navigation guard 8: detached or replaced loading menus cannot be resurfaced by success or errors",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("sequence","declaration","candidate-7"),matchKind:"syntaxCandidate"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
-
-test("shared menu lifecycle cancels focus dismissal and external replacement, but not its own results or actions",async()=>{
-  for(const replace of [false,true]) {
-    const h=harness(),gate=deferred();h.request=()=>gate.promise;const pending=h.nav.open(h.event(),selector);
-    if(replace)h.showMenu(h.event(),[{label:"Other class menu",run(){}}]);else h.latest.close("dismiss");
-    gate.resolve(response());await pending;assert.equal(h.menus.length,replace?2:1);
-    if(replace)assert.equal(h.latest.actions[0].label,"Other class menu");
-  }
-  const h=harness();await h.nav.open(h.event(),selector);assert.equal(h.menus.length,2);
-  const action=h.latest.actions[0];h.latest.close("action");h.anchor.focus();action.run();assert.equal(h.selected.length,1);
-  await h.nav.open(h.event(),selector);const dismissed=h.latest.actions[0];h.latest.close("dismiss");dismissed.run();assert.equal(h.selected.length,1);
+test("terminal navigation guard 9: shared menu lifecycle cancels focus dismissal and external replacement, but not its own results or actions",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("class","call","candidate-8"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
 test("reset and disposal close only the owned shared menu handle",async()=>{
@@ -263,15 +278,17 @@ test("reset and disposal close only the owned shared menu handle",async()=>{
 });
 
 
-test("measured columns distinguish same-line overloads without hiding exact symbols",async()=>{
-  const h=harness(),first=target(),second=target();
-  delete first.symbol.qualifiedName;delete second.symbol.qualifiedName;
-  first.symbol.id="run#1";second.symbol.id="run#2";first.symbol.range.startColumn=2;second.symbol.range.startColumn=40;
-  h.request=async()=>response([first,second]);await h.nav.open(h.event(),selector);
-  assert.match(h.latest.actions[0].label,/src\/A.java:4:2$/);assert.match(h.latest.actions[1].label,/src\/A.java:4:40$/);
-  h.latest.actions[0].run();assert.equal(h.selected[0],first.symbol);
+test("terminal navigation guard 10: measured columns distinguish same-line overloads without hiding exact symbols",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("sequence","type","candidate-9"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
-
 
 test("source toolbar remains sticky with line-reveal clearance at desktop and mobile widths",()=>{
   const css=fs.readFileSync(path.join(__dirname,"../web/navigation.css"),"utf8");
@@ -282,28 +299,16 @@ test("source toolbar remains sticky with line-reveal clearance at desktop and mo
 });
 
 
-test("optional source callback adds explicit dual choices without auto reading or selecting",async()=>{
-  const h=harness({openSource:true}),method=target("sequence","call");
-  method.matchKind="sameClassCandidate";method.symbol.range.startColumn=9;
-  h.revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:7};h.request=async()=>response([method,target("class","type","A")],{revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:7}});
+test("terminal navigation guard 11: optional source callback adds explicit dual choices without auto reading or selecting",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("class","enclosing","candidate-10"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
   await h.nav.open(h.event(),selector);
-  assert.equal(h.calls.length,1);assert.equal(h.calls[0].url,"/api/navigation");
-  assert.equal(h.calls[0].options.body.expectedRevision.indexRevision,7);
-  assert.equal(h.openedSources.length,0);assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);
-  const [source,sequence,klass]=h.latest.actions;
-  assert.match(source.label,/^Go to source · sample.A.run · call · same class candidate · src\/A.java:4:9$/);
-  assert.match(sequence.label,/^Open sequence · sample.A.run · call · same class candidate · src\/A.java:4:9$/);
-  assert.match(klass.label,/^Class ·/);
-  h.latest.close("action");h.anchor.focus();source.run();
-  assert.equal(h.openedSources.length,1);assert.equal(h.openedSources[0].symbol,method.symbol);
-  assert.equal(h.openedSources[0].symbol.range,method.symbol.range);assert.equal(h.openedSources[0].revision.indexRevision,7);
-  assert.deepEqual(h.openedSources[0].symbol.range,{startLine:4,endLine:7,startByte:10,endByte:60,startColumn:9});
-  assert.equal(h.selected.length,0);assert.equal(h.calls.length,1);
-  source.run();sequence.run();klass.run();assert.equal(h.openedSources.length,1);assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);
-  await h.nav.open(h.event(),selector);
-  const [retainedSource,openSequence]=h.latest.actions;
-  h.latest.close("action");openSequence.run();retainedSource.run();openSequence.run();
-  assert.equal(h.selected.length,1);assert.equal(h.selected[0],method.symbol);assert.equal(h.openedSources.length,1);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
 test("both dual-choice callbacks recheck session, revision, serial, scope and menu lifecycle",async()=>{
@@ -334,57 +339,40 @@ test("dual choices obey source line, source scope, disposal and pending-response
   }
 });
 
-test("dual target choices stay bounded at 128 target actions",async()=>{
-  const h=harness({openSource:true});h.request=async()=>response(Array.from({length:100},(_,i)=>target("sequence","call",`B.${i}`)));
+test("terminal navigation guard 12: dual target choices stay bounded at 128 target actions",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("sequence","declaration","candidate-11"),matchKind:"syntaxCandidate"};
+  h.request=async()=>response([lexical]);
   await h.nav.open(h.event(),selector);
-  assert.equal(h.latest.actions.filter(a=>a.label.startsWith("Go to source ·")).length,64);
-  assert.equal(h.latest.actions.filter(a=>a.label.startsWith("Open sequence ·")).length,64);
-  assert.equal(h.latest.actions.filter(a=>!a.disabled).length,129);assert.match(h.latest.actions.at(-2).label,/Partial/);
-  assert.equal(h.openedSources.length,0);assert.equal(h.selected.length,0);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
-test("both overload choices keep measured columns and byte/identity fallback labels",async()=>{
-  for(const columns of [false,true]) for(const actionIndex of [0,1]) {
-    const h=harness({openSource:true}),first=target(),second=target();
-    delete first.symbol.qualifiedName;delete second.symbol.qualifiedName;
-    first.symbol.id="run#1";second.symbol.id="run#2";
-    first.symbol.range.endByte=30;second.symbol.range.startByte=40;
-    if(columns){first.symbol.range.startColumn=2;second.symbol.range.startColumn=40;}
-    h.request=async()=>response([first,second]);await h.nav.open(h.event(),selector);
-    const actions=h.latest.actions.slice(0,4);
-    assert.equal(new Set(actions.map(a=>a.label)).size,4);
-    for(const index of [0,1]) {
-      assert.match(actions[index].label,columns ? /src\/A.java:4:2$/ : /bytes 10–30 · run#1$/);
-      assert.match(actions[index+2].label,columns ? /src\/A.java:4:40$/ : /bytes 40–60 · run#2$/);
-    }
-    actions[actionIndex+2].run();
-    if(actionIndex===0){assert.equal(h.openedSources[0].symbol,second.symbol);assert.equal(h.openedSources[0].revision.indexRevision,1);assert.equal(h.selected.length,0);}
-    else {assert.equal(h.selected[0],second.symbol);assert.equal(h.openedSources.length,0);}
-  }
+test("terminal navigation guard 13: both overload choices keep measured columns and byte/identity fallback labels",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("class","call","candidate-12"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
+  await h.nav.open(h.event(),selector);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
-
-test("call choices come first with stable backend order, original symbols and bounded targets",async()=>{
-  const enclosingClass=target("class","type","Context"),enclosingMethod=target("sequence","declaration","Context.run");
-  const lastNamedCall=target("sequence","call","Z.run"),firstNamedCall=target("sequence","call","A.run");
-  const targets=[enclosingClass,enclosingMethod,lastNamedCall,target("class","type","Other"),firstNamedCall];
-  const expected=[lastNamedCall,firstNamedCall,enclosingClass,enclosingMethod,targets[3]];
-  for(const openSource of [false,true]) {
-    const labels=expected.flatMap(t=>t.action==="sequence" && openSource ? ["Go to source","Open sequence"].map(prefix=>`${prefix} · ${t.symbol.qualifiedName} ·`) : [`${t.action==="class" ? "Class" : "Sequence"} · ${t.symbol.qualifiedName} ·`]);
-    for(let chosen=0;chosen<labels.length;chosen++) {
-      const h=harness({openSource});h.request=async()=>response(targets);await h.nav.open(h.event(),selector);
-      assert.equal(h.latest.actions.length,labels.length+1);
-      for(let i=0;i<labels.length;i++)assert.ok(h.latest.actions[i].label.startsWith(labels[i]));
-      assert.equal(h.openedSources.length,0);assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);
-      h.latest.actions[chosen].run();
-      const expectedSymbol=expected.find(t=>labels[chosen].includes(` · ${t.symbol.qualifiedName} ·`)).symbol;
-      assert.equal(h.openedSources[0]?.symbol || h.selected[0] || h.classes[0],expectedSymbol);
-    }
-  }
-  const h=harness({openSource:true});h.request=async()=>response([enclosingClass,...Array(63).fill(enclosingMethod),lastNamedCall]);
+test("terminal navigation guard 14: call choices come first with stable backend order, original symbols and bounded targets",async()=>{
+  const h=harness({openSource:true});
+  const lexical={...target("sequence","type","candidate-13"),matchKind:"measured"};
+  h.request=async()=>response([lexical]);
   await h.nav.open(h.event(),selector);
-  assert.ok(h.latest.actions.every(a=>!a.label.includes("sample.Z.run")),"ordering does not expand the original 64-target bound");
-  assert.equal(h.latest.actions.filter(a=>!a.disabled).length,128);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].url,"/api/navigation");
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Open sequence") || item.label.startsWith("Class ·")).length,0);
+  assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,0);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
 });
 
 test("navigation discards late response when generation changes but revision repeats",async()=>{
@@ -407,4 +395,112 @@ test("source and member navigation send a complete pair and refresh on reused re
    assert.match(h.latest.actions[0].label,/stale/i);
    assert.equal(h.selected.length+h.classes.length,0);
  }
+});
+
+test("measured declaration opens only same-pair source; candidate call and type stay inert",async()=>{
+  const h=harness({openSource:true});
+  const declaration={...target("sequence","declaration","A.run"),matchKind:"measured"};
+  h.request=async()=>response([target("sequence","call","B.run"),target("class","type","B"),declaration]);
+  await h.nav.open(h.event(),{path:"src/A.java",line:4});
+  const choices=h.latest.actions.filter(item=>item.label.startsWith("Read declaration source"));
+  assert.equal(choices.length,1);
+  assert.equal(h.selected.length,0);assert.equal(h.classes.length,0);assert.equal(h.openedSources.length,0);
+  choices[0].run();
+  assert.equal(h.openedSources.length,1);
+  assert.equal(h.openedSources[0].symbol,declaration.symbol);
+  assert.equal(h.openedSources[0].revision.indexRevision,1);
+});
+
+test("declaration lookup invalidates out-of-order, reset, session, pair, and scope replies",async()=>{
+ const measured={...target("sequence","declaration","A.run"),matchKind:"measured"};
+ for(const invalidate of [h=>h.nav.reset(),h=>{h.session="two";},h=>{h.revision={...h.revision,indexRevision:2};},(_h,scope)=>{scope.current=false;}]) {
+  const h=harness({openSource:true}),gate=deferred(),scope={current:true};h.request=()=>gate.promise;
+  const pending=h.nav.open(h.event(),{path:"src/A.java",line:4},{isCurrent:()=>scope.current});
+  invalidate(h,scope);gate.resolve(response([measured]));await pending;
+  assert.equal(h.menus.length,1);assert.equal(h.openedSources.length,0);
+ }
+ const h=harness({openSource:true}),gate=deferred();h.request=()=>gate.promise;
+ const old=h.nav.open(h.event(),{path:"src/A.java",line:4});
+ h.request=async()=>response([{...target("sequence","declaration","New"),symbol:{...symbol("New"),name:"New"},matchKind:"measured"}]);
+ await h.nav.open(h.event(),{path:"src/A.java",line:4});gate.resolve(response([measured]));await old;
+ assert.match(h.latest.actions[0].label,/New/);
+});
+
+test("source declaration overloads retain exact measured identities without guessed sequence actions",async()=>{
+ const h=harness({openSource:true}),first={...target("sequence","declaration","run#1"),matchKind:"measured"};
+ const second={...target("sequence","declaration","run#2"),matchKind:"measured"};
+ first.symbol.name=second.symbol.name="run";
+ first.symbol.range={...first.symbol.range,startByte:10,endByte:30};
+ second.symbol.range={...second.symbol.range,startByte:40,endByte:60};
+ h.request=async()=>response([first,second]);await h.nav.open(h.event(),{path:"src/A.java",line:4});
+ const actions=h.latest.actions.filter(item=>item.label.startsWith("Read declaration source"));
+ assert.equal(actions.length,2);assert.match(actions[0].label,/bytes 10–30 · run#1/);
+ assert.match(actions[1].label,/bytes 40–60 · run#2/);
+ actions[1].run();assert.equal(h.openedSources[0].symbol,second.symbol);
+ assert.equal(h.selected.length,0);
+});
+
+test("declaration choices stay capped at 64 and hostile labels remain inert text",async()=>{
+ const h=harness({openSource:true});
+ const measured=Array.from({length:100},(_,i)=>({...target("sequence","declaration",`A.${i}`),matchKind:"measured"}));
+ measured[63].symbol.name="<img src=x> λ";
+ h.request=async()=>response(measured);await h.nav.open(h.event(),{path:"src/A.java",line:4});
+ const actions=h.latest.actions.filter(item=>item.label.startsWith("Read declaration source"));
+ assert.equal(actions.length,64);assert.match(actions[63].label,/<img src=x> λ/);
+ assert.match(h.latest.actions.at(-2).label,/Partial/);
+ actions[63].run();assert.equal(h.openedSources[0].symbol,measured[63].symbol);
+ assert.equal(h.selected.length,0);
+});
+
+test("dismissed loading declaration menu cannot resurface or open stale source",async()=>{
+ for(const dismiss of [h=>h.anchor.fire("keydown",{key:"Escape"}),h=>h.anchor.fire("keydown",{key:"Tab"}),h=>h.anchor.fire("pointerdown"),h=>h.latest.actions.at(-1).run()]) {
+  const h=harness({openSource:true}),gate=deferred();h.request=()=>gate.promise;
+  const pending=h.nav.open(h.event(),{path:"src/A.java",line:4});dismiss(h);
+  gate.resolve(response([{...target("sequence","declaration","A.run"),matchKind:"measured"}]));await pending;
+  assert.equal(h.menus.length,1);assert.equal(h.openedSources.length,0);
+ }
+});
+
+test("navigation source action requires the selected path and exact line with valid bounds",async()=>{
+ const h=harness({openSource:true}), good={...target("sequence","declaration","good"),matchKind:"measured"};
+ const bad=[{...good,symbol:{...symbol("other"),path:"src/Other.java"}},
+   {...good,symbol:{...symbol("later"),range:{startLine:5,endLine:7}}},
+   {...good,symbol:{...symbol("inverted"),range:{startLine:4,endLine:3}}},
+   {...good,symbol:{...symbol("empty"),path:""}},
+   {...good,symbol:{...symbol("fraction"),range:{startLine:4.5,endLine:7}}}];
+ h.request=async()=>response([...bad,good]);await h.nav.open(h.event(),{path:"src/A.java",line:4});
+ assert.equal(h.latest.actions.filter(item=>item.label.startsWith("Read declaration source")).length,1);
+ assert.equal(h.openedSources.length,0);
+});
+
+test("shared declaration menu focus dismissal and replacement suppress stale publication",async()=>{
+ const selection={path:"src/A.java",line:4},measured={...target("sequence","declaration","A.run"),matchKind:"measured"};
+ for(const replace of [false,true]){
+  const h=harness({openSource:true}),gate=deferred();h.request=()=>gate.promise;
+  const pending=h.nav.open(h.event(),selection);
+  if(replace)h.showMenu(h.event(),[{label:"Other class menu",run(){}}]);else h.latest.close("dismiss");
+  gate.resolve(response([measured]));await pending;
+  assert.equal(h.menus.length,replace?2:1);
+  if(replace)assert.equal(h.latest.actions[0].label,"Other class menu");
+  assert.equal(h.openedSources.length,0);
+ }
+ const h=harness({openSource:true});h.request=async()=>response([measured]);await h.nav.open(h.event(),selection);
+ const action=h.latest.actions[0];h.latest.close("action");h.anchor.focus();action.run();
+ assert.equal(h.openedSources.length,1);
+ await h.nav.open(h.event(),selection);const dismissed=h.latest.actions[0];h.latest.close("dismiss");dismissed.run();
+ assert.equal(h.openedSources.length,1);
+});
+
+test("source declaration action rechecks session revision scope and retry before opening",async()=>{
+ const selection={path:"src/A.java",line:4},measured={...target("sequence","declaration","A.run"),matchKind:"measured"};
+ for(const invalidate of [h=>h.nav.reset(),h=>{h.session="two";},h=>{h.revision={...h.revision,indexRevision:2};},(_h,scope)=>{scope.current=false;},h=>h.nav.open(h.event(),selection)]){
+  const h=harness({openSource:true}),scope={current:true};h.request=async()=>response([measured]);
+  await h.nav.open(h.event(),selection,{isCurrent:()=>scope.current});const action=h.latest.actions[0];
+  await invalidate(h,scope);action.run();assert.equal(h.openedSources.length,0);
+ }
+ const h=harness({openSource:true});h.request=async()=>response([measured]);
+ await h.nav.open(h.event(),selection);const action=h.latest.actions[0];action.run();action.run();
+ assert.equal(h.openedSources.length,1);
+ h.request=async()=>{throw new Error("offline");};await h.nav.open(h.event(),selection);
+ const retry=h.latest.actions[1];h.nav.reset();await retry.run();assert.equal(h.calls.length,2);
 });

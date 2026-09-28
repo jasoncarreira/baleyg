@@ -135,6 +135,7 @@ dependencies = [
  "directories",
  "hex",
  "http-body-util",
+ "icu_normalizer",
  "ignore",
  "libc",
  "protobuf",

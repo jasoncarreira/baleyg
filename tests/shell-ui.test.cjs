@@ -60,9 +60,9 @@ test("inspector uses safe original evidence, never claims candidate confidence",
   const h=harness(),step=call();let opened=0;const original=JSON.stringify(step);
   h.shell.selectStep(step,view([step]),()=>opened++);
   assert.equal(opened,0);assert.equal(h.get("inspector-title").textContent,step.label);assert.equal(h.get("inspector-clear").disabled,false);
-  assert.match(h.get("inspector-target").textContent,/candidate, not resolved dispatch/);
+  assert.match(h.get("inspector-target").textContent,/Terminal syntax only · no verified target/);
   assert.match(h.get("inspector-location").textContent,/main.rs:3:2–9:7 · revision 12345678:1/);
-  assert.match(h.get("inspector-evidence").textContent,/unresolved/);
+  assert.match(h.get("inspector-evidence").textContent,/not a runtime trace or verified dispatch/);
   assert.doesNotMatch(text(h.get("inspector-content"))+text(h.get("inspector-detail")),/confidence.*1\.0/);
   assert.equal(all(h.get("inspector-detail")).some(n=>n.tagName==="script"),false);
   h.get("inspector-open-source").listeners.click();assert.equal(opened,1);assert.equal(JSON.stringify(step),original);
@@ -168,7 +168,7 @@ test("inspector keeps raw evidence folded and source action before full details"
   assert.ok(html.indexOf('id="inspector-open-source"') < html.indexOf('id="inspector-detail"'));
   const source = fs.readFileSync(path.join(__dirname, "../web/shell.js"), "utf8");
   assert.doesNotMatch(source, /evidence\(step, detail[^;]+\.open = true/);
-  assert.match(source, /full && target.identification/);
+  assert.match(source, /"target", "resolution", "candidateSymbols"/);
 });
 
 
@@ -200,4 +200,17 @@ test("desktop source clears latent drawers before a mobile resize", () => {
   assert.equal(h.document.body.classList.contains("inspector-open"), false);
   assert.equal(h.document.body.classList.contains("explorer-open"), false);
   assert.equal(h.get("source-dock").hidden, false);
+});
+
+test("inspector refuses source callback for malformed ranges or missing paired snapshot",()=>{
+ const h=harness(),malformed=[{...call("missing"),path:""},
+  {...call("empty"),range:{}},{...call("inverted"),range:{startLine:4,endLine:2}},
+  {...call("fraction"),range:{startLine:1.5,endLine:2}}];
+ let opened=0;
+ for(const step of malformed){h.shell.selectStep(step,view([step]),()=>opened++);
+  assert.equal(h.get("inspector-open-source").disabled,true);
+  h.get("inspector-open-source").listeners.click();}
+ const good=call("good");h.shell.selectStep(good,{...view([good]),revision:null},()=>opened++);
+ assert.equal(h.get("inspector-open-source").disabled,true);
+ assert.equal(opened,0);
 });

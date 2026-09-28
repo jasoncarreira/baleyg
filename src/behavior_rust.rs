@@ -1,7 +1,7 @@
 //! Rust-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
 use crate::behavior::{Participant, SequenceStep, SequenceView};
-use crate::model::{CallSite, IndexPin, Resolution, SourceFile, SourceRange, Symbol, SymbolKind};
+use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
@@ -297,17 +297,7 @@ impl Builder<'_> {
             );
             return self.then(evaluation, f, n);
         };
-        let mut participant = if c.resolution == Resolution::Internal {
-            c.target.as_ref().map(|id| Participant {
-                id: id.clone(),
-                label: bounded(&c.callee_text),
-                kind: "internal".into(),
-                identification: "Measured internal symbol target; not inferred dispatch.".into(),
-            })
-        } else {
-            None
-        }
-        .unwrap_or_else(|| unresolved_participant(n, self.file));
+        let mut participant = unresolved_participant(n, self.file);
         if participant.kind != "internal"
             && self.view.participants.len() >= MAX_PARTICIPANTS - 1
             && !self
@@ -342,9 +332,7 @@ impl Builder<'_> {
             call_label(n, self.file),
         ) {
             s.call_id = Some(c.id);
-            s.resolution = Some(c.resolution);
             s.range = c.range;
-            s.target = target;
             f.steps.push(s);
         }
         self.then(evaluation, f, n)
@@ -680,8 +668,6 @@ fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<Sequ
             group.label = bounded(label);
             group.range = range(n);
             group.call_id = None;
-            group.target = None;
-            group.resolution = None;
             group.children = steps.drain(first..end).collect();
             steps.insert(first, group);
             return;

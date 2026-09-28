@@ -104,18 +104,19 @@ fn setup() -> Fixture {
     assert!(!sentinel.exists(), "indexing executed workspace code");
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
     assert_eq!(
-        store
-            .publish(
-                &graph,
-                &store.leader().unwrap(),
-                baleyg::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 0
-                },
-                &cancel
-            )
-            .unwrap()
-            .index_revision,
+        publish_bundle(
+            &store,
+            &graph,
+            &workspace,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.index_baseline().unwrap().index_generation,
+                index_revision: 0
+            },
+            &cancel
+        )
+        .unwrap()
+        .index_revision,
         1
     );
     let app = http::router(
@@ -296,9 +297,13 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
             assert_eq!(measured.caller, seed.id, "no foreign method body calls");
             assert_eq!(step.range, measured.range);
             assert_eq!(step.path, measured.path);
-            assert_eq!(step.resolution, Some(measured.resolution));
-            assert!(measured.target.is_none(), "no semantic target was proven");
-            assert_eq!(measured.resolution, baleyg::model::Resolution::Unresolved);
+            assert!(step.resolution.is_none() && step.target.is_none());
+            assert!(
+                serde_json::to_value(measured)
+                    .unwrap()
+                    .get("target")
+                    .is_none()
+            );
             if let Some(target) = &step.target {
                 let participant = sequence
                     .participants
@@ -357,7 +362,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         let mut all_steps = Vec::new();
         flatten(&all.steps, &mut all_steps);
         for step in all_steps.iter().filter(|s| s.call_id.is_some()) {
-            assert_eq!(step.resolution, Some(baleyg::model::Resolution::Unresolved));
+            assert!(step.resolution.is_none() && step.target.is_none());
             assert!(step.children.is_empty() && step.alternate.is_empty());
             if let Some(target) = &step.target {
                 let participant = all.participants.iter().find(|p| &p.id == target).unwrap();
@@ -432,18 +437,19 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
     let f = setup();
     let cancel = Arc::new(AtomicBool::new(false));
     assert_eq!(
-        f.store
-            .publish(
-                &f.graph,
-                &f.store.leader().unwrap(),
-                baleyg::model::IndexPin {
-                    index_generation: f.store.status().unwrap().revision.index_generation,
-                    index_revision: 1
-                },
-                &cancel
-            )
-            .unwrap()
-            .index_revision,
+        publish_bundle(
+            &f.store,
+            &f.graph,
+            &f.workspace,
+            &f.store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: f.store.status().unwrap().revision.index_generation,
+                index_revision: 1
+            },
+            &cancel
+        )
+        .unwrap()
+        .index_revision,
         2
     );
     for path in ["Worker.java", "worker.py"] {
@@ -510,4 +516,25 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
         }
     }
     assert!(!f.sentinel.exists());
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

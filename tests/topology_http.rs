@@ -126,14 +126,15 @@ async fn durable_crud_matrix() {
         record.join("workspace.db").exists(),
         "empty record remains durable"
     );
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            store.status().unwrap().revision,
-            &Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+    publish_bundle(
+        &store,
+        &graph,
+        &temp.path().join("workspace"),
+        &store.leader().unwrap(),
+        store.index_baseline().unwrap(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
 }
 #[tokio::test]
 async fn workspace_root_changed() {
@@ -153,4 +154,25 @@ async fn workspace_root_changed() {
         assert_eq!(result["error"]["code"], "root_changed");
     }
     assert!(store.status().is_err());
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

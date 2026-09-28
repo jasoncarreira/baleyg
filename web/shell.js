@@ -74,15 +74,20 @@
     if (get("inspector-clear")) get("inspector-clear").disabled = true;
     if (get("inspector-title")) get("inspector-title").title = "";
   }
-  function participant(view, target) { return (view.participants || []).find(item => item.id === target); }
-  function targetText(step, view, full = true) {
-    const target = participant(view, step.target);
-    if (!target) return step.target ? `Target reference: ${step.target}` : "No target identified for this step.";
-    const labels = {externalCandidate:"External candidate, not resolved dispatch", unresolvedReceiver:"Receiver type unresolved", unresolvedCallee:"Callee unresolved", boundary:"Unknown target", builtin:"Built-in name, not runtime proof", import:"Imported binding, not runtime proof", receiver:"Receiver hint", internal:"Indexed target", method:"Selected method"};
-    return `${target.label} · ${labels[target.kind] || target.kind}${full && target.identification ? " · " + target.identification : ""}`;
+  function targetText() { return "Terminal syntax only · no verified target"; }
+  function sourceWitness(item) {
+    const r = item?.range;
+    return typeof item?.path === "string" && !!item.path.trim() && !!r &&
+      Number.isSafeInteger(r.startLine) && r.startLine > 0 &&
+      Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine &&
+      (r.startColumn == null || (Number.isSafeInteger(r.startColumn) && r.startColumn > 0)) &&
+      (r.endColumn == null || (Number.isSafeInteger(r.endColumn) && r.endColumn > 0)) &&
+      (r.startLine !== r.endLine || r.startColumn == null || r.endColumn == null || r.endColumn >= r.startColumn) &&
+      (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
+      (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
   }
   function location(step) {
-    if (!step.path || !step.range) return "Source range unavailable";
+    if (!sourceWitness(step)) return "Source range unavailable";
     const r = step.range;
     return `${step.path}:${r.startLine}${r.startColumn == null ? "" : ":" + r.startColumn}–${r.endLine}${r.endColumn == null ? "" : ":" + r.endColumn}`;
   }
@@ -93,7 +98,7 @@
     if (get("inspector-clear")) get("inspector-clear").disabled = false;
     text("inspector-title", step.label || step.id || "Selected step");
     text("inspector-kind", step.kind || "Step");
-    text("inspector-location", `${location(step)} · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}`);
+    text("inspector-location", `${location(step)} · ${view.revision?.indexGeneration && Number.isSafeInteger(view.revision.indexRevision) ? `revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : "snapshot unavailable"}`);
     const children = step.children || [];
     const flat = step.kind === "group" && !step.alternate?.length && children.length && children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length);
     const entry = flat ? children[0] : step;
@@ -102,7 +107,7 @@
     text("inspector-target", flat
       ? `First measured entry call only: ${targetText(entry, view, false)}. Other calls may have different receivers and return types.`
       : targetText(step, view, false));
-    text("inspector-evidence", `Static possible path, not a runtime trace. ${entry.resolution == null ? "No resolution evidence supplied." : "Original resolution: " + describe(entry.resolution)}`);
+    text("inspector-evidence", `Measured source steps, not a runtime trace or verified dispatch.`);
     const detail = get("inspector-detail");
     // Every original field and all nested guards, alternates and chain calls remain
     // available as safe text. Never infer equivalent guards or invent confidence.
@@ -110,22 +115,22 @@
       const disclosure = make("details");
       disclosure.append(make("summary", `${label ? label + " · " : ""}${item.kind || "step"}: ${item.label || item.id || "Details"}`));
       disclosure.append(make("p", `${location(item)} · ${targetText(item, view)}`));
-      const fields = Object.fromEntries(Object.entries(item).filter(([key]) => !["children", "alternate"].includes(key)));
+      const fields = Object.fromEntries(Object.entries(item).filter(([key]) => !["children", "alternate", "target", "resolution", "candidateSymbols", "callbackArguments"].includes(key)));
       disclosure.append(make("pre", JSON.stringify(fields, null, 2)));
       for (const child of item.children || []) evidence(child, disclosure, "Child");
       for (const child of item.alternate || []) evidence(child, disclosure, "Alternate");
       parent.append(disclosure);
       return disclosure;
     }
-    if (detail) evidence(step, detail, "Original evidence");
-    openSource = step.path && step.range && typeof callback === "function" ? callback : null;
+    if (detail) evidence(step, detail, "Measured syntax");
+    openSource = sourceWitness(step) && view.revision?.indexGeneration && Number.isSafeInteger(view.revision.indexRevision) && typeof callback === "function" ? callback : null;
     if (get("inspector-open-source")) get("inspector-open-source").disabled = !openSource;
     drawer("inspector", true);
   }
   function updateWorkspace(status) {
     const root = status?.workspaceRoot || "";
     text("workspace-name", root.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
-    text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${status.stats?.semanticState === "unavailable" ? "Syntax only" : status.stats?.semanticState || "syntax evidence"}` : "Connect to a local daemon");
+    text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${"Syntax only · SCIP display metadata is not proof"}` : "Connect to a local daemon");
     if (get("workspace-name")) get("workspace-name").title = root;
   }
   function reset() {

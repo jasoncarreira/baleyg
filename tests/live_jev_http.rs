@@ -9,7 +9,7 @@ mod offline {
     };
     use baleyg::{
         http,
-        indexer::{IndexOptions, index_workspace},
+        indexer::{IndexOptions, index_workspace_bundle},
         model::*,
         store::Store,
     };
@@ -24,22 +24,10 @@ mod offline {
         std::fs::write(workspace.join("a.js"), format!("function leaf() {{}}\nfunction helper() {{ leaf(); }}\nfunction seed(flag) {{ if (flag) helper(); console.log(flag); }}\n//{}", "x".repeat(padding))).unwrap();
         let options = IndexOptions::new(workspace.clone());
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut graph = index_workspace(&options, &cancel, |_| {}).unwrap();
-        // Synthetic internal links exercise deeper-display policy; lexical indexing does not infer them.
-        for call in &mut graph.calls {
-            if matches!(call.callee_text.as_str(), "helper" | "leaf") {
-                call.target = Some(
-                    graph
-                        .nodes
-                        .iter()
-                        .find(|n| n.name == call.callee_text)
-                        .unwrap()
-                        .id
-                        .clone(),
-                );
-                call.resolution = Resolution::Internal;
-            }
-        }
+        let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        // Named calls remain measured terminal sites; they do not link to sibling declarations.
         let seed = graph
             .nodes
             .iter()
@@ -47,15 +35,13 @@ mod offline {
             .unwrap()
             .id
             .clone();
-        let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
         store
-            .publish(
+            .publish_native(
                 &graph,
+                &capture,
+                &native,
                 &store.leader().unwrap(),
-                baleyg::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 0,
-                },
+                store.index_baseline().unwrap(),
                 &cancel,
             )
             .unwrap();
@@ -223,15 +209,22 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
         400
     );
     assert_eq!(call(&app, "POST", &url, json!({})).await.0, 429);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &IndexOptions::new(dir.path().join("workspace")),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
     store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            store.status().unwrap().revision,
+            &cancel,
         )
         .unwrap();
     assert_eq!(call(&app, "POST", &url, json!({})).await.0, 409);

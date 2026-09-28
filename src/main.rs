@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use baleyg::{
     auth, http,
-    indexer::{IndexOptions, index_workspace},
+    indexer::IndexOptions,
     mcp,
     model::{CancelFlag, ViewQuery},
     store::{
@@ -263,22 +263,20 @@ async fn main() -> Result<()> {
         }
         Command::Index(args) => {
             let (store, options, _) = args.resolve()?;
-            let expected = store.status()?.revision;
+            let coordinator =
+                baleyg::index_coordinator::IndexJobCoordinator::prepare(&store, None)?;
             let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
             let signal = tokio::spawn(async move {
                 shutdown_signal().await;
                 flag.store(true, Ordering::Release);
             });
-            let leader = store.leader()?;
-            let writer = store.clone();
-            let work = tokio::task::spawn_blocking(move || -> Result<baleyg::model::IndexPin> {
-                let graph = index_workspace(&options, &cancel, |p| {
+            let work = tokio::task::spawn_blocking(move || {
+                coordinator.run(&options, &cancel, |p| {
                     if p.completed == p.total {
                         eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
                     }
-                })?;
-                writer.publish(&graph, &leader, expected, &cancel)
+                })
             })
             .await
             .context("index worker panicked")?;

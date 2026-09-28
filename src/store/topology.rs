@@ -1205,19 +1205,40 @@ fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
     Ok(db)
 }
 fn inspect_index(dir: &Path, key: &str, now_secs: i64) -> Result<(&'static str, &'static str)> {
+    inspect_index_with_open_hook(dir, key, now_secs, |_| Ok(()))
+}
+fn inspect_index_with_open_hook(
+    dir: &Path,
+    key: &str,
+    now_secs: i64,
+    before_snapshot: impl FnOnce(&rusqlite::Connection) -> Result<()>,
+) -> Result<(&'static str, &'static str)> {
     private_dir(dir)?;
-    let db = readonly_db(&dir.join("index.db"))?;
+    let mut connection = readonly_db(&dir.join("index.db"))?;
+    before_snapshot(&connection)?;
+    let tx = connection.transaction()?;
+    let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version == 4, "incompatible index schema");
-    let (schema, spelling, dev, ino, age): (i64, String, String, String, rusqlite::types::Value) = db.query_row(
-        "SELECT schema_version,root_spelling,root_device,root_inode,last_opened_at FROM index_metadata WHERE singleton=1", [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+    ensure!(matches!(version, 4..=6), "incompatible index schema");
+    // GC may classify only the two exact cache formats this binary knows.
+    // The same structural and extractor-marker check applies before it can
+    // declare an index eligible for deletion or report it as recently opened.
+    super::validate_cache_shape(db)?;
+    let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
+    ensure!(count == 1, "incompatible index metadata cardinality");
+    let (schema, extractor, spelling, dev, ino, age): (i64, String, String, String, String, rusqlite::types::Value) = db.query_row(
+        "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,last_opened_at FROM index_metadata WHERE singleton=1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
     ensure!(
-        schema == 4
+        ((version == 4 && schema == 4 && extractor == "native-v1")
+            || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1")
+            || (version == 6 && schema == 6 && extractor == "native-paired-v1"))
             && Path::new(&spelling).is_absolute()
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"
     );
+    let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    ensure!(integrity == "ok", "incompatible index integrity");
     let device: u64 = dev.parse()?;
     let inode: u64 = ino.parse()?;
     ensure!(device > 0 && inode > 0, "invalid root identity");
@@ -1506,10 +1527,18 @@ impl TopologyRoots {
 
 #[cfg(test)]
 pub fn assert_topology_fixture(store: &crate::store::Store, state: &Path) {
-    let status = store.status().unwrap();
+    let baseline = store.index_baseline().unwrap();
+    assert_eq!(baseline.index_revision, 0);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     let identity = WorkspaceIdentity::discover(
-        Some(Path::new(&status.workspace_root)),
-        Path::new(&status.workspace_root),
+        Some(Path::new(&store.workspace_root)),
+        Path::new(&store.workspace_root),
     )
     .unwrap();
     let roots = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
@@ -1534,4 +1563,90 @@ pub fn assert_topology_fixture(store: &crate::store::Store, state: &Path) {
         UseGuard::acquire_existing(&roots.index_use_lock(&identity), false, false).unwrap();
     assert!(UseGuard::acquire_existing(&roots.index_use_lock(&identity), true, true).is_err());
     drop(shared);
+}
+
+#[cfg(test)]
+mod gc_schema_race_tests {
+    use super::*;
+    use std::{
+        cell::RefCell,
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn extra_view_after_readonly_open_before_snapshot_never_attests_gc_or_deletion() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let store = crate::store::Store::open_for_tests(state.path(), work.path()).unwrap();
+        let pin = store.index_baseline().unwrap();
+        let path = roots.index_db(&identity);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let after_external = RefCell::new(None);
+        let refused = inspect_index_with_open_hook(
+            &roots.index_dir(&identity),
+            &identity.root_key,
+            now,
+            |_checked_readonly| {
+                // The readonly connection has already checked journal/permissions;
+                // this second SQLite connection changes the schema before its snapshot.
+                let attacker = rusqlite::Connection::open(&path)?;
+                attacker.execute_batch("CREATE VIEW gc_after_admission AS SELECT 1")?;
+                drop(attacker);
+                *after_external.borrow_mut() = Some(fs::read(&path)?);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("incompatible_index: unknown cache object")
+        );
+        let ddl_bytes = after_external.into_inner().unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            ddl_bytes,
+            "read-only GC must not write after external VIEW creation"
+        );
+        let derived = roots.gc_report_at(now).unwrap().derived;
+        assert_eq!(derived.len(), 1);
+        assert_eq!(
+            (derived[0].status, derived[0].reason),
+            ("unknown", "metadata_unreadable")
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            ddl_bytes,
+            "GC report must not change attacker-created VIEW or index bytes"
+        );
+        let attacker = rusqlite::Connection::open(&path).unwrap();
+        let (schema, marker, generation, revision): (i64,String,String,i64) = attacker.query_row(
+            "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            (schema, marker.as_str(), generation, revision),
+            (
+                5,
+                "native-no-lexical-v1",
+                pin.index_generation.to_string(),
+                pin.index_revision as i64
+            )
+        );
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible_index")
+        );
+    }
 }

@@ -1,6 +1,6 @@
 mod common;
 use baleyg::{
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::*,
 };
 use std::{
@@ -30,28 +30,16 @@ fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
                 n.id == graph
                     .calls
                     .iter()
-                    .find(|c| c.callee_text == callee)
+                    .find(|c| c.callee_text.as_deref() == Some(callee))
                     .unwrap()
                     .caller
             })
             .unwrap()
     };
-    assert_eq!(owner("factory").kind, SymbolKind::Module);
-    assert_eq!(owner("base").kind, SymbolKind::Module);
-    assert_eq!(owner("initialize").name, "Café");
-    assert_eq!(owner("method_decorator").name, "Café");
-    assert_eq!(owner("default").name, "Café");
-    assert_eq!(owner("nested_default").name, "run");
     assert_eq!(owner("nested_body").name, "nested");
     assert_eq!(owner("nested_body").kind, SymbolKind::Function);
-    assert_eq!(owner("lambda_default").name, "run");
-    assert!(owner("lambda_body").name.starts_with("<lambda@"));
-    assert_eq!(owner("request").kind, SymbolKind::Method);
-    let callback = graph.calls.iter().find(|c| c.callee_text == "use").unwrap();
-    assert_eq!(
-        callback.callback_arguments,
-        [owner("lambda_body").id.clone()]
-    );
+    assert_eq!(owner("request").name, "run");
+    assert_ne!(owner("lambda_body").id, owner("use").id);
     let class = graph.nodes.iter().find(|n| n.name == "Café").unwrap();
     assert!(source[class.range.start_byte..class.range.end_byte].starts_with("class Café"));
     let ids: BTreeSet<_> = graph.calls.iter().map(|c| &c.id).collect();
@@ -63,8 +51,8 @@ fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
     }));
     for call in graph.calls.iter().filter(|c| c.path == "sample.py") {
         assert_eq!(call.provenance.semantic, SemanticState::Unavailable);
-        assert_eq!(call.resolution, Resolution::Unresolved);
-        assert!(call.target.is_none() && call.candidate_symbols.is_empty());
+        assert!(call.id.starts_with("occ:v1:"));
+        assert!(graph.nodes.iter().any(|n| n.id == call.caller));
         assert!(
             source.is_char_boundary(call.range.start_byte)
                 && source.is_char_boundary(call.range.end_byte)
@@ -82,26 +70,30 @@ fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
     assert!(!graph.regions.is_empty());
     let state = tempfile::tempdir().unwrap();
     let store = crate::common::open_store(&state.path().join("state"), dir.path()).unwrap();
-    store
-        .publish(
-            &graph,
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (bundle_graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    assert_eq!(graph, bundle_graph);
+    let baseline = store.index_baseline().unwrap();
+    let pin = store
+        .publish_native(
+            &bundle_graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            baseline,
+            &cancel,
         )
         .unwrap();
+    assert_eq!(pin.index_revision, 1);
     assert!(
         store
-            .publish(
-                &graph,
+            .publish_native(
+                &bundle_graph,
+                &capture,
+                &native,
                 &store.leader().unwrap(),
-                baleyg::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 1
-                },
+                pin,
                 &Arc::new(AtomicBool::new(true))
             )
             .is_err()
@@ -117,20 +109,26 @@ fn recovery_annotations_and_cancellation_are_explicit() {
     let graph = run(&options);
     assert_eq!(graph.stats.parse_error_files, 1);
     assert!(graph.nodes.iter().any(|n| n.name == "healthy"));
-    assert!(
-        !graph
+    // Annotation syntax is source-measured but never execution or semantic proof.
+    for name in ["annotation", "returned"] {
+        for call in graph
             .calls
             .iter()
-            .any(|c| ["annotation", "returned"].contains(&c.callee_text.as_str()))
+            .filter(|c| c.callee_text.as_deref() == Some(name))
+        {
+            let r = call.callee_range.as_ref().unwrap();
+            assert_eq!(&source[r.start_byte..r.end_byte], name);
+            assert_eq!(call.provenance.semantic, SemanticState::Unavailable);
+        }
+    }
+    assert!(
+        graph
+            .calls
+            .iter()
+            .any(|c| c.callee_text.as_deref() == Some("café"))
     );
-    assert!(graph.calls.iter().any(|c| c.callee_text == "café"));
     assert!(index_workspace(&options, &Arc::new(AtomicBool::new(true)), |_| {}).is_err());
     fs::remove_file(dir.path().join("bad.py")).unwrap();
     assert_eq!(graph.files[0].text, source);
-    assert!(
-        graph
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "python-lexical-only")
-    );
+    assert!(graph.diagnostics.iter().any(|d| d.code == "parse-error"));
 }

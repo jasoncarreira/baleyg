@@ -5,7 +5,11 @@ use axum::{
     http::Request,
 };
 use baleyg::{
-    dependencies::CatalogOptions, http, indexer::IndexOptions, model::Graph, store::Store,
+    dependencies::CatalogOptions,
+    http,
+    indexer::{IndexOptions, index_workspace_bundle},
+    model::Graph,
+    store::Store,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -37,6 +41,25 @@ fn setup(enabled: bool) -> Fixture {
     .unwrap();
     std::fs::write(library.join("std/src/lib.rs"), "// café\npub struct LibraryType;\nimpl LibraryType { pub fn method(&self) { hidden_call(); } }\npub enum Other { A }\n").unwrap();
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    assert!(store.status().is_err());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(workspace.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
     let state = http::new_with_dependency_options(
         store.clone(),
         IndexOptions::new(workspace.clone()),
@@ -235,13 +258,39 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
             .0,
         409
     );
-    fixture
+    let before = fixture.store.index_baseline().unwrap();
+    let error = fixture
         .store
         .publish(
             &Graph::default(),
             &fixture.store.leader().unwrap(),
-            fixture.store.status().unwrap().revision,
+            before,
             &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("native_evidence_required"),
+        "{error}"
+    );
+    assert_eq!(fixture.store.index_baseline().unwrap(), before);
+    let workspace = fixture.temp.path().join("workspace");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(workspace),
+        fixture.store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    fixture
+        .store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &fixture.store.leader().unwrap(),
+            before,
+            &cancel,
         )
         .unwrap();
     assert_eq!(
@@ -494,7 +543,25 @@ async fn workspace_generation_reuse() {
         &fixture.temp.path().join("workspace"),
     )
     .unwrap();
-    let fresh = replacement.status().unwrap().revision;
+    assert!(replacement.status().is_err());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(fixture.temp.path().join("workspace")),
+        replacement.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let fresh = replacement
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &replacement.leader().unwrap(),
+            replacement.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
     assert_eq!(fresh.index_revision, old.index_revision);
     assert_ne!(fresh.index_generation, old.index_generation);
     assert_eq!(

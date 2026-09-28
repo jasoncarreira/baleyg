@@ -1,7 +1,7 @@
 //! JavaScript-only adapter. No execution, filesystem reads, or model calls.
 //! A conservative structured walk models evaluation order, not lexical call order.
 use crate::behavior::{Participant, SequenceStep, SequenceView};
-use crate::model::{CallSite, IndexPin, Resolution, SourceFile, SourceRange, Symbol, SymbolKind};
+use crate::model::{CallSite, IndexPin, SourceFile, SourceRange, Symbol, SymbolKind};
 use anyhow::{Context, Result, ensure};
 use tree_sitter::Node;
 
@@ -383,7 +383,6 @@ impl Builder<'_> {
             }) && let Some(s) = out.steps.first_mut()
             {
                 s.call_id = Some(c.id.clone());
-                s.resolution = Some(c.resolution);
                 s.range = c.range.clone();
             }
             return out;
@@ -409,22 +408,24 @@ impl Builder<'_> {
             );
             return out;
         };
-        let participant = if c.resolution == Resolution::Internal {
-            c.target.as_ref().map(|t| Participant {
-                id: t.clone(),
-                label: bounded(&c.callee_text),
-                kind: "internal".into(),
-                identification: "Measured internal symbol target.".into(),
-            })
-        } else {
-            self.bindings.identify(n, &self.file.text, &self.file.path)
-        }
-        .unwrap_or_else(|| Participant {
-            id: "boundary:unknown".into(),
-            label: "Unknown/external operations (visual group, not object identity)".into(),
-            kind: "boundary".into(),
-            identification: "Target unknown; visual group only.".into(),
-        });
+        // The full callee expression is source display text only; the native
+        // measured CallSite still uses its independently verified token.
+        let label = n
+            .child_by_field_name("function")
+            .or_else(|| n.child_by_field_name("constructor"))
+            .and_then(|node| self.file.text.get(node.byte_range()))
+            .unwrap_or(c.callee_text.as_deref().unwrap_or(""));
+        // Binding and name matching can label a terminal visual group, not a
+        // callee identity or a cross-participant sequence arrow.
+        let participant = self
+            .bindings
+            .identify(n, &self.file.text, &self.file.path)
+            .unwrap_or_else(|| Participant {
+                id: "boundary:unknown".into(),
+                label: "Unknown/external operations (visual group, not object identity)".into(),
+                kind: "boundary".into(),
+                identification: "Target unknown; visual group only.".into(),
+            });
         let target = participant.id.clone();
         // A boundary lane groups operations visually; it does not identify a shared object.
         if !self.view.participants.iter().any(|p| p.id == target) {
@@ -434,10 +435,9 @@ impl Builder<'_> {
                 if let Some(mut s) = self.step(
                     n,
                     "boundary",
-                    format!("Participant limit: {}", bounded(&c.callee_text)),
+                    format!("Participant limit: {}", bounded(label)),
                 ) {
                     s.call_id = Some(c.id);
-                    s.resolution = Some(c.resolution);
                     s.range = c.range;
                     out.steps.push(s);
                 }
@@ -448,11 +448,11 @@ impl Builder<'_> {
                 ..participant
             });
         }
-        if let Some(mut s) = self.step(n, "call", &c.callee_text) {
+        if let Some(mut s) = self.step(n, "call", label) {
             // Only the standalone wrapper is hidden, never receiver/argument effects,
             // test expressions, returned values, warn/error, or arbitrary logger names.
             if !self.show_all
-                && matches!(c.callee_text.as_str(), "console.log" | "console.debug")
+                && matches!(label, "console.log" | "console.debug")
                 && n.parent()
                     .is_some_and(|p| p.kind() == "expression_statement")
             {
@@ -461,8 +461,6 @@ impl Builder<'_> {
                 self.warn("Standalone console.log/debug wrappers are hidden by a naming heuristic, not a proof of purity; argument effects remain. Use Show all to restore them.");
             }
             s.call_id = Some(c.id);
-            s.target = Some(target);
-            s.resolution = Some(c.resolution);
             s.range = c.range;
             out.steps.push(s);
         }

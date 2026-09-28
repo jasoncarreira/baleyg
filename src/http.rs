@@ -3,7 +3,7 @@ use crate::{
     acp::Acp,
     auth::valid_token,
     dependencies::{Catalog, CatalogOptions},
-    indexer::{IndexOptions, index_workspace},
+    indexer::IndexOptions,
     jev,
     live_jev::LiveJev,
     model::*,
@@ -407,6 +407,11 @@ impl From<anyhow::Error> for ApiError {
                     "workspace_id_changed",
                 ),
                 ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
+                (
+                    "index_not_ready",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "index_not_ready",
+                ),
                 (
                     "incompatible_index",
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1217,7 +1222,10 @@ async fn sequence(
         )
     })?
     .map_err(|e| {
-        if e.to_string().starts_with("revision conflict") {
+        if e.to_string().starts_with("revision conflict")
+            || e.to_string().starts_with("index_not_ready")
+            || e.to_string().starts_with("incompatible_index")
+        {
             e.into()
         } else {
             browse_invalid()
@@ -1312,14 +1320,7 @@ async fn start_index(
         }
         serde_json::from_value(value).map_err(|_| invalid())?
     };
-    let baseline = db(s.clone(), |s| s.status()).await?.revision;
-    if request.expected_revision.is_some_and(|r| r != baseline) {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "revision_conflict",
-            "The index revision changed",
-        ));
-    }
+    let requested = request.expected_revision;
     {
         let jobs = s.jobs.lock().unwrap();
         if jobs
@@ -1335,7 +1336,10 @@ async fn start_index(
             ));
         }
     }
-    let leader = db(s.clone(), |s| s.leader()).await?;
+    let coordinator = db(s.clone(), move |store| {
+        crate::index_coordinator::IndexJobCoordinator::prepare(store, requested)
+    })
+    .await?;
     let cancel = Arc::new(AtomicBool::new(false));
     let job = IndexJob {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1380,49 +1384,57 @@ async fn start_index(
         let worker_id = id.clone();
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let graph = index_workspace(&worker.options, &worker_cancel, |p| {
+            coordinator.run(&worker.options, &worker_cancel, |p| {
                 if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
                     j.progress = p;
                 }
-            })?;
-            worker
-                .store
-                .publish(&graph, &leader, baseline, &worker_cancel)
+            })
         })
         .await;
-        let mut jobs = s.jobs.lock().unwrap();
-        let j = jobs.jobs.get_mut(&id).unwrap();
-        match result {
-            Ok(Ok(revision)) => {
-                j.state = "completed".into();
-                j.revision = Some(revision)
-            }
-            Ok(Err(e)) => {
-                if cancel.load(Ordering::Acquire) {
-                    j.state = "cancelled".into()
-                } else {
-                    j.state = "failed".into();
-                    let code = if e.to_string().starts_with("revision conflict") {
-                        "revision_conflict"
-                    } else {
-                        "index_failed"
-                    };
-                    j.error = Some(json!({"code":code,"message":"Index job failed"}));
-                }
-            }
-            Err(_) => {
-                j.state = "failed".into();
-                j.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
-            }
-        }
-        j.finished_at = Some(now());
-        let completed = j.state == "completed";
-        drop(jobs);
-        if completed {
-            s.start_dependency_index();
-        }
+        let outcome = match result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("index worker failed")),
+        };
+        finish_index_job(&s, &id, outcome, &cancel);
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
+}
+// A failed publication cannot release cached packet ownership. Only a committed
+// revision transition clears packets; old barriers still block their public reads.
+fn finish_index_job(
+    s: &Arc<DaemonState>,
+    id: &str,
+    result: anyhow::Result<IndexPin>,
+    cancel: &CancelFlag,
+) {
+    let mut jobs = s.jobs.lock().unwrap();
+    let job = jobs.jobs.get_mut(id).expect("started index job");
+    match result {
+        Ok(revision) => {
+            job.state = "completed".into();
+            job.revision = Some(revision);
+        }
+        Err(error) if cancel.load(Ordering::Acquire) => {
+            let _ = error;
+            job.state = "cancelled".into();
+        }
+        Err(error) => {
+            job.state = "failed".into();
+            let code = if error.to_string().starts_with("revision conflict") {
+                "revision_conflict"
+            } else {
+                "index_failed"
+            };
+            job.error = Some(json!({"code":code,"message":"Index job failed"}));
+        }
+    }
+    job.finished_at = Some(now());
+    let completed = job.state == "completed";
+    drop(jobs);
+    if completed {
+        *s.packets.lock().unwrap() = PacketCache::default();
+        s.start_dependency_index();
+    }
 }
 async fn current_job(State(s): State<Arc<DaemonState>>) -> Json<Option<IndexJob>> {
     let jobs = s.jobs.lock().unwrap();
@@ -1616,7 +1628,10 @@ async fn delete_annotation(
 // These endpoints only transform locally indexed evidence. They never contact a provider.
 fn question_error(e: anyhow::Error) -> ApiError {
     let message = e.to_string();
-    if message.starts_with("revision conflict") {
+    if message.starts_with("revision conflict")
+        || message.starts_with("index_not_ready")
+        || message.starts_with("incompatible_index")
+    {
         e.into()
     } else if message == "question seed not found" {
         missing()
@@ -1687,6 +1702,8 @@ async fn question_preview(
     Ok(Json(result))
 }
 async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPacket>, ApiError> {
+    // Gate readiness before touching cached evidence, including stale packets.
+    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await?;
     let packet = {
         let cache = s.packets.lock().unwrap();
         cache
@@ -1696,7 +1713,6 @@ async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPa
             .map(|(p, _)| p.clone())
             .ok_or_else(missing)?
     };
-    let revision = db(s, |store| Ok(store.status()?.revision)).await?;
     if revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1704,6 +1720,14 @@ async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPa
             "The index revision changed",
         ));
     }
+    // A packet hash authenticates only the in-memory copy. Recheck its exact
+    // selected graph and source witnesses under one pinned SQLite snapshot
+    // before exporting, displaying, or sending cached evidence to a provider.
+    let witness = packet.clone();
+    db(s, move |store| {
+        store.validate_selected_view(&witness.context, &witness.source_files)
+    })
+    .await?;
     Ok(packet)
 }
 async fn question_export(
@@ -1812,6 +1836,7 @@ async fn question_answer(
     if !request.as_object().is_some_and(|object| object.is_empty()) {
         return Err(invalid());
     }
+    db(s.clone(), |store| store.status().map(|_| ())).await?;
     let provider = s.acp.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "acp_disabled",
@@ -1893,6 +1918,7 @@ async fn question_run(
     if !body.is_empty() && body.as_ref() != b"{}" {
         return Err(invalid());
     }
+    db(s.clone(), |store| store.status().map(|_| ())).await?;
     let provider = s.provider.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "jev_disabled",
@@ -1922,6 +1948,7 @@ async fn question_run(
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    use crate::indexer::index_workspace_bundle;
     use tower::ServiceExt;
 
     #[test]
@@ -1949,6 +1976,11 @@ mod live_tests {
     #[tokio::test]
     async fn live_response_is_labeled_and_accounted() {
         mock_run(false, "success").await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_selected_cached_source_prevents_live_provider_call() {
+        mock_run(false, "selected_corruption").await;
     }
 
     #[tokio::test]
@@ -2045,7 +2077,10 @@ mod live_tests {
         .unwrap();
         let options = IndexOptions::new(workspace.clone());
         let cancel = Arc::new(AtomicBool::new(false));
-        let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
+        let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
+        crate::store::topology::assert_topology_fixture(&store, &dir.path().join("state"));
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
         let seed = graph
             .nodes
             .iter()
@@ -2053,16 +2088,13 @@ mod live_tests {
             .unwrap()
             .id
             .clone();
-        let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
-        crate::store::topology::assert_topology_fixture(&store, &dir.path().join("state"));
         store
-            .publish(
+            .publish_native(
                 &graph,
+                &capture,
+                &native,
                 &store.leader().unwrap(),
-                crate::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 0,
-                },
+                store.index_baseline().unwrap(),
                 &cancel,
             )
             .unwrap();
@@ -2112,19 +2144,65 @@ mod live_tests {
             "/api/questions/{}/jev-run",
             preview["packet"]["packetId"].as_str().unwrap()
         );
+        if scenario == "selected_corruption" {
+            let index_root = dir.path().join("state/cache/indexes");
+            let db_path = std::fs::read_dir(index_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.is_dir())
+                .unwrap()
+                .join("index.db");
+            let db = rusqlite::Connection::open(db_path).unwrap();
+            let mut bytes: Vec<u8> = db
+                .query_row(
+                    "SELECT source_bytes FROM native_documents WHERE path='a.js'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            bytes[0] ^= 1;
+            assert_eq!(
+                db.execute(
+                    "UPDATE native_documents SET source_bytes=?1 WHERE path='a.js'",
+                    [bytes],
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                store.status().unwrap().revision,
+                serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
+            );
+            let attempts = provider.budget().unwrap().attempts;
+            let response = app.oneshot(request(&path, json!({}))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "incompatible_index");
+            assert_eq!(provider.budget().unwrap().attempts, attempts);
+            server.abort();
+            return;
+        }
         let run = tokio::spawn(app.oneshot(request(&path, json!({}))));
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
             .await
             .unwrap();
         if change_snapshot {
+            let (updated, native, captured) = index_workspace_bundle(
+                &IndexOptions::new(workspace.clone()),
+                store.root_id(),
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
             store
-                .publish(
-                    &graph,
+                .publish_native(
+                    &updated,
+                    &captured,
+                    &native,
                     &store.leader().unwrap(),
-                    crate::model::IndexPin {
-                        index_generation: store.status().unwrap().revision.index_generation,
-                        index_revision: 1,
-                    },
+                    store.status().unwrap().revision,
                     &cancel,
                 )
                 .unwrap();
@@ -2233,6 +2311,24 @@ mod dependency_lifecycle_tests {
         std::fs::create_dir(&workspace).unwrap();
         let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
         crate::store::topology::assert_topology_fixture(&store, &temp.path().join("state"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) = crate::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let pin0 = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
         let state = new_with_dependency_options(
             store.clone(),
             IndexOptions::new(workspace.clone()),
@@ -2240,13 +2336,12 @@ mod dependency_lifecycle_tests {
             "127.0.0.1:7331".parse().unwrap(),
             None,
             None,
-            workspace,
+            workspace.clone(),
             vec![],
             Some(CatalogOptions::default()),
         )
         .unwrap();
         let active = AtomicBool::new(false);
-        let pin0 = store.status().unwrap().revision;
         state.dependencies.lock().unwrap().generation = 2;
         state.publish_dependency_index(2, &active, Ok(catalog("new", pin0)));
         state.publish_dependency_index(1, &active, Ok(catalog("old", pin0)));
@@ -2254,12 +2349,21 @@ mod dependency_lifecycle_tests {
         assert_eq!(state.catalog_snapshot(pin0).unwrap().id, "new");
         state.publish_dependency_index(2, &AtomicBool::new(true), Ok(catalog("cancelled", pin0)));
         assert_eq!(state.catalog_snapshot(pin0).unwrap().id, "new");
+        let (updated, native, captured) = crate::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
         store
-            .publish(
-                &Graph::default(),
+            .publish_native(
+                &updated,
+                &captured,
+                &native,
                 &store.leader().unwrap(),
                 pin0,
-                &Arc::new(AtomicBool::new(false)),
+                &cancel,
             )
             .unwrap();
         let pin1 = store.status().unwrap().revision;
@@ -2270,5 +2374,168 @@ mod dependency_lifecycle_tests {
         let generation = state.dependencies.lock().unwrap().generation;
         state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
         assert!(state.catalog_snapshot(pin1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rebaseline_packet_cache_tests {
+    use super::*;
+    use crate::indexer::index_workspace_bundle;
+    use std::{fs, sync::atomic::AtomicBool};
+
+    #[test]
+    fn failed_known_old_commit_keeps_private_packet_cache_success_clears_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("one.js"), "function go() { measured(); }\n").unwrap();
+        let options = IndexOptions::new(workspace.clone());
+        let ready = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &ready, |_| {}).unwrap();
+        let old = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &ready,
+            )
+            .unwrap();
+        let db_path = fs::read_dir(temp.path().join("state/cache/indexes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap()
+            .join("index.db");
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        let tables = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        for table in tables {
+            db.execute(&format!("DROP TABLE \"{table}\""), []).unwrap();
+        }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        drop(db);
+        let old_bytes = fs::read(&db_path).unwrap();
+        let state = new(
+            store.clone(),
+            options,
+            "0123456789abcdef".repeat(4),
+            "127.0.0.1:7332".parse().unwrap(),
+        )
+        .unwrap();
+        let seed = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "go")
+            .unwrap()
+            .id
+            .clone();
+        let packet = Arc::new(QuestionPacket {
+            packet_id: "cached-before-old".into(),
+            revision: old,
+            request: QuestionRequest {
+                seed: seed.clone(),
+                question: "what?".into(),
+                expected_revision: old,
+                evidence_depth: 0,
+                max_visible: 1,
+                allow_deeper_display: false,
+                focus_terms: vec![],
+            },
+            context: ViewResult {
+                revision: old,
+                query: ViewQuery {
+                    seed,
+                    depth: 0,
+                    max_nodes: 1,
+                    max_calls: 1,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                nodes: vec![],
+                calls: vec![],
+                regions: vec![],
+                truncated: false,
+                omitted_nodes: 0,
+                warnings: vec![],
+            },
+            source_files: vec![],
+            warnings: vec![],
+        });
+        state.packets.lock().unwrap().remember(packet, 128);
+        let register = |id: &str| {
+            state.jobs.lock().unwrap().jobs.insert(
+                id.into(),
+                IndexJob {
+                    id: id.into(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            )
+        };
+        register("failed");
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                old,
+                &cancelled,
+            )
+            .unwrap_err();
+        finish_index_job(&state, "failed", Err(error), &cancelled);
+        assert_eq!(state.jobs.lock().unwrap().jobs["failed"].state, "cancelled");
+        assert_eq!(state.packets.lock().unwrap().packets.len(), 1);
+        assert_eq!(state.packets.lock().unwrap().bytes, 128);
+        assert_eq!(fs::read(&db_path).unwrap(), old_bytes);
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
+        register("committed");
+        let revision = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                old,
+                &ready,
+            )
+            .unwrap();
+        finish_index_job(&state, "committed", Ok(revision), &ready);
+        assert_ne!(revision.index_generation, old.index_generation);
+        assert_eq!(state.packets.lock().unwrap().packets.len(), 0);
+        assert_eq!(state.packets.lock().unwrap().bytes, 0);
     }
 }

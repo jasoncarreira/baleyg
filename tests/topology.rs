@@ -1326,12 +1326,19 @@ fn index_open_and_generation() {
     let work = root(base.path());
     let state = base.path().join("state");
     let store = common::open_store(&state, &work).unwrap();
-    let first = store.status().unwrap().revision;
+    let first = store.index_baseline().unwrap();
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     assert_eq!(first.index_revision, 0);
     assert_eq!(first.index_generation.get_version_num(), 4);
     drop(store);
     let reopened = common::open_store(&state, &work).unwrap();
-    assert_eq!(reopened.status().unwrap().revision, first);
+    assert_eq!(reopened.index_baseline().unwrap(), first);
 }
 #[test]
 fn index_delete_journal_no_wal() {
@@ -1355,7 +1362,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1363,7 +1370,14 @@ fn index_delete_journal_no_wal() {
     for suffix in ["-wal", "-shm", "-journal"] {
         assert!(!index.with_file_name(format!("index.db{suffix}")).exists());
     }
-    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 }
 #[test]
 fn leader_records_open_age_and_follower_preserves_it() {
@@ -1386,7 +1400,14 @@ fn leader_records_open_age_and_follower_preserves_it() {
             .unwrap()
     };
     assert!(read_age() > 0);
-    let baseline = store.status().unwrap().revision;
+    let baseline = store.index_baseline().unwrap();
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     let leader = store.leader().unwrap();
     let age = read_age();
     assert!(age > 0);
@@ -1394,10 +1415,10 @@ fn leader_records_open_age_and_follower_preserves_it() {
     drop(store);
     let follower = common::open_store(&state, &work).unwrap();
     assert_eq!(read_age(), age);
-    assert_eq!(follower.status().unwrap().revision, baseline);
+    assert_eq!(follower.index_baseline().unwrap(), baseline);
     let leader = follower.leader().unwrap();
     assert!(read_age() >= age);
-    assert_eq!(follower.status().unwrap().revision, baseline);
+    assert_eq!(follower.index_baseline().unwrap(), baseline);
     drop(leader);
 }
 
@@ -2003,4 +2024,65 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes() {
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    drop(common::open_store(temp.path(), &work).unwrap());
+    let index = roots.index_db(&identity);
+    let now = 1_800_000_000_i64;
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.execute("UPDATE index_metadata SET last_opened_at=?1", [now])
+        .unwrap();
+    let inspect = || {
+        let before = gc_manifest(temp.path());
+        let entry = roots.gc_report_at(now).unwrap().derived.remove(0);
+        assert_eq!(
+            before,
+            gc_manifest(temp.path()),
+            "GC must not mutate any index bytes"
+        );
+        (entry.status, entry.reason)
+    };
+    assert_eq!(inspect(), ("unknown", "recent_open"));
+    db.execute(
+        "UPDATE index_metadata SET extractor_version='native-v1'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.execute(
+        "UPDATE index_metadata SET extractor_version='native-no-lexical-v1'",
+        [],
+    )
+    .unwrap();
+    db.execute_batch("CREATE TABLE unsupported(id INTEGER)")
+        .unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.execute_batch("DROP TABLE unsupported").unwrap();
+    db.execute_batch("CREATE VIEW unapproved_view AS SELECT 1")
+        .unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.execute_batch("DROP VIEW unapproved_view").unwrap();
+    db.pragma_update(None, "user_version", 6).unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.pragma_update(None, "user_version", 5).unwrap();
+    assert_eq!(inspect(), ("unknown", "recent_open"));
+    db.execute(
+        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+        [],
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(inspect(), ("unknown", "recent_open"));
+    db.execute_batch("CREATE TRIGGER unapproved_trigger AFTER INSERT ON calls BEGIN SELECT RAISE(FAIL,'FORGED'); END;").unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
+    assert_eq!(inspect(), ("unknown", "recent_open"));
+    db.execute("UPDATE index_metadata SET root_inode='1'", [])
+        .unwrap();
+    assert_eq!(inspect(), ("eligible", "root_replaced"));
 }

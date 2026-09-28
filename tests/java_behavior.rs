@@ -22,7 +22,8 @@ fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
     let seed = graph
         .nodes
         .iter()
-        .find(|n| n.name == name && matches!(n.kind, SymbolKind::Function | SymbolKind::Method))
+        .filter(|n| n.name == name && matches!(n.kind, SymbolKind::Function | SymbolKind::Method))
+        .min_by_key(|n| n.range.start_byte)
         .unwrap_or_else(|| panic!("missing {name}: {:?}", graph.nodes));
     let view = build_sequence(test_pin(7), seed, &graph.files[0], &graph.calls, false).unwrap();
     (graph, view)
@@ -80,7 +81,7 @@ fn receiver_arguments_constructor_assignment_order_and_measured_evidence() {
             .unwrap();
         assert_eq!(step.range, c.range);
         assert_eq!(step.path, c.path);
-        assert_eq!(step.resolution, Some(c.resolution));
+        assert!(step.resolution.is_none() && step.target.is_none());
     }
     assert_eq!(view.hidden_steps, 0);
     assert!(
@@ -158,14 +159,16 @@ fn nested_lambda_and_anonymous_bodies_never_execute_at_construction() {
         "run",
     );
     assert_eq!(calls(&view.steps), ["use", "arg", "new Base", "after"]);
-    let lambda = graph
-        .nodes
-        .iter()
-        .find(|s| s.name.starts_with("<lambda@"))
-        .unwrap();
-    let lambda_view =
-        build_sequence(test_pin(7), lambda, &graph.files[0], &graph.calls, true).unwrap();
-    assert_eq!(calls(&lambda_view.steps), ["inside"]);
+    assert!(!calls(&view.steps).contains(&"inside"));
+    assert!(!calls(&view.steps).contains(&"initOnly"));
+    assert!(!calls(&view.steps).contains(&"nestedOnly"));
+    assert!(graph.calls.iter().all(|call| {
+        call.caller == view.seed.id
+            || !view
+                .steps
+                .iter()
+                .any(|step| step.call_id.as_deref() == Some(&call.id))
+    }));
 }
 #[test]
 fn signatures_and_annotation_defaults_have_no_invocation_body() {

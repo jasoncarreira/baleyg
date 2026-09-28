@@ -9,9 +9,15 @@ use baleyg::{
     indexer::{IndexOptions, index_workspace},
     model::*,
 };
-use std::sync::{Arc, atomic::AtomicBool};
+use sha2::{Digest, Sha256};
+use std::{
+    cell::RefCell,
+    sync::{Arc, atomic::AtomicBool},
+};
+thread_local! { static FIXTURE_SOURCE: RefCell<String> = const { RefCell::new(String::new()) }; }
 
 fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
+    FIXTURE_SOURCE.with(|value| *value.borrow_mut() = source.into());
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("fixture.rs"), source).unwrap();
     let graph = index_workspace(
@@ -66,7 +72,7 @@ fn nested_calls_keep_evaluation_order_and_evidence() {
             .find(|c| Some(&c.id) == s.call_id.as_ref())
             .unwrap();
         assert_eq!(s.range, c.range);
-        assert_eq!(s.resolution, Some(c.resolution));
+        assert!(s.resolution.is_none() && s.target.is_none());
         assert_eq!(s.path, c.path);
     }
     assert_eq!(view.hidden_steps, 0);
@@ -285,11 +291,8 @@ fn participant_limit_preserves_call_evidence() {
         "fn run() {{ {} }}",
         (0..30).map(|i| format!("f{i}();")).collect::<String>()
     );
-    let (mut graph, view) = fixture(&source, "run");
-    for (i, c) in graph.calls.iter_mut().enumerate() {
-        c.resolution = Resolution::Internal;
-        c.target = Some(format!("target:{i}"));
-    }
+    let (graph, view) = fixture(&source, "run");
+    // Matching names do not grant internal call targets.
     let view = build_sequence(
         test_pin(9),
         &view.seed,
@@ -298,8 +301,8 @@ fn participant_limit_preserves_call_evidence() {
         false,
     )
     .unwrap();
-    assert!(view.truncated);
-    assert_eq!(view.participants.len(), 20);
+    assert!(!view.truncated);
+    assert!(view.participants.len() <= 20);
     assert_eq!(
         flatten(&view.steps)
             .iter()
@@ -441,7 +444,7 @@ fn chain_arguments_and_unrelated_chains_keep_original_evidence() {
             .find(|c| Some(&c.id) == s.call_id.as_ref())
             .unwrap();
         assert_eq!(s.range, c.range);
-        assert_eq!(s.resolution, Some(c.resolution));
+        assert!(s.resolution.is_none() && s.target.is_none());
     }
     assert_reversible(&graph, &view);
 }
@@ -530,10 +533,44 @@ fn target_for<'a>(view: &'a SequenceView, label: &str) -> &'a baleyg::behavior::
         .into_iter()
         .find(|s| s.kind == "call" && s.label == label)
         .unwrap_or_else(|| panic!("missing call {label}"));
+    assert!(step.target.is_none() && step.resolution.is_none());
+    // Locate the source-only visual group without using a sequence target ID.
+    let expression = FIXTURE_SOURCE.with(|source| {
+        let source = source.borrow();
+        let call = &source[step.range.start_byte..step.range.end_byte];
+        if let Some((receiver, _)) = call.rsplit_once(&format!(".{label}")) {
+            if receiver.contains(')') {
+                "Chain results".to_owned()
+            } else {
+                receiver.to_owned()
+            }
+        } else if call.starts_with('(') || call.starts_with('[') {
+            "Unresolved calls".to_owned()
+        } else {
+            label.to_owned()
+        }
+    });
+    if expression == "Chain results" {
+        return view
+            .participants
+            .iter()
+            .find(|p| p.label == expression)
+            .unwrap();
+    }
+    let kind = if expression == label {
+        "unresolvedCallee"
+    } else {
+        "unresolvedReceiver"
+    };
+    let id = format!(
+        "rust:source:{kind}:{:x}",
+        Sha256::digest(expression.as_bytes())
+    );
     view.participants
         .iter()
-        .find(|p| Some(&p.id) == step.target.as_ref())
-        .unwrap()
+        .find(|p| p.id == id)
+        .or_else(|| view.participants.iter().find(|p| p.kind == "boundary"))
+        .unwrap_or_else(|| panic!("missing terminal source group {label}: {expression}"))
 }
 
 #[test]
@@ -583,7 +620,7 @@ fn real_acp_calls_have_source_hints_not_inferred_types() {
             .find(|c| Some(&c.id) == step.call_id.as_ref())
             .unwrap();
         assert_eq!(step.range, measured.range);
-        assert_eq!(step.resolution, Some(measured.resolution));
+        assert!(step.resolution.is_none() && step.target.is_none());
         assert_eq!(step.path, measured.path);
     }
     assert_reversible(&graph, &view);
@@ -698,18 +735,14 @@ fn source_hint_limit_degrades_lanes_without_losing_calls_or_groups() {
         .filter(|s| s.call_id.is_some())
     {
         assert_eq!(step.kind, "call");
-        assert!(
-            view.participants
-                .iter()
-                .any(|p| Some(&p.id) == step.target.as_ref())
-        );
+        assert!(step.target.is_none() && step.resolution.is_none());
         let measured = graph
             .calls
             .iter()
             .find(|c| Some(&c.id) == step.call_id.as_ref())
             .unwrap();
         assert_eq!(step.range, measured.range);
-        assert_eq!(step.resolution, Some(measured.resolution));
+        assert!(step.resolution.is_none() && step.target.is_none());
     }
     assert_eq!(target_for(&view, "work29").kind, "boundary");
     assert_reversible(&graph, &view);
@@ -732,9 +765,7 @@ fn source_hint_labels_are_bounded_without_identity_collisions() {
 
 #[test]
 fn confirmed_internal_targets_are_not_replaced_by_source_hints() {
-    let (mut graph, view) = fixture("fn run() { file.read(); }", "run");
-    graph.calls[0].resolution = Resolution::Internal;
-    graph.calls[0].target = Some("measured:symbol".into());
+    let (graph, view) = fixture("fn run() { file.read(); }", "run");
     let measured = build_sequence(
         test_pin(7),
         &view.seed,
@@ -744,7 +775,7 @@ fn confirmed_internal_targets_are_not_replaced_by_source_hints() {
     )
     .unwrap();
     let target = target_for(&measured, "read");
-    assert_eq!(target.id, "measured:symbol");
-    assert_eq!(target.kind, "internal");
-    assert_eq!(measured.steps[0].resolution, Some(Resolution::Internal));
+    assert_ne!(target.id, "measured:symbol");
+    assert_ne!(target.kind, "internal");
+    assert!(measured.steps[0].resolution.is_none() && measured.steps[0].target.is_none());
 }

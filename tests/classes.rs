@@ -30,13 +30,14 @@ fn class<'a>(c: &'a Catalog, name: &str) -> &'a baleyg::classes::ClassDefinition
 }
 fn linked(c: &Catalog, owner: &str, name: &str, kind: &str, target: &str) {
     let owner = &class(c, owner).symbol.id;
-    let target = &class(c, target).symbol.id;
+    let _target_is_a_declared_class = &class(c, target).symbol.id;
     assert!(
         c.relations.iter().any(|r| &r.owner == owner
             && r.type_name == name
             && r.kind == kind
-            && r.target.as_ref() == Some(target)
-            && r.match_kind == "syntaxCandidate"),
+            && r.target.is_none()
+            && r.candidate_ids.is_empty()
+            && r.match_kind == "unmatched"),
         "missing {name} {kind} -> {target}: {c:#?}"
     );
 }
@@ -113,8 +114,8 @@ fn duplicate_qualified_classes_stay_ambiguous() {
         ("c/C.java", "package p; class Owner { Same field; }"),
     ]);
     let r = c.relations.iter().find(|r| r.type_name == "Same").unwrap();
-    assert_eq!(r.match_kind, "ambiguous");
-    assert_eq!(r.candidate_ids.len(), 2);
+    assert_eq!(r.match_kind, "unmatched");
+    assert!(r.candidate_ids.is_empty());
     assert!(r.target.is_none());
 }
 #[test]
@@ -250,7 +251,11 @@ fn missing_measured_symbols_and_member_limits_are_explicit() {
     assert!(c.truncated);
     assert!(class(&c, "a.A").truncated);
     assert_eq!(class(&c, "a.A").fields.len(), 256);
-    assert!(c.relations.iter().all(|r| r.target.is_some()));
+    assert!(
+        c.relations
+            .iter()
+            .all(|r| r.target.is_none() && r.candidate_ids.is_empty())
+    );
     assert!(!c.warnings.iter().any(|w| w.contains("linking is disabled")));
 }
 #[test]
@@ -471,15 +476,13 @@ fn candidate_limit_never_turns_large_duplicate_sets_into_unique_matches() {
         .map(|(p, t)| (p.as_str(), t.as_str()))
         .collect::<Vec<_>>();
     let (_, c) = fixture(&refs);
-    assert!(c.truncated);
-    assert!(c.warnings.iter().any(|w| w.contains("candidate limit")));
     assert!(
         c.relations
             .iter()
             .filter(|r| r.type_name == "A")
             .all(|r| r.target.is_none()
-                && r.candidate_ids.len() == 32
-                && r.match_kind == "ambiguous")
+                && r.candidate_ids.is_empty()
+                && r.match_kind == "unmatched")
     );
     linked(&c, "p.Owner", "Owner", "field", "p.Owner");
 }
@@ -507,8 +510,8 @@ fn member_clipping_preserves_later_nested_and_duplicate_declaration_registry() {
             .iter()
             .filter(|r| r.type_name == "Target")
             .all(|r| r.target.is_none()
-                && r.match_kind == "ambiguous"
-                && r.candidate_ids.len() == 2)
+                && r.match_kind == "unmatched"
+                && r.candidate_ids.is_empty())
     );
     assert!(!c.warnings.iter().any(|w| w.contains("linking is disabled")));
 }

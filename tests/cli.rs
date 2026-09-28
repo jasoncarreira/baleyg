@@ -38,11 +38,8 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
         );
     }
     let output = cmd.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("index_not_ready"));
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.odin.baleyg"
     } else {
@@ -94,7 +91,8 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     let view: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(view["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(view["calls"].as_array().unwrap().len(), 1);
-    assert_eq!(view["calls"][0]["resolution"], "unresolved");
+    assert!(view["calls"][0].get("resolution").is_none());
+    assert!(view["calls"][0].get("target").is_none());
     let path = temp.path().join("graph.json");
     assert!(
         command(&root, &state, "export")
@@ -273,14 +271,18 @@ fn fixed_locations_and_removed_flag() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let status = command(&root, &home, "status").output().unwrap();
+    let unready = command(&root, &home, "status").output().unwrap();
+    assert!(!unready.status.success());
+    assert!(String::from_utf8_lossy(&unready.stderr).contains("index_not_ready"));
+    let status = command(&root, &home, "index").output().unwrap();
     assert!(
         status.status.success(),
         "{}",
         String::from_utf8_lossy(&status.stderr)
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(first["revision"]["indexRevision"], 0);
+    let first = &first["status"];
+    assert_eq!(first["revision"]["indexRevision"], 1);
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -318,8 +320,8 @@ fn index_forwards_pair_and_reports_pair() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let before: Value =
-        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    let unready = command(&root, &home, "status").output().unwrap();
+    assert!(!unready.status.success());
     let result = command(&root, &home, "index").output().unwrap();
     assert!(
         result.status.success(),
@@ -332,8 +334,8 @@ fn index_forwards_pair_and_reports_pair() {
         published["publishedRevision"]
     );
     assert_eq!(
-        published["publishedRevision"]["indexGeneration"],
-        before["revision"]["indexGeneration"]
+        published["status"]["evidenceFormat"],
+        "terminal-native-graph-v1"
     );
     assert_eq!(published["publishedRevision"]["indexRevision"], 1);
 }
@@ -502,7 +504,7 @@ fn gc_report_without_workspace_does_not_create_state() {
     let root = temp.path().join("work");
     fs::create_dir(&root).unwrap();
     assert!(
-        command(&root, &home, "status")
+        command(&root, &home, "index")
             .output()
             .unwrap()
             .status
@@ -534,7 +536,7 @@ fn gc_cli_reports_multiple_indexes_in_sorted_order() {
         .collect::<Vec<_>>();
     workspaces.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, root) in &workspaces {
-        let status = command(root, &home, "status").output().unwrap();
+        let status = command(root, &home, "index").output().unwrap();
         assert!(
             status.status.success(),
             "{}",
@@ -667,4 +669,1521 @@ fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
     assert_eq!(fs::read(&path).unwrap(), before);
     assert_eq!(fs::read(&lock).unwrap(), lock_before);
     assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+}
+
+#[test]
+fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function go() { foo(); }").unwrap();
+    let first = command(&root, &home, "index").output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let old_pin = first["status"]["revision"].clone();
+    let symbols = command(&root, &home, "symbols")
+        .arg("--search")
+        .arg("go")
+        .output()
+        .unwrap();
+    assert!(symbols.status.success());
+    let symbols: Value = serde_json::from_slice(&symbols.stdout).unwrap();
+    let valid_seed = symbols["items"][0]["id"].as_str().unwrap().to_owned();
+    let cached = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let path = fs::read_dir(cached)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "foreign_keys", false).unwrap();
+        let native_tables = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in native_tables {
+            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        db.execute("UPDATE calls SET payload=json_set(payload,'$.target','lexical-guess','$.resolution','internal')",[]).unwrap();
+    }
+    for sub in ["status", "symbols", "query", "export"] {
+        let mut cmd = command(&root, &home, sub);
+        if sub == "query" {
+            cmd.arg("--seed").arg(&valid_seed);
+        }
+        let blocked_export = temp.path().join("old-export-must-not-exist.json");
+        if sub == "export" {
+            cmd.arg("--output").arg(&blocked_export);
+        }
+        let result = cmd.output().unwrap();
+        assert!(!blocked_export.exists(), "old export wrote a destination");
+        assert!(
+            !result.status.success(),
+            "{sub} unexpectedly read old index"
+        );
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(visible.contains("index_not_ready"), "{sub}: {visible}");
+        assert!(!visible.contains(old_pin["indexGeneration"].as_str().unwrap()));
+        assert!(!visible.contains("lexical-guess"));
+    }
+    // Real CLI exploit regression: an exact legacy4 DB with an extra trigger
+    // cannot rebaseline into a forged schema5 publication or write anything.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER forged_call AFTER INSERT ON calls BEGIN
+        UPDATE calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
+        WHERE id=NEW.id; END;",
+    )
+    .unwrap();
+    drop(db);
+    let dangerous_bytes = fs::read(&path).unwrap();
+    let rejected = command(&root, &home, "index").output().unwrap();
+    assert!(!rejected.status.success());
+    let message = String::from_utf8_lossy(&rejected.stderr);
+    assert!(message.contains("incompatible_index"), "{message}");
+    assert_eq!(fs::read(&path).unwrap(), dangerous_bytes);
+    let blocked_export = command(&root, &home, "export").output().unwrap();
+    assert!(!blocked_export.status.success());
+    assert!(!String::from_utf8_lossy(&blocked_export.stdout).contains("FORGED-NOT-MEASURED"));
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let forged: i64 = db
+        .query_row(
+            "SELECT count(*) FROM calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(forged, 0, "unknown trigger executed despite refusal");
+    db.execute_batch("DROP TRIGGER forged_call").unwrap();
+    drop(db);
+    let next = command(&root, &home, "index").output().unwrap();
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let next: Value = serde_json::from_slice(&next.stdout).unwrap();
+    assert_ne!(
+        next["status"]["revision"]["indexGeneration"],
+        old_pin["indexGeneration"]
+    );
+    assert_eq!(next["status"]["evidenceFormat"], "terminal-native-graph-v1");
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(status.status.success());
+    let ready: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(ready["revision"], next["status"]["revision"]);
+    let queried = command(&root, &home, "query")
+        .arg("--seed")
+        .arg(&valid_seed)
+        .output()
+        .unwrap();
+    assert!(
+        queried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queried.stderr)
+    );
+    let view: Value = serde_json::from_slice(&queried.stdout).unwrap();
+    assert_eq!(view["revision"], ready["revision"]);
+    assert!(
+        view["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|call| call.get("target").is_none())
+    );
+    assert!(!view.to_string().contains("lexical-guess"));
+    let exported = command(&root, &home, "export").output().unwrap();
+    assert!(exported.status.success());
+    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert_eq!(graph["files"][0]["text"], "function go() { foo(); }");
+    assert!(!graph.to_string().contains("lexical-guess"));
+}
+
+// Read the normalized publication, including every native row, from the real daemon's database.
+fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
+    fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "index.db") {
+                return Some(path);
+            }
+            if path.is_dir()
+                && let Some(db) = find(&path)
+            {
+                return Some(db);
+            }
+        }
+        None
+    }
+    find(home).expect("published native database")
+}
+fn real_native_snapshot(home: &std::path::Path) -> Value {
+    use rusqlite::types::ValueRef;
+    let db = rusqlite::Connection::open(real_index_db(home)).unwrap();
+    let source_set: (String, String) = db
+        .query_row("SELECT id,root_id FROM native_source_sets", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    let revision: (String, String, String, String, String) = db.query_row(
+        "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions", [],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
+    ).unwrap();
+    let mut documents = Vec::new();
+    let mut stmt = db.prepare(
+        "SELECT source_set_id,language,path,revision_id,content_hash,byte_length,source_bytes FROM native_documents ORDER BY path"
+    ).unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Vec<u8>>(6)?,
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (set, language, path, revision, hash, length, bytes) = row.unwrap();
+        documents.push(serde_json::json!({"sourceSetId":set,"language":language,"path":path,
+            "revisionId":revision,"contentHash":hash,"byteLength":length,"bytesHex":hex::encode(bytes)}));
+    }
+    let mut all_rows = serde_json::Map::new();
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%' ORDER BY name").unwrap();
+    for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+        let name = name.unwrap();
+        let mut table = db
+            .prepare(&format!("SELECT * FROM {name} ORDER BY rowid"))
+            .unwrap();
+        let columns = table.column_count();
+        let records = table
+            .query_map([], |row| {
+                let mut cells = Vec::new();
+                for i in 0..columns {
+                    let cell = match row.get_ref(i)? {
+                        ValueRef::Null => Value::Null,
+                        ValueRef::Integer(n) => serde_json::json!(n),
+                        ValueRef::Real(n) => serde_json::json!(n),
+                        ValueRef::Text(bytes) => serde_json::json!(String::from_utf8_lossy(bytes)),
+                        ValueRef::Blob(bytes) => serde_json::json!({"blobHex":hex::encode(bytes)}),
+                    };
+                    cells.push(cell);
+                }
+                Ok(cells)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        all_rows.insert(name, serde_json::json!(records));
+    }
+    serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
+        "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
+            "configHash":revision.3,"dependencyHash":revision.4},
+        "documents":documents,"allRows":all_rows})
+}
+
+fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
+    let output = command(root, home, "export").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+async fn real_api(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    method: reqwest::Method,
+    route: &str,
+    body: Option<Value>,
+) -> (reqwest::StatusCode, Value) {
+    let mut request = client
+        .request(method, format!("{url}{route}"))
+        .header("Origin", url)
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap())
+}
+
+// Reverse the lossless Jev table encoding to check the real cached export against
+// the separately read graph and preview, not only its HTTP status or packet ID.
+fn decoded_jev_rows(export: &Value, table: &str) -> Vec<Value> {
+    fn identity(cell: &Value, identities: &[Value]) -> Value {
+        match cell {
+            Value::Null => Value::Null,
+            Value::Number(n) => identities[n.as_u64().unwrap() as usize].clone(),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|v| identity(v, identities)).collect())
+            }
+            _ => panic!("unexpected Jev identity cell: {cell}"),
+        }
+    }
+    let state = &export["state"];
+    let encoded = &state["packet"]["context"][table];
+    let identities = state["identities"].as_array().unwrap();
+    let columns = encoded["columns"].as_array().unwrap();
+    let identity_columns = encoded["identityColumns"].as_array().unwrap();
+    let range_columns = state["rangeColumns"].as_array().unwrap();
+    encoded["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let cells = row.as_array().unwrap();
+            assert_eq!(cells.len(), columns.len());
+            let mut result = serde_json::Map::new();
+            for (column, cell) in columns.iter().zip(cells) {
+                let name = column.as_str().unwrap();
+                let decoded = if identity_columns.iter().any(|id| id.as_str() == Some(name)) {
+                    identity(cell, identities)
+                } else if name == "range" {
+                    let values = cell.as_array().unwrap();
+                    assert_eq!(values.len(), range_columns.len());
+                    Value::Object(
+                        range_columns
+                            .iter()
+                            .zip(values)
+                            .map(|(key, value)| (key.as_str().unwrap().to_owned(), value.clone()))
+                            .collect(),
+                    )
+                } else {
+                    cell.clone()
+                };
+                result.insert(name.to_owned(), decoded);
+            }
+            Value::Object(result)
+        })
+        .collect()
+}
+
+fn assert_fixture_declaration(
+    native: &Value,
+    symbol: &Value,
+    path: &str,
+    name: &str,
+    kind: &str,
+    owner: Option<&str>,
+    source: &str,
+) {
+    let matching: Vec<_> = native["allRows"]["native_declarations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[0] == symbol["id"])
+        .collect();
+    assert_eq!(matching.len(), 1, "one native declaration for {name}");
+    let row = matching[0];
+    assert_eq!(symbol["name"], name);
+    assert_eq!(symbol["path"], path);
+    assert_eq!(symbol["parent"], serde_json::json!(owner));
+    assert_eq!(
+        row[1], native["sourceSet"]["id"],
+        "{name}: native declaration source set"
+    );
+    assert_eq!(row[3], path, "{name}: native document path");
+    assert_eq!(
+        row[4], native["revision"]["id"],
+        "{name}: native declaration revision"
+    );
+    assert_eq!(row[5], serde_json::json!(owner), "{name}: native owner");
+    assert_eq!(row[6], kind, "{name}: native declaration kind");
+    assert_eq!(row[7], name, "{name}: native measured name");
+    assert_eq!(
+        row[13], symbol["range"]["startByte"],
+        "{name}: native start"
+    );
+    assert_eq!(row[14], symbol["range"]["endByte"], "{name}: native end");
+    let start = row[13].as_u64().unwrap() as usize;
+    let end = row[14].as_u64().unwrap() as usize;
+    assert!(
+        source
+            .get(start..end)
+            .is_some_and(|text| text.contains(name)),
+        "{name}: captured bytes must witness declaration"
+    );
+}
+
+// Exercise the actual executable on both sides of the coordinator, not an in-process router.
+#[tokio::test]
+async fn real_cli_and_authenticated_daemon_share_native_pair_for_every_language_and_empty_root() {
+    use std::{io::Read, os::unix::fs::PermissionsExt, time::Duration};
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for (name, file, source) in [
+        (
+            "java",
+            "Flow.java",
+            "class Flow { void seed() { sink(); } void sink() {} }
+",
+        ),
+        (
+            "javascript",
+            "flow.js",
+            "function seed() { sink(); } function sink() {}
+",
+        ),
+        (
+            "python",
+            "flow.py",
+            "def seed():
+    sink()
+def sink():
+    pass
+",
+        ),
+        (
+            "rust",
+            "flow.rs",
+            "fn seed() { sink(); } fn sink() {}
+",
+        ),
+        ("empty", "", ""),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("workspace");
+        let home = tmp.path().join("home");
+        fs::create_dir(&root).unwrap();
+        if !file.is_empty() {
+            fs::write(root.join(file), source).unwrap();
+        }
+        let indexed = command(&root, &home, "index").output().unwrap();
+        assert!(
+            indexed.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+        let first: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+        let old_pin = first["publishedRevision"].clone();
+        assert_eq!(first["status"]["revision"], old_pin, "{name}");
+        let native_before = real_native_snapshot(&home);
+        let graph_before = real_export(&root, &home);
+        assert_eq!(
+            native_before["documents"].as_array().unwrap().len(),
+            usize::from(!file.is_empty()),
+            "{name}"
+        );
+
+        let token_file = tmp.path().join("token");
+        fs::write(&token_file, TOKEN).unwrap();
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let stderr_path = tmp.path().join("daemon-stderr");
+        let mut server = Server(
+            isolated_command(&home)
+                .arg("serve")
+                .arg("--workspace")
+                .arg(&root)
+                .arg("--bind")
+                .arg(format!("127.0.0.1:{port}"))
+                .arg("--token-file")
+                .arg(&token_file)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(
+                    fs::File::create(&stderr_path).unwrap(),
+                ))
+                .spawn()
+                .unwrap(),
+        );
+        let url = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..100 {
+            if client
+                .get(format!("{url}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if !ready {
+            let status = server.0.try_wait().unwrap();
+            let mut diagnostic = String::new();
+            fs::File::open(&stderr_path)
+                .unwrap()
+                .take(2048)
+                .read_to_string(&mut diagnostic)
+                .unwrap();
+            let diagnostic = diagnostic.replace(TOKEN, "[redacted]");
+            panic!("{name}: daemon did not start: status={status:?}, stderr={diagnostic}");
+        }
+        let request = || {
+            client
+                .post(format!("{url}/api/index"))
+                .header("Origin", &url)
+                .json(&serde_json::json!({"expectedRevision":old_pin}))
+        };
+        let denied = request().bearer_auth("incorrect").send().await.unwrap();
+        assert_eq!(denied.status(), 401, "{name}");
+        let invalid_origin = client
+            .post(format!("{url}/api/index"))
+            .header("Origin", "https://evil.example")
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_origin.status(), 403, "{name}");
+        let current: Value = client
+            .get(format!("{url}/api/jobs/current"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            current.is_null(),
+            "{name}: rejected auth/origin must not start work"
+        );
+        let accepted = request().bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(accepted.status(), 202, "{name}");
+        let started: Value = accepted.json().await.unwrap();
+        let id = started["id"].as_str().unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let job: Value = client
+                    .get(format!("{url}/api/jobs/{id}"))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !job["finishedAt"].is_null() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed["state"], "completed", "{name}: {completed}");
+        let pin = completed["revision"].clone();
+        assert_eq!(pin["indexGeneration"], old_pin["indexGeneration"], "{name}");
+        assert_eq!(pin["indexRevision"], 2, "{name}");
+        let status: Value = client
+            .get(format!("{url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["revision"], pin, "{name}");
+        assert_eq!(
+            status["stats"]["files"],
+            usize::from(!file.is_empty()),
+            "{name}"
+        );
+        use sha2::{Digest, Sha256};
+        let native_after = real_native_snapshot(&home);
+        let graph_after = real_export(&root, &home);
+        assert_eq!(
+            native_after, native_before,
+            "{name}: complete normalized native rows must be stable"
+        );
+        assert_eq!(
+            graph_after, graph_before,
+            "{name}: identical bytes must reproduce graph"
+        );
+        let root_id =
+            baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+                .unwrap()
+                .record_id;
+        assert_eq!(native_after["sourceSet"]["rootId"], root_id, "{name}");
+        assert_eq!(
+            native_after["revision"]["sourceSetId"], native_after["sourceSet"]["id"],
+            "{name}"
+        );
+        for field in ["toolchainHash", "configHash", "dependencyHash"] {
+            assert_eq!(
+                native_after["revision"][field].as_str().unwrap().len(),
+                64,
+                "{name}: {field}"
+            );
+        }
+        let documents = native_after["documents"].as_array().unwrap();
+        let graph_files = graph_after["files"].as_array().unwrap();
+        assert_eq!(
+            documents.len(),
+            graph_files.len(),
+            "{name}: every graph source needs native bytes"
+        );
+        for doc in documents {
+            let path = doc["path"].as_str().unwrap();
+            let graph_file = graph_files.iter().find(|row| row["path"] == path).unwrap();
+            let bytes = graph_file["text"].as_str().unwrap().as_bytes();
+            let digest = hex::encode(Sha256::digest(bytes));
+            assert_eq!(
+                doc["sourceSetId"], native_after["sourceSet"]["id"],
+                "{name}"
+            );
+            assert_eq!(doc["revisionId"], native_after["revision"]["id"], "{name}");
+            assert_eq!(doc["language"], graph_file["language"], "{name}");
+            assert_eq!(doc["contentHash"], digest, "{name}");
+            assert_eq!(doc["contentHash"], graph_file["hash"], "{name}");
+            assert_eq!(doc["byteLength"], bytes.len(), "{name}");
+            assert_eq!(doc["bytesHex"], hex::encode(bytes), "{name}");
+            let route = format!(
+                "/api/source?path={path}&indexGeneration={}&indexRevision={}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            );
+            let (code, source_at) =
+                real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+            assert_eq!(code, 200, "{name}: {source_at}");
+            assert_eq!(source_at["revision"], pin, "{name}");
+            assert_eq!(
+                source_at["file"], *graph_file,
+                "{name}: pinned source equals graph and native bytes"
+            );
+        }
+        if !file.is_empty() {
+            assert_eq!(documents[0]["path"], file, "{name}");
+            assert_eq!(graph_files[0]["text"], source, "{name}");
+            let pinned = format!(
+                "indexGeneration={}&indexRevision={}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            );
+            let measured = graph_after["nodes"].as_array().unwrap();
+            let (code, classes) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/classes?{pinned}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {classes}");
+            assert_eq!(classes["revision"], pin, "{name}");
+            let measured_classes: Vec<_> = measured
+                .iter()
+                .filter(|node| node["kind"] == "class")
+                .collect();
+            assert_eq!(
+                measured_classes.len(),
+                usize::from(name == "java"),
+                "{name}: expected independently measured class set"
+            );
+            let class_owner = if name == "java" {
+                Some(measured_classes[0]["id"].as_str().unwrap())
+            } else {
+                None
+            };
+            let returned_classes = classes["items"].as_array().unwrap();
+            assert_eq!(
+                returned_classes.len(),
+                measured_classes.len(),
+                "{name}: truthful class catalog"
+            );
+            for class in returned_classes {
+                let symbol = &class["symbol"];
+                assert!(
+                    measured_classes.contains(&symbol),
+                    "{name}: class must be a captured declaration: {class}"
+                );
+                assert_eq!(
+                    symbol["name"], "Flow",
+                    "{name}: only Java has a measured class"
+                );
+                assert_fixture_declaration(
+                    &native_after,
+                    symbol,
+                    file,
+                    "Flow",
+                    "type",
+                    None,
+                    source,
+                );
+            }
+            assert_eq!(
+                returned_classes.len(),
+                usize::from(name == "java"),
+                "{name}"
+            );
+            let (code, symbols) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                "/api/symbols?q=seed",
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {symbols}");
+            assert_eq!(symbols["revision"], pin, "{name}");
+            let seed = symbols["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "seed")
+                .expect("measured seed declaration")["id"]
+                .as_str()
+                .unwrap();
+            let measured_seed = measured.iter().find(|node| node["id"] == seed).unwrap();
+            assert_eq!(measured_seed["path"], file, "{name}");
+            let callable_kind = if name == "java" { "method" } else { "function" };
+            assert_fixture_declaration(
+                &native_after,
+                measured_seed,
+                file,
+                "seed",
+                callable_kind,
+                class_owner,
+                source,
+            );
+            let (code, navigation) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::POST,
+                "/api/navigation",
+                Some(serde_json::json!({"expectedRevision":pin,"path":file,"line":1})),
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {navigation}");
+            assert_eq!(navigation["revision"], pin, "{name}");
+            let targets = navigation["targets"].as_array().unwrap();
+            assert!(
+                targets.iter().any(|target| target["symbol"]["id"] == seed),
+                "{name}: source line must navigate to measured seed: {navigation}"
+            );
+            for target in targets {
+                let symbol = &target["symbol"];
+                assert_eq!(symbol["path"], file, "{name}");
+                assert_eq!(target["matchKind"], "measured", "{name}");
+                assert!(
+                    measured.iter().any(|node| node == symbol),
+                    "{name}: navigation only to captured symbol: {target}"
+                );
+                let target_name = symbol["name"].as_str().unwrap();
+                match target_name {
+                    "Flow" if name == "java" => assert_fixture_declaration(
+                        &native_after,
+                        symbol,
+                        file,
+                        "Flow",
+                        "type",
+                        None,
+                        source,
+                    ),
+                    "seed" | "sink" => assert_fixture_declaration(
+                        &native_after,
+                        symbol,
+                        file,
+                        target_name,
+                        callable_kind,
+                        class_owner,
+                        source,
+                    ),
+                    _ => panic!("{name}: unexpected navigation declaration {target}"),
+                }
+            }
+            let (code, sequence) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::POST,
+                "/api/sequence",
+                Some(serde_json::json!({"expectedRevision":pin,"seed":seed})),
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {sequence}");
+            assert_eq!(sequence["revision"], pin, "{name}");
+            assert_eq!(
+                sequence["seed"], *measured_seed,
+                "{name}: sequence selected wrong seed"
+            );
+            let graph_calls = graph_after["calls"].as_array().unwrap();
+            let native_calls = native_after["allRows"]["native_calls"].as_array().unwrap();
+            assert_eq!(
+                graph_calls.len(),
+                1,
+                "{name}: fixture has exactly one measured sink call"
+            );
+            assert_eq!(
+                native_calls.len(),
+                1,
+                "{name}: exactly one native sink call"
+            );
+            let call = &graph_calls[0];
+            let native_call = &native_calls[0];
+            let expected_start = source.find("sink()").unwrap();
+            let expected_end = expected_start + "sink()".len();
+            assert_eq!(source.get(expected_start..expected_end), Some("sink()"));
+            assert_eq!(call["caller"], seed, "{name}: measured call owner");
+            assert_eq!(call["path"], file, "{name}: measured call path");
+            assert_eq!(call["calleeText"], "sink", "{name}: measured call spelling");
+            assert_eq!(call["range"]["startByte"], expected_start, "{name}");
+            assert_eq!(call["range"]["endByte"], expected_end, "{name}");
+            assert_eq!(
+                native_call[0], call["id"],
+                "{name}: same measured native call ID"
+            );
+            assert_eq!(native_call[1], seed, "{name}: native call owner");
+            assert_eq!(
+                native_call[3], native_after["sourceSet"]["id"],
+                "{name}: call source set"
+            );
+            assert_eq!(
+                native_call[6], native_after["revision"]["id"],
+                "{name}: call revision"
+            );
+            assert_eq!(native_call[4], name, "{name}: native language");
+            assert_eq!(native_call[5], file, "{name}: native call path");
+            assert_eq!(native_call[7], expected_start, "{name}: native start byte");
+            assert_eq!(native_call[8], expected_end, "{name}: native end byte");
+            assert_eq!(native_call[11], "sink", "{name}: native callee spelling");
+            fn measured_steps(
+                steps: &[Value],
+                file: &str,
+                text: &str,
+                calls: &[Value],
+                native: &[Value],
+                seen: &mut Vec<String>,
+                flattened: &mut Vec<Value>,
+            ) {
+                for step in steps {
+                    flattened.push(step.clone());
+                    assert_eq!(step["path"], file, "sequence step path: {step}");
+                    let start = step["range"]["startByte"].as_u64().unwrap() as usize;
+                    let end = step["range"]["endByte"].as_u64().unwrap() as usize;
+                    assert!(
+                        start <= end && end <= text.len(),
+                        "step outside captured source: {step}"
+                    );
+                    assert!(
+                        step.get("target").is_none() && step.get("resolution").is_none(),
+                        "syntax must never infer dispatch: {step}"
+                    );
+                    if let Some(id) = step["callId"].as_str() {
+                        let call = calls
+                            .iter()
+                            .find(|call| call["id"] == id)
+                            .expect("measured graph call");
+                        assert_eq!(step["path"], call["path"]);
+                        assert_eq!(step["range"], call["range"]);
+                        assert!(
+                            native.iter().any(|row| row[0] == id),
+                            "native call ID absent: {id}"
+                        );
+                        seen.push(id.to_owned());
+                    }
+                    for branch in ["children", "alternate"] {
+                        measured_steps(
+                            step[branch].as_array().unwrap(),
+                            file,
+                            text,
+                            calls,
+                            native,
+                            seen,
+                            flattened,
+                        );
+                    }
+                }
+            }
+            let mut seen = Vec::new();
+            let mut flattened = Vec::new();
+            measured_steps(
+                sequence["steps"].as_array().unwrap(),
+                file,
+                source,
+                graph_calls,
+                native_calls,
+                &mut seen,
+                &mut flattened,
+            );
+            assert_eq!(
+                seen,
+                vec![call["id"].as_str().unwrap().to_owned()],
+                "{name}: exactly one source-witnessed sink call and no duplicate/extra call IDs"
+            );
+            assert_eq!(
+                flattened.len(),
+                1,
+                "{name}: no invented null-call/control steps: {sequence}"
+            );
+            let step = &flattened[0];
+            assert_eq!(step["kind"], "call", "{name}");
+            assert_eq!(step["callId"], call["id"], "{name}");
+            assert_eq!(step["label"], "sink", "{name}");
+            assert_eq!(step["path"], file, "{name}");
+            assert_eq!(step["range"], call["range"], "{name}");
+            assert_eq!(source.get(expected_start..expected_end), Some("sink()"));
+            let expected_seed: baleyg::model::Symbol =
+                serde_json::from_value(measured_seed.clone()).unwrap();
+            let expected_file: baleyg::model::SourceFile =
+                serde_json::from_value(graph_files[0].clone()).unwrap();
+            let expected_calls: Vec<baleyg::model::CallSite> = graph_calls
+                .iter()
+                .map(|call| serde_json::from_value(call.clone()).unwrap())
+                .collect();
+            let expected_pin: baleyg::model::IndexPin =
+                serde_json::from_value(pin.clone()).unwrap();
+            let expected_sequence = baleyg::behavior::build_sequence(
+                expected_pin,
+                &expected_seed,
+                &expected_file,
+                &expected_calls,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                sequence["steps"],
+                serde_json::json!(expected_sequence.steps),
+                "{name}: no extra invented or null-call steps beyond captured source projection"
+            );
+            let (code, preview) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::POST,
+                "/api/questions/preview",
+                Some(serde_json::json!({
+                    "seed":seed,"question":"what happens?","expectedRevision":pin
+                })),
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {preview}");
+            let preview_packet = &preview["packet"];
+            assert_eq!(preview_packet["revision"], pin, "{name}");
+            assert_eq!(preview_packet["request"]["expectedRevision"], pin, "{name}");
+            assert_eq!(preview_packet["request"]["seed"], seed, "{name}");
+            assert_eq!(preview_packet["context"]["revision"], pin, "{name}");
+            assert_eq!(preview_packet["context"]["query"]["seed"], seed, "{name}");
+            assert_eq!(
+                preview_packet["context"]["nodes"],
+                serde_json::json!([measured_seed]),
+                "{name}: packet must contain the exact selected graph/native seed"
+            );
+            assert_eq!(
+                preview_packet["sourceFiles"],
+                serde_json::json!([graph_files[0]]),
+                "{name}: packet must cite exact selected captured source"
+            );
+            let selected_calls = preview_packet["context"]["calls"].as_array().unwrap();
+            assert_eq!(
+                selected_calls.len(),
+                1,
+                "{name}: exactly one preview sink call"
+            );
+            assert_eq!(
+                selected_calls[0], *call,
+                "{name}: preview must cite the full measured native/graph call"
+            );
+            assert!(
+                graph_after["regions"].as_array().unwrap().is_empty(),
+                "{name}: simple seed-to-sink fixture has no control region"
+            );
+            assert_eq!(
+                preview_packet["context"]["regions"], graph_after["regions"],
+                "{name}: no fabricated preview control regions"
+            );
+            assert!(!preview.to_string().contains("lexical-guess"), "{name}");
+            let packet = preview_packet["packetId"].as_str().unwrap();
+            let (code, export) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/questions/{packet}/jev-request"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {export}");
+            assert_eq!(
+                export["state"]["identityPaths"],
+                serde_json::json!(["/request/seed", "/context/query/seed"]),
+                "{name}: canonical identity paths"
+            );
+            assert_eq!(
+                export["state"]["rangeColumns"],
+                serde_json::json!([
+                    "startByte",
+                    "endByte",
+                    "startLine",
+                    "startColumn",
+                    "endLine",
+                    "endColumn"
+                ]),
+                "{name}: canonical source range columns"
+            );
+            for (table, columns) in [
+                ("nodes", serde_json::json!(["id", "parent"])),
+                ("calls", serde_json::json!(["id", "caller", "regions"])),
+                ("regions", serde_json::json!(["id", "parent", "owner"])),
+            ] {
+                assert_eq!(
+                    export["state"]["packet"]["context"][table]["identityColumns"], columns,
+                    "{name}: canonical {table} identity columns"
+                );
+            }
+            let wire = &export["state"]["packet"];
+            assert_eq!(
+                wire["packetId"], packet,
+                "{name}: cached export packet identity"
+            );
+            assert_eq!(wire["revision"], pin, "{name}");
+            assert_eq!(wire["request"]["expectedRevision"], pin, "{name}");
+            assert_eq!(wire["context"]["revision"], pin, "{name}");
+            assert_eq!(
+                wire["sourceFiles"], preview_packet["sourceFiles"],
+                "{name}: cached source witness"
+            );
+            let identities = export["state"]["identities"].as_array().unwrap();
+            for index in [
+                wire["request"]["seed"].as_u64().unwrap(),
+                wire["context"]["query"]["seed"].as_u64().unwrap(),
+            ] {
+                assert_eq!(
+                    identities[index as usize], seed,
+                    "{name}: encoded seed identity"
+                );
+            }
+            let mut decoded = wire.clone();
+            decoded["request"]["seed"] = serde_json::json!(seed);
+            decoded["context"]["query"]["seed"] = serde_json::json!(seed);
+            for table in ["nodes", "calls", "regions"] {
+                let rows = decoded_jev_rows(&export, table);
+                if table == "nodes" || table == "calls" {
+                    assert!(
+                        !rows.is_empty(),
+                        "{name}: cached {table} witness cannot be empty"
+                    );
+                }
+                decoded["context"][table] = serde_json::json!(rows);
+            }
+            assert_eq!(
+                decoded, *preview_packet,
+                "{name}: lossless cached export must equal the entire selected measured packet"
+            );
+            let question_keys: Vec<_> = export["questions"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            let mut expected_keys: Vec<_> = (0..selected_calls.len())
+                .map(|i| format!("c{i}_{packet}"))
+                .collect();
+            expected_keys.sort();
+            assert!(
+                !expected_keys.is_empty(),
+                "{name}: expected measured seed call questions"
+            );
+            assert_eq!(
+                question_keys, expected_keys,
+                "{name}: cached questions bind selected packet/calls"
+            );
+            assert!(!export.to_string().contains("lexical-guess"), "{name}");
+        }
+        let stale = request().bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(
+            stale.status(),
+            409,
+            "{name}: stale entire pair refused before work"
+        );
+        assert_eq!(real_native_snapshot(&home), native_before, "{name}");
+        drop(server);
+    }
+}
+
+#[tokio::test]
+async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached_packet() {
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct Writer(rusqlite::Connection);
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.0.execute_batch("ROLLBACK");
+        }
+    }
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("workspace");
+    let home = tmp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    let original = "function seed() { sink(); } function sink() {}
+";
+    fs::write(root.join("flow.js"), original).unwrap();
+    let initial = command(&root, &home, "index").output().unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let token_file = tmp.path().join("token");
+    fs::write(&token_file, TOKEN).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let server = Server(
+        isolated_command(&home)
+            .arg("serve")
+            .arg("--workspace")
+            .arg(&root)
+            .arg("--bind")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--token-file")
+            .arg(&token_file)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(
+                fs::File::create(tmp.path().join("daemon-stderr")).unwrap(),
+            ))
+            .spawn()
+            .unwrap(),
+    );
+    let url = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("{url}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real daemon readiness");
+    let (code, status) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{status}");
+    let pin = status["revision"].clone();
+    let native_before = real_native_snapshot(&home);
+    let graph_before = real_export(&root, &home);
+    let pinned_source = format!(
+        "/api/source?path=flow.js&indexGeneration={}&indexRevision={}",
+        pin["indexGeneration"].as_str().unwrap(),
+        pin["indexRevision"].as_u64().unwrap()
+    );
+    let (code, source_before) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &pinned_source,
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{source_before}");
+    let (code, symbols) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/symbols?q=seed",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{symbols}");
+    let seed = symbols["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "seed")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let (code, preview) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        "/api/questions/preview",
+        Some(serde_json::json!({"seed":seed,"question":"what happens?","expectedRevision":pin})),
+    )
+    .await;
+    assert_eq!(code, 200, "{preview}");
+    let packet_id = preview["packet"]["packetId"].as_str().unwrap();
+    let packet_route = format!("/api/questions/{packet_id}/jev-request");
+    let (code, packet_before) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &packet_route,
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{packet_before}");
+
+    // A bounded multi-file scan lets the client acquire a real SQLite writer lock
+    // after the HTTP job is accepted but before projection completes.
+    let padding = "x".repeat(48 * 1024);
+    for i in 0..80 {
+        fs::write(
+            root.join(format!("extra{i:03}.js")),
+            format!("// {padding}\nfunction extra{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let (code, accepted) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        "/api/index",
+        Some(serde_json::json!({"expectedRevision":pin})),
+    )
+    .await;
+    assert_eq!(code, 202, "{accepted}");
+    let id = accepted["id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (code, job) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{job}");
+            assert!(
+                job["finishedAt"].is_null(),
+                "job finished before lock: {job}"
+            );
+            if job["progress"]["phase"] == "scan"
+                && job["progress"]["completed"].as_u64().unwrap() < 81
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("scan progress before SQLite lock");
+    let writer = Writer(rusqlite::Connection::open(real_index_db(&home)).unwrap());
+    writer.0.busy_timeout(Duration::from_secs(1)).unwrap();
+    writer.0.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let after_capture = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let (code, job) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{job}");
+            if job["progress"]["phase"] == "complete" {
+                break job;
+            }
+            assert!(
+                job["finishedAt"].is_null(),
+                "failed before captured graph: {job}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("captured graph must complete before cancellation");
+    assert_eq!(after_capture["progress"]["completed"], 81);
+    let (code, _) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        &format!("/api/jobs/{id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(code, 200);
+    drop(writer); // Always rolls back the external writer lock, including on panic.
+    let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (code, job) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{job}");
+            if !job["finishedAt"].is_null() {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("failed or cancelled job terminal");
+    assert!(
+        matches!(terminal["state"].as_str(), Some("failed" | "cancelled")),
+        "{terminal}"
+    );
+    assert_eq!(terminal["progress"]["phase"], "complete");
+    let (code, current) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{current}");
+    assert_eq!(
+        current["revision"], pin,
+        "failed job may not advance full pair"
+    );
+    assert_eq!(
+        real_native_snapshot(&home),
+        native_before,
+        "all native rows remain unchanged"
+    );
+    assert_eq!(
+        real_export(&root, &home),
+        graph_before,
+        "all graph rows remain unchanged"
+    );
+    let (code, source_after) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &pinned_source,
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{source_after}");
+    assert_eq!(
+        source_after, source_before,
+        "previous pinned source remains usable"
+    );
+    let (code, packet_after) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &packet_route,
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{packet_after}");
+    assert_eq!(
+        packet_after, packet_before,
+        "cached packet must remain usable after failed publication"
+    );
+    let (code, retry) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        "/api/index",
+        Some(serde_json::json!({"expectedRevision":pin})),
+    )
+    .await;
+    assert_eq!(code, 202, "{retry}");
+    let retry_id = retry["id"].as_str().unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let (code, job) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{retry_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{job}");
+            if !job["finishedAt"].is_null() {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("later successful job");
+    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(
+        completed["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(
+        completed["revision"]["indexRevision"],
+        pin["indexRevision"].as_u64().unwrap() + 1
+    );
+    use sha2::{Digest, Sha256};
+    let new_pin = &completed["revision"];
+    let (code, published) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{published}");
+    assert_eq!(
+        published["revision"], *new_pin,
+        "retry must publish full new pin"
+    );
+    assert_eq!(published["stats"]["files"], 81);
+    let native_after = real_native_snapshot(&home);
+    let graph_after = real_export(&root, &home);
+    assert_ne!(
+        native_after, native_before,
+        "retry must replace normalized evidence rows"
+    );
+    assert_ne!(graph_after, graph_before, "retry must replace graph rows");
+    assert_eq!(
+        native_after["sourceSet"], native_before["sourceSet"],
+        "source set retains this root/language catalog"
+    );
+    assert_ne!(
+        native_after["revision"]["id"], native_before["revision"]["id"],
+        "added source bytes must create a new native revision"
+    );
+    assert_eq!(
+        native_after["revision"]["sourceSetId"],
+        native_after["sourceSet"]["id"]
+    );
+    let root_id =
+        baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .unwrap()
+            .record_id;
+    assert_eq!(native_after["sourceSet"]["rootId"], root_id);
+    let documents = native_after["documents"].as_array().unwrap();
+    let files = graph_after["files"].as_array().unwrap();
+    assert_eq!(documents.len(), 81);
+    assert_eq!(files.len(), 81);
+    for doc in documents {
+        let path = doc["path"].as_str().unwrap();
+        let expected = if path == "flow.js" {
+            original.to_owned()
+        } else {
+            let index = path
+                .strip_prefix("extra")
+                .and_then(|suffix| suffix.strip_suffix(".js"))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert!(index < 80, "unexpected published source path: {path}");
+            format!("// {padding}\nfunction extra{index}() {{}}\n")
+        };
+        let graph = files.iter().find(|file| file["path"] == path).unwrap();
+        assert_eq!(graph["text"], expected, "{path}: retry graph source bytes");
+        assert_eq!(graph["language"], "javascript", "{path}");
+        assert_eq!(doc["language"], graph["language"], "{path}");
+        assert_eq!(
+            doc["sourceSetId"], native_after["sourceSet"]["id"],
+            "{path}"
+        );
+        assert_eq!(doc["revisionId"], native_after["revision"]["id"], "{path}");
+        assert_eq!(doc["byteLength"], expected.len(), "{path}");
+        assert_eq!(doc["bytesHex"], hex::encode(expected.as_bytes()), "{path}");
+        assert_eq!(
+            doc["contentHash"],
+            hex::encode(Sha256::digest(expected.as_bytes())),
+            "{path}"
+        );
+        assert_eq!(doc["contentHash"], graph["hash"], "{path}");
+        let route = format!(
+            "/api/source?path={path}&indexGeneration={}&indexRevision={}",
+            new_pin["indexGeneration"].as_str().unwrap(),
+            new_pin["indexRevision"].as_u64().unwrap()
+        );
+        let (code, source) =
+            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+        assert_eq!(code, 200, "{path}: {source}");
+        assert_eq!(
+            source["revision"], *new_pin,
+            "{path}: authenticated full pin"
+        );
+        assert_eq!(
+            source["file"], *graph,
+            "{path}: pinned source matches paired graph/native"
+        );
+    }
+    for i in 0..80 {
+        let path = format!("extra{i:03}.js");
+        assert!(
+            documents.iter().any(|doc| doc["path"] == path),
+            "missing retry document: {path}"
+        );
+    }
+    drop(server);
 }

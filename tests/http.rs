@@ -47,7 +47,7 @@ async fn guards_public_and_private() {
         ("/healthz", "127.0.0.1:7331", None, None, 200),
         ("/", "localhost:7331", None, None, 200),
         ("/api/status", "127.0.0.1:7331", None, None, 401),
-        ("/api/status", "127.0.0.1:7331", None, Some(TOKEN), 200),
+        ("/api/status", "127.0.0.1:7331", None, Some(TOKEN), 503),
         ("/healthz", "evil.example", None, None, 403),
         (
             "/",
@@ -68,7 +68,7 @@ async fn guards_public_and_private() {
             "localhost:7331",
             Some("http://localhost:7331"),
             Some(TOKEN),
-            200,
+            503,
         ),
     ] {
         let mut req = Request::builder().uri(path).header("host", host);
@@ -147,7 +147,7 @@ async fn validation_and_limit() {
         400
     );
     let stale = IndexPin {
-        index_generation: _store.status().unwrap().revision.index_generation,
+        index_generation: _store.index_baseline().unwrap().index_generation,
         index_revision: 9,
     };
     assert_eq!(
@@ -173,22 +173,25 @@ async fn validation_and_limit() {
 #[tokio::test]
 async fn source_is_snapshot_and_revision_checked() {
     let (_d, store, _state, app) = setup();
-    let mut graph = Graph::default();
-    graph.files.push(SourceFile {
-        path: "a.js".into(),
-        hash: "hash".into(),
-        language: "javascript".into(),
-        text: "cached secret-free source".into(),
-    });
+    let workspace = _d.path().join("workspace");
+    std::fs::write(workspace.join("a.js"), "cached secret-free source").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &IndexOptions::new(workspace),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(graph.files[0].text, "cached secret-free source");
     store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            store.index_baseline().unwrap(),
+            &cancel,
         )
         .unwrap();
     let pin = store.status().unwrap().revision;
@@ -315,7 +318,7 @@ async fn active_job_cancellation_does_not_publish() {
     .await
     .unwrap();
     assert_eq!(terminal["state"], "cancelled");
-    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
 }
 
 #[tokio::test]
@@ -373,4 +376,566 @@ async fn local_design_assets_preserve_same_origin_guards() {
             .0,
         404
     );
+}
+
+#[tokio::test]
+async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_comparison() {
+    let (dir, store, _state, app) = setup();
+    let workspace = dir.path().join("workspace");
+    std::fs::write(
+        workspace.join("a.js"),
+        "function go() { console.log(1); }\nconst value = 1;",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("Types.java"),
+        "class Types { void run() { System.out.println(1); } }",
+    )
+    .unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) =
+        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+            .unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let seed = graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "go")
+        .unwrap()
+        .id
+        .clone();
+    let class_seed = graph
+        .nodes
+        .iter()
+        .find(|node| node.name == "Types")
+        .unwrap()
+        .id
+        .clone();
+    let variable_seed = graph
+        .nodes
+        .iter()
+        .find(|node| node.name == "value")
+        .unwrap()
+        .id
+        .clone();
+    let (code, preview) = call(
+        &app,
+        "POST",
+        "/api/questions/preview",
+        json!({"seed":seed,"question":"what happens?","expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{preview}");
+    let packet = preview["packet"]["packetId"].as_str().unwrap();
+    let old_selection = preview["selection"].clone();
+    // Retain the valid leader lease across deliberate legacy metadata tampering.
+    let leader = store.leader().unwrap();
+    let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    {
+        let db = rusqlite::Connection::open(&index).unwrap();
+        db.pragma_update(None, "foreign_keys", false).unwrap();
+        let native_tables = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in native_tables {
+            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+    }
+    let same_old_pair = json!(pin).to_string();
+    let unauthenticated = Request::builder()
+        .method("POST")
+        .uri("/api/index")
+        .header("host", "127.0.0.1:7331")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unauthenticated).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut denied_routes = Vec::new();
+    for (method, path, body) in [
+        ("GET", "/api/status".to_owned(), Value::Null),
+        ("GET", "/api/symbols?q=go".to_owned(), Value::Null),
+        ("GET", "/api/source?path=a.js".to_owned(), Value::Null),
+        ("GET", "/api/classes".to_owned(), Value::Null),
+        ("GET", "/api/tree".to_owned(), Value::Null),
+        ("GET", "/api/files".to_owned(), Value::Null),
+        ("GET", "/api/dependencies".to_owned(), Value::Null),
+        (
+            "GET",
+            "/api/dependencies/symbols?catalogId=stale&q=go".to_owned(),
+            Value::Null,
+        ),
+        (
+            "GET",
+            "/api/dependencies/source?catalogId=stale&sourceRef=stale".to_owned(),
+            Value::Null,
+        ),
+        ("GET", "/api/methods?path=a.js".to_owned(), Value::Null),
+        ("GET", format!("/api/symbol?id={seed}"), Value::Null),
+        (
+            "GET",
+            format!(
+                "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+                pin.index_generation, pin.index_revision
+            ),
+            Value::Null,
+        ),
+        (
+            "GET",
+            format!(
+                "/api/classes?indexGeneration={}&indexRevision={}",
+                pin.index_generation, pin.index_revision
+            ),
+            Value::Null,
+        ),
+        (
+            "GET",
+            format!(
+                "/api/files?indexGeneration={}&indexRevision={}",
+                pin.index_generation, pin.index_revision
+            ),
+            Value::Null,
+        ),
+        (
+            "POST",
+            "/api/navigation".to_owned(),
+            json!({"expectedRevision":pin,"path":"a.js","line":1}),
+        ),
+        (
+            "POST",
+            "/api/sequence".to_owned(),
+            json!({"seed":seed,"expectedRevision":pin}),
+        ),
+        (
+            "POST",
+            "/api/class-diagram".to_owned(),
+            json!({"seed":class_seed,"expectedRevision":pin}),
+        ),
+        (
+            "POST",
+            "/api/query".to_owned(),
+            json!({"seed":seed,"includeCallbacks":true}),
+        ),
+        (
+            "POST",
+            "/api/questions/preview".to_owned(),
+            json!({"seed":seed,"question":"what?","expectedRevision":pin}),
+        ),
+        (
+            "GET",
+            format!("/api/questions/{packet}/jev-request"),
+            Value::Null,
+        ),
+        (
+            "POST",
+            format!("/api/questions/{packet}/selection"),
+            json!({"packetId":packet,"decisions":[]}),
+        ),
+        (
+            "POST",
+            format!("/api/questions/{packet}/jev-response"),
+            json!({}),
+        ),
+        (
+            "POST",
+            format!("/api/questions/{packet}/jev-run"),
+            json!({}),
+        ),
+        (
+            "POST",
+            format!("/api/questions/{packet}/acp-answer"),
+            json!({}),
+        ),
+    ] {
+        let (status, response) = call(&app, method, &path, body).await;
+        if status != StatusCode::SERVICE_UNAVAILABLE
+            || response["error"]["code"] != "index_not_ready"
+        {
+            denied_routes.push(format!("{method} {path}: {status} {response}"));
+        }
+        assert!(
+            !response.to_string().contains(&same_old_pair),
+            "old pin escaped {path}"
+        );
+    }
+    assert!(
+        denied_routes.is_empty(),
+        "unexpected old-cache responses: {denied_routes:#?}"
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/jobs/current", Value::Null).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/acp/status", Value::Null).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/jev/status", Value::Null).await.0,
+        StatusCode::OK
+    );
+    // A failed explicit old rebaseline cannot publish or clear a prior question packet.
+    // The old-readiness gate still prevents any cached packet from being served.
+    let old_bytes = std::fs::read(&index).unwrap();
+    let cancelled = Arc::new(AtomicBool::new(true));
+    assert!(
+        store
+            .publish_native(&graph, &capture, &native, &leader, pin, &cancelled)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&index).unwrap(), old_bytes);
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            &format!("/api/questions/{packet}/jev-request"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/status", Value::Null).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(leader);
+    let (code, job) = call(&app, "POST", "/api/index", json!({"expectedRevision":pin})).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    let id = job["id"].as_str().unwrap();
+    let done = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, current) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            if !current["finishedAt"].is_null() {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(done["state"], "completed", "{done}");
+    let (status, ready) = call(&app, "GET", "/api/status", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["evidenceFormat"], "terminal-native-graph-v1");
+    assert_ne!(
+        ready["revision"]["indexGeneration"],
+        json!(pin)["indexGeneration"]
+    );
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            &format!("/api/questions/{packet}/jev-request"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, graph_result) = call(
+        &app,
+        "POST",
+        "/api/query",
+        json!({"seed":seed,"includeCallbacks":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{graph_result}");
+    assert_eq!(graph_result["nodes"].as_array().unwrap().len(), 1);
+    assert!(
+        graph_result["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|call| call.get("target").is_none())
+    );
+    let fresh: IndexPin = serde_json::from_value(ready["revision"].clone()).unwrap();
+    assert!(fresh.index_revision > 0);
+    let pinned = |route: &str, revision: &IndexPin| {
+        format!(
+            "{route}{}indexGeneration={}&indexRevision={}",
+            if route.contains('?') { '&' } else { '?' },
+            revision.index_generation,
+            revision.index_revision
+        )
+    };
+    let (status, source) = call(
+        &app,
+        "GET",
+        &pinned("/api/source?path=a.js", &fresh),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{source}");
+    assert_eq!(source["revision"], json!(fresh));
+    assert_eq!(
+        source["file"]["text"],
+        "function go() { console.log(1); }\nconst value = 1;"
+    );
+    let (status, symbol) = call(
+        &app,
+        "GET",
+        &pinned(&format!("/api/symbol?id={seed}"), &fresh),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{symbol}");
+    assert_eq!(symbol["revision"], json!(fresh));
+    assert_eq!(symbol["symbol"]["name"], "go");
+    let (status, search) = call(&app, "GET", "/api/symbols?q=value", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(
+        search["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == variable_seed && item["kind"] == "variable"),
+        "{search}"
+    );
+    let (status, variable) = call(
+        &app,
+        "GET",
+        &pinned(&format!("/api/symbol?id={variable_seed}"), &fresh),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{variable}");
+    assert_eq!(variable["symbol"]["kind"], "variable");
+    let (status, methods) = call(&app, "GET", "/api/methods?path=a.js", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{methods}");
+    assert!(
+        methods["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["symbol"]["id"] != variable_seed)
+    );
+    let (status, files) = call(&app, "GET", "/api/files", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{files}");
+    let js_file = files["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["path"] == "a.js")
+        .unwrap();
+    assert_eq!(js_file["methodCount"], 1);
+    let (status, refused) = call(
+        &app,
+        "POST",
+        "/api/sequence",
+        json!({"seed":variable_seed,"expectedRevision":fresh}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let (status, variable_view) =
+        call(&app, "POST", "/api/query", json!({"seed":variable_seed})).await;
+    assert_eq!(status, StatusCode::OK, "{variable_view}");
+    assert_eq!(variable_view["nodes"][0]["kind"], "variable");
+    assert_eq!(variable_view["calls"], json!([]));
+    let (status, variable_packet) = call(
+        &app,
+        "POST",
+        "/api/questions/preview",
+        json!({"seed":variable_seed,"question":"what is value?","expectedRevision":fresh}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{variable_packet}");
+    assert_eq!(variable_packet["packet"]["context"]["calls"], json!([]));
+    assert_eq!(
+        variable_packet["packet"]["context"]["nodes"][0]["kind"],
+        "variable"
+    );
+    for route in [
+        "/api/symbols?q=go",
+        "/api/files",
+        "/api/methods?path=a.js",
+        "/api/classes",
+        "/api/tree",
+        "/api/dependencies",
+    ] {
+        let (status, body) = call(&app, "GET", route, Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        assert!(
+            !body.to_string().contains("lexical-guess"),
+            "{route}: {body}"
+        );
+    }
+    for (route, body) in [
+        (
+            "/api/navigation",
+            json!({"expectedRevision":fresh,"path":"a.js","line":1}),
+        ),
+        (
+            "/api/sequence",
+            json!({"seed":seed,"expectedRevision":fresh}),
+        ),
+        (
+            "/api/class-diagram",
+            json!({"seed":class_seed,"expectedRevision":fresh}),
+        ),
+    ] {
+        let (status, view) = call(&app, "POST", route, body).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {view}");
+        assert_eq!(view["revision"], json!(fresh), "{route}: {view}");
+        assert!(!view.to_string().contains("lexical-guess"));
+        assert!(!view.to_string().contains(r#""resolution":"internal""#));
+    }
+    let (status, preview) = call(
+        &app,
+        "POST",
+        "/api/questions/preview",
+        json!({"seed":seed,"question":"what happens?","expectedRevision":fresh}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["packet"]["revision"], json!(fresh));
+    assert!(!preview.to_string().contains("lexical-guess"));
+    let fresh_packet = preview["packet"]["packetId"].as_str().unwrap();
+    let (status, export) = call(
+        &app,
+        "GET",
+        &format!("/api/questions/{fresh_packet}/jev-request"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{export}");
+    assert!(!export.to_string().contains("lexical-guess"));
+    let mut answers = serde_json::Map::new();
+    for alias in export["questions"].as_object().unwrap().keys() {
+        answers.insert(
+            alias.clone(),
+            json!({"type":"choice","choice":"essential","confidence":1.0,
+            "probabilities":{"essential":1.0,"supporting":0.0,"incidental":0.0,"uncertain":0.0}}),
+        );
+    }
+    let (status, imported) = call(
+        &app,
+        "POST",
+        &format!("/api/questions/{fresh_packet}/jev-response"),
+        json!({"model":"jev-1.13.0","answers":answers}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{imported}");
+    assert_eq!(imported["view"]["selectionSource"], "importedJev");
+    assert!(
+        imported["view"]["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|call| call.get("target").is_none())
+    );
+    let (status, selected) = call(
+        &app,
+        "POST",
+        &format!("/api/questions/{fresh_packet}/selection"),
+        imported["selection"].clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{selected}");
+    assert_eq!(selected["view"]["selectionSource"], "manual");
+    for (action, code) in [("acp-answer", "acp_disabled"), ("jev-run", "jev_disabled")] {
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/questions/{fresh_packet}/{action}"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{action}: {body}");
+        assert_eq!(body["error"]["code"], code);
+        assert!(!body.to_string().contains("lexical-guess"));
+    }
+    for route in ["/api/jobs/current", "/api/acp/status", "/api/jev/status"] {
+        assert_eq!(
+            call(&app, "GET", route, Value::Null).await.0,
+            StatusCode::OK,
+            "{route}"
+        );
+    }
+    // A once-valid schema-4 pair must never join data from the rotated generation.
+    for route in [
+        "/api/files",
+        "/api/classes",
+        "/api/methods?path=a.js",
+        "/api/source?path=a.js",
+        &format!("/api/symbol?id={seed}"),
+    ] {
+        let (status, body) = call(&app, "GET", &pinned(route, &pin), Value::Null).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
+        assert_eq!(body["error"]["code"], "revision_conflict");
+    }
+    for (route, body) in [
+        ("/api/sequence", json!({"seed":seed,"expectedRevision":pin})),
+        (
+            "/api/navigation",
+            json!({"path":"a.js","line":1,"expectedRevision":pin}),
+        ),
+        (
+            "/api/class-diagram",
+            json!({"seed":class_seed,"expectedRevision":pin}),
+        ),
+        (
+            "/api/questions/preview",
+            json!({"seed":seed,"question":"what?","expectedRevision":pin}),
+        ),
+    ] {
+        let (status, response) = call(&app, "POST", route, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {response}");
+    }
+    for (action, method, body) in [
+        ("jev-request", "GET", Value::Null),
+        ("selection", "POST", old_selection),
+        (
+            "jev-response",
+            "POST",
+            json!({"model":"jev-1.13.0","answers":{}}),
+        ),
+    ] {
+        let route = format!("/api/questions/{packet}/{action}");
+        let (status, response) = call(&app, method, &route, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{route}: {response}");
+    }
+    for (action, code) in [("jev-run", "jev_disabled"), ("acp-answer", "acp_disabled")] {
+        let route = format!("/api/questions/{packet}/{action}");
+        let (status, body) = call(&app, "POST", &route, json!({})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{route}: {body}");
+        assert_eq!(body["error"]["code"], code);
+    }
+    for route in [
+        "/api/dependencies/symbols?catalogId=stale&q=go",
+        "/api/dependencies/source?catalogId=stale&sourceRef=stale",
+    ] {
+        let (status, body) = call(&app, "GET", route, Value::Null).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
+        assert_eq!(body["error"]["code"], "stale_catalog");
+    }
 }

@@ -71,17 +71,7 @@ fn wire_packet(packet: &QuestionPacket) -> Result<(Value, Vec<String>)> {
     }
     for (name, identity_columns) in [
         ("nodes", &["id", "parent"][..]),
-        (
-            "calls",
-            &[
-                "id",
-                "caller",
-                "target",
-                "candidateSymbols",
-                "regions",
-                "callbackArguments",
-            ][..],
-        ),
+        ("calls", &["id", "caller", "regions"][..]),
         ("regions", &["id", "parent", "owner"][..]),
     ] {
         let objects = evidence["context"][name]

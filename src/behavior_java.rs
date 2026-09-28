@@ -463,8 +463,6 @@ impl Builder<'_> {
         if let Some(mut step) = self.step(n, "call", call_label(n, self.file)) {
             step.call_id = Some(c.id);
             step.range = c.range;
-            step.resolution = Some(c.resolution);
-            step.target = Some(target);
             f.steps.push(step);
         }
         self.then(evaluation, f, n)

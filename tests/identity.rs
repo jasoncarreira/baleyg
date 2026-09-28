@@ -24,17 +24,18 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     let symbol = graph.nodes.iter().find(|n| n.name == "first").unwrap();
     let old_id = symbol.id.clone();
     let store = crate::common::open_store(&state, &root).unwrap();
-    let rev = store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &cancel,
-        )
-        .unwrap();
+    let rev = publish_bundle(
+        &store,
+        &graph,
+        &root,
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.index_baseline().unwrap().index_generation,
+            index_revision: 0,
+        },
+        &cancel,
+    )
+    .unwrap();
     assert_eq!(store.graph().unwrap(), graph);
     store
         .put_annotation(&Annotation {
@@ -56,16 +57,22 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     assert_eq!(
         view.calls
             .iter()
-            .map(|c| c.callee_text.as_str())
+            .map(|c| c.callee_text.as_deref())
             .collect::<Vec<_>>(),
-        vec!["a", "b", "c"]
+        vec![Some("a"), Some("b"), Some("c")]
     );
     fs::write(root.join("flow.js"), text.replace("first", "other")).unwrap();
     let changed = index_workspace(&opts, &cancel, |_| {}).unwrap();
     assert!(changed.nodes.iter().all(|n| n.id != old_id));
-    store
-        .publish(&changed, &store.leader().unwrap(), rev, &cancel)
-        .unwrap();
+    publish_bundle(
+        &store,
+        &changed,
+        &root,
+        &store.leader().unwrap(),
+        rev,
+        &cancel,
+    )
+    .unwrap();
     assert!(store.annotations().unwrap()[0].orphaned);
     assert_eq!(
         store.annotations().unwrap()[0].annotation.body,
@@ -74,47 +81,57 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
 }
 
 #[test]
-fn class_instance_initializers_are_not_calls_from_definition_context() {
+fn class_field_calls_keep_measured_declaration_owners_without_execution_claims() {
     let temp = TempDir::new().unwrap();
-    fs::write(temp.path().join("fields.js"),"function make() { if (ok) return class C { [fieldKey()] = build(); static eager = now(); [key()]() { body(); } }; }\n").unwrap();
+    let text = "function make() { if (ok) return class C { [fieldKey()] = build(); static eager = now(); [key()]() { body(); } }; }\n";
+    fs::write(temp.path().join("fields.js"), text).unwrap();
     let graph = index_workspace(
         &IndexOptions::new(temp.path().canonicalize().unwrap()),
         &Arc::new(AtomicBool::new(false)),
         |_| {},
     )
     .unwrap();
-    let owner = |callee: &str| {
-        let call = graph
+    let calls = ["fieldKey", "now", "key", "build"];
+    for callee in calls {
+        let measured = graph
             .calls
             .iter()
-            .find(|c| c.callee_text == callee)
+            .find(|call| call.callee_text.as_deref() == Some(callee))
             .unwrap();
-        graph
+        let source = &graph.files[0].text;
+        let token = measured.callee_range.as_ref().unwrap();
+        assert_eq!(&source[token.start_byte..token.end_byte], callee);
+        assert_eq!(
+            source
+                .get(measured.range.start_byte..measured.range.end_byte)
+                .unwrap(),
+            format!("{callee}()")
+        );
+        let owner = graph
             .nodes
             .iter()
-            .find(|n| n.id == call.caller)
-            .unwrap()
-            .name
-            .clone()
-    };
-    assert_eq!(owner("fieldKey"), "make");
-    assert_eq!(owner("now"), "make");
-    assert_eq!(owner("key"), "make");
-    assert_eq!(owner("build"), "C");
-    let build = graph
-        .calls
-        .iter()
-        .find(|c| c.callee_text == "build")
-        .unwrap();
-    let regions: Vec<_> = graph
-        .regions
-        .iter()
-        .filter(|r| build.regions.contains(&r.id))
-        .collect();
-    assert_eq!(regions.len(), 1);
-    assert_eq!(regions[0].kind, "instance-initializer");
+            .find(|node| node.id == measured.caller)
+            .unwrap();
+        assert_eq!(
+            owner.name, "C",
+            "{callee} remains under its measured class syntax"
+        );
+        assert!(
+            measured.regions.is_empty(),
+            "field syntax is not an invented control region"
+        );
+        let wire = serde_json::to_value(measured).unwrap();
+        for unsafe_field in [
+            "target",
+            "resolution",
+            "candidateSymbols",
+            "callbackArguments",
+        ] {
+            assert!(wire.get(unsafe_field).is_none());
+        }
+    }
     assert!(
-        graph
+        !graph
             .diagnostics
             .iter()
             .any(|d| d.code == "instance-initializer-boundary")
@@ -139,34 +156,75 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let cancel = Arc::new(AtomicBool::new(false));
     let first = index_workspace(&options, &cancel, |_| {}).unwrap();
     let store = crate::common::open_store(&state, &root).unwrap();
-    let revision = store
-        .publish(
-            &first,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &cancel,
-        )
-        .unwrap();
+    let revision = publish_bundle(
+        &store,
+        &first,
+        &root,
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.index_baseline().unwrap().index_generation,
+            index_revision: 0,
+        },
+        &cancel,
+    )
+    .unwrap();
     fs::write(root.join("flow.js"), "function after() { c(); d(); }\n").unwrap();
     let next = index_workspace(&options, &cancel, |_| {}).unwrap();
     let id = next.calls[1].id.replace('\'', "''");
+    let leader = store.leader().unwrap();
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch(&format!("CREATE TRIGGER abort_second_call BEFORE INSERT ON calls WHEN NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'injected post-write failure'); END;")).unwrap();
     drop(db);
-    let failure = store
-        .publish(&next, &store.leader().unwrap(), revision, &cancel)
-        .unwrap_err();
-    assert!(failure.to_string().contains("injected post-write failure"));
-    assert_eq!(store.status().unwrap().revision, revision);
-    assert_eq!(store.graph().unwrap(), first);
+    let unchanged = fs::read(index_db(&state)).unwrap();
+    let failure = publish_bundle(&store, &next, &root, &leader, revision, &cancel).unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("incompatible_index: unknown cache object")
+    );
+    assert_eq!(fs::read(index_db(&state)).unwrap(), unchanged);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch("DROP TRIGGER abort_second_call").unwrap();
     drop(db);
-    let next_revision = store
-        .publish(&next, &store.leader().unwrap(), revision, &cancel)
-        .unwrap();
+    drop(leader);
+    assert_eq!(store.status().unwrap().revision, revision);
+    assert_eq!(store.graph().unwrap(), first);
+    let next_revision = publish_bundle(
+        &store,
+        &next,
+        &root,
+        &store.leader().unwrap(),
+        revision,
+        &cancel,
+    )
+    .unwrap();
     assert_eq!(next_revision.index_revision, revision.index_revision + 1);
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

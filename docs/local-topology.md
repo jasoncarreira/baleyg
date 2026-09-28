@@ -114,3 +114,25 @@ The labels here are fixture placeholders, **not #22 identity vectors**. For each
 3. **Ordered updates and root identity (AC3).** Browser request Q1 and CLI request Q2 queue while a watcher edit is pending; one leader publishes serially, and every result uses one coherent revision. A crash after Q1's index publish but before its completion permits repeat work without regression; Q2 remains accepted across index rebuild. Move the root or replace its inode: old openers refuse evidence and waiting clients report `root_changed`. An old-path leader or replacement opener fails old-root queued/running rows before any replacement work; without either opener, GC may discard the abandoned requests. Replacement enters through fresh reconciliation, never through old requests; failed recording cannot be reported as success. Overflow or a lost watcher event forces full scan; a silently changed tracked config is found by the next successful full scan.
 4. **Reassembly and recovery (AC4).** Add a declaration named by an unresolved native lookup: reassemble affected native owners and dependents atomically, including previously unsuccessful lookups, but leave historical semantic `CallBinding` unresolved. Remove a supertype/import and reassemble its dependents. A failed publish leaves earlier graph, dependencies and source bytes together. An incompatible index rebuilds in place with new generation G2 while accepted requests and saved note N survive. Corruption requiring recreation waits for all shared-use readers and preserves requests; busy/full-disk alone never triggers recreation.
 5. **Durable and cleanup boundary (AC5).** Save a view and captured #22 anchor, change its header, then read: #22 orphans attachment without overwriting the saved anchor. A valid empty record after deleting its last item remains. GC skips an open index and may remove a missing/replaced root or a 30-day unopened derived index under exclusive use; it cannot remove the saved view. A follower read writes no last-opened metadata. `gc --report` changes no files. `forget U` refuses without exclusive use/confirmation, then removes only U's record; UUIDs, requests belonging to other indexes, facts and ledgers remain.
+
+## #64 one-capture admission boundary (intermediate, not a rebuild lifecycle)
+
+The indexer admits the root, visited directories, supported source paths, 22 root
+project inputs, two root Rust toolchain selectors, and present or absent `.gitignore`
+and `.ignore` files in visited directories. It reads each admitted source through one
+no-follow regular-file descriptor and shares that immutable buffer with the current
+graph extractor. It also captures the running native executable and optional display
+artifacts. Metadata and complete eligible source/directory inventories are checked
+again at cutoff. Source-identity aliases (including lexical `./` paths and hard links)
+used as display inputs refuse admission before the optional read; nonregular eligible
+sources such as FIFOs refuse admission rather than disappear from the inventory.
+Identity-equivalent non-source inputs reuse one captured buffer after metadata checks.
+Drift, unreadable or unsafe inputs, excess size, and cancellation
+fail the indexing call rather than publishing its result. Ambient ancestor, global,
+and Git-info ignore files do not participate in admission.
+
+This is a non-adversarial writer check, not a filesystem security sandbox. A writer
+able to restore *all* observable identity, size, mtime, and ctime metadata between
+checks can evade it. Ancestor directory replacement is not capability-fenced.
+This intermediate boundary does not implement #39/#70 reconciliation or rebuild
+publication, nor T04’s durable `requests.db` queue and leader-owned request coordinator.

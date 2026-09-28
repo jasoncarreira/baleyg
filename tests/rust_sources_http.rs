@@ -4,8 +4,13 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use baleyg::{http, indexer::IndexOptions, store::Store};
+use baleyg::{
+    http,
+    indexer::{IndexOptions, index_workspace_bundle},
+    store::Store,
+};
 use serde_json::Value;
+use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 fn setup() -> (tempfile::TempDir, Store, Router) {
@@ -21,6 +26,24 @@ fn setup() -> (tempfile::TempDir, Store, Router) {
     .unwrap();
     std::fs::write(source.join("secret"), "SECRET_MUST_NOT_LEAK").unwrap();
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(workspace.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
     let app = http::router(
         http::new_with_source_roots(
             store.clone(),

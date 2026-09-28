@@ -21,6 +21,7 @@ fn range(n: Node<'_>) -> SourceRange {
         end_column: n.end_position().column + 1,
     }
 }
+#[cfg(test)]
 pub(crate) fn extract(g: &mut Graph, file: &SourceFile, cancel: &CancelFlag) -> Result<()> {
     extract_with_limits(g, file, cancel, usize::MAX, usize::MAX)
 }
@@ -64,6 +65,7 @@ fn extract_with_limits(
     g.nodes.push(Symbol {
         id: module.clone(),
         name: file.path.clone(),
+        display_label: None,
         kind: SymbolKind::Module,
         path: file.path.clone(),
         range: range(tree.root_node()),
@@ -178,6 +180,7 @@ impl Extractor<'_> {
             self.g.nodes.push(Symbol {
                 id: id.clone(),
                 name,
+                display_label: None,
                 kind,
                 path: self.file.path.clone(),
                 range: range(n),
@@ -216,30 +219,15 @@ impl Extractor<'_> {
                 .child_by_field_name("function")
                 .map(|v| self.text(v).to_owned())
                 .unwrap_or_default();
-            let mut callbacks = Vec::new();
-            if let Some(args) = n.child_by_field_name("arguments") {
-                let mut cur = args.walk();
-                for mut arg in args.named_children(&mut cur) {
-                    while arg.kind() == "parenthesized_expression" && arg.named_child_count() == 1 {
-                        arg = arg.named_child(0).unwrap();
-                    }
-                    if arg.kind() == "closure_expression" {
-                        callbacks.push(self.id(arg, "syntax"));
-                    }
-                }
-            }
             self.g.calls.push(CallSite {
                 id: self.id(n, "call"),
                 caller: owner.clone(),
-                callee_text: callee,
+                callee_text: (!callee.is_empty()).then_some(callee),
                 path: self.file.path.clone(),
                 range: range(n),
-                target: None,
-                candidate_symbols: vec![],
-                resolution: Resolution::Unresolved,
+                callee_range: None,
                 ordinal: 0,
                 regions: regions.clone(),
-                callback_arguments: callbacks,
                 provenance: provenance(),
             });
         }
@@ -249,6 +237,31 @@ impl Extractor<'_> {
         }
         Ok(())
     }
+}
+
+/// Closed #22 syntax categories measured by the Rust adapter, without cfg expansion.
+pub(crate) fn native_kind(n: Node<'_>) -> Option<&'static str> {
+    Some(match n.kind() {
+        "struct_item" | "enum_item" | "trait_item" | "union_item" => "type",
+        "impl_item" => "implementation",
+        "mod_item" => "namespace",
+        "function_item" | "function_signature_item"
+            if n.parent()
+                .and_then(|body| body.parent())
+                .is_some_and(|container| {
+                    matches!(container.kind(), "impl_item" | "trait_item")
+                }) =>
+        {
+            "method"
+        }
+        "function_item" | "function_signature_item" => "function",
+        "closure_expression" => "anonymousFunction",
+        "field_declaration" => "field",
+        "type_item" => "alias",
+        "const_item" | "static_item" => "variable",
+        "parameter" => "parameter",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

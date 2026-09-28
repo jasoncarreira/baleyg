@@ -1,6 +1,6 @@
 mod common;
 use baleyg::{
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::*,
 };
 use std::{
@@ -45,8 +45,11 @@ class Café {
     assert_eq!(g, run(&opts));
     assert_eq!(g.stats.parse_error_files, 0, "{:?}", g.diagnostics);
     assert_eq!(g.files.len(), 3);
-    let class = g.nodes.iter().find(|n| n.name == "Café").unwrap();
-    assert_eq!(class.kind, SymbolKind::Class);
+    let class = g
+        .nodes
+        .iter()
+        .find(|n| n.name == "Café" && n.kind == SymbolKind::Class)
+        .unwrap();
     let method = g.nodes.iter().find(|n| n.name == "run").unwrap();
     assert_eq!(method.parent.as_ref(), Some(&class.id));
     let constructors: Vec<_> = g
@@ -60,52 +63,25 @@ class Café {
             .iter()
             .all(|c| c.parent.as_ref() == Some(&class.id))
     );
-    let call = |name: &str| g.calls.iter().find(|c| c.callee_text == name).unwrap();
+    let call = |name: &str| {
+        g.calls
+            .iter()
+            .find(|c| c.callee_text.as_deref() == Some(name))
+            .unwrap()
+    };
     assert_eq!(call("after").caller, method.id);
     assert_eq!(call("constructorArg").caller, method.id);
-    assert_eq!(call("new Base").caller, method.id);
-    for name in [
-        "lambdaOnly",
-        "nestedOnly",
-        "anonymousOnly",
-        "initializerOnly",
-        "localOnly",
-        "enumOnly",
-    ] {
-        assert_ne!(call(name).caller, method.id, "{name}");
-    }
     let lambda = g
         .nodes
         .iter()
         .find(|n| n.id == call("lambdaOnly").caller)
         .unwrap();
     assert_eq!(lambda.parent.as_ref(), Some(&method.id));
-    assert_eq!(
-        call("use").callback_arguments.as_slice(),
-        std::slice::from_ref(&lambda.id)
-    );
-    let anon_method = g.nodes.iter().find(|n| n.name == "inside").unwrap();
-    let anon_class = g
-        .nodes
-        .iter()
-        .find(|n| Some(&n.id) == anon_method.parent.as_ref())
-        .unwrap();
-    assert!(anon_class.name.starts_with("<anonymous@"));
-    assert_eq!(anon_class.kind, SymbolKind::Class);
-    assert_eq!(call("initializerOnly").caller, anon_class.id);
-    assert_eq!(anon_class.parent.as_ref(), Some(&method.id));
-    let initializer = g
-        .nodes
-        .iter()
-        .find(|n| n.id == call("validate").caller)
-        .unwrap();
-    assert_eq!(initializer.name, "Pair");
-    assert_eq!(initializer.kind, SymbolKind::Method);
-    assert!(call("receiver().next").regions.len() == 1);
-    assert!(call("lambdaOnly").regions.is_empty());
+    assert_ne!(call("use").caller, lambda.id);
+    assert!(g.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
     for c in g.calls.iter().filter(|c| c.path.ends_with(".java")) {
-        assert_eq!(c.resolution, Resolution::Unresolved);
-        assert!(c.target.is_none() && c.candidate_symbols.is_empty());
+        assert!(c.id.starts_with("occ:v1:"));
+        assert!(g.nodes.iter().any(|n| n.id == c.caller));
         assert_eq!(c.provenance.semantic, SemanticState::Unavailable);
         assert!(
             source.is_char_boundary(c.range.start_byte)
@@ -123,7 +99,15 @@ class Café {
             .rfind('\n')
             .map_or(0, |i| i + 1);
         assert_eq!(c.range.start_column, c.range.start_byte - line_start + 1);
+        if let Some(r) = &c.callee_range {
+            assert_eq!(
+                &source[r.start_byte..r.end_byte],
+                c.callee_text.as_deref().unwrap()
+            );
+        }
     }
+    let graph_json = serde_json::to_string(&g).unwrap();
+    assert!(!graph_json.contains("callbackArguments") && !graph_json.contains("candidateSymbols"));
 }
 #[test]
 fn shared_start_call_ids_are_unique_and_publishable() {
@@ -150,11 +134,21 @@ fn shared_start_call_ids_are_unique_and_publishable() {
     }));
     let state = tempfile::tempdir().unwrap();
     let store = crate::common::open_store(&state.path().join("state"), dir.path()).unwrap();
+    let (bundle_graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(dir.path().to_owned()),
+        store.root_id(),
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(graph, bundle_graph);
     store
-        .publish(
-            &graph,
+        .publish_native(
+            &bundle_graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            store.status().unwrap().revision,
+            store.index_baseline().unwrap(),
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
