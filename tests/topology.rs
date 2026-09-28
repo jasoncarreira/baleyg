@@ -2293,11 +2293,25 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let target = "sid:v1:0123456789abcdef0123456789abcdef";
-    let make_view = |title: char| SavedViewRecord::from_base(SavedView {
-        id: "view-race".into(), title: title.to_string(),
-        query: ViewQuery { seed: target.into(), depth: 1, max_nodes: 40, max_calls: 200, include_callbacks: false, exclude_paths: vec![] },
-        pins: BTreeMap::new(), hidden: vec![],
-    }, None);
+    let make_view = |title: char| {
+        SavedViewRecord::from_base(
+            SavedView {
+                id: "view-race".into(),
+                title: title.to_string(),
+                query: ViewQuery {
+                    seed: target.into(),
+                    depth: 1,
+                    max_nodes: 40,
+                    max_calls: 200,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                pins: BTreeMap::new(),
+                hidden: vec![],
+            },
+            None,
+        )
+    };
 
     // Whole-record creation intentionally uses a nonblocking exclusive use lock.
     // One contender wins; retry the typed busy loser only after the winner released it.
@@ -2316,28 +2330,50 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
             (hash, result)
         }));
     }
-    let outcomes: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
-    let winner = outcomes.iter().find_map(|(_, result)| result.as_ref().ok()).expect("one creator must win");
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    let winner = outcomes
+        .iter()
+        .find_map(|(_, result)| result.as_ref().ok())
+        .expect("one creator must win");
     let winner_raw = winner.anchor.as_ref().unwrap().get().to_owned();
-    let losers: Vec<_> = outcomes.iter().filter(|(_, result)| result.is_err()).collect();
+    let losers: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, result)| result.is_err())
+        .collect();
     assert!(losers.len() <= 1, "only the nonblocking creator may lose");
     for (_, result) in outcomes.iter().filter(|(_, result)| result.is_ok()) {
-        assert_eq!(result.as_ref().unwrap().anchor.as_ref().unwrap().get(), winner_raw);
+        assert_eq!(
+            result.as_ref().unwrap().anchor.as_ref().unwrap().get(),
+            winner_raw
+        );
     }
     if let Some((loser_hash, loser)) = losers.first() {
         assert_expected_storage_busy(loser.as_ref().unwrap_err());
         let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
         let retried = DurableRecords::new(&roots, &identity)
-            .update_view_record(&make_view(**loser_hash), || Ok(test_anchor_raw(target, **loser_hash)))
+            .update_view_record(&make_view(**loser_hash), || {
+                Ok(test_anchor_raw(target, **loser_hash))
+            })
             .unwrap();
         assert_eq!(retried.anchor.as_ref().unwrap().get(), winner_raw);
     }
 
     // Once the durable DB exists, same-ID note contenders either serialize in SQLite
     // or report typed busy. Retry any loser after both contenders have completed.
-    let make_note = |body: char| AnnotationRecord::from_base(Annotation {
-        id: "note-race".into(), node_id: target.into(), body: body.to_string(),
-    }, None, None);
+    let make_note = |body: char| {
+        AnnotationRecord::from_base(
+            Annotation {
+                id: "note-race".into(),
+                node_id: target.into(),
+                body: body.to_string(),
+            },
+            None,
+            None,
+        )
+    };
     let barrier = Arc::new(Barrier::new(2));
     let mut workers = vec![];
     for hash in ['c', 'd'] {
@@ -2348,13 +2384,22 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         workers.push(thread::spawn(move || {
             let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
             barrier.wait();
-            let result = DurableRecords::new(&roots, &identity)
-                .update_annotation_record(&record, false, || Ok(test_anchor_raw(target, hash)));
+            let result = DurableRecords::new(&roots, &identity).update_annotation_record(
+                &record,
+                false,
+                || Ok(test_anchor_raw(target, hash)),
+            );
             (hash, result)
         }));
     }
-    let outcomes: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
-    let winner = outcomes.iter().find_map(|(_, result)| result.as_ref().ok()).expect("one note writer must win");
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    let winner = outcomes
+        .iter()
+        .find_map(|(_, result)| result.as_ref().ok())
+        .expect("one note writer must win");
     let note_winner_raw = winner.anchor.as_ref().unwrap().get().to_owned();
     for (hash, result) in outcomes {
         match result {
@@ -2363,7 +2408,9 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
                 assert_expected_storage_busy(&error);
                 let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
                 let retried = DurableRecords::new(&roots, &identity)
-                    .update_annotation_record(&make_note(hash), false, || Ok(test_anchor_raw(target, hash)))
+                    .update_annotation_record(&make_note(hash), false, || {
+                        Ok(test_anchor_raw(target, hash))
+                    })
                     .unwrap();
                 assert_eq!(retried.anchor.unwrap().get(), note_winner_raw);
             }
@@ -2375,15 +2422,24 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     // that every successful edit response carries a real immutable anchor.
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let records = DurableRecords::new(&roots, &identity);
-    let edit = SavedViewRecord { title: "edit".into(), ..records.view_record("view-race").unwrap().unwrap() };
+    let edit = SavedViewRecord {
+        title: "edit".into(),
+        ..records.view_record("view-race").unwrap().unwrap()
+    };
     let barrier = Arc::new(Barrier::new(2));
-    let edit_roots = roots.clone(); let edit_work = work.clone(); let edit_barrier = barrier.clone(); let edit_copy = edit.clone();
+    let edit_roots = roots.clone();
+    let edit_work = work.clone();
+    let edit_barrier = barrier.clone();
+    let edit_copy = edit.clone();
     let editor = thread::spawn(move || {
         let identity = WorkspaceIdentity::discover(Some(&edit_work), &edit_work).unwrap();
         edit_barrier.wait();
-        DurableRecords::new(&edit_roots, &identity).update_view_record(&edit_copy, || Ok(test_anchor_raw(target, 'e')))
+        DurableRecords::new(&edit_roots, &identity)
+            .update_view_record(&edit_copy, || Ok(test_anchor_raw(target, 'e')))
     });
-    let delete_roots = roots.clone(); let delete_work = work.clone(); let delete_barrier = barrier.clone();
+    let delete_roots = roots.clone();
+    let delete_work = work.clone();
+    let delete_barrier = barrier.clone();
     let deleter = thread::spawn(move || {
         let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
         delete_barrier.wait();
@@ -2398,7 +2454,9 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         Ok(record) => record,
         Err(error) => {
             assert_expected_storage_busy(&error);
-            records.update_view_record(&edit, || Ok(test_anchor_raw(target, 'e'))).unwrap()
+            records
+                .update_view_record(&edit, || Ok(test_anchor_raw(target, 'e')))
+                .unwrap()
         }
     };
     let delete_was_busy = delete_result.is_err();
@@ -2426,15 +2484,27 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         assert_eq!(response_raw, old_raw);
     }
 
-    let edit = AnnotationRecord { body: "edit".into(), ..records.annotation_record("note-race").unwrap().unwrap() };
+    let edit = AnnotationRecord {
+        body: "edit".into(),
+        ..records.annotation_record("note-race").unwrap().unwrap()
+    };
     let barrier = Arc::new(Barrier::new(2));
-    let edit_roots = roots.clone(); let edit_work = work.clone(); let edit_barrier = barrier.clone(); let edit_copy = edit.clone();
+    let edit_roots = roots.clone();
+    let edit_work = work.clone();
+    let edit_barrier = barrier.clone();
+    let edit_copy = edit.clone();
     let editor = thread::spawn(move || {
         let identity = WorkspaceIdentity::discover(Some(&edit_work), &edit_work).unwrap();
         edit_barrier.wait();
-        DurableRecords::new(&edit_roots, &identity).update_annotation_record(&edit_copy, false, || Ok(test_anchor_raw(target, 'f')))
+        DurableRecords::new(&edit_roots, &identity).update_annotation_record(
+            &edit_copy,
+            false,
+            || Ok(test_anchor_raw(target, 'f')),
+        )
     });
-    let delete_roots = roots.clone(); let delete_work = work.clone(); let delete_barrier = barrier.clone();
+    let delete_roots = roots.clone();
+    let delete_work = work.clone();
+    let delete_barrier = barrier.clone();
     let deleter = thread::spawn(move || {
         let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
         delete_barrier.wait();
@@ -2449,7 +2519,9 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         Ok(record) => record,
         Err(error) => {
             assert_expected_storage_busy(&error);
-            records.update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f'))).unwrap()
+            records
+                .update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f')))
+                .unwrap()
         }
     };
     let delete_was_busy = delete_result.is_err();
