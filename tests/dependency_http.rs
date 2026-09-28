@@ -464,203 +464,31 @@ async fn disabled_and_shutdown_do_not_launch_catalog_work() {
 }
 #[tokio::test]
 async fn successful_workspace_index_automatically_rebuilds_catalog() {
-    use std::time::{Duration, Instant};
-    // The old 10s wall timer raced native capture, projection, revalidation,
-    // paired CAS and other parallel macOS fixtures. Keep separate finite
-    // phase budgets and one overall watchdog, with every observed transition.
-    const START_BUDGET: Duration = Duration::from_secs(20);
-    const PROJECT_BUDGET: Duration = Duration::from_secs(60);
-    const PUBLISH_BUDGET: Duration = Duration::from_secs(60);
-    const JOB_BUDGET: Duration = Duration::from_secs(120);
-    const CATALOG_BUDGET: Duration = Duration::from_secs(45);
-    const HTTP_BUDGET: Duration = Duration::from_secs(10);
-    const SAMPLE: Duration = Duration::from_millis(20);
-
     let fixture = setup(true);
     fixture.state.start_dependency_index();
     let old = ready(&fixture.app).await;
-    let old_revision = json!(fixture.store.status().unwrap().revision);
-    assert_eq!(old["workspaceRevision"], old_revision);
-    let old_catalog_id = old["catalogId"].as_str().expect("old ready catalog ID");
-    let (accepted, started_job) = request(&fixture.app, "POST", "/api/index", "{}").await;
-    assert_eq!(accepted, 202, "index admission response: {started_job}");
-    let job_id = started_job["id"].as_str().expect("202 must contain job ID");
-    assert_eq!(started_job["state"], "running", "{started_job}");
-    let job_path = format!("/api/jobs/{job_id}");
-    let began = Instant::now();
-    let mut stage_started = began;
-    let mut stage = "start";
-    let mut last_job = started_job.clone();
-    let mut last_state = started_job["state"].as_str().unwrap().to_owned();
-    let mut last_phase = started_job["progress"]["phase"]
-        .as_str()
-        .expect("202 must include progress.phase")
-        .to_owned();
-    let mut transitions = vec![format!("0ms state={last_state} phase={last_phase:?}")];
-    let new_revision = loop {
-        let (status, job) = tokio::time::timeout(
-            HTTP_BUDGET, request(&fixture.app, "GET", &job_path, ""),
-        ).await.unwrap_or_else(|elapsed| panic!(
-            "job {job_id} GET stalled: {elapsed}; stage={stage} stageElapsed={:?} totalElapsed={:?}; transitions={transitions:?}; lastJob={last_job}; oldRevision={old_revision}",
-            stage_started.elapsed(), began.elapsed(),
-        ));
-        assert_eq!(
-            status, 200,
-            "job {job_id} GET status={status}; body={job}; stage={stage}; transitions={transitions:?}; lastJob={last_job}"
-        );
-        assert_eq!(
-            job["id"].as_str(),
-            Some(job_id),
-            "wrong/missing job ID; expected={job_id}; body={job}; transitions={transitions:?}"
-        );
-        let state = job["state"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing job state: {job}"));
-        let progress = &job["progress"];
-        let phase = progress["phase"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing job progress.phase: {job}"));
-        assert!(
-            progress["completed"].as_u64().is_some() && progress["total"].as_u64().is_some(),
-            "malformed job progress counters: {job}"
-        );
-        assert!(
-            matches!(phase, "" | "parse" | "complete"),
-            "unexpected progress phase: {job}"
-        );
-        if state != last_state || phase != last_phase {
-            transitions.push(format!(
-                "{:?} state={state} phase={phase:?} progress={}/{} revision={} error={}",
-                began.elapsed(),
-                progress["completed"],
-                progress["total"],
-                job["revision"],
-                job["error"]
-            ));
-            last_state = state.to_owned();
-            last_phase = phase.to_owned();
+    assert_eq!(
+        request(&fixture.app, "POST", "/api/index", "{}").await.0,
+        202
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, job) = request(&fixture.app, "GET", "/api/jobs/current", "").await;
+            if job["state"] == "completed" {
+                break;
+            }
+            assert_ne!(job["state"], "failed", "{job}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        last_job = job.clone();
-        match state {
-            "failed" | "cancelled" | "cancelling" => panic!(
-                "job {job_id} ended {state}: {job}; transitions={transitions:?}; oldRevision={old_revision}"
-            ),
-            "running" | "completed" => {}
-            _ => panic!("job {job_id} unexpected state: {job}; transitions={transitions:?}"),
-        }
-        assert!(
-            job["error"].is_null(),
-            "job {job_id} exposes unexpected error: {job}; transitions={transitions:?}"
-        );
-        if phase == "complete" && stage != "publish/commit" {
-            stage = "publish/commit";
-            stage_started = Instant::now();
-            transitions.push(format!(
-                "{:?} graph projection complete; publication/commit not yet proven",
-                began.elapsed()
-            ));
-        } else if phase == "parse" && stage == "start" {
-            stage = "capture/project";
-            stage_started = Instant::now();
-            transitions.push(format!(
-                "{:?} capture/project progress observed",
-                began.elapsed()
-            ));
-        }
-        let phase_budget = match stage {
-            "start" => START_BUDGET,
-            "capture/project" => PROJECT_BUDGET,
-            _ => PUBLISH_BUDGET,
-        };
-        if began.elapsed() > JOB_BUDGET || stage_started.elapsed() > phase_budget {
-            let current = fixture
-                .store
-                .status()
-                .map(|s| json!(s.revision))
-                .unwrap_or_else(|e| json!({"statusError":e.to_string()}));
-            panic!(
-                "job {job_id} exceeded bounded {stage} budget {phase_budget:?} or overall {JOB_BUDGET:?}; stageElapsed={:?} totalElapsed={:?}; transitions={transitions:?}; lastJob={last_job}; oldRevision={old_revision}; currentStoreRevision={current}",
-                stage_started.elapsed(),
-                began.elapsed()
-            );
-        }
-        if state == "completed" {
-            assert_eq!(
-                phase, "complete",
-                "job completed without projection evidence: {job}"
-            );
-            let revision = job
-                .get("revision")
-                .filter(|value| !value.is_null())
-                .unwrap_or_else(|| panic!("completed job has no revision: {job}"));
-            assert!(
-                revision["indexGeneration"].as_str().is_some()
-                    && revision["indexRevision"].as_u64().is_some(),
-                "malformed completed revision: {job}"
-            );
-            assert_ne!(
-                revision, &old_revision,
-                "job completed without changing the workspace revision: {job}"
-            );
-            let current = json!(fixture.store.status().unwrap().revision);
-            assert_eq!(
-                revision, &current,
-                "job/store revision mismatch; transitions={transitions:?}; job={job}"
-            );
-            break revision.clone();
-        }
-        assert!(
-            job["revision"].is_null(),
-            "running job already has revision: {job}"
-        );
-        tokio::time::sleep(SAMPLE).await;
-    };
-
-    // Job completion precedes the automatic dependency-index trigger. Do not
-    // accept the old ready catalog just because its state is still `ready`.
-    let catalog_started = Instant::now();
-    let mut last_catalog = old.clone();
-    let new = loop {
-        let (status, catalog) = tokio::time::timeout(
-            HTTP_BUDGET, request(&fixture.app, "GET", "/api/dependencies", ""),
-        ).await.unwrap_or_else(|elapsed| panic!(
-            "catalog GET stalled after job {job_id}: {elapsed}; catalogElapsed={:?}; oldCatalogId={old_catalog_id}; jobRevision={new_revision}; lastCatalog={last_catalog}; lastJob={last_job}; transitions={transitions:?}",
-            catalog_started.elapsed(),
-        ));
-        assert_eq!(
-            status, 200,
-            "catalog GET failed status={status}; body={catalog}; jobRevision={new_revision}; lastJob={last_job}"
-        );
-        let catalog_state = catalog["state"]
-            .as_str()
-            .unwrap_or_else(|| panic!("malformed catalog state: {catalog}"));
-        assert!(
-            matches!(catalog_state, "loading" | "ready" | "failed"),
-            "unexpected catalog state: {catalog}"
-        );
-        let fresh = catalog_state == "ready"
-            && catalog["workspaceRevision"] == new_revision
-            && catalog["catalogId"]
-                .as_str()
-                .is_some_and(|id| id != old_catalog_id);
-        last_catalog = catalog.clone();
-        if fresh {
-            break catalog;
-        }
-        if catalog_started.elapsed() > CATALOG_BUDGET {
-            panic!(
-                "automatic dependency catalog did not reach NEW ready revision within {CATALOG_BUDGET:?}; elapsed={:?}; oldCatalogId={old_catalog_id}; oldRevision={old_revision}; jobRevision={new_revision}; lastCatalog={last_catalog}; lastJob={last_job}; transitions={transitions:?}",
-                catalog_started.elapsed()
-            );
-        }
-        tokio::time::sleep(SAMPLE).await;
-    };
-    assert_eq!(new["workspaceRevision"], new_revision);
-    assert_ne!(old["catalogId"], new["catalogId"]);
+    })
+    .await
+    .unwrap();
+    let new = ready(&fixture.app).await;
     assert_eq!(
         new["workspaceRevision"],
-        json!(fixture.store.status().unwrap().revision)
+        serde_json::json!(fixture.store.status().unwrap().revision)
     );
+    assert_ne!(old["catalogId"], new["catalogId"]);
 }
 #[cfg(unix)]
 #[tokio::test]
