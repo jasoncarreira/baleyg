@@ -1,6 +1,17 @@
 import { validate } from "./formats.mjs";
+// Tables depend only on source bytes; callers resolve many ranges per source.
+// Entries own a copy of their bytes, so a caller mutating its buffer misses.
+const recentTables = [];
 function scalarTable(source) {
   const bytes = Buffer.isBuffer(source) ? source : Buffer.from(source);
+  const hit = recentTables.find((entry) => entry.bytes.equals(bytes));
+  if (hit) return { bytes, tables: hit.tables };
+  const tables = buildScalarTables(bytes);
+  recentTables.unshift({ bytes: Buffer.from(bytes), tables });
+  if (recentTables.length > 16) recentTables.pop();
+  return { bytes, tables };
+}
+function buildScalarTables(bytes) {
   const text = new TextDecoder("utf-8", {
     fatal: true,
     ignoreBOM: true,
@@ -21,7 +32,7 @@ function scalarTable(source) {
     tables.utf16.set(unit, byte);
     tables.unicodeScalar.set(scalar, byte);
   }
-  return { bytes, tables };
+  return tables;
 }
 export function toByteRange(source, range) {
   validate("PositionRange", range);
