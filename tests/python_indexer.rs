@@ -1,6 +1,6 @@
 mod common;
 use baleyg::{
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::*,
 };
 use std::{
@@ -70,26 +70,30 @@ fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
     assert!(!graph.regions.is_empty());
     let state = tempfile::tempdir().unwrap();
     let store = crate::common::open_store(&state.path().join("state"), dir.path()).unwrap();
-    store
-        .publish(
-            &graph,
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (bundle_graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    assert_eq!(graph, bundle_graph);
+    let baseline = store.index_baseline().unwrap();
+    let pin = store
+        .publish_native(
+            &bundle_graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            baseline,
+            &cancel,
         )
         .unwrap();
+    assert_eq!(pin.index_revision, 1);
     assert!(
         store
-            .publish(
-                &graph,
+            .publish_native(
+                &bundle_graph,
+                &capture,
+                &native,
                 &store.leader().unwrap(),
-                baleyg::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 1
-                },
+                pin,
                 &Arc::new(AtomicBool::new(true))
             )
             .is_err()

@@ -25,8 +25,10 @@ enum PublishStage {
     AfterFile,
     BeforeCommit,
 }
-const DATABASE_SCHEMA_VERSION: u32 = 5;
-const EXTRACTOR_VERSION: &str = "native-no-lexical-v1";
+const DATABASE_SCHEMA_VERSION: u32 = 6;
+const EXTRACTOR_VERSION: &str = "native-paired-v1";
+const GRAPH_SCHEMA_VERSION: u32 = 5;
+const GRAPH_EXTRACTOR_VERSION: &str = "native-no-lexical-v1";
 const LEGACY_SCHEMA_VERSION: u32 = 4;
 const LEGACY_EXTRACTOR_VERSION: &str = "native-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
@@ -46,6 +48,35 @@ CREATE INDEX nodes_name ON nodes(name);
 CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
 CREATE INDEX calls_caller ON calls(caller);
 CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+";
+
+const NATIVE_SCHEMA: &str = "
+CREATE TABLE native_producers(id TEXT PRIMARY KEY,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'));
+CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL REFERENCES native_producers(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,language),UNIQUE(producer_id,ordinal));
+CREATE TABLE native_source_sets(id TEXT PRIMARY KEY,root_id TEXT NOT NULL);
+CREATE TABLE native_source_set_languages(source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(source_set_id,language),UNIQUE(source_set_id,ordinal));
+CREATE TABLE native_source_set_dependencies(source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,dependency_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(source_set_id,dependency_id),UNIQUE(source_set_id,ordinal));
+CREATE TABLE native_revisions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,toolchain_hash TEXT NOT NULL CHECK(length(toolchain_hash)=64),config_hash TEXT NOT NULL CHECK(length(config_hash)=64),dependency_hash TEXT NOT NULL CHECK(length(dependency_hash)=64));
+CREATE TABLE native_documents(source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,path TEXT NOT NULL,revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,PRIMARY KEY(revision_id,language,path),UNIQUE(source_set_id,language,path,revision_id),UNIQUE(source_set_id,language,path,revision_id,content_hash));
+CREATE INDEX native_documents_path ON native_documents(path,revision_id);
+CREATE TABLE native_coverage(producer_id TEXT NOT NULL REFERENCES native_producers(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,source_set_id TEXT NOT NULL,document_path TEXT NOT NULL,revision_id TEXT NOT NULL,requested INTEGER NOT NULL CHECK(requested IN (0,1)),selected INTEGER NOT NULL CHECK(selected IN (0,1)),state TEXT NOT NULL CHECK(state IN ('notRequested','omitted','unsupported','failed','partial','complete')),diagnostic TEXT,CHECK((state='complete')=(diagnostic IS NULL)),PRIMARY KEY(producer_id,revision_id,language,document_path),FOREIGN KEY(source_set_id,language,document_path,revision_id) REFERENCES native_documents(source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_coverage_document ON native_coverage(revision_id,language,document_path);
+CREATE TABLE native_coverage_roles(producer_id TEXT NOT NULL,revision_id TEXT NOT NULL,language TEXT NOT NULL,document_path TEXT NOT NULL,role_kind TEXT NOT NULL CHECK(role_kind IN ('supported','observed')),role TEXT NOT NULL CHECK(role IN ('definition','call')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,revision_id,language,document_path,role_kind,ordinal),UNIQUE(producer_id,revision_id,language,document_path,role_kind,role),FOREIGN KEY(producer_id,revision_id,language,document_path) REFERENCES native_coverage(producer_id,revision_id,language,document_path) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_provenance(id TEXT PRIMARY KEY,producer_id TEXT NOT NULL REFERENCES native_producers(id) DEFERRABLE INITIALLY DEFERRED,source_set_id TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,revision_id TEXT NOT NULL,content_hash TEXT NOT NULL,evidence_kind TEXT NOT NULL CHECK(evidence_kind='measuredSyntax'),basis TEXT CHECK(basis IS NULL),derived_from TEXT CHECK(derived_from IS NULL),freshness TEXT NOT NULL CHECK(freshness='fresh'),UNIQUE(revision_id,language,path),UNIQUE(id,source_set_id,language,path,revision_id),FOREIGN KEY(source_set_id,language,path,revision_id) REFERENCES native_documents(source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(source_set_id,language,path,revision_id,content_hash) REFERENCES native_documents(source_set_id,language,path,revision_id,content_hash) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_provenance_document ON native_provenance(revision_id,language,path);
+CREATE TABLE native_declarations(syntax_id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,revision_id TEXT NOT NULL,owner_syntax_id TEXT REFERENCES native_declarations(syntax_id) DEFERRABLE INITIALLY DEFERRED,kind TEXT NOT NULL,name TEXT,lookup_key TEXT,key_signature_present INTEGER NOT NULL CHECK(key_signature_present IN (0,1)),key_type_parameter_count INTEGER,key_variadic INTEGER,key_ordinal INTEGER NOT NULL CHECK(key_ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,name_start INTEGER,name_end INTEGER,provenance_id TEXT NOT NULL REFERENCES native_provenance(id) DEFERRABLE INITIALLY DEFERRED,CHECK(start_byte>=0 AND end_byte>=start_byte),CHECK((name IS NULL)=(lookup_key IS NULL) AND (name IS NULL)=(name_start IS NULL) AND (name_start IS NULL)=(name_end IS NULL)),CHECK(name_start IS NULL OR (name_start>=start_byte AND name_end<=end_byte AND name_end>name_start)),CHECK((key_signature_present=0 AND key_type_parameter_count IS NULL AND key_variadic IS NULL) OR (key_signature_present=1 AND key_type_parameter_count>=0 AND key_variadic IN (0,1))),UNIQUE(syntax_id,source_set_id,language,path,revision_id),FOREIGN KEY(source_set_id,language,path,revision_id) REFERENCES native_documents(source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(provenance_id,source_set_id,language,path,revision_id) REFERENCES native_provenance(id,source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(owner_syntax_id,source_set_id,language,path,revision_id) REFERENCES native_declarations(syntax_id,source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_declarations_lookup ON native_declarations(revision_id,language,lookup_key,syntax_id);
+CREATE INDEX native_declarations_document ON native_declarations(revision_id,language,path);
+CREATE TABLE native_declaration_ancestors(syntax_id TEXT NOT NULL REFERENCES native_declarations(syntax_id) DEFERRABLE INITIALLY DEFERRED,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,name TEXT,sibling_ordinal INTEGER NOT NULL CHECK(sibling_ordinal>=0),signature_present INTEGER NOT NULL CHECK(signature_present IN (0,1)),type_parameter_count INTEGER,variadic INTEGER,CHECK((signature_present=0 AND type_parameter_count IS NULL AND variadic IS NULL) OR (signature_present=1 AND type_parameter_count>=0 AND variadic IN (0,1))),PRIMARY KEY(syntax_id,ordinal));
+CREATE TABLE native_signature_parameter_types(syntax_id TEXT NOT NULL,ancestor_ordinal INTEGER NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),type_name TEXT NOT NULL,PRIMARY KEY(syntax_id,ancestor_ordinal,ordinal),FOREIGN KEY(syntax_id) REFERENCES native_declarations(syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_headers(syntax_id TEXT PRIMARY KEY REFERENCES native_declarations(syntax_id) DEFERRABLE INITIALLY DEFERRED,kind TEXT NOT NULL,name TEXT,result_type TEXT);
+CREATE TABLE native_header_items(syntax_id TEXT NOT NULL REFERENCES native_headers(syntax_id) DEFERRABLE INITIALLY DEFERRED,item_kind TEXT NOT NULL CHECK(item_kind IN ('modifier','typeParameter','base')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),value TEXT NOT NULL,PRIMARY KEY(syntax_id,item_kind,ordinal));
+CREATE TABLE native_parameters(syntax_id TEXT NOT NULL REFERENCES native_headers(syntax_id) DEFERRABLE INITIALLY DEFERRED,ordinal INTEGER NOT NULL CHECK(ordinal>=0),name TEXT,type_name TEXT,variadic INTEGER NOT NULL CHECK(variadic IN (0,1)),PRIMARY KEY(syntax_id,ordinal));
+CREATE TABLE native_calls(id TEXT PRIMARY KEY,owner_syntax_id TEXT NOT NULL REFERENCES native_declarations(syntax_id) DEFERRABLE INITIALLY DEFERRED,ordinal INTEGER NOT NULL CHECK(ordinal>=0),source_set_id TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,revision_id TEXT NOT NULL,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,callee_start INTEGER,callee_end INTEGER,spelling TEXT,provenance_id TEXT NOT NULL REFERENCES native_provenance(id) DEFERRABLE INITIALLY DEFERRED,CHECK(start_byte>=0 AND end_byte>start_byte),CHECK((callee_start IS NULL)=(callee_end IS NULL)),CHECK(callee_start IS NULL OR (callee_start>=start_byte AND callee_end<=end_byte AND callee_end>callee_start)),UNIQUE(revision_id,owner_syntax_id,ordinal),FOREIGN KEY(source_set_id,language,path,revision_id) REFERENCES native_documents(source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(provenance_id,source_set_id,language,path,revision_id) REFERENCES native_provenance(id,source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(owner_syntax_id,source_set_id,language,path,revision_id) REFERENCES native_declarations(syntax_id,source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_calls_owner ON native_calls(revision_id,owner_syntax_id,ordinal);
+CREATE TABLE native_call_regions(call_id TEXT NOT NULL REFERENCES native_calls(id) DEFERRABLE INITIALLY DEFERRED,region_id TEXT NOT NULL REFERENCES native_control_regions(id) DEFERRABLE INITIALLY DEFERRED,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(call_id,ordinal),UNIQUE(call_id,region_id));
+CREATE TABLE native_control_regions(id TEXT PRIMARY KEY,owner_syntax_id TEXT NOT NULL REFERENCES native_declarations(syntax_id) DEFERRABLE INITIALLY DEFERRED,ordinal INTEGER NOT NULL CHECK(ordinal>=0),source_set_id TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,revision_id TEXT NOT NULL,kind TEXT NOT NULL,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,parent_id TEXT REFERENCES native_control_regions(id) DEFERRABLE INITIALLY DEFERRED,arm TEXT,provenance_id TEXT NOT NULL REFERENCES native_provenance(id) DEFERRABLE INITIALLY DEFERRED,CHECK(start_byte>=0 AND end_byte>start_byte),UNIQUE(revision_id,owner_syntax_id,ordinal),UNIQUE(id,owner_syntax_id,source_set_id,language,path,revision_id),FOREIGN KEY(source_set_id,language,path,revision_id) REFERENCES native_documents(source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(provenance_id,source_set_id,language,path,revision_id) REFERENCES native_provenance(id,source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(owner_syntax_id,source_set_id,language,path,revision_id) REFERENCES native_declarations(syntax_id,source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(parent_id,owner_syntax_id,source_set_id,language,path,revision_id) REFERENCES native_control_regions(id,owner_syntax_id,source_set_id,language,path,revision_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_control_regions_owner ON native_control_regions(revision_id,owner_syntax_id,ordinal);
 ";
 /// A normal connection keeps the verified index use lock until SQLite closes.
 struct IndexConnection {
@@ -160,6 +191,15 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(CACHE_SCHEMA)?;
     expected.execute_batch(CLASS_SCHEMA)?;
+    let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version == DATABASE_SCHEMA_VERSION {
+        expected.execute_batch(NATIVE_SCHEMA)?;
+    } else {
+        ensure!(
+            matches!(version, LEGACY_SCHEMA_VERSION | GRAPH_SCHEMA_VERSION),
+            "incompatible_index: unknown schema version"
+        );
+    }
     ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -188,7 +228,10 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     ensure!(mode == "delete", "incompatible_index: journal mode");
     let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     ensure!(
-        version == DATABASE_SCHEMA_VERSION || version == LEGACY_SCHEMA_VERSION,
+        matches!(
+            version,
+            LEGACY_SCHEMA_VERSION | GRAPH_SCHEMA_VERSION | DATABASE_SCHEMA_VERSION
+        ),
         "incompatible_index: schema version {version}"
     );
     storage_result(db.prepare(
@@ -209,7 +252,8 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     )?;
     ensure!(
         (version == LEGACY_SCHEMA_VERSION && metadata == (4, LEGACY_EXTRACTOR_VERSION.into()))
-            || (version == DATABASE_SCHEMA_VERSION && metadata == (5, EXTRACTOR_VERSION.into())),
+            || (version == GRAPH_SCHEMA_VERSION && metadata == (5, GRAPH_EXTRACTOR_VERSION.into()))
+            || (version == DATABASE_SCHEMA_VERSION && metadata == (6, EXTRACTOR_VERSION.into())),
         "incompatible_index: schema and metadata mismatch"
     );
     let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
@@ -496,6 +540,380 @@ fn resolve_class(db: &Connection, id: &str) -> Result<(crate::classes::ClassDefi
     Ok((class, clipped))
 }
 
+fn write_native(
+    db: &Connection,
+    artifact: &crate::native_evidence::Artifact,
+    capture: &crate::capture::Capture,
+    cancel: &CancelFlag,
+) -> Result<()> {
+    use crate::native_evidence::Signature;
+    let a = artifact;
+    db.execute_batch("DELETE FROM native_call_regions; DELETE FROM native_calls; DELETE FROM native_control_regions; DELETE FROM native_signature_parameter_types; DELETE FROM native_declaration_ancestors; DELETE FROM native_parameters; DELETE FROM native_header_items; DELETE FROM native_headers; DELETE FROM native_declarations; DELETE FROM native_provenance; DELETE FROM native_coverage_roles; DELETE FROM native_coverage; DELETE FROM native_documents; DELETE FROM native_revisions; DELETE FROM native_source_set_dependencies; DELETE FROM native_source_set_languages; DELETE FROM native_source_sets; DELETE FROM native_producer_languages; DELETE FROM native_producers;")?;
+    db.execute(
+        "INSERT INTO native_producers VALUES(?1,?2,?3,?4,?5)",
+        params![
+            a.producer.id,
+            a.producer.version,
+            a.producer.executable_hash,
+            a.producer.kind,
+            a.producer.position_encoding
+        ],
+    )?;
+    for (ordinal, language) in a.producer.languages.iter().enumerate() {
+        db.execute(
+            "INSERT INTO native_producer_languages VALUES(?1,?2,?3)",
+            params![a.producer.id, language, ordinal as i64],
+        )?;
+    }
+    db.execute(
+        "INSERT INTO native_source_sets VALUES(?1,?2)",
+        params![a.source_set.id, a.source_set.root_id],
+    )?;
+    for (ordinal, language) in a.source_set.languages.iter().enumerate() {
+        db.execute(
+            "INSERT INTO native_source_set_languages VALUES(?1,?2,?3)",
+            params![a.source_set.id, language, ordinal as i64],
+        )?;
+    }
+    for (ordinal, dependency) in a.source_set.dependencies.iter().enumerate() {
+        db.execute(
+            "INSERT INTO native_source_set_dependencies VALUES(?1,?2,?3)",
+            params![a.source_set.id, dependency, ordinal as i64],
+        )?;
+    }
+    db.execute(
+        "INSERT INTO native_revisions VALUES(?1,?2,?3,?4,?5)",
+        params![
+            a.revision.id,
+            a.revision.source_set_id,
+            a.revision.toolchain_hash,
+            a.revision.config_hash,
+            a.revision.dependency_hash
+        ],
+    )?;
+    let sources: BTreeMap<_, _> = capture
+        .files
+        .iter()
+        .map(|file| ((file.language.as_str(), file.path.as_str()), file))
+        .collect();
+    for doc in &a.revision.documents {
+        check_cancel(cancel)?;
+        let file = sources
+            .get(&(doc.key.language.as_str(), doc.key.path.as_str()))
+            .context("native document missing captured bytes")?;
+        ensure!(
+            file.hash == doc.content_hash && file.text.len() == doc.byte_length,
+            "native document bytes differ from capture"
+        );
+        db.execute(
+            "INSERT INTO native_documents VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                doc.key.source_set_id,
+                doc.key.language,
+                doc.key.path,
+                doc.revision_id,
+                doc.content_hash,
+                doc.byte_length as i64,
+                file.text.as_bytes()
+            ],
+        )?;
+    }
+    for coverage in &a.coverage {
+        check_cancel(cancel)?;
+        db.execute(
+            "INSERT INTO native_coverage VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                coverage.producer_id,
+                coverage.language,
+                coverage.source_set_id,
+                coverage.document_path,
+                coverage.revision_id,
+                coverage.requested,
+                coverage.selected,
+                coverage.state,
+                coverage.diagnostic
+            ],
+        )?;
+        for (kind, roles) in [
+            ("supported", &coverage.supported_roles),
+            ("observed", &coverage.observed_roles),
+        ] {
+            for (ordinal, role) in roles.iter().enumerate() {
+                db.execute(
+                    "INSERT INTO native_coverage_roles VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        coverage.producer_id,
+                        coverage.revision_id,
+                        coverage.language,
+                        coverage.document_path,
+                        kind,
+                        role,
+                        ordinal as i64
+                    ],
+                )?;
+            }
+        }
+    }
+    for proof in &a.provenance {
+        check_cancel(cancel)?;
+        ensure!(
+            proof.basis.is_none() && proof.derived_from.is_none(),
+            "native proof must be fresh and direct"
+        );
+        db.execute(
+            "INSERT INTO native_provenance VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL,?9)",
+            params![
+                proof.id,
+                proof.producer_id,
+                proof.document.source_set_id,
+                proof.document.language,
+                proof.document.path,
+                proof.revision_id,
+                proof.content_hash,
+                proof.evidence_kind,
+                proof.freshness
+            ],
+        )?;
+    }
+    fn signature(
+        db: &Connection,
+        id: &str,
+        ancestor: i64,
+        signature: &Option<Signature>,
+    ) -> Result<()> {
+        if let Some(signature) = signature {
+            for (ordinal, parameter) in signature.parameter_types.iter().enumerate() {
+                db.execute(
+                    "INSERT INTO native_signature_parameter_types VALUES(?1,?2,?3,?4)",
+                    params![id, ancestor, ordinal as i64, parameter],
+                )?;
+            }
+        }
+        Ok(())
+    }
+    let mut owners = BTreeMap::new();
+    for d in &a.declarations {
+        let key = (
+            d.document.path.clone(),
+            serde_json::to_string(&d.ancestors)?,
+            serde_json::to_string(&d.key)?,
+        );
+        ensure!(
+            owners.insert(key, d.syntax_id.clone()).is_none(),
+            "duplicate native owner key"
+        );
+    }
+    for declaration in &a.declarations {
+        check_cancel(cancel)?;
+        let d = declaration;
+        let owner = d
+            .ancestors
+            .last()
+            .map(|last| -> Result<String> {
+                let prefix = serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?;
+                let key = serde_json::to_string(last)?;
+                owners
+                    .get(&(d.document.path.clone(), prefix, key))
+                    .cloned()
+                    .context("native declaration parent missing")
+            })
+            .transpose()?;
+        let sig = d.key.signature.as_ref();
+        db.execute("INSERT INTO native_declarations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",params![d.syntax_id,d.document.source_set_id,d.document.language,d.document.path,d.revision_id,owner,d.kind,d.name,d.lookup_key,sig.is_some(),sig.map(|s|s.type_parameter_count as i64),sig.map(|s|s.variadic),d.key.ordinal as i64,d.range.start as i64,d.range.end as i64,d.name_range.as_ref().map(|r|r.start as i64),d.name_range.as_ref().map(|r|r.end as i64),d.provenance_id])?;
+        signature(db, &d.syntax_id, -1, &d.key.signature)?;
+        for (ordinal, key) in d.ancestors.iter().enumerate() {
+            let sig = key.signature.as_ref();
+            db.execute(
+                "INSERT INTO native_declaration_ancestors VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    d.syntax_id,
+                    ordinal as i64,
+                    key.kind,
+                    key.name,
+                    key.ordinal as i64,
+                    sig.is_some(),
+                    sig.map(|s| s.type_parameter_count as i64),
+                    sig.map(|s| s.variadic)
+                ],
+            )?;
+            signature(db, &d.syntax_id, ordinal as i64, &key.signature)?;
+        }
+        db.execute(
+            "INSERT INTO native_headers VALUES(?1,?2,?3,?4)",
+            params![
+                d.syntax_id,
+                d.header.kind,
+                d.header.name,
+                d.header.result_type
+            ],
+        )?;
+        for (kind, values) in [
+            ("modifier", &d.header.modifiers),
+            ("typeParameter", &d.header.type_parameters),
+            ("base", &d.header.bases),
+        ] {
+            for (ordinal, value) in values.iter().enumerate() {
+                db.execute(
+                    "INSERT INTO native_header_items VALUES(?1,?2,?3,?4)",
+                    params![d.syntax_id, kind, ordinal as i64, value],
+                )?;
+            }
+        }
+        for (ordinal, parameter) in d.header.parameters.iter().enumerate() {
+            db.execute(
+                "INSERT INTO native_parameters VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    d.syntax_id,
+                    ordinal as i64,
+                    parameter.name,
+                    parameter.type_name,
+                    parameter.variadic
+                ],
+            )?;
+        }
+    }
+    for region in &a.control_regions {
+        check_cancel(cancel)?;
+        let r = region;
+        db.execute(
+            "INSERT INTO native_control_regions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                r.id,
+                r.owner_syntax_id,
+                r.ordinal as i64,
+                r.document.source_set_id,
+                r.document.language,
+                r.document.path,
+                r.revision_id,
+                r.kind,
+                r.range.start as i64,
+                r.range.end as i64,
+                r.parent_id,
+                r.arm,
+                r.provenance_id
+            ],
+        )?;
+    }
+    for call in &a.calls {
+        check_cancel(cancel)?;
+        let c = call;
+        db.execute(
+            "INSERT INTO native_calls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                c.id,
+                c.owner_syntax_id,
+                c.ordinal as i64,
+                c.document.source_set_id,
+                c.document.language,
+                c.document.path,
+                c.revision_id,
+                c.range.start as i64,
+                c.range.end as i64,
+                c.callee_range.as_ref().map(|r| r.start as i64),
+                c.callee_range.as_ref().map(|r| r.end as i64),
+                c.spelling,
+                c.provenance_id
+            ],
+        )?;
+        for (ordinal, region) in c.region_ids.iter().enumerate() {
+            db.execute(
+                "INSERT INTO native_call_regions VALUES(?1,?2,?3)",
+                params![c.id, region, ordinal as i64],
+            )?;
+        }
+    }
+    ensure!(
+        db.prepare("PRAGMA foreign_key_check")?
+            .query([])?
+            .next()?
+            .is_none(),
+        "native foreign key failure"
+    );
+    Ok(())
+}
+
+/// Bounded readiness check for a pair installed by the verified writer. This does not
+/// attest every stored BLOB after out-of-band SQLite mutation. Opening the Store checks
+/// all rows; pinned source reads verify the selected BLOB inside their read snapshot.
+fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
+    fn one_row(db: &Connection, sql: &str) -> Result<Option<(String, String)>> {
+        let mut rows = db
+            .prepare(sql)?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            rows.len() <= 1,
+            "incompatible_index: duplicate native pair metadata"
+        );
+        Ok(rows.pop())
+    }
+    let producer = one_row(db, "SELECT id,kind FROM native_producers LIMIT 2")?;
+    let source = one_row(db, "SELECT id,root_id FROM native_source_sets LIMIT 2")?;
+    let revision = one_row(db, "SELECT id,source_set_id FROM native_revisions LIMIT 2")?;
+    let expected_source = format!("source-set:v1:{root_id}");
+    ensure!(
+        producer
+            .as_ref()
+            .is_some_and(|(id, kind)| id == "baleyg.native.syntax" && kind == "native")
+            && source
+                .as_ref()
+                .is_some_and(|(id, root)| id == &expected_source && root == root_id)
+            && revision.as_ref().is_some_and(
+                |(id, source)| id.starts_with("revision:v1:") && source == &expected_source
+            ),
+        "incompatible_index: missing native pair metadata"
+    );
+    Ok(())
+}
+
+fn validate_paired_rows(db: &Connection) -> Result<()> {
+    let count = |table: &str| -> Result<i64> {
+        Ok(db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
+    };
+    ensure!(
+        count("native_producers")? == 1
+            && count("native_source_sets")? == 1
+            && count("native_revisions")? == 1,
+        "incompatible_index: missing native pair"
+    );
+    ensure!(
+        count("native_documents")? == count("files")?
+            && count("native_coverage")? == count("files")?
+            && count("native_provenance")? == count("files")?,
+        "incompatible_index: incomplete native pair"
+    );
+    let mut stmt=db.prepare("SELECT d.source_bytes,d.content_hash,d.byte_length,f.payload,f.hash FROM native_documents d JOIN files f ON d.path=f.path")?;
+    let mut rows = stmt.query([])?;
+    let mut matched = 0;
+    while let Some(row) = rows.next()? {
+        use sha2::{Digest, Sha256};
+        let bytes: Vec<u8> = row.get(0)?;
+        let hash: String = row.get(1)?;
+        let length: i64 = row.get(2)?;
+        let file: SourceFile = serde_json::from_str(&row.get::<_, String>(3)?)?;
+        ensure!(
+            length == bytes.len() as i64
+                && hash == hex::encode(Sha256::digest(&bytes))
+                && file.hash == hash
+                && row.get::<_, String>(4)? == hash
+                && file.text.as_bytes() == bytes,
+            "incompatible_index: graph/native bytes mismatch"
+        );
+        matched += 1;
+    }
+    ensure!(
+        matched == count("files")?,
+        "incompatible_index: missing graph/native document"
+    );
+    ensure!(
+        db.prepare("PRAGMA foreign_key_check")?
+            .query([])?
+            .next()?
+            .is_none(),
+        "incompatible_index: native foreign key mismatch"
+    );
+    Ok(())
+}
 impl Store {
     pub fn open(
         roots: topology::TopologyRoots,
@@ -526,6 +944,10 @@ impl Store {
         let mut db = store.cache()?;
         let tx = storage_result(db.transaction())?;
         store.read_control_status(&tx)?;
+        let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if schema == DATABASE_SCHEMA_VERSION {
+            validate_paired_rows(&tx)?;
+        }
         Ok(store)
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
@@ -591,7 +1013,7 @@ impl Store {
             db.execute(
                 "INSERT INTO index_metadata VALUES(1,5,?1,?2,?3,?4,?5,0,?6,'',?7,?8)",
                 params![
-                    EXTRACTOR_VERSION,
+                    GRAPH_EXTRACTOR_VERSION,
                     self.workspace_root,
                     self.identity.device.to_string(),
                     self.identity.inode.to_string(),
@@ -601,7 +1023,7 @@ impl Store {
                     json(&Vec::<Diagnostic>::new())?
                 ],
             )?;
-            db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
+            db.pragma_update(None, "user_version", GRAPH_SCHEMA_VERSION)?;
             db.execute_batch("COMMIT")?;
             Ok(())
         })();
@@ -714,6 +1136,9 @@ impl Store {
             (schema_version == i64::from(LEGACY_SCHEMA_VERSION)
                 && row.0 == schema_version
                 && row.1 == LEGACY_EXTRACTOR_VERSION)
+                || (schema_version == i64::from(GRAPH_SCHEMA_VERSION)
+                    && row.0 == schema_version
+                    && row.1 == GRAPH_EXTRACTOR_VERSION)
                 || (schema_version == i64::from(DATABASE_SCHEMA_VERSION)
                     && row.0 == schema_version
                     && row.1 == EXTRACTOR_VERSION),
@@ -730,6 +1155,9 @@ impl Store {
         let pin: IndexPin = serde_json::from_value(
             serde_json::json!({"indexGeneration":row.5,"indexRevision":row.6}),
         )?;
+        if schema_version == i64::from(DATABASE_SCHEMA_VERSION) {
+            validate_paired_metadata(db, &self.identity.record_id)?;
+        }
         Ok(IndexStatus {
             workspace_root: self.workspace_root.clone(),
             revision: pin,
@@ -753,6 +1181,9 @@ impl Store {
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         Ok(self.read_control_status(&tx)?.revision)
+    }
+    pub fn root_id(&self) -> &str {
+        &self.identity.record_id
     }
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
@@ -778,7 +1209,8 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
-        self.publish_inner(graph, None, leader, expected_revision, cancel)
+        let _ = (graph, leader, expected_revision, cancel);
+        anyhow::bail!("native_evidence_required: graph-only publication refused")
     }
     pub fn publish_captured(
         &self,
@@ -788,32 +1220,73 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
-        self.publish_inner(graph, Some(capture), leader, expected_revision, cancel)
+        let _ = (graph, capture, leader, expected_revision, cancel);
+        anyhow::bail!("native_evidence_required: captured graph-only publication refused")
     }
-    fn publish_inner(
+    pub fn publish_native(
         &self,
         graph: &Graph,
-        capture: Option<&crate::capture::Capture>,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
         leader: &topology::LeaderGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
-        self.publish_inner_checked(graph, capture, leader, expected_revision, cancel, |_, _| {
-            Ok(())
-        })
+        native.validate(
+            capture,
+            Path::new(&self.workspace_root),
+            &self.identity.record_id,
+        )?;
+        ensure!(
+            capture.graph_projection_count() == 1,
+            "native_evidence_required: capture must have one graph projection"
+        );
+        ensure!(
+            capture.source_operations.len() == capture.files.len()
+                && capture
+                    .source_operations
+                    .values()
+                    .all(|counts| counts.opens == 1
+                        && counts.complete_reads == 1
+                        && counts.hashes == 1),
+            "native_evidence_required: each source must open, read, and hash once"
+        );
+        crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
+        self.publish_inner(graph, capture, native, leader, expected_revision, cancel)
+    }
+    fn publish_inner(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        leader: &topology::LeaderGuard,
+        expected_revision: IndexPin,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_inner_checked(
+            (graph, capture, native),
+            leader,
+            expected_revision,
+            cancel,
+            |_, _| Ok(()),
+        )
     }
 
     // Private transaction seam used by the in-module rollback tests. Normal callers
     // always pass a no-op; no SQL-fault control is exposed to API or CLI clients.
     fn publish_inner_checked(
         &self,
-        graph: &Graph,
-        capture: Option<&crate::capture::Capture>,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
         leader: &topology::LeaderGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
+        let (graph, capture, native) = bundle;
         ensure!(
             graph.schema_version == SCHEMA_VERSION,
             "unsupported graph schema"
@@ -849,11 +1322,24 @@ impl Store {
             expected_revision == old,
             "revision conflict: expected {expected_revision:?}, found {old:?}"
         );
-        let rebaseline = baseline.evidence_format.is_none();
-        if rebaseline {
+        let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let rebaseline = schema != DATABASE_SCHEMA_VERSION;
+        ensure!(
+            graph.files.len() == native.revision.documents.len(),
+            "graph/native document cardinality mismatch"
+        );
+        for file in &graph.files {
             ensure!(
-                capture.is_some(),
-                "index_not_ready: rebaseline needs verified capture"
+                native
+                    .revision
+                    .documents
+                    .iter()
+                    .any(|doc| doc.key.path == file.path
+                        && doc.key.language == file.language
+                        && doc.content_hash == file.hash
+                        && doc.byte_length == file.text.len()
+                        && capture.files.iter().any(|source| source == file)),
+                "graph/native captured source mismatch"
             );
         }
         let revision = IndexPin {
@@ -868,6 +1354,9 @@ impl Store {
                 .filter(|n| *n <= 9_007_199_254_740_991)
                 .context("revision overflow")?,
         };
+        if rebaseline {
+            tx.execute_batch(NATIVE_SCHEMA)?;
+        }
         tx.execute_batch(
             "DELETE FROM class_relations; DELETE FROM classes; DELETE FROM class_catalog;
              DELETE FROM calls; DELETE FROM regions; DELETE FROM nodes; DELETE FROM files;",
@@ -926,6 +1415,7 @@ impl Store {
                 ],
             )?;
         }
+        write_native(&tx, native, capture, cancel)?;
         tx.execute(
             "INSERT INTO class_catalog VALUES(1,?1,?2)",
             params![json(&classes.warnings)?, classes.truncated],
@@ -934,20 +1424,279 @@ impl Store {
             .duration_since(UNIX_EPOCH)?
             .as_millis()
             .to_string();
-        tx.execute("UPDATE index_metadata SET schema_version=5,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6 WHERE singleton=1",
+        tx.execute("UPDATE index_metadata SET schema_version=6,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6 WHERE singleton=1",
             params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?])?;
         if rebaseline {
             tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
         }
+        validate_paired_metadata(&tx, &self.identity.record_id)?;
+        validate_paired_rows(&tx)?;
         check_cancel(cancel)?;
-        if let Some(capture) = capture {
-            capture.verify(cancel)?;
-        }
+        capture.verify(cancel)?;
         leader.verify()?;
         self.identity.verify()?;
         during_tx(PublishStage::BeforeCommit, &tx)?;
+        check_cancel(cancel)?;
+        capture.verify(cancel)?;
+        leader.verify()?;
+        self.identity.verify()?;
         storage_result(tx.commit())?;
         Ok(revision)
+    }
+
+    fn native_at<T>(
+        &self,
+        pin: IndexPin,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut db = self.cache()?;
+        let tx = storage_result(db.transaction())?;
+        ensure!(
+            self.read_status(&tx)?.revision == pin,
+            "revision conflict: stale native pin"
+        );
+        read(&tx)
+    }
+
+    pub fn native_declarations_at(
+        &self,
+        pin: IndexPin,
+        language: &str,
+        lookup_key: &str,
+    ) -> Result<Vec<crate::native_evidence::Declaration>> {
+        use crate::native_evidence::{
+            Declaration, DocumentKey, Header, Key, Parameter, Range, Signature,
+        };
+        self.native_at(pin, |db| {
+            type AncestorRow = (i64, String, Option<String>, i64, bool, Option<i64>, Option<bool>);
+            let mut types: BTreeMap<(String, i64), Vec<String>> = BTreeMap::new();
+            let mut statement = db.prepare(
+                "SELECT t.syntax_id,t.ancestor_ordinal,t.type_name FROM native_signature_parameter_types t                  JOIN native_declarations d ON d.syntax_id=t.syntax_id                  WHERE d.language=?1 AND d.lookup_key=?2 ORDER BY t.syntax_id,t.ancestor_ordinal,t.ordinal",
+            )?;
+            for item in statement.query_map(params![language, lookup_key], |r| {
+                Ok((r.get::<_, String>(0)?,r.get::<_, i64>(1)?,r.get::<_, String>(2)?))
+            })? {
+                let (id, ordinal, name) = item?;
+                types.entry((id, ordinal)).or_default().push(name);
+            }
+            let mut ancestors: BTreeMap<String, Vec<AncestorRow>> = BTreeMap::new();
+            let mut statement = db.prepare(
+                "SELECT a.syntax_id,a.ordinal,a.kind,a.name,a.sibling_ordinal,a.signature_present,                 a.type_parameter_count,a.variadic FROM native_declaration_ancestors a                  JOIN native_declarations d ON d.syntax_id=a.syntax_id                  WHERE d.language=?1 AND d.lookup_key=?2 ORDER BY a.syntax_id,a.ordinal",
+            )?;
+            for item in statement.query_map(params![language, lookup_key], |r| {
+                Ok((r.get::<_, String>(0)?,r.get::<_, i64>(1)?,r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,r.get::<_, i64>(4)?,r.get::<_, bool>(5)?,
+                    r.get::<_, Option<i64>>(6)?,r.get::<_, Option<bool>>(7)?))
+            })? {
+                let (id, ordinal, kind, name, sibling, signature, count, variadic) = item?;
+                ancestors.entry(id).or_default().push((ordinal, kind, name, sibling, signature, count, variadic));
+            }
+            let mut headers: BTreeMap<String, Header> = BTreeMap::new();
+            let mut statement = db.prepare(
+                "SELECT h.syntax_id,h.kind,h.name,h.result_type FROM native_headers h                  JOIN native_declarations d ON d.syntax_id=h.syntax_id                  WHERE d.language=?1 AND d.lookup_key=?2",
+            )?;
+            for item in statement.query_map(params![language, lookup_key], |r| {
+                Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,r.get::<_, Option<String>>(3)?))
+            })? {
+                let (id, kind, name, result_type) = item?;
+                ensure!(headers.insert(id, Header {
+                    kind, name, modifiers: vec![], type_parameters: vec![],
+                    parameters: vec![], result_type, bases: vec![],
+                }).is_none(), "duplicate native header");
+            }
+            let mut statement = db.prepare(
+                "SELECT i.syntax_id,i.item_kind,i.value FROM native_header_items i                  JOIN native_declarations d ON d.syntax_id=i.syntax_id                  WHERE d.language=?1 AND d.lookup_key=?2                  ORDER BY i.syntax_id,i.item_kind,i.ordinal",
+            )?;
+            for item in statement.query_map(params![language, lookup_key], |r| {
+                Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?))
+            })? {
+                let (id, kind, value) = item?;
+                let header = headers.get_mut(&id).context("missing native header")?;
+                match kind.as_str() {
+                    "modifier" => header.modifiers.push(value),
+                    "typeParameter" => header.type_parameters.push(value),
+                    "base" => header.bases.push(value),
+                    _ => anyhow::bail!("unknown native header item"),
+                }
+            }
+            let mut statement = db.prepare(
+                "SELECT p.syntax_id,p.name,p.type_name,p.variadic FROM native_parameters p                  JOIN native_declarations d ON d.syntax_id=p.syntax_id                  WHERE d.language=?1 AND d.lookup_key=?2 ORDER BY p.syntax_id,p.ordinal",
+            )?;
+            for item in statement.query_map(params![language, lookup_key], |r| {
+                Ok((r.get::<_, String>(0)?,r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,r.get::<_, bool>(3)?))
+            })? {
+                let (id, name, type_name, variadic) = item?;
+                headers.get_mut(&id).context("missing native parameter header")?
+                    .parameters.push(Parameter {name, type_name, variadic});
+            }
+            fn signature(
+                types: &mut BTreeMap<(String, i64), Vec<String>>,
+                id: &str, ordinal: i64, present: bool,
+                count: Option<i64>, variadic: Option<bool>,
+            ) -> Result<Option<Signature>> {
+                let parameter_types = types.remove(&(id.to_owned(), ordinal)).unwrap_or_default();
+                if !present {
+                    ensure!(parameter_types.is_empty(), "orphan native signature types");
+                    return Ok(None);
+                }
+                Ok(Some(Signature {
+                    parameter_types,
+                    type_parameter_count: usize::try_from(count.context("missing signature count")?)?,
+                    variadic: variadic.context("missing signature variadic")?,
+                }))
+            }
+            let mut stmt = db.prepare(
+                "SELECT syntax_id,source_set_id,path,revision_id,kind,name,lookup_key,                 key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,                 start_byte,end_byte,name_start,name_end,provenance_id                  FROM native_declarations WHERE revision_id=(SELECT id FROM native_revisions LIMIT 1)                  AND language=?1 AND lookup_key=?2 ORDER BY syntax_id",
+            )?;
+            let rows = stmt.query_map(params![language,lookup_key], |r| {
+                Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,r.get::<_, String>(4)?,r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,r.get::<_, bool>(7)?,r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<bool>>(9)?,r.get::<_, i64>(10)?,r.get::<_, i64>(11)?,
+                    r.get::<_, i64>(12)?,r.get::<_, Option<i64>>(13)?,
+                    r.get::<_, Option<i64>>(14)?,r.get::<_, String>(15)?))
+            })?;
+            let mut declarations = Vec::new();
+            for row in rows {
+                let (syntax_id,source_set_id,path,revision_id,kind,name,lookup_key,present,count,
+                    variadic,key_ordinal,start,end,name_start,name_end,provenance_id) = row?;
+                let key = Key {
+                    kind: kind.clone(), name: name.clone(),
+                    signature: signature(&mut types,&syntax_id,-1,present,count,variadic)?,
+                    ordinal: usize::try_from(key_ordinal)?,
+                };
+                let mut ancestor_keys = Vec::new();
+                for (ordinal,kind,name,sibling,present,count,variadic) in
+                    ancestors.remove(&syntax_id).unwrap_or_default()
+                {
+                    ensure!(ordinal == ancestor_keys.len() as i64,"native ancestor ordinal gap");
+                    ancestor_keys.push(Key {
+                        kind, name,
+                        signature: signature(&mut types,&syntax_id,ordinal,present,count,variadic)?,
+                        ordinal: usize::try_from(sibling)?,
+                    });
+                }
+                let name_range = name_start.zip(name_end).map(|(start,end)| -> Result<Range> {
+                    Ok(Range { start: usize::try_from(start)?, end: usize::try_from(end)? })
+                }).transpose()?;
+                declarations.push(Declaration {
+                    syntax_id: syntax_id.clone(),
+                    document: DocumentKey { source_set_id, language: language.to_owned(), path },
+                    revision_id, kind, name, lookup_key, ancestors: ancestor_keys, key,
+                    range: Range { start: usize::try_from(start)?, end: usize::try_from(end)? },
+                    name_range,
+                    header: headers.remove(&syntax_id).context("missing native declaration header")?,
+                    provenance_id,
+                });
+            }
+            ensure!(types.is_empty() && ancestors.is_empty() && headers.is_empty(),"orphan native declaration children");
+            Ok(declarations)
+        })
+    }
+
+    pub fn native_source_at(
+        &self,
+        pin: IndexPin,
+        key: &crate::native_evidence::DocumentKey,
+    ) -> Result<Option<(crate::native_evidence::Document, Vec<u8>)>> {
+        use crate::native_evidence::Document;
+        self.native_at(pin, |db| {
+            db.query_row("SELECT revision_id,content_hash,byte_length,source_bytes FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
+                params![key.source_set_id,key.language,key.path], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,Vec<u8>>(3)?)))
+                .optional()?.map(|(revision_id,content_hash,byte_length,bytes)| -> Result<_> {
+                    use sha2::{Digest,Sha256};
+                    ensure!(byte_length == bytes.len() as i64 && content_hash == hex::encode(Sha256::digest(&bytes)), "incompatible_index: native source hash mismatch");
+                    Ok((Document {key:key.clone(),revision_id,content_hash,byte_length:usize::try_from(byte_length)?},bytes))
+                }).transpose()
+        })
+    }
+    pub fn native_coverage_at(
+        &self,
+        pin: IndexPin,
+        key: &crate::native_evidence::DocumentKey,
+    ) -> Result<Option<crate::native_evidence::Coverage>> {
+        use crate::native_evidence::Coverage;
+        self.native_at(pin, |db| {
+            let row: Option<(String,String,bool,bool,String,Option<String>)> = db.query_row("SELECT producer_id,revision_id,requested,selected,state,diagnostic FROM native_coverage WHERE source_set_id=?1 AND language=?2 AND document_path=?3",
+                params![key.source_set_id,key.language,key.path],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
+            row.map(|(producer_id,revision_id,requested,selected,state,diagnostic)| -> Result<_> {
+                let mut roles = db.prepare("SELECT role_kind,role FROM native_coverage_roles WHERE producer_id=?1 AND revision_id=?2 AND language=?3 AND document_path=?4 ORDER BY role_kind,ordinal")?;
+                let mut supported_roles=Vec::new();
+                let mut observed_roles=Vec::new();
+                for role in roles.query_map(params![producer_id,revision_id,key.language,key.path],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))? {
+                    let (kind,role)=role?;
+                    match kind.as_str() { "supported"=>supported_roles.push(role),"observed"=>observed_roles.push(role),_=>anyhow::bail!("invalid native coverage role kind") }
+                }
+                Ok(Coverage {producer_id,language:key.language.clone(),source_set_id:key.source_set_id.clone(),document_path:key.path.clone(),revision_id,requested,selected,state,supported_roles,observed_roles,diagnostic})
+            }).transpose()
+        })
+    }
+    pub fn native_calls_at(
+        &self,
+        pin: IndexPin,
+        owner: &str,
+    ) -> Result<Vec<crate::native_evidence::Call>> {
+        use crate::native_evidence::{Call, DocumentKey, Range};
+        self.native_at(pin, |db| {
+            let mut regions = BTreeMap::<String, Vec<String>>::new();
+            let mut region_stmt = db.prepare(
+                "SELECT r.call_id,r.region_id FROM native_call_regions r                  JOIN native_calls c ON c.id=r.call_id WHERE c.owner_syntax_id=?1                  ORDER BY c.ordinal,r.ordinal",
+            )?;
+            for row in region_stmt.query_map([owner], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })? {
+                let (call, region) = row?;
+                regions.entry(call).or_default().push(region);
+            }
+            let mut stmt = db.prepare(
+                "SELECT id,ordinal,source_set_id,language,path,revision_id,start_byte,end_byte,                 callee_start,callee_end,spelling,provenance_id FROM native_calls                  WHERE owner_syntax_id=?1 ORDER BY ordinal",
+            )?;
+            let rows = stmt.query_map([owner], |r| {
+                Ok((r.get::<_, String>(0)?,r.get::<_, i64>(1)?,r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,r.get::<_, String>(4)?,r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)?,r.get::<_, i64>(7)?,r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<i64>>(9)?,r.get::<_, Option<String>>(10)?,r.get::<_, String>(11)?))
+            })?;
+            let mut calls = Vec::new();
+            for row in rows {
+                let (id,ordinal,source_set_id,language,path,revision_id,start,end,callee_start,callee_end,spelling,provenance_id) = row?;
+                let callee_range = callee_start.zip(callee_end).map(|(start,end)| -> Result<Range> {
+                    Ok(Range {start: usize::try_from(start)?, end: usize::try_from(end)?})
+                }).transpose()?;
+                let region_ids = regions.remove(&id).unwrap_or_default();
+                calls.push(Call {
+                    id,
+                    owner_syntax_id: owner.to_owned(),
+                    ordinal: usize::try_from(ordinal)?,
+                    document: DocumentKey { source_set_id, language, path },
+                    revision_id,
+                    range: Range { start: usize::try_from(start)?, end: usize::try_from(end)? },
+                    callee_range,
+                    spelling,
+                    region_ids,
+                    provenance_id,
+                });
+            }
+            ensure!(regions.is_empty(), "native region references missing call");
+            Ok(calls)
+        })
+    }
+
+    pub fn native_control_regions_at(
+        &self,
+        pin: IndexPin,
+        owner: &str,
+    ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+        use crate::native_evidence::{ControlRegion, DocumentKey, Range};
+        self.native_at(pin, |db| {
+            let mut stmt=db.prepare("SELECT id,ordinal,source_set_id,language,path,revision_id,kind,start_byte,end_byte,parent_id,arm,provenance_id FROM native_control_regions WHERE owner_syntax_id=?1 ORDER BY ordinal")?;
+            let rows=stmt.query_map([owner],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?,r.get::<_,i64>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,Option<String>>(10)?,r.get::<_,String>(11)?)))?;
+            rows.map(|row| {let (id,ordinal,source_set_id,language,path,revision_id,kind,start,end,parent_id,arm,provenance_id)=row?;
+                Ok(ControlRegion{id,owner_syntax_id:owner.to_owned(),ordinal:usize::try_from(ordinal)?,document:DocumentKey{source_set_id,language,path},revision_id,kind,range:Range{start:usize::try_from(start)?,end:usize::try_from(end)?},parent_id,arm,provenance_id})
+            }).collect()
+        })
     }
     /// Search only the persisted projection. Wildcards are literal user text.
     /// One read snapshot and revision guard; no source reads or catalog rebuilds.
@@ -960,6 +1709,45 @@ impl Store {
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(request.expected_revision() == revision, "revision conflict");
+        // Navigation's source selector counts lines in the graph JSON, and its
+        // member selector reads graph class/node rows. Before either consumes a
+        // selected document, authenticate that JSON against the paired native BLOB
+        // in this same read transaction. Never scan the entire workspace here.
+        let selected_path: Option<String> = match request {
+            crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
+            crate::navigation::NavigationRequest::Member(s) => tx.query_row(
+                "SELECT path FROM nodes WHERE id=?1 AND json_extract(payload,'$.kind')='class' LIMIT 1",
+                [&s.class_id], |row| row.get(0),
+            ).optional()?,
+        };
+        if let Some(path) = selected_path {
+            // Gate allocation of the selected JSON/BLOB before decoding either.
+            // This reads only SQLite byte lengths, not every workspace document.
+            let sizes: Option<(i64, i64)> = tx.query_row(
+                "SELECT length(CAST(f.payload AS BLOB)),length(d.source_bytes) FROM files f JOIN native_documents d ON d.path=f.path WHERE f.path=?1",
+                [&path], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if let Some((graph_len, native_len)) = sizes {
+                ensure!(
+                    graph_len <= 2 * 1024 * 1024 && native_len <= 2 * 1024 * 1024,
+                    "incompatible_index: selected navigation source exceeds budget"
+                );
+                ensure!(
+                    Self::selected_source_row(&tx, &path)?.is_some(),
+                    "incompatible_index: selected native source missing"
+                );
+            } else {
+                let graph_file: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",
+                    [&path],
+                    |row| row.get(0),
+                )?;
+                ensure!(
+                    !graph_file,
+                    "incompatible_index: selected native document missing"
+                );
+            }
+        }
         crate::navigation::navigate(&tx, request, revision)
     }
 
@@ -1155,16 +1943,40 @@ impl Store {
             expected_revision,
         )
     }
+    fn selected_source_row(db: &Connection, path: &str) -> Result<Option<SourceFile>> {
+        let row: Option<(String, String, Vec<u8>, String, i64)> = db.query_row(
+            "SELECT f.payload,d.content_hash,d.source_bytes,d.language,d.byte_length FROM native_documents d JOIN files f ON f.path=d.path WHERE d.path=?1", [path],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional()?;
+        row.map(|(payload, hash, bytes, language, length)| -> Result<_> {
+            use sha2::{Digest, Sha256};
+            ensure!(
+                length == bytes.len() as i64 && hash == hex::encode(Sha256::digest(&bytes)),
+                "incompatible_index: source hash mismatch"
+            );
+            let file: SourceFile = serde_json::from_str(&payload)?;
+            let text = String::from_utf8(bytes)?;
+            ensure!(
+                file.text == text && file.hash == hash && file.language == language,
+                "incompatible_index: source bytes mismatch"
+            );
+            Ok(SourceFile { text, ..file })
+        })
+        .transpose()
+    }
     pub fn source_at(
         &self,
         path: &str,
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, SourceFile)>> {
-        self.entity_at(
-            "SELECT payload FROM files WHERE path=?1",
-            path,
-            expected_revision,
-        )
+        let mut db = self.cache()?;
+        let tx = storage_result(db.transaction())?;
+        let revision = self.read_status(&tx)?.revision;
+        ensure!(
+            expected_revision.is_none_or(|pin| pin == revision),
+            "revision conflict"
+        );
+        Ok(Self::selected_source_row(&tx, path)?.map(|file| (revision, file)))
     }
     /// Catalog reads pin revision and rows to one SQLite read transaction.
     /// Enrich only the visible tree page from one cached index snapshot.
@@ -1455,7 +2267,7 @@ impl Store {
 #[cfg(test)]
 mod rebaseline_fault_tests {
     use super::*;
-    use crate::indexer::{IndexOptions, index_workspace_with_capture};
+    use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{fs, ptr, sync::atomic::AtomicBool};
 
     unsafe extern "C" fn abort_commit(_: *mut std::ffi::c_void) -> i32 {
@@ -1470,16 +2282,9 @@ mod rebaseline_fault_tests {
         let store = Store::open_for_tests(state.path(), work.path()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let options = IndexOptions::new(work.path().to_owned());
-        let (graph, capture) = index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
-        let original = store
-            .publish_captured(
-                &graph,
-                &capture,
-                &store.leader().unwrap(),
-                store.index_baseline().unwrap(),
-                &cancel,
-            )
-            .unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let original = store.index_baseline().unwrap();
         let path = store.roots.index_db(&store.identity);
         let db = Connection::open(&path).unwrap();
         db.execute(
@@ -1494,8 +2299,7 @@ mod rebaseline_fault_tests {
         for mode in [PublishStage::AfterFile, PublishStage::BeforeCommit] {
             let failure = store
                 .publish_inner_checked(
-                    &graph,
-                    Some(&capture),
+                    (&graph, &capture, &native),
                     &leader,
                     original,
                     &cancel,
@@ -1570,7 +2374,7 @@ mod rebaseline_fault_tests {
             );
         }
         let rotated = store
-            .publish_captured(&graph, &capture, &leader, original, &cancel)
+            .publish_native(&graph, &capture, &native, &leader, original, &cancel)
             .unwrap();
         assert_ne!(rotated.index_generation, original.index_generation);
         assert_eq!(rotated.index_revision, original.index_revision + 1);
@@ -1580,7 +2384,7 @@ mod rebaseline_fault_tests {
 #[cfg(test)]
 mod sqlite_schema_race_tests {
     use super::*;
-    use crate::indexer::{IndexOptions, index_workspace_with_capture};
+    use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{cell::RefCell, fs, sync::atomic::AtomicBool};
 
     fn ready() -> (
@@ -1589,6 +2393,7 @@ mod sqlite_schema_race_tests {
         Store,
         Graph,
         crate::capture::Capture,
+        crate::native_evidence::Artifact,
         IndexPin,
         CancelFlag,
     ) {
@@ -1602,34 +2407,28 @@ mod sqlite_schema_race_tests {
         let store = Store::open_for_tests(state.path(), work.path()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let options = IndexOptions::new(work.path().to_owned());
-        let (graph, capture) = index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
         let pin = store
-            .publish_captured(
+            .publish_native(
                 &graph,
                 &capture,
+                &native,
                 &store.leader().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
             .unwrap();
-        (state, work, store, graph, capture, pin, cancel)
+        (state, work, store, graph, capture, native, pin, cancel)
     }
 
     #[test]
     fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
-        let (_state, _work, store, graph, capture, old, cancel) = ready();
+        let (_state, _work, store, graph, capture, native, old, cancel) = ready();
         let path = store.roots.index_db(&store.identity);
-        let db = Connection::open(&path).unwrap();
-        db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-            [],
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
-        drop(db);
         let leader = store.leader().unwrap();
         let after_external = RefCell::new(None);
-        let error = store.publish_inner_checked(&graph, Some(&capture), &leader, old, &cancel,
+        let error = store.publish_inner_checked((&graph, &capture, &native), &leader, old, &cancel,
             |stage, _checked_connection| {
                 if stage == PublishStage::BeforeTransaction {
                     // The Store connection has passed open_index's exact object check,
@@ -1660,8 +2459,8 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                4,
-                "native-v1",
+                6,
+                "native-paired-v1",
                 old.index_generation.to_string(),
                 old.index_revision as i64
             )
@@ -1669,7 +2468,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4
+            6
         );
         let forged: i64 = db
             .query_row(
@@ -1690,7 +2489,7 @@ mod sqlite_schema_race_tests {
 
     #[test]
     fn changed_metadata_between_admission_and_leader_lock_refuses_before_update() {
-        let (_state, _work, store, _graph, _capture, pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
         let path = store.roots.index_db(&store.identity);
         let after_external = RefCell::new(None);
         let error = store
@@ -1720,7 +2519,7 @@ mod sqlite_schema_race_tests {
 
     #[test]
     fn second_connection_adds_view_after_admission_before_status_and_leader_snapshot() {
-        let (_state, _work, store, _graph, _capture, pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
         let path = store.roots.index_db(&store.identity);
         let after_status_ddl = RefCell::new(None);
         let status_error = store
@@ -1775,8 +2574,8 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                5,
-                "native-no-lexical-v1",
+                6,
+                "native-paired-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
             )

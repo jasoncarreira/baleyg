@@ -1,0 +1,493 @@
+use baleyg::{
+    indexer::{IndexOptions, index_workspace_bundle},
+    model::{CancelFlag, IndexPin},
+    store::Store,
+};
+use rusqlite::Connection;
+use std::{
+    fs,
+    sync::{Arc, atomic::AtomicBool},
+};
+
+fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, CancelFlag) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (name, text) in [
+        (
+            "flow.js",
+            "function hello(x) { if (x) { obj.go(); } }
+",
+        ),
+        (
+            "flow.java",
+            "class Demo { void go() { if (true) { run(); } } }
+",
+        ),
+        (
+            "flow.rs",
+            "fn main() { if true { run(); } }
+",
+        ),
+        (
+            "flow.py",
+            "def go():
+    if True:
+        run()
+",
+        ),
+    ] {
+        fs::write(root.path().join(name), text).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    (state, root, store, Arc::new(AtomicBool::new(false)))
+}
+fn publish(
+    store: &Store,
+    root: &std::path::Path,
+    cancel: &CancelFlag,
+    expected: IndexPin,
+) -> anyhow::Result<IndexPin> {
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(capture.graph_projection_count(), 1);
+    assert!(
+        capture
+            .source_operations
+            .values()
+            .all(|operations| operations.opens == 1
+                && operations.complete_reads == 1
+                && operations.hashes == 1)
+    );
+    let revision = store.publish_native(
+        &graph,
+        &capture,
+        &native,
+        &store.leader()?,
+        expected,
+        cancel,
+    )?;
+    assert_eq!(capture.graph_projection_count(), 1);
+    Ok(revision)
+}
+#[test]
+fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
+    let (state, root, store, cancel) = fixture();
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    let baseline = store.index_baseline().unwrap();
+    let pin = publish(&store, root.path(), &cancel, baseline).unwrap();
+    assert_ne!(baseline.index_generation, pin.index_generation);
+    assert_eq!(
+        store.status().unwrap().evidence_format.as_deref(),
+        Some("terminal-native-graph-v1")
+    );
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    let report = roots.gc_report().unwrap();
+    assert_eq!(report.derived[0].reason, "recent_open");
+    let (graph, artifact, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    for document in &artifact.revision.documents {
+        let (stored, bytes) = store.native_source_at(pin, &document.key).unwrap().unwrap();
+        assert_eq!(stored, *document);
+        assert_eq!(
+            bytes,
+            capture
+                .files
+                .iter()
+                .find(|f| f.path == document.key.path)
+                .unwrap()
+                .text
+                .as_bytes()
+        );
+        let coverage = store
+            .native_coverage_at(pin, &document.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coverage,
+            *artifact
+                .coverage
+                .iter()
+                .find(|c| c.document_path == document.key.path)
+                .unwrap()
+        );
+        let (_, source) = store
+            .source_at(&document.key.path, Some(pin))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.text.as_bytes(), bytes);
+    }
+    for declaration in &artifact.declarations {
+        if let Some(lookup) = &declaration.lookup_key {
+            let found = store
+                .native_declarations_at(pin, &declaration.document.language, lookup)
+                .unwrap();
+            assert!(
+                found.contains(declaration),
+                "missing typed declaration: {}",
+                declaration.syntax_id
+            );
+        }
+        assert_eq!(
+            store.native_calls_at(pin, &declaration.syntax_id).unwrap(),
+            artifact
+                .calls
+                .iter()
+                .filter(|c| c.owner_syntax_id == declaration.syntax_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store
+                .native_control_regions_at(pin, &declaration.syntax_id)
+                .unwrap(),
+            artifact
+                .control_regions
+                .iter()
+                .filter(|r| r.owner_syntax_id == declaration.syntax_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(
+            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap()
+                .root_key,
+        )
+        .join("index.db");
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
+    let count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(count >= 18);
+    for node in &graph.nodes {
+        let parent: Option<String> = db
+            .query_row(
+                "SELECT owner_syntax_id FROM native_declarations WHERE syntax_id=?1",
+                [&node.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parent, node.parent,
+            "native parent differs from measured graph parent"
+        );
+    }
+    assert_eq!(
+        store
+            .publish(&graph, &store.leader().unwrap(), pin, &cancel)
+            .unwrap_err()
+            .to_string(),
+        "native_evidence_required: graph-only publication refused"
+    );
+    assert!(
+        store
+            .native_source_at(baseline, &artifact.revision.documents[0].key)
+            .unwrap_err()
+            .to_string()
+            .contains("revision conflict")
+    );
+    drop(db);
+    let next = publish(&store, root.path(), &cancel, pin).unwrap();
+    assert_eq!(next.index_generation, pin.index_generation);
+    assert_eq!(next.index_revision, pin.index_revision + 1);
+    assert!(store.native_declarations_at(pin, "java", "Demo").is_err());
+}
+
+#[test]
+fn invalid_native_and_conflict_never_change_published_pair() {
+    let (state, root, store, cancel) = fixture();
+    let baseline = store.index_baseline().unwrap();
+    let pin = publish(&store, root.path(), &cancel, baseline).unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(
+            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap()
+                .root_key,
+        )
+        .join("index.db");
+    let leader = store.leader().unwrap();
+    let before = fs::read(&path).unwrap();
+    let (graph, mut native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    native.provenance[0].derived_from = Some(serde_json::json!({"forged":true}));
+    assert!(
+        store
+            .publish_native(&graph, &capture, &native, &leader, pin, &cancel)
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    native.provenance[0].derived_from = None;
+    let mut forged_graph = graph.clone();
+    forged_graph.nodes[0].name = "not-source-measured".into();
+    assert!(
+        store
+            .publish_native(&forged_graph, &capture, &native, &leader, pin, &cancel)
+            .unwrap_err()
+            .to_string()
+            .contains("graph declaration differs from measured native row")
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(
+        store
+            .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+            .unwrap_err()
+            .to_string()
+            .contains("revision conflict")
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let mut value = serde_json::to_value(&native).unwrap();
+    value["calls"][0]["target"] = serde_json::json!("unmeasured");
+    assert!(serde_json::from_value::<baleyg::native_evidence::Artifact>(value).is_err());
+    assert_eq!(store.status().unwrap().revision, pin);
+}
+
+#[test]
+fn empty_workspace_has_native_pair_without_document_rows() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let original = store.index_baseline().unwrap();
+    let pin = publish(&store, root.path(), &cancel, original).unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
+    let db = Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(
+                baleyg::store::topology::WorkspaceIdentity::discover(
+                    Some(root.path()),
+                    root.path(),
+                )
+                .unwrap()
+                .root_key,
+            )
+            .join("index.db"),
+    )
+    .unwrap();
+    for table in [
+        "native_documents",
+        "native_coverage",
+        "native_provenance",
+        "native_calls",
+        "native_declarations",
+    ] {
+        let count: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM native_revisions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn known_old_schema_four_remains_unready_until_full_native_reindex() {
+    let (state, root, store, cancel) = fixture();
+    let original = store.index_baseline().unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(
+            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap()
+                .root_key,
+        )
+        .join("index.db");
+    let db = Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+        [],
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    drop(db);
+    assert_eq!(store.index_baseline().unwrap(), original);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    let leader = store.leader().unwrap();
+    let before = fs::read(&path).unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    assert!(
+        store
+            .publish_native(&graph, &capture, &native, &leader, original, &cancel)
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    cancel.store(false, std::sync::atomic::Ordering::Release);
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, original, &cancel)
+        .unwrap();
+    assert_ne!(pin.index_generation, original.index_generation);
+    assert_eq!(pin.index_revision, original.index_revision + 1);
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert!(
+        store
+            .native_source_at(original, &native.revision.documents[0].key)
+            .is_err()
+    );
+}
+
+#[test]
+fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(
+            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap()
+                .root_key,
+        )
+        .join("index.db");
+    let db = Connection::open(path).unwrap();
+    let mut bytes: Vec<u8> = db
+        .query_row(
+            "SELECT source_bytes FROM native_documents WHERE path='flow.rs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bytes[0] ^= 1;
+    db.execute(
+        "UPDATE native_documents SET source_bytes=?1 WHERE path='flow.rs'",
+        [bytes],
+    )
+    .unwrap();
+    drop(db);
+    // Status is a bounded metadata/pin check; selected reads validate the exact stored BLOB.
+    assert_eq!(store.status().unwrap().revision, pin);
+    let source_set_id = format!("source-set:v1:{}", store.root_id());
+    let unaffected = baleyg::native_evidence::DocumentKey {
+        source_set_id: source_set_id.clone(),
+        language: "java".into(),
+        path: "flow.java".into(),
+    };
+    let corrupted = baleyg::native_evidence::DocumentKey {
+        source_set_id,
+        language: "rust".into(),
+        path: "flow.rs".into(),
+    };
+    assert!(store.native_source_at(pin, &unaffected).unwrap().is_some());
+    assert!(store.native_source_at(pin, &corrupted).is_err());
+    assert!(store.source_at("flow.rs", Some(pin)).is_err());
+    assert!(Store::open_for_tests(state.path(), root.path()).is_err());
+}
+
+#[test]
+fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for n in 0..64 {
+        fs::write(
+            root.path().join(format!("source{n:02}.js")),
+            format!(
+                "function item{n}() {{ return {n}; }}\n{}",
+                "// captured bytes\n".repeat(256)
+            ),
+        )
+        .unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db_path = state
+        .path()
+        .join("cache/indexes")
+        .join(
+            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap()
+                .root_key,
+        )
+        .join("index.db");
+    let db = Connection::open(db_path).unwrap();
+    let mut bytes: Vec<u8> = db
+        .query_row(
+            "SELECT source_bytes FROM native_documents WHERE path='source63.js'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bytes[0] ^= 1;
+    db.execute(
+        "UPDATE native_documents SET source_bytes=?1 WHERE path='source63.js'",
+        [bytes],
+    )
+    .unwrap();
+    drop(db);
+    for _ in 0..64 {
+        assert_eq!(store.status().unwrap().revision, pin);
+    }
+    let key = baleyg::native_evidence::DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "javascript".into(),
+        path: "source63.js".into(),
+    };
+    assert!(store.native_source_at(pin, &key).is_err());
+}

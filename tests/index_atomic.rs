@@ -54,11 +54,11 @@ fn first_index_is_invisible_until_validated_and_synced() {
     );
     release.send(()).unwrap();
     let store = opener.join().unwrap().unwrap();
-    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
     assert_eq!(staged_files(&dir), Vec::<std::path::PathBuf>::new());
     drop(store);
     let reopened = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    assert_eq!(reopened.status().unwrap().revision.index_revision, 0);
+    assert_eq!(reopened.index_baseline().unwrap().index_revision, 0);
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn failed_stage_does_not_publish_or_leave_its_temp_file() {
     assert!(!dir.join("index.db").exists());
     assert!(staged_files(&dir).is_empty());
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
     assert!(staged_files(&dir).is_empty());
 }
 
@@ -99,9 +99,8 @@ fn truncated_stage_is_rejected_before_publication() {
     assert_eq!(
         Store::open_for_tests(state.path(), workspace.path())
             .unwrap()
-            .status()
+            .index_baseline()
             .unwrap()
-            .revision
             .index_revision,
         0
     );
@@ -123,7 +122,7 @@ fn crash_left_partial_stage_is_not_published_or_mistaken_for_the_index() {
     let dir = index_dir(state.path());
     assert!(!dir.join("index.db").exists());
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
     assert_eq!(
         fs::read(dir.join("index.db.tmp-crashed")).unwrap(),
         b"SQLite form"
@@ -163,7 +162,7 @@ fn failed_capture_leaves_existing_index_revision_unchanged() {
     let (state, workspace) = fixture();
     fs::write(workspace.path().join("main.js"), "f();").unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let before = store.status().unwrap().revision;
+    let before = store.index_baseline().unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let error = index_workspace(
         &IndexOptions::new(workspace.path().to_owned()),
@@ -176,13 +175,12 @@ fn failed_capture_leaves_existing_index_revision_unchanged() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("cancelled"));
-    assert_eq!(store.status().unwrap().revision, before);
+    assert_eq!(store.index_baseline().unwrap(), before);
     assert_eq!(
         Store::open_for_tests(state.path(), workspace.path())
             .unwrap()
-            .status()
-            .unwrap()
-            .revision,
+            .index_baseline()
+            .unwrap(),
         before
     );
 }
@@ -201,14 +199,15 @@ fn drift_refusal_preserves_populated_store_pair_and_graph() {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = Store::open_for_tests(state.path(), root).unwrap();
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
-    let before = store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            store.status().unwrap().revision,
-            &cancel,
-        )
-        .unwrap();
+    let before = publish_bundle(
+        &store,
+        &graph,
+        root,
+        &store.leader().unwrap(),
+        store.index_baseline().unwrap(),
+        &cancel,
+    )
+    .unwrap();
     assert_eq!(before.index_revision, 1);
     let error = index_workspace(&options, &cancel, |progress| {
         if progress.phase == "parse" {
@@ -219,5 +218,26 @@ fn drift_refusal_preserves_populated_store_pair_and_graph() {
     assert!(error.to_string().contains("drift"), "{error:#}");
     let reopened = Store::open_for_tests(state.path(), root).unwrap();
     assert_eq!(reopened.status().unwrap().revision, before);
-    assert_eq!(store.status().unwrap().revision, before);
+    assert_eq!(store.index_baseline().unwrap(), before);
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

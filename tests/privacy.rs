@@ -41,7 +41,14 @@ fn state_and_databases_are_private_and_symlink_safe() {
         !state.join("data/workspaces").exists(),
         "reads do not initialize durable data"
     );
-    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     let public = temp.path().join("public");
     fs::create_dir(&public).unwrap();
     fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();

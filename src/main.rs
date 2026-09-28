@@ -273,13 +273,17 @@ async fn main() -> Result<()> {
             let leader = store.leader()?;
             let writer = store.clone();
             let work = tokio::task::spawn_blocking(move || -> Result<baleyg::model::IndexPin> {
-                let (graph, capture) =
-                    baleyg::indexer::index_workspace_with_capture(&options, &cancel, |p| {
+                let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+                    &options,
+                    writer.root_id(),
+                    &cancel,
+                    |p| {
                         if p.completed == p.total {
                             eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
                         }
-                    })?;
-                writer.publish_captured(&graph, &capture, &leader, expected, &cancel)
+                    },
+                )?;
+                writer.publish_native(&graph, &capture, &native, &leader, expected, &cancel)
             })
             .await
             .context("index worker panicked")?;

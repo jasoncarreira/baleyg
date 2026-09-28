@@ -70,6 +70,21 @@ pub fn index_workspace_with_native(
     Ok((graph, native))
 }
 
+/// One admission produces the graph and native artifact for the same immutable capture.
+pub fn index_workspace_bundle(
+    options: &IndexOptions,
+    root_id: &str,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+) -> Result<(Graph, native_evidence::Artifact, Capture)> {
+    let capture = Capture::admit(options, cancel, &progress)?;
+    let root = std::fs::canonicalize(&options.workspace_root)?;
+    let native = native_evidence::from_capture(&capture, &root, root_id)?;
+    let graph = project_native(options, &capture, &native, cancel, &progress)?;
+    capture.verify(cancel)?;
+    Ok((graph, native, capture))
+}
+
 fn location(text: &str, byte: usize) -> Result<(usize, usize)> {
     ensure!(
         byte <= text.len() && text.is_char_boundary(byte),
@@ -251,6 +266,7 @@ fn project_native(
     progress: &impl Fn(IndexProgress),
 ) -> Result<Graph> {
     ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
+    capture.claim_graph_projection()?;
     let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
     let mut graph = Graph {
         files: capture.files.clone(),
@@ -391,6 +407,173 @@ fn project_native(
         total: graph.files.len(),
     });
     Ok(graph)
+}
+
+/// Verify every public graph row against the exact captured native syntax projection.
+/// Display labels are presentation-only SCIP text and cannot authorize a graph edge.
+pub fn validate_native_graph(
+    graph: &Graph,
+    capture: &Capture,
+    native: &native_evidence::Artifact,
+    cancel: &CancelFlag,
+) -> Result<()> {
+    ensure!(
+        graph.files == capture.files,
+        "native_evidence_required: graph source differs from capture"
+    );
+    let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut declaration_keys = BTreeMap::new();
+    for d in &native.declarations {
+        let key = (
+            d.document.path.as_str(),
+            serde_json::to_string(&d.ancestors)?,
+            serde_json::to_string(&d.key)?,
+        );
+        ensure!(
+            declaration_keys.insert(key, d.syntax_id.as_str()).is_none(),
+            "native declaration key collision"
+        );
+    }
+    let symbols: BTreeMap<_, _> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    ensure!(
+        symbols.len() == native.declarations.len() && graph.nodes.len() == symbols.len(),
+        "native_evidence_required: graph declaration cardinality"
+    );
+    for d in &native.declarations {
+        ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
+        let f = files
+            .get(d.document.path.as_str())
+            .context("native declaration source missing")?;
+        let symbol = symbols
+            .get(d.syntax_id.as_str())
+            .context("native_evidence_required: missing measured declaration")?;
+        let owner = if let Some(last) = d.ancestors.last() {
+            let prefix = serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?;
+            let last = serde_json::to_string(last)?;
+            Some(
+                *declaration_keys
+                    .get(&(d.document.path.as_str(), prefix, last))
+                    .context("native declaration parent missing")?,
+            )
+        } else {
+            None
+        };
+        if let Some(label) = &symbol.display_label {
+            ensure!(
+                label.len() <= 256 && !label.chars().any(char::is_control),
+                "invalid display-only label"
+            );
+        }
+        ensure!(
+            symbol.name
+                == d.name.clone().unwrap_or_else(|| if d.kind == "module" {
+                    f.path.clone()
+                } else {
+                    format!("<{}@{}>", d.kind, d.range.start)
+                })
+                && symbol.kind == graph_kind(&d.kind)?
+                && symbol.path == d.document.path
+                && symbol.range == measured_range(f, &d.range)?
+                && symbol.parent.as_deref() == owner
+                && symbol.accessor == d.header.modifiers.iter().any(|m| m == "get" || m == "set")
+                && symbol.provenance == graph_provenance(),
+            "native_evidence_required: graph declaration differs from measured native row"
+        );
+    }
+    let regions: BTreeMap<_, _> = graph.regions.iter().map(|r| (r.id.as_str(), r)).collect();
+    ensure!(
+        regions.len() == native.control_regions.len() && graph.regions.len() == regions.len(),
+        "native_evidence_required: graph region cardinality"
+    );
+    for r in &native.control_regions {
+        ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
+        let f = files
+            .get(r.document.path.as_str())
+            .context("native region source missing")?;
+        let region = regions
+            .get(r.id.as_str())
+            .context("native_evidence_required: missing measured region")?;
+        let text = f
+            .text
+            .get(r.range.start..r.range.end)
+            .context("native region text missing")?;
+        ensure!(
+            region.kind == r.kind
+                && region.label == text.chars().take(140).collect::<String>()
+                && region.parent == r.parent_id
+                && region.owner == r.owner_syntax_id
+                && region.path == r.document.path
+                && region.range == measured_range(f, &r.range)?,
+            "native_evidence_required: graph region differs from measured native row"
+        );
+    }
+    let calls: BTreeMap<_, _> = graph.calls.iter().map(|c| (c.id.as_str(), c)).collect();
+    ensure!(
+        calls.len() == native.calls.len() && graph.calls.len() == calls.len(),
+        "native_evidence_required: graph call cardinality"
+    );
+    for c in &native.calls {
+        ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
+        let f = files
+            .get(c.document.path.as_str())
+            .context("native call source missing")?;
+        let call = calls
+            .get(c.id.as_str())
+            .context("native_evidence_required: missing measured call")?;
+        ensure!(
+            call.caller == c.owner_syntax_id
+                && call.callee_text == c.spelling
+                && call.path == c.document.path
+                && call.range == measured_range(f, &c.range)?
+                && call.callee_range
+                    == c.callee_range
+                        .as_ref()
+                        .map(|range| measured_range(f, range))
+                        .transpose()?
+                && call.ordinal == c.ordinal
+                && call.regions == c.region_ids
+                && call.provenance == graph_provenance(),
+            "native_evidence_required: graph call differs from measured native row"
+        );
+    }
+    let mut stats = IndexStats {
+        files: graph.files.len(),
+        symbols: symbols.len(),
+        calls: calls.len(),
+        regions: regions.len(),
+        unresolved: calls.len(),
+        ..IndexStats::default()
+    };
+    let mut diagnostics = Vec::new();
+    for c in &native.coverage {
+        if c.state != "complete" {
+            let recovered = c
+                .diagnostic
+                .as_deref()
+                .is_some_and(|d| d.contains("parser recovered"));
+            if recovered {
+                stats.parse_error_files += 1;
+            }
+            diagnostics.push(Diagnostic {
+                path: Some(c.document_path.clone()),
+                code: if recovered {
+                    "parse-error"
+                } else {
+                    "native-coverage-partial"
+                }
+                .into(),
+                message: c
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "Native extraction is incomplete".into()),
+            });
+        }
+    }
+    ensure!(
+        graph.stats == stats && graph.diagnostics == diagnostics,
+        "native_evidence_required: graph diagnostics or statistics differ from native coverage"
+    );
+    Ok(())
 }
 
 /// Closed #22 syntax categories measured by the JavaScript adapter.

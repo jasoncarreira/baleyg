@@ -6,7 +6,7 @@ use axum::{
 };
 use baleyg::{
     http,
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace_bundle},
     store::Store,
 };
 use serde_json::Value;
@@ -22,17 +22,18 @@ fn setup() -> (tempfile::TempDir, Store, Router) {
     std::fs::write(root.join(".credentials"), "never return me").unwrap();
     std::fs::write(workspace.join("demo.js"), "function run() { save(); }").unwrap();
     let opts = IndexOptions::new(workspace.clone());
-    let graph = index_workspace(&opts, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) =
+        index_workspace_bundle(&opts, store.root_id(), &cancel, |_| {}).unwrap();
     store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            store.index_baseline().unwrap(),
+            &cancel,
         )
         .unwrap();
     let app = http::router(

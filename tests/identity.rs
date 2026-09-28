@@ -24,17 +24,18 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     let symbol = graph.nodes.iter().find(|n| n.name == "first").unwrap();
     let old_id = symbol.id.clone();
     let store = crate::common::open_store(&state, &root).unwrap();
-    let rev = store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &cancel,
-        )
-        .unwrap();
+    let rev = publish_bundle(
+        &store,
+        &graph,
+        &root,
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.index_baseline().unwrap().index_generation,
+            index_revision: 0,
+        },
+        &cancel,
+    )
+    .unwrap();
     assert_eq!(store.graph().unwrap(), graph);
     store
         .put_annotation(&Annotation {
@@ -63,9 +64,15 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     fs::write(root.join("flow.js"), text.replace("first", "other")).unwrap();
     let changed = index_workspace(&opts, &cancel, |_| {}).unwrap();
     assert!(changed.nodes.iter().all(|n| n.id != old_id));
-    store
-        .publish(&changed, &store.leader().unwrap(), rev, &cancel)
-        .unwrap();
+    publish_bundle(
+        &store,
+        &changed,
+        &root,
+        &store.leader().unwrap(),
+        rev,
+        &cancel,
+    )
+    .unwrap();
     assert!(store.annotations().unwrap()[0].orphaned);
     assert_eq!(
         store.annotations().unwrap()[0].annotation.body,
@@ -149,17 +156,18 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let cancel = Arc::new(AtomicBool::new(false));
     let first = index_workspace(&options, &cancel, |_| {}).unwrap();
     let store = crate::common::open_store(&state, &root).unwrap();
-    let revision = store
-        .publish(
-            &first,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &cancel,
-        )
-        .unwrap();
+    let revision = publish_bundle(
+        &store,
+        &first,
+        &root,
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.index_baseline().unwrap().index_generation,
+            index_revision: 0,
+        },
+        &cancel,
+    )
+    .unwrap();
     fs::write(root.join("flow.js"), "function after() { c(); d(); }\n").unwrap();
     let next = index_workspace(&options, &cancel, |_| {}).unwrap();
     let id = next.calls[1].id.replace('\'', "''");
@@ -168,9 +176,7 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     db.execute_batch(&format!("CREATE TRIGGER abort_second_call BEFORE INSERT ON calls WHEN NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'injected post-write failure'); END;")).unwrap();
     drop(db);
     let unchanged = fs::read(index_db(&state)).unwrap();
-    let failure = store
-        .publish(&next, &leader, revision, &cancel)
-        .unwrap_err();
+    let failure = publish_bundle(&store, &next, &root, &leader, revision, &cancel).unwrap_err();
     assert!(
         failure
             .to_string()
@@ -190,8 +196,35 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     drop(leader);
     assert_eq!(store.status().unwrap().revision, revision);
     assert_eq!(store.graph().unwrap(), first);
-    let next_revision = store
-        .publish(&next, &store.leader().unwrap(), revision, &cancel)
-        .unwrap();
+    let next_revision = publish_bundle(
+        &store,
+        &next,
+        &root,
+        &store.leader().unwrap(),
+        revision,
+        &cancel,
+    )
+    .unwrap();
     assert_eq!(next_revision.index_revision, revision.index_revision + 1);
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

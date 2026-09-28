@@ -7,7 +7,7 @@ use axum::{
 };
 use baleyg::{
     http,
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace_bundle},
     model::*,
     store::Store,
 };
@@ -22,17 +22,18 @@ fn setup() -> (tempfile::TempDir, Store, Graph, Router) {
     std::fs::write(workspace.join("a.js"), "function check(x) { return x > 0; }\nfunction seed(x) { function nested() { side(); } if (x) external(x); return x; }\nclass Box { get value() { audit(); return this.x; } method() { save(); } }\n").unwrap();
     std::fs::write(workspace.join("z.js"), "// no methods\n").unwrap();
     let options = IndexOptions::new(workspace.clone());
-    let graph = index_workspace(&options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            store.index_baseline().unwrap(),
+            &cancel,
         )
         .unwrap();
     let app = http::router(
@@ -189,15 +190,22 @@ async fn strict_errors_revisions_and_auth() {
             400
         );
     }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(_dir.path().join("workspace")),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
     store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            pin,
+            &cancel,
         )
         .unwrap();
     for path in [

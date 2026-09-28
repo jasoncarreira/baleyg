@@ -440,7 +440,7 @@ impl LiveJev {
 mod tests {
     use super::*;
     use crate::{
-        indexer::{IndexOptions, index_workspace},
+        indexer::IndexOptions,
         planning::{QuestionRequest, prepare},
         store::Store,
     };
@@ -459,21 +459,26 @@ mod tests {
         }
         std::fs::write(work.path().join("a.js"), code).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let graph =
-            index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
         let store = Store::open_for_tests(state.path(), work.path()).unwrap();
         crate::store::topology::assert_topology_fixture(&store, state.path());
+        let (graph, native, capture) = crate::indexer::index_workspace_bundle(
+            &IndexOptions::new(work.path().into()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
         let revision = store
-            .publish(
+            .publish_native(
                 &graph,
+                &capture,
+                &native,
                 &store.leader().unwrap(),
-                crate::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 0,
-                },
+                store.index_baseline().unwrap(),
                 &cancel,
             )
             .unwrap();
+        assert_eq!(store.status().unwrap().revision, revision);
         let request: QuestionRequest = serde_json::from_value(json!({
             "seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id,
             "question":question,"expectedRevision":revision

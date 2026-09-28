@@ -35,17 +35,18 @@ fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
         .id
         .clone();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &cancel,
-        )
-        .unwrap();
+    publish_bundle(
+        &store,
+        &graph,
+        &workspace,
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.index_baseline().unwrap().index_generation,
+            index_revision: 0,
+        },
+        &cancel,
+    )
+    .unwrap();
     let state = http::new(
         store.clone(),
         options,
@@ -208,7 +209,7 @@ async fn offline_roundtrip_is_stable_and_preserves_display_policy() {
 }
 #[tokio::test]
 async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
-    let (_d, store, graph, app, request) = setup(0);
+    let (dir, store, graph, app, request) = setup(0);
     let (_, preview) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
     let (status, export) = call(&app, "GET", &path(&preview, "jev-request"), Value::Null).await;
     assert_eq!(status, 200);
@@ -287,17 +288,18 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
         call(&app, "POST", "/api/questions/preview", absent).await.0,
         404
     );
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1,
-            },
-            &Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+    publish_bundle(
+        &store,
+        &graph,
+        &dir.path().join("workspace"),
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.status().unwrap().revision.index_generation,
+            index_revision: 1,
+        },
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     assert_eq!(
         call(&app, "POST", "/api/questions/preview", request)
             .await
@@ -472,14 +474,15 @@ async fn packet_operation_pair_matrix() {
     let recreated =
         crate::common::open_store(&temp.path().join("state"), &temp.path().join("workspace"))
             .unwrap();
-    recreated
-        .publish(
-            &graph,
-            &recreated.leader().unwrap(),
-            recreated.status().unwrap().revision,
-            &Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+    publish_bundle(
+        &recreated,
+        &graph,
+        &temp.path().join("workspace"),
+        &recreated.leader().unwrap(),
+        recreated.index_baseline().unwrap(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     let fresh = recreated.status().unwrap().revision;
     assert_eq!(old.index_revision, fresh.index_revision);
     assert_ne!(old.index_generation, fresh.index_generation);
@@ -514,6 +517,17 @@ async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_termina
         .join("index.db");
     {
         let db = rusqlite::Connection::open(db_path).unwrap();
+        db.pragma_update(None, "foreign_keys", false).unwrap();
+        let native_tables = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in native_tables {
+            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        }
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],
@@ -615,4 +629,25 @@ async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_termina
     .await;
     assert_eq!(status, StatusCode::OK, "{selected}");
     assert_eq!(selected["view"]["selectionSource"], "manual");
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

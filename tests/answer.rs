@@ -1,7 +1,7 @@
 mod common;
 use baleyg::{
     answer::*,
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace_bundle},
     planning::*,
 };
 use serde_json::{Value, json};
@@ -18,16 +18,21 @@ fn packet(code: &str) -> QuestionPacket {
     }
     std::fs::write(work.path().join("a.js"), code).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let graph = index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(work.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
     let revision = store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
+            store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();

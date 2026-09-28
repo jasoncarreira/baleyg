@@ -1326,12 +1326,19 @@ fn index_open_and_generation() {
     let work = root(base.path());
     let state = base.path().join("state");
     let store = common::open_store(&state, &work).unwrap();
-    let first = store.status().unwrap().revision;
+    let first = store.index_baseline().unwrap();
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     assert_eq!(first.index_revision, 0);
     assert_eq!(first.index_generation.get_version_num(), 4);
     drop(store);
     let reopened = common::open_store(&state, &work).unwrap();
-    assert_eq!(reopened.status().unwrap().revision, first);
+    assert_eq!(reopened.index_baseline().unwrap(), first);
 }
 #[test]
 fn index_delete_journal_no_wal() {
@@ -1363,7 +1370,14 @@ fn index_delete_journal_no_wal() {
     for suffix in ["-wal", "-shm", "-journal"] {
         assert!(!index.with_file_name(format!("index.db{suffix}")).exists());
     }
-    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 }
 #[test]
 fn leader_records_open_age_and_follower_preserves_it() {
@@ -1386,7 +1400,14 @@ fn leader_records_open_age_and_follower_preserves_it() {
             .unwrap()
     };
     assert!(read_age() > 0);
-    let baseline = store.status().unwrap().revision;
+    let baseline = store.index_baseline().unwrap();
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     let leader = store.leader().unwrap();
     let age = read_age();
     assert!(age > 0);
@@ -1394,10 +1415,10 @@ fn leader_records_open_age_and_follower_preserves_it() {
     drop(store);
     let follower = common::open_store(&state, &work).unwrap();
     assert_eq!(read_age(), age);
-    assert_eq!(follower.status().unwrap().revision, baseline);
+    assert_eq!(follower.index_baseline().unwrap(), baseline);
     let leader = follower.leader().unwrap();
     assert!(read_age() >= age);
-    assert_eq!(follower.status().unwrap().revision, baseline);
+    assert_eq!(follower.index_baseline().unwrap(), baseline);
     drop(leader);
 }
 

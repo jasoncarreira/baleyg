@@ -24,17 +24,18 @@ fn fixture(code: &str) -> (TempDir, TempDir, Store, Graph, QuestionRequest) {
     let graph = index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
     // Native measured calls cannot acquire lexical targets from matching names.
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
-    let revision = store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &cancel,
-        )
-        .unwrap();
+    let revision = publish_bundle(
+        &store,
+        &graph,
+        work.path(),
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.index_baseline().unwrap().index_generation,
+            index_revision: 0,
+        },
+        &cancel,
+    )
+    .unwrap();
     let request = serde_json::from_value(serde_json::json!({"seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id, "question":"Where is helper called?", "expectedRevision":revision})).unwrap();
     (work, state, store, graph, request)
 }
@@ -201,14 +202,15 @@ fn local_literal_only_uncertainty_and_no_budget_filling() {
 fn revision_drift_rejected_snapshot_remains_immutable() {
     let (_w, _s, store, graph, request) = fixture(CODE);
     let p = prepare(&store, request.clone()).unwrap();
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            request.expected_revision,
-            &Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+    publish_bundle(
+        &store,
+        &graph,
+        _w.path(),
+        &store.leader().unwrap(),
+        request.expected_revision,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     assert!(
         prepare(&store, request)
             .unwrap_err()
@@ -259,14 +261,15 @@ fn assembly_preserves_boundaries_and_never_expands_callbacks() {
         .unwrap()
         .id
         .clone();
-    request.expected_revision = store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            request.expected_revision,
-            &Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+    request.expected_revision = publish_bundle(
+        &store,
+        &graph,
+        _w.path(),
+        &store.leader().unwrap(),
+        request.expected_revision,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     let p = prepare(&store, request).unwrap();
     assert_eq!(p.context.calls.len(), 2);
     let v = assemble(&p, &all(&p, Relevance::Essential), "manual").unwrap();
@@ -468,4 +471,25 @@ fn variable_question_packet_is_source_only_not_an_executable_seed() {
             .unwrap()
             .contains("\"target\"")
     );
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

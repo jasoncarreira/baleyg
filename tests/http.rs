@@ -47,7 +47,7 @@ async fn guards_public_and_private() {
         ("/healthz", "127.0.0.1:7331", None, None, 200),
         ("/", "localhost:7331", None, None, 200),
         ("/api/status", "127.0.0.1:7331", None, None, 401),
-        ("/api/status", "127.0.0.1:7331", None, Some(TOKEN), 200),
+        ("/api/status", "127.0.0.1:7331", None, Some(TOKEN), 503),
         ("/healthz", "evil.example", None, None, 403),
         (
             "/",
@@ -68,7 +68,7 @@ async fn guards_public_and_private() {
             "localhost:7331",
             Some("http://localhost:7331"),
             Some(TOKEN),
-            200,
+            503,
         ),
     ] {
         let mut req = Request::builder().uri(path).header("host", host);
@@ -147,7 +147,7 @@ async fn validation_and_limit() {
         400
     );
     let stale = IndexPin {
-        index_generation: _store.status().unwrap().revision.index_generation,
+        index_generation: _store.index_baseline().unwrap().index_generation,
         index_revision: 9,
     };
     assert_eq!(
@@ -173,22 +173,25 @@ async fn validation_and_limit() {
 #[tokio::test]
 async fn source_is_snapshot_and_revision_checked() {
     let (_d, store, _state, app) = setup();
-    let mut graph = Graph::default();
-    graph.files.push(SourceFile {
-        path: "a.js".into(),
-        hash: "hash".into(),
-        language: "javascript".into(),
-        text: "cached secret-free source".into(),
-    });
+    let workspace = _d.path().join("workspace");
+    std::fs::write(workspace.join("a.js"), "cached secret-free source").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &IndexOptions::new(workspace),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(graph.files[0].text, "cached secret-free source");
     store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            store.index_baseline().unwrap(),
+            &cancel,
         )
         .unwrap();
     let pin = store.status().unwrap().revision;
@@ -315,7 +318,7 @@ async fn active_job_cancellation_does_not_publish() {
     .await
     .unwrap();
     assert_eq!(terminal["state"], "cancelled");
-    assert_eq!(store.status().unwrap().revision.index_revision, 0);
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
 }
 
 #[tokio::test]
@@ -377,7 +380,6 @@ async fn local_design_assets_preserve_same_origin_guards() {
 
 #[tokio::test]
 async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_comparison() {
-    use baleyg::indexer::index_workspace_with_capture;
     let (dir, store, _state, app) = setup();
     let workspace = dir.path().join("workspace");
     std::fs::write(
@@ -392,11 +394,14 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     .unwrap();
     let options = IndexOptions::new(workspace.clone());
     let cancel = Arc::new(AtomicBool::new(false));
-    let (graph, capture) = index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+    let (graph, native, capture) =
+        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+            .unwrap();
     let pin = store
-        .publish_captured(
+        .publish_native(
             &graph,
             &capture,
+            &native,
             &store.leader().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
@@ -433,6 +438,8 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     assert_eq!(code, StatusCode::OK, "{preview}");
     let packet = preview["packet"]["packetId"].as_str().unwrap();
     let old_selection = preview["selection"].clone();
+    // Retain the valid leader lease across deliberate legacy metadata tampering.
+    let leader = store.leader().unwrap();
     let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -441,6 +448,17 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         .join("index.db");
     {
         let db = rusqlite::Connection::open(&index).unwrap();
+        db.pragma_update(None, "foreign_keys", false).unwrap();
+        let native_tables = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in native_tables {
+            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        }
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],
@@ -459,6 +477,7 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         app.clone().oneshot(unauthenticated).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
+    let mut denied_routes = Vec::new();
     for (method, path, body) in [
         ("GET", "/api/status".to_owned(), Value::Null),
         ("GET", "/api/symbols?q=go".to_owned(), Value::Null),
@@ -555,17 +574,20 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         ),
     ] {
         let (status, response) = call(&app, method, &path, body).await;
-        assert_eq!(
-            status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{method} {path}: {response}"
-        );
-        assert_eq!(response["error"]["code"], "index_not_ready");
+        if status != StatusCode::SERVICE_UNAVAILABLE
+            || response["error"]["code"] != "index_not_ready"
+        {
+            denied_routes.push(format!("{method} {path}: {status} {response}"));
+        }
         assert!(
             !response.to_string().contains(&same_old_pair),
             "old pin escaped {path}"
         );
     }
+    assert!(
+        denied_routes.is_empty(),
+        "unexpected old-cache responses: {denied_routes:#?}"
+    );
     assert_eq!(
         call(&app, "GET", "/api/jobs/current", Value::Null).await.0,
         StatusCode::OK
@@ -584,13 +606,7 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     let cancelled = Arc::new(AtomicBool::new(true));
     assert!(
         store
-            .publish_captured(
-                &graph,
-                &capture,
-                &store.leader().unwrap(),
-                store.index_baseline().unwrap(),
-                &cancelled
-            )
+            .publish_native(&graph, &capture, &native, &leader, pin, &cancelled)
             .is_err()
     );
     assert_eq!(std::fs::read(&index).unwrap(), old_bytes);
@@ -609,6 +625,7 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         call(&app, "GET", "/api/status", Value::Null).await.0,
         StatusCode::SERVICE_UNAVAILABLE
     );
+    drop(leader);
     let (code, job) = call(&app, "POST", "/api/index", json!({"expectedRevision":pin})).await;
     assert_eq!(code, StatusCode::ACCEPTED);
     let id = job["id"].as_str().unwrap();

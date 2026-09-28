@@ -10,7 +10,10 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 pub const ROOT_INPUTS: &[&str] = &[
@@ -288,6 +291,7 @@ pub struct Capture {
     inputs: BTreeMap<PathBuf, Option<Stamp>>,
     pub files: Vec<SourceFile>,
     pub source_operations: BTreeMap<String, SourceOperations>,
+    graph_projections: AtomicUsize,
     pub hashes: BTreeMap<String, String>,
     pub input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
 }
@@ -446,11 +450,23 @@ impl Capture {
             inputs,
             files,
             source_operations,
+            graph_projections: AtomicUsize::new(0),
             hashes,
             input_bytes,
         };
         capture.verify(cancel)?;
         Ok(capture)
+    }
+    /// A capture may feed exactly one graph projection. Cross-link validation is not projection.
+    pub fn graph_projection_count(&self) -> usize {
+        self.graph_projections.load(Ordering::Relaxed)
+    }
+    pub(crate) fn claim_graph_projection(&self) -> Result<()> {
+        ensure!(
+            self.graph_projections.fetch_add(1, Ordering::Relaxed) == 0,
+            "a capture cannot project a graph twice"
+        );
+        Ok(())
     }
     pub fn verify(&self, cancel: &CancelFlag) -> Result<()> {
         check(cancel)?;

@@ -29,17 +29,18 @@ fn setup(files: &[(&str, &str)]) -> (tempfile::TempDir, Store, Graph, Router) {
     let options = IndexOptions::new(root.clone());
     let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &root).unwrap();
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &cancel(),
-        )
-        .unwrap();
+    publish_bundle(
+        &store,
+        &graph,
+        &root,
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.index_baseline().unwrap().index_generation,
+            index_revision: 0,
+        },
+        &cancel(),
+    )
+    .unwrap();
     let app = http::router(
         http::new(
             store.clone(),
@@ -213,17 +214,18 @@ async fn strict_selectors_validation_and_revision() {
         assert_eq!(status, 400, "{body}: {value}");
     }
     let old_source = source("A.java", 3, &dir);
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1,
-            },
-            &cancel(),
-        )
-        .unwrap();
+    publish_bundle(
+        &store,
+        &graph,
+        &dir.path().join("workspace"),
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.status().unwrap().revision.index_generation,
+            index_revision: 1,
+        },
+        &cancel(),
+    )
+    .unwrap();
     assert_eq!(call(&app, good).await.0, 409);
     assert_eq!(call(&app, old_source).await.0, 409);
 }
@@ -395,26 +397,108 @@ async fn java_field_envelope_is_exact_across_comments_lines_shared_declarations_
 async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     let mut text = String::from("class A { B value; } class B {}\n");
     text.push_str(&" ".repeat(300_000));
-    let (dir, _store, graph, app) = setup(&[("Large.java", &text)]);
+    let (dir, store, graph, app) = setup(&[("Large.java", &text)]);
     let selector = member(&dir, id(&graph, "A"), "value", 0);
-    let (_, within_budget) = call(&app, selector.clone()).await;
+    let (status, within_budget) = call(&app, selector.clone()).await;
+    assert_eq!(status, 200, "{within_budget}");
     assert!(targets(&within_budget, "type").is_empty());
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
+    let original_text = text.clone();
+    text.push_str("\nforged()\n");
     text.push_str(&" ".repeat(2 * 1024 * 1024));
     db.execute(
         "UPDATE files SET payload=json_set(payload,'$.text',?1)",
         [text],
     )
     .unwrap();
-    let (_, limited) = call(&app, selector.clone()).await;
-    assert!(targets(&limited, "type").is_empty());
+    // Member navigation must authenticate the selected graph JSON/native pair
+    // even though it does not use the source body for type inference.
+    let (status, limited) = call(&app, selector.clone()).await;
+    assert_eq!(status, 503, "{limited}");
+    assert_eq!(limited["error"]["code"], "incompatible_index");
+    assert!(limited.get("targets").is_none());
+    // The source selector would count forged lines in files.payload.text. Gate
+    // that read in the same pinned transaction, before any false line is admitted.
+    let (status, forged_line) = call(&app, source("Large.java", 2, &dir)).await;
+    assert_eq!(status, 503, "{forged_line}");
+    assert_eq!(forged_line["error"]["code"], "incompatible_index");
+    assert!(store.source_at("Large.java", None).is_err());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/source?path=Large.java")
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "incompatible_index");
     db.execute(
         "UPDATE files SET payload=json_set(payload,'$.text','class A { C other; } class B {}')",
         [],
     )
     .unwrap();
-    let (_, unproven) = call(&app, selector).await;
-    assert!(targets(&unproven, "type").is_empty());
+    let (status, unproven) = call(&app, selector.clone()).await;
+    assert_eq!(status, 503, "{unproven}");
+    assert_eq!(unproven["error"]["code"], "incompatible_index");
+    assert!(unproven.get("targets").is_none());
+    assert!(store.source_at("Large.java", None).is_err());
+    // Restore graph JSON, then tamper the actual selected native BLOB. A pinned
+    // typed read must reject it, while unrelated member navigation stays inert.
+    db.execute(
+        "UPDATE files SET payload=json_set(payload,'$.text',?1)",
+        [&original_text],
+    )
+    .unwrap();
+    let mut bytes: Vec<u8> = db
+        .query_row(
+            "SELECT source_bytes FROM native_documents WHERE path='Large.java'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    bytes[0] ^= 1;
+    db.execute(
+        "UPDATE native_documents SET source_bytes=?1 WHERE path='Large.java'",
+        [bytes],
+    )
+    .unwrap();
+    let native_key = baleyg::native_evidence::DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "java".into(),
+        path: "Large.java".into(),
+    };
+    assert!(
+        store
+            .native_source_at(store.status().unwrap().revision, &native_key)
+            .is_err()
+    );
+    assert!(store.source_at("Large.java", None).is_err());
+    let (status, corrupted) = call(&app, selector).await;
+    assert_eq!(status, 503, "{corrupted}");
+    assert_eq!(corrupted["error"]["code"], "incompatible_index");
+    assert!(corrupted.get("targets").is_none());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/source?path=Large.java")
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "incompatible_index");
 }
 
 #[tokio::test]
@@ -831,4 +915,25 @@ class Own extends Base {
                 .all(|t| t["reason"] != "call" && t["reason"] != "type")
         );
     }
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

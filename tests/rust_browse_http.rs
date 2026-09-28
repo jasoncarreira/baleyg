@@ -7,7 +7,7 @@ use axum::{
 };
 use baleyg::{
     http,
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace_bundle},
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -62,7 +62,14 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     .unwrap();
     let options = IndexOptions::new(workspace.clone());
     let cancel = Arc::new(AtomicBool::new(false));
-    let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
+    let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(workspace.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
     assert!(!sentinel.exists());
     assert!(
         graph
@@ -76,15 +83,13 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             .iter()
             .any(|f| f.path == "helper.js" && f.language == "javascript")
     );
-    let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
     store
-        .publish(
+        .publish_native(
             &graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
+            store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
@@ -156,17 +161,28 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     .await;
     assert_eq!(code, 200);
     assert_eq!(source["file"]["text"], text);
+    // A new publication needs a live root again; the previous reads used cached source.
+    std::fs::write(workspace.join("lib.rs"), text).unwrap();
+    let (refreshed_graph, refreshed_native, refreshed_capture) = index_workspace_bundle(
+        &IndexOptions::new(workspace.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(refreshed_graph.files, graph.files);
+    assert_eq!(refreshed_graph.calls, graph.calls);
     store
-        .publish(
-            &graph,
+        .publish_native(
+            &refreshed_graph,
+            &refreshed_capture,
+            &refreshed_native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1,
-            },
+            pin,
             &cancel,
         )
         .unwrap();
+    std::fs::remove_file(workspace.join("lib.rs")).unwrap();
     assert_eq!(
         request(
             &app,
