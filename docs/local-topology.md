@@ -23,7 +23,7 @@ This section bounds what every Stage 2–4 implementation and review must defend
 
 A same-user process can already change the source, the binary and the configuration, so these defenses would add no security.
 
-Accordingly, reads don't re-authenticate stored rows against captured source or the graph, the local database isn't signed or MACed, and reads need no per-field size caps beyond the existing request and response bounds. Validation happens at capture and publication; reads decode strictly and reject what fails.
+Accordingly, reads need not re-authenticate stored rows against captured source or the graph, the local database need not be signed or MACed, and reads need no per-field size caps beyond the existing request and response bounds. These remove requirements; they don't forbid existing read checks or relax paired-pin publication rules. Validation happens at capture and publication; reads decode strictly and reject what fails.
 
 <a id="workspace-discovery"></a>
 ## T01 — Discovery and identity
