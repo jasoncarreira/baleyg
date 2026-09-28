@@ -842,3 +842,106 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
     assert!(store.query_view(&unaffected).unwrap().is_some());
     assert!(store.sequence_at(&java, pin, true).unwrap().is_some());
 }
+
+#[test]
+fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_witness() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    let original: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let fake = "sid:v1:ffffffffffffffffffffffffffffffff";
+    db.execute("INSERT INTO native_declarations(syntax_id,source_set_id,language,path,revision_id,owner_syntax_id,kind,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end,provenance_id)
+        SELECT ?1,source_set_id,language,path,revision_id,owner_syntax_id,kind,'phantom','phantom',key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end,provenance_id
+        FROM native_declarations WHERE syntax_id=?2",
+        rusqlite::params![fake,original]).unwrap();
+    db.execute(
+        "INSERT INTO native_headers(syntax_id,kind,name,result_type)
+        SELECT ?1,kind,'phantom',result_type FROM native_headers WHERE syntax_id=?2",
+        rusqlite::params![fake, original],
+    )
+    .unwrap();
+    let fk_count: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_count, 0, "forgery must retain valid SQL FKs");
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert!(
+        store
+            .native_declarations_at(pin, "javascript", "phantom")
+            .is_err(),
+        "new-key declaration escaped selected source witness"
+    );
+    assert!(
+        !store
+            .native_declarations_at(pin, "java", "go")
+            .unwrap()
+            .is_empty(),
+        "unrelated selected Java document must remain available"
+    );
+}
+
+#[test]
+fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    let owner: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<1500)
+        INSERT INTO native_signature_parameter_types(syntax_id,ancestor_ordinal,ordinal,type_name)
+        SELECT ?1,10000+v,0,'amplified' FROM n",
+        [&owner],
+    )
+    .unwrap();
+    let fk_count: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_count, 0, "amplification must retain valid SQL FKs");
+    let error = store
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("selected evidence row budget exceeded"),
+        "{error:#}"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert!(
+        !store
+            .native_declarations_at(pin, "java", "go")
+            .unwrap()
+            .is_empty(),
+        "unrelated selected Java document must remain available"
+    );
+}

@@ -1536,25 +1536,82 @@ impl Store {
     /// Authenticate one selected document's normalized records and graph DTOs
     /// against its paired BLOB in the same pinned SQLite transaction.
     fn attest_selected_document(&self, db: &Connection, path: &str) -> Result<()> {
-        let row_counts: (i64,i64,i64,i64,i64) = db.query_row(
-            "SELECT (SELECT count(*) FROM nodes WHERE path=?1),(SELECT count(*) FROM calls WHERE path=?1),(SELECT count(*) FROM regions WHERE path=?1),(SELECT count(*) FROM native_declarations WHERE path=?1),(SELECT count(*) FROM native_calls WHERE path=?1)",
-            [path],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        // SQLite lengths and bounded row counts precede BLOB/JSON allocation and
+        // selected tree-sitter extraction. All predicates stay on this source set,
+        // revision, language and path; no workspace-wide payload scan.
+        let mut sizes=db.prepare("SELECT d.source_set_id,d.language,d.revision_id,length(d.source_bytes),length(CAST(f.payload AS BLOB)) FROM native_documents d JOIN files f ON f.path=d.path WHERE d.path=?1 LIMIT 2")?;
+        let selected: Vec<(String, String, String, i64, i64)> = sizes
+            .query_map([path], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        ensure!(
+            selected.len() == 1,
+            "incompatible_index: selected document identity missing or ambiguous"
+        );
+        let (source_set_id, language, revision_id, native_bytes, graph_bytes) = &selected[0];
+        ensure!(
+            source_set_id == &format!("source-set:v1:{}", self.root_id())
+                && *native_bytes >= 0
+                && *native_bytes <= 256 * 1024 * 1024
+                && *graph_bytes >= 0
+                && *graph_bytes <= 256 * 1024 * 1024 + 16 * 1024
+                && *graph_bytes <= native_bytes.saturating_mul(6).saturating_add(16 * 1024),
+            "incompatible_index: selected source byte budget exceeded"
+        );
+        let row_limit = native_bytes.saturating_mul(16).clamp(1024, 1_000_000);
+        let row_sql = r#"SELECT (SELECT count(*) FROM files WHERE path=?1),
+(SELECT count(*) FROM nodes WHERE path=?1),
+(SELECT count(*) FROM calls WHERE path=?1),
+(SELECT count(*) FROM regions WHERE path=?1),
+(SELECT count(*) FROM classes WHERE path=?1),
+(SELECT count(*) FROM native_documents WHERE source_set_id=?2 AND language=?3 AND revision_id=?4 AND path=?1),
+(SELECT count(*) FROM native_coverage WHERE producer_id=(SELECT id FROM native_producers LIMIT 1) AND revision_id=?4 AND language=?3 AND document_path=?1 AND source_set_id=?2),
+(SELECT count(*) FROM native_coverage_roles WHERE producer_id=(SELECT id FROM native_producers LIMIT 1) AND revision_id=?4 AND language=?3 AND document_path=?1),
+(SELECT count(*) FROM native_provenance WHERE revision_id=?4 AND language=?3 AND path=?1 AND source_set_id=?2),
+(SELECT count(*) FROM native_declarations d WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1),
+(SELECT count(*) FROM native_declaration_ancestors x JOIN native_declarations d ON d.syntax_id=x.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1),
+(SELECT count(*) FROM native_signature_parameter_types x JOIN native_declarations d ON d.syntax_id=x.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1),
+(SELECT count(*) FROM native_headers x JOIN native_declarations d ON d.syntax_id=x.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1),
+(SELECT count(*) FROM native_header_items x JOIN native_declarations d ON d.syntax_id=x.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1),
+(SELECT count(*) FROM native_parameters x JOIN native_declarations d ON d.syntax_id=x.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1),
+(SELECT count(*) FROM native_calls WHERE source_set_id=?2 AND language=?3 AND revision_id=?4 AND path=?1),
+(SELECT count(*) FROM native_call_regions x JOIN native_calls c ON c.id=x.call_id WHERE c.source_set_id=?2 AND c.language=?3 AND c.revision_id=?4 AND c.path=?1),
+(SELECT count(*) FROM native_control_regions WHERE source_set_id=?2 AND language=?3 AND revision_id=?4 AND path=?1),
+(SELECT count(*) FROM native_producer_languages WHERE producer_id=(SELECT id FROM native_producers LIMIT 1)),
+(SELECT count(*) FROM native_source_set_languages WHERE source_set_id=?2),
+(SELECT count(*) FROM native_source_set_dependencies WHERE source_set_id=?2)"#;
+        let row_counts: Vec<i64> = db.query_row(
+            row_sql,
+            params![path, source_set_id, language, revision_id],
+            |r| {
+                (0..21)
+                    .map(|i| r.get::<_, i64>(i))
+                    .collect::<rusqlite::Result<_>>()
+            },
         )?;
         ensure!(
-            [
-                row_counts.0,
-                row_counts.1,
-                row_counts.2,
-                row_counts.3,
-                row_counts.4
-            ]
-            .into_iter()
-            .all(|count| count <= 1_000_000),
+            row_counts.len() == 21 && row_counts.into_iter().all(|n| n >= 0 && n <= row_limit),
             "incompatible_index: selected evidence row budget exceeded"
         );
         let file = Self::selected_source_row(db, path)?
             .context("incompatible_index: selected graph/native source missing")?;
         let witness = self.selected_native_witness(db, path)?;
+        let mut stored:Vec<(String,Option<String>)>=db.prepare(
+            "SELECT syntax_id,lookup_key FROM native_declarations WHERE source_set_id=?1 AND language=?2 AND revision_id=?3 AND path=?4 ORDER BY syntax_id"
+        )?.query_map(params![source_set_id,language,revision_id,path],|r|Ok((r.get(0)?,r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut expected: Vec<_> = witness
+            .declarations
+            .iter()
+            .map(|d| (d.syntax_id.clone(), d.lookup_key.clone()))
+            .collect();
+        stored.sort_by(|a, b| a.0.cmp(&b.0));
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        ensure!(
+            stored == expected,
+            "incompatible_index: selected native declaration inventory differs from source"
+        );
         let key = &witness.revision.documents[0].key;
         let coverage = Self::read_native_coverage(db, key)?
             .context("incompatible_index: selected native coverage missing")?;
@@ -1759,12 +1816,13 @@ impl Store {
         lookup_key: &str,
     ) -> Result<Vec<crate::native_evidence::Declaration>> {
         self.native_at(pin, |db| {
-            let rows = Self::read_native_declarations(db, language, Some(lookup_key), None)?;
-            let paths: BTreeSet<_> = rows.iter().map(|d| d.document.path.as_str()).collect();
-            for path in paths {
-                self.attest_selected_document(db, path)?;
-            }
-            Ok(rows)
+            let mut paths=db.prepare(
+                "SELECT DISTINCT path FROM native_declarations WHERE revision_id=(SELECT id FROM native_revisions LIMIT 1) AND language=?1 AND lookup_key=?2 ORDER BY path LIMIT 5001"
+            )?.query_map(params![language,lookup_key],|r|r.get::<_,String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(paths.len()<=5000,"incompatible_index: selected lookup document budget exceeded");
+            for path in paths.drain(..) { self.attest_selected_document(db,&path)?; }
+            Self::read_native_declarations(db, language, Some(lookup_key), None)
         })
     }
     fn read_native_declarations(
@@ -2059,16 +2117,14 @@ impl Store {
         key: &crate::native_evidence::DocumentKey,
     ) -> Result<Option<crate::native_evidence::Coverage>> {
         self.native_at(pin, |db| {
-            let row = Self::read_native_coverage(db, key)?;
-            if row.is_some() {
-                self.attest_selected_document(db, &key.path)?;
-            } else {
-                let selected:bool=db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3)",
-                    params![key.source_set_id,key.language,key.path],|r|r.get(0),
-                )?;
-                ensure!(!selected,"incompatible_index: selected native coverage missing");
-            }
+            let selected:bool=db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3)",
+                params![key.source_set_id,key.language,key.path],|r|r.get(0),
+            )?;
+            if selected { self.attest_selected_document(db,&key.path)?; }
+            let row=Self::read_native_coverage(db,key)?;
+            ensure!(!selected || row.is_some(),
+                "incompatible_index: selected native coverage missing");
             Ok(row)
         })
     }
@@ -2097,20 +2153,24 @@ impl Store {
         owner: &str,
     ) -> Result<Vec<crate::native_evidence::Call>> {
         self.native_at(pin, |db| {
-            let rows = Self::read_native_calls(db, owner)?;
             let path: Option<String> = db
                 .query_row(
                     "SELECT path FROM native_declarations WHERE syntax_id=?1",
                     [owner],
-                    |row| row.get(0),
+                    |r| r.get(0),
                 )
                 .optional()?;
-            if let Some(path) = path {
-                self.attest_selected_document(db, &path)?;
+            if let Some(ref path) = path {
+                self.attest_selected_document(db, path)?;
             } else {
-                ensure!(rows.is_empty(), "incompatible_index: native owner absent");
+                let dangling: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM native_calls WHERE owner_syntax_id=?1)",
+                    [owner],
+                    |r| r.get(0),
+                )?;
+                ensure!(!dangling, "incompatible_index: native owner absent");
             }
-            Ok(rows)
+            Self::read_native_calls(db, owner)
         })
     }
     fn read_native_calls(
@@ -2204,20 +2264,24 @@ impl Store {
         owner: &str,
     ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
         self.native_at(pin, |db| {
-            let rows = Self::read_native_control_regions(db, owner)?;
             let path: Option<String> = db
                 .query_row(
                     "SELECT path FROM native_declarations WHERE syntax_id=?1",
                     [owner],
-                    |row| row.get(0),
+                    |r| r.get(0),
                 )
                 .optional()?;
-            if let Some(path) = path {
-                self.attest_selected_document(db, &path)?;
+            if let Some(ref path) = path {
+                self.attest_selected_document(db, path)?;
             } else {
-                ensure!(rows.is_empty(), "incompatible_index: native owner absent");
+                let dangling: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM native_control_regions WHERE owner_syntax_id=?1)",
+                    [owner],
+                    |r| r.get(0),
+                )?;
+                ensure!(!dangling, "incompatible_index: native owner absent");
             }
-            Ok(rows)
+            Self::read_native_control_regions(db, owner)
         })
     }
     fn read_native_control_regions(
