@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-// Independent serializer: this test deliberately does not call production native_ids.
+// Independent serializer: this serializer deliberately does not call production native_ids.
 fn encode(v: &Value) -> Vec<u8> {
     match v {
         Value::Null => b"null".to_vec(),
@@ -61,6 +61,7 @@ fn every_normative_stable_id_vector() {
     ))
     .unwrap();
     let mut languages = BTreeMap::new();
+    let mut production_ids = baleyg::native_ids::IdentityRegistry::default();
     let cases = root["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 64);
     for case in cases {
@@ -97,6 +98,12 @@ fn every_normative_stable_id_vector() {
             hex::encode(full),
             syntax["sha256"].as_str().unwrap(),
             "{} full digest",
+            case["caseId"]
+        );
+        assert_eq!(
+            production_ids.stable(&input).unwrap(),
+            case["expected"]["stableId"].as_str().unwrap(),
+            "{} production stable ID",
             case["caseId"]
         );
     }
