@@ -428,6 +428,7 @@ fn is_region(n: Node<'_>) -> bool {
     matches!(
         n.kind(),
         "if_statement"
+            | "if_expression"
             | "else_clause"
             | "elif_clause"
             | "while_statement"
@@ -533,14 +534,68 @@ fn key_of(n: Node<'_>, f: &SourceFile, k: &str) -> Key {
         ordinal: 0,
     }
 }
+fn modifier_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "public"
+            | "protected"
+            | "private"
+            | "static"
+            | "abstract"
+            | "final"
+            | "native"
+            | "synchronized"
+            | "volatile"
+            | "transient"
+            | "strictfp"
+            | "default"
+            | "async"
+            | "const"
+            | "unsafe"
+            | "extern"
+            | "override"
+            | "get"
+            | "set"
+            | "readonly"
+    )
+}
+
 fn header(n: Node<'_>, f: &SourceFile, key: &Key) -> Header {
     let from = |node: Node<'_>| f.text.get(node.byte_range()).map(str::to_owned);
     let field = |field: &str| n.child_by_field_name(field).and_then(from);
-    let modifiers = child_nodes(n)
+    let mut modifier_tokens: Vec<(usize, usize, String)> = Vec::new();
+    let mut cursor = n.walk();
+    for child in n.children(&mut cursor) {
+        match child.kind() {
+            "visibility_modifier" => {
+                if let Some(value) = from(child) {
+                    modifier_tokens.push((child.start_byte(), child.end_byte(), value));
+                }
+            }
+            "modifiers" | "function_modifiers" => {
+                let mut nested_cursor = child.walk();
+                for token in child.children(&mut nested_cursor) {
+                    if let Some(value) = from(token)
+                        && (token.is_named() || modifier_keyword(&value))
+                    {
+                        modifier_tokens.push((token.start_byte(), token.end_byte(), value));
+                    }
+                }
+            }
+            _ if !child.is_named() => {
+                if let Some(value) = from(child)
+                    && modifier_keyword(&value)
+                {
+                    modifier_tokens.push((child.start_byte(), child.end_byte(), value));
+                }
+            }
+            _ => {}
+        }
+    }
+    modifier_tokens.sort_by_key(|(start, end, _)| (*start, *end));
+    let modifiers = modifier_tokens
         .into_iter()
-        .filter(|child| child.kind() == "modifiers")
-        .flat_map(child_nodes)
-        .filter_map(from)
+        .map(|(_, _, value)| value)
         .collect();
     let type_parameters = n
         .child_by_field_name("type_parameters")

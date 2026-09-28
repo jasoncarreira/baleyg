@@ -238,20 +238,83 @@ fn nested_occurrences_sort_before_hashing_and_unverifiable_callees_remain_nullab
     artifact
         .validate(&capture, root.path(), &identity.record_id)
         .unwrap();
-    for lang in ["java", "javascript", "python", "rust"] {
-        assert!(
-            artifact.calls.iter().any(|c| c.document.language == lang
-                && c.spelling.as_deref() == Some("foo")
-                && c.callee_range.is_some()),
-            "missing measured {lang} foo"
+    // These are literal source expressions, not records regenerated as the test oracle.
+    for (lang, path, unverified_expression, spelling) in [
+        ("java", "A.java", "new A()", None),
+        ("javascript", "a.js", "obj[key]()", Some("obj[key]")),
+        ("python", "a.py", "(foo())()", Some("(foo())")),
+        ("rust", "a.rs", "foo()()", Some("foo()")),
+    ] {
+        let source = &capture
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap()
+            .text;
+        let owner = artifact
+            .declarations
+            .iter()
+            .find(|d| d.document.language == lang && d.name.as_deref() == Some("go"))
+            .unwrap();
+        let positive_at = source.find("obj.foo()").unwrap();
+        let positive = artifact
+            .calls
+            .iter()
+            .find(|call| call.document.language == lang && call.range.start == positive_at)
+            .unwrap();
+        assert_eq!(
+            (positive.range.start, positive.range.end),
+            (positive_at, positive_at + "obj.foo()".len())
         );
+        assert_eq!(positive.spelling.as_deref(), Some("foo"));
+        let token = positive.callee_range.as_ref().unwrap();
+        assert_eq!((token.start, token.end), (positive_at + 4, positive_at + 7));
+        assert_eq!(positive.owner_syntax_id, owner.syntax_id);
+        let at = source.find(unverified_expression).unwrap();
         let unverified = artifact
             .calls
             .iter()
-            .find(|c| c.document.language == lang && c.callee_range.is_none());
+            .find(|call| {
+                call.document.language == lang
+                    && call.range.start == at
+                    && call.range.end == at + unverified_expression.len()
+            })
+            .unwrap();
+        assert_eq!(
+            unverified.spelling.as_deref(),
+            spelling,
+            "{lang} full captured spelling"
+        );
+        assert_eq!(unverified.callee_range, None, "{lang} cannot infer a token");
+        assert_eq!(
+            unverified.owner_syntax_id, owner.syntax_id,
+            "{lang} lexical owner"
+        );
+        assert_eq!(
+            &source[unverified.range.start..unverified.range.end],
+            unverified_expression
+        );
+        let wire = serde_json::to_value(unverified).unwrap();
+        for field in [
+            "receiver",
+            "target",
+            "hint",
+            "candidateSymbols",
+            "resolution",
+            "binding",
+            "symbol",
+        ] {
+            assert!(
+                wire.get(field).is_none(),
+                "{lang} fabricated semantic {field}"
+            );
+        }
+    }
+    let native_wire = serde_json::to_value(&artifact).unwrap();
+    for field in ["references", "symbols", "bindings", "semanticProducer"] {
         assert!(
-            unverified.is_some(),
-            "missing unverifiable expression {lang}"
+            native_wire.get(field).is_none(),
+            "native artifact fabricated {field}"
         );
     }
     let js: Vec<_> = artifact
@@ -746,4 +809,134 @@ fn validation_refuses_cutoff_drift_without_source_reread() {
     );
     assert_eq!(capture.source_operations["a.js"].complete_reads, 1);
     assert_eq!(capture.source_operations["a.js"].hashes, 1);
+}
+
+#[test]
+fn source_grounded_four_language_headers_owners_and_control_regions() {
+    use baleyg::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        .unwrap();
+    for (path, source) in [
+        (
+            "A.java",
+            "public class A { public static void go() { if (true) obj.foo(); } }",
+        ),
+        ("a.js", "async function go() { if (true) obj.foo(); }"),
+        ("a.py", "async def go():\n    if True:\n        obj.foo()\n"),
+        (
+            "a.rs",
+            "pub struct S {}\nstruct Plain {}\npub async fn go() { if true { obj.foo(); } }\nfn plain() {}",
+        ),
+    ] {
+        fs::write(root.path().join(path), source).unwrap();
+    }
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &id.record_id).unwrap();
+    let rust_struct = artifact
+        .declarations
+        .iter()
+        .find(|d| d.document.language == "rust" && d.name.as_deref() == Some("S"))
+        .unwrap();
+    assert_eq!(rust_struct.header.modifiers, ["pub"]);
+    let rust_plain = artifact
+        .declarations
+        .iter()
+        .find(|d| d.document.language == "rust" && d.name.as_deref() == Some("Plain"))
+        .unwrap();
+    assert!(
+        rust_plain.header.modifiers.is_empty(),
+        "private Rust struct must not inherit pub"
+    );
+    let plain_function = artifact
+        .declarations
+        .iter()
+        .find(|d| d.document.language == "rust" && d.name.as_deref() == Some("plain"))
+        .unwrap();
+    assert!(
+        plain_function.header.modifiers.is_empty(),
+        "plain Rust fn must not inherit async/pub"
+    );
+    let java_type = artifact
+        .declarations
+        .iter()
+        .find(|d| d.document.language == "java" && d.name.as_deref() == Some("A"))
+        .unwrap();
+    assert_eq!(java_type.header.modifiers, ["public"]);
+    for (lang, path, modifiers, control_text, kind) in [
+        (
+            "java",
+            "A.java",
+            vec!["public", "static"],
+            "if (true) obj.foo();",
+            "if_statement",
+        ),
+        (
+            "javascript",
+            "a.js",
+            vec!["async"],
+            "if (true) obj.foo();",
+            "if_statement",
+        ),
+        (
+            "python",
+            "a.py",
+            vec!["async"],
+            "if True:\n        obj.foo()",
+            "if_statement",
+        ),
+        (
+            "rust",
+            "a.rs",
+            vec!["pub", "async"],
+            "if true { obj.foo(); }",
+            "if_expression",
+        ),
+    ] {
+        let source = &capture.files.iter().find(|f| f.path == path).unwrap().text;
+        let owner = artifact
+            .declarations
+            .iter()
+            .find(|d| d.document.language == lang && d.name.as_deref() == Some("go"))
+            .unwrap();
+        assert_eq!(
+            owner.header.modifiers, modifiers,
+            "{lang} literal header modifiers"
+        );
+        assert_eq!(
+            &source[owner.range.start..owner.range.end].contains("go"),
+            &true
+        );
+        if lang == "java" {
+            assert_eq!(owner.header.result_type.as_deref(), Some("void"));
+        }
+        let begin = source.find(control_text).unwrap();
+        let region = artifact
+            .control_regions
+            .iter()
+            .find(|r| r.document.language == lang && r.kind == kind && r.range.start == begin)
+            .unwrap_or_else(|| panic!("missing {lang} control: {:?}", artifact.control_regions));
+        assert_eq!(
+            (region.range.start, region.range.end),
+            (begin, begin + control_text.len())
+        );
+        assert_eq!(region.owner_syntax_id, owner.syntax_id);
+        let call_at = source.find("obj.foo()").unwrap();
+        let call = artifact
+            .calls
+            .iter()
+            .find(|c| c.document.language == lang && c.range.start == call_at)
+            .unwrap();
+        assert_eq!(call.owner_syntax_id, owner.syntax_id);
+        assert!(call.region_ids.contains(&region.id));
+        assert_eq!(call.spelling.as_deref(), Some("foo"));
+        assert_eq!(call.callee_range.as_ref().unwrap().start, call_at + 4);
+    }
 }
