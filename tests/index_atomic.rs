@@ -241,3 +241,97 @@ fn publish_bundle(
     );
     store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }
+
+#[test]
+fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let (state, workspace) = fixture();
+    let root = workspace.path();
+    fs::write(
+        root.join("main.js"),
+        "function seed() { sink(); } function sink() {}
+",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), root).unwrap();
+    let options = IndexOptions::new(root.to_owned());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let first = IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let (old_pin, old_file) = store.source_at("main.js", Some(first)).unwrap().unwrap();
+    assert_eq!(old_pin, first);
+    let original = old_file.text;
+    let cancelled = IndexJobCoordinator::prepare(&store, Some(first)).unwrap();
+    cancel.store(true, Ordering::Release);
+    assert!(
+        cancelled
+            .run(&options, &cancel, |_| {})
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+    );
+    cancel.store(false, Ordering::Release);
+    assert_eq!(store.status().unwrap().revision, first);
+
+    let drift = IndexJobCoordinator::prepare(&store, Some(first)).unwrap();
+    let error = drift
+        .run(&options, &cancel, |p| {
+            if p.phase == "parse" {
+                fs::write(
+                    root.join("main.js"),
+                    "function changed() {}
+",
+                )
+                .unwrap();
+            }
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("drift"), "{error:#}");
+    assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(
+        store
+            .source_at("main.js", Some(first))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        original
+    );
+    let stale = IndexJobCoordinator::prepare(
+        &store,
+        Some(baleyg::model::IndexPin {
+            index_generation: first.index_generation,
+            index_revision: first.index_revision - 1,
+        }),
+    );
+    assert!(
+        matches!(stale, Err(error) if error.to_string().contains("revision conflict")),
+        "stale pair must refuse before work"
+    );
+    assert_eq!(store.status().unwrap().revision, first);
+    let next = IndexJobCoordinator::prepare(&store, Some(first))
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(next.index_generation, first.index_generation);
+    assert_eq!(next.index_revision, first.index_revision + 1);
+    assert!(store.source_at("main.js", Some(first)).is_err());
+    assert_eq!(
+        store
+            .source_at("main.js", Some(next))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function changed() {}
+"
+    );
+}

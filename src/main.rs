@@ -263,27 +263,20 @@ async fn main() -> Result<()> {
         }
         Command::Index(args) => {
             let (store, options, _) = args.resolve()?;
-            let expected = store.index_baseline()?;
+            let coordinator =
+                baleyg::index_coordinator::IndexJobCoordinator::prepare(&store, None)?;
             let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
             let signal = tokio::spawn(async move {
                 shutdown_signal().await;
                 flag.store(true, Ordering::Release);
             });
-            let leader = store.leader()?;
-            let writer = store.clone();
-            let work = tokio::task::spawn_blocking(move || -> Result<baleyg::model::IndexPin> {
-                let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
-                    &options,
-                    writer.root_id(),
-                    &cancel,
-                    |p| {
-                        if p.completed == p.total {
-                            eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
-                        }
-                    },
-                )?;
-                writer.publish_native(&graph, &capture, &native, &leader, expected, &cancel)
+            let work = tokio::task::spawn_blocking(move || {
+                coordinator.run(&options, &cancel, |p| {
+                    if p.completed == p.total {
+                        eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
+                    }
+                })
             })
             .await
             .context("index worker panicked")?;
