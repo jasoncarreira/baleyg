@@ -134,5 +134,5 @@ and Git-info ignore files do not participate in admission.
 This is a non-adversarial writer check, not a filesystem security sandbox. A writer
 able to restore *all* observable identity, size, mtime, and ctime metadata between
 checks can evade it. Ancestor directory replacement is not capability-fenced.
-This intermediate boundary does not implement #39 reconciliation or rebuild
-publication, nor native evidence persistence or a coordinator.
+This intermediate boundary does not implement #39/#70 reconciliation or rebuild
+publication, nor T04’s durable `requests.db` queue and leader-owned request coordinator.

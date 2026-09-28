@@ -3343,6 +3343,254 @@ mod rebaseline_fault_tests {
     use std::{fs, ptr, sync::atomic::AtomicBool};
 
     #[test]
+    fn cancellation_at_before_commit_rolls_back_entire_native_class_graph_pair() {
+        use crate::class_diagram::ClassDiagramRequest;
+        use std::{
+            sync::{atomic::Ordering, mpsc},
+            thread::JoinHandle,
+            time::Duration,
+        };
+
+        // The guard cancels, releases the callback, and joins on every early
+        // failure, including a timeout or an assertion panic on the main thread.
+        struct PublisherGuard {
+            cancel: CancelFlag,
+            release: Option<mpsc::Sender<()>>,
+            worker: Option<JoinHandle<Result<IndexPin>>>,
+        }
+        impl Drop for PublisherGuard {
+            fn drop(&mut self) {
+                self.cancel.store(true, Ordering::Release);
+                if let Some(release) = self.release.take() {
+                    let _ = release.send(());
+                }
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+        fn worker_outcome(result: std::thread::Result<Result<IndexPin>>) -> String {
+            match result {
+                Ok(Ok(pin)) => format!("unexpected publisher success: {pin:?}"),
+                Ok(Err(error)) => format!("publisher error: {error:#}"),
+                Err(panic) => format!(
+                    "publisher panic: {}",
+                    panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic payload")
+                ),
+            }
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("Types.java");
+        let original = "class A { void go() { helper(); } void helper() {} }\nclass B {}\n";
+        fs::write(&path, original).unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let initial_cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &initial_cancel, |_| {}).unwrap();
+        let leader = store.leader().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                store.index_baseline().unwrap(),
+                &initial_cancel,
+            )
+            .unwrap();
+        let seed = graph
+            .nodes
+            .iter()
+            .find(|node| node.name == "A" && node.kind == SymbolKind::Class)
+            .unwrap()
+            .id
+            .clone();
+        let question = ClassDiagramRequest {
+            seed,
+            expected_revision: pin,
+            expanded: vec![],
+            include_unmatched: false,
+            include_hierarchy: false,
+        };
+        let old_graph = store.graph().unwrap();
+        let old_diagram = serde_json::to_value(store.class_diagram_at(&question).unwrap()).unwrap();
+        let old_key = native
+            .revision
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == "Types.java")
+            .unwrap()
+            .key
+            .clone();
+        let old_source = store.source_at("Types.java", Some(pin)).unwrap().unwrap();
+        let old_native_source = store.native_source_at(pin, &old_key).unwrap().unwrap();
+        let old_coverage = store.native_coverage_at(pin, &old_key).unwrap().unwrap();
+        let old_declarations = store.native_declarations_at(pin, "java", "go").unwrap();
+        assert!(!old_declarations.is_empty());
+        let go_owner = &old_declarations[0].syntax_id;
+        let old_calls = store.native_calls_at(pin, go_owner).unwrap();
+        assert!(
+            !old_calls.is_empty(),
+            "real Java call is paired native evidence"
+        );
+        let old_regions = store.native_control_regions_at(pin, go_owner).unwrap();
+
+        let changed = format!("{original}class Added {{ void added() {{}} }}\n");
+        fs::write(&path, &changed).unwrap();
+        let (next, next_native, next_capture) =
+            index_workspace_bundle(&options, store.root_id(), &initial_cancel, |_| {}).unwrap();
+        assert!(
+            next.nodes
+                .iter()
+                .any(|node| node.name == "Added" && node.kind == SymbolKind::Class)
+        );
+        // The private seam skips the public publish_native wrapper: retain each
+        // wrapper admission check on this genuine immutable captured bundle.
+        next_native
+            .validate(&next_capture, work.path(), store.root_id())
+            .unwrap();
+        ensure!(
+            next_capture.graph_projection_count() == 1,
+            "capture must contain exactly one graph projection"
+        )
+        .unwrap();
+        ensure!(
+            next_capture.source_operations.len() == next_capture.files.len()
+                && next_capture
+                    .source_operations
+                    .values()
+                    .all(|counts| counts.opens == 1
+                        && counts.complete_reads == 1
+                        && counts.hashes == 1),
+            "each captured source must open/read/hash exactly once"
+        )
+        .unwrap();
+        crate::indexer::validate_native_graph(&next, &next_capture, &next_native, &initial_cancel)
+            .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store.publish_inner_checked(
+                (&next, &next_capture, &next_native),
+                &leader,
+                pin,
+                &worker_cancel,
+                |stage, tx| {
+                    if stage != PublishStage::BeforeCommit {
+                        return Ok(());
+                    }
+                    // BeforeCommit runs after graph/native/class inserts and
+                    // paired validation, before the final cancellation check.
+                    let new_revision: i64 = tx.query_row(
+                        "SELECT index_revision FROM index_metadata WHERE singleton=1",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(
+                        new_revision == i64::try_from(pin.index_revision + 1)?,
+                        "new revision not staged inside writer transaction"
+                    );
+                    let added: i64 = tx.query_row(
+                        "SELECT count(*) FROM classes WHERE path='Types.java' AND name='Added'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(added == 1, "new class projection not staged");
+                    let raw: Vec<u8> = tx.query_row(
+                        "SELECT source_bytes FROM native_documents WHERE path='Types.java'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(raw == changed.as_bytes(), "new native source not staged");
+                    validate_paired_metadata(tx, worker_store.root_id())?;
+                    validate_paired_rows(tx)?;
+                    entered_tx
+                        .send(())
+                        .context("failed to signal BeforeCommit stage")?;
+                    release_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .context("bounded BeforeCommit release timed out")?;
+                    Ok(())
+                },
+            )
+        });
+        let mut guard = PublisherGuard {
+            cancel,
+            release: Some(release_tx),
+            worker: Some(worker),
+        };
+        if let Err(wait) = entered_rx.recv_timeout(Duration::from_secs(30)) {
+            let detail = if guard.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+                worker_outcome(guard.worker.take().unwrap().join())
+            } else {
+                format!("publisher still before BeforeCommit stage after bounded wait: {wait}")
+            };
+            panic!("publisher did not enter the staged writer transaction: {detail}");
+        }
+        // The worker is blocked inside its own BeforeCommit callback. Probe on
+        // a second connection, not on the publisher's Connection reference.
+        let probe = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        match probe.execute_batch("BEGIN IMMEDIATE") {
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy => {}
+            Ok(()) => {
+                probe.execute_batch("ROLLBACK").unwrap();
+                panic!("independent writer obtained lock while publisher paused BeforeCommit");
+            }
+            Err(error) => panic!("independent writer probe failed unexpectedly: {error}"),
+        }
+        guard.cancel.store(true, Ordering::Release);
+        guard.release.take().unwrap().send(()).unwrap();
+        let outcome = guard.worker.take().unwrap().join();
+        match outcome {
+            Ok(Err(error)) if error.to_string().contains("cancelled") => {}
+            other => panic!(
+                "publisher failed cancellation contract: {}",
+                worker_outcome(other)
+            ),
+        }
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(store.graph().unwrap(), old_graph);
+        assert_eq!(
+            serde_json::to_value(store.class_diagram_at(&question).unwrap()).unwrap(),
+            old_diagram
+        );
+        assert_eq!(
+            store.source_at("Types.java", Some(pin)).unwrap().unwrap(),
+            old_source
+        );
+        assert_eq!(
+            store.native_source_at(pin, &old_key).unwrap().unwrap(),
+            old_native_source
+        );
+        assert_eq!(
+            store.native_coverage_at(pin, &old_key).unwrap().unwrap(),
+            old_coverage
+        );
+        assert_eq!(
+            store.native_declarations_at(pin, "java", "go").unwrap(),
+            old_declarations
+        );
+        assert_eq!(store.native_calls_at(pin, go_owner).unwrap(), old_calls);
+        assert_eq!(
+            store.native_control_regions_at(pin, go_owner).unwrap(),
+            old_regions
+        );
+    }
+
+    #[test]
     fn captured_long_call_exceeds_injected_small_graph_cap_and_remains_selectable() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
