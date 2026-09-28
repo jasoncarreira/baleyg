@@ -306,10 +306,10 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
     identity.verify()?;
     let source_set_id = format!("source-set:v1:{root_id}");
     let exe = std::env::current_exe()?;
-    let exe_bytes = capture
-        .bytes(&exe)
-        .context("native executable not admitted")?;
-    let executable_hash = hash(exe_bytes);
+    let executable_hash = capture
+        .executable_digest(&exe)
+        .context("native executable not admitted or replaced")?
+        .to_owned();
     let producer = Producer {
         id: PRODUCER.into(),
         version: "native-v2".into(),
@@ -340,12 +340,12 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
     for p in &selectors {
         config.push(entry(root, p, capture.bytes(p))?);
     }
-    for (p, b) in &capture.input_bytes {
+    for (p, b) in capture.admitted_inputs() {
         if p.file_name()
             .is_some_and(|n| n == ".gitignore" || n == ".ignore")
             && p.starts_with(root)
         {
-            config.push(entry(root, p, b.as_deref())?);
+            config.push(entry(root, p, b)?);
         }
     }
     let selectors: Vec<Value> = selectors
@@ -1412,5 +1412,82 @@ impl Artifact {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cached_executable_digest_tests {
+    use super::*;
+    use crate::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        store::Store,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    #[test]
+    fn admitted_executable_digest_survives_projection_validation_and_paired_publish() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Types.java"),
+            "class A { void go() { helper(); } void helper() {} }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(workspace.path().to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(
+            native.producer.executable_hash,
+            capture.executable_digest(&exe).unwrap()
+        );
+        assert_eq!(capture.graph_projection_count(), 1);
+        assert!(
+            capture
+                .source_operations
+                .values()
+                .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1)
+        );
+        native.validate(&capture, &root, store.root_id()).unwrap();
+        assert_eq!(
+            from_capture(&capture, &root, store.root_id()).unwrap(),
+            native
+        );
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(store.status().unwrap().revision, pin);
+        let key = &native.revision.documents[0].key;
+        let (document, bytes) = store.native_source_at(pin, key).unwrap().unwrap();
+        assert_eq!(
+            document.content_hash,
+            native.revision.documents[0].content_hash
+        );
+        assert_eq!(bytes.as_slice(), graph.files[0].text.as_bytes());
+        let go = store.native_declarations_at(pin, "java", "go").unwrap();
+        assert!(!go.is_empty());
+        assert!(go.iter().all(|row| {
+            native
+                .declarations
+                .iter()
+                .any(|expected| row.syntax_id == expected.syntax_id)
+        }));
     }
 }

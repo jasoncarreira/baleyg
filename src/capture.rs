@@ -293,7 +293,12 @@ pub struct Capture {
     pub source_operations: BTreeMap<String, SourceOperations>,
     graph_projections: AtomicUsize,
     pub hashes: BTreeMap<String, String>,
-    pub input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
+    // One admitted immutable executable byte allocation and one SHA-256 pass.
+    // The private identity binds the cached digest to this exact captured Arc.
+    executable_path: PathBuf,
+    executable_bytes: Arc<[u8]>,
+    executable_digest: String,
+    input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
 }
 impl Capture {
     pub fn admit(
@@ -370,14 +375,15 @@ impl Capture {
             &mut inputs,
             &mut input_bytes,
         )?;
-        ensure!(
-            input_bytes
-                .get(&exe)
-                .and_then(Option::as_ref)
-                .is_some_and(|b| !b.is_empty()),
-            "running executable bytes unavailable: {}",
-            exe.display()
-        );
+        let executable_bytes = input_bytes
+            .get(&exe)
+            .and_then(Option::as_ref)
+            .filter(|bytes| !bytes.is_empty())
+            .cloned()
+            .with_context(|| format!("running executable bytes unavailable: {}", exe.display()))?;
+        check(cancel)?;
+        let executable_digest = hash(&executable_bytes);
+        check(cancel)?;
         for path in [options.scip_path.as_ref(), options.manifest_path.as_ref()]
             .into_iter()
             .flatten()
@@ -452,6 +458,9 @@ impl Capture {
             source_operations,
             graph_projections: AtomicUsize::new(0),
             hashes,
+            executable_path: exe,
+            executable_bytes,
+            executable_digest,
             input_bytes,
         };
         capture.verify(cancel)?;
@@ -489,6 +498,22 @@ impl Capture {
     }
     pub fn bytes(&self, path: &Path) -> Option<&[u8]> {
         self.input_bytes.get(path).and_then(|b| b.as_deref())
+    }
+    /// Only the exact admitted executable Arc may use its one cached digest.
+    /// A missing or replaced map entry fails closed without hashing again.
+    pub(crate) fn executable_digest(&self, path: &Path) -> Option<&str> {
+        (path == self.executable_path.as_path()
+            && self
+                .input_bytes
+                .get(path)
+                .and_then(Option::as_ref)
+                .is_some_and(|bytes| Arc::ptr_eq(bytes, &self.executable_bytes)))
+        .then_some(self.executable_digest.as_str())
+    }
+    pub(crate) fn admitted_inputs(&self) -> impl Iterator<Item = (&Path, Option<&[u8]>)> {
+        self.input_bytes
+            .iter()
+            .map(|(path, bytes)| (path.as_path(), bytes.as_deref()))
     }
 }
 
@@ -565,6 +590,11 @@ mod tests {
                 hashes: 1,
             }
         );
+        assert_eq!(capture.bytes(&exe), Some(&b"native-v1"[..]));
+        assert_eq!(
+            capture.executable_digest(&exe),
+            Some("d0f25cc40fe46416cf32b2e565dd9a5fbd979845a57297a3c78e0fc833048ba5")
+        );
         capture.verify(&cancel).unwrap();
         fs::write(&exe, "native-v2").unwrap();
         assert!(
@@ -574,5 +604,67 @@ mod tests {
                 .to_string()
                 .contains("drift")
         );
+    }
+    #[test]
+    fn cached_executable_digest_rejects_wrong_path_and_replaced_arc() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("fake-native-bin");
+        fs::write(&exe, "native-v1").unwrap();
+        fs::write(root.path().join("one.js"), "f();").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut capture = Capture::admit_with_executable(
+            &IndexOptions::new(root.path().to_owned()),
+            &cancel,
+            &|_| {},
+            exe.clone(),
+        )
+        .unwrap();
+        let admitted = capture
+            .input_bytes
+            .get(&exe)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(Arc::ptr_eq(&admitted, &capture.executable_bytes));
+        let digest = capture.executable_digest(&exe).unwrap().to_owned();
+        assert_eq!(
+            digest,
+            "d0f25cc40fe46416cf32b2e565dd9a5fbd979845a57297a3c78e0fc833048ba5"
+        );
+        let wrong = root.path().join("forged-native-bin");
+        capture
+            .input_bytes
+            .insert(wrong.clone(), Some(admitted.clone()));
+        assert_eq!(
+            capture.executable_digest(&wrong),
+            None,
+            "even the same Arc under a wrong executable path is not admitted"
+        );
+        let equal_bytes: Arc<[u8]> = Arc::from(admitted.as_ref());
+        assert!(!Arc::ptr_eq(&admitted, &equal_bytes));
+        capture.input_bytes.insert(exe.clone(), Some(equal_bytes));
+        assert_eq!(
+            capture.executable_digest(&exe),
+            None,
+            "forged equal bytes in a different Arc must fail closed"
+        );
+        capture
+            .input_bytes
+            .insert(exe.clone(), Some(Arc::from(&b"native-v2"[..])));
+        assert_eq!(
+            capture.executable_digest(&exe),
+            None,
+            "forged different bytes must fail closed"
+        );
+        capture.input_bytes.remove(&exe);
+        assert_eq!(
+            capture.executable_digest(&exe),
+            None,
+            "removed executable bytes must fail closed"
+        );
+        capture.input_bytes.insert(exe.clone(), Some(admitted));
+        assert_eq!(capture.executable_digest(&exe), Some(digest.as_str()));
+        capture.verify(&cancel).unwrap();
     }
 }
