@@ -2142,13 +2142,16 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut statement = db.prepare(
                 "SELECT t.syntax_id,t.ancestor_ordinal,t.type_name FROM native_signature_parameter_types t                  JOIN native_declarations d ON d.syntax_id=t.syntax_id                  WHERE d.language=?1 AND (?4 OR ((?2 IS NULL AND d.lookup_key IS NULL) OR d.lookup_key=?2)) AND (?3 IS NULL OR d.path=?3) ORDER BY t.syntax_id,t.ancestor_ordinal,t.ordinal",
             )?;
-        for item in statement.query_map(params![language, lookup_key, selected_path, all_lookup_keys], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })? {
+        for item in statement.query_map(
+            params![language, lookup_key, selected_path, all_lookup_keys],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )? {
             let (id, ordinal, name) = item?;
             types.entry((id, ordinal)).or_default().push(name);
         }
@@ -2156,18 +2159,21 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut statement = db.prepare(
                 "SELECT a.syntax_id,a.ordinal,a.kind,a.name,a.sibling_ordinal,a.signature_present,                 a.type_parameter_count,a.variadic FROM native_declaration_ancestors a                  JOIN native_declarations d ON d.syntax_id=a.syntax_id                  WHERE d.language=?1 AND (?4 OR ((?2 IS NULL AND d.lookup_key IS NULL) OR d.lookup_key=?2)) AND (?3 IS NULL OR d.path=?3) ORDER BY a.syntax_id,a.ordinal",
             )?;
-        for item in statement.query_map(params![language, lookup_key, selected_path, all_lookup_keys], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, bool>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-                r.get::<_, Option<bool>>(7)?,
-            ))
-        })? {
+        for item in statement.query_map(
+            params![language, lookup_key, selected_path, all_lookup_keys],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<bool>>(7)?,
+                ))
+            },
+        )? {
             let (id, ordinal, kind, name, sibling, signature, count, variadic) = item?;
             ancestors
                 .entry(id)
@@ -2178,14 +2184,17 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut statement = db.prepare(
                 "SELECT h.syntax_id,h.kind,h.name,h.result_type FROM native_headers h                  JOIN native_declarations d ON d.syntax_id=h.syntax_id                  WHERE d.language=?1 AND (?4 OR ((?2 IS NULL AND d.lookup_key IS NULL) OR d.lookup_key=?2)) AND (?3 IS NULL OR d.path=?3)",
             )?;
-        for item in statement.query_map(params![language, lookup_key, selected_path, all_lookup_keys], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })? {
+        for item in statement.query_map(
+            params![language, lookup_key, selected_path, all_lookup_keys],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )? {
             let (id, kind, name, result_type) = item?;
             ensure!(
                 headers
@@ -2208,13 +2217,16 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut statement = db.prepare(
                 "SELECT i.syntax_id,i.item_kind,i.value FROM native_header_items i                  JOIN native_declarations d ON d.syntax_id=i.syntax_id                  WHERE d.language=?1 AND (?4 OR ((?2 IS NULL AND d.lookup_key IS NULL) OR d.lookup_key=?2)) AND (?3 IS NULL OR d.path=?3)                  ORDER BY i.syntax_id,i.item_kind,i.ordinal",
             )?;
-        for item in statement.query_map(params![language, lookup_key, selected_path, all_lookup_keys], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })? {
+        for item in statement.query_map(
+            params![language, lookup_key, selected_path, all_lookup_keys],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )? {
             let (id, kind, value) = item?;
             let header = headers.get_mut(&id).context("missing native header")?;
             match kind.as_str() {
@@ -2227,14 +2239,17 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut statement = db.prepare(
                 "SELECT p.syntax_id,p.name,p.type_name,p.variadic FROM native_parameters p                  JOIN native_declarations d ON d.syntax_id=p.syntax_id                  WHERE d.language=?1 AND (?4 OR ((?2 IS NULL AND d.lookup_key IS NULL) OR d.lookup_key=?2)) AND (?3 IS NULL OR d.path=?3) ORDER BY p.syntax_id,p.ordinal",
             )?;
-        for item in statement.query_map(params![language, lookup_key, selected_path, all_lookup_keys], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, bool>(3)?,
-            ))
-        })? {
+        for item in statement.query_map(
+            params![language, lookup_key, selected_path, all_lookup_keys],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
+            },
+        )? {
             let (id, name, type_name, variadic) = item?;
             headers
                 .get_mut(&id)
@@ -2268,26 +2283,29 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut stmt = db.prepare(
                 "SELECT syntax_id,source_set_id,path,revision_id,kind,name,lookup_key,                 key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,                 start_byte,end_byte,name_start,name_end,provenance_id                  FROM native_declarations WHERE revision_id=(SELECT id FROM native_revisions LIMIT 1)                  AND language=?1 AND (?4 OR ((?2 IS NULL AND lookup_key IS NULL) OR lookup_key=?2)) AND (?3 IS NULL OR path=?3) ORDER BY syntax_id",
             )?;
-        let rows = stmt.query_map(params![language, lookup_key, selected_path, all_lookup_keys], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, bool>(7)?,
-                r.get::<_, Option<i64>>(8)?,
-                r.get::<_, Option<bool>>(9)?,
-                r.get::<_, i64>(10)?,
-                r.get::<_, i64>(11)?,
-                r.get::<_, i64>(12)?,
-                r.get::<_, Option<i64>>(13)?,
-                r.get::<_, Option<i64>>(14)?,
-                r.get::<_, String>(15)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![language, lookup_key, selected_path, all_lookup_keys],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, bool>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<bool>>(9)?,
+                    r.get::<_, i64>(10)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, i64>(12)?,
+                    r.get::<_, Option<i64>>(13)?,
+                    r.get::<_, Option<i64>>(14)?,
+                    r.get::<_, String>(15)?,
+                ))
+            },
+        )?;
         let mut declarations = Vec::new();
         for row in rows {
             let (
@@ -3246,10 +3264,13 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
     }
 
     fn selected_anchor_in(db: &Connection, store: &Self, target: &str) -> Result<DurableAnchor> {
-        let selected: Option<(String, String)> = db.query_row(
-            "SELECT language,path FROM native_declarations WHERE syntax_id=?1",
-            [target], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
+        let selected: Option<(String, String)> = db
+            .query_row(
+                "SELECT language,path FROM native_declarations WHERE syntax_id=?1",
+                [target],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         let (language, path) = selected.context("native declaration target missing")?;
         store.attest_selected_document(db, &path)?;
         let declarations = Self::read_native_declarations(db, &language, None, Some(&path), true)?;
@@ -3257,45 +3278,109 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         anchors::capture_anchor(focused, &declarations)
     }
 
-    fn declarations_for_anchor(db: &Connection, store: &Self, anchor: &DurableAnchor) -> Result<(String, Vec<crate::native_evidence::Declaration>)> {
+    fn declarations_for_anchor(
+        db: &Connection,
+        store: &Self,
+        anchor: &DurableAnchor,
+    ) -> Result<(String, Vec<crate::native_evidence::Declaration>)> {
         let revision: Option<String> = db.query_row(
             "SELECT revision_id FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
             params![anchor.document.source_set_id, anchor.document.language, anchor.document.path], |row| row.get(0),
         ).optional()?;
         let revision = revision.context("invalid anchor document association")?;
         store.attest_selected_document(db, &anchor.document.path)?;
-        let declarations = Self::read_native_declarations(db, &anchor.document.language, None, Some(&anchor.document.path), true)?;
-        ensure!(anchors::document_matches(&anchor.document, &declarations), "invalid anchor document association");
+        let declarations = Self::read_native_declarations(
+            db,
+            &anchor.document.language,
+            None,
+            Some(&anchor.document.path),
+            true,
+        )?;
+        ensure!(
+            anchors::document_matches(&anchor.document, &declarations),
+            "invalid anchor document association"
+        );
         Ok((revision, declarations))
     }
 
-    fn anchor_attachment(db: &Connection, store: &Self, raw: Option<&serde_json::value::RawValue>) -> Result<AnchorAttachment> {
-        let Some(raw) = raw else { return Ok(AnchorAttachment { availability: AttachmentAvailability::Anchorless, result: None }); };
+    fn anchor_attachment(
+        db: &Connection,
+        store: &Self,
+        raw: Option<&serde_json::value::RawValue>,
+    ) -> Result<AnchorAttachment> {
+        let Some(raw) = raw else {
+            return Ok(AnchorAttachment {
+                availability: AttachmentAvailability::Anchorless,
+                result: None,
+            });
+        };
         let anchor: DurableAnchor = serde_json::from_str(raw.get())?;
         anchor.validate()?;
         let (revision, declarations) = Self::declarations_for_anchor(db, store, &anchor)?;
-        let current = declarations.iter().find(|row| row.syntax_id == anchor.syntax_id);
+        let current = declarations
+            .iter()
+            .find(|row| row.syntax_id == anchor.syntax_id);
         let result = anchors::audit_anchor(&anchor, &revision, current, &declarations, None)?;
-        Ok(AnchorAttachment { availability: AttachmentAvailability::Ready, result: Some(result) })
+        Ok(AnchorAttachment {
+            availability: AttachmentAvailability::Ready,
+            result: Some(result),
+        })
     }
 
-    fn resolve_view(db: &Connection, store: &Self, view: SavedViewRecord, pin: Option<IndexPin>) -> Result<SavedViewState> {
-        let ids: BTreeSet<&String> = std::iter::once(&view.query.seed).chain(view.pins.keys()).chain(view.hidden.iter()).collect();
+    fn resolve_view(
+        db: &Connection,
+        store: &Self,
+        view: SavedViewRecord,
+        pin: Option<IndexPin>,
+    ) -> Result<SavedViewState> {
+        let ids: BTreeSet<&String> = std::iter::once(&view.query.seed)
+            .chain(view.pins.keys())
+            .chain(view.hidden.iter())
+            .collect();
         let mut orphaned_ids = vec![];
         for id in ids {
-            let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1)", [id], |r| r.get(0))?;
-            if !exists { orphaned_ids.push(id.clone()); }
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                orphaned_ids.push(id.clone());
+            }
         }
         let attachment = Self::anchor_attachment(db, store, view.anchor.as_deref())?;
-        if attachment.result.as_ref().is_none_or(|result| result.status != AnchorStatus::Attached)
-            && !orphaned_ids.contains(&view.query.seed) { orphaned_ids.push(view.query.seed.clone()); }
-        Ok(SavedViewState { view, orphaned_ids, index_generation: pin.map(|p| p.index_generation.to_string()), index_revision: pin.map(|p| p.index_revision), attachment })
+        if attachment
+            .result
+            .as_ref()
+            .is_none_or(|result| result.status != AnchorStatus::Attached)
+            && !orphaned_ids.contains(&view.query.seed)
+        {
+            orphaned_ids.push(view.query.seed.clone());
+        }
+        Ok(SavedViewState {
+            view,
+            orphaned_ids,
+            index_generation: pin.map(|p| p.index_generation.to_string()),
+            index_revision: pin.map(|p| p.index_revision),
+            attachment,
+        })
     }
 
     fn unavailable_view(view: SavedViewRecord) -> SavedViewState {
-        let orphaned_ids = std::iter::once(view.query.seed.clone()).chain(view.pins.keys().cloned()).chain(view.hidden.iter().cloned()).collect();
-        SavedViewState { view, orphaned_ids, index_generation: None, index_revision: None,
-            attachment: AnchorAttachment { availability: AttachmentAvailability::IndexUnavailable, result: None } }
+        let orphaned_ids = std::iter::once(view.query.seed.clone())
+            .chain(view.pins.keys().cloned())
+            .chain(view.hidden.iter().cloned())
+            .collect();
+        SavedViewState {
+            view,
+            orphaned_ids,
+            index_generation: None,
+            index_revision: None,
+            attachment: AnchorAttachment {
+                availability: AttachmentAvailability::IndexUnavailable,
+                result: None,
+            },
+        }
     }
 
     pub fn saved_views_at(&self, expected_pin: Option<IndexPin>) -> Result<Vec<SavedViewState>> {
@@ -3304,43 +3389,80 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let tx = storage_result(db.transaction())?;
         let control = self.read_control_status(&tx)?;
         if control.evidence_format.is_none() {
-            ensure!(expected_pin.is_none(), "revision conflict: native evidence unavailable");
+            ensure!(
+                expected_pin.is_none(),
+                "revision conflict: native evidence unavailable"
+            );
             return Ok(views.into_iter().map(Self::unavailable_view).collect());
         }
         let pin = self.read_status(&tx)?.revision;
-        ensure!(expected_pin.is_none_or(|expected| expected == pin), "revision conflict: stale native pin");
-        views.into_iter().map(|view| Self::resolve_view(&tx, self, view, Some(pin))).collect()
+        ensure!(
+            expected_pin.is_none_or(|expected| expected == pin),
+            "revision conflict: stale native pin"
+        );
+        views
+            .into_iter()
+            .map(|view| Self::resolve_view(&tx, self, view, Some(pin)))
+            .collect()
     }
-    pub fn views(&self) -> Result<Vec<SavedViewState>> { self.saved_views_at(None) }
+    pub fn views(&self) -> Result<Vec<SavedViewState>> {
+        self.saved_views_at(None)
+    }
 
-    pub fn saved_view_at(&self, id: &str, expected_pin: Option<IndexPin>) -> Result<Option<SavedViewState>> {
+    pub fn saved_view_at(
+        &self,
+        id: &str,
+        expected_pin: Option<IndexPin>,
+    ) -> Result<Option<SavedViewState>> {
         let view = self.records().view_record(id)?;
-        let Some(view) = view else { return Ok(None); };
+        let Some(view) = view else {
+            return Ok(None);
+        };
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         let control = self.read_control_status(&tx)?;
         if control.evidence_format.is_none() {
-            ensure!(expected_pin.is_none(), "revision conflict: native evidence unavailable");
+            ensure!(
+                expected_pin.is_none(),
+                "revision conflict: native evidence unavailable"
+            );
             return Ok(Some(Self::unavailable_view(view)));
         }
         let pin = self.read_status(&tx)?.revision;
-        ensure!(expected_pin.is_none_or(|expected| expected == pin), "revision conflict: stale native pin");
+        ensure!(
+            expected_pin.is_none_or(|expected| expected == pin),
+            "revision conflict: stale native pin"
+        );
         Ok(Some(Self::resolve_view(&tx, self, view, Some(pin))?))
     }
-    pub fn view(&self, id: &str) -> Result<Option<SavedViewState>> { self.saved_view_at(id, None) }
+    pub fn view(&self, id: &str) -> Result<Option<SavedViewState>> {
+        self.saved_view_at(id, None)
+    }
 
     pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
         view.validate()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        ensure!(self.read_status(&tx)?.revision == pin, "revision conflict: stale native pin");
+        ensure!(
+            self.read_status(&tx)?.revision == pin,
+            "revision conflict: stale native pin"
+        );
         let record = self.records().update_view_record(
             &SavedViewRecord::from_base(view.clone(), None),
-            || serde_json::value::to_raw_value(&Self::selected_anchor_in(&tx, self, &view.query.seed)?).map_err(Into::into),
+            || {
+                serde_json::value::to_raw_value(&Self::selected_anchor_in(
+                    &tx,
+                    self,
+                    &view.query.seed,
+                )?)
+                .map_err(Into::into)
+            },
         )?;
         Self::resolve_view(&tx, self, record, Some(pin))
     }
-    pub fn delete_view(&self, id: &str) -> Result<bool> { self.records().delete_view(id) }
+    pub fn delete_view(&self, id: &str) -> Result<bool> {
+        self.records().delete_view(id)
+    }
 
     pub fn put_annotation(&self, annotation: &Annotation) -> Result<()> {
         annotation.validate()?;
@@ -3348,45 +3470,104 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         Ok(())
     }
 
-    fn resolve_annotation(db: &Connection, store: &Self, annotation: AnnotationRecord, pin: Option<IndexPin>) -> Result<AnnotationState> {
+    fn resolve_annotation(
+        db: &Connection,
+        store: &Self,
+        annotation: AnnotationRecord,
+        pin: Option<IndexPin>,
+    ) -> Result<AnnotationState> {
         let attachment = Self::anchor_attachment(db, store, annotation.anchor.as_deref())?;
-        let orphaned = attachment.result.as_ref().is_none_or(|result| result.status != AnchorStatus::Attached);
-        Ok(AnnotationState { annotation, orphaned, index_generation: pin.map(|p| p.index_generation.to_string()), index_revision: pin.map(|p| p.index_revision), attachment })
+        let orphaned = attachment
+            .result
+            .as_ref()
+            .is_none_or(|result| result.status != AnchorStatus::Attached);
+        Ok(AnnotationState {
+            annotation,
+            orphaned,
+            index_generation: pin.map(|p| p.index_generation.to_string()),
+            index_revision: pin.map(|p| p.index_revision),
+            attachment,
+        })
     }
     fn unavailable_annotation(annotation: AnnotationRecord) -> AnnotationState {
-        AnnotationState { annotation, orphaned: true, index_generation: None, index_revision: None,
-            attachment: AnchorAttachment { availability: AttachmentAvailability::IndexUnavailable, result: None } }
+        AnnotationState {
+            annotation,
+            orphaned: true,
+            index_generation: None,
+            index_revision: None,
+            attachment: AnchorAttachment {
+                availability: AttachmentAvailability::IndexUnavailable,
+                result: None,
+            },
+        }
     }
-    pub fn saved_annotations_at(&self, expected_pin: Option<IndexPin>) -> Result<Vec<AnnotationState>> {
+    pub fn saved_annotations_at(
+        &self,
+        expected_pin: Option<IndexPin>,
+    ) -> Result<Vec<AnnotationState>> {
         let annotations = self.records().annotation_records()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         let control = self.read_control_status(&tx)?;
         if control.evidence_format.is_none() {
-            ensure!(expected_pin.is_none(), "revision conflict: native evidence unavailable");
-            return Ok(annotations.into_iter().map(Self::unavailable_annotation).collect());
+            ensure!(
+                expected_pin.is_none(),
+                "revision conflict: native evidence unavailable"
+            );
+            return Ok(annotations
+                .into_iter()
+                .map(Self::unavailable_annotation)
+                .collect());
         }
         let pin = self.read_status(&tx)?.revision;
-        ensure!(expected_pin.is_none_or(|expected| expected == pin), "revision conflict: stale native pin");
-        annotations.into_iter().map(|item| Self::resolve_annotation(&tx, self, item, Some(pin))).collect()
+        ensure!(
+            expected_pin.is_none_or(|expected| expected == pin),
+            "revision conflict: stale native pin"
+        );
+        annotations
+            .into_iter()
+            .map(|item| Self::resolve_annotation(&tx, self, item, Some(pin)))
+            .collect()
     }
-    pub fn annotations(&self) -> Result<Vec<AnnotationState>> { self.saved_annotations_at(None) }
+    pub fn annotations(&self) -> Result<Vec<AnnotationState>> {
+        self.saved_annotations_at(None)
+    }
 
-    pub fn save_annotation_at(&self, pin: IndexPin, request: &AnnotationRequest) -> Result<AnnotationState> {
+    pub fn save_annotation_at(
+        &self,
+        pin: IndexPin,
+        request: &AnnotationRequest,
+    ) -> Result<AnnotationState> {
         request.validate()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        ensure!(self.read_status(&tx)?.revision == pin, "revision conflict: stale native pin");
-        let title = request.title.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()).map(str::to_owned);
+        ensure!(
+            self.read_status(&tx)?.revision == pin,
+            "revision conflict: stale native pin"
+        );
+        let title = request
+            .title
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         let record = self.records().update_annotation_record(
             &AnnotationRecord::from_base(request.base(), title, None),
             request.title.is_none(),
-            || serde_json::value::to_raw_value(&Self::selected_anchor_in(&tx, self, &request.node_id)?).map_err(Into::into),
+            || {
+                serde_json::value::to_raw_value(&Self::selected_anchor_in(
+                    &tx,
+                    self,
+                    &request.node_id,
+                )?)
+                .map_err(Into::into)
+            },
         )?;
         Self::resolve_annotation(&tx, self, record, Some(pin))
     }
-    pub fn delete_annotation(&self, id: &str) -> Result<bool> { self.records().delete_annotation(id) }
-
+    pub fn delete_annotation(&self, id: &str) -> Result<bool> {
+        self.records().delete_annotation(id)
+    }
 }
 
 #[cfg(test)]

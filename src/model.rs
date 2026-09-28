@@ -320,7 +320,9 @@ impl DurableAnchor {
     pub fn validate(&self) -> anyhow::Result<()> {
         fn hash(value: &str) -> bool {
             value.len() == 64
-                && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         }
         anyhow::ensure!(
             self.syntax_id.len() == 39
@@ -350,7 +352,10 @@ impl DurableAnchor {
                 && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
             "invalid durable anchor document path"
         );
-        anyhow::ensure!(hash(&self.header_hash) && hash(&self.sibling_group_hash), "invalid durable anchor hash");
+        anyhow::ensure!(
+            hash(&self.header_hash) && hash(&self.sibling_group_hash),
+            "invalid durable anchor hash"
+        );
         anyhow::ensure!(
             self.sibling_count > 0
                 && self.identical_header_count > 0
@@ -363,10 +368,19 @@ impl DurableAnchor {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum AnchorStatus { Attached, Orphaned }
+pub enum AnchorStatus {
+    Attached,
+    Orphaned,
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum AnchorReason { None, Missing, HeaderMismatch, GroupChanged, UnprovenContinuity }
+pub enum AnchorReason {
+    None,
+    Missing,
+    HeaderMismatch,
+    GroupChanged,
+    UnprovenContinuity,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AnchorResult {
@@ -376,10 +390,18 @@ pub struct AnchorResult {
 }
 impl AnchorResult {
     pub fn attached(id: String) -> Self {
-        Self { status: AnchorStatus::Attached, target_id: Some(id), reason: AnchorReason::None }
+        Self {
+            status: AnchorStatus::Attached,
+            target_id: Some(id),
+            reason: AnchorReason::None,
+        }
     }
     pub fn orphaned(reason: AnchorReason) -> Self {
-        Self { status: AnchorStatus::Orphaned, target_id: None, reason }
+        Self {
+            status: AnchorStatus::Orphaned,
+            target_id: None,
+            reason,
+        }
     }
 }
 
@@ -398,24 +420,56 @@ pub struct SavedViewRecord {
 }
 impl PartialEq for SavedViewRecord {
     fn eq(&self, other: &Self) -> bool {
-        self.base() == other.base() && self.anchor.as_deref().map(|raw| raw.get()) == other.anchor.as_deref().map(|raw| raw.get())
+        self.base() == other.base()
+            && self.anchor.as_deref().map(|raw| raw.get())
+                == other.anchor.as_deref().map(|raw| raw.get())
     }
 }
-impl PartialEq<SavedView> for SavedViewRecord { fn eq(&self, other: &SavedView) -> bool { self.base() == *other } }
-impl PartialEq<SavedViewRecord> for SavedView { fn eq(&self, other: &SavedViewRecord) -> bool { *self == other.base() } }
+impl PartialEq<SavedView> for SavedViewRecord {
+    fn eq(&self, other: &SavedView) -> bool {
+        self.base() == *other
+    }
+}
+impl PartialEq<SavedViewRecord> for SavedView {
+    fn eq(&self, other: &SavedViewRecord) -> bool {
+        *self == other.base()
+    }
+}
 impl SavedViewRecord {
-    pub fn base(&self) -> SavedView { SavedView { id: self.id.clone(), title: self.title.clone(), query: self.query.clone(), pins: self.pins.clone(), hidden: self.hidden.clone() } }
+    pub fn base(&self) -> SavedView {
+        SavedView {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            query: self.query.clone(),
+            pins: self.pins.clone(),
+            hidden: self.hidden.clone(),
+        }
+    }
     pub fn from_base(view: SavedView, anchor: Option<Box<serde_json::value::RawValue>>) -> Self {
-        Self { id: view.id, title: view.title, query: view.query, pins: view.pins, hidden: view.hidden, anchor }
+        Self {
+            id: view.id,
+            title: view.title,
+            query: view.query,
+            pins: view.pins,
+            hidden: view.hidden,
+            anchor,
+        }
     }
     pub fn typed_anchor(&self) -> anyhow::Result<Option<DurableAnchor>> {
-        self.anchor.as_ref().map(|raw| {
-            let value: DurableAnchor = serde_json::from_str(raw.get())?;
-            value.validate()?;
-            Ok(value)
-        }).transpose()
+        self.anchor
+            .as_ref()
+            .map(|raw| {
+                let value: DurableAnchor = serde_json::from_str(raw.get())?;
+                value.validate()?;
+                Ok(value)
+            })
+            .transpose()
     }
-    pub fn validate(&self) -> anyhow::Result<()> { self.base().validate()?; self.typed_anchor()?; Ok(()) }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.base().validate()?;
+        self.typed_anchor()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,28 +485,60 @@ pub struct AnnotationRecord {
 }
 impl PartialEq for AnnotationRecord {
     fn eq(&self, other: &Self) -> bool {
-        self.base() == other.base() && self.title == other.title
-            && self.anchor.as_deref().map(|raw| raw.get()) == other.anchor.as_deref().map(|raw| raw.get())
+        self.base() == other.base()
+            && self.title == other.title
+            && self.anchor.as_deref().map(|raw| raw.get())
+                == other.anchor.as_deref().map(|raw| raw.get())
     }
 }
 impl Eq for AnnotationRecord {}
-impl PartialEq<Annotation> for AnnotationRecord { fn eq(&self, other: &Annotation) -> bool { self.base() == *other } }
-impl PartialEq<AnnotationRecord> for Annotation { fn eq(&self, other: &AnnotationRecord) -> bool { *self == other.base() } }
+impl PartialEq<Annotation> for AnnotationRecord {
+    fn eq(&self, other: &Annotation) -> bool {
+        self.base() == *other
+    }
+}
+impl PartialEq<AnnotationRecord> for Annotation {
+    fn eq(&self, other: &AnnotationRecord) -> bool {
+        *self == other.base()
+    }
+}
 impl AnnotationRecord {
-    pub fn base(&self) -> Annotation { Annotation { id: self.id.clone(), node_id: self.node_id.clone(), body: self.body.clone() } }
-    pub fn from_base(annotation: Annotation, title: Option<String>, anchor: Option<Box<serde_json::value::RawValue>>) -> Self {
-        Self { id: annotation.id, node_id: annotation.node_id, body: annotation.body, title, anchor }
+    pub fn base(&self) -> Annotation {
+        Annotation {
+            id: self.id.clone(),
+            node_id: self.node_id.clone(),
+            body: self.body.clone(),
+        }
+    }
+    pub fn from_base(
+        annotation: Annotation,
+        title: Option<String>,
+        anchor: Option<Box<serde_json::value::RawValue>>,
+    ) -> Self {
+        Self {
+            id: annotation.id,
+            node_id: annotation.node_id,
+            body: annotation.body,
+            title,
+            anchor,
+        }
     }
     pub fn typed_anchor(&self) -> anyhow::Result<Option<DurableAnchor>> {
-        self.anchor.as_ref().map(|raw| {
-            let value: DurableAnchor = serde_json::from_str(raw.get())?;
-            value.validate()?;
-            Ok(value)
-        }).transpose()
+        self.anchor
+            .as_ref()
+            .map(|raw| {
+                let value: DurableAnchor = serde_json::from_str(raw.get())?;
+                value.validate()?;
+                Ok(value)
+            })
+            .transpose()
     }
     pub fn validate(&self) -> anyhow::Result<()> {
         self.base().validate()?;
-        anyhow::ensure!(self.title.as_ref().is_none_or(|title| title.len() <= 256), "annotation title must be at most 256 bytes");
+        anyhow::ensure!(
+            self.title.as_ref().is_none_or(|title| title.len() <= 256),
+            "annotation title must be at most 256 bytes"
+        );
         self.typed_anchor()?;
         Ok(())
     }
@@ -469,17 +555,30 @@ pub struct AnnotationRequest {
     pub title: Option<String>,
 }
 impl AnnotationRequest {
-    pub fn base(&self) -> Annotation { Annotation { id: self.id.clone(), node_id: self.node_id.clone(), body: self.body.clone() } }
+    pub fn base(&self) -> Annotation {
+        Annotation {
+            id: self.id.clone(),
+            node_id: self.node_id.clone(),
+            body: self.body.clone(),
+        }
+    }
     pub fn validate(&self) -> anyhow::Result<()> {
         self.base().validate()?;
-        anyhow::ensure!(self.title.as_ref().is_none_or(|title| title.len() <= 256), "annotation title must be at most 256 bytes");
+        anyhow::ensure!(
+            self.title.as_ref().is_none_or(|title| title.len() <= 256),
+            "annotation title must be at most 256 bytes"
+        );
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum AttachmentAvailability { Ready, Anchorless, IndexUnavailable }
+pub enum AttachmentAvailability {
+    Ready,
+    Anchorless,
+    IndexUnavailable,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AnchorAttachment {
@@ -529,7 +628,9 @@ impl SavedView {
             );
         }
         anyhow::ensure!(
-            self.hidden.iter().all(|id| !id.is_empty() && id.len() <= 8192),
+            self.hidden
+                .iter()
+                .all(|id| !id.is_empty() && id.len() <= 8192),
             "invalid hidden symbol"
         );
         Ok(())
@@ -538,8 +639,14 @@ impl SavedView {
 impl Annotation {
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_record_id(&self.id)?;
-        anyhow::ensure!(!self.node_id.is_empty() && self.node_id.len() <= 8192, "invalid nodeId");
-        anyhow::ensure!(!self.body.trim().is_empty() && self.body.len() <= 65536, "annotation body must contain 1..65536 bytes");
+        anyhow::ensure!(
+            !self.node_id.is_empty() && self.node_id.len() <= 8192,
+            "invalid nodeId"
+        );
+        anyhow::ensure!(
+            !self.body.trim().is_empty() && self.body.len() <= 65536,
+            "annotation body must contain 1..65536 bytes"
+        );
         Ok(())
     }
 }

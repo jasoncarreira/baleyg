@@ -430,11 +430,17 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     store.put_view(&view).unwrap();
     let saved_note = store.annotations().unwrap().remove(0);
     assert!(saved_note.orphaned);
-    assert_eq!(saved_note.attachment.availability, AttachmentAvailability::Anchorless);
+    assert_eq!(
+        saved_note.attachment.availability,
+        AttachmentAvailability::Anchorless
+    );
     let saved_view = store.views().unwrap().remove(0);
     assert!(saved_view.orphaned_ids.contains(&a));
     assert!(saved_view.orphaned_ids.contains(&"missing".into()));
-    assert_eq!(saved_view.attachment.availability, AttachmentAvailability::Anchorless);
+    assert_eq!(
+        saved_view.attachment.availability,
+        AttachmentAvailability::Anchorless
+    );
     drop(store);
     std::fs::remove_file(index_db(state.path())).unwrap();
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
@@ -448,7 +454,10 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     assert_eq!(store.index_baseline().unwrap().index_revision, 0);
     let unavailable_note = store.annotations().unwrap().remove(0);
     assert!(unavailable_note.orphaned);
-    assert_eq!(unavailable_note.attachment.availability, AttachmentAvailability::IndexUnavailable);
+    assert_eq!(
+        unavailable_note.attachment.availability,
+        AttachmentAvailability::IndexUnavailable
+    );
     assert_eq!(unavailable_note.annotation, annotation);
     let orphaned = store.view("view").unwrap().unwrap().orphaned_ids;
     assert_eq!(orphaned.len(), 3);
@@ -457,7 +466,10 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     publish_bundle(&store, &fresh, store.index_baseline().unwrap());
     let restored_note = store.annotations().unwrap().remove(0);
     assert!(restored_note.orphaned);
-    assert_eq!(restored_note.attachment.availability, AttachmentAvailability::Anchorless);
+    assert_eq!(
+        restored_note.attachment.availability,
+        AttachmentAvailability::Anchorless
+    );
     // Public graph-only writes cannot remove indexed symbols.
     assert!(
         store
@@ -1148,7 +1160,6 @@ fn legacy_rebaseline_capture_drift_after_partial_write_preserves_old_bytes() {
     );
 }
 
-
 #[test]
 fn saved_reads_without_records_are_conservative_and_write_nothing() {
     let (state, work, store) = fixture();
@@ -1157,8 +1168,20 @@ fn saved_reads_without_records_are_conservative_and_write_nothing() {
     assert!(store.views().unwrap().is_empty());
     assert!(store.annotations().unwrap().is_empty());
     assert!(store.view("missing").unwrap().is_none());
-    assert_eq!(std::fs::read(&cache).unwrap(), before, "saved reads changed the cache database");
-    let identity = baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
-    assert!(!roots.record_db(&identity).exists(), "saved reads created a durable database");
+    assert_eq!(
+        std::fs::read(&cache).unwrap(),
+        before,
+        "saved reads changed the cache database"
+    );
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
+            .unwrap();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    assert!(
+        !roots.record_db(&identity).exists(),
+        "saved reads created a durable database"
+    );
 }

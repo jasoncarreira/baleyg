@@ -2087,7 +2087,6 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
     assert_eq!(inspect(), ("eligible", "root_replaced"));
 }
 
-
 #[test]
 fn saved_anchor_raw_bytes_survive_edits() {
     use baleyg::{
@@ -2101,13 +2100,35 @@ fn saved_anchor_raw_bytes_survive_edits() {
         r#"{ "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef", "document":{"sourceSetId":"set","language":"rust","path":"src/lib.rs"}, "capturedRevisionId":"rev", "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "siblingGroupHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "siblingCount":1, "identicalHeaderCount":1 }"#.into(),
     ).unwrap();
     let records = DurableRecords::new(&roots, &identity);
-    records.put_annotation_record(&AnnotationRecord::from_base(Annotation {
-        id: "note".into(), node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(), body: "first".into(),
-    }, Some("Title".into()), Some(raw)), false).unwrap();
-    let before = records.annotation_record("note").unwrap().unwrap().anchor.unwrap().get().to_owned();
-    records.put_annotation(&Annotation {
-        id: "note".into(), node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(), body: "edited".into(),
-    }).unwrap();
+    records
+        .put_annotation_record(
+            &AnnotationRecord::from_base(
+                Annotation {
+                    id: "note".into(),
+                    node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(),
+                    body: "first".into(),
+                },
+                Some("Title".into()),
+                Some(raw),
+            ),
+            false,
+        )
+        .unwrap();
+    let before = records
+        .annotation_record("note")
+        .unwrap()
+        .unwrap()
+        .anchor
+        .unwrap()
+        .get()
+        .to_owned();
+    records
+        .put_annotation(&Annotation {
+            id: "note".into(),
+            node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(),
+            body: "edited".into(),
+        })
+        .unwrap();
     let after = records.annotation_record("note").unwrap().unwrap();
     assert_eq!(after.anchor.unwrap().get(), before);
     assert_eq!(after.title.as_deref(), Some("Title"));
@@ -2121,56 +2142,124 @@ fn saved_anchor_rejects_target_replacement() {
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let records = DurableRecords::new(&roots, &identity);
-    records.put_annotation(&Annotation { id: "note".into(), node_id: "old".into(), body: "first".into() }).unwrap();
-    let error = records.put_annotation(&Annotation { id: "note".into(), node_id: "new".into(), body: "second".into() }).unwrap_err();
+    records
+        .put_annotation(&Annotation {
+            id: "note".into(),
+            node_id: "old".into(),
+            body: "first".into(),
+        })
+        .unwrap();
+    let error = records
+        .put_annotation(&Annotation {
+            id: "note".into(),
+            node_id: "new".into(),
+            body: "second".into(),
+        })
+        .unwrap_err();
     assert!(error.to_string().contains("target replacement"));
     assert_eq!(records.annotation("note").unwrap().unwrap().node_id, "old");
 }
-
 
 fn test_anchor_raw(target: &str, hash_byte: char) -> Box<serde_json::value::RawValue> {
     let hash: String = std::iter::repeat_n(hash_byte, 64).collect();
     serde_json::value::to_raw_value(&baleyg::model::DurableAnchor {
         syntax_id: target.into(),
-        document: baleyg::native_evidence::DocumentKey { source_set_id: "set".into(), language: "rust".into(), path: "src/lib.rs".into() },
-        captured_revision_id: "revision".into(), header_hash: hash.clone(), sibling_group_hash: hash,
-        sibling_count: 1, identical_header_count: 1,
-    }).unwrap()
+        document: baleyg::native_evidence::DocumentKey {
+            source_set_id: "set".into(),
+            language: "rust".into(),
+            path: "src/lib.rs".into(),
+        },
+        captured_revision_id: "revision".into(),
+        header_hash: hash.clone(),
+        sibling_group_hash: hash,
+        sibling_count: 1,
+        identical_header_count: 1,
+    })
+    .unwrap()
 }
 
 #[test]
 fn malformed_anchor_documents_fail_before_persistence() {
-    use baleyg::{model::{Annotation, AnnotationRecord}, store::topology::DurableRecords};
+    use baleyg::{
+        model::{Annotation, AnnotationRecord},
+        store::topology::DurableRecords,
+    };
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let records = DurableRecords::new(&roots, &identity);
     for (language, path) in [
-        ("typescript", "src/lib.rs"), ("rust", "/src/lib.rs"), ("rust", "src\\lib.rs"),
-        ("rust", "src//lib.rs"), ("rust", "src/./lib.rs"), ("rust", "src/../lib.rs"),
+        ("typescript", "src/lib.rs"),
+        ("rust", "/src/lib.rs"),
+        ("rust", "src\\lib.rs"),
+        ("rust", "src//lib.rs"),
+        ("rust", "src/./lib.rs"),
+        ("rust", "src/../lib.rs"),
     ] {
-        let mut value: serde_json::Value = serde_json::from_str(test_anchor_raw("sid:v1:0123456789abcdef0123456789abcdef", 'a').get()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(
+            test_anchor_raw("sid:v1:0123456789abcdef0123456789abcdef", 'a').get(),
+        )
+        .unwrap();
         value["document"]["language"] = language.into();
         value["document"]["path"] = path.into();
         let raw = serde_json::value::to_raw_value(&value).unwrap();
-        let record = AnnotationRecord::from_base(Annotation { id: "bad".into(), node_id: "node".into(), body: "body".into() }, None, Some(raw));
-        assert!(records.put_annotation_record(&record, false).is_err(), "accepted {language}:{path}");
+        let record = AnnotationRecord::from_base(
+            Annotation {
+                id: "bad".into(),
+                node_id: "node".into(),
+                body: "body".into(),
+            },
+            None,
+            Some(raw),
+        );
+        assert!(
+            records.put_annotation_record(&record, false).is_err(),
+            "accepted {language}:{path}"
+        );
     }
     assert!(!roots.record_db(&identity).exists());
 }
 
 #[test]
 fn view_anchor_raw_bytes_survive_edits() {
-    use baleyg::{model::{SavedView, SavedViewRecord, ViewQuery}, store::topology::DurableRecords};
+    use baleyg::{
+        model::{SavedView, SavedViewRecord, ViewQuery},
+        store::topology::DurableRecords,
+    };
     use std::collections::BTreeMap;
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let target = "sid:v1:0123456789abcdef0123456789abcdef";
     let records = DurableRecords::new(&roots, &identity);
-    let view = SavedView { id: "view".into(), title: "First".into(), query: ViewQuery { seed: target.into(), depth: 1, max_nodes: 40, max_calls: 200, include_callbacks: false, exclude_paths: vec![] }, pins: BTreeMap::new(), hidden: vec![] };
-    records.put_view_record(&SavedViewRecord::from_base(view.clone(), Some(test_anchor_raw(target, 'a')))).unwrap();
-    let before = records.view_record("view").unwrap().unwrap().anchor.unwrap().get().to_owned();
+    let view = SavedView {
+        id: "view".into(),
+        title: "First".into(),
+        query: ViewQuery {
+            seed: target.into(),
+            depth: 1,
+            max_nodes: 40,
+            max_calls: 200,
+            include_callbacks: false,
+            exclude_paths: vec![],
+        },
+        pins: BTreeMap::new(),
+        hidden: vec![],
+    };
+    records
+        .put_view_record(&SavedViewRecord::from_base(
+            view.clone(),
+            Some(test_anchor_raw(target, 'a')),
+        ))
+        .unwrap();
+    let before = records
+        .view_record("view")
+        .unwrap()
+        .unwrap()
+        .anchor
+        .unwrap()
+        .get()
+        .to_owned();
     let mut edited = view;
     edited.title = "Edited".into();
     records.put_view(&edited).unwrap();
@@ -2181,8 +2270,15 @@ fn view_anchor_raw_bytes_survive_edits() {
 
 #[test]
 fn saved_anchor_atomic_first_save_and_delete_edit_races() {
-    use baleyg::{model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery}, store::topology::DurableRecords};
-    use std::{collections::BTreeMap, sync::{Arc, Barrier}, thread};
+    use baleyg::{
+        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
+        store::topology::DurableRecords,
+    };
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Barrier},
+        thread,
+    };
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let target = "sid:v1:0123456789abcdef0123456789abcdef";
@@ -2195,14 +2291,34 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         workers.push(thread::spawn(move || {
             let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
             let records = DurableRecords::new(&roots, &identity);
-            let view = SavedView { id: "view-race".into(), title: format!("{hash}"), query: ViewQuery { seed: target.into(), depth: 1, max_nodes: 40, max_calls: 200, include_callbacks: false, exclude_paths: vec![] }, pins: BTreeMap::new(), hidden: vec![] };
+            let view = SavedView {
+                id: "view-race".into(),
+                title: format!("{hash}"),
+                query: ViewQuery {
+                    seed: target.into(),
+                    depth: 1,
+                    max_nodes: 40,
+                    max_calls: 200,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                pins: BTreeMap::new(),
+                hidden: vec![],
+            };
             barrier.wait();
-            records.update_view_record(&SavedViewRecord::from_base(view, None), || Ok(test_anchor_raw(target, hash))).unwrap()
+            records
+                .update_view_record(&SavedViewRecord::from_base(view, None), || {
+                    Ok(test_anchor_raw(target, hash))
+                })
+                .unwrap()
         }));
     }
     let first = workers.remove(0).join().unwrap();
     let second = workers.remove(0).join().unwrap();
-    assert_eq!(first.anchor.as_ref().unwrap().get(), second.anchor.as_ref().unwrap().get());
+    assert_eq!(
+        first.anchor.as_ref().unwrap().get(),
+        second.anchor.as_ref().unwrap().get()
+    );
 
     let barrier = Arc::new(Barrier::new(2));
     let mut workers = vec![];
@@ -2213,19 +2329,35 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         workers.push(thread::spawn(move || {
             let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
             let records = DurableRecords::new(&roots, &identity);
-            let note = AnnotationRecord::from_base(Annotation { id: "note-race".into(), node_id: target.into(), body: format!("{hash}") }, None, None);
+            let note = AnnotationRecord::from_base(
+                Annotation {
+                    id: "note-race".into(),
+                    node_id: target.into(),
+                    body: format!("{hash}"),
+                },
+                None,
+                None,
+            );
             barrier.wait();
-            records.update_annotation_record(&note, false, || Ok(test_anchor_raw(target, hash))).unwrap()
+            records
+                .update_annotation_record(&note, false, || Ok(test_anchor_raw(target, hash)))
+                .unwrap()
         }));
     }
     let first = workers.remove(0).join().unwrap();
     let second = workers.remove(0).join().unwrap();
-    assert_eq!(first.anchor.as_ref().unwrap().get(), second.anchor.as_ref().unwrap().get());
+    assert_eq!(
+        first.anchor.as_ref().unwrap().get(),
+        second.anchor.as_ref().unwrap().get()
+    );
 
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let records = DurableRecords::new(&roots, &identity);
     let seeded = records.view_record("view-race").unwrap().unwrap();
-    let edit = SavedViewRecord { title: "edit".into(), ..seeded.clone() };
+    let edit = SavedViewRecord {
+        title: "edit".into(),
+        ..seeded.clone()
+    };
     let barrier = Arc::new(Barrier::new(2));
     let delete_roots = roots.clone();
     let delete_work = work.clone();
@@ -2233,16 +2365,25 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     let deleter = thread::spawn(move || {
         let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
         delete_barrier.wait();
-        DurableRecords::new(&delete_roots, &identity).delete_view("view-race").unwrap()
+        DurableRecords::new(&delete_roots, &identity)
+            .delete_view("view-race")
+            .unwrap()
     });
     barrier.wait();
-    let response = records.update_view_record(&edit, || Ok(test_anchor_raw(target, 'e'))).unwrap();
+    let response = records
+        .update_view_record(&edit, || Ok(test_anchor_raw(target, 'e')))
+        .unwrap();
     deleter.join().unwrap();
     assert!(response.anchor.is_some());
-    if let Some(final_record) = records.view_record("view-race").unwrap() { assert!(final_record.anchor.is_some()); }
+    if let Some(final_record) = records.view_record("view-race").unwrap() {
+        assert!(final_record.anchor.is_some());
+    }
 
     let seeded = records.annotation_record("note-race").unwrap().unwrap();
-    let edit = AnnotationRecord { body: "edit".into(), ..seeded.clone() };
+    let edit = AnnotationRecord {
+        body: "edit".into(),
+        ..seeded.clone()
+    };
     let barrier = Arc::new(Barrier::new(2));
     let delete_roots = roots.clone();
     let delete_work = work.clone();
@@ -2250,11 +2391,17 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     let deleter = thread::spawn(move || {
         let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
         delete_barrier.wait();
-        DurableRecords::new(&delete_roots, &identity).delete_annotation("note-race").unwrap()
+        DurableRecords::new(&delete_roots, &identity)
+            .delete_annotation("note-race")
+            .unwrap()
     });
     barrier.wait();
-    let response = records.update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f'))).unwrap();
+    let response = records
+        .update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f')))
+        .unwrap();
     deleter.join().unwrap();
     assert!(response.anchor.is_some());
-    if let Some(final_record) = records.annotation_record("note-race").unwrap() { assert!(final_record.anchor.is_some()); }
+    if let Some(final_record) = records.annotation_record("note-race").unwrap() {
+        assert!(final_record.anchor.is_some());
+    }
 }

@@ -933,14 +933,7 @@ impl<'a> DurableRecords<'a> {
             // Another process may have completed creation before the lock was acquired.
             if self.roots.record_dir(self.identity).exists() {
                 drop(guard);
-                return self.save_existing(
-                    table,
-                    id,
-                    node,
-                    &payload,
-                    preserve_title,
-                    &mut capture,
-                );
+                return self.save_existing(table, id, node, &payload, preserve_title, &mut capture);
             }
             make_private(&self.roots.record_dir(self.identity))?;
             let path = self.roots.record_db(self.identity);
@@ -962,13 +955,7 @@ impl<'a> DurableRecords<'a> {
                 "INSERT INTO record_metadata VALUES(1,1,?1,1)",
                 [&self.identity.record_id],
             )?;
-            let payload = Self::merge_item(
-                &tx,
-                table,
-                &payload,
-                preserve_title,
-                &mut capture,
-            )?;
+            let payload = Self::merge_item(&tx, table, &payload, preserve_title, &mut capture)?;
             Self::write_item(&tx, table, id, node, &payload)?;
             self.write_root(&tx)?;
             self.identity.verify()?;
@@ -1110,10 +1097,18 @@ impl<'a> DurableRecords<'a> {
         self.list("SELECT payload FROM annotations ORDER BY id")
     }
     pub fn views(&self) -> Result<Vec<crate::model::SavedView>> {
-        Ok(self.view_records()?.into_iter().map(|record| record.base()).collect())
+        Ok(self
+            .view_records()?
+            .into_iter()
+            .map(|record| record.base())
+            .collect())
     }
     pub fn annotations(&self) -> Result<Vec<crate::model::Annotation>> {
-        Ok(self.annotation_records()?.into_iter().map(|record| record.base()).collect())
+        Ok(self
+            .annotation_records()?
+            .into_iter()
+            .map(|record| record.base())
+            .collect())
     }
     pub fn view_record(&self, id: &str) -> Result<Option<crate::model::SavedViewRecord>> {
         Ok(self.view_records()?.into_iter().find(|v| v.id == id))
@@ -1129,7 +1124,14 @@ impl<'a> DurableRecords<'a> {
     }
     pub fn put_view_record(&self, record: &crate::model::SavedViewRecord) -> Result<()> {
         record.validate()?;
-        self.save("views", &record.id, None, serde_json::to_string(record)?, false).map(|_| ())
+        self.save(
+            "views",
+            &record.id,
+            None,
+            serde_json::to_string(record)?,
+            false,
+        )
+        .map(|_| ())
     }
     pub fn update_view_record(
         &self,
@@ -1138,18 +1140,37 @@ impl<'a> DurableRecords<'a> {
     ) -> Result<crate::model::SavedViewRecord> {
         record.validate()?;
         let payload = self.save_with_first_save_hook(
-            "views", &record.id, None, serde_json::to_string(record)?, false,
-            |_| capture().map(Some), |_| Ok(()),
+            "views",
+            &record.id,
+            None,
+            serde_json::to_string(record)?,
+            false,
+            |_| capture().map(Some),
+            |_| Ok(()),
         )?;
         Ok(serde_json::from_str(&payload)?)
     }
     pub fn put_view(&self, view: &crate::model::SavedView) -> Result<()> {
         view.validate()?;
-        self.put_view_record(&crate::model::SavedViewRecord::from_base(view.clone(), None))
+        self.put_view_record(&crate::model::SavedViewRecord::from_base(
+            view.clone(),
+            None,
+        ))
     }
-    pub fn put_annotation_record(&self, record: &crate::model::AnnotationRecord, preserve_title: bool) -> Result<()> {
+    pub fn put_annotation_record(
+        &self,
+        record: &crate::model::AnnotationRecord,
+        preserve_title: bool,
+    ) -> Result<()> {
         record.validate()?;
-        self.save("annotations", &record.id, Some(&record.node_id), serde_json::to_string(record)?, preserve_title).map(|_| ())
+        self.save(
+            "annotations",
+            &record.id,
+            Some(&record.node_id),
+            serde_json::to_string(record)?,
+            preserve_title,
+        )
+        .map(|_| ())
     }
     pub fn update_annotation_record(
         &self,
@@ -1159,8 +1180,13 @@ impl<'a> DurableRecords<'a> {
     ) -> Result<crate::model::AnnotationRecord> {
         record.validate()?;
         let payload = self.save_with_first_save_hook(
-            "annotations", &record.id, Some(&record.node_id), serde_json::to_string(record)?, preserve_title,
-            |_| capture().map(Some), |_| Ok(()),
+            "annotations",
+            &record.id,
+            Some(&record.node_id),
+            serde_json::to_string(record)?,
+            preserve_title,
+            |_| capture().map(Some),
+            |_| Ok(()),
         )?;
         Ok(serde_json::from_str(&payload)?)
     }
