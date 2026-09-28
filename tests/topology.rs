@@ -2282,126 +2282,145 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let target = "sid:v1:0123456789abcdef0123456789abcdef";
+    let make_view = |title: char| SavedViewRecord::from_base(SavedView {
+        id: "view-race".into(), title: title.to_string(),
+        query: ViewQuery { seed: target.into(), depth: 1, max_nodes: 40, max_calls: 200, include_callbacks: false, exclude_paths: vec![] },
+        pins: BTreeMap::new(), hidden: vec![],
+    }, None);
+
+    // Whole-record creation intentionally uses a nonblocking exclusive use lock.
+    // One contender wins; retry the typed busy loser only after the winner released it.
     let barrier = Arc::new(Barrier::new(2));
     let mut workers = vec![];
     for hash in ['a', 'b'] {
         let roots = roots.clone();
         let work = work.clone();
         let barrier = barrier.clone();
+        let record = make_view(hash);
         workers.push(thread::spawn(move || {
             let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-            let records = DurableRecords::new(&roots, &identity);
-            let view = SavedView {
-                id: "view-race".into(),
-                title: format!("{hash}"),
-                query: ViewQuery {
-                    seed: target.into(),
-                    depth: 1,
-                    max_nodes: 40,
-                    max_calls: 200,
-                    include_callbacks: false,
-                    exclude_paths: vec![],
-                },
-                pins: BTreeMap::new(),
-                hidden: vec![],
-            };
             barrier.wait();
-            records
-                .update_view_record(&SavedViewRecord::from_base(view, None), || {
-                    Ok(test_anchor_raw(target, hash))
-                })
-                .unwrap()
+            let result = DurableRecords::new(&roots, &identity)
+                .update_view_record(&record, || Ok(test_anchor_raw(target, hash)));
+            (hash, result)
         }));
     }
-    let first = workers.remove(0).join().unwrap();
-    let second = workers.remove(0).join().unwrap();
-    assert_eq!(
-        first.anchor.as_ref().unwrap().get(),
-        second.anchor.as_ref().unwrap().get()
-    );
+    let outcomes: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+    let winner = outcomes.iter().find_map(|(_, result)| result.as_ref().ok()).expect("one creator must win");
+    let winner_raw = winner.anchor.as_ref().unwrap().get().to_owned();
+    let losers: Vec<_> = outcomes.iter().filter(|(_, result)| result.is_err()).collect();
+    assert!(losers.len() <= 1, "only the nonblocking creator may lose");
+    for (_, result) in outcomes.iter().filter(|(_, result)| result.is_ok()) {
+        assert_eq!(result.as_ref().unwrap().anchor.as_ref().unwrap().get(), winner_raw);
+    }
+    if let Some((loser_hash, loser)) = losers.first() {
+        assert!(loser.as_ref().unwrap_err().to_string().contains("storage_busy"));
+        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        let retried = DurableRecords::new(&roots, &identity)
+            .update_view_record(&make_view(**loser_hash), || Ok(test_anchor_raw(target, **loser_hash)))
+            .unwrap();
+        assert_eq!(retried.anchor.as_ref().unwrap().get(), winner_raw);
+    }
 
+    // Once the durable DB exists, same-ID note contenders either serialize in SQLite
+    // or report typed busy. Retry any loser after both contenders have completed.
+    let make_note = |body: char| AnnotationRecord::from_base(Annotation {
+        id: "note-race".into(), node_id: target.into(), body: body.to_string(),
+    }, None, None);
     let barrier = Arc::new(Barrier::new(2));
     let mut workers = vec![];
     for hash in ['c', 'd'] {
         let roots = roots.clone();
         let work = work.clone();
         let barrier = barrier.clone();
+        let record = make_note(hash);
         workers.push(thread::spawn(move || {
             let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-            let records = DurableRecords::new(&roots, &identity);
-            let note = AnnotationRecord::from_base(
-                Annotation {
-                    id: "note-race".into(),
-                    node_id: target.into(),
-                    body: format!("{hash}"),
-                },
-                None,
-                None,
-            );
             barrier.wait();
-            records
-                .update_annotation_record(&note, false, || Ok(test_anchor_raw(target, hash)))
-                .unwrap()
+            let result = DurableRecords::new(&roots, &identity)
+                .update_annotation_record(&record, false, || Ok(test_anchor_raw(target, hash)));
+            (hash, result)
         }));
     }
-    let first = workers.remove(0).join().unwrap();
-    let second = workers.remove(0).join().unwrap();
-    assert_eq!(
-        first.anchor.as_ref().unwrap().get(),
-        second.anchor.as_ref().unwrap().get()
-    );
+    let outcomes: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+    let winner = outcomes.iter().find_map(|(_, result)| result.as_ref().ok()).expect("one note writer must win");
+    let note_winner_raw = winner.anchor.as_ref().unwrap().get().to_owned();
+    for (hash, result) in outcomes {
+        match result {
+            Ok(record) => assert_eq!(record.anchor.unwrap().get(), note_winner_raw),
+            Err(error) => {
+                assert!(error.to_string().contains("storage_busy"));
+                let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+                let retried = DurableRecords::new(&roots, &identity)
+                    .update_annotation_record(&make_note(hash), false, || Ok(test_anchor_raw(target, hash)))
+                    .unwrap();
+                assert_eq!(retried.anchor.unwrap().get(), note_winner_raw);
+            }
+        }
+    }
 
+    // Delete/edit contention may expose the same documented typed busy result.
+    // Complete the loser only after the winner releases the transaction and prove
+    // that every successful edit response carries a real immutable anchor.
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let records = DurableRecords::new(&roots, &identity);
-    let seeded = records.view_record("view-race").unwrap().unwrap();
-    let edit = SavedViewRecord {
-        title: "edit".into(),
-        ..seeded.clone()
-    };
+    let edit = SavedViewRecord { title: "edit".into(), ..records.view_record("view-race").unwrap().unwrap() };
     let barrier = Arc::new(Barrier::new(2));
-    let delete_roots = roots.clone();
-    let delete_work = work.clone();
-    let delete_barrier = barrier.clone();
+    let edit_roots = roots.clone(); let edit_work = work.clone(); let edit_barrier = barrier.clone(); let edit_copy = edit.clone();
+    let editor = thread::spawn(move || {
+        let identity = WorkspaceIdentity::discover(Some(&edit_work), &edit_work).unwrap();
+        edit_barrier.wait();
+        DurableRecords::new(&edit_roots, &identity).update_view_record(&edit_copy, || Ok(test_anchor_raw(target, 'e')))
+    });
+    let delete_roots = roots.clone(); let delete_work = work.clone(); let delete_barrier = barrier.clone();
     let deleter = thread::spawn(move || {
         let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
         delete_barrier.wait();
-        DurableRecords::new(&delete_roots, &identity)
-            .delete_view("view-race")
-            .unwrap()
+        DurableRecords::new(&delete_roots, &identity).delete_view("view-race")
     });
-    barrier.wait();
-    let response = records
-        .update_view_record(&edit, || Ok(test_anchor_raw(target, 'e')))
-        .unwrap();
-    deleter.join().unwrap();
-    assert!(response.anchor.is_some());
-    if let Some(final_record) = records.view_record("view-race").unwrap() {
-        assert!(final_record.anchor.is_some());
+    let edit_result = editor.join().unwrap();
+    let delete_result = deleter.join().unwrap();
+    let edit_response = match edit_result {
+        Ok(record) => record,
+        Err(error) => {
+            assert!(error.to_string().contains("storage_busy"));
+            records.update_view_record(&edit, || Ok(test_anchor_raw(target, 'e'))).unwrap()
+        }
+    };
+    assert!(edit_response.anchor.is_some());
+    if let Err(error) = delete_result {
+        assert!(error.to_string().contains("storage_busy"));
+        records.delete_view("view-race").unwrap();
     }
+    if let Some(final_record) = records.view_record("view-race").unwrap() { assert!(final_record.anchor.is_some()); }
 
-    let seeded = records.annotation_record("note-race").unwrap().unwrap();
-    let edit = AnnotationRecord {
-        body: "edit".into(),
-        ..seeded.clone()
-    };
+    let edit = AnnotationRecord { body: "edit".into(), ..records.annotation_record("note-race").unwrap().unwrap() };
     let barrier = Arc::new(Barrier::new(2));
-    let delete_roots = roots.clone();
-    let delete_work = work.clone();
-    let delete_barrier = barrier.clone();
+    let edit_roots = roots.clone(); let edit_work = work.clone(); let edit_barrier = barrier.clone(); let edit_copy = edit.clone();
+    let editor = thread::spawn(move || {
+        let identity = WorkspaceIdentity::discover(Some(&edit_work), &edit_work).unwrap();
+        edit_barrier.wait();
+        DurableRecords::new(&edit_roots, &identity).update_annotation_record(&edit_copy, false, || Ok(test_anchor_raw(target, 'f')))
+    });
+    let delete_roots = roots.clone(); let delete_work = work.clone(); let delete_barrier = barrier.clone();
     let deleter = thread::spawn(move || {
         let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
         delete_barrier.wait();
-        DurableRecords::new(&delete_roots, &identity)
-            .delete_annotation("note-race")
-            .unwrap()
+        DurableRecords::new(&delete_roots, &identity).delete_annotation("note-race")
     });
-    barrier.wait();
-    let response = records
-        .update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f')))
-        .unwrap();
-    deleter.join().unwrap();
-    assert!(response.anchor.is_some());
-    if let Some(final_record) = records.annotation_record("note-race").unwrap() {
-        assert!(final_record.anchor.is_some());
+    let edit_result = editor.join().unwrap();
+    let delete_result = deleter.join().unwrap();
+    let edit_response = match edit_result {
+        Ok(record) => record,
+        Err(error) => {
+            assert!(error.to_string().contains("storage_busy"));
+            records.update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f'))).unwrap()
+        }
+    };
+    assert!(edit_response.anchor.is_some());
+    if let Err(error) = delete_result {
+        assert!(error.to_string().contains("storage_busy"));
+        records.delete_annotation("note-race").unwrap();
     }
+    if let Some(final_record) = records.annotation_record("note-race").unwrap() { assert!(final_record.anchor.is_some()); }
 }
