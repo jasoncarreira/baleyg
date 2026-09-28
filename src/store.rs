@@ -3453,8 +3453,9 @@ mod rebaseline_fault_tests {
         );
         // The private seam skips the public publish_native wrapper: retain each
         // wrapper admission check on this genuine immutable captured bundle.
+        let canonical_work = fs::canonicalize(work.path()).unwrap();
         next_native
-            .validate(&next_capture, work.path(), store.root_id())
+            .validate(&next_capture, &canonical_work, store.root_id())
             .unwrap();
         assert!(
             next_capture.graph_projection_count() == 1,
