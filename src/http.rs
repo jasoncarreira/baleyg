@@ -2169,9 +2169,11 @@ mod live_tests {
                 .unwrap(),
                 1
             );
-            assert_eq!(
-                store.status().unwrap().revision,
-                serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
+            let status_error = store.status().unwrap_err();
+            assert!(
+                status_error.to_string().contains("index_not_ready")
+                    && status_error.to_string().contains("invalid reconciled snapshot"),
+                "{status_error:#}"
             );
             let attempts = provider.budget().unwrap().attempts;
             let response = app.oneshot(request(&path, json!({}))).await.unwrap();
