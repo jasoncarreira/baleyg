@@ -41,9 +41,18 @@ pub fn assert_topology_fixture(
     let cache = state.join("cache");
     let indexes = cache.join("indexes");
     let root = workspace.canonicalize().unwrap();
-    assert_eq!(
-        store.status().unwrap().workspace_root,
-        root.to_str().unwrap()
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(workspace), workspace).unwrap();
+    assert_eq!(identity.root, root);
+    store.verify_root().unwrap();
+    let baseline = store.index_baseline().unwrap();
+    assert_eq!(baseline.index_revision, 0);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
     );
     let entries: Vec<_> = fs::read_dir(&indexes)
         .unwrap()

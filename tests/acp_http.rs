@@ -46,17 +46,18 @@ impl Fixture {
             .id
             .clone();
         let store = crate::common::open_store(&dir.path().join("index"), &workspace).unwrap();
-        store
-            .publish(
-                &graph,
-                &store.leader().unwrap(),
-                baleyg::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 0,
-                },
-                &cancel,
-            )
-            .unwrap();
+        publish_bundle(
+            &store,
+            &graph,
+            &workspace,
+            &store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: store.index_baseline().unwrap().index_generation,
+                index_revision: 0,
+            },
+            &cancel,
+        )
+        .unwrap();
         let runner = dir.path().join("runner");
         let gate = if gated {
             for name in ["entered", "release"] {
@@ -134,17 +135,18 @@ impl Fixture {
         std::fs::write(self.dir.path().join("response.json"), value.to_string()).unwrap();
     }
     fn advance(&self) {
-        self.store
-            .publish(
-                &self.graph,
-                &self.store.leader().unwrap(),
-                baleyg::model::IndexPin {
-                    index_generation: self.store.status().unwrap().revision.index_generation,
-                    index_revision: 1,
-                },
-                &Arc::new(AtomicBool::new(false)),
-            )
-            .unwrap();
+        publish_bundle(
+            &self.store,
+            &self.graph,
+            &self.dir.path().join("workspace"),
+            &self.store.leader().unwrap(),
+            baleyg::model::IndexPin {
+                index_generation: self.store.status().unwrap().revision.index_generation,
+                index_revision: 1,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
     }
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (u16, Value) {
@@ -402,4 +404,25 @@ async fn controlled_process_diagnostics_are_actionable_but_never_echo_output() {
         );
         assert_eq!(f.provider.as_ref().unwrap().status().unwrap().attempts, 1);
     }
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

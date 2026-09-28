@@ -1003,14 +1003,15 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
     }
     let state = tempfile::tempdir().unwrap();
     let store = baleyg::store::Store::open_for_tests(state.path(), d.path()).unwrap();
-    let pin = store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel(),
-        )
-        .unwrap();
+    let pin = publish_bundle(
+        &store,
+        &graph,
+        d.path(),
+        &store.leader().unwrap(),
+        store.index_baseline().unwrap(),
+        &cancel(),
+    )
+    .unwrap();
     let saved = store.graph().unwrap();
     assert_eq!(saved.nodes, graph.nodes);
     assert_eq!(saved.calls, graph.calls);
@@ -1086,4 +1087,25 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
         }
         assert_eq!(store.source(path).unwrap().unwrap().text, text);
     }
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

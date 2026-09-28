@@ -1219,7 +1219,7 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(matches!(version, 4 | 5), "incompatible index schema");
+    ensure!(matches!(version, 4..=6), "incompatible index schema");
     // GC may classify only the two exact cache formats this binary knows.
     // The same structural and extractor-marker check applies before it can
     // declare an index eligible for deletion or report it as recently opened.
@@ -1231,7 +1231,8 @@ fn inspect_index_with_open_hook(
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
     ensure!(
         ((version == 4 && schema == 4 && extractor == "native-v1")
-            || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1"))
+            || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1")
+            || (version == 6 && schema == 6 && extractor == "native-paired-v1"))
             && Path::new(&spelling).is_absolute()
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"
@@ -1526,10 +1527,18 @@ impl TopologyRoots {
 
 #[cfg(test)]
 pub fn assert_topology_fixture(store: &crate::store::Store, state: &Path) {
-    let status = store.status().unwrap();
+    let baseline = store.index_baseline().unwrap();
+    assert_eq!(baseline.index_revision, 0);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     let identity = WorkspaceIdentity::discover(
-        Some(Path::new(&status.workspace_root)),
-        Path::new(&status.workspace_root),
+        Some(Path::new(&store.workspace_root)),
+        Path::new(&store.workspace_root),
     )
     .unwrap();
     let roots = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
@@ -1575,7 +1584,7 @@ mod gc_schema_race_tests {
             state.path().join("data"),
         );
         let store = crate::store::Store::open_for_tests(state.path(), work.path()).unwrap();
-        let pin = store.status().unwrap().revision;
+        let pin = store.index_baseline().unwrap();
         let path = roots.index_db(&identity);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

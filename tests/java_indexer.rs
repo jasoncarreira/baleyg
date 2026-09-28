@@ -1,6 +1,6 @@
 mod common;
 use baleyg::{
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::*,
 };
 use std::{
@@ -134,11 +134,21 @@ fn shared_start_call_ids_are_unique_and_publishable() {
     }));
     let state = tempfile::tempdir().unwrap();
     let store = crate::common::open_store(&state.path().join("state"), dir.path()).unwrap();
+    let (bundle_graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(dir.path().to_owned()),
+        store.root_id(),
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(graph, bundle_graph);
     store
-        .publish(
-            &graph,
+        .publish_native(
+            &bundle_graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            store.status().unwrap().revision,
+            store.index_baseline().unwrap(),
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();

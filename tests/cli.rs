@@ -38,11 +38,8 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
         );
     }
     let output = cmd.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("index_not_ready"));
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.odin.baleyg"
     } else {
@@ -274,14 +271,18 @@ fn fixed_locations_and_removed_flag() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let status = command(&root, &home, "status").output().unwrap();
+    let unready = command(&root, &home, "status").output().unwrap();
+    assert!(!unready.status.success());
+    assert!(String::from_utf8_lossy(&unready.stderr).contains("index_not_ready"));
+    let status = command(&root, &home, "index").output().unwrap();
     assert!(
         status.status.success(),
         "{}",
         String::from_utf8_lossy(&status.stderr)
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(first["revision"]["indexRevision"], 0);
+    let first = &first["status"];
+    assert_eq!(first["revision"]["indexRevision"], 1);
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -319,8 +320,8 @@ fn index_forwards_pair_and_reports_pair() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let before: Value =
-        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    let unready = command(&root, &home, "status").output().unwrap();
+    assert!(!unready.status.success());
     let result = command(&root, &home, "index").output().unwrap();
     assert!(
         result.status.success(),
@@ -333,8 +334,8 @@ fn index_forwards_pair_and_reports_pair() {
         published["publishedRevision"]
     );
     assert_eq!(
-        published["publishedRevision"]["indexGeneration"],
-        before["revision"]["indexGeneration"]
+        published["status"]["evidenceFormat"],
+        "terminal-native-graph-v1"
     );
     assert_eq!(published["publishedRevision"]["indexRevision"], 1);
 }
@@ -503,7 +504,7 @@ fn gc_report_without_workspace_does_not_create_state() {
     let root = temp.path().join("work");
     fs::create_dir(&root).unwrap();
     assert!(
-        command(&root, &home, "status")
+        command(&root, &home, "index")
             .output()
             .unwrap()
             .status
@@ -535,7 +536,7 @@ fn gc_cli_reports_multiple_indexes_in_sorted_order() {
         .collect::<Vec<_>>();
     workspaces.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, root) in &workspaces {
-        let status = command(root, &home, "status").output().unwrap();
+        let status = command(root, &home, "index").output().unwrap();
         assert!(
             status.status.success(),
             "{}",
@@ -706,6 +707,20 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         .join("index.db");
     {
         let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "foreign_keys", false).unwrap();
+        let native_tables = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in native_tables {
+            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],

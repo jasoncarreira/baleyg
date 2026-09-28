@@ -207,15 +207,37 @@ fn chained_calls_have_unique_range_ids_and_publish() {
     }));
     let state = tempfile::tempdir().unwrap();
     let store = crate::common::open_store(&state.path().join("state"), d.path()).unwrap();
-    store
-        .publish(
-            &graph,
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+    publish_bundle(
+        &store,
+        &graph,
+        d.path(),
+        &store.leader().unwrap(),
+        baleyg::model::IndexPin {
+            index_generation: store.index_baseline().unwrap().index_generation,
+            index_revision: 0,
+        },
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+}
+
+fn publish_bundle(
+    store: &baleyg::store::Store,
+    graph: &baleyg::model::Graph,
+    workspace: &std::path::Path,
+    leader: &baleyg::store::topology::LeaderGuard,
+    expected: baleyg::model::IndexPin,
+    cancel: &baleyg::model::CancelFlag,
+) -> anyhow::Result<baleyg::model::IndexPin> {
+    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        cancel,
+        |_| {},
+    )?;
+    assert_eq!(
+        &indexed, graph,
+        "published graph must match captured source"
+    );
+    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

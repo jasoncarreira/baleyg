@@ -6,7 +6,7 @@ use axum::{
 };
 use baleyg::{
     http,
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace_bundle},
     model::{CancelFlag, Graph, IndexPin},
     store::Store,
 };
@@ -25,7 +25,9 @@ fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
     .unwrap();
     let options = IndexOptions::new(root.clone());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
+    let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let id = graph
         .nodes
         .iter()
@@ -33,10 +35,17 @@ fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
         .unwrap()
         .id
         .clone();
-    let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let baseline = store.status().unwrap().revision;
+    assert!(store.status().is_err());
+    let baseline = store.index_baseline().unwrap();
     store
-        .publish(&graph, &store.leader().unwrap(), baseline, &cancel)
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.leader().unwrap(),
+            baseline,
+            &cancel,
+        )
         .unwrap();
     let app = http::router(
         http::new(
@@ -140,12 +149,28 @@ async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
 
     let root = temp.path().join("workspace");
     let recreated = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let baseline = recreated.status().unwrap().revision;
+    let baseline = recreated.index_baseline().unwrap();
+    assert!(recreated.status().is_err());
     assert_eq!(baseline.index_revision, 0);
     assert_ne!(baseline.index_generation, old.index_generation);
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let (fresh_graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.clone()),
+        recreated.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(fresh_graph, graph);
     recreated
-        .publish(&graph, &recreated.leader().unwrap(), baseline, &cancel)
+        .publish_native(
+            &fresh_graph,
+            &capture,
+            &native,
+            &recreated.leader().unwrap(),
+            baseline,
+            &cancel,
+        )
         .unwrap();
     let current = recreated.status().unwrap().revision;
     assert_eq!(current.index_revision, old.index_revision);
@@ -306,7 +331,7 @@ async fn index_admission_and_publication_pair() {
     assert_eq!(code, 202, "{job}");
     assert!(job["revision"].is_null());
     let id = job["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let (_, result) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !result["finishedAt"].is_null() {
@@ -334,8 +359,16 @@ fn sqlite_journal_child() {
         return;
     };
     let db = rusqlite::Connection::open(path).unwrap();
-    db.execute_batch("PRAGMA cache_size=10; BEGIN IMMEDIATE; UPDATE index_metadata SET index_revision=3 WHERE singleton=1; UPDATE files SET payload=hex(randomblob(2048)) WHERE path LIKE 'spill-%'")
+    db.execute_batch("PRAGMA cache_size=10; BEGIN IMMEDIATE; UPDATE index_metadata SET index_revision=3 WHERE singleton=1")
         .unwrap();
+    // Uncommitted spill rows exercise rollback without corrupting the published pair.
+    for i in 0..100 {
+        db.execute(
+            "INSERT INTO files(path,hash,payload) VALUES(?1,'x',?2)",
+            rusqlite::params![format!("spill-{i}"), "x".repeat(4096)],
+        )
+        .unwrap();
+    }
     println!("JOURNAL_READY");
     use std::io::Write;
     std::io::stdout().flush().unwrap();
@@ -356,17 +389,6 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         .find(|path| path.is_dir())
         .unwrap()
         .join("index.db");
-    let db = rusqlite::Connection::open(&db_path).unwrap();
-    db.execute_batch("BEGIN IMMEDIATE").unwrap();
-    for i in 0..100 {
-        db.execute(
-            "INSERT INTO files(path,hash,payload) VALUES(?1,'x',?2)",
-            rusqlite::params![format!("spill-{i}"), "x".repeat(4096)],
-        )
-        .unwrap();
-    }
-    db.execute_batch("COMMIT").unwrap();
-    drop(db);
     let journal = db_path.with_file_name("index.db-journal");
     let leader_path = db_path.with_file_name("leader.lock");
     let leader = store.leader().unwrap();

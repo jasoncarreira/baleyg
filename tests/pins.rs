@@ -1,6 +1,6 @@
 mod common;
 use baleyg::{
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::{CancelFlag, IndexPin, ViewQuery},
     store::Store,
 };
@@ -28,20 +28,37 @@ fn fixture() -> (tempfile::TempDir, Store, baleyg::model::Graph, String) {
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
     (temp, store, graph, id)
 }
-fn publish(store: &Store, graph: &baleyg::model::Graph, expected: IndexPin) -> IndexPin {
+fn publish(
+    store: &Store,
+    graph: &baleyg::model::Graph,
+    expected: IndexPin,
+    root: &std::path::Path,
+) -> IndexPin {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (bundle_graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(&bundle_graph, graph);
     store
-        .publish(
-            graph,
+        .publish_native(
+            &bundle_graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
             expected,
-            &Arc::new(AtomicBool::new(false)),
+            &cancel,
         )
         .unwrap()
 }
 #[test]
 fn pin_shape_and_status() {
-    let (_temp, store, graph, _id) = fixture();
-    let first = store.status().unwrap().revision;
+    let (temp, store, graph, _id) = fixture();
+    let first = store.index_baseline().unwrap();
+    assert!(store.status().is_err());
     assert_eq!(first.index_revision, 0);
     assert_eq!(first.index_generation.get_version_num(), 4);
     let wire = serde_json::to_value(first).unwrap();
@@ -69,16 +86,16 @@ fn pin_shape_and_status() {
             "{malformed}"
         );
     }
-    let next = publish(&store, &graph, first);
-    assert_eq!(next.index_generation, first.index_generation);
+    let next = publish(&store, &graph, first, &temp.path().join("workspace"));
+    assert_ne!(next.index_generation, first.index_generation); // First native publish rebaselines the legacy schema.
     assert_eq!(next.index_revision, 1);
     assert_eq!(store.status().unwrap().revision, next);
 }
 #[test]
 fn store_pinned_read_matrix() {
-    let (_temp, store, graph, id) = fixture();
-    let first = store.status().unwrap().revision;
-    let pin = publish(&store, &graph, first);
+    let (temp, store, graph, id) = fixture();
+    let first = store.index_baseline().unwrap();
+    let pin = publish(&store, &graph, first, &temp.path().join("workspace"));
     let stale = IndexPin {
         index_generation: pin.index_generation,
         index_revision: 0,
@@ -131,7 +148,12 @@ fn store_pinned_read_matrix() {
 #[test]
 fn current_store_producer_matrix() {
     let (temp, store, graph, id) = fixture();
-    let pin = publish(&store, &graph, store.status().unwrap().revision);
+    let pin = publish(
+        &store,
+        &graph,
+        store.index_baseline().unwrap(),
+        &temp.path().join("workspace"),
+    );
     assert_eq!(store.symbols_at("run", 10).unwrap().0, pin);
     let query: ViewQuery = serde_json::from_value(json!({"seed":id})).unwrap();
     assert_eq!(store.query_view(&query).unwrap().unwrap().revision, pin);
@@ -151,8 +173,8 @@ fn current_store_producer_matrix() {
 #[test]
 fn pair_recreation_cas() {
     let (temp, store, graph, _id) = fixture();
-    let first = store.status().unwrap().revision;
-    let old = publish(&store, &graph, first);
+    let first = store.index_baseline().unwrap();
+    let old = publish(&store, &graph, first, &temp.path().join("workspace"));
     let index_root = temp.path().join("state/cache/indexes");
     let dir = std::fs::read_dir(&index_root)
         .unwrap()
@@ -171,19 +193,31 @@ fn pair_recreation_cas() {
     std::fs::remove_file(use_lock).unwrap();
     let root = temp.path().join("workspace");
     let recreated = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let fresh = recreated.status().unwrap().revision;
+    let fresh = recreated.index_baseline().unwrap();
+    assert!(recreated.status().is_err());
     assert_eq!(fresh.index_revision, 0);
     assert_ne!(fresh.index_generation, old.index_generation);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (bundle_graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.clone()),
+        recreated.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(graph, bundle_graph);
     assert!(
         recreated
-            .publish(
-                &graph,
+            .publish_native(
+                &bundle_graph,
+                &capture,
+                &native,
                 &recreated.leader().unwrap(),
                 first,
-                &Arc::new(AtomicBool::new(false))
+                &cancel
             )
             .is_err()
     );
-    assert_eq!(publish(&recreated, &graph, fresh).index_revision, 1);
+    assert_eq!(publish(&recreated, &graph, fresh, &root).index_revision, 1);
     assert!(recreated.source_at("Types.java", Some(old)).is_err());
 }

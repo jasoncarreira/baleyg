@@ -1224,6 +1224,7 @@ async fn sequence(
     .map_err(|e| {
         if e.to_string().starts_with("revision conflict")
             || e.to_string().starts_with("index_not_ready")
+            || e.to_string().starts_with("incompatible_index")
         {
             e.into()
         } else {
@@ -1387,8 +1388,9 @@ async fn start_index(
         let worker_id = id.clone();
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let (graph, capture) = crate::indexer::index_workspace_with_capture(
+            let (graph, native, capture) = crate::indexer::index_workspace_bundle(
                 &worker.options,
+                worker.store.root_id(),
                 &worker_cancel,
                 |p| {
                     if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
@@ -1396,9 +1398,14 @@ async fn start_index(
                     }
                 },
             )?;
-            worker
-                .store
-                .publish_captured(&graph, &capture, &leader, baseline, &worker_cancel)
+            worker.store.publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                baseline,
+                &worker_cancel,
+            )
         })
         .await;
         let outcome = match result {
@@ -1638,7 +1645,10 @@ async fn delete_annotation(
 // These endpoints only transform locally indexed evidence. They never contact a provider.
 fn question_error(e: anyhow::Error) -> ApiError {
     let message = e.to_string();
-    if message.starts_with("revision conflict") || message.starts_with("index_not_ready") {
+    if message.starts_with("revision conflict")
+        || message.starts_with("index_not_ready")
+        || message.starts_with("incompatible_index")
+    {
         e.into()
     } else if message == "question seed not found" {
         missing()
@@ -1727,6 +1737,14 @@ async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPa
             "The index revision changed",
         ));
     }
+    // A packet hash authenticates only the in-memory copy. Recheck its exact
+    // selected graph and source witnesses under one pinned SQLite snapshot
+    // before exporting, displaying, or sending cached evidence to a provider.
+    let witness = packet.clone();
+    db(s, move |store| {
+        store.validate_selected_view(&witness.context, &witness.source_files)
+    })
+    .await?;
     Ok(packet)
 }
 async fn question_export(
@@ -1947,7 +1965,7 @@ async fn question_run(
 #[cfg(test)]
 mod live_tests {
     use super::*;
-    use crate::indexer::index_workspace;
+    use crate::indexer::index_workspace_bundle;
     use tower::ServiceExt;
 
     #[test]
@@ -1975,6 +1993,11 @@ mod live_tests {
     #[tokio::test]
     async fn live_response_is_labeled_and_accounted() {
         mock_run(false, "success").await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_selected_cached_source_prevents_live_provider_call() {
+        mock_run(false, "selected_corruption").await;
     }
 
     #[tokio::test]
@@ -2071,7 +2094,10 @@ mod live_tests {
         .unwrap();
         let options = IndexOptions::new(workspace.clone());
         let cancel = Arc::new(AtomicBool::new(false));
-        let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
+        let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
+        crate::store::topology::assert_topology_fixture(&store, &dir.path().join("state"));
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
         let seed = graph
             .nodes
             .iter()
@@ -2079,16 +2105,13 @@ mod live_tests {
             .unwrap()
             .id
             .clone();
-        let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
-        crate::store::topology::assert_topology_fixture(&store, &dir.path().join("state"));
         store
-            .publish(
+            .publish_native(
                 &graph,
+                &capture,
+                &native,
                 &store.leader().unwrap(),
-                crate::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 0,
-                },
+                store.index_baseline().unwrap(),
                 &cancel,
             )
             .unwrap();
@@ -2138,19 +2161,65 @@ mod live_tests {
             "/api/questions/{}/jev-run",
             preview["packet"]["packetId"].as_str().unwrap()
         );
+        if scenario == "selected_corruption" {
+            let index_root = dir.path().join("state/cache/indexes");
+            let db_path = std::fs::read_dir(index_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.is_dir())
+                .unwrap()
+                .join("index.db");
+            let db = rusqlite::Connection::open(db_path).unwrap();
+            let mut bytes: Vec<u8> = db
+                .query_row(
+                    "SELECT source_bytes FROM native_documents WHERE path='a.js'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            bytes[0] ^= 1;
+            assert_eq!(
+                db.execute(
+                    "UPDATE native_documents SET source_bytes=?1 WHERE path='a.js'",
+                    [bytes],
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                store.status().unwrap().revision,
+                serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
+            );
+            let attempts = provider.budget().unwrap().attempts;
+            let response = app.oneshot(request(&path, json!({}))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "incompatible_index");
+            assert_eq!(provider.budget().unwrap().attempts, attempts);
+            server.abort();
+            return;
+        }
         let run = tokio::spawn(app.oneshot(request(&path, json!({}))));
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
             .await
             .unwrap();
         if change_snapshot {
+            let (updated, native, captured) = index_workspace_bundle(
+                &IndexOptions::new(workspace.clone()),
+                store.root_id(),
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
             store
-                .publish(
-                    &graph,
+                .publish_native(
+                    &updated,
+                    &captured,
+                    &native,
                     &store.leader().unwrap(),
-                    crate::model::IndexPin {
-                        index_generation: store.status().unwrap().revision.index_generation,
-                        index_revision: 1,
-                    },
+                    store.status().unwrap().revision,
                     &cancel,
                 )
                 .unwrap();
@@ -2259,6 +2328,24 @@ mod dependency_lifecycle_tests {
         std::fs::create_dir(&workspace).unwrap();
         let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
         crate::store::topology::assert_topology_fixture(&store, &temp.path().join("state"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) = crate::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let pin0 = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
         let state = new_with_dependency_options(
             store.clone(),
             IndexOptions::new(workspace.clone()),
@@ -2266,13 +2353,12 @@ mod dependency_lifecycle_tests {
             "127.0.0.1:7331".parse().unwrap(),
             None,
             None,
-            workspace,
+            workspace.clone(),
             vec![],
             Some(CatalogOptions::default()),
         )
         .unwrap();
         let active = AtomicBool::new(false);
-        let pin0 = store.status().unwrap().revision;
         state.dependencies.lock().unwrap().generation = 2;
         state.publish_dependency_index(2, &active, Ok(catalog("new", pin0)));
         state.publish_dependency_index(1, &active, Ok(catalog("old", pin0)));
@@ -2280,12 +2366,21 @@ mod dependency_lifecycle_tests {
         assert_eq!(state.catalog_snapshot(pin0).unwrap().id, "new");
         state.publish_dependency_index(2, &AtomicBool::new(true), Ok(catalog("cancelled", pin0)));
         assert_eq!(state.catalog_snapshot(pin0).unwrap().id, "new");
+        let (updated, native, captured) = crate::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
         store
-            .publish(
-                &Graph::default(),
+            .publish_native(
+                &updated,
+                &captured,
+                &native,
                 &store.leader().unwrap(),
                 pin0,
-                &Arc::new(AtomicBool::new(false)),
+                &cancel,
             )
             .unwrap();
         let pin1 = store.status().unwrap().revision;
@@ -2302,7 +2397,7 @@ mod dependency_lifecycle_tests {
 #[cfg(test)]
 mod rebaseline_packet_cache_tests {
     use super::*;
-    use crate::indexer::index_workspace_with_capture;
+    use crate::indexer::index_workspace_bundle;
     use std::{fs, sync::atomic::AtomicBool};
 
     #[test]
@@ -2313,12 +2408,14 @@ mod rebaseline_packet_cache_tests {
         fs::write(workspace.join("one.js"), "function go() { measured(); }\n").unwrap();
         let options = IndexOptions::new(workspace.clone());
         let ready = Arc::new(AtomicBool::new(false));
-        let (graph, capture) = index_workspace_with_capture(&options, &ready, |_| {}).unwrap();
         let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &ready, |_| {}).unwrap();
         let old = store
-            .publish_captured(
+            .publish_native(
                 &graph,
                 &capture,
+                &native,
                 &store.leader().unwrap(),
                 store.index_baseline().unwrap(),
                 &ready,
@@ -2331,6 +2428,24 @@ mod rebaseline_packet_cache_tests {
             .unwrap()
             .join("index.db");
         let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        let tables = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        for table in tables {
+            db.execute(&format!("DROP TABLE \"{table}\""), []).unwrap();
+        }
+        for index in ["nodes_path", "calls_path", "regions_path"] {
+            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        }
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],
@@ -2403,7 +2518,14 @@ mod rebaseline_packet_cache_tests {
         register("failed");
         let cancelled = Arc::new(AtomicBool::new(true));
         let error = store
-            .publish_captured(&graph, &capture, &store.leader().unwrap(), old, &cancelled)
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                old,
+                &cancelled,
+            )
             .unwrap_err();
         finish_index_job(&state, "failed", Err(error), &cancelled);
         assert_eq!(state.jobs.lock().unwrap().jobs["failed"].state, "cancelled");
@@ -2419,7 +2541,14 @@ mod rebaseline_packet_cache_tests {
         );
         register("committed");
         let revision = store
-            .publish_captured(&graph, &capture, &store.leader().unwrap(), old, &ready)
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                old,
+                &ready,
+            )
             .unwrap();
         finish_index_job(&state, "committed", Ok(revision), &ready);
         assert_ne!(revision.index_generation, old.index_generation);

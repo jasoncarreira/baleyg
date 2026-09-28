@@ -9,7 +9,7 @@ use baleyg::{
     behavior::{Participant, SequenceStep, SequenceView, build_sequence},
     dependencies::{Catalog, CatalogSymbol, Package},
     dependency_links::annotate,
-    indexer::{IndexOptions, index_workspace},
+    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::*,
 };
 use std::{
@@ -303,26 +303,42 @@ fn candidate_terminal_id_cannot_be_used_as_workspace_sequence_root() {
     assert!(!graph.nodes.iter().any(|n| n.id == id));
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("fixture.rs"),
+        "fn run() { std::fs::OpenOptions::new(); }",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let store = crate::common::open_store(state.path(), workspace.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (bundle_graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(workspace.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(bundle_graph.files, graph.files);
+    assert_eq!(bundle_graph.calls.len(), graph.calls.len());
+    assert_eq!(bundle_graph.calls[0].range, graph.calls[0].range);
+    assert!(!bundle_graph.nodes.iter().any(|node| node.id == id));
     let revision = store
-        .publish(
-            &graph,
+        .publish_native(
+            &bundle_graph,
+            &capture,
+            &native,
             &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 0,
-            },
-            &Arc::new(AtomicBool::new(false)),
+            store.index_baseline().unwrap(),
+            &cancel,
         )
         .unwrap();
     assert!(store.sequence_at(id, revision, false).unwrap().is_none());
     assert!(store.symbol(id).unwrap().is_none());
-    assert_eq!(store.graph().unwrap().calls, graph.calls);
+    assert_eq!(store.graph().unwrap().calls, bundle_graph.calls);
 }
 
 #[test]
