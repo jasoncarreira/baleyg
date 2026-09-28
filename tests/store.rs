@@ -428,8 +428,13 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
         hidden: vec![b.clone()],
     };
     store.put_view(&view).unwrap();
-    assert!(!store.annotations().unwrap()[0].orphaned);
-    assert_eq!(store.views().unwrap()[0].orphaned_ids, vec!["missing"]);
+    let saved_note = store.annotations().unwrap().remove(0);
+    assert!(saved_note.orphaned);
+    assert_eq!(saved_note.attachment.availability, AttachmentAvailability::Anchorless);
+    let saved_view = store.views().unwrap().remove(0);
+    assert!(saved_view.orphaned_ids.contains(&a));
+    assert!(saved_view.orphaned_ids.contains(&"missing".into()));
+    assert_eq!(saved_view.attachment.availability, AttachmentAvailability::Anchorless);
     drop(store);
     std::fs::remove_file(index_db(state.path())).unwrap();
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
@@ -441,14 +446,18 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
             .contains("index_not_ready")
     );
     assert_eq!(store.index_baseline().unwrap().index_revision, 0);
-    assert!(store.annotations().unwrap()[0].orphaned);
-    assert_eq!(store.annotations().unwrap()[0].annotation, annotation);
+    let unavailable_note = store.annotations().unwrap().remove(0);
+    assert!(unavailable_note.orphaned);
+    assert_eq!(unavailable_note.attachment.availability, AttachmentAvailability::IndexUnavailable);
+    assert_eq!(unavailable_note.annotation, annotation);
     let orphaned = store.view("view").unwrap().unwrap().orphaned_ids;
     assert_eq!(orphaned.len(), 3);
     assert!(orphaned.contains(&a) && orphaned.contains(&b) && orphaned.contains(&"missing".into()));
     let fresh = bundle(&store, &work);
     publish_bundle(&store, &fresh, store.index_baseline().unwrap());
-    assert!(!store.annotations().unwrap()[0].orphaned);
+    let restored_note = store.annotations().unwrap().remove(0);
+    assert!(restored_note.orphaned);
+    assert_eq!(restored_note.attachment.availability, AttachmentAvailability::Anchorless);
     // Public graph-only writes cannot remove indexed symbols.
     assert!(
         store
