@@ -21,6 +21,7 @@ pub struct Store {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublishStage {
+    BeforeTransaction,
     AfterFile,
     BeforeCommit,
 }
@@ -522,8 +523,9 @@ impl Store {
             let leader = store.roots.leader(&store.identity)?;
             store.initialize(&leader, before_publish)?;
         }
-        let db = store.cache()?;
-        store.read_control_status(&db)?;
+        let mut db = store.cache()?;
+        let tx = storage_result(db.transaction())?;
+        store.read_control_status(&tx)?;
         Ok(store)
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
@@ -610,14 +612,16 @@ impl Store {
         drop(db);
         before_publish(&staged.path)?;
         verify_index_file(&staged.path)?;
-        let checked = open_index(&staged.path, true)?;
-        self.read_control_status(&checked)?;
+        let mut checked = open_index(&staged.path, true)?;
+        let checked_snapshot = storage_result(checked.transaction())?;
+        self.read_control_status(&checked_snapshot)?;
         let integrity: String =
-            storage_result(checked.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
+            storage_result(checked_snapshot.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
         ensure!(
             integrity == "ok",
             "incompatible_index: staged integrity check failed"
         );
+        drop(checked_snapshot);
         drop(checked);
         staged.file.sync_all()?;
         // The verified pathname must still refer to the inode we created.
@@ -641,21 +645,37 @@ impl Store {
         Ok(())
     }
     pub fn leader(&self) -> Result<topology::LeaderGuard> {
+        self.leader_with_open_hook(|_| Ok(()))
+    }
+    fn leader_with_open_hook(
+        &self,
+        before_write: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<topology::LeaderGuard> {
         drop(self.cache()?);
         let leader = self.roots.leader(&self.identity)?;
-        // Acquiring the leader must not mutate legacy cache bytes: a failed
-        // rebaseline leaves the old schema-4 database intact and unreadable.
+        // Opening can race a second SQLite writer: repeat validation only AFTER
+        // BEGIN IMMEDIATE excludes schema changes and before any metadata UPDATE.
         let mut db = self.cache_write()?;
-        if self.read_control_status(&db)?.evidence_format.is_some() {
-            let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let admitted_version: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
+        before_write(&db)?;
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let status = self.read_control_status(&tx)?;
+        let locked_version: i64 =
+            storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
+        ensure!(
+            locked_version == admitted_version,
+            "incompatible_index: cache changed after admission"
+        );
+        if status.evidence_format.is_some() {
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
             storage_result(tx.execute(
                 "UPDATE index_metadata SET last_opened_at=?1 WHERE singleton=1",
                 [age as i64],
             ))?;
-            storage_result(tx.commit())?;
         }
+        storage_result(tx.commit())?;
         drop(db);
         leader.verify()?;
         self.identity.verify()?;
@@ -682,12 +702,21 @@ impl Store {
         topology::DurableRecords::new(&self.roots, &self.identity)
     }
     fn read_control_status(&self, db: &Connection) -> Result<IndexStatus> {
+        // This check must run INSIDE the caller's read snapshot or writer lock.
+        // The open_index admission check alone cannot protect against later DDL.
+        validate_cache_shape(db)?;
+        let schema_version: i64 =
+            storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
         let row: (i64,String,String,String,String,String,i64,String,String,String) = storage_result(db.query_row(
             "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata WHERE singleton=1",
             [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))))?;
         ensure!(
-            (row.0 == i64::from(LEGACY_SCHEMA_VERSION) && row.1 == LEGACY_EXTRACTOR_VERSION)
-                || (row.0 == i64::from(DATABASE_SCHEMA_VERSION) && row.1 == EXTRACTOR_VERSION),
+            (schema_version == i64::from(LEGACY_SCHEMA_VERSION)
+                && row.0 == schema_version
+                && row.1 == LEGACY_EXTRACTOR_VERSION)
+                || (schema_version == i64::from(DATABASE_SCHEMA_VERSION)
+                    && row.0 == schema_version
+                    && row.1 == EXTRACTOR_VERSION),
             "incompatible_index: extractor or schema"
         );
         ensure!(
@@ -721,15 +750,26 @@ impl Store {
     }
     /// Internal control baseline, never returned by public status or evidence reads.
     pub fn index_baseline(&self) -> Result<IndexPin> {
-        let db = self.cache()?;
-        Ok(self.read_control_status(&db)?.revision)
+        let mut db = self.cache()?;
+        let tx = storage_result(db.transaction())?;
+        Ok(self.read_control_status(&tx)?.revision)
     }
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
     }
     pub fn status(&self) -> Result<IndexStatus> {
-        let db = self.cache()?;
-        self.read_status(&db)
+        self.status_with_open_hook(|_| Ok(()))
+    }
+    // Private barrier after the admission check, before the read transaction.
+    // A second SQLite connection can add DDL here in regression tests.
+    fn status_with_open_hook(
+        &self,
+        before_snapshot: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<IndexStatus> {
+        let mut db = self.cache()?;
+        before_snapshot(&db)?;
+        let tx = storage_result(db.transaction())?;
+        self.read_status(&tx)
     }
     pub fn publish(
         &self,
@@ -772,7 +812,7 @@ impl Store {
         leader: &topology::LeaderGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
-        mut during_tx: impl FnMut(PublishStage, &rusqlite::Transaction<'_>) -> Result<()>,
+        mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
         ensure!(
             graph.schema_version == SCHEMA_VERSION,
@@ -793,8 +833,17 @@ impl Store {
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
         let mut db = self.cache_write()?;
+        let admitted_version: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
+        during_tx(PublishStage::BeforeTransaction, &db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let baseline = self.read_control_status(&tx)?;
+        let locked_version: i64 =
+            storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
+        ensure!(
+            locked_version == admitted_version,
+            "incompatible_index: cache changed after admission"
+        );
         let old = baseline.revision;
         ensure!(
             expected_revision == old,
@@ -1470,6 +1519,7 @@ mod rebaseline_fault_tests {
                                         );
                                     }
                                 }
+                                PublishStage::BeforeTransaction => unreachable!(),
                             }
                         }
                         Ok(())
@@ -1480,6 +1530,7 @@ mod rebaseline_fault_tests {
                 failure.to_string().contains(match mode {
                     PublishStage::AfterFile => "UNIQUE constraint failed",
                     PublishStage::BeforeCommit => "constraint failed",
+                    PublishStage::BeforeTransaction => unreachable!(),
                 }),
                 "{failure:#}"
             );
@@ -1523,5 +1574,219 @@ mod rebaseline_fault_tests {
             .unwrap();
         assert_ne!(rotated.index_generation, original.index_generation);
         assert_eq!(rotated.index_revision, original.index_revision + 1);
+    }
+}
+
+#[cfg(test)]
+mod sqlite_schema_race_tests {
+    use super::*;
+    use crate::indexer::{IndexOptions, index_workspace_with_capture};
+    use std::{cell::RefCell, fs, sync::atomic::AtomicBool};
+
+    fn ready() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Store,
+        Graph,
+        crate::capture::Capture,
+        IndexPin,
+        CancelFlag,
+    ) {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join("flow.js"),
+            "function go() { measured(); }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(work.path().to_owned());
+        let (graph, capture) = index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+        let pin = store
+            .publish_captured(
+                &graph,
+                &capture,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        (state, work, store, graph, capture, pin, cancel)
+    }
+
+    #[test]
+    fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
+        let (_state, _work, store, graph, capture, old, cancel) = ready();
+        let path = store.roots.index_db(&store.identity);
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        drop(db);
+        let leader = store.leader().unwrap();
+        let after_external = RefCell::new(None);
+        let error = store.publish_inner_checked(&graph, Some(&capture), &leader, old, &cancel,
+            |stage, _checked_connection| {
+                if stage == PublishStage::BeforeTransaction {
+                    // The Store connection has passed open_index's exact object check,
+                    // but has NOT acquired the SQLite writer lock yet.
+                    let attacker = Connection::open(&path)?;
+                    attacker.execute_batch("CREATE TRIGGER forged_after_admission AFTER INSERT ON calls BEGIN
+                        UPDATE calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED') WHERE id=NEW.id; END;")?;
+                    drop(attacker);
+                    *after_external.borrow_mut() = Some(fs::read(&path)?);
+                }
+                Ok(())
+            }).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible_index: unknown cache object"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            after_external.into_inner().unwrap(),
+            "Store must not change DB bytes after the external CREATE TRIGGER"
+        );
+        let db = Connection::open(&path).unwrap();
+        let (schema, marker, generation, revision): (i64, String, String, i64) = db.query_row(
+            "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            (schema, marker.as_str(), generation, revision),
+            (
+                4,
+                "native-v1",
+                old.index_generation.to_string(),
+                old.index_revision as i64
+            )
+        );
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        let forged: i64 = db
+            .query_row(
+                "SELECT count(*) FROM calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(forged, 0, "post-admission trigger must never execute");
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible_index")
+        );
+    }
+
+    #[test]
+    fn changed_metadata_between_admission_and_leader_lock_refuses_before_update() {
+        let (_state, _work, store, _graph, _capture, pin, _cancel) = ready();
+        let path = store.roots.index_db(&store.identity);
+        let after_external = RefCell::new(None);
+        let error = store
+            .leader_with_open_hook(|_checked| {
+                let attacker = Connection::open(&path)?;
+                attacker.execute(
+                    "UPDATE index_metadata SET last_opened_at=last_opened_at+1",
+                    [],
+                )?;
+                drop(attacker);
+                *after_external.borrow_mut() = Some(fs::read(&path)?);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible_index: cache changed after admission"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            after_external.into_inner().unwrap()
+        );
+        assert_eq!(store.status().unwrap().revision, pin);
+    }
+
+    #[test]
+    fn second_connection_adds_view_after_admission_before_status_and_leader_snapshot() {
+        let (_state, _work, store, _graph, _capture, pin, _cancel) = ready();
+        let path = store.roots.index_db(&store.identity);
+        let after_status_ddl = RefCell::new(None);
+        let status_error = store
+            .status_with_open_hook(|_checked| {
+                let attacker = Connection::open(&path)?;
+                attacker.execute_batch("CREATE VIEW status_after_admission AS SELECT 1")?;
+                drop(attacker);
+                *after_status_ddl.borrow_mut() = Some(fs::read(&path)?);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            status_error
+                .to_string()
+                .contains("incompatible_index: unknown cache object")
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            after_status_ddl.into_inner().unwrap()
+        );
+        let attacker = Connection::open(&path).unwrap();
+        attacker
+            .execute_batch("DROP VIEW status_after_admission")
+            .unwrap();
+        drop(attacker);
+        assert_eq!(store.status().unwrap().revision, pin);
+
+        let after_leader_ddl = RefCell::new(None);
+        let leader_error = store
+            .leader_with_open_hook(|_checked| {
+                let attacker = Connection::open(&path)?;
+                attacker.execute_batch("CREATE VIEW leader_after_admission AS SELECT 1")?;
+                drop(attacker);
+                *after_leader_ddl.borrow_mut() = Some(fs::read(&path)?);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            leader_error
+                .to_string()
+                .contains("incompatible_index: unknown cache object")
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            after_leader_ddl.into_inner().unwrap(),
+            "leader metadata update must not write after external DDL"
+        );
+        let attacker = Connection::open(&path).unwrap();
+        let (schema, marker, generation, revision): (i64,String,String,i64) = attacker.query_row(
+            "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            (schema, marker.as_str(), generation, revision),
+            (
+                5,
+                "native-no-lexical-v1",
+                pin.index_generation.to_string(),
+                pin.index_revision as i64
+            )
+        );
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible_index")
+        );
     }
 }
