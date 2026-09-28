@@ -3590,6 +3590,244 @@ mod rebaseline_fault_tests {
     }
 
     #[test]
+    fn large_real_native_pair_cancels_at_before_commit_without_partial_rows() {
+        use std::{
+            sync::{atomic::Ordering, mpsc},
+            thread::JoinHandle,
+            time::Duration,
+        };
+        // Never leave a live writer or paused callback behind on timeout,
+        // assertion failure, unexpected worker error, or worker panic.
+        struct PublisherGuard {
+            cancel: CancelFlag,
+            release: Option<mpsc::Sender<()>>,
+            worker: Option<JoinHandle<Result<IndexPin>>>,
+        }
+        impl Drop for PublisherGuard {
+            fn drop(&mut self) {
+                self.cancel.store(true, Ordering::Release);
+                if let Some(release) = self.release.take() {
+                    let _ = release.send(());
+                }
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+        fn outcome(result: std::thread::Result<Result<IndexPin>>) -> String {
+            match result {
+                Ok(Ok(pin)) => format!("unexpected publisher success: {pin:?}"),
+                Ok(Err(error)) => format!("publisher error: {error:#}"),
+                Err(panic) => format!(
+                    "publisher panic: {}",
+                    panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic payload")
+                ),
+            }
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.js");
+        let original = "function a() { b(); c(); }\nfunction b() { c(); }\nfunction c() { a(); }\n";
+        fs::write(&path, original).unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let initial_cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &initial_cancel, |_| {}).unwrap();
+        let leader = store.leader().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                store.index_baseline().unwrap(),
+                &initial_cancel,
+            )
+            .unwrap();
+        let old_graph = store.graph().unwrap();
+        let old_source = store.source_at("a.js", Some(pin)).unwrap().unwrap();
+        let old_key = native
+            .revision
+            .documents
+            .iter()
+            .find(|d| d.key.path == "a.js")
+            .unwrap()
+            .key
+            .clone();
+        let old_native_source = store.native_source_at(pin, &old_key).unwrap().unwrap();
+        let old_coverage = store.native_coverage_at(pin, &old_key).unwrap().unwrap();
+        let old_declarations = store
+            .native_declarations_at(pin, "javascript", "a")
+            .unwrap();
+        assert!(!old_declarations.is_empty());
+        let old_owner = &old_declarations[0].syntax_id;
+        let old_calls = store.native_calls_at(pin, old_owner).unwrap();
+        assert!(
+            !old_calls.is_empty(),
+            "old JavaScript function has measured native calls"
+        );
+        let old_regions = store.native_control_regions_at(pin, old_owner).unwrap();
+
+        // Preserve the old test's 5,000 genuine JavaScript function definitions
+        // and call sites rather than replacing them with synthetic graph rows.
+        let large_source = (0..5_000)
+            .map(|i| {
+                format!(
+                    "function node_{i:05}() {{ node_{:05}(); }}\n",
+                    (i + 1) % 5_000
+                )
+            })
+            .collect::<String>();
+        fs::write(&path, &large_source).unwrap();
+        let (next, next_native, next_capture) =
+            index_workspace_bundle(&options, store.root_id(), &initial_cancel, |_| {}).unwrap();
+        assert_eq!(
+            next.nodes
+                .iter()
+                .filter(|n| n.kind == SymbolKind::Function)
+                .count(),
+            5_000
+        );
+        assert_eq!(next.calls.len(), 5_000);
+        assert_eq!(
+            next_native
+                .declarations
+                .iter()
+                .filter(|d| d.kind == "function")
+                .count(),
+            5_000
+        );
+        assert_eq!(next_native.calls.len(), 5_000);
+        // The private publish seam skips the public wrapper. Apply each native,
+        // captured-source and graph parity check explicitly before the worker.
+        let canonical_work = fs::canonicalize(work.path()).unwrap();
+        next_native
+            .validate(&next_capture, &canonical_work, store.root_id())
+            .unwrap();
+        assert_eq!(next_capture.graph_projection_count(), 1);
+        assert_eq!(
+            next_capture.source_operations.len(),
+            next_capture.files.len()
+        );
+        assert!(
+            next_capture
+                .source_operations
+                .values()
+                .all(|operations| operations.opens == 1
+                    && operations.complete_reads == 1
+                    && operations.hashes == 1)
+        );
+        crate::indexer::validate_native_graph(&next, &next_capture, &next_native, &initial_cancel)
+            .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store.publish_inner_checked(
+                (&next,&next_capture,&next_native),&leader,pin,&worker_cancel,
+                |stage,tx|{
+                    if stage!=PublishStage::BeforeCommit {return Ok(());}
+                    // All graph/native/class inserts and paired checks precede
+                    // this callback; the final cancellation check follows it.
+                    let revision:i64=tx.query_row(
+                        "SELECT index_revision FROM index_metadata WHERE singleton=1",[],|r|r.get(0))?;
+                    ensure!(revision==i64::try_from(pin.index_revision+1)?,
+                        "new revision not staged in publisher transaction");
+                    let graph_functions:i64=tx.query_row(
+                        "SELECT count(*) FROM nodes WHERE path='a.js' AND json_extract(payload,'$.kind')='function'",[],|r|r.get(0))?;
+                    let native_functions:i64=tx.query_row(
+                        "SELECT count(*) FROM native_declarations WHERE path='a.js' AND kind='function'",[],|r|r.get(0))?;
+                    let graph_calls:i64=tx.query_row(
+                        "SELECT count(*) FROM calls WHERE path='a.js'",[],|r|r.get(0))?;
+                    let native_calls:i64=tx.query_row(
+                        "SELECT count(*) FROM native_calls WHERE path='a.js'",[],|r|r.get(0))?;
+                    ensure!((graph_functions,native_functions,graph_calls,native_calls)==(5_000,5_000,5_000,5_000),
+                        "5,000 measured graph/native function and call rows not staged: graph={graph_functions}/{graph_calls} native={native_functions}/{native_calls}");
+                    let source_bytes:Vec<u8>=tx.query_row(
+                        "SELECT source_bytes FROM native_documents WHERE path='a.js'",[],|r|r.get(0))?;
+                    ensure!(source_bytes==large_source.as_bytes(),
+                        "new captured native source bytes not staged");
+                    validate_paired_metadata(tx,worker_store.root_id())?;
+                    validate_paired_rows(tx)?;
+                    entered_tx.send(()).context("cannot signal staged BeforeCommit")?;
+                    release_rx.recv_timeout(Duration::from_secs(30))
+                        .context("bounded BeforeCommit release timed out")?;
+                    Ok(())
+                },
+            )
+        });
+        let mut guard = PublisherGuard {
+            cancel,
+            release: Some(release_tx),
+            worker: Some(worker),
+        };
+        // This generous bounded wait is only failure diagnosis/cleanup for the
+        // real 5,000-function pre-lock work. It is NOT lock observation.
+        if let Err(wait) = entered_rx.recv_timeout(Duration::from_secs(180)) {
+            let detail = if guard.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+                outcome(guard.worker.take().unwrap().join())
+            } else {
+                format!("large-source publisher still before BeforeCommit: {wait}")
+            };
+            panic!("publisher never reached its staged transaction: {detail}");
+        }
+        let probe = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        match probe.execute_batch("BEGIN IMMEDIATE") {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy => {}
+            Ok(()) => {
+                probe.execute_batch("ROLLBACK").unwrap();
+                panic!("independent writer acquired lock while publisher paused BeforeCommit");
+            }
+            Err(error) => panic!("independent SQLite writer probe failed: {error}"),
+        }
+        guard.cancel.store(true, Ordering::Release);
+        guard.release.take().unwrap().send(()).unwrap();
+        match guard.worker.take().unwrap().join() {
+            Ok(Err(error)) if error.to_string().contains("cancelled") => {}
+            other => panic!(
+                "large paired publisher failed cancellation contract: {}",
+                outcome(other)
+            ),
+        }
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(store.graph().unwrap(), old_graph);
+        assert_eq!(
+            store.source_at("a.js", Some(pin)).unwrap().unwrap(),
+            old_source
+        );
+        assert_eq!(
+            store.native_source_at(pin, &old_key).unwrap().unwrap(),
+            old_native_source
+        );
+        assert_eq!(
+            store.native_coverage_at(pin, &old_key).unwrap().unwrap(),
+            old_coverage
+        );
+        assert_eq!(
+            store
+                .native_declarations_at(pin, "javascript", "a")
+                .unwrap(),
+            old_declarations
+        );
+        assert_eq!(store.native_calls_at(pin, old_owner).unwrap(), old_calls);
+        assert_eq!(
+            store.native_control_regions_at(pin, old_owner).unwrap(),
+            old_regions
+        );
+    }
+
+    #[test]
     fn captured_long_call_exceeds_injected_small_graph_cap_and_remains_selectable() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
