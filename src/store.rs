@@ -1662,7 +1662,7 @@ impl Store {
             status.evidence_format.is_some(),
             "index_not_ready: reindex required"
         );
-        validate_paired_rows(db).context("index_not_ready: invalid reconciled snapshot")?;
+        validate_paired_rows(db).context("incompatible_index: invalid reconciled snapshot")?;
         // Every public schema-7 derived read needs the same bounded catalog
         // singleton. Missing/oversized live metadata is corruption, never an
         // old-index "requireIndex" fallback. This is one indexed metadata row.
