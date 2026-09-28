@@ -2172,7 +2172,9 @@ mod live_tests {
             let status_error = store.status().unwrap_err();
             assert!(
                 status_error.to_string().contains("incompatible_index")
-                    && status_error.to_string().contains("invalid reconciled snapshot"),
+                    && status_error
+                        .to_string()
+                        .contains("invalid reconciled snapshot"),
                 "{status_error:#}"
             );
             let attempts = provider.budget().unwrap().attempts;
