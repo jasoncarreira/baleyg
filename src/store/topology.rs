@@ -1139,11 +1139,13 @@ impl<'a> DurableRecords<'a> {
         mut capture: impl FnMut() -> Result<Box<serde_json::value::RawValue>>,
     ) -> Result<crate::model::SavedViewRecord> {
         record.validate()?;
+        let mut incoming = record.clone();
+        incoming.anchor = None;
         let payload = self.save_with_first_save_hook(
             "views",
             &record.id,
             None,
-            serde_json::to_string(record)?,
+            serde_json::to_string(&incoming)?,
             false,
             |_| capture().map(Some),
             |_| Ok(()),
@@ -1179,11 +1181,13 @@ impl<'a> DurableRecords<'a> {
         mut capture: impl FnMut() -> Result<Box<serde_json::value::RawValue>>,
     ) -> Result<crate::model::AnnotationRecord> {
         record.validate()?;
+        let mut incoming = record.clone();
+        incoming.anchor = None;
         let payload = self.save_with_first_save_hook(
             "annotations",
             &record.id,
             Some(&record.node_id),
-            serde_json::to_string(record)?,
+            serde_json::to_string(&incoming)?,
             preserve_title,
             |_| capture().map(Some),
             |_| Ok(()),
