@@ -179,7 +179,8 @@ pub fn audit_anchor(
         if sibling_group_hash(&headers)? != anchor.sibling_group_hash
             || headers.len() != anchor.sibling_count
             || identical != anchor.identical_header_count
-            || continuity.state == ContinuityState::Changed
+            || (anchor.captured_revision_id != current_revision_id
+                && continuity.state == ContinuityState::Changed)
         {
             return Ok(AnchorResult::orphaned(AnchorReason::GroupChanged));
         }

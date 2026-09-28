@@ -823,6 +823,13 @@ CREATE TABLE views(id TEXT PRIMARY KEY,payload TEXT NOT NULL);
 CREATE TABLE annotations(id TEXT PRIMARY KEY,node_id TEXT NOT NULL,payload TEXT NOT NULL);
 ";
 
+#[derive(Clone, Copy)]
+struct RecordItem<'a> {
+    table: &'a str,
+    id: &'a str,
+    node: Option<&'a str>,
+}
+
 impl<'a> DurableRecords<'a> {
     pub fn new(roots: &'a TopologyRoots, identity: &'a WorkspaceIdentity) -> Self {
         Self { roots, identity }
@@ -898,16 +905,12 @@ impl<'a> DurableRecords<'a> {
     }
     fn save(
         &self,
-        table: &str,
-        id: &str,
-        node: Option<&str>,
+        item: RecordItem<'_>,
         payload: String,
         preserve_title: bool,
     ) -> Result<String> {
         self.save_with_first_save_hook(
-            table,
-            id,
-            node,
+            item,
             payload,
             preserve_title,
             |_| Ok(None),
@@ -916,15 +919,14 @@ impl<'a> DurableRecords<'a> {
     }
     fn save_with_first_save_hook(
         &self,
-        table: &str,
-        id: &str,
-        node: Option<&str>,
+        item: RecordItem<'_>,
         payload: String,
         preserve_title: bool,
         mut capture: impl FnMut(&str) -> Result<Option<Box<serde_json::value::RawValue>>>,
         mut hook: impl FnMut(&str) -> Result<()>,
     ) -> Result<String> {
         use rusqlite::{Connection, TransactionBehavior};
+        let RecordItem { table, id, node } = item;
         let exists = self.existing()?;
         if !exists {
             self.roots.prepare_records(self.identity)?;
@@ -1091,10 +1093,18 @@ impl<'a> DurableRecords<'a> {
         result
     }
     pub fn view_records(&self) -> Result<Vec<crate::model::SavedViewRecord>> {
-        self.list("SELECT payload FROM views ORDER BY id")
+        let records = self.list("SELECT payload FROM views ORDER BY id")?;
+        for record in &records {
+            record.validate()?;
+        }
+        Ok(records)
     }
     pub fn annotation_records(&self) -> Result<Vec<crate::model::AnnotationRecord>> {
-        self.list("SELECT payload FROM annotations ORDER BY id")
+        let records = self.list("SELECT payload FROM annotations ORDER BY id")?;
+        for record in &records {
+            record.validate()?;
+        }
+        Ok(records)
     }
     pub fn views(&self) -> Result<Vec<crate::model::SavedView>> {
         Ok(self
@@ -1125,9 +1135,7 @@ impl<'a> DurableRecords<'a> {
     pub fn put_view_record(&self, record: &crate::model::SavedViewRecord) -> Result<()> {
         record.validate()?;
         self.save(
-            "views",
-            &record.id,
-            None,
+            RecordItem { table: "views", id: &record.id, node: None },
             serde_json::to_string(record)?,
             false,
         )
@@ -1142,9 +1150,7 @@ impl<'a> DurableRecords<'a> {
         let mut incoming = record.clone();
         incoming.anchor = None;
         let payload = self.save_with_first_save_hook(
-            "views",
-            &record.id,
-            None,
+            RecordItem { table: "views", id: &record.id, node: None },
             serde_json::to_string(&incoming)?,
             false,
             |_| capture().map(Some),
@@ -1166,9 +1172,7 @@ impl<'a> DurableRecords<'a> {
     ) -> Result<()> {
         record.validate()?;
         self.save(
-            "annotations",
-            &record.id,
-            Some(&record.node_id),
+            RecordItem { table: "annotations", id: &record.id, node: Some(&record.node_id) },
             serde_json::to_string(record)?,
             preserve_title,
         )
@@ -1184,9 +1188,7 @@ impl<'a> DurableRecords<'a> {
         let mut incoming = record.clone();
         incoming.anchor = None;
         let payload = self.save_with_first_save_hook(
-            "annotations",
-            &record.id,
-            Some(&record.node_id),
+            RecordItem { table: "annotations", id: &record.id, node: Some(&record.node_id) },
             serde_json::to_string(&incoming)?,
             preserve_title,
             |_| capture().map(Some),
@@ -1206,9 +1208,7 @@ impl<'a> DurableRecords<'a> {
         annotation.validate()?;
         let record = crate::model::AnnotationRecord::from_base(annotation.clone(), None, None);
         self.save_with_first_save_hook(
-            "annotations",
-            &annotation.id,
-            Some(&annotation.node_id),
+            RecordItem { table: "annotations", id: &annotation.id, node: Some(&annotation.node_id) },
             serde_json::to_string(&record)?,
             true,
             |_| Ok(None),

@@ -2122,17 +2122,25 @@ fn saved_anchor_raw_bytes_survive_edits() {
         .unwrap()
         .get()
         .to_owned();
-    records
-        .put_annotation(&Annotation {
+    let edited = AnnotationRecord::from_base(
+        Annotation {
             id: "note".into(),
             node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(),
-            body: "edited".into(),
-        })
+            body: "edited body".into(),
+        },
+        Some("Edited title".into()),
+        None,
+    );
+    let response = records
+        .update_annotation_record(&edited, false, || panic!("existing edit must not recapture"))
         .unwrap();
+    assert_eq!(response.anchor.as_ref().unwrap().get(), before);
+    assert_eq!(response.title.as_deref(), Some("Edited title"));
+    assert_eq!(response.body, "edited body");
     let after = records.annotation_record("note").unwrap().unwrap();
     assert_eq!(after.anchor.unwrap().get(), before);
-    assert_eq!(after.title.as_deref(), Some("Title"));
-    assert_eq!(after.body, "edited");
+    assert_eq!(after.title.as_deref(), Some("Edited title"));
+    assert_eq!(after.body, "edited body");
 }
 
 #[test]
@@ -2257,11 +2265,11 @@ fn view_anchor_raw_bytes_survive_edits() {
         pins: BTreeMap::new(),
         hidden: vec![],
     };
+    let raw = serde_json::value::RawValue::from_string(
+        r#"{ "siblingCount":1, "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef", "document": {"path":"src/lib.rs","language":"rust","sourceSetId":"set"}, "capturedRevisionId":"revision", "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "siblingGroupHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "identicalHeaderCount":1 }"#.into(),
+    ).unwrap();
     records
-        .put_view_record(&SavedViewRecord::from_base(
-            view.clone(),
-            Some(test_anchor_raw(target, 'a')),
-        ))
+        .put_view_record(&SavedViewRecord::from_base(view.clone(), Some(raw)))
         .unwrap();
     let before = records
         .view_record("view")
