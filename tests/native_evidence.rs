@@ -111,6 +111,21 @@ fn unicode_lookup_normalizes_without_changing_exact_identity_bytes() {
     assert_eq!(lookup("python", "Ａ").unwrap(), "A");
     assert_eq!(lookup("java", "e\u{301}").unwrap(), "e\u{301}");
     assert_eq!(lookup("javascript", "Ａ").unwrap(), "Ａ");
+    // NFC and NFD spellings share one lookup key in Python and Rust only.
+    for language in ["python", "rust"] {
+        assert_eq!(
+            lookup(language, "e\u{301}").unwrap(),
+            lookup(language, "\u{e9}").unwrap(),
+            "{language} NFD/NFC"
+        );
+    }
+    for language in ["java", "javascript"] {
+        assert_ne!(
+            lookup(language, "e\u{301}").unwrap(),
+            lookup(language, "\u{e9}").unwrap(),
+            "{language} keeps NFC/NFD distinct"
+        );
+    }
 }
 
 #[test]
@@ -234,10 +249,16 @@ fn nested_occurrences_sort_before_hashing_and_unverifiable_callees_remain_nullab
     }
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let artifact = from_capture(&capture, root.path(), &identity.record_id).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
     artifact
-        .validate(&capture, root.path(), &identity.record_id)
+        .validate(&capture, root.path(), &identity.record_id, &cancel)
         .unwrap();
+    // Re-validation honors the caller's cancellation instead of a private flag.
+    let cancelled: CancelFlag = Arc::new(AtomicBool::new(true));
+    let error = artifact
+        .validate(&capture, root.path(), &identity.record_id, &cancelled)
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
     // These are literal source expressions, not records regenerated as the test oracle.
     for (lang, path, unverified_expression, spelling) in [
         ("java", "A.java", "new A()", None),
@@ -520,7 +541,7 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
     .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let artifact = from_capture(&capture, root.path(), &id.record_id).unwrap();
+    let artifact = from_capture(&capture, root.path(), &id.record_id, &cancel).unwrap();
     let bad_hash = "a".repeat(64);
     type Mutation = (&'static str, Box<dyn Fn(&mut Artifact)>);
     let mut mutations: Vec<Mutation> = vec![
@@ -742,13 +763,13 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
         mutator(&mut changed);
         assert!(
             changed
-                .validate(&capture, root.path(), &id.record_id)
+                .validate(&capture, root.path(), &id.record_id, &cancel)
                 .is_err(),
             "forged {label} accepted"
         );
     }
     artifact
-        .validate(&capture, root.path(), &id.record_id)
+        .validate(&capture, root.path(), &id.record_id, &cancel)
         .unwrap();
     for ops in capture.source_operations.values() {
         assert_eq!((ops.opens, ops.complete_reads, ops.hashes), (1, 1, 1));
@@ -770,7 +791,7 @@ fn parser_recovery_reports_partial_not_false_complete() {
     fs::write(root.path().join("broken.js"), "function broken( { foo(); }").unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let artifact = from_capture(&capture, root.path(), &id.record_id).unwrap();
+    let artifact = from_capture(&capture, root.path(), &id.record_id, &cancel).unwrap();
     assert_eq!(artifact.coverage.len(), 1);
     assert_eq!(artifact.coverage[0].state, "partial");
     assert!(artifact.coverage[0].diagnostic.is_some());
@@ -779,7 +800,7 @@ fn parser_recovery_reports_partial_not_false_complete() {
     forged.coverage[0].diagnostic = None;
     assert!(
         forged
-            .validate(&capture, root.path(), &id.record_id)
+            .validate(&capture, root.path(), &id.record_id, &cancel)
             .is_err()
     );
 }
@@ -800,11 +821,11 @@ fn validation_refuses_cutoff_drift_without_source_reread() {
     fs::write(&source, "function f() { foo(); }").unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let artifact = from_capture(&capture, root.path(), &id.record_id).unwrap();
+    let artifact = from_capture(&capture, root.path(), &id.record_id, &cancel).unwrap();
     fs::write(&source, "function f() { bar(); }").unwrap();
     assert!(
         artifact
-            .validate(&capture, root.path(), &id.record_id)
+            .validate(&capture, root.path(), &id.record_id, &cancel)
             .is_err()
     );
     assert_eq!(capture.source_operations["a.js"].complete_reads, 1);
@@ -839,7 +860,7 @@ fn source_grounded_four_language_headers_owners_and_control_regions() {
     }
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let artifact = from_capture(&capture, root.path(), &id.record_id).unwrap();
+    let artifact = from_capture(&capture, root.path(), &id.record_id, &cancel).unwrap();
     let rust_struct = artifact
         .declarations
         .iter()
@@ -962,9 +983,9 @@ fn direct_native_opaque_macro_does_not_overflow_or_invent_calls() {
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let artifact = from_capture(&capture, root.path(), &identity.record_id).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
     artifact
-        .validate(&capture, root.path(), &identity.record_id)
+        .validate(&capture, root.path(), &identity.record_id, &cancel)
         .unwrap();
     let spellings: Vec<_> = artifact
         .calls
@@ -1008,7 +1029,7 @@ fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    let error = from_capture(&capture, root.path(), &identity.record_id).unwrap_err();
+    let error = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap_err();
     assert!(
         error
             .to_string()

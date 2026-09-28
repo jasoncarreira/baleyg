@@ -389,7 +389,7 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     .unwrap();
     std::fs::write(
         workspace.join("Types.java"),
-        "class Types { void run() { System.out.println(1); } }",
+        "class Base {}\nclass Types extends Base { void run() { System.out.println(1); } }",
     )
     .unwrap();
     let options = IndexOptions::new(workspace.clone());
@@ -462,6 +462,26 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         for index in ["nodes_path", "calls_path", "regions_path"] {
             db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
         }
+        // An old index holds lexical class adjacency and lexical call targets.
+        let base: String = db
+            .query_row("SELECT id FROM classes WHERE name='Base'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let lexical_edges = db
+            .execute(
+                "UPDATE class_relations SET target=?1, payload=json_set(payload,'$.target',?1,'$.candidateIds',json_array(?1),'$.matchKind','actual')",
+                [&base],
+            )
+            .unwrap();
+        assert!(lexical_edges > 0, "fixture needs a lexical class edge");
+        let lexical_calls = db
+            .execute(
+                "UPDATE calls SET target=?1, payload=json_set(payload,'$.target',?1,'$.resolution','internal')",
+                [&base],
+            )
+            .unwrap();
+        assert!(lexical_calls > 0, "fixture needs a lexical call target");
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],
