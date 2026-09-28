@@ -941,6 +941,104 @@ async fn real_api(
     (status, response.json().await.unwrap())
 }
 
+// Reverse the lossless Jev table encoding to check the real cached export against
+// the separately read graph and preview, not only its HTTP status or packet ID.
+fn decoded_jev_rows(export: &Value, table: &str) -> Vec<Value> {
+    fn identity(cell: &Value, identities: &[Value]) -> Value {
+        match cell {
+            Value::Null => Value::Null,
+            Value::Number(n) => identities[n.as_u64().unwrap() as usize].clone(),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|v| identity(v, identities)).collect())
+            }
+            _ => panic!("unexpected Jev identity cell: {cell}"),
+        }
+    }
+    let state = &export["state"];
+    let encoded = &state["packet"]["context"][table];
+    let identities = state["identities"].as_array().unwrap();
+    let columns = encoded["columns"].as_array().unwrap();
+    let identity_columns = encoded["identityColumns"].as_array().unwrap();
+    let range_columns = state["rangeColumns"].as_array().unwrap();
+    encoded["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let cells = row.as_array().unwrap();
+            assert_eq!(cells.len(), columns.len());
+            let mut result = serde_json::Map::new();
+            for (column, cell) in columns.iter().zip(cells) {
+                let name = column.as_str().unwrap();
+                let decoded = if identity_columns.iter().any(|id| id.as_str() == Some(name)) {
+                    identity(cell, identities)
+                } else if name == "range" {
+                    let values = cell.as_array().unwrap();
+                    assert_eq!(values.len(), range_columns.len());
+                    Value::Object(
+                        range_columns
+                            .iter()
+                            .zip(values)
+                            .map(|(key, value)| (key.as_str().unwrap().to_owned(), value.clone()))
+                            .collect(),
+                    )
+                } else {
+                    cell.clone()
+                };
+                result.insert(name.to_owned(), decoded);
+            }
+            Value::Object(result)
+        })
+        .collect()
+}
+
+fn assert_fixture_declaration(
+    native: &Value,
+    symbol: &Value,
+    path: &str,
+    name: &str,
+    kind: &str,
+    owner: Option<&str>,
+    source: &str,
+) {
+    let matching: Vec<_> = native["allRows"]["native_declarations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[0] == symbol["id"])
+        .collect();
+    assert_eq!(matching.len(), 1, "one native declaration for {name}");
+    let row = matching[0];
+    assert_eq!(symbol["name"], name);
+    assert_eq!(symbol["path"], path);
+    assert_eq!(symbol["parent"], serde_json::json!(owner));
+    assert_eq!(
+        row[1], native["sourceSet"]["id"],
+        "{name}: native declaration source set"
+    );
+    assert_eq!(row[3], path, "{name}: native document path");
+    assert_eq!(
+        row[4], native["revision"]["id"],
+        "{name}: native declaration revision"
+    );
+    assert_eq!(row[5], serde_json::json!(owner), "{name}: native owner");
+    assert_eq!(row[6], kind, "{name}: native declaration kind");
+    assert_eq!(row[7], name, "{name}: native measured name");
+    assert_eq!(
+        row[13], symbol["range"]["startByte"],
+        "{name}: native start"
+    );
+    assert_eq!(row[14], symbol["range"]["endByte"], "{name}: native end");
+    let start = row[13].as_u64().unwrap() as usize;
+    let end = row[14].as_u64().unwrap() as usize;
+    assert!(
+        source
+            .get(start..end)
+            .is_some_and(|text| text.contains(name)),
+        "{name}: captured bytes must witness declaration"
+    );
+}
+
 // Exercise the actual executable on both sides of the coordinator, not an in-process router.
 #[tokio::test]
 async fn real_cli_and_authenticated_daemon_share_native_pair_for_every_language_and_empty_root() {
@@ -1199,6 +1297,7 @@ def sink():
                 pin["indexGeneration"].as_str().unwrap(),
                 pin["indexRevision"].as_u64().unwrap()
             );
+            let measured = graph_after["nodes"].as_array().unwrap();
             let (code, classes) = real_api(
                 &client,
                 &url,
@@ -1210,6 +1309,51 @@ def sink():
             .await;
             assert_eq!(code, 200, "{name}: {classes}");
             assert_eq!(classes["revision"], pin, "{name}");
+            let measured_classes: Vec<_> = measured
+                .iter()
+                .filter(|node| node["kind"] == "class")
+                .collect();
+            assert_eq!(
+                measured_classes.len(),
+                usize::from(name == "java"),
+                "{name}: expected independently measured class set"
+            );
+            let class_owner = if name == "java" {
+                Some(measured_classes[0]["id"].as_str().unwrap())
+            } else {
+                None
+            };
+            let returned_classes = classes["items"].as_array().unwrap();
+            assert_eq!(
+                returned_classes.len(),
+                measured_classes.len(),
+                "{name}: truthful class catalog"
+            );
+            for class in returned_classes {
+                let symbol = &class["symbol"];
+                assert!(
+                    measured_classes.contains(&symbol),
+                    "{name}: class must be a captured declaration: {class}"
+                );
+                assert_eq!(
+                    symbol["name"], "Flow",
+                    "{name}: only Java has a measured class"
+                );
+                assert_fixture_declaration(
+                    &native_after,
+                    symbol,
+                    file,
+                    "Flow",
+                    "type",
+                    None,
+                    source,
+                );
+            }
+            assert_eq!(
+                returned_classes.len(),
+                usize::from(name == "java"),
+                "{name}"
+            );
             let (code, symbols) = real_api(
                 &client,
                 &url,
@@ -1229,36 +1373,219 @@ def sink():
                 .expect("measured seed declaration")["id"]
                 .as_str()
                 .unwrap();
-            for (route, body) in [
-                (
-                    "/api/navigation",
-                    serde_json::json!({"expectedRevision":pin,"path":file,"line":1}),
-                ),
-                (
-                    "/api/sequence",
-                    serde_json::json!({"expectedRevision":pin,"seed":seed}),
-                ),
-            ] {
-                let (code, result) = real_api(
-                    &client,
-                    &url,
-                    TOKEN,
-                    reqwest::Method::POST,
-                    route,
-                    Some(body),
-                )
-                .await;
-                assert_eq!(code, 200, "{name}: {route}: {result}");
-                assert_eq!(result["revision"], pin, "{name}: {route}");
+            let measured_seed = measured.iter().find(|node| node["id"] == seed).unwrap();
+            assert_eq!(measured_seed["path"], file, "{name}");
+            let callable_kind = if name == "java" { "method" } else { "function" };
+            assert_fixture_declaration(
+                &native_after,
+                measured_seed,
+                file,
+                "seed",
+                callable_kind,
+                class_owner,
+                source,
+            );
+            let (code, navigation) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::POST,
+                "/api/navigation",
+                Some(serde_json::json!({"expectedRevision":pin,"path":file,"line":1})),
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {navigation}");
+            assert_eq!(navigation["revision"], pin, "{name}");
+            let targets = navigation["targets"].as_array().unwrap();
+            assert!(
+                targets.iter().any(|target| target["symbol"]["id"] == seed),
+                "{name}: source line must navigate to measured seed: {navigation}"
+            );
+            for target in targets {
+                let symbol = &target["symbol"];
+                assert_eq!(symbol["path"], file, "{name}");
+                assert_eq!(target["matchKind"], "measured", "{name}");
                 assert!(
-                    !result.to_string().contains("lexical-guess"),
-                    "{name}: {route}"
+                    measured.iter().any(|node| node == symbol),
+                    "{name}: navigation only to captured symbol: {target}"
                 );
-                assert!(
-                    !result.to_string().contains(r#""resolution":"internal""#),
-                    "{name}: {route}"
-                );
+                let target_name = symbol["name"].as_str().unwrap();
+                match target_name {
+                    "Flow" if name == "java" => assert_fixture_declaration(
+                        &native_after,
+                        symbol,
+                        file,
+                        "Flow",
+                        "type",
+                        None,
+                        source,
+                    ),
+                    "seed" | "sink" => assert_fixture_declaration(
+                        &native_after,
+                        symbol,
+                        file,
+                        target_name,
+                        callable_kind,
+                        class_owner,
+                        source,
+                    ),
+                    _ => panic!("{name}: unexpected navigation declaration {target}"),
+                }
             }
+            let (code, sequence) = real_api(
+                &client,
+                &url,
+                TOKEN,
+                reqwest::Method::POST,
+                "/api/sequence",
+                Some(serde_json::json!({"expectedRevision":pin,"seed":seed})),
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: {sequence}");
+            assert_eq!(sequence["revision"], pin, "{name}");
+            assert_eq!(
+                sequence["seed"], *measured_seed,
+                "{name}: sequence selected wrong seed"
+            );
+            let graph_calls = graph_after["calls"].as_array().unwrap();
+            let native_calls = native_after["allRows"]["native_calls"].as_array().unwrap();
+            assert_eq!(
+                graph_calls.len(),
+                1,
+                "{name}: fixture has exactly one measured sink call"
+            );
+            assert_eq!(
+                native_calls.len(),
+                1,
+                "{name}: exactly one native sink call"
+            );
+            let call = &graph_calls[0];
+            let native_call = &native_calls[0];
+            let expected_start = source.find("sink()").unwrap();
+            let expected_end = expected_start + "sink()".len();
+            assert_eq!(source.get(expected_start..expected_end), Some("sink()"));
+            assert_eq!(call["caller"], seed, "{name}: measured call owner");
+            assert_eq!(call["path"], file, "{name}: measured call path");
+            assert_eq!(call["calleeText"], "sink", "{name}: measured call spelling");
+            assert_eq!(call["range"]["startByte"], expected_start, "{name}");
+            assert_eq!(call["range"]["endByte"], expected_end, "{name}");
+            assert_eq!(
+                native_call[0], call["id"],
+                "{name}: same measured native call ID"
+            );
+            assert_eq!(native_call[1], seed, "{name}: native call owner");
+            assert_eq!(
+                native_call[3], native_after["sourceSet"]["id"],
+                "{name}: call source set"
+            );
+            assert_eq!(
+                native_call[6], native_after["revision"]["id"],
+                "{name}: call revision"
+            );
+            assert_eq!(native_call[4], name, "{name}: native language");
+            assert_eq!(native_call[5], file, "{name}: native call path");
+            assert_eq!(native_call[7], expected_start, "{name}: native start byte");
+            assert_eq!(native_call[8], expected_end, "{name}: native end byte");
+            assert_eq!(native_call[11], "sink", "{name}: native callee spelling");
+            fn measured_steps(
+                steps: &[Value],
+                file: &str,
+                text: &str,
+                calls: &[Value],
+                native: &[Value],
+                seen: &mut Vec<String>,
+                flattened: &mut Vec<Value>,
+            ) {
+                for step in steps {
+                    flattened.push(step.clone());
+                    assert_eq!(step["path"], file, "sequence step path: {step}");
+                    let start = step["range"]["startByte"].as_u64().unwrap() as usize;
+                    let end = step["range"]["endByte"].as_u64().unwrap() as usize;
+                    assert!(
+                        start <= end && end <= text.len(),
+                        "step outside captured source: {step}"
+                    );
+                    assert!(
+                        step.get("target").is_none() && step.get("resolution").is_none(),
+                        "syntax must never infer dispatch: {step}"
+                    );
+                    if let Some(id) = step["callId"].as_str() {
+                        let call = calls
+                            .iter()
+                            .find(|call| call["id"] == id)
+                            .expect("measured graph call");
+                        assert_eq!(step["path"], call["path"]);
+                        assert_eq!(step["range"], call["range"]);
+                        assert!(
+                            native.iter().any(|row| row[0] == id),
+                            "native call ID absent: {id}"
+                        );
+                        seen.push(id.to_owned());
+                    }
+                    for branch in ["children", "alternate"] {
+                        measured_steps(
+                            step[branch].as_array().unwrap(),
+                            file,
+                            text,
+                            calls,
+                            native,
+                            seen,
+                            flattened,
+                        );
+                    }
+                }
+            }
+            let mut seen = Vec::new();
+            let mut flattened = Vec::new();
+            measured_steps(
+                sequence["steps"].as_array().unwrap(),
+                file,
+                source,
+                graph_calls,
+                native_calls,
+                &mut seen,
+                &mut flattened,
+            );
+            assert_eq!(
+                seen,
+                vec![call["id"].as_str().unwrap().to_owned()],
+                "{name}: exactly one source-witnessed sink call and no duplicate/extra call IDs"
+            );
+            assert_eq!(
+                flattened.len(),
+                1,
+                "{name}: no invented null-call/control steps: {sequence}"
+            );
+            let step = &flattened[0];
+            assert_eq!(step["kind"], "call", "{name}");
+            assert_eq!(step["callId"], call["id"], "{name}");
+            assert_eq!(step["label"], "sink", "{name}");
+            assert_eq!(step["path"], file, "{name}");
+            assert_eq!(step["range"], call["range"], "{name}");
+            assert_eq!(source.get(expected_start..expected_end), Some("sink()"));
+            let expected_seed: baleyg::model::Symbol =
+                serde_json::from_value(measured_seed.clone()).unwrap();
+            let expected_file: baleyg::model::SourceFile =
+                serde_json::from_value(graph_files[0].clone()).unwrap();
+            let expected_calls: Vec<baleyg::model::CallSite> = graph_calls
+                .iter()
+                .map(|call| serde_json::from_value(call.clone()).unwrap())
+                .collect();
+            let expected_pin: baleyg::model::IndexPin =
+                serde_json::from_value(pin.clone()).unwrap();
+            let expected_sequence = baleyg::behavior::build_sequence(
+                expected_pin,
+                &expected_seed,
+                &expected_file,
+                &expected_calls,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                sequence["steps"],
+                serde_json::json!(expected_sequence.steps),
+                "{name}: no extra invented or null-call steps beyond captured source projection"
+            );
             let (code, preview) = real_api(
                 &client,
                 &url,
@@ -1271,9 +1598,42 @@ def sink():
             )
             .await;
             assert_eq!(code, 200, "{name}: {preview}");
-            assert_eq!(preview["packet"]["revision"], pin, "{name}");
+            let preview_packet = &preview["packet"];
+            assert_eq!(preview_packet["revision"], pin, "{name}");
+            assert_eq!(preview_packet["request"]["expectedRevision"], pin, "{name}");
+            assert_eq!(preview_packet["request"]["seed"], seed, "{name}");
+            assert_eq!(preview_packet["context"]["revision"], pin, "{name}");
+            assert_eq!(preview_packet["context"]["query"]["seed"], seed, "{name}");
+            assert_eq!(
+                preview_packet["context"]["nodes"],
+                serde_json::json!([measured_seed]),
+                "{name}: packet must contain the exact selected graph/native seed"
+            );
+            assert_eq!(
+                preview_packet["sourceFiles"],
+                serde_json::json!([graph_files[0]]),
+                "{name}: packet must cite exact selected captured source"
+            );
+            let selected_calls = preview_packet["context"]["calls"].as_array().unwrap();
+            assert_eq!(
+                selected_calls.len(),
+                1,
+                "{name}: exactly one preview sink call"
+            );
+            assert_eq!(
+                selected_calls[0], *call,
+                "{name}: preview must cite the full measured native/graph call"
+            );
+            assert!(
+                graph_after["regions"].as_array().unwrap().is_empty(),
+                "{name}: simple seed-to-sink fixture has no control region"
+            );
+            assert_eq!(
+                preview_packet["context"]["regions"], graph_after["regions"],
+                "{name}: no fabricated preview control regions"
+            );
             assert!(!preview.to_string().contains("lexical-guess"), "{name}");
-            let packet = preview["packet"]["packetId"].as_str().unwrap();
+            let packet = preview_packet["packetId"].as_str().unwrap();
             let (code, export) = real_api(
                 &client,
                 &url,
@@ -1284,6 +1644,90 @@ def sink():
             )
             .await;
             assert_eq!(code, 200, "{name}: {export}");
+            assert_eq!(
+                export["state"]["identityPaths"],
+                serde_json::json!(["/request/seed", "/context/query/seed"]),
+                "{name}: canonical identity paths"
+            );
+            assert_eq!(
+                export["state"]["rangeColumns"],
+                serde_json::json!([
+                    "startByte",
+                    "endByte",
+                    "startLine",
+                    "startColumn",
+                    "endLine",
+                    "endColumn"
+                ]),
+                "{name}: canonical source range columns"
+            );
+            for (table, columns) in [
+                ("nodes", serde_json::json!(["id", "parent"])),
+                ("calls", serde_json::json!(["id", "caller", "regions"])),
+                ("regions", serde_json::json!(["id", "parent", "owner"])),
+            ] {
+                assert_eq!(
+                    export["state"]["packet"]["context"][table]["identityColumns"], columns,
+                    "{name}: canonical {table} identity columns"
+                );
+            }
+            let wire = &export["state"]["packet"];
+            assert_eq!(
+                wire["packetId"], packet,
+                "{name}: cached export packet identity"
+            );
+            assert_eq!(wire["revision"], pin, "{name}");
+            assert_eq!(wire["request"]["expectedRevision"], pin, "{name}");
+            assert_eq!(wire["context"]["revision"], pin, "{name}");
+            assert_eq!(
+                wire["sourceFiles"], preview_packet["sourceFiles"],
+                "{name}: cached source witness"
+            );
+            let identities = export["state"]["identities"].as_array().unwrap();
+            for index in [
+                wire["request"]["seed"].as_u64().unwrap(),
+                wire["context"]["query"]["seed"].as_u64().unwrap(),
+            ] {
+                assert_eq!(
+                    identities[index as usize], seed,
+                    "{name}: encoded seed identity"
+                );
+            }
+            let mut decoded = wire.clone();
+            decoded["request"]["seed"] = serde_json::json!(seed);
+            decoded["context"]["query"]["seed"] = serde_json::json!(seed);
+            for table in ["nodes", "calls", "regions"] {
+                let rows = decoded_jev_rows(&export, table);
+                if table == "nodes" || table == "calls" {
+                    assert!(
+                        !rows.is_empty(),
+                        "{name}: cached {table} witness cannot be empty"
+                    );
+                }
+                decoded["context"][table] = serde_json::json!(rows);
+            }
+            assert_eq!(
+                decoded, *preview_packet,
+                "{name}: lossless cached export must equal the entire selected measured packet"
+            );
+            let question_keys: Vec<_> = export["questions"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            let mut expected_keys: Vec<_> = (0..selected_calls.len())
+                .map(|i| format!("c{i}_{packet}"))
+                .collect();
+            expected_keys.sort();
+            assert!(
+                !expected_keys.is_empty(),
+                "{name}: expected measured seed call questions"
+            );
+            assert_eq!(
+                question_keys, expected_keys,
+                "{name}: cached questions bind selected packet/calls"
+            );
             assert!(!export.to_string().contains("lexical-guess"), "{name}");
         }
         let stale = request().bearer_auth(TOKEN).send().await.unwrap();
@@ -1641,5 +2085,105 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         completed["revision"]["indexRevision"],
         pin["indexRevision"].as_u64().unwrap() + 1
     );
+    use sha2::{Digest, Sha256};
+    let new_pin = &completed["revision"];
+    let (code, published) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{published}");
+    assert_eq!(
+        published["revision"], *new_pin,
+        "retry must publish full new pin"
+    );
+    assert_eq!(published["stats"]["files"], 81);
+    let native_after = real_native_snapshot(&home);
+    let graph_after = real_export(&root, &home);
+    assert_ne!(
+        native_after, native_before,
+        "retry must replace normalized evidence rows"
+    );
+    assert_ne!(graph_after, graph_before, "retry must replace graph rows");
+    assert_eq!(
+        native_after["sourceSet"], native_before["sourceSet"],
+        "source set retains this root/language catalog"
+    );
+    assert_ne!(
+        native_after["revision"]["id"], native_before["revision"]["id"],
+        "added source bytes must create a new native revision"
+    );
+    assert_eq!(
+        native_after["revision"]["sourceSetId"],
+        native_after["sourceSet"]["id"]
+    );
+    let root_id =
+        baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .unwrap()
+            .record_id;
+    assert_eq!(native_after["sourceSet"]["rootId"], root_id);
+    let documents = native_after["documents"].as_array().unwrap();
+    let files = graph_after["files"].as_array().unwrap();
+    assert_eq!(documents.len(), 81);
+    assert_eq!(files.len(), 81);
+    for doc in documents {
+        let path = doc["path"].as_str().unwrap();
+        let expected = if path == "flow.js" {
+            original.to_owned()
+        } else {
+            let index = path
+                .strip_prefix("extra")
+                .and_then(|suffix| suffix.strip_suffix(".js"))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert!(index < 80, "unexpected published source path: {path}");
+            format!("// {padding}\nfunction extra{index}() {{}}\n")
+        };
+        let graph = files.iter().find(|file| file["path"] == path).unwrap();
+        assert_eq!(graph["text"], expected, "{path}: retry graph source bytes");
+        assert_eq!(graph["language"], "javascript", "{path}");
+        assert_eq!(doc["language"], graph["language"], "{path}");
+        assert_eq!(
+            doc["sourceSetId"], native_after["sourceSet"]["id"],
+            "{path}"
+        );
+        assert_eq!(doc["revisionId"], native_after["revision"]["id"], "{path}");
+        assert_eq!(doc["byteLength"], expected.len(), "{path}");
+        assert_eq!(doc["bytesHex"], hex::encode(expected.as_bytes()), "{path}");
+        assert_eq!(
+            doc["contentHash"],
+            hex::encode(Sha256::digest(expected.as_bytes())),
+            "{path}"
+        );
+        assert_eq!(doc["contentHash"], graph["hash"], "{path}");
+        let route = format!(
+            "/api/source?path={path}&indexGeneration={}&indexRevision={}",
+            new_pin["indexGeneration"].as_str().unwrap(),
+            new_pin["indexRevision"].as_u64().unwrap()
+        );
+        let (code, source) =
+            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+        assert_eq!(code, 200, "{path}: {source}");
+        assert_eq!(
+            source["revision"], *new_pin,
+            "{path}: authenticated full pin"
+        );
+        assert_eq!(
+            source["file"], *graph,
+            "{path}: pinned source matches paired graph/native"
+        );
+    }
+    for i in 0..80 {
+        let path = format!("extra{i:03}.js");
+        assert!(
+            documents.iter().any(|doc| doc["path"] == path),
+            "missing retry document: {path}"
+        );
+    }
     drop(server);
 }
