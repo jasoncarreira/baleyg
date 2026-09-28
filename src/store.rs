@@ -1214,7 +1214,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                 );
                 if key.starts_with("executable:") {
                     ensure!(
-                        executable.replace(key.clone()).is_none(),
+                        executable.replace(key.to_owned()).is_none(),
                         "incompatible_index: duplicate executable input"
                     );
                 }
