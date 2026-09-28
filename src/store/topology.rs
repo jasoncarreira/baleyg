@@ -1212,17 +1212,7 @@ fn inspect_index(dir: &Path, key: &str, now_secs: i64) -> Result<(&'static str, 
     // GC may classify only the two exact cache formats this binary knows.
     // The same structural and extractor-marker check applies before it can
     // declare an index eligible for deletion or report it as recently opened.
-    let defined = db.prepare("SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'")?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
-    let expected: std::collections::BTreeSet<String> =
-        format!("{}{}", super::CACHE_SCHEMA, super::CLASS_SCHEMA)
-            .split(';')
-            .map(str::trim)
-            .filter(|sql| !sql.is_empty())
-            .map(str::to_owned)
-            .collect();
-    ensure!(defined == expected, "incompatible index shape");
+    super::validate_cache_shape(&db)?;
     let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
     ensure!(count == 1, "incompatible index metadata cardinality");
     let (schema, extractor, spelling, dev, ino, age): (i64, String, String, String, String, rusqlite::types::Value) = db.query_row(

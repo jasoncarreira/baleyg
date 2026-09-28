@@ -364,28 +364,76 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
             )
             .is_err()
     );
-    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let prior = store.status().unwrap().revision;
+    let leader = store.leader().unwrap();
+    let path = index_db(&dir.path().join("state"));
+    let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("CREATE TRIGGER fail_projection BEFORE INSERT ON class_relations BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
+    let unchanged = std::fs::read(&path).unwrap();
     assert!(
         store
-            .publish(
-                &graph,
-                &store.leader().unwrap(),
-                baleyg::model::IndexPin {
-                    index_generation: store.status().unwrap().revision.index_generation,
-                    index_revision: 1
-                },
-                &cancel()
-            )
-            .is_err()
+            .leader()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
     );
-    assert_eq!(store.status().unwrap().revision.index_revision, 1);
+    let rejected = store
+        .publish(&graph, &leader, prior, &cancel())
+        .unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("incompatible_index: unknown cache object"),
+        "{rejected:#}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), unchanged);
+    let (version, marker, generation, revision): (i64, String, String, i64) = db
+        .query_row("SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+    assert_eq!(
+        (version, marker.as_str(), generation, revision),
+        (
+            5,
+            "native-no-lexical-v1",
+            prior.index_generation.to_string(),
+            prior.index_revision as i64
+        )
+    );
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    assert!(
+        store
+            .class_diagram_at(&q)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    assert!(
+        store
+            .graph()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    db.execute_batch("DROP TRIGGER fail_projection").unwrap();
+    drop(db);
+    drop(leader);
+    assert_eq!(store.status().unwrap().revision, prior);
     assert_eq!(
         serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap(),
         before
     );
     assert_eq!(store.graph().unwrap().nodes, graph.nodes);
-    db.execute_batch("DROP TRIGGER fail_projection").unwrap();
     assert!(
         store
             .publish(

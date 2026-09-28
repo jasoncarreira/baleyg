@@ -755,6 +755,63 @@ fn legacy_cache_is_control_only_until_lock_safe_rebaseline_rotates_full_pair() {
     assert!(rejected.is_err());
     assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
     assert!(store.status().is_err());
+    let assert_old = || {
+        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        assert_eq!(store.index_baseline().unwrap(), first);
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
+        assert!(
+            store
+                .graph()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let (version, marker): (i64, String) = db
+            .query_row(
+                "SELECT schema_version,extractor_version FROM index_metadata",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((version, marker.as_str()), (4, "native-v1"));
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+    };
+    let mut stale = first;
+    stale.index_revision += 1;
+    assert!(
+        store
+            .publish_captured(&graph, &capture, &store.leader().unwrap(), stale, &cancel())
+            .unwrap_err()
+            .to_string()
+            .starts_with("revision conflict")
+    );
+    assert_old();
+    let (_other_state, _other_work, other_store) = fixture();
+    assert!(
+        store
+            .publish_captured(
+                &graph,
+                &capture,
+                &other_store.leader().unwrap(),
+                first,
+                &cancel()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("leader")
+    );
+    assert_old();
     // The captured source, root, use and leader locks, and full expected pair all
     // participate in the same SQLite transaction before the new marker appears.
     let next = store
@@ -786,5 +843,279 @@ fn legacy_cache_is_control_only_until_lock_safe_rebaseline_rotates_full_pair() {
             .unwrap_err()
             .to_string()
             .starts_with("revision conflict")
+    );
+}
+
+#[test]
+fn legacy_unknown_trigger_is_refused_before_any_rebaseline_write_or_forged_export() {
+    use baleyg::indexer::{IndexOptions, index_workspace_with_capture};
+    let (state, work, store) = fixture();
+    std::fs::write(work.path().join("a.js"), "function foo() { bar(); }\n").unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let (graph, capture) = index_workspace_with_capture(&options, &cancel(), |_| {}).unwrap();
+    let first = store
+        .publish_captured(
+            &graph,
+            &capture,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel(),
+        )
+        .unwrap();
+    let path = index_db(state.path());
+    let leader = store.leader().unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+        [],
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER forged_call AFTER INSERT ON calls BEGIN
+        UPDATE calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
+        WHERE id=NEW.id; END;",
+    )
+    .unwrap();
+    drop(db);
+    let old_bytes = std::fs::read(&path).unwrap();
+    assert!(
+        Store::open_for_tests(state.path(), work.path())
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index: unknown cache object")
+    );
+    let error = store
+        .publish_captured(&graph, &capture, &leader, first, &cancel())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("incompatible_index: unknown cache object"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    assert!(
+        store
+            .graph()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let (version, generation, revision): (i64, String, i64) = db
+        .query_row(
+            "SELECT schema_version,index_generation,index_revision FROM index_metadata",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (version, generation, revision),
+        (
+            4,
+            first.index_generation.to_string(),
+            first.index_revision as i64
+        )
+    );
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    let forged: i64 = db
+        .query_row(
+            "SELECT count(*) FROM calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        forged, 0,
+        "unknown trigger executed during rejected rebaseline"
+    );
+}
+
+#[test]
+fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervenes() {
+    let (state, work, store) = fixture();
+    let before = store
+        .publish(
+            &graph(),
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel(),
+        )
+        .unwrap();
+    let leader = store.leader().unwrap();
+    let path = index_db(state.path());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("CREATE VIEW unapproved_view AS SELECT 1")
+        .unwrap();
+    drop(db);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        Store::open_for_tests(state.path(), work.path())
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index: unknown cache object")
+    );
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    assert!(
+        store
+            .graph()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    assert!(
+        store
+            .publish(&graph(), &leader, before, &cancel())
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("DROP VIEW unapproved_view").unwrap();
+    assert_eq!(store.status().unwrap().revision, before);
+}
+
+#[test]
+fn legacy_rebaseline_changed_root_refuses_without_rewriting_known_old_bytes() {
+    use baleyg::indexer::{IndexOptions, index_workspace_with_capture};
+    let (state, work, store) = fixture();
+    std::fs::write(work.path().join("a.js"), "function one() { foo(); }\n").unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let (graph, capture) = index_workspace_with_capture(&options, &cancel(), |_| {}).unwrap();
+    let old = store
+        .publish_captured(
+            &graph,
+            &capture,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel(),
+        )
+        .unwrap();
+    let path = index_db(state.path());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+        [],
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    drop(db);
+    let old_bytes = std::fs::read(&path).unwrap();
+    let leader = store.leader().unwrap();
+    let moved = work.path().with_extension("temporarily-moved");
+    std::fs::rename(work.path(), &moved).unwrap();
+    let refused = store
+        .publish_captured(&graph, &capture, &leader, old, &cancel())
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("root_changed") || refused.to_string().contains("root drift")
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+    std::fs::rename(moved, work.path()).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let pair: (i64, String, String, i64) = db.query_row(
+        "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+    assert_eq!(
+        pair,
+        (
+            4,
+            "native-v1".into(),
+            old.index_generation.to_string(),
+            old.index_revision as i64
+        )
+    );
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+}
+
+#[test]
+fn legacy_rebaseline_capture_drift_after_partial_write_preserves_old_bytes() {
+    use baleyg::indexer::{IndexOptions, index_workspace_with_capture};
+    let (state, work, store) = fixture();
+    let source = work.path().join("a.js");
+    std::fs::write(&source, "function one() { foo(); }\n").unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let (graph, capture) = index_workspace_with_capture(&options, &cancel(), |_| {}).unwrap();
+    let old = store
+        .publish_captured(
+            &graph,
+            &capture,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel(),
+        )
+        .unwrap();
+    let path = index_db(state.path());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+        [],
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    drop(db);
+    let old_bytes = std::fs::read(&path).unwrap();
+    let leader = store.leader().unwrap();
+    // Capture verifies again after all projection INSERTs and metadata UPDATE.
+    std::fs::write(&source, "function changed() { notInCapture(); }\n").unwrap();
+    let refused = store
+        .publish_captured(&graph, &capture, &leader, old, &cancel())
+        .unwrap_err();
+    assert!(refused.to_string().contains("drift"), "{refused:#}");
+    assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let pair: (i64, String, String, i64) = db.query_row(
+        "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+    assert_eq!(
+        pair,
+        (
+            4,
+            "native-v1".into(),
+            old.index_generation.to_string(),
+            old.index_revision as i64
+        )
+    );
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
     );
 }

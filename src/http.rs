@@ -1401,40 +1401,50 @@ async fn start_index(
                 .publish_captured(&graph, &capture, &leader, baseline, &worker_cancel)
         })
         .await;
-        let mut jobs = s.jobs.lock().unwrap();
-        let j = jobs.jobs.get_mut(&id).unwrap();
-        match result {
-            Ok(Ok(revision)) => {
-                j.state = "completed".into();
-                j.revision = Some(revision)
-            }
-            Ok(Err(e)) => {
-                if cancel.load(Ordering::Acquire) {
-                    j.state = "cancelled".into()
-                } else {
-                    j.state = "failed".into();
-                    let code = if e.to_string().starts_with("revision conflict") {
-                        "revision_conflict"
-                    } else {
-                        "index_failed"
-                    };
-                    j.error = Some(json!({"code":code,"message":"Index job failed"}));
-                }
-            }
-            Err(_) => {
-                j.state = "failed".into();
-                j.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
-            }
-        }
-        j.finished_at = Some(now());
-        let completed = j.state == "completed";
-        drop(jobs);
-        if completed {
-            *s.packets.lock().unwrap() = PacketCache::default();
-            s.start_dependency_index();
-        }
+        let outcome = match result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("index worker failed")),
+        };
+        finish_index_job(&s, &id, outcome, &cancel);
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
+}
+// A failed publication cannot release cached packet ownership. Only a committed
+// revision transition clears packets; old barriers still block their public reads.
+fn finish_index_job(
+    s: &Arc<DaemonState>,
+    id: &str,
+    result: anyhow::Result<IndexPin>,
+    cancel: &CancelFlag,
+) {
+    let mut jobs = s.jobs.lock().unwrap();
+    let job = jobs.jobs.get_mut(id).expect("started index job");
+    match result {
+        Ok(revision) => {
+            job.state = "completed".into();
+            job.revision = Some(revision);
+        }
+        Err(error) if cancel.load(Ordering::Acquire) => {
+            let _ = error;
+            job.state = "cancelled".into();
+        }
+        Err(error) => {
+            job.state = "failed".into();
+            let code = if error.to_string().starts_with("revision conflict") {
+                "revision_conflict"
+            } else {
+                "index_failed"
+            };
+            job.error = Some(json!({"code":code,"message":"Index job failed"}));
+        }
+    }
+    job.finished_at = Some(now());
+    let completed = job.state == "completed";
+    drop(jobs);
+    if completed {
+        *s.packets.lock().unwrap() = PacketCache::default();
+        s.start_dependency_index();
+    }
 }
 async fn current_job(State(s): State<Arc<DaemonState>>) -> Json<Option<IndexJob>> {
     let jobs = s.jobs.lock().unwrap();
@@ -2286,5 +2296,134 @@ mod dependency_lifecycle_tests {
         let generation = state.dependencies.lock().unwrap().generation;
         state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
         assert!(state.catalog_snapshot(pin1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rebaseline_packet_cache_tests {
+    use super::*;
+    use crate::indexer::index_workspace_with_capture;
+    use std::{fs, sync::atomic::AtomicBool};
+
+    #[test]
+    fn failed_known_old_commit_keeps_private_packet_cache_success_clears_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("one.js"), "function go() { measured(); }\n").unwrap();
+        let options = IndexOptions::new(workspace.clone());
+        let ready = Arc::new(AtomicBool::new(false));
+        let (graph, capture) = index_workspace_with_capture(&options, &ready, |_| {}).unwrap();
+        let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+        let old = store
+            .publish_captured(
+                &graph,
+                &capture,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &ready,
+            )
+            .unwrap();
+        let db_path = fs::read_dir(temp.path().join("state/cache/indexes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap()
+            .join("index.db");
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        drop(db);
+        let old_bytes = fs::read(&db_path).unwrap();
+        let state = new(
+            store.clone(),
+            options,
+            "0123456789abcdef".repeat(4),
+            "127.0.0.1:7332".parse().unwrap(),
+        )
+        .unwrap();
+        let seed = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "go")
+            .unwrap()
+            .id
+            .clone();
+        let packet = Arc::new(QuestionPacket {
+            packet_id: "cached-before-old".into(),
+            revision: old,
+            request: QuestionRequest {
+                seed: seed.clone(),
+                question: "what?".into(),
+                expected_revision: old,
+                evidence_depth: 0,
+                max_visible: 1,
+                allow_deeper_display: false,
+                focus_terms: vec![],
+            },
+            context: ViewResult {
+                revision: old,
+                query: ViewQuery {
+                    seed,
+                    depth: 0,
+                    max_nodes: 1,
+                    max_calls: 1,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                nodes: vec![],
+                calls: vec![],
+                regions: vec![],
+                truncated: false,
+                omitted_nodes: 0,
+                warnings: vec![],
+            },
+            source_files: vec![],
+            warnings: vec![],
+        });
+        state.packets.lock().unwrap().remember(packet, 128);
+        let register = |id: &str| {
+            state.jobs.lock().unwrap().jobs.insert(
+                id.into(),
+                IndexJob {
+                    id: id.into(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            )
+        };
+        register("failed");
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = store
+            .publish_captured(&graph, &capture, &store.leader().unwrap(), old, &cancelled)
+            .unwrap_err();
+        finish_index_job(&state, "failed", Err(error), &cancelled);
+        assert_eq!(state.jobs.lock().unwrap().jobs["failed"].state, "cancelled");
+        assert_eq!(state.packets.lock().unwrap().packets.len(), 1);
+        assert_eq!(state.packets.lock().unwrap().bytes, 128);
+        assert_eq!(fs::read(&db_path).unwrap(), old_bytes);
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
+        register("committed");
+        let revision = store
+            .publish_captured(&graph, &capture, &store.leader().unwrap(), old, &ready)
+            .unwrap();
+        finish_index_job(&state, "committed", Ok(revision), &ready);
+        assert_ne!(revision.index_generation, old.index_generation);
+        assert_eq!(state.packets.lock().unwrap().packets.len(), 0);
+        assert_eq!(state.packets.lock().unwrap().bytes, 0);
     }
 }

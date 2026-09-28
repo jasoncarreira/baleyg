@@ -84,6 +84,13 @@ pub enum SymbolKind {
     Function,
     Method,
     Class,
+    /// Measured declarations that are not executable graph entries. Keep their #22 IDs,
+    /// parent chains and source ranges without misrepresenting them as functions.
+    Field,
+    Variable,
+    Parameter,
+    TypeParameter,
+    Alias,
 }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

@@ -2042,6 +2042,10 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
         .unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
     db.execute_batch("DROP TABLE unsupported").unwrap();
+    db.execute_batch("CREATE VIEW unapproved_view AS SELECT 1")
+        .unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.execute_batch("DROP VIEW unapproved_view").unwrap();
     db.pragma_update(None, "user_version", 6).unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
     db.pragma_update(None, "user_version", 5).unwrap();
@@ -2052,6 +2056,10 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
     )
     .unwrap();
     db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(inspect(), ("unknown", "recent_open"));
+    db.execute_batch("CREATE TRIGGER unapproved_trigger AFTER INSERT ON calls BEGIN SELECT RAISE(FAIL,'FORGED'); END;").unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();

@@ -163,18 +163,33 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     fs::write(root.join("flow.js"), "function after() { c(); d(); }\n").unwrap();
     let next = index_workspace(&options, &cancel, |_| {}).unwrap();
     let id = next.calls[1].id.replace('\'', "''");
+    let leader = store.leader().unwrap();
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch(&format!("CREATE TRIGGER abort_second_call BEFORE INSERT ON calls WHEN NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'injected post-write failure'); END;")).unwrap();
     drop(db);
+    let unchanged = fs::read(index_db(&state)).unwrap();
     let failure = store
-        .publish(&next, &store.leader().unwrap(), revision, &cancel)
+        .publish(&next, &leader, revision, &cancel)
         .unwrap_err();
-    assert!(failure.to_string().contains("injected post-write failure"));
-    assert_eq!(store.status().unwrap().revision, revision);
-    assert_eq!(store.graph().unwrap(), first);
+    assert!(
+        failure
+            .to_string()
+            .contains("incompatible_index: unknown cache object")
+    );
+    assert_eq!(fs::read(index_db(&state)).unwrap(), unchanged);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch("DROP TRIGGER abort_second_call").unwrap();
     drop(db);
+    drop(leader);
+    assert_eq!(store.status().unwrap().revision, revision);
+    assert_eq!(store.graph().unwrap(), first);
     let next_revision = store
         .publish(&next, &store.leader().unwrap(), revision, &cancel)
         .unwrap();

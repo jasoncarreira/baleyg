@@ -430,3 +430,42 @@ fn scores_never_promote_lower_labels_or_override_direct_display_policy() {
         assert_eq!(v.policy_hidden_count, 0);
     }
 }
+
+#[test]
+fn variable_question_packet_is_source_only_not_an_executable_seed() {
+    let source = "function seed(arg) { const value = arg; return value; }\n";
+    let (_work, _state, store, graph, mut request) = fixture(source);
+    let variable = graph.nodes.iter().find(|n| n.name == "value").unwrap();
+    assert_eq!(variable.kind, SymbolKind::Variable);
+    request.seed = variable.id.clone();
+    request.question = "What source declares value?".into();
+    let packet = prepare(&store, request).unwrap();
+    assert_eq!(packet.context.nodes, vec![variable.clone()]);
+    assert!(packet.context.calls.is_empty());
+    assert!(packet.context.regions.is_empty());
+    assert_eq!(packet.source_files.len(), 1);
+    assert_eq!(packet.source_files[0].text, source);
+    assert_eq!(packet.context.revision, packet.revision);
+    assert!(
+        packet
+            .warnings
+            .iter()
+            .any(|w| w.contains("source-only") && w.contains("noncallable"))
+    );
+    let preview = preview(&packet).unwrap();
+    assert!(preview.decisions.is_empty());
+    let view = assemble(&packet, &preview, "manual").unwrap();
+    assert_eq!(view.nodes, vec![variable.clone()]);
+    assert!(view.calls.is_empty());
+    assert!(view.regions.is_empty());
+    assert!(
+        !serde_json::to_string(&packet)
+            .unwrap()
+            .contains("candidateSymbols")
+    );
+    assert!(
+        !serde_json::to_string(&packet)
+            .unwrap()
+            .contains("\"target\"")
+    );
+}

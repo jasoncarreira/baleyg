@@ -164,6 +164,18 @@ pub fn prepare(store: &Store, request: QuestionRequest) -> Result<QuestionPacket
         context.revision == request.expected_revision,
         "revision conflict: graph changed during question preparation"
     );
+    let noncallable = context
+        .nodes
+        .first()
+        .is_some_and(|node| !matches!(node.kind, SymbolKind::Function | SymbolKind::Method));
+    // A variable/field/parameter/alias is a measured declaration, not an entry
+    // point. Retain its exact source, but refuse any supposed execution evidence.
+    if noncallable {
+        ensure!(
+            context.nodes.len() == 1 && context.calls.is_empty() && context.regions.is_empty(),
+            "noncallable question seed cannot carry executable evidence"
+        );
+    }
     let paths: BTreeSet<_> = context
         .nodes
         .iter()
@@ -189,7 +201,11 @@ pub fn prepare(store: &Store, request: QuestionRequest) -> Result<QuestionPacket
         "revision conflict: graph changed during question preparation"
     );
     let mut warnings = context.warnings.clone();
-    warnings.push("Bounded terminal evidence only: selected declaration and its measured calls/regions; no target or callback traversal. This is not a complete program or answer.".into());
+    warnings.push(if noncallable {
+        "Bounded source-only evidence: selected noncallable declaration, with no executable calls, target, or callback traversal. This is not a complete program or answer."
+    } else {
+        "Bounded terminal evidence only: selected declaration and its measured calls/regions; no target or callback traversal. This is not a complete program or answer."
+    }.into());
     let mut packet = QuestionPacket {
         packet_id: String::new(),
         revision: context.revision,

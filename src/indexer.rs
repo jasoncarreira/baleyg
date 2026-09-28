@@ -94,13 +94,21 @@ fn measured_range(file: &SourceFile, range: &native_evidence::Range) -> Result<S
         end_column,
     })
 }
-fn graph_kind(kind: &str) -> SymbolKind {
-    match kind {
+fn graph_kind(kind: &str) -> Result<SymbolKind> {
+    // Exhaust the validated #22 declaration vocabulary. Unknown kinds must fail closed,
+    // rather than silently inventing a callable graph node.
+    Ok(match kind {
         "module" | "namespace" => SymbolKind::Module,
         "type" | "implementation" => SymbolKind::Class,
         "method" | "constructor" => SymbolKind::Method,
-        _ => SymbolKind::Function,
-    }
+        "function" | "anonymousFunction" => SymbolKind::Function,
+        "field" => SymbolKind::Field,
+        "variable" => SymbolKind::Variable,
+        "parameter" => SymbolKind::Parameter,
+        "typeParameter" => SymbolKind::TypeParameter,
+        "alias" => SymbolKind::Alias,
+        _ => anyhow::bail!("unknown native declaration kind: {kind}"),
+    })
 }
 fn graph_provenance() -> Provenance {
     Provenance {
@@ -284,7 +292,7 @@ fn project_native(
                 }
             }),
             display_label: display_labels.get(&d.syntax_id).cloned(),
-            kind: graph_kind(&d.kind),
+            kind: graph_kind(&d.kind)?,
             path: d.document.path.clone(),
             range: measured_range(file, &d.range)?,
             parent,

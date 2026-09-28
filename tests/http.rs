@@ -380,7 +380,16 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     use baleyg::indexer::index_workspace_with_capture;
     let (dir, store, _state, app) = setup();
     let workspace = dir.path().join("workspace");
-    std::fs::write(workspace.join("a.js"), "function go() { console.log(1); }").unwrap();
+    std::fs::write(
+        workspace.join("a.js"),
+        "function go() { console.log(1); }\nconst value = 1;",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("Types.java"),
+        "class Types { void run() { System.out.println(1); } }",
+    )
+    .unwrap();
     let options = IndexOptions::new(workspace.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, capture) = index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
@@ -400,6 +409,20 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         .unwrap()
         .id
         .clone();
+    let class_seed = graph
+        .nodes
+        .iter()
+        .find(|node| node.name == "Types")
+        .unwrap()
+        .id
+        .clone();
+    let variable_seed = graph
+        .nodes
+        .iter()
+        .find(|node| node.name == "value")
+        .unwrap()
+        .id
+        .clone();
     let (code, preview) = call(
         &app,
         "POST",
@@ -409,6 +432,7 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     .await;
     assert_eq!(code, StatusCode::OK, "{preview}");
     let packet = preview["packet"]["packetId"].as_str().unwrap();
+    let old_selection = preview["selection"].clone();
     let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -444,6 +468,42 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         ("GET", "/api/files".to_owned(), Value::Null),
         ("GET", "/api/dependencies".to_owned(), Value::Null),
         (
+            "GET",
+            "/api/dependencies/symbols?catalogId=stale&q=go".to_owned(),
+            Value::Null,
+        ),
+        (
+            "GET",
+            "/api/dependencies/source?catalogId=stale&sourceRef=stale".to_owned(),
+            Value::Null,
+        ),
+        ("GET", "/api/methods?path=a.js".to_owned(), Value::Null),
+        ("GET", format!("/api/symbol?id={seed}"), Value::Null),
+        (
+            "GET",
+            format!(
+                "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+                pin.index_generation, pin.index_revision
+            ),
+            Value::Null,
+        ),
+        (
+            "GET",
+            format!(
+                "/api/classes?indexGeneration={}&indexRevision={}",
+                pin.index_generation, pin.index_revision
+            ),
+            Value::Null,
+        ),
+        (
+            "GET",
+            format!(
+                "/api/files?indexGeneration={}&indexRevision={}",
+                pin.index_generation, pin.index_revision
+            ),
+            Value::Null,
+        ),
+        (
             "POST",
             "/api/navigation".to_owned(),
             json!({"expectedRevision":pin,"path":"a.js","line":1}),
@@ -456,7 +516,7 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         (
             "POST",
             "/api/class-diagram".to_owned(),
-            json!({"seed":seed,"expectedRevision":pin}),
+            json!({"seed":class_seed,"expectedRevision":pin}),
         ),
         (
             "POST",
@@ -518,6 +578,37 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         call(&app, "GET", "/api/jev/status", Value::Null).await.0,
         StatusCode::OK
     );
+    // A failed explicit old rebaseline cannot publish or clear a prior question packet.
+    // The old-readiness gate still prevents any cached packet from being served.
+    let old_bytes = std::fs::read(&index).unwrap();
+    let cancelled = Arc::new(AtomicBool::new(true));
+    assert!(
+        store
+            .publish_captured(
+                &graph,
+                &capture,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancelled
+            )
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&index).unwrap(), old_bytes);
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            &format!("/api/questions/{packet}/jev-request"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/status", Value::Null).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     let (code, job) = call(&app, "POST", "/api/index", json!({"expectedRevision":pin})).await;
     assert_eq!(code, StatusCode::ACCEPTED);
     let id = job["id"].as_str().unwrap();
@@ -567,4 +658,264 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
             .iter()
             .all(|call| call.get("target").is_none())
     );
+    let fresh: IndexPin = serde_json::from_value(ready["revision"].clone()).unwrap();
+    assert!(fresh.index_revision > 0);
+    let pinned = |route: &str, revision: &IndexPin| {
+        format!(
+            "{route}{}indexGeneration={}&indexRevision={}",
+            if route.contains('?') { '&' } else { '?' },
+            revision.index_generation,
+            revision.index_revision
+        )
+    };
+    let (status, source) = call(
+        &app,
+        "GET",
+        &pinned("/api/source?path=a.js", &fresh),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{source}");
+    assert_eq!(source["revision"], json!(fresh));
+    assert_eq!(
+        source["file"]["text"],
+        "function go() { console.log(1); }\nconst value = 1;"
+    );
+    let (status, symbol) = call(
+        &app,
+        "GET",
+        &pinned(&format!("/api/symbol?id={seed}"), &fresh),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{symbol}");
+    assert_eq!(symbol["revision"], json!(fresh));
+    assert_eq!(symbol["symbol"]["name"], "go");
+    let (status, search) = call(&app, "GET", "/api/symbols?q=value", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(
+        search["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == variable_seed && item["kind"] == "variable"),
+        "{search}"
+    );
+    let (status, variable) = call(
+        &app,
+        "GET",
+        &pinned(&format!("/api/symbol?id={variable_seed}"), &fresh),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{variable}");
+    assert_eq!(variable["symbol"]["kind"], "variable");
+    let (status, methods) = call(&app, "GET", "/api/methods?path=a.js", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{methods}");
+    assert!(
+        methods["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["symbol"]["id"] != variable_seed)
+    );
+    let (status, files) = call(&app, "GET", "/api/files", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{files}");
+    let js_file = files["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["path"] == "a.js")
+        .unwrap();
+    assert_eq!(js_file["methodCount"], 1);
+    let (status, refused) = call(
+        &app,
+        "POST",
+        "/api/sequence",
+        json!({"seed":variable_seed,"expectedRevision":fresh}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let (status, variable_view) =
+        call(&app, "POST", "/api/query", json!({"seed":variable_seed})).await;
+    assert_eq!(status, StatusCode::OK, "{variable_view}");
+    assert_eq!(variable_view["nodes"][0]["kind"], "variable");
+    assert_eq!(variable_view["calls"], json!([]));
+    let (status, variable_packet) = call(
+        &app,
+        "POST",
+        "/api/questions/preview",
+        json!({"seed":variable_seed,"question":"what is value?","expectedRevision":fresh}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{variable_packet}");
+    assert_eq!(variable_packet["packet"]["context"]["calls"], json!([]));
+    assert_eq!(
+        variable_packet["packet"]["context"]["nodes"][0]["kind"],
+        "variable"
+    );
+    for route in [
+        "/api/symbols?q=go",
+        "/api/files",
+        "/api/methods?path=a.js",
+        "/api/classes",
+        "/api/tree",
+        "/api/dependencies",
+    ] {
+        let (status, body) = call(&app, "GET", route, Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        assert!(
+            !body.to_string().contains("lexical-guess"),
+            "{route}: {body}"
+        );
+    }
+    for (route, body) in [
+        (
+            "/api/navigation",
+            json!({"expectedRevision":fresh,"path":"a.js","line":1}),
+        ),
+        (
+            "/api/sequence",
+            json!({"seed":seed,"expectedRevision":fresh}),
+        ),
+        (
+            "/api/class-diagram",
+            json!({"seed":class_seed,"expectedRevision":fresh}),
+        ),
+    ] {
+        let (status, view) = call(&app, "POST", route, body).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {view}");
+        assert_eq!(view["revision"], json!(fresh), "{route}: {view}");
+        assert!(!view.to_string().contains("lexical-guess"));
+        assert!(!view.to_string().contains(r#""resolution":"internal""#));
+    }
+    let (status, preview) = call(
+        &app,
+        "POST",
+        "/api/questions/preview",
+        json!({"seed":seed,"question":"what happens?","expectedRevision":fresh}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["packet"]["revision"], json!(fresh));
+    assert!(!preview.to_string().contains("lexical-guess"));
+    let fresh_packet = preview["packet"]["packetId"].as_str().unwrap();
+    let (status, export) = call(
+        &app,
+        "GET",
+        &format!("/api/questions/{fresh_packet}/jev-request"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{export}");
+    assert!(!export.to_string().contains("lexical-guess"));
+    let mut answers = serde_json::Map::new();
+    for alias in export["questions"].as_object().unwrap().keys() {
+        answers.insert(
+            alias.clone(),
+            json!({"type":"choice","choice":"essential","confidence":1.0,
+            "probabilities":{"essential":1.0,"supporting":0.0,"incidental":0.0,"uncertain":0.0}}),
+        );
+    }
+    let (status, imported) = call(
+        &app,
+        "POST",
+        &format!("/api/questions/{fresh_packet}/jev-response"),
+        json!({"model":"jev-1.13.0","answers":answers}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{imported}");
+    assert_eq!(imported["view"]["selectionSource"], "importedJev");
+    assert!(
+        imported["view"]["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|call| call.get("target").is_none())
+    );
+    let (status, selected) = call(
+        &app,
+        "POST",
+        &format!("/api/questions/{fresh_packet}/selection"),
+        imported["selection"].clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{selected}");
+    assert_eq!(selected["view"]["selectionSource"], "manual");
+    for (action, code) in [("acp-answer", "acp_disabled"), ("jev-run", "jev_disabled")] {
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/questions/{fresh_packet}/{action}"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{action}: {body}");
+        assert_eq!(body["error"]["code"], code);
+        assert!(!body.to_string().contains("lexical-guess"));
+    }
+    for route in ["/api/jobs/current", "/api/acp/status", "/api/jev/status"] {
+        assert_eq!(
+            call(&app, "GET", route, Value::Null).await.0,
+            StatusCode::OK,
+            "{route}"
+        );
+    }
+    // A once-valid schema-4 pair must never join data from the rotated generation.
+    for route in [
+        "/api/files",
+        "/api/classes",
+        "/api/methods?path=a.js",
+        "/api/source?path=a.js",
+        &format!("/api/symbol?id={seed}"),
+    ] {
+        let (status, body) = call(&app, "GET", &pinned(route, &pin), Value::Null).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
+        assert_eq!(body["error"]["code"], "revision_conflict");
+    }
+    for (route, body) in [
+        ("/api/sequence", json!({"seed":seed,"expectedRevision":pin})),
+        (
+            "/api/navigation",
+            json!({"path":"a.js","line":1,"expectedRevision":pin}),
+        ),
+        (
+            "/api/class-diagram",
+            json!({"seed":class_seed,"expectedRevision":pin}),
+        ),
+        (
+            "/api/questions/preview",
+            json!({"seed":seed,"question":"what?","expectedRevision":pin}),
+        ),
+    ] {
+        let (status, response) = call(&app, "POST", route, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {response}");
+    }
+    for (action, method, body) in [
+        ("jev-request", "GET", Value::Null),
+        ("selection", "POST", old_selection),
+        (
+            "jev-response",
+            "POST",
+            json!({"model":"jev-1.13.0","answers":{}}),
+        ),
+    ] {
+        let route = format!("/api/questions/{packet}/{action}");
+        let (status, response) = call(&app, method, &route, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{route}: {response}");
+    }
+    for (action, code) in [("jev-run", "jev_disabled"), ("acp-answer", "acp_disabled")] {
+        let route = format!("/api/questions/{packet}/{action}");
+        let (status, body) = call(&app, "POST", &route, json!({})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{route}: {body}");
+        assert_eq!(body["error"]["code"], code);
+    }
+    for route in [
+        "/api/dependencies/symbols?catalogId=stale&q=go",
+        "/api/dependencies/source?catalogId=stale&sourceRef=stale",
+    ] {
+        let (status, body) = call(&app, "GET", route, Value::Null).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
+        assert_eq!(body["error"]["code"], "stale_catalog");
+    }
 }

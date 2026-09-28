@@ -19,6 +19,11 @@ pub struct Store {
     identity: Arc<topology::WorkspaceIdentity>,
     workspace_root: String,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublishStage {
+    AfterFile,
+    BeforeCommit,
+}
 const DATABASE_SCHEMA_VERSION: u32 = 5;
 const EXTRACTOR_VERSION: &str = "native-no-lexical-v1";
 const LEGACY_SCHEMA_VERSION: u32 = 4;
@@ -139,6 +144,27 @@ impl Drop for StagedIndex {
         }
     }
 }
+/// Match every cache schema object, including type, name, owning table, SQL,
+/// and SQLite autoindexes. Unknown views/triggers must never execute on rebaseline.
+fn validate_cache_shape(db: &Connection) -> Result<()> {
+    type Object = (String, String, String, Option<String>);
+    fn objects(db: &Connection) -> Result<Vec<Object>> {
+        Ok(db
+            .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(CACHE_SCHEMA)?;
+    expected.execute_batch(CLASS_SCHEMA)?;
+    ensure!(
+        objects(db)? == objects(&expected)?,
+        "incompatible_index: unknown cache object type, name or shape"
+    );
+    Ok(())
+}
 fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     use rusqlite::OpenFlags;
     reject_sidecars(path, writable)?;
@@ -174,40 +200,7 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     storage_result(db.prepare("SELECT warnings,truncated FROM class_catalog"))?;
     storage_result(db.prepare("SELECT id,name,qualified_name,path,payload FROM classes"))?;
     storage_result(db.prepare("SELECT id,owner,target,payload FROM class_relations"))?;
-    let tables = db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-    let expected: BTreeSet<String> = [
-        "index_metadata",
-        "files",
-        "nodes",
-        "calls",
-        "regions",
-        "class_catalog",
-        "classes",
-        "class_relations",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    ensure!(
-        tables == expected,
-        "incompatible_index: unknown cache table shape"
-    );
-    let defined = db.prepare("SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'")?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-    let expected_sql: BTreeSet<String> = format!("{CACHE_SCHEMA}{CLASS_SCHEMA}")
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-        .map(str::to_owned)
-        .collect();
-    ensure!(
-        defined == expected_sql,
-        "incompatible_index: unknown cache column or index shape"
-    );
+    validate_cache_shape(&db)?;
     let metadata: (i64, String) = db.query_row(
         "SELECT schema_version,extractor_version FROM index_metadata WHERE singleton=1",
         [],
@@ -765,6 +758,22 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        self.publish_inner_checked(graph, capture, leader, expected_revision, cancel, |_, _| {
+            Ok(())
+        })
+    }
+
+    // Private transaction seam used by the in-module rollback tests. Normal callers
+    // always pass a no-op; no SQL-fault control is exposed to API or CLI clients.
+    fn publish_inner_checked(
+        &self,
+        graph: &Graph,
+        capture: Option<&crate::capture::Capture>,
+        leader: &topology::LeaderGuard,
+        expected_revision: IndexPin,
+        cancel: &CancelFlag,
+        mut during_tx: impl FnMut(PublishStage, &rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<IndexPin> {
         ensure!(
             graph.schema_version == SCHEMA_VERSION,
             "unsupported graph schema"
@@ -820,6 +829,7 @@ impl Store {
                 "INSERT INTO files VALUES(?1,?2,?3)",
                 params![f.path, f.hash, json(f)?],
             )?;
+            during_tx(PublishStage::AfterFile, &tx)?;
         }
         for n in &graph.nodes {
             check_cancel(cancel)?;
@@ -886,6 +896,7 @@ impl Store {
         }
         leader.verify()?;
         self.identity.verify()?;
+        during_tx(PublishStage::BeforeCommit, &tx)?;
         storage_result(tx.commit())?;
         Ok(revision)
     }
@@ -1389,5 +1400,128 @@ impl Store {
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
         self.records().delete_annotation(id)
+    }
+}
+
+#[cfg(test)]
+mod rebaseline_fault_tests {
+    use super::*;
+    use crate::indexer::{IndexOptions, index_workspace_with_capture};
+    use std::{fs, ptr, sync::atomic::AtomicBool};
+
+    unsafe extern "C" fn abort_commit(_: *mut std::ffi::c_void) -> i32 {
+        1
+    }
+
+    #[test]
+    fn known_old_sqlite_partial_insert_and_commit_failure_keep_exact_bytes_and_pin() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("flow.js"), "function foo() { bar(); }\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(work.path().to_owned());
+        let (graph, capture) = index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+        let original = store
+            .publish_captured(
+                &graph,
+                &capture,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        drop(db);
+        let before = fs::read(&path).unwrap();
+        let leader = store.leader().unwrap();
+        for mode in [PublishStage::AfterFile, PublishStage::BeforeCommit] {
+            let failure = store
+                .publish_inner_checked(
+                    &graph,
+                    Some(&capture),
+                    &leader,
+                    original,
+                    &cancel,
+                    |stage, tx| {
+                        if stage == mode {
+                            match mode {
+                                PublishStage::AfterFile => {
+                                    // Real SQLite UNIQUE error after DELETEs and one inserted file.
+                                    tx.execute(
+                                        "INSERT INTO files VALUES(?1,'duplicate','{}')",
+                                        [&graph.files[0].path],
+                                    )?;
+                                }
+                                PublishStage::BeforeCommit => {
+                                    // SQLite aborts COMMIT itself; its transaction is rolled back.
+                                    unsafe {
+                                        rusqlite::ffi::sqlite3_commit_hook(
+                                            tx.handle(),
+                                            Some(abort_commit),
+                                            ptr::null_mut(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                failure.to_string().contains(match mode {
+                    PublishStage::AfterFile => "UNIQUE constraint failed",
+                    PublishStage::BeforeCommit => "constraint failed",
+                }),
+                "{failure:#}"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "failed commit changed old bytes"
+            );
+            assert_eq!(store.index_baseline().unwrap(), original);
+            assert!(
+                store
+                    .status()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("index_not_ready")
+            );
+            assert!(
+                store
+                    .graph()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("index_not_ready")
+            );
+            let db = Connection::open(&path).unwrap();
+            let (schema, extractor): (i64, String) = db
+                .query_row(
+                    "SELECT schema_version,extractor_version FROM index_metadata",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((schema, extractor.as_str()), (4, "native-v1"));
+            assert_eq!(
+                db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                4
+            );
+        }
+        let rotated = store
+            .publish_captured(&graph, &capture, &leader, original, &cancel)
+            .unwrap();
+        assert_ne!(rotated.index_generation, original.index_generation);
+        assert_eq!(rotated.index_revision, original.index_revision + 1);
     }
 }

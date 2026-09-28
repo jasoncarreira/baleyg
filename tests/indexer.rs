@@ -873,3 +873,217 @@ fn hard_linked_nonsource_inputs_share_immutable_bytes() {
     );
     capture.verify(&flag).unwrap();
 }
+
+#[test]
+fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_executable() {
+    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    let d = tempfile::tempdir().unwrap();
+    let samples = [
+        (
+            "main.js",
+            "class Js { field = 1; method(arg) { const local = arg; return local; } }\nfunction jsFun(arg) { return arg; }\n",
+        ),
+        (
+            "Main.java",
+            "class JavaThing { int field; void method(int arg) { int local = arg; } }\n",
+        ),
+        (
+            "main.py",
+            "class PythonThing:\n    field = 1\n    def method(self, arg):\n        local = arg\n        return local\n",
+        ),
+        (
+            "main.rs",
+            "type Alias = u32;\nstruct RustThing { field: Alias }\nfn rust_fun(arg: Alias) { let local = arg; }\n",
+        ),
+    ];
+    for (path, text) in samples {
+        write(d.path(), path, text);
+    }
+    let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path())
+        .unwrap()
+        .record_id;
+    let (graph, native) = index_workspace_with_native(
+        &IndexOptions::new(d.path().to_owned()),
+        &root_id,
+        &cancel(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        graph.nodes.len(),
+        native.declarations.len(),
+        "native declarations must remain visible"
+    );
+    for declaration in &native.declarations {
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| n.id == declaration.syntax_id)
+            .unwrap();
+        let source = graph.files.iter().find(|f| f.path == node.path).unwrap();
+        assert_eq!(
+            (node.range.start_byte, node.range.end_byte),
+            (declaration.range.start, declaration.range.end)
+        );
+        assert_eq!(
+            &source.text[node.range.start_byte..node.range.end_byte],
+            &source.text[declaration.range.start..declaration.range.end]
+        );
+        let expected = match declaration.kind.as_str() {
+            "module" | "namespace" => SymbolKind::Module,
+            "type" | "implementation" => SymbolKind::Class,
+            "function" | "anonymousFunction" => SymbolKind::Function,
+            "method" | "constructor" => SymbolKind::Method,
+            "field" => SymbolKind::Field,
+            "variable" => SymbolKind::Variable,
+            "parameter" => SymbolKind::Parameter,
+            "typeParameter" => SymbolKind::TypeParameter,
+            "alias" => SymbolKind::Alias,
+            other => panic!("unexpected native declaration kind: {other}"),
+        };
+        assert_eq!(node.kind, expected, "{} {}", node.path, node.name);
+        assert_eq!(node.provenance.semantic, SemanticState::Unavailable);
+    }
+    // These are witnessed #22 declarations, not names inferred from the graph.
+    for (path, expected) in [
+        (
+            "main.js",
+            [
+                ("field", SymbolKind::Field),
+                ("local", SymbolKind::Variable),
+                ("method", SymbolKind::Method),
+            ],
+        ),
+        (
+            "Main.java",
+            [
+                ("field", SymbolKind::Field),
+                ("arg", SymbolKind::Parameter),
+                ("local", SymbolKind::Variable),
+            ],
+        ),
+        (
+            "main.py",
+            [
+                ("field", SymbolKind::Variable),
+                ("local", SymbolKind::Variable),
+                ("method", SymbolKind::Function),
+            ],
+        ),
+        (
+            "main.rs",
+            [
+                ("Alias", SymbolKind::Alias),
+                ("field", SymbolKind::Field),
+                ("arg", SymbolKind::Parameter),
+            ],
+        ),
+    ] {
+        for (name, kind) in expected {
+            let declaration = native
+                .declarations
+                .iter()
+                .find(|d| d.document.path == path && d.name.as_deref() == Some(name))
+                .unwrap();
+            let node = graph
+                .nodes
+                .iter()
+                .find(|n| n.id == declaration.syntax_id)
+                .unwrap();
+            assert_eq!(node.kind, kind, "{path} {name}");
+        }
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.path == path
+                    && matches!(n.kind, SymbolKind::Function | SymbolKind::Method)),
+            "{path}: real callable"
+        );
+    }
+    let state = tempfile::tempdir().unwrap();
+    let store = baleyg::store::Store::open_for_tests(state.path(), d.path()).unwrap();
+    let pin = store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel(),
+        )
+        .unwrap();
+    let saved = store.graph().unwrap();
+    assert_eq!(saved.nodes, graph.nodes);
+    assert_eq!(saved.calls, graph.calls);
+    for (path, text) in samples {
+        let methods = store.methods_at(path, Some(pin)).unwrap().unwrap();
+        let items = methods["items"].as_array().unwrap();
+        let expected: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.path == path && matches!(n.kind, SymbolKind::Function | SymbolKind::Method)
+            })
+            .collect();
+        assert_eq!(items.len(), expected.len(), "{path}");
+        let files = store.files_at(Some(pin), 0, 100).unwrap();
+        let file = files["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["path"] == path)
+            .unwrap();
+        assert_eq!(file["methodCount"], expected.len());
+        for n in graph.nodes.iter().filter(|n| {
+            n.path == path
+                && matches!(
+                    n.kind,
+                    SymbolKind::Field
+                        | SymbolKind::Variable
+                        | SymbolKind::Parameter
+                        | SymbolKind::Alias
+                        | SymbolKind::TypeParameter
+                )
+        }) {
+            assert_eq!(store.symbol(&n.id).unwrap().unwrap().kind, n.kind);
+            assert!(
+                store
+                    .symbols(&n.name, 150)
+                    .unwrap()
+                    .iter()
+                    .any(|candidate| candidate.id == n.id && candidate.kind == n.kind)
+            );
+            assert!(
+                !items.iter().any(|item| item["symbol"]["id"] == n.id),
+                "{path}: {} is not a method",
+                n.name
+            );
+            assert!(
+                store.sequence_at(&n.id, pin, false).is_err(),
+                "{path}: {} is not executable",
+                n.name
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "seed": n.id, "question": "Which exact source declares this name?", "expectedRevision": pin
+            })).unwrap();
+            let packet = baleyg::planning::prepare(&store, request).unwrap();
+            assert_eq!(
+                packet.context.nodes,
+                vec![n.clone()],
+                "{path}: source-only declaration"
+            );
+            assert!(
+                packet.context.calls.is_empty() && packet.context.regions.is_empty(),
+                "{path}: no executable call evidence"
+            );
+            assert_eq!(packet.source_files.len(), 1);
+            assert_eq!(packet.source_files[0].text, text);
+            assert!(
+                packet
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("source-only") && w.contains("noncallable"))
+            );
+        }
+        assert_eq!(store.source(path).unwrap().unwrap().text, text);
+    }
+}

@@ -685,6 +685,14 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
     );
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
     let old_pin = first["status"]["revision"].clone();
+    let symbols = command(&root, &home, "symbols")
+        .arg("--search")
+        .arg("go")
+        .output()
+        .unwrap();
+    assert!(symbols.status.success());
+    let symbols: Value = serde_json::from_slice(&symbols.stdout).unwrap();
+    let valid_seed = symbols["items"][0]["id"].as_str().unwrap().to_owned();
     let cached = if cfg!(target_os = "macos") {
         home.join("Library/Caches/dev.odin.baleyg/indexes")
     } else {
@@ -709,9 +717,14 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
     for sub in ["status", "symbols", "query", "export"] {
         let mut cmd = command(&root, &home, sub);
         if sub == "query" {
-            cmd.arg("--seed").arg("sid:v1:untrusted");
+            cmd.arg("--seed").arg(&valid_seed);
+        }
+        let blocked_export = temp.path().join("old-export-must-not-exist.json");
+        if sub == "export" {
+            cmd.arg("--output").arg(&blocked_export);
         }
         let result = cmd.output().unwrap();
+        assert!(!blocked_export.exists(), "old export wrote a destination");
         assert!(
             !result.status.success(),
             "{sub} unexpectedly read old index"
@@ -725,6 +738,36 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         assert!(!visible.contains(old_pin["indexGeneration"].as_str().unwrap()));
         assert!(!visible.contains("lexical-guess"));
     }
+    // Real CLI exploit regression: an exact legacy4 DB with an extra trigger
+    // cannot rebaseline into a forged schema5 publication or write anything.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER forged_call AFTER INSERT ON calls BEGIN
+        UPDATE calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
+        WHERE id=NEW.id; END;",
+    )
+    .unwrap();
+    drop(db);
+    let dangerous_bytes = fs::read(&path).unwrap();
+    let rejected = command(&root, &home, "index").output().unwrap();
+    assert!(!rejected.status.success());
+    let message = String::from_utf8_lossy(&rejected.stderr);
+    assert!(message.contains("incompatible_index"), "{message}");
+    assert_eq!(fs::read(&path).unwrap(), dangerous_bytes);
+    let blocked_export = command(&root, &home, "export").output().unwrap();
+    assert!(!blocked_export.status.success());
+    assert!(!String::from_utf8_lossy(&blocked_export.stdout).contains("FORGED-NOT-MEASURED"));
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let forged: i64 = db
+        .query_row(
+            "SELECT count(*) FROM calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(forged, 0, "unknown trigger executed despite refusal");
+    db.execute_batch("DROP TRIGGER forged_call").unwrap();
+    drop(db);
     let next = command(&root, &home, "index").output().unwrap();
     assert!(
         next.status.success(),
@@ -737,8 +780,33 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         old_pin["indexGeneration"]
     );
     assert_eq!(next["status"]["evidenceFormat"], "terminal-native-graph-v1");
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(status.status.success());
+    let ready: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(ready["revision"], next["status"]["revision"]);
+    let queried = command(&root, &home, "query")
+        .arg("--seed")
+        .arg(&valid_seed)
+        .output()
+        .unwrap();
+    assert!(
+        queried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queried.stderr)
+    );
+    let view: Value = serde_json::from_slice(&queried.stdout).unwrap();
+    assert_eq!(view["revision"], ready["revision"]);
+    assert!(
+        view["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|call| call.get("target").is_none())
+    );
+    assert!(!view.to_string().contains("lexical-guess"));
     let exported = command(&root, &home, "export").output().unwrap();
     assert!(exported.status.success());
     let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert_eq!(graph["files"][0]["text"], "function go() { foo(); }");
     assert!(!graph.to_string().contains("lexical-guess"));
 }
