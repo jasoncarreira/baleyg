@@ -2160,6 +2160,17 @@ fn saved_anchor_rejects_target_replacement() {
     assert_eq!(records.annotation("note").unwrap().unwrap().node_id, "old");
 }
 
+fn assert_expected_storage_busy(error: &anyhow::Error) {
+    if error.to_string().starts_with("storage_busy") {
+        return;
+    }
+    match error.downcast_ref::<rusqlite::Error>() {
+        Some(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::DatabaseBusy => {}
+        _ => panic!("unexpected contention error: {error:#}"),
+    }
+}
+
 fn test_anchor_raw(target: &str, hash_byte: char) -> Box<serde_json::value::RawValue> {
     let hash: String = std::iter::repeat_n(hash_byte, 64).collect();
     serde_json::value::to_raw_value(&baleyg::model::DurableAnchor {
@@ -2314,7 +2325,7 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         assert_eq!(result.as_ref().unwrap().anchor.as_ref().unwrap().get(), winner_raw);
     }
     if let Some((loser_hash, loser)) = losers.first() {
-        assert!(loser.as_ref().unwrap_err().to_string().contains("storage_busy"));
+        assert_expected_storage_busy(loser.as_ref().unwrap_err());
         let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
         let retried = DurableRecords::new(&roots, &identity)
             .update_view_record(&make_view(**loser_hash), || Ok(test_anchor_raw(target, **loser_hash)))
@@ -2349,7 +2360,7 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         match result {
             Ok(record) => assert_eq!(record.anchor.unwrap().get(), note_winner_raw),
             Err(error) => {
-                assert!(error.to_string().contains("storage_busy"));
+                assert_expected_storage_busy(&error);
                 let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
                 let retried = DurableRecords::new(&roots, &identity)
                     .update_annotation_record(&make_note(hash), false, || Ok(test_anchor_raw(target, hash)))
@@ -2378,21 +2389,42 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         delete_barrier.wait();
         DurableRecords::new(&delete_roots, &identity).delete_view("view-race")
     });
+    let old_raw = edit.anchor.as_ref().unwrap().get().to_owned();
+    let replacement_raw = test_anchor_raw(target, 'e').get().to_owned();
     let edit_result = editor.join().unwrap();
     let delete_result = deleter.join().unwrap();
+    let edit_was_busy = edit_result.is_err();
     let edit_response = match edit_result {
         Ok(record) => record,
         Err(error) => {
-            assert!(error.to_string().contains("storage_busy"));
+            assert_expected_storage_busy(&error);
             records.update_view_record(&edit, || Ok(test_anchor_raw(target, 'e'))).unwrap()
         }
     };
-    assert!(edit_response.anchor.is_some());
-    if let Err(error) = delete_result {
-        assert!(error.to_string().contains("storage_busy"));
-        records.delete_view("view-race").unwrap();
+    let delete_was_busy = delete_result.is_err();
+    match delete_result {
+        Ok(deleted) => assert!(deleted),
+        Err(error) => {
+            assert_expected_storage_busy(&error);
+            assert!(records.delete_view("view-race").unwrap());
+        }
     }
-    if let Some(final_record) = records.view_record("view-race").unwrap() { assert!(final_record.anchor.is_some()); }
+    let response_raw = edit_response.anchor.as_ref().unwrap().get();
+    assert!(response_raw == old_raw || response_raw == replacement_raw);
+    assert!(edit_response.typed_anchor().unwrap().is_some());
+    let final_record = records.view_record("view-race").unwrap();
+    if edit_was_busy {
+        assert_eq!(response_raw, replacement_raw);
+        assert_eq!(final_record.unwrap().anchor.unwrap().get(), replacement_raw);
+    } else if delete_was_busy {
+        assert_eq!(response_raw, old_raw);
+        assert!(final_record.is_none());
+    } else if let Some(final_record) = final_record {
+        assert_eq!(response_raw, replacement_raw);
+        assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+    } else {
+        assert_eq!(response_raw, old_raw);
+    }
 
     let edit = AnnotationRecord { body: "edit".into(), ..records.annotation_record("note-race").unwrap().unwrap() };
     let barrier = Arc::new(Barrier::new(2));
@@ -2408,19 +2440,40 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         delete_barrier.wait();
         DurableRecords::new(&delete_roots, &identity).delete_annotation("note-race")
     });
+    let old_raw = edit.anchor.as_ref().unwrap().get().to_owned();
+    let replacement_raw = test_anchor_raw(target, 'f').get().to_owned();
     let edit_result = editor.join().unwrap();
     let delete_result = deleter.join().unwrap();
+    let edit_was_busy = edit_result.is_err();
     let edit_response = match edit_result {
         Ok(record) => record,
         Err(error) => {
-            assert!(error.to_string().contains("storage_busy"));
+            assert_expected_storage_busy(&error);
             records.update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f'))).unwrap()
         }
     };
-    assert!(edit_response.anchor.is_some());
-    if let Err(error) = delete_result {
-        assert!(error.to_string().contains("storage_busy"));
-        records.delete_annotation("note-race").unwrap();
+    let delete_was_busy = delete_result.is_err();
+    match delete_result {
+        Ok(deleted) => assert!(deleted),
+        Err(error) => {
+            assert_expected_storage_busy(&error);
+            assert!(records.delete_annotation("note-race").unwrap());
+        }
     }
-    if let Some(final_record) = records.annotation_record("note-race").unwrap() { assert!(final_record.anchor.is_some()); }
+    let response_raw = edit_response.anchor.as_ref().unwrap().get();
+    assert!(response_raw == old_raw || response_raw == replacement_raw);
+    assert!(edit_response.typed_anchor().unwrap().is_some());
+    let final_record = records.annotation_record("note-race").unwrap();
+    if edit_was_busy {
+        assert_eq!(response_raw, replacement_raw);
+        assert_eq!(final_record.unwrap().anchor.unwrap().get(), replacement_raw);
+    } else if delete_was_busy {
+        assert_eq!(response_raw, old_raw);
+        assert!(final_record.is_none());
+    } else if let Some(final_record) = final_record {
+        assert_eq!(response_raw, replacement_raw);
+        assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+    } else {
+        assert_eq!(response_raw, old_raw);
+    }
 }
