@@ -6,11 +6,11 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
 };
 
 pub const ROOT_INPUTS: &[&str] = &[
@@ -86,7 +86,20 @@ fn metadata(path: &Path) -> Result<Option<Stamp>> {
         Err(e) => Err(e).with_context(|| format!("input metadata: {}", path.display())),
     }
 }
-fn regular_read(path: &Path, cap: u64, expected: &Stamp, cancel: &CancelFlag) -> Result<Vec<u8>> {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceOperations {
+    pub opens: usize,
+    pub complete_reads: usize,
+    pub hashes: usize,
+}
+
+fn regular_read(
+    path: &Path,
+    cap: u64,
+    expected: &Stamp,
+    cancel: &CancelFlag,
+    operations: Option<&mut SourceOperations>,
+) -> Result<Vec<u8>> {
     ensure!(
         expected.kind == 2 && expected.len <= cap,
         "unsafe or oversized input: {}",
@@ -102,6 +115,10 @@ fn regular_read(path: &Path, cap: u64, expected: &Stamp, cancel: &CancelFlag) ->
     let mut file = options
         .open(path)
         .with_context(|| format!("opening input: {}", path.display()))?;
+    let mut operations = operations;
+    if let Some(counts) = operations.as_deref_mut() {
+        counts.opens += 1;
+    }
     ensure!(
         stamp(&file.metadata()?) == *expected,
         "input drift during open: {}",
@@ -132,10 +149,68 @@ fn regular_read(path: &Path, cap: u64, expected: &Stamp, cancel: &CancelFlag) ->
         "input replaced during read: {}",
         path.display()
     );
+    if let Some(counts) = operations {
+        counts.complete_reads += 1;
+    }
     Ok(bytes)
 }
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+#[cfg(unix)]
+fn identity(item: &Stamp) -> Option<(u64, u64)> {
+    Some((item.dev, item.ino))
+}
+#[cfg(not(unix))]
+fn identity(_item: &Stamp) -> Option<(u64, u64)> {
+    None
+}
+
+fn admit_input(
+    path: PathBuf,
+    cap: u64,
+    cancel: &CancelFlag,
+    source_identities: &BTreeSet<(u64, u64)>,
+    identities: &mut BTreeMap<(u64, u64), PathBuf>,
+    inputs: &mut BTreeMap<PathBuf, Option<Stamp>>,
+    input_bytes: &mut BTreeMap<PathBuf, Option<Arc<[u8]>>>,
+) -> Result<()> {
+    let state = metadata(&path)?;
+    let bytes = match &state {
+        None => None,
+        Some(item) => {
+            ensure!(
+                item.kind == 2 && item.len <= cap,
+                "unsafe or oversized input: {}",
+                path.display()
+            );
+            let key = identity(item);
+            ensure!(
+                !key.is_some_and(|key| source_identities.contains(&key)),
+                "input aliases source: {}",
+                path.display()
+            );
+            if let Some(old_path) = key.and_then(|key| identities.get(&key)) {
+                ensure!(
+                    metadata(old_path)? == inputs[old_path],
+                    "input alias drift: {}",
+                    old_path.display()
+                );
+                input_bytes
+                    .get(old_path)
+                    .cloned()
+                    .context("missing admitted input")?
+            } else {
+                Some(Arc::from(regular_read(&path, cap, item, cancel, None)?))
+            }
+        }
+    };
+    if let Some(key) = state.as_ref().and_then(identity) {
+        identities.entry(key).or_insert_with(|| path.clone());
+    }
+    inputs.insert(path.clone(), state);
+    input_bytes.insert(path, bytes);
+    Ok(())
 }
 fn source(path: &Path) -> bool {
     matches!(
@@ -184,7 +259,7 @@ fn walk(root: &Path, cancel: &CancelFlag) -> Result<(BTreeMap<PathBuf, Stamp>, V
         let entry = entry.context("workspace walk failed")?;
         let path = entry.path();
         let kind = entry.file_type().context("missing entry type")?;
-        if kind.is_dir() || source(path) && (kind.is_file() || kind.is_symlink()) {
+        if kind.is_dir() || source(path) {
             let item = metadata(path)?.context("walk entry disappeared")?;
             if kind.is_dir() {
                 ensure!(item.kind == 1, "directory changed: {}", path.display());
@@ -212,14 +287,24 @@ pub struct Capture {
     inventory: BTreeMap<PathBuf, Stamp>,
     inputs: BTreeMap<PathBuf, Option<Stamp>>,
     pub files: Vec<SourceFile>,
+    pub source_operations: BTreeMap<String, SourceOperations>,
     pub hashes: BTreeMap<String, String>,
-    pub input_bytes: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    pub input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
 }
 impl Capture {
     pub fn admit(
         options: &IndexOptions,
         cancel: &CancelFlag,
         progress: &impl Fn(IndexProgress),
+    ) -> Result<Self> {
+        let exe = std::env::current_exe()?;
+        Self::admit_with_executable(options, cancel, progress, exe)
+    }
+    fn admit_with_executable(
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        progress: &impl Fn(IndexProgress),
+        exe: PathBuf,
     ) -> Result<Self> {
         check(cancel)?;
         let root_meta = metadata(&options.workspace_root)?.context("workspace root absent")?;
@@ -231,20 +316,28 @@ impl Capture {
         let (inventory, sources) = walk(&root, cancel)?;
         let mut inputs = BTreeMap::new();
         let mut input_bytes = BTreeMap::new();
+        let mut source_identities = BTreeSet::new();
+        let mut input_identities = BTreeMap::new();
+        for path in &sources {
+            let item = inventory.get(path).context("missing source inventory")?;
+            if let Some(key) = identity(item) {
+                ensure!(
+                    source_identities.insert(key),
+                    "duplicate source identity: {}",
+                    path.display()
+                );
+            }
+        }
         for name in ROOT_INPUTS {
-            let path = root.join(name);
-            let state = metadata(&path)?;
-            let bytes = match &state {
-                Some(s) => Some(regular_read(
-                    &path,
-                    options.max_file_bytes.min(16 * 1024 * 1024),
-                    s,
-                    cancel,
-                )?),
-                None => None,
-            };
-            inputs.insert(path.clone(), state);
-            input_bytes.insert(path, bytes);
+            admit_input(
+                root.join(name),
+                options.max_file_bytes.min(16 * 1024 * 1024),
+                cancel,
+                &source_identities,
+                &mut input_identities,
+                &mut inputs,
+                &mut input_bytes,
+            )?;
         }
         for dir in inventory
             .iter()
@@ -252,60 +345,57 @@ impl Capture {
             .map(|(p, _)| p)
         {
             for name in [".gitignore", ".ignore"] {
-                let path = dir.join(name);
-                let state = metadata(&path)?;
-                let bytes = match &state {
-                    Some(s) => Some(regular_read(
-                        &path,
-                        options.max_file_bytes.min(16 * 1024 * 1024),
-                        s,
-                        cancel,
-                    )?),
-                    None => None,
-                };
-                inputs.insert(path.clone(), state);
-                input_bytes.insert(path, bytes);
+                admit_input(
+                    dir.join(name),
+                    options.max_file_bytes.min(16 * 1024 * 1024),
+                    cancel,
+                    &source_identities,
+                    &mut input_identities,
+                    &mut inputs,
+                    &mut input_bytes,
+                )?;
             }
         }
         // The linked native extractor is part of the running executable, not ambient PATH.
-        let exe = std::env::current_exe()?;
-        let s = metadata(&exe)?.context("running executable absent")?;
-        let bytes = regular_read(&exe, 512 * 1024 * 1024, &s, cancel)?;
-        inputs.insert(exe.clone(), Some(s));
-        input_bytes.insert(exe, Some(bytes));
+        admit_input(
+            exe,
+            512 * 1024 * 1024,
+            cancel,
+            &source_identities,
+            &mut input_identities,
+            &mut inputs,
+            &mut input_bytes,
+        )?;
         for path in [options.scip_path.as_ref(), options.manifest_path.as_ref()]
             .into_iter()
             .flatten()
         {
-            ensure!(
-                !sources.contains(path),
-                "display artifact aliases source: {}",
-                path.display()
-            );
-            if input_bytes.contains_key(path) {
-                continue;
-            }
-            let state = metadata(path)?;
-            let bytes = match &state {
-                Some(s) => Some(regular_read(path, 256 * 1024 * 1024, s, cancel)?),
-                None => None,
-            };
-            inputs.insert(path.clone(), state);
-            input_bytes.insert(path.clone(), bytes);
+            admit_input(
+                path.clone(),
+                256 * 1024 * 1024,
+                cancel,
+                &source_identities,
+                &mut input_identities,
+                &mut inputs,
+                &mut input_bytes,
+            )?;
         }
         let mut files = Vec::new();
         let mut hashes = BTreeMap::new();
+        let mut source_operations = BTreeMap::new();
         let mut total_bytes = 0u64;
         for (i, path) in sources.iter().enumerate() {
             check(cancel)?;
             let state = inventory
                 .get(path)
                 .context("source absent from inventory")?;
+            let mut counts = SourceOperations::default();
             let bytes = regular_read(
                 path,
                 options.max_file_bytes.min(256 * 1024 * 1024),
                 state,
                 cancel,
+                Some(&mut counts),
             )?;
             total_bytes += bytes.len() as u64;
             ensure!(
@@ -319,6 +409,8 @@ impl Capture {
                 .replace('\\', "/");
             let text = String::from_utf8(bytes).context("non-UTF8 source text")?;
             let digest = hash(text.as_bytes());
+            counts.hashes += 1;
+            source_operations.insert(rel.clone(), counts);
             hashes.insert(rel.clone(), digest.clone());
             files.push(SourceFile {
                 path: rel,
@@ -345,6 +437,7 @@ impl Capture {
             inventory,
             inputs,
             files,
+            source_operations,
             hashes,
             input_bytes,
         };
@@ -372,5 +465,43 @@ impl Capture {
     }
     pub fn bytes(&self, path: &Path) -> Option<&[u8]> {
         self.input_bytes.get(path).and_then(|b| b.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
+    #[test]
+    fn executable_cutoff_and_stable_source_operation_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("fake-native-bin");
+        fs::write(&exe, "native-v1").unwrap();
+        fs::write(root.path().join("one.js"), "f();").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit_with_executable(
+            &IndexOptions::new(root.path().to_owned()),
+            &cancel,
+            &|_| {},
+            exe.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            capture.source_operations["one.js"],
+            SourceOperations {
+                opens: 1,
+                complete_reads: 1,
+                hashes: 1,
+            }
+        );
+        capture.verify(&cancel).unwrap();
+        fs::write(&exe, "native-v2").unwrap();
+        assert!(
+            capture
+                .verify(&cancel)
+                .unwrap_err()
+                .to_string()
+                .contains("drift")
+        );
     }
 }

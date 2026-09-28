@@ -102,7 +102,11 @@ and `.ignore` files in visited directories. It reads each admitted source throug
 no-follow regular-file descriptor and shares that immutable buffer with the current
 graph extractor. It also captures the running native executable and optional display
 artifacts. Metadata and complete eligible source/directory inventories are checked
-again at cutoff. Drift, unreadable or unsafe inputs, excess size, and cancellation
+again at cutoff. Source-identity aliases (including lexical `./` paths and hard links)
+used as display inputs refuse admission before the optional read; nonregular eligible
+sources such as FIFOs refuse admission rather than disappear from the inventory.
+Identity-equivalent non-source inputs reuse one captured buffer after metadata checks.
+Drift, unreadable or unsafe inputs, excess size, and cancellation
 fail the indexing call rather than publishing its result. Ambient ancestor, global,
 and Git-info ignore files do not participate in admission.
 

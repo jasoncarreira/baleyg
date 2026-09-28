@@ -186,3 +186,38 @@ fn failed_capture_leaves_existing_index_revision_unchanged() {
         before
     );
 }
+
+#[test]
+fn drift_refusal_preserves_populated_store_pair_and_graph() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace},
+        model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let root = workspace.path();
+    fs::write(root.join("main.js"), "function f() {} f();").unwrap();
+    let options = IndexOptions::new(root.to_owned());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), root).unwrap();
+    let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
+    let before = store
+        .publish(
+            &graph,
+            &store.leader().unwrap(),
+            store.status().unwrap().revision,
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(before.index_revision, 1);
+    let error = index_workspace(&options, &cancel, |progress| {
+        if progress.phase == "parse" {
+            fs::write(root.join("main.js"), "function f() {} g();").unwrap();
+        }
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("drift"), "{error:#}");
+    let reopened = Store::open_for_tests(state.path(), root).unwrap();
+    assert_eq!(reopened.status().unwrap().revision, before);
+    assert_eq!(store.status().unwrap().revision, before);
+}

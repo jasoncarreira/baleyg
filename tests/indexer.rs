@@ -648,3 +648,143 @@ fn capture_rejects_absent_present_and_cancellation_but_accepts_empty_root() {
     .unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error:#}");
 }
+
+#[test]
+fn identity_aliases_and_nonregular_sources_fail_admission() {
+    for (alias, field) in [
+        ("lexical", "scip"),
+        ("hardlink", "scip"),
+        ("lexical", "manifest"),
+        ("hardlink", "manifest"),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "main.js", "f();");
+        let path = if alias == "lexical" {
+            d.path().join("./main.js")
+        } else {
+            let alias = d.path().join("display.scip");
+            fs::hard_link(d.path().join("main.js"), &alias).unwrap();
+            alias
+        };
+        let mut options = IndexOptions::new(d.path().to_owned());
+        if field == "scip" {
+            options.scip_path = Some(path);
+        } else {
+            options.manifest_path = Some(path);
+        }
+        let error = index_workspace(&options, &cancel(), |_| {}).unwrap_err();
+        assert!(
+            error.to_string().contains("aliases source"),
+            "{alias}/{field}: {error:#}"
+        );
+    }
+    let d = tempfile::tempdir().unwrap();
+    let fifo = d.path().join("blocked.js");
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let error =
+        index_workspace(&IndexOptions::new(d.path().to_owned()), &cancel(), |_| {}).unwrap_err();
+    assert!(error.to_string().contains("unsafe source"), "{error:#}");
+}
+
+#[test]
+fn stable_capture_counts_one_open_read_hash_per_source_and_verifies_unchanged() {
+    use baleyg::capture::{Capture, SourceOperations};
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "one.js", "f();");
+    write(d.path(), "two.py", "def f(): pass\n");
+    let cancel = cancel();
+    let capture =
+        Capture::admit(&IndexOptions::new(d.path().to_owned()), &cancel, &|_| {}).unwrap();
+    assert_eq!(capture.source_operations.len(), 2);
+    for operations in capture.source_operations.values() {
+        assert_eq!(
+            *operations,
+            SourceOperations {
+                opens: 1,
+                complete_reads: 1,
+                hashes: 1
+            }
+        );
+    }
+    capture.verify(&cancel).unwrap();
+    assert_eq!(run(&IndexOptions::new(d.path().to_owned())).files.len(), 2);
+}
+
+#[test]
+fn declared_inputs_and_root_refuse_cutoff_drift() {
+    for scenario in [
+        "root",
+        "root-replaced",
+        "toolchain",
+        "config",
+        "ignore",
+        "display",
+        "manifest",
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write(root, "main.js", "f();");
+        write(root, "rust-toolchain", "stable\n");
+        write(root, "package.json", "{}\n");
+        write(root, ".ignore", "*.tmp\n");
+        write(root, "display.scip", "invalid-scip");
+        write(root, "display.hashes", "{}\n");
+        let mut options = IndexOptions::new(root.to_owned());
+        options.scip_path = Some(root.join("display.scip"));
+        options.manifest_path = Some(root.join("display.hashes"));
+        let moved = root.with_extension("moved");
+        let error = index_workspace(&options, &cancel(), |progress| {
+            if progress.phase != "parse" {
+                return;
+            }
+            match scenario {
+                "root" => fs::rename(root, &moved).unwrap(),
+                "root-replaced" => {
+                    fs::rename(root, &moved).unwrap();
+                    fs::create_dir(root).unwrap();
+                }
+                "toolchain" => write(root, "rust-toolchain", "nightly\n"),
+                "config" => write(root, "package.json", "[]\n"),
+                "ignore" => write(root, ".ignore", "*.log\n"),
+                "display" => write(root, "display.scip", "changed-scip"),
+                "manifest" => write(root, "display.hashes", "[]\n"),
+                _ => unreachable!(),
+            }
+        })
+        .unwrap_err();
+        if scenario == "root" {
+            fs::rename(&moved, root).unwrap();
+        }
+        if scenario == "root-replaced" {
+            fs::remove_dir(root).unwrap();
+            fs::rename(&moved, root).unwrap();
+        }
+        assert!(error.to_string().contains("drift"), "{scenario}: {error:#}");
+    }
+}
+
+#[test]
+fn hard_linked_nonsource_inputs_share_immutable_bytes() {
+    use baleyg::capture::Capture;
+    let d = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(d.path()).unwrap();
+    let root = root.as_path();
+    write(root, "main.js", "f();");
+    write(root, "package.json", "{}\n");
+    fs::hard_link(root.join("package.json"), root.join("display.scip")).unwrap();
+    let mut options = IndexOptions::new(root.to_owned());
+    options.scip_path = Some(root.join("display.scip"));
+    let flag = cancel();
+    let capture = Capture::admit(&options, &flag, &|_| {}).unwrap();
+    assert_eq!(
+        capture.bytes(&root.join("package.json")),
+        Some(b"{}\n".as_slice())
+    );
+    assert_eq!(
+        capture.bytes(&root.join("display.scip")),
+        capture.bytes(&root.join("package.json"))
+    );
+    capture.verify(&flag).unwrap();
+}
