@@ -2564,49 +2564,102 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     }
 }
 
-
 #[test]
 fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() {
     use baleyg::{
         model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
         store::topology::DurableRecords,
     };
-    use std::{collections::BTreeMap, sync::atomic::{AtomicBool, Ordering}};
+    use std::{
+        collections::BTreeMap,
+        sync::atomic::{AtomicBool, Ordering},
+    };
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let records = DurableRecords::new(&roots, &identity);
     let target = "sid:v1:0123456789abcdef0123456789abcdef";
 
-    let stale_view = SavedViewRecord::from_base(SavedView {
-        id: "view-recreate".into(), title: "old".into(),
-        query: ViewQuery { seed: target.into(), depth: 1, max_nodes: 40, max_calls: 200, include_callbacks: false, exclude_paths: vec![] },
-        pins: BTreeMap::new(), hidden: vec![],
-    }, Some(test_anchor_raw(target, 'a')));
+    let stale_view = SavedViewRecord::from_base(
+        SavedView {
+            id: "view-recreate".into(),
+            title: "old".into(),
+            query: ViewQuery {
+                seed: target.into(),
+                depth: 1,
+                max_nodes: 40,
+                max_calls: 200,
+                include_callbacks: false,
+                exclude_paths: vec![],
+            },
+            pins: BTreeMap::new(),
+            hidden: vec![],
+        },
+        Some(test_anchor_raw(target, 'a')),
+    );
     records.put_view_record(&stale_view).unwrap();
     assert!(records.delete_view("view-recreate").unwrap());
     assert!(records.view_record("view-recreate").unwrap().is_none());
     let view_capture_called = AtomicBool::new(false);
-    let recreated_view = records.update_view_record(&stale_view, || {
-        assert!(!view_capture_called.swap(true, Ordering::SeqCst));
-        Ok(test_anchor_raw(target, 'e'))
-    }).unwrap();
+    let recreated_view = records
+        .update_view_record(&stale_view, || {
+            assert!(!view_capture_called.swap(true, Ordering::SeqCst));
+            Ok(test_anchor_raw(target, 'e'))
+        })
+        .unwrap();
     assert!(view_capture_called.load(Ordering::SeqCst));
-    assert_eq!(recreated_view.anchor.as_ref().unwrap().get(), test_anchor_raw(target, 'e').get());
-    assert_eq!(records.view_record("view-recreate").unwrap().unwrap().anchor.unwrap().get(), test_anchor_raw(target, 'e').get());
+    assert_eq!(
+        recreated_view.anchor.as_ref().unwrap().get(),
+        test_anchor_raw(target, 'e').get()
+    );
+    assert_eq!(
+        records
+            .view_record("view-recreate")
+            .unwrap()
+            .unwrap()
+            .anchor
+            .unwrap()
+            .get(),
+        test_anchor_raw(target, 'e').get()
+    );
 
-    let stale_note = AnnotationRecord::from_base(Annotation {
-        id: "note-recreate".into(), node_id: target.into(), body: "old".into(),
-    }, Some("Title".into()), Some(test_anchor_raw(target, 'b')));
+    let stale_note = AnnotationRecord::from_base(
+        Annotation {
+            id: "note-recreate".into(),
+            node_id: target.into(),
+            body: "old".into(),
+        },
+        Some("Title".into()),
+        Some(test_anchor_raw(target, 'b')),
+    );
     records.put_annotation_record(&stale_note, false).unwrap();
     assert!(records.delete_annotation("note-recreate").unwrap());
-    assert!(records.annotation_record("note-recreate").unwrap().is_none());
+    assert!(
+        records
+            .annotation_record("note-recreate")
+            .unwrap()
+            .is_none()
+    );
     let note_capture_called = AtomicBool::new(false);
-    let recreated_note = records.update_annotation_record(&stale_note, false, || {
-        assert!(!note_capture_called.swap(true, Ordering::SeqCst));
-        Ok(test_anchor_raw(target, 'f'))
-    }).unwrap();
+    let recreated_note = records
+        .update_annotation_record(&stale_note, false, || {
+            assert!(!note_capture_called.swap(true, Ordering::SeqCst));
+            Ok(test_anchor_raw(target, 'f'))
+        })
+        .unwrap();
     assert!(note_capture_called.load(Ordering::SeqCst));
-    assert_eq!(recreated_note.anchor.as_ref().unwrap().get(), test_anchor_raw(target, 'f').get());
-    assert_eq!(records.annotation_record("note-recreate").unwrap().unwrap().anchor.unwrap().get(), test_anchor_raw(target, 'f').get());
+    assert_eq!(
+        recreated_note.anchor.as_ref().unwrap().get(),
+        test_anchor_raw(target, 'f').get()
+    );
+    assert_eq!(
+        records
+            .annotation_record("note-recreate")
+            .unwrap()
+            .unwrap()
+            .anchor
+            .unwrap()
+            .get(),
+        test_anchor_raw(target, 'f').get()
+    );
 }
