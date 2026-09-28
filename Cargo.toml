@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "6"
 hex = "0.4"
 ignore = "0.4"
+icu_normalizer = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 libc = "0.2"
 protobuf = "3"
 rand = "0.9"

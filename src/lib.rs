@@ -22,6 +22,8 @@ mod indexer_python;
 mod indexer_rust;
 pub mod mcp;
 pub mod model;
+pub mod native_evidence;
+pub mod native_ids;
 pub mod navigation;
 mod rust_sources;
 pub mod store;
