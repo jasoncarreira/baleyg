@@ -428,8 +428,19 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
         hidden: vec![b.clone()],
     };
     store.put_view(&view).unwrap();
-    assert!(!store.annotations().unwrap()[0].orphaned);
-    assert_eq!(store.views().unwrap()[0].orphaned_ids, vec!["missing"]);
+    let saved_note = store.annotations().unwrap().remove(0);
+    assert!(saved_note.orphaned);
+    assert_eq!(
+        saved_note.attachment.availability,
+        AttachmentAvailability::Anchorless
+    );
+    let saved_view = store.views().unwrap().remove(0);
+    assert!(saved_view.orphaned_ids.contains(&a));
+    assert!(saved_view.orphaned_ids.contains(&"missing".into()));
+    assert_eq!(
+        saved_view.attachment.availability,
+        AttachmentAvailability::Anchorless
+    );
     drop(store);
     std::fs::remove_file(index_db(state.path())).unwrap();
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
@@ -441,14 +452,24 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
             .contains("index_not_ready")
     );
     assert_eq!(store.index_baseline().unwrap().index_revision, 0);
-    assert!(store.annotations().unwrap()[0].orphaned);
-    assert_eq!(store.annotations().unwrap()[0].annotation, annotation);
+    let unavailable_note = store.annotations().unwrap().remove(0);
+    assert!(unavailable_note.orphaned);
+    assert_eq!(
+        unavailable_note.attachment.availability,
+        AttachmentAvailability::IndexUnavailable
+    );
+    assert_eq!(unavailable_note.annotation, annotation);
     let orphaned = store.view("view").unwrap().unwrap().orphaned_ids;
     assert_eq!(orphaned.len(), 3);
     assert!(orphaned.contains(&a) && orphaned.contains(&b) && orphaned.contains(&"missing".into()));
     let fresh = bundle(&store, &work);
     publish_bundle(&store, &fresh, store.index_baseline().unwrap());
-    assert!(!store.annotations().unwrap()[0].orphaned);
+    let restored_note = store.annotations().unwrap().remove(0);
+    assert!(restored_note.orphaned);
+    assert_eq!(
+        restored_note.attachment.availability,
+        AttachmentAvailability::Anchorless
+    );
     // Public graph-only writes cannot remove indexed symbols.
     assert!(
         store
@@ -1136,5 +1157,119 @@ fn legacy_rebaseline_capture_drift_after_partial_write_preserves_old_bytes() {
             .unwrap_err()
             .to_string()
             .contains("index_not_ready")
+    );
+}
+
+#[test]
+fn saved_reads_without_records_are_conservative_and_write_nothing() {
+    let (state, work, store) = fixture();
+    let cache = index_db(state.path());
+    let before = std::fs::read(&cache).unwrap();
+    assert!(store.views().unwrap().is_empty());
+    assert!(store.annotations().unwrap().is_empty());
+    assert!(store.view("missing").unwrap().is_none());
+    assert_eq!(
+        std::fs::read(&cache).unwrap(),
+        before,
+        "saved reads changed the cache database"
+    );
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
+            .unwrap();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    assert!(
+        !roots.record_db(&identity).exists(),
+        "saved reads created a durable database"
+    );
+}
+
+#[test]
+fn malformed_persisted_anchors_fail_closed_without_an_index() {
+    let (state, work, store) = fixture();
+    let view = SavedView {
+        id: "view-malformed".into(),
+        title: "View".into(),
+        query: query(),
+        pins: BTreeMap::new(),
+        hidden: vec![],
+    };
+    let note = Annotation {
+        id: "note-malformed".into(),
+        node_id: "node".into(),
+        body: "body".into(),
+    };
+    store.put_view(&view).unwrap();
+    store.put_annotation(&note).unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
+            .unwrap();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    let db = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
+    let original_view: String = db
+        .query_row("SELECT payload FROM views WHERE id=?1", [&view.id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let original_note: String = db
+        .query_row(
+            "SELECT payload FROM annotations WHERE id=?1",
+            [&note.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let malformed_anchor = serde_json::json!({
+        "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef",
+        "document":{"sourceSetId":"set","language":"typescript","path":"../escape.rs"},
+        "capturedRevisionId":"revision",
+        "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "siblingGroupHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "siblingCount":1,"identicalHeaderCount":1
+    });
+    let mut malformed_view: serde_json::Value = serde_json::from_str(&original_view).unwrap();
+    malformed_view["anchor"] = malformed_anchor.clone();
+    db.execute(
+        "UPDATE views SET payload=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&malformed_view).unwrap(), view.id],
+    )
+    .unwrap();
+    assert!(
+        store
+            .views()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid durable anchor")
+    );
+    assert!(
+        store
+            .view("view-malformed")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid durable anchor")
+    );
+    db.execute(
+        "UPDATE views SET payload=?1 WHERE id=?2",
+        rusqlite::params![original_view, view.id],
+    )
+    .unwrap();
+
+    let mut malformed_note: serde_json::Value = serde_json::from_str(&original_note).unwrap();
+    malformed_note["anchor"] = malformed_anchor;
+    db.execute(
+        "UPDATE annotations SET payload=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&malformed_note).unwrap(), note.id],
+    )
+    .unwrap();
+    assert!(
+        store
+            .annotations()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid durable anchor")
     );
 }
