@@ -1320,14 +1320,7 @@ async fn start_index(
         }
         serde_json::from_value(value).map_err(|_| invalid())?
     };
-    let baseline = db(s.clone(), |s| s.index_baseline()).await?;
-    if request.expected_revision.is_some_and(|r| r != baseline) {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "revision_conflict",
-            "The index revision changed",
-        ));
-    }
+    let requested = request.expected_revision;
     {
         let jobs = s.jobs.lock().unwrap();
         if jobs
@@ -1343,7 +1336,10 @@ async fn start_index(
             ));
         }
     }
-    let leader = db(s.clone(), |s| s.leader()).await?;
+    let coordinator = db(s.clone(), move |store| {
+        crate::index_coordinator::IndexJobCoordinator::prepare(store, requested)
+    })
+    .await?;
     let cancel = Arc::new(AtomicBool::new(false));
     let job = IndexJob {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1388,24 +1384,11 @@ async fn start_index(
         let worker_id = id.clone();
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let (graph, native, capture) = crate::indexer::index_workspace_bundle(
-                &worker.options,
-                worker.store.root_id(),
-                &worker_cancel,
-                |p| {
-                    if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
-                        j.progress = p;
-                    }
-                },
-            )?;
-            worker.store.publish_native(
-                &graph,
-                &capture,
-                &native,
-                &leader,
-                baseline,
-                &worker_cancel,
-            )
+            coordinator.run(&worker.options, &worker_cancel, |p| {
+                if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
+                    j.progress = p;
+                }
+            })
         })
         .await;
         let outcome = match result {

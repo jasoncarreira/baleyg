@@ -16,6 +16,7 @@ mod dependency_rust;
 pub mod dependency_rust_symbols;
 pub mod file_tree;
 pub mod http;
+pub mod index_coordinator;
 pub mod indexer;
 mod indexer_java;
 mod indexer_python;

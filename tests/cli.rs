@@ -825,3 +825,246 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
     assert_eq!(graph["files"][0]["text"], "function go() { foo(); }");
     assert!(!graph.to_string().contains("lexical-guess"));
 }
+
+// Exercise the actual executable on both sides of the coordinator, not an in-process router.
+#[tokio::test]
+async fn real_cli_and_authenticated_daemon_share_native_pair_for_every_language_and_empty_root() {
+    use std::{io::Read, os::unix::fs::PermissionsExt, time::Duration};
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn paired_native(home: &std::path::Path) -> (String, String, usize) {
+        fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+            for entry in fs::read_dir(dir).ok()?.flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "index.db") {
+                    return Some(path);
+                }
+                if path.is_dir()
+                    && let Some(db) = find(&path)
+                {
+                    return Some(db);
+                }
+            }
+            None
+        }
+        let db =
+            rusqlite::Connection::open(find(home).expect("published native database")).unwrap();
+        let set: String = db
+            .query_row("SELECT id FROM native_source_sets", [], |r| r.get(0))
+            .unwrap();
+        let revision: String = db
+            .query_row("SELECT id FROM native_revisions", [], |r| r.get(0))
+            .unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM native_documents", [], |r| r.get(0))
+            .unwrap();
+        (set, revision, count.try_into().unwrap())
+    }
+    for (name, file, source) in [
+        (
+            "java",
+            "Flow.java",
+            "class Flow { void seed() { sink(); } void sink() {} }
+",
+        ),
+        (
+            "javascript",
+            "flow.js",
+            "function seed() { sink(); } function sink() {}
+",
+        ),
+        (
+            "python",
+            "flow.py",
+            "def seed():
+    sink()
+def sink():
+    pass
+",
+        ),
+        (
+            "rust",
+            "flow.rs",
+            "fn seed() { sink(); } fn sink() {}
+",
+        ),
+        ("empty", "", ""),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("workspace");
+        let home = tmp.path().join("home");
+        fs::create_dir(&root).unwrap();
+        if !file.is_empty() {
+            fs::write(root.join(file), source).unwrap();
+        }
+        let indexed = command(&root, &home, "index").output().unwrap();
+        assert!(
+            indexed.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+        let first: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+        let old_pin = first["publishedRevision"].clone();
+        assert_eq!(first["status"]["revision"], old_pin, "{name}");
+        let native_before = paired_native(&home);
+        assert_eq!(native_before.2, usize::from(!file.is_empty()), "{name}");
+
+        let token_file = tmp.path().join("token");
+        fs::write(&token_file, TOKEN).unwrap();
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let stderr_path = tmp.path().join("daemon-stderr");
+        let mut server = Server(
+            isolated_command(&home)
+                .arg("serve")
+                .arg("--workspace")
+                .arg(&root)
+                .arg("--bind")
+                .arg(format!("127.0.0.1:{port}"))
+                .arg("--token-file")
+                .arg(&token_file)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(
+                    fs::File::create(&stderr_path).unwrap(),
+                ))
+                .spawn()
+                .unwrap(),
+        );
+        let url = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..100 {
+            if client
+                .get(format!("{url}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if !ready {
+            let status = server.0.try_wait().unwrap();
+            let mut diagnostic = String::new();
+            fs::File::open(&stderr_path)
+                .unwrap()
+                .take(2048)
+                .read_to_string(&mut diagnostic)
+                .unwrap();
+            let diagnostic = diagnostic.replace(TOKEN, "[redacted]");
+            panic!("{name}: daemon did not start: status={status:?}, stderr={diagnostic}");
+        }
+        let request = || {
+            client
+                .post(format!("{url}/api/index"))
+                .header("Origin", &url)
+                .json(&serde_json::json!({"expectedRevision":old_pin}))
+        };
+        let denied = request().bearer_auth("incorrect").send().await.unwrap();
+        assert_eq!(denied.status(), 401, "{name}");
+        let invalid_origin = client
+            .post(format!("{url}/api/index"))
+            .header("Origin", "https://evil.example")
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_origin.status(), 403, "{name}");
+        let current: Value = client
+            .get(format!("{url}/api/jobs/current"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            current.is_null(),
+            "{name}: rejected auth/origin must not start work"
+        );
+        let accepted = request().bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(accepted.status(), 202, "{name}");
+        let started: Value = accepted.json().await.unwrap();
+        let id = started["id"].as_str().unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let job: Value = client
+                    .get(format!("{url}/api/jobs/{id}"))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !job["finishedAt"].is_null() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed["state"], "completed", "{name}: {completed}");
+        let pin = completed["revision"].clone();
+        assert_eq!(pin["indexGeneration"], old_pin["indexGeneration"], "{name}");
+        assert_eq!(pin["indexRevision"], 2, "{name}");
+        let status: Value = client
+            .get(format!("{url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["revision"], pin, "{name}");
+        assert_eq!(
+            status["stats"]["files"],
+            usize::from(!file.is_empty()),
+            "{name}"
+        );
+        assert_eq!(
+            paired_native(&home),
+            native_before,
+            "{name}: identical inputs must retain native source-set and revision IDs"
+        );
+        if !file.is_empty() {
+            let source_at: Value = client
+                .get(format!(
+                    "{url}/api/source?path={file}&indexGeneration={}&indexRevision={}",
+                    pin["indexGeneration"].as_str().unwrap(),
+                    pin["indexRevision"].as_u64().unwrap()
+                ))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(source_at["revision"], pin, "{name}");
+            assert_eq!(source_at["file"]["text"], source, "{name}");
+        }
+        let stale = request().bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(
+            stale.status(),
+            409,
+            "{name}: stale entire pair refused before work"
+        );
+        assert_eq!(paired_native(&home), native_before, "{name}");
+        drop(server);
+    }
+}
