@@ -209,13 +209,10 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
             .to_string(),
         "native_evidence_required: graph-only publication refused"
     );
-    assert!(
-        store
-            .native_source_at(baseline, &artifact.revision.documents[0].key)
-            .unwrap_err()
-            .to_string()
-            .contains("revision conflict")
-    );
+    let closed = store
+        .native_source_at(baseline, &artifact.revision.documents[0].key)
+        .unwrap_err();
+    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
     drop(db);
     let next = publish(&store, root.path(), &cancel, pin).unwrap();
     assert_eq!(next.index_generation, pin.index_generation);
@@ -275,7 +272,9 @@ fn invalid_native_and_conflict_never_change_published_pair() {
     let mut value = serde_json::to_value(&native).unwrap();
     value["calls"][0]["target"] = serde_json::json!("unmeasured");
     assert!(serde_json::from_value::<baleyg::native_evidence::Artifact>(value).is_err());
-    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(store.index_baseline().unwrap(), pin);
+    let closed = store.status().unwrap_err();
+    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
 }
 
 #[test]
@@ -431,7 +430,15 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     assert!(store.native_source_at(pin, &unaffected).unwrap().is_some());
     assert!(store.native_source_at(pin, &corrupted).is_err());
     assert!(store.source_at("flow.rs", Some(pin)).is_err());
-    assert!(Store::open_for_tests(state.path(), root.path()).is_err());
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(reopened.index_baseline().unwrap(), pin);
+    let closed = reopened.status().unwrap_err();
+    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    let selected = reopened.source_at("flow.rs", Some(pin)).unwrap_err();
+    assert!(
+        selected.to_string().contains("index_not_ready"),
+        "{selected:#}"
+    );
 }
 
 #[test]
