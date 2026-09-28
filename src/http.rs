@@ -2169,13 +2169,9 @@ mod live_tests {
                 .unwrap(),
                 1
             );
-            let status_error = store.status().unwrap_err();
-            assert!(
-                status_error.to_string().contains("incompatible_index")
-                    && status_error
-                        .to_string()
-                        .contains("invalid reconciled snapshot"),
-                "{status_error:#}"
+            assert_eq!(
+                store.status().unwrap().revision,
+                serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
             );
             let attempts = provider.budget().unwrap().attempts;
             let response = app.oneshot(request(&path, json!({}))).await.unwrap();

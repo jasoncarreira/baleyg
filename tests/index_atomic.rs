@@ -790,6 +790,23 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     assert_ne!(recovered.index_generation, rebuilt.index_generation);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     assert_eq!(store.status().unwrap().revision, recovered);
+
+    // A newly acquired writer is a takeover until it completes publication.
+    // The latch is shared by Store clones and remains closed after the guard drops.
+    let clone = store.clone();
+    drop(store.leader().unwrap());
+    assert!(store.status().is_err());
+    assert!(clone.status().is_err());
+    // A separately opened Store performs its own full recovery admission.
+    let separate = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert_eq!(separate.index_baseline().unwrap(), recovered);
+    drop(separate);
+    let next = IndexJobCoordinator::prepare(&clone, Some(recovered))
+        .unwrap()
+        .run(&options, &failed_cancel, |_| {})
+        .unwrap();
+    assert_eq!(clone.status().unwrap().revision, next);
+    assert_eq!(store.status().unwrap().revision, next);
 }
 
 #[test]

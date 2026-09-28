@@ -8,8 +8,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
     path::Path,
-    sync::Arc,
-    sync::atomic::Ordering,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,6 +20,7 @@ pub struct Store {
     roots: topology::TopologyRoots,
     identity: Arc<topology::WorkspaceIdentity>,
     workspace_root: String,
+    recovery_required: Arc<AtomicBool>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublishStage {
@@ -1315,7 +1318,7 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
             && count("native_provenance")? == count("files")?,
         "incompatible_index: incomplete native pair"
     );
-    let mut stmt=db.prepare("SELECT d.source_bytes,d.content_hash,d.byte_length,f.payload,f.hash FROM native_documents d JOIN files f ON d.path=f.path")?;
+    let mut stmt=db.prepare("SELECT d.source_bytes,d.content_hash,d.byte_length,f.payload,f.hash,f.path FROM native_documents d JOIN files f ON d.path=f.path")?;
     let mut rows = stmt.query([])?;
     let mut matched = 0;
     while let Some(row) = rows.next()? {
@@ -1329,6 +1332,7 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
                 && hash == hex::encode(Sha256::digest(&bytes))
                 && file.hash == hash
                 && row.get::<_, String>(4)? == hash
+                && file.path == row.get::<_, String>(5)?
                 && file.text.as_bytes() == bytes,
             "incompatible_index: graph/native bytes mismatch"
         );
@@ -1373,6 +1377,7 @@ impl Store {
                 .to_owned(),
             roots,
             identity: Arc::new(identity),
+            recovery_required: Arc::new(AtomicBool::new(false)),
         };
         if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.leader(&store.identity)?;
@@ -1516,6 +1521,9 @@ impl Store {
     ) -> Result<topology::LeaderGuard> {
         drop(self.cache()?);
         let leader = self.roots.leader(&self.identity)?;
+        // The leader incarnation is already durable. From this point every clone
+        // must remain closed unless a complete paired publication commits.
+        self.recovery_required.store(true, Ordering::Release);
         // Opening can race a second SQLite writer: repeat validation only AFTER
         // BEGIN IMMEDIATE excludes schema changes and before any metadata UPDATE.
         let mut db = self.cache_write()?;
@@ -1599,6 +1607,9 @@ impl Store {
         } else {
             false
         };
+        if !compatible {
+            self.recovery_required.store(true, Ordering::Release);
+        }
         Ok((
             IndexPin {
                 index_generation: generation,
@@ -1662,7 +1673,11 @@ impl Store {
             status.evidence_format.is_some(),
             "index_not_ready: reindex required"
         );
-        validate_paired_rows(db).context("incompatible_index: invalid reconciled snapshot")?;
+        ensure!(
+            !self.recovery_required.load(Ordering::Acquire),
+            "index_not_ready: reconciliation required"
+        );
+        validate_reconcile_inventory(db)?;
         // Every public schema-7 derived read needs the same bounded catalog
         // singleton. Missing/oversized live metadata is corruption, never an
         // old-index "requireIndex" fallback. This is one indexed metadata row.
@@ -2102,6 +2117,7 @@ impl Store {
         leader.verify()?;
         self.identity.verify()?;
         storage_result(tx.commit())?;
+        self.recovery_required.store(false, Ordering::Release);
         Ok(revision)
     }
 
@@ -4667,6 +4683,26 @@ mod sqlite_schema_race_tests {
             )
             .unwrap();
         (state, work, store, graph, capture, native, pin, cancel)
+    }
+
+    #[test]
+    fn failed_takeover_before_writer_transaction_closes_every_clone() {
+        let (state, work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let clone = store.clone();
+        let error = store
+            .leader_with_open_hook(|_| anyhow::bail!("injected pre-transaction takeover failure"))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "injected pre-transaction takeover failure"
+        );
+        assert!(store.status().is_err());
+        assert!(clone.status().is_err());
+        let separately_opened = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(separately_opened.index_baseline().unwrap(), pin);
+        assert!(
+            !separately_opened.recovery_required.load(Ordering::Acquire)
+        );
     }
 
     #[test]
