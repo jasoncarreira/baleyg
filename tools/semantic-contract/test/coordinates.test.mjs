@@ -114,3 +114,23 @@ test("COORD.INVALID_UTF8 rejects malformed exact source bytes", () => {
     /not valid for encoding utf-8/,
   );
 });
+test("COORD.CACHE mutated caller buffers and evicted sources convert afresh", () => {
+  const range = { encoding: "utf16", start: 1, end: 2 };
+  const buffer = Buffer.from("aé");
+  assert.deepEqual(toByteRange(buffer, range), { start: 1, end: 3 });
+  buffer.write("bc", 1, "utf8");
+  assert.equal(buffer.toString("utf8"), "abc");
+  assert.deepEqual(toByteRange(buffer, range), { start: 1, end: 2 });
+  assert.deepEqual(toByteRange("aé", range), { start: 1, end: 3 });
+
+  const sources = Array.from({ length: 20 }, (_, i) => `${"é".repeat(i)}x`);
+  const expected = (i) => ({ start: 2 * i, end: 2 * i + 1 });
+  for (const [i, source] of sources.entries()) {
+    const at = { encoding: "utf16", start: i, end: i + 1 };
+    assert.deepEqual(toByteRange(source, at), expected(i));
+  }
+  for (const [i, source] of sources.entries()) {
+    const at = { encoding: "utf16", start: i, end: i + 1 };
+    assert.deepEqual(toByteRange(source, at), expected(i), `source ${i}`);
+  }
+});
