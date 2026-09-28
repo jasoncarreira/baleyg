@@ -2422,9 +2422,12 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     // that every successful edit response carries a real immutable anchor.
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let records = DurableRecords::new(&roots, &identity);
+    let existing = records.view_record("view-race").unwrap().unwrap();
+    let old_raw = existing.anchor.as_ref().unwrap().get().to_owned();
     let edit = SavedViewRecord {
         title: "edit".into(),
-        ..records.view_record("view-race").unwrap().unwrap()
+        anchor: None,
+        ..existing
     };
     let barrier = Arc::new(Barrier::new(2));
     let edit_roots = roots.clone();
@@ -2445,7 +2448,6 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         delete_barrier.wait();
         DurableRecords::new(&delete_roots, &identity).delete_view("view-race")
     });
-    let old_raw = edit.anchor.as_ref().unwrap().get().to_owned();
     let replacement_raw = test_anchor_raw(target, 'e').get().to_owned();
     let edit_result = editor.join().unwrap();
     let delete_result = deleter.join().unwrap();
@@ -2471,22 +2473,30 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     assert!(response_raw == old_raw || response_raw == replacement_raw);
     assert!(edit_response.typed_anchor().unwrap().is_some());
     let final_record = records.view_record("view-race").unwrap();
-    if edit_was_busy {
-        assert_eq!(response_raw, replacement_raw);
-        assert_eq!(final_record.unwrap().anchor.unwrap().get(), replacement_raw);
-    } else if delete_was_busy {
-        assert_eq!(response_raw, old_raw);
-        assert!(final_record.is_none());
-    } else if let Some(final_record) = final_record {
-        assert_eq!(response_raw, replacement_raw);
-        assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
-    } else {
-        assert_eq!(response_raw, old_raw);
+    match (edit_was_busy, delete_was_busy, final_record) {
+        // The edit retry runs first; the delete retry then removes that exact row.
+        (_, true, None) => assert_eq!(response_raw, old_raw),
+        // The completed delete ran first; the edit retry is a fresh server capture.
+        (true, false, Some(final_record)) => {
+            assert_eq!(response_raw, replacement_raw);
+            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+        }
+        // With no retry, final presence proves delete-before-edit.
+        (false, false, Some(final_record)) => {
+            assert_eq!(response_raw, replacement_raw);
+            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+        }
+        // With no retry, final absence proves edit-before-delete.
+        (false, false, None) => assert_eq!(response_raw, old_raw),
+        chronology => panic!("impossible view contention chronology: {chronology:?}"),
     }
 
+    let existing = records.annotation_record("note-race").unwrap().unwrap();
+    let old_raw = existing.anchor.as_ref().unwrap().get().to_owned();
     let edit = AnnotationRecord {
         body: "edit".into(),
-        ..records.annotation_record("note-race").unwrap().unwrap()
+        anchor: None,
+        ..existing
     };
     let barrier = Arc::new(Barrier::new(2));
     let edit_roots = roots.clone();
@@ -2510,7 +2520,6 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
         delete_barrier.wait();
         DurableRecords::new(&delete_roots, &identity).delete_annotation("note-race")
     });
-    let old_raw = edit.anchor.as_ref().unwrap().get().to_owned();
     let replacement_raw = test_anchor_raw(target, 'f').get().to_owned();
     let edit_result = editor.join().unwrap();
     let delete_result = deleter.join().unwrap();
@@ -2536,16 +2545,68 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     assert!(response_raw == old_raw || response_raw == replacement_raw);
     assert!(edit_response.typed_anchor().unwrap().is_some());
     let final_record = records.annotation_record("note-race").unwrap();
-    if edit_was_busy {
-        assert_eq!(response_raw, replacement_raw);
-        assert_eq!(final_record.unwrap().anchor.unwrap().get(), replacement_raw);
-    } else if delete_was_busy {
-        assert_eq!(response_raw, old_raw);
-        assert!(final_record.is_none());
-    } else if let Some(final_record) = final_record {
-        assert_eq!(response_raw, replacement_raw);
-        assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
-    } else {
-        assert_eq!(response_raw, old_raw);
+    match (edit_was_busy, delete_was_busy, final_record) {
+        // The edit retry runs first; the delete retry then removes that exact row.
+        (_, true, None) => assert_eq!(response_raw, old_raw),
+        // The completed delete ran first; the edit retry is a fresh server capture.
+        (true, false, Some(final_record)) => {
+            assert_eq!(response_raw, replacement_raw);
+            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+        }
+        // With no retry, final presence proves delete-before-edit.
+        (false, false, Some(final_record)) => {
+            assert_eq!(response_raw, replacement_raw);
+            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+        }
+        // With no retry, final absence proves edit-before-delete.
+        (false, false, None) => assert_eq!(response_raw, old_raw),
+        chronology => panic!("impossible view contention chronology: {chronology:?}"),
     }
+}
+
+
+#[test]
+fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() {
+    use baleyg::{
+        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
+        store::topology::DurableRecords,
+    };
+    use std::{collections::BTreeMap, sync::atomic::{AtomicBool, Ordering}};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    let target = "sid:v1:0123456789abcdef0123456789abcdef";
+
+    let stale_view = SavedViewRecord::from_base(SavedView {
+        id: "view-recreate".into(), title: "old".into(),
+        query: ViewQuery { seed: target.into(), depth: 1, max_nodes: 40, max_calls: 200, include_callbacks: false, exclude_paths: vec![] },
+        pins: BTreeMap::new(), hidden: vec![],
+    }, Some(test_anchor_raw(target, 'a')));
+    records.put_view_record(&stale_view).unwrap();
+    assert!(records.delete_view("view-recreate").unwrap());
+    assert!(records.view_record("view-recreate").unwrap().is_none());
+    let view_capture_called = AtomicBool::new(false);
+    let recreated_view = records.update_view_record(&stale_view, || {
+        assert!(!view_capture_called.swap(true, Ordering::SeqCst));
+        Ok(test_anchor_raw(target, 'e'))
+    }).unwrap();
+    assert!(view_capture_called.load(Ordering::SeqCst));
+    assert_eq!(recreated_view.anchor.as_ref().unwrap().get(), test_anchor_raw(target, 'e').get());
+    assert_eq!(records.view_record("view-recreate").unwrap().unwrap().anchor.unwrap().get(), test_anchor_raw(target, 'e').get());
+
+    let stale_note = AnnotationRecord::from_base(Annotation {
+        id: "note-recreate".into(), node_id: target.into(), body: "old".into(),
+    }, Some("Title".into()), Some(test_anchor_raw(target, 'b')));
+    records.put_annotation_record(&stale_note, false).unwrap();
+    assert!(records.delete_annotation("note-recreate").unwrap());
+    assert!(records.annotation_record("note-recreate").unwrap().is_none());
+    let note_capture_called = AtomicBool::new(false);
+    let recreated_note = records.update_annotation_record(&stale_note, false, || {
+        assert!(!note_capture_called.swap(true, Ordering::SeqCst));
+        Ok(test_anchor_raw(target, 'f'))
+    }).unwrap();
+    assert!(note_capture_called.load(Ordering::SeqCst));
+    assert_eq!(recreated_note.anchor.as_ref().unwrap().get(), test_anchor_raw(target, 'f').get());
+    assert_eq!(records.annotation_record("note-recreate").unwrap().unwrap().anchor.unwrap().get(), test_anchor_raw(target, 'f').get());
 }
