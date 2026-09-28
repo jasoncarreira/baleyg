@@ -525,7 +525,7 @@ async fn successful_workspace_index_automatically_rebuilds_catalog() {
             "malformed job progress counters: {job}"
         );
         assert!(
-            matches!(phase, "" | "parse" | "complete"),
+            matches!(phase, "" | "scan" | "parse" | "complete"),
             "unexpected progress phase: {job}"
         );
         if state != last_state || phase != last_phase {
@@ -559,7 +559,7 @@ async fn successful_workspace_index_automatically_rebuilds_catalog() {
                 "{:?} graph projection complete; publication/commit not yet proven",
                 began.elapsed()
             ));
-        } else if phase == "parse" && stage == "start" {
+        } else if matches!(phase, "scan" | "parse") && stage == "start" {
             stage = "capture/project";
             stage_started = Instant::now();
             transitions.push(format!(
