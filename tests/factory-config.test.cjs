@@ -131,9 +131,10 @@ test("verify is one executable command and retains all checks", () => {
   const fakeDir = mkdtempSync(join(tmpdir(), "baleyg-factory-verify-"));
   const log = join(fakeDir, "verify.log");
   const fakeTool = `#!/bin/sh
-printf '%s' "\${0##*/}" >> "$FAKE_VERIFY_LOG"
-printf '\\t%s' "$@" >> "$FAKE_VERIFY_LOG"
-printf '\\n' >> "$FAKE_VERIFY_LOG"
+line="\${0##*/}"
+for arg in "$@"; do line="$line$(printf '\\t')$arg"; done
+# One append per call keeps lines whole when lanes run concurrently.
+printf '%s\\n' "$line" >> "$FAKE_VERIFY_LOG"
 if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
 `;
@@ -157,29 +158,50 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       const commands = readFileSync(log, "utf8").trimEnd().split("\n").map((line) => line.split("\t"));
       return { result, commands };
     }
-    const expected = [
-      ["cargo", "fmt", "--all", "--", "--check"],
-      ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
-      ["cargo", "test", "--locked", "--all-targets"],
-      ["node", "--test", "runtime/acp/runner.test.mjs"],
-      ["node", "--test", "tests/factory-config.test.cjs"],
-      ["node", "tools/semantic-contract/test/run.mjs"],
-      ["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"],
-      ["node", "docs/semantic-evidence/check-policy.mjs"],
-      ["node", "--check", "web/app.js"],
-      ["node", "--test", "tests/question-ui.test.cjs", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs"],
-    ];
+    // Lanes run concurrently; commands within a lane keep this order.
+    const lanes = {
+      rust: [
+        ["cargo", "fmt", "--all", "--", "--check"],
+        ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+        ["cargo", "test", "--locked", "--all-targets"],
+      ],
+      semantic: [["node", "tools/semantic-contract/test/run.mjs"]],
+      cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
+      checks: [
+        ["node", "--test", "runtime/acp/runner.test.mjs"],
+        ["node", "--test", "tests/factory-config.test.cjs"],
+        ["node", "docs/semantic-evidence/check-policy.mjs"],
+        ["node", "--check", "web/app.js"],
+        ["node", "--test", "tests/question-ui.test.cjs", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs"],
+      ],
+    };
+    function assertRan(commands, expected) {
+      const key = (command) => JSON.stringify(command);
+      assert.deepEqual(commands.map(key).sort(), Object.values(expected).flat().map(key).sort());
+      for (const lane of Object.values(expected)) {
+        const own = new Set(lane.map(key));
+        assert.deepEqual(commands.filter((command) => own.has(key(command))), lane);
+      }
+    }
     const success = runVerify();
     assert.equal(success.result.status, 0, success.result.stderr);
-    assert.deepEqual(success.commands, expected);
+    assertRan(success.commands, lanes);
     rmSync(log);
     const failure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" });
     assert.equal(failure.result.status, 23);
-    assert.deepEqual(failure.commands, expected.slice(0, 2));
+    assertRan(failure.commands, { ...lanes, rust: lanes.rust.slice(0, 2) });
+    assert.match(failure.result.stderr, /failed lane\(s\): rust$/m);
+    assert.match(failure.result.stdout, /^==> verify lane rust \(exit 23\)$/m);
     rmSync(log);
     const semanticFailure = runVerify({ FAKE_VERIFY_FAIL_SEMANTIC: "1" });
     assert.equal(semanticFailure.result.status, 29);
-    assert.deepEqual(semanticFailure.commands, expected.slice(0, 6));
+    assertRan(semanticFailure.commands, lanes);
+    assert.match(semanticFailure.result.stderr, /failed lane\(s\): semantic$/m);
+    rmSync(log);
+    const bothFailure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1", FAKE_VERIFY_FAIL_SEMANTIC: "1" });
+    assert.equal(bothFailure.result.status, 23);
+    assertRan(bothFailure.commands, { ...lanes, rust: lanes.rust.slice(0, 2) });
+    assert.match(bothFailure.result.stderr, /failed lane\(s\): rust semantic$/m);
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }

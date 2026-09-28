@@ -1,14 +1,50 @@
 #!/bin/sh
 # Factory runs verify as an argv-tokenized command, not through a shell.
+# Independent lanes run concurrently. Each lane stops at its first failure;
+# verify waits for every lane, prints each lane's output, and exits with the
+# first failed lane's status.
 set -eu
 
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
-node --test runtime/acp/runner.test.mjs
-node --test tests/factory-config.test.cjs
-node tools/semantic-contract/test/run.mjs
-node --test tools/synthetic-cohorts/test/cohorts.test.mjs
-node docs/semantic-evidence/check-policy.mjs
-node --check web/app.js
-node --test tests/question-ui.test.cjs tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs
+rust() {
+  cargo fmt --all -- --check
+  cargo clippy --locked --all-targets -- -D warnings
+  cargo test --locked --all-targets
+}
+semantic() {
+  node tools/semantic-contract/test/run.mjs
+}
+cohorts() {
+  node --test tools/synthetic-cohorts/test/cohorts.test.mjs
+}
+checks() {
+  node --test runtime/acp/runner.test.mjs
+  node --test tests/factory-config.test.cjs
+  node docs/semantic-evidence/check-policy.mjs
+  node --check web/app.js
+  node --test tests/question-ui.test.cjs tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs
+}
+
+lanes="rust semantic cohorts checks"
+logs=$(mktemp -d "${TMPDIR:-/tmp}/baleyg-verify.XXXXXX")
+trap 'rm -rf "$logs"' EXIT
+for lane in $lanes; do
+  (set -e; "$lane") >"$logs/$lane" 2>&1 &
+  eval "pid_$lane=$!"
+done
+
+status=0
+failed=""
+for lane in $lanes; do
+  code=0
+  eval "wait \$pid_$lane" || code=$?
+  echo "==> verify lane $lane (exit $code)"
+  cat "$logs/$lane"
+  if [ "$code" -ne 0 ]; then
+    [ "$status" -ne 0 ] || status=$code
+    failed="$failed $lane"
+  fi
+done
+if [ "$status" -ne 0 ]; then
+  echo "verify: failed lane(s):$failed" >&2
+fi
+exit "$status"
