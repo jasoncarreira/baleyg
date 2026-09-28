@@ -4,6 +4,27 @@
 
 Each selected checkout has a disposable, path-keyed index outside the checkout. Its Git directory holds a workspace UUID that keys durable saved views and notes across moves; a non-Git root uses path identity. Future `baleyg mcp` is a local stdio entry point. In the full future topology, exactly one local lock-elected leader watches and writes native index data. Other processes read verified snapshots and submit persistent reconciliation requests. The UUID marker is the sole permitted topology write into Git metadata, which can itself be inside the checkout.
 
+<a id="threat-model"></a>
+## T00 — Threat model
+
+This section bounds what every Stage 2–4 implementation and review must defend against. A review finding outside this bound is not a blocker.
+
+**In scope.** Implementations must handle these safely, failing closed where they can't:
+
+- **Untrusted repository content.** Any source, configuration or manifest bytes, including pathological sizes, nesting and encodings. Parsing and extraction stay bounded and never crash the process.
+- **Untrusted callers.** Requests to the daemon, browser API and MCP server are authenticated where the contract requires it, and bounded and validated.
+- **Ordinary faults.** Crashes, power loss, partial writes, full disks, I/O and permission errors. Concurrent Baleyg processes, stale pins, and races with ordinary edits, `git checkout` and similar tools.
+- **Accidental corruption of state files.** SQLite integrity failures and rows that fail typed decoding or closed validation return the contract's typed corrupt failure, never a partial or best-effort result.
+
+**Out of scope.** Implementations need not defend against:
+
+- A process running as the same user deliberately editing Baleyg's state (`index.db`, `requests.db`, the fact cache, locks or markers), including consistent rewrites that pass integrity checks, such as a BLOB and its hash changed together, or extra rows inserted with valid foreign keys.
+- Hostile replacement of filesystem ancestors by the same user (see T02).
+
+A same-user process can already change the source, the binary and the configuration, so these defenses would add no security.
+
+Accordingly, reads need not re-authenticate stored rows against captured source or the graph, the local database need not be signed or MACed, and reads need no per-field size caps beyond the existing request and response bounds. These remove requirements; they don't forbid existing read checks or relax paired-pin publication rules. Validation happens at capture and publication; reads decode strictly and reject what fails.
+
 <a id="workspace-discovery"></a>
 ## T01 — Discovery and identity
 
