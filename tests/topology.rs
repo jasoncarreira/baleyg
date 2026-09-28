@@ -2132,7 +2132,9 @@ fn saved_anchor_raw_bytes_survive_edits() {
         None,
     );
     let response = records
-        .update_annotation_record(&edited, false, || panic!("existing edit must not recapture"))
+        .update_annotation_record(&edited, false, || {
+            panic!("existing edit must not recapture")
+        })
         .unwrap();
     assert_eq!(response.anchor.as_ref().unwrap().get(), before);
     assert_eq!(response.title.as_deref(), Some("Edited title"));

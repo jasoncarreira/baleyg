@@ -196,47 +196,85 @@ fn generated_semantic_contract_anchors_are_the_rust_golden() {
     }
 }
 
-
 #[test]
 fn authored_semantic_contract_cases_execute_through_production_audit() {
     let authored: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/semantic-evidence/v1/example/expected/anchors.json"
-    )).unwrap();
+    ))
+    .unwrap();
     let capture: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/semantic-evidence/v1/example/captures/native.json"
-    )).unwrap();
+    ))
+    .unwrap();
     let records: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/semantic-evidence/v1/example/generated/bundles/676d58ad7a57fcd810e7fdd579b6a4349cd26f1ae8fa91ec5753d076362b0964/records.json"
     )).unwrap();
-    let declarations: Vec<Declaration> = serde_json::from_value(records["declarations"].clone()).unwrap();
+    let declarations: Vec<Declaration> =
+        serde_json::from_value(records["declarations"].clone()).unwrap();
     let captured_rows = capture["declarations"].as_array().unwrap();
     let declaration_for_ref = |reference: &str| -> &Declaration {
-        let authored_row = captured_rows.iter().find(|row| row["ref"] == reference).unwrap();
-        declarations.iter().find(|row| {
-            row.revision_id == authored_row["revisionId"].as_str().unwrap()
-                && serde_json::to_value(&row.document).unwrap() == authored_row["document"]
-                && row.range.start == authored_row["range"]["start"].as_u64().unwrap() as usize
-                && row.range.end == authored_row["range"]["end"].as_u64().unwrap() as usize
-        }).unwrap()
+        let authored_row = captured_rows
+            .iter()
+            .find(|row| row["ref"] == reference)
+            .unwrap();
+        declarations
+            .iter()
+            .find(|row| {
+                row.revision_id == authored_row["revisionId"].as_str().unwrap()
+                    && serde_json::to_value(&row.document).unwrap() == authored_row["document"]
+                    && row.range.start == authored_row["range"]["start"].as_u64().unwrap() as usize
+                    && row.range.end == authored_row["range"]["end"].as_u64().unwrap() as usize
+            })
+            .unwrap()
     };
     for case in authored["cases"].as_array().unwrap() {
         let captured = declaration_for_ref(case["capturedDeclarationRef"].as_str().unwrap());
-        let captured_document: Vec<_> = declarations.iter().filter(|row| {
-            row.revision_id == captured.revision_id && row.document == captured.document
-        }).cloned().collect();
+        let captured_document: Vec<_> = declarations
+            .iter()
+            .filter(|row| {
+                row.revision_id == captured.revision_id && row.document == captured.document
+            })
+            .cloned()
+            .collect();
         let anchor = capture_anchor(captured, &captured_document).unwrap();
         let current_revision = case["currentRevisionId"].as_str().unwrap();
-        let current_document: Vec<_> = declarations.iter().filter(|row| {
-            row.revision_id == current_revision && row.document == captured.document
-        }).cloned().collect();
-        let current = current_document.iter().find(|row| row.syntax_id == anchor.syntax_id);
-        let continuity: GroupContinuity = serde_json::from_value(case["continuity"].clone()).unwrap();
-        let actual = audit_anchor(&anchor, current_revision, current, &current_document, Some(&continuity)).unwrap();
-        assert_eq!(serde_json::to_value(actual.status).unwrap(), case["expectedResult"]["status"], "{}", case["id"]);
-        assert_eq!(serde_json::to_value(actual.reason).unwrap(), case["expectedResult"]["reason"], "{}", case["id"]);
+        let current_document: Vec<_> = declarations
+            .iter()
+            .filter(|row| row.revision_id == current_revision && row.document == captured.document)
+            .cloned()
+            .collect();
+        let current = current_document
+            .iter()
+            .find(|row| row.syntax_id == anchor.syntax_id);
+        let continuity: GroupContinuity =
+            serde_json::from_value(case["continuity"].clone()).unwrap();
+        let actual = audit_anchor(
+            &anchor,
+            current_revision,
+            current,
+            &current_document,
+            Some(&continuity),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual.status).unwrap(),
+            case["expectedResult"]["status"],
+            "{}",
+            case["id"]
+        );
+        assert_eq!(
+            serde_json::to_value(actual.reason).unwrap(),
+            case["expectedResult"]["reason"],
+            "{}",
+            case["id"]
+        );
         let expected_target = match &case["expectedResult"]["targetId"] {
             serde_json::Value::Null => None,
-            value => Some(declaration_for_ref(value["ref"].as_str().unwrap()).syntax_id.clone()),
+            value => Some(
+                declaration_for_ref(value["ref"].as_str().unwrap())
+                    .syntax_id
+                    .clone(),
+            ),
         };
         assert_eq!(actual.target_id, expected_target, "{}", case["id"]);
     }
@@ -293,7 +331,8 @@ fn full_ordered_group_vectors_and_golden_fixture() {
         Some(&inserted_different),
         &[inserted_different.clone(), shifted_original],
         None,
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(result.reason, AnchorReason::HeaderMismatch);
     assert_eq!(result.target_id, None);
 

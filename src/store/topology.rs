@@ -903,19 +903,8 @@ impl<'a> DurableRecords<'a> {
         self.identity.verify()?;
         Ok(db)
     }
-    fn save(
-        &self,
-        item: RecordItem<'_>,
-        payload: String,
-        preserve_title: bool,
-    ) -> Result<String> {
-        self.save_with_first_save_hook(
-            item,
-            payload,
-            preserve_title,
-            |_| Ok(None),
-            |_| Ok(()),
-        )
+    fn save(&self, item: RecordItem<'_>, payload: String, preserve_title: bool) -> Result<String> {
+        self.save_with_first_save_hook(item, payload, preserve_title, |_| Ok(None), |_| Ok(()))
     }
     fn save_with_first_save_hook(
         &self,
@@ -1135,7 +1124,11 @@ impl<'a> DurableRecords<'a> {
     pub fn put_view_record(&self, record: &crate::model::SavedViewRecord) -> Result<()> {
         record.validate()?;
         self.save(
-            RecordItem { table: "views", id: &record.id, node: None },
+            RecordItem {
+                table: "views",
+                id: &record.id,
+                node: None,
+            },
             serde_json::to_string(record)?,
             false,
         )
@@ -1150,7 +1143,11 @@ impl<'a> DurableRecords<'a> {
         let mut incoming = record.clone();
         incoming.anchor = None;
         let payload = self.save_with_first_save_hook(
-            RecordItem { table: "views", id: &record.id, node: None },
+            RecordItem {
+                table: "views",
+                id: &record.id,
+                node: None,
+            },
             serde_json::to_string(&incoming)?,
             false,
             |_| capture().map(Some),
@@ -1172,7 +1169,11 @@ impl<'a> DurableRecords<'a> {
     ) -> Result<()> {
         record.validate()?;
         self.save(
-            RecordItem { table: "annotations", id: &record.id, node: Some(&record.node_id) },
+            RecordItem {
+                table: "annotations",
+                id: &record.id,
+                node: Some(&record.node_id),
+            },
             serde_json::to_string(record)?,
             preserve_title,
         )
@@ -1188,7 +1189,11 @@ impl<'a> DurableRecords<'a> {
         let mut incoming = record.clone();
         incoming.anchor = None;
         let payload = self.save_with_first_save_hook(
-            RecordItem { table: "annotations", id: &record.id, node: Some(&record.node_id) },
+            RecordItem {
+                table: "annotations",
+                id: &record.id,
+                node: Some(&record.node_id),
+            },
             serde_json::to_string(&incoming)?,
             preserve_title,
             |_| capture().map(Some),
@@ -1208,7 +1213,11 @@ impl<'a> DurableRecords<'a> {
         annotation.validate()?;
         let record = crate::model::AnnotationRecord::from_base(annotation.clone(), None, None);
         self.save_with_first_save_hook(
-            RecordItem { table: "annotations", id: &annotation.id, node: Some(&annotation.node_id) },
+            RecordItem {
+                table: "annotations",
+                id: &annotation.id,
+                node: Some(&annotation.node_id),
+            },
             serde_json::to_string(&record)?,
             true,
             |_| Ok(None),

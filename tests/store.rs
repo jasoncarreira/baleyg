@@ -1186,22 +1186,43 @@ fn saved_reads_without_records_are_conservative_and_write_nothing() {
     );
 }
 
-
 #[test]
 fn malformed_persisted_anchors_fail_closed_without_an_index() {
     let (state, work, store) = fixture();
     let view = SavedView {
-        id: "view-malformed".into(), title: "View".into(), query: query(),
-        pins: BTreeMap::new(), hidden: vec![],
+        id: "view-malformed".into(),
+        title: "View".into(),
+        query: query(),
+        pins: BTreeMap::new(),
+        hidden: vec![],
     };
-    let note = Annotation { id: "note-malformed".into(), node_id: "node".into(), body: "body".into() };
+    let note = Annotation {
+        id: "note-malformed".into(),
+        node_id: "node".into(),
+        body: "body".into(),
+    };
     store.put_view(&view).unwrap();
     store.put_annotation(&note).unwrap();
-    let identity = baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
+            .unwrap();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
     let db = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
-    let original_view: String = db.query_row("SELECT payload FROM views WHERE id=?1", [&view.id], |row| row.get(0)).unwrap();
-    let original_note: String = db.query_row("SELECT payload FROM annotations WHERE id=?1", [&note.id], |row| row.get(0)).unwrap();
+    let original_view: String = db
+        .query_row("SELECT payload FROM views WHERE id=?1", [&view.id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let original_note: String = db
+        .query_row(
+            "SELECT payload FROM annotations WHERE id=?1",
+            [&note.id],
+            |row| row.get(0),
+        )
+        .unwrap();
     let malformed_anchor = serde_json::json!({
         "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef",
         "document":{"sourceSetId":"set","language":"typescript","path":"../escape.rs"},
@@ -1212,13 +1233,43 @@ fn malformed_persisted_anchors_fail_closed_without_an_index() {
     });
     let mut malformed_view: serde_json::Value = serde_json::from_str(&original_view).unwrap();
     malformed_view["anchor"] = malformed_anchor.clone();
-    db.execute("UPDATE views SET payload=?1 WHERE id=?2", rusqlite::params![serde_json::to_string(&malformed_view).unwrap(), view.id]).unwrap();
-    assert!(store.views().unwrap_err().to_string().contains("invalid durable anchor"));
-    assert!(store.view("view-malformed").unwrap_err().to_string().contains("invalid durable anchor"));
-    db.execute("UPDATE views SET payload=?1 WHERE id=?2", rusqlite::params![original_view, view.id]).unwrap();
+    db.execute(
+        "UPDATE views SET payload=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&malformed_view).unwrap(), view.id],
+    )
+    .unwrap();
+    assert!(
+        store
+            .views()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid durable anchor")
+    );
+    assert!(
+        store
+            .view("view-malformed")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid durable anchor")
+    );
+    db.execute(
+        "UPDATE views SET payload=?1 WHERE id=?2",
+        rusqlite::params![original_view, view.id],
+    )
+    .unwrap();
 
     let mut malformed_note: serde_json::Value = serde_json::from_str(&original_note).unwrap();
     malformed_note["anchor"] = malformed_anchor;
-    db.execute("UPDATE annotations SET payload=?1 WHERE id=?2", rusqlite::params![serde_json::to_string(&malformed_note).unwrap(), note.id]).unwrap();
-    assert!(store.annotations().unwrap_err().to_string().contains("invalid durable anchor"));
+    db.execute(
+        "UPDATE annotations SET payload=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&malformed_note).unwrap(), note.id],
+    )
+    .unwrap();
+    assert!(
+        store
+            .annotations()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid durable anchor")
+    );
 }
