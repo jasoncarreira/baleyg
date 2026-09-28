@@ -309,49 +309,83 @@ async fn ambiguity_preserves_all_cached_candidates_and_unresolved_calls_are_not_
     }
 }
 #[tokio::test]
-async fn old_projection_guidance_and_large_payloads_are_bounded() {
+async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
+    let refusal = |(status, body): (StatusCode, Value)| {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "incompatible_index", "{body}");
+        assert!(
+            body["targets"].is_null(),
+            "no forged navigation targets: {body}"
+        );
+        assert!(
+            body["requireIndex"].is_null(),
+            "not a legacy projection: {body}"
+        );
+    };
+    // A clean native-paired document still serves bounded navigation.
     let (dir, _store, graph, app) = fixture();
     let selector = member(&dir, id(&graph, "A"), "first", 0);
+    let (status, clean) = call(&app, selector.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(targets(&clean, "type").is_empty());
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
-    // A large unrelated member array must not be deserialized to validate one tiny field.
     let huge=json!({"name":"padding","typeHint":"x".repeat(2*1024*1024),"symbolId":null,"path":"A.java","range":{"startByte":0,"endByte":1,"startLine":1,"endLine":1,"startColumn":1,"endColumn":2}}).to_string();
     db.execute(
         "UPDATE classes SET payload=json_insert(payload,'$.methods[#]',json(?1)) WHERE id=?2",
         rusqlite::params![huge, id(&graph, "A")],
     )
     .unwrap();
-    assert!(targets(&call(&app, selector.clone()).await.1, "type").is_empty());
+    refusal(call(&app, selector).await);
+    refusal(call(&app, member(&dir, id(&graph, "A"), "padding", 0)).await);
+    let (status, other) = call(&app, source("B.java", 1, &dir)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unaffected native document: {other}"
+    );
+
+    // Catalog warnings are global metadata, so corruption refuses every
+    // public schema-6 derived read before the huge JSON is decoded.
+    let (dir, store, graph, app) = fixture();
+    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     db.execute(
         "UPDATE class_catalog SET warnings=?1",
         [json!(["x".repeat(2 * 1024 * 1024)]).to_string()],
     )
     .unwrap();
-    // Also cap a selected record, returning a limits notice rather than an invalid-selector error.
-    let oversized = member(&dir, id(&graph, "A"), "padding", 0);
-    let (status, selected_limit) = call(&app, oversized).await;
-    assert_eq!(status, 200);
-    assert_eq!(selected_limit["truncated"], true);
-    assert!(selected_limit["targets"].as_array().unwrap().is_empty());
-    db.execute("UPDATE class_relations SET payload=json_set(payload,'$.candidateIds',json(?1)) WHERE owner=?2",rusqlite::params![json!(["x".repeat(100000)]).to_string(),id(&graph,"A")]).unwrap();
-    let (_, clipped) = call(&app, selector.clone()).await;
-    assert!(clipped["targets"].as_array().unwrap().is_empty());
+    refusal(call(&app, member(&dir, id(&graph, "A"), "first", 0)).await);
+    assert!(
+        store
+            .classes_at(None, "", None, 0, 20)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+
+    // Selected class relationships are scoped by their owner and file.
+    let (dir, _store, graph, app) = fixture();
+    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
+    db.execute("UPDATE class_relations SET payload=json_set(payload,'$.candidateIds',json(?1)) WHERE owner=?2",
+        rusqlite::params![json!(["x".repeat(100000)]).to_string(),id(&graph,"A")]).unwrap();
+    refusal(call(&app, member(&dir, id(&graph, "A"), "first", 0)).await);
+    let (status, other) = call(&app, source("B.java", 1, &dir)).await;
+    assert_eq!(status, StatusCode::OK, "unrelated native document: {other}");
+
+    // Deleting the live schema-6 catalog is corruption, not a truthful old4
+    // private baseline or a public requireIndex fallback.
+    let (dir, store, _graph, app) = fixture();
+    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     db.execute_batch(
         "DELETE FROM class_relations; DELETE FROM classes; DELETE FROM class_catalog;",
     )
     .unwrap();
-    let (_, old) = call(&app, source("A.java", 6, &dir)).await;
-    assert_eq!(old["requireIndex"], true);
+    refusal(call(&app, source("A.java", 6, &dir)).await);
     assert!(
-        targets(&old, "declaration")
-            .iter()
-            .any(|name| name == "run")
-    );
-    assert!(
-        old["warnings"].as_array().unwrap().iter().any(|s| s
-            .as_str()
-            .unwrap()
-            .to_lowercase()
-            .contains("index"))
+        store
+            .classes_at(None, "", None, 0, 20)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
     );
 }
 #[tokio::test]

@@ -945,3 +945,226 @@ fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
         "unrelated selected Java document must remain available"
     );
 }
+
+#[test]
+fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    let owner: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute("INSERT INTO native_signature_parameter_types(syntax_id,ancestor_ordinal,ordinal,type_name) VALUES(?1,10000,0,?2)",
+        rusqlite::params![owner,"X".repeat(64*1024)]).unwrap();
+    let fk_count: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_count, 0, "single oversized child remains FK-valid");
+    let error = store
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("selected evidence byte budget exceeded"),
+        "{error:#}"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert!(
+        !store
+            .native_declarations_at(pin, "java", "go")
+            .unwrap()
+            .is_empty(),
+        "unrelated selected Java document stays readable"
+    );
+}
+
+#[test]
+fn selected_class_payload_oversize_refuses_before_json_decode() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let id: String = db
+        .query_row(
+            "SELECT id FROM classes WHERE path='flow.java' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE classes SET payload=?1 WHERE id=?2",
+        rusqlite::params!["not-valid-class-json".repeat(8000), id],
+    )
+    .unwrap();
+    let error = store.symbol_at(&id, Some(pin)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("selected evidence byte budget exceeded"),
+        "{error:#}"
+    );
+    let rust_id: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.rs' AND name='main'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(store.symbol_at(&rust_id, Some(pin)).unwrap().is_some());
+}
+
+#[test]
+fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    let owner: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<40)
+        INSERT INTO native_signature_parameter_types(syntax_id,ancestor_ordinal,ordinal,type_name)
+        SELECT ?1,30000+v,0,?2 FROM n",
+        rusqlite::params![owner, "Y".repeat(8 * 1024)],
+    )
+    .unwrap();
+    let fk_count: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_count, 0);
+    assert_eq!(store.status().unwrap().revision, pin);
+    let error = store
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("selected evidence byte budget exceeded"),
+        "{error:#}"
+    );
+    assert!(
+        !store
+            .native_declarations_at(pin, "java", "go")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    for table in ["nodes", "calls", "regions"] {
+        // These three fixed SQL identifiers are the selected graph row families.
+        let query = format!("SELECT id,payload FROM {table} WHERE path='flow.js' LIMIT 1");
+        let (id, original): (String, String) = db
+            .query_row(&query, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        db.execute(
+            &format!("UPDATE {table} SET payload=?1 WHERE id=?2"),
+            rusqlite::params!["invalid-json".repeat(8000), id],
+        )
+        .unwrap();
+        let error = store
+            .native_declarations_at(pin, "javascript", "hello")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selected graph row byte budget exceeded"),
+            "{table}: {error:#}"
+        );
+        db.execute(
+            &format!("UPDATE {table} SET payload=?1 WHERE id=?2"),
+            rusqlite::params![original, id],
+        )
+        .unwrap();
+    }
+    assert!(
+        !store
+            .native_declarations_at(pin, "java", "go")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
+    let (state, root, store, cancel) = fixture();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    db.execute(
+        "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<40)
+        INSERT INTO nodes(id,name,path,payload)
+        SELECT printf('forged-graph-%d',v),'forged','flow.js',?1 FROM n",
+        ["invalid-json".repeat(800)],
+    )
+    .unwrap();
+    let fk_count: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_count, 0);
+    let error = store
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("selected graph row byte budget exceeded"),
+        "{error:#}"
+    );
+    assert!(
+        !store
+            .native_declarations_at(pin, "java", "go")
+            .unwrap()
+            .is_empty()
+    );
+}

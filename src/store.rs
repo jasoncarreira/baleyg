@@ -25,6 +25,69 @@ enum PublishStage {
     AfterFile,
     BeforeCommit,
 }
+// Serde's compact JSON serializer writes exactly the bytes persisted by `json()`.
+// Count and abort while streaming; never build an over-limit encoded source.
+struct EncodedSourceBudget {
+    bytes: usize,
+    max_bytes: usize,
+}
+impl std::io::Write for EncodedSourceBudget {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(chunk.len())
+            .filter(|size| *size <= self.max_bytes)
+            .ok_or_else(|| std::io::Error::other("selected source JSON budget exceeded"))?;
+        self.bytes = next;
+        Ok(chunk.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(row_bytes),0) FROM (
+SELECT COALESCE(length(CAST(k.id AS BLOB)),0)+COALESCE(length(CAST(k.name AS BLOB)),0)+COALESCE(length(CAST(k.qualified_name AS BLOB)),0)+COALESCE(length(CAST(k.path AS BLOB)),0)+COALESCE(length(CAST(k.payload AS BLOB)),0) AS row_bytes FROM classes k WHERE k.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(r.id AS BLOB)),0)+COALESCE(length(CAST(r.owner AS BLOB)),0)+COALESCE(length(CAST(r.target AS BLOB)),0)+COALESCE(length(CAST(r.payload AS BLOB)),0) AS row_bytes FROM class_relations r JOIN classes k ON k.id=r.owner WHERE k.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(p.id AS BLOB)),0)+COALESCE(length(CAST(p.version AS BLOB)),0)+COALESCE(length(CAST(p.executable_hash AS BLOB)),0)+COALESCE(length(CAST(p.kind AS BLOB)),0)+COALESCE(length(CAST(p.position_encoding AS BLOB)),0) AS row_bytes FROM native_producers p WHERE p.id=(SELECT id FROM native_producers LIMIT 1)
+UNION ALL
+SELECT COALESCE(length(CAST(p.producer_id AS BLOB)),0)+COALESCE(length(CAST(p.language AS BLOB)),0) AS row_bytes FROM native_producer_languages p WHERE p.producer_id=(SELECT id FROM native_producers LIMIT 1)
+UNION ALL
+SELECT COALESCE(length(CAST(s.id AS BLOB)),0)+COALESCE(length(CAST(s.root_id AS BLOB)),0) AS row_bytes FROM native_source_sets s WHERE s.id=?2
+UNION ALL
+SELECT COALESCE(length(CAST(s.source_set_id AS BLOB)),0)+COALESCE(length(CAST(s.language AS BLOB)),0) AS row_bytes FROM native_source_set_languages s WHERE s.source_set_id=?2
+UNION ALL
+SELECT COALESCE(length(CAST(s.source_set_id AS BLOB)),0)+COALESCE(length(CAST(s.dependency_id AS BLOB)),0) AS row_bytes FROM native_source_set_dependencies s WHERE s.source_set_id=?2
+UNION ALL
+SELECT COALESCE(length(CAST(r.id AS BLOB)),0)+COALESCE(length(CAST(r.source_set_id AS BLOB)),0)+COALESCE(length(CAST(r.toolchain_hash AS BLOB)),0)+COALESCE(length(CAST(r.config_hash AS BLOB)),0)+COALESCE(length(CAST(r.dependency_hash AS BLOB)),0) AS row_bytes FROM native_revisions r WHERE r.id=?4 AND r.source_set_id=?2
+UNION ALL
+SELECT COALESCE(length(CAST(d.source_set_id AS BLOB)),0)+COALESCE(length(CAST(d.language AS BLOB)),0)+COALESCE(length(CAST(d.path AS BLOB)),0)+COALESCE(length(CAST(d.revision_id AS BLOB)),0)+COALESCE(length(CAST(d.content_hash AS BLOB)),0) AS row_bytes FROM native_documents d WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(v.producer_id AS BLOB)),0)+COALESCE(length(CAST(v.language AS BLOB)),0)+COALESCE(length(CAST(v.source_set_id AS BLOB)),0)+COALESCE(length(CAST(v.document_path AS BLOB)),0)+COALESCE(length(CAST(v.revision_id AS BLOB)),0)+COALESCE(length(CAST(v.state AS BLOB)),0)+COALESCE(length(CAST(v.diagnostic AS BLOB)),0) AS row_bytes FROM native_coverage v WHERE v.source_set_id=?2 AND v.language=?3 AND v.revision_id=?4 AND v.document_path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(v.producer_id AS BLOB)),0)+COALESCE(length(CAST(v.revision_id AS BLOB)),0)+COALESCE(length(CAST(v.language AS BLOB)),0)+COALESCE(length(CAST(v.document_path AS BLOB)),0)+COALESCE(length(CAST(v.role_kind AS BLOB)),0)+COALESCE(length(CAST(v.role AS BLOB)),0) AS row_bytes FROM native_coverage_roles v WHERE v.revision_id=?4 AND v.language=?3 AND v.document_path=?1 AND v.producer_id=(SELECT id FROM native_producers LIMIT 1)
+UNION ALL
+SELECT COALESCE(length(CAST(v.id AS BLOB)),0)+COALESCE(length(CAST(v.producer_id AS BLOB)),0)+COALESCE(length(CAST(v.source_set_id AS BLOB)),0)+COALESCE(length(CAST(v.language AS BLOB)),0)+COALESCE(length(CAST(v.path AS BLOB)),0)+COALESCE(length(CAST(v.revision_id AS BLOB)),0)+COALESCE(length(CAST(v.content_hash AS BLOB)),0)+COALESCE(length(CAST(v.evidence_kind AS BLOB)),0)+COALESCE(length(CAST(v.basis AS BLOB)),0)+COALESCE(length(CAST(v.derived_from AS BLOB)),0)+COALESCE(length(CAST(v.freshness AS BLOB)),0) AS row_bytes FROM native_provenance v WHERE v.source_set_id=?2 AND v.language=?3 AND v.revision_id=?4 AND v.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(d.syntax_id AS BLOB)),0)+COALESCE(length(CAST(d.source_set_id AS BLOB)),0)+COALESCE(length(CAST(d.language AS BLOB)),0)+COALESCE(length(CAST(d.path AS BLOB)),0)+COALESCE(length(CAST(d.revision_id AS BLOB)),0)+COALESCE(length(CAST(d.owner_syntax_id AS BLOB)),0)+COALESCE(length(CAST(d.kind AS BLOB)),0)+COALESCE(length(CAST(d.name AS BLOB)),0)+COALESCE(length(CAST(d.lookup_key AS BLOB)),0)+COALESCE(length(CAST(d.provenance_id AS BLOB)),0) AS row_bytes FROM native_declarations d WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(a.syntax_id AS BLOB)),0)+COALESCE(length(CAST(a.kind AS BLOB)),0)+COALESCE(length(CAST(a.name AS BLOB)),0) AS row_bytes FROM native_declaration_ancestors a JOIN native_declarations d ON d.syntax_id=a.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(a.syntax_id AS BLOB)),0)+COALESCE(length(CAST(a.type_name AS BLOB)),0) AS row_bytes FROM native_signature_parameter_types a JOIN native_declarations d ON d.syntax_id=a.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(a.syntax_id AS BLOB)),0)+COALESCE(length(CAST(a.kind AS BLOB)),0)+COALESCE(length(CAST(a.name AS BLOB)),0)+COALESCE(length(CAST(a.result_type AS BLOB)),0) AS row_bytes FROM native_headers a JOIN native_declarations d ON d.syntax_id=a.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(a.syntax_id AS BLOB)),0)+COALESCE(length(CAST(a.item_kind AS BLOB)),0)+COALESCE(length(CAST(a.value AS BLOB)),0) AS row_bytes FROM native_header_items a JOIN native_declarations d ON d.syntax_id=a.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(a.syntax_id AS BLOB)),0)+COALESCE(length(CAST(a.name AS BLOB)),0)+COALESCE(length(CAST(a.type_name AS BLOB)),0) AS row_bytes FROM native_parameters a JOIN native_declarations d ON d.syntax_id=a.syntax_id WHERE d.source_set_id=?2 AND d.language=?3 AND d.revision_id=?4 AND d.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(c.id AS BLOB)),0)+COALESCE(length(CAST(c.owner_syntax_id AS BLOB)),0)+COALESCE(length(CAST(c.source_set_id AS BLOB)),0)+COALESCE(length(CAST(c.language AS BLOB)),0)+COALESCE(length(CAST(c.path AS BLOB)),0)+COALESCE(length(CAST(c.revision_id AS BLOB)),0)+COALESCE(length(CAST(c.spelling AS BLOB)),0)+COALESCE(length(CAST(c.provenance_id AS BLOB)),0) AS row_bytes FROM native_calls c WHERE c.source_set_id=?2 AND c.language=?3 AND c.revision_id=?4 AND c.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(a.call_id AS BLOB)),0)+COALESCE(length(CAST(a.region_id AS BLOB)),0) AS row_bytes FROM native_call_regions a JOIN native_calls c ON c.id=a.call_id WHERE c.source_set_id=?2 AND c.language=?3 AND c.revision_id=?4 AND c.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(c.id AS BLOB)),0)+COALESCE(length(CAST(c.owner_syntax_id AS BLOB)),0)+COALESCE(length(CAST(c.source_set_id AS BLOB)),0)+COALESCE(length(CAST(c.language AS BLOB)),0)+COALESCE(length(CAST(c.path AS BLOB)),0)+COALESCE(length(CAST(c.revision_id AS BLOB)),0)+COALESCE(length(CAST(c.kind AS BLOB)),0)+COALESCE(length(CAST(c.parent_id AS BLOB)),0)+COALESCE(length(CAST(c.arm AS BLOB)),0)+COALESCE(length(CAST(c.provenance_id AS BLOB)),0) AS row_bytes FROM native_control_regions c WHERE c.source_set_id=?2 AND c.language=?3 AND c.revision_id=?4 AND c.path=?1
+)"#;
 const DATABASE_SCHEMA_VERSION: u32 = 6;
 const EXTRACTOR_VERSION: &str = "native-paired-v1";
 const GRAPH_SCHEMA_VERSION: u32 = 5;
@@ -436,33 +499,36 @@ fn validate_graph(graph: &Graph, cancel: &CancelFlag) -> Result<IndexStats> {
     Ok(stats)
 }
 
-fn class_metadata(db: &Connection) -> Result<Option<(Vec<String>, bool)>> {
-    let metadata: Option<(String, bool)> = db
+fn class_metadata(db: &Connection) -> Result<(Vec<String>, bool)> {
+    let length: i64 = db
         .query_row(
-            "SELECT warnings,truncated FROM class_catalog WHERE singleton=1",
+            "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
-        .optional()?;
-    metadata
-        .map(|(warnings, mut truncated)| {
-            let warnings: Vec<String> = serde_json::from_str(&warnings)?;
-            let mut bytes = 0;
-            let mut visible = Vec::new();
-            for warning in warnings {
-                bytes += serde_json::to_vec(&warning)?.len() + 1;
-                if bytes > 256 * 1024 {
-                    truncated = true;
-                    visible.push(
-                        "Further catalog warnings omitted by the presentation byte limit.".into(),
-                    );
-                    break;
-                }
-                visible.push(warning);
-            }
-            Ok((visible, truncated))
-        })
-        .transpose()
+        .map_err(|e| anyhow::anyhow!("incompatible_index: class catalog missing: {e}"))?;
+    ensure!(
+        (0..=256 * 1024).contains(&length),
+        "incompatible_index: class catalog byte budget exceeded"
+    );
+    let (warnings, mut truncated): (String, bool) = db.query_row(
+        "SELECT warnings,truncated FROM class_catalog WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let warnings: Vec<String> = serde_json::from_str(&warnings)?;
+    let mut bytes = 0;
+    let mut visible = Vec::new();
+    for warning in warnings {
+        bytes += serde_json::to_vec(&warning)?.len() + 1;
+        if bytes > 256 * 1024 {
+            truncated = true;
+            visible.push("Further catalog warnings omitted by the presentation byte limit.".into());
+            break;
+        }
+        visible.push(warning);
+    }
+    Ok((visible, truncated))
 }
 /// Read at most 64 KiB of class JSON into Rust. Large member arrays are
 /// clipped in SQLite, without materializing their full strings in the API.
@@ -1180,6 +1246,20 @@ impl Store {
             status.evidence_format.is_some(),
             "index_not_ready: reindex required"
         );
+        // Every public schema-6 derived read needs the same bounded catalog
+        // singleton. Missing/oversized live metadata is corruption, never an
+        // old-index "requireIndex" fallback. This is one indexed metadata row.
+        let warnings_bytes: Option<i64> = db
+            .query_row(
+                "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)),
+            "incompatible_index: class catalog byte budget exceeded or missing"
+        );
         Ok(status)
     }
     /// Internal control baseline, never returned by public status or evidence reads.
@@ -1278,6 +1358,97 @@ impl Store {
         )
     }
 
+    // Admission/read parity: only publish SourceFile JSON that pinned reads can
+    // select under the same encoded-byte ceiling. This inspects the immutable
+    // captured graph; it neither opens source files nor reprojects the graph.
+    fn enforce_selected_source_admission(graph: &Graph, max_graph_json_bytes: usize) -> Result<()> {
+        fn encoded_len<T: Serialize>(value: &T, max: usize) -> Result<usize> {
+            let mut sink = EncodedSourceBudget {
+                bytes: 0,
+                max_bytes: max,
+            };
+            serde_json::to_writer(&mut sink, value)?;
+            Ok(sink.bytes)
+        }
+        let mut selected: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for file in &graph.files {
+            let raw = file.text.len();
+            ensure!(
+                raw <= 256 * 1024 * 1024,
+                "incompatible_index: selected source byte budget exceeded before publication"
+            );
+            let envelope =
+                max_graph_json_bytes.min(raw.saturating_mul(6).saturating_add(16 * 1024));
+            encoded_len(file,envelope).map_err(|e|anyhow::anyhow!(
+                "incompatible_index: selected source byte budget exceeded before publication: {e}"))?;
+            ensure!(
+                selected.insert(&file.path, (raw, 0)).is_none(),
+                "incompatible_index: duplicate captured graph source"
+            );
+        }
+        fn account<T: Serialize>(
+            selected: &mut BTreeMap<&str, (usize, usize)>,
+            path: &str,
+            metadata_bytes: usize,
+            value: &T,
+        ) -> Result<()> {
+            let (raw, total) = selected
+                .get_mut(path)
+                .context("incompatible_index: graph row without captured source")?;
+            let row_cap = raw
+                .saturating_mul(6)
+                .saturating_add(16 * 1024)
+                .min(256 * 1024 * 1024 + 16 * 1024);
+            let bytes=encoded_len(value,row_cap).map_err(|e|anyhow::anyhow!(
+                "incompatible_index: selected graph row byte budget exceeded before publication: {e}"))?;
+            let row_bytes = metadata_bytes.checked_add(bytes).context(
+                "incompatible_index: selected graph row byte budget exceeded before publication",
+            )?;
+            *total = total.checked_add(row_bytes).context(
+                "incompatible_index: selected graph row byte budget exceeded before publication",
+            )?;
+            let total_cap = raw
+                .saturating_mul(64)
+                .saturating_add(256 * 1024)
+                .min(512 * 1024 * 1024);
+            ensure!(
+                row_bytes <= row_cap && *total <= total_cap,
+                "incompatible_index: selected graph row byte budget exceeded before publication"
+            );
+            Ok(())
+        }
+        for n in &graph.nodes {
+            account(
+                &mut selected,
+                &n.path,
+                n.id.len()
+                    .saturating_add(n.name.len())
+                    .saturating_add(n.path.len()),
+                n,
+            )?;
+        }
+        for c in &graph.calls {
+            account(
+                &mut selected,
+                &c.path,
+                c.id.len()
+                    .saturating_add(c.caller.len())
+                    .saturating_add(c.path.len()),
+                c,
+            )?;
+        }
+        for r in &graph.regions {
+            account(
+                &mut selected,
+                &r.path,
+                r.id.len()
+                    .saturating_add(r.owner.len())
+                    .saturating_add(r.path.len()),
+                r,
+            )?;
+        }
+        Ok(())
+    }
     // Private transaction seam used by the in-module rollback tests. Normal callers
     // always pass a no-op; no SQL-fault control is exposed to API or CLI clients.
     fn publish_inner_checked(
@@ -1290,9 +1461,34 @@ impl Store {
         leader: &topology::LeaderGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        self.publish_inner_checked_with_source_cap(
+            bundle,
+            leader,
+            expected_revision,
+            cancel,
+            256 * 1024 * 1024 + 16 * 1024,
+            during_tx,
+        )
+    }
+    // This test-only injection exercises the production admission path with a
+    // small graph-JSON cap, without creating a 256MiB escaped source fixture.
+    fn publish_inner_checked_with_source_cap(
+        &self,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
+        leader: &topology::LeaderGuard,
+        expected_revision: IndexPin,
+        cancel: &CancelFlag,
+        max_graph_json_bytes: usize,
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
         let (graph, capture, native) = bundle;
+        Self::enforce_selected_source_admission(graph, max_graph_json_bytes)?;
         ensure!(
             graph.schema_version == SCHEMA_VERSION,
             "unsupported graph schema"
@@ -1307,6 +1503,12 @@ impl Store {
                 && r.candidate_ids.is_empty()
                 && r.match_kind == "unmatched"),
             "unsafe_index: lexical class relationship"
+        );
+        // The public read_status guard has this exact singleton JSON ceiling.
+        // Refuse over-limit catalog warnings before paired CAS.
+        ensure!(
+            json(&classes.warnings)?.len() <= 256 * 1024,
+            "incompatible_index: class catalog byte budget exceeded before publication"
         );
         check_cancel(cancel)?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
@@ -1535,10 +1737,58 @@ impl Store {
 
     /// Authenticate one selected document's normalized records and graph DTOs
     /// against its paired BLOB in the same pinned SQLite transaction.
+    // SQL aggregate touches only the selected path's ancillary native and class rows.
+    // SourceFile JSON and graph node/call/region payloads have separate envelopes.
+    fn selected_ancillary_byte_usage(
+        db: &Connection,
+        path: &str,
+        source_set_id: &str,
+        language: &str,
+        revision_id: &str,
+    ) -> Result<(i64, i64)> {
+        db.query_row(
+            SELECTED_ANCILLARY_BYTE_SQL,
+            params![path, source_set_id, language, revision_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("incompatible_index: selected evidence byte budget exceeded: {e}")
+        })
+    }
     fn attest_selected_document(&self, db: &Connection, path: &str) -> Result<()> {
         // SQLite lengths and bounded row counts precede BLOB/JSON allocation and
         // selected tree-sitter extraction. All predicates stay on this source set,
         // revision, language and path; no workspace-wide payload scan.
+        let mut size_guard=db.prepare("SELECT length(CAST(d.source_set_id AS BLOB)),length(CAST(d.language AS BLOB)),length(CAST(d.revision_id AS BLOB)),length(CAST(d.path AS BLOB)),length(CAST(d.content_hash AS BLOB)),length(CAST(f.hash AS BLOB)),length(d.source_bytes),length(CAST(f.payload AS BLOB)) FROM native_documents d JOIN files f ON f.path=d.path WHERE d.path=?1 LIMIT 2")?;
+        let byte_headers: Vec<[i64; 8]> = size_guard
+            .query_map([path], |r| {
+                Ok([
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ])
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        ensure!(
+            byte_headers.len() == 1
+                && byte_headers[0][..6]
+                    .iter()
+                    .all(|length| *length >= 0 && *length <= 16 * 1024)
+                && byte_headers[0][6] >= 0
+                && byte_headers[0][6] <= 256 * 1024 * 1024
+                && byte_headers[0][7] >= 0
+                && byte_headers[0][7] <= 256 * 1024 * 1024 + 16 * 1024
+                && byte_headers[0][7]
+                    <= byte_headers[0][6]
+                        .saturating_mul(6)
+                        .saturating_add(16 * 1024),
+            "incompatible_index: selected source byte budget exceeded"
+        );
         let mut sizes=db.prepare("SELECT d.source_set_id,d.language,d.revision_id,length(d.source_bytes),length(CAST(f.payload AS BLOB)) FROM native_documents d JOIN files f ON f.path=d.path WHERE d.path=?1 LIMIT 2")?;
         let selected: Vec<(String, String, String, i64, i64)> = sizes
             .query_map([path], |r| {
@@ -1565,6 +1815,7 @@ impl Store {
 (SELECT count(*) FROM calls WHERE path=?1),
 (SELECT count(*) FROM regions WHERE path=?1),
 (SELECT count(*) FROM classes WHERE path=?1),
+(SELECT count(*) FROM class_relations r JOIN classes k ON k.id=r.owner WHERE k.path=?1),
 (SELECT count(*) FROM native_documents WHERE source_set_id=?2 AND language=?3 AND revision_id=?4 AND path=?1),
 (SELECT count(*) FROM native_coverage WHERE producer_id=(SELECT id FROM native_producers LIMIT 1) AND revision_id=?4 AND language=?3 AND document_path=?1 AND source_set_id=?2),
 (SELECT count(*) FROM native_coverage_roles WHERE producer_id=(SELECT id FROM native_producers LIMIT 1) AND revision_id=?4 AND language=?3 AND document_path=?1),
@@ -1585,14 +1836,65 @@ impl Store {
             row_sql,
             params![path, source_set_id, language, revision_id],
             |r| {
-                (0..21)
+                (0..22)
                     .map(|i| r.get::<_, i64>(i))
                     .collect::<rusqlite::Result<_>>()
             },
         )?;
         ensure!(
-            row_counts.len() == 21 && row_counts.into_iter().all(|n| n >= 0 && n <= row_limit),
+            row_counts.len() == 22 && row_counts.into_iter().all(|n| n >= 0 && n <= row_limit),
             "incompatible_index: selected evidence row budget exceeded"
+        );
+        // Materialized native TEXT and class/graph JSON also need a byte budget.
+        // One SQL aggregate inspects the SAME selected row sets without copying
+        // their TEXT into Rust. Max bounds a single row; SUM prevents count × cap.
+        let (max_row, total_bytes) =
+            Self::selected_ancillary_byte_usage(db, path, source_set_id, language, revision_id)?;
+        let per_row_limit = native_bytes
+            .saturating_mul(32)
+            .saturating_add(16 * 1024)
+            .min(256 * 1024 * 1024);
+        let total_limit = native_bytes
+            .saturating_mul(64)
+            .saturating_add(256 * 1024)
+            .min(512 * 1024 * 1024);
+        ensure!(
+            max_row >= 0
+                && total_bytes >= 0
+                && max_row <= per_row_limit
+                && total_bytes <= total_limit,
+            "incompatible_index: selected evidence byte budget exceeded"
+        );
+        // All graph rows have a capture-aligned pre-allocation byte envelope.
+        // Their aggregate is bounded separately from ancillary/native rows.
+        let graph_sql = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(row_bytes),0) FROM (
+SELECT COALESCE(length(CAST(n.id AS BLOB)),0)+COALESCE(length(CAST(n.name AS BLOB)),0)+COALESCE(length(CAST(n.path AS BLOB)),0)+COALESCE(length(CAST(n.payload AS BLOB)),0) AS row_bytes FROM nodes n WHERE n.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.caller AS BLOB)),0)+COALESCE(length(CAST(g.target AS BLOB)),0)+COALESCE(length(CAST(g.path AS BLOB)),0)+COALESCE(length(CAST(g.payload AS BLOB)),0) AS row_bytes FROM calls g WHERE g.path=?1
+UNION ALL
+SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BLOB)),0)+COALESCE(length(CAST(g.path AS BLOB)),0)+COALESCE(length(CAST(g.payload AS BLOB)),0) AS row_bytes FROM regions g WHERE g.path=?1
+)"#;
+        let (graph_row, graph_total): (i64, i64) = db
+            .query_row(graph_sql, [path], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| {
+                anyhow::anyhow!("incompatible_index: selected graph row byte budget exceeded: {e}")
+            })?;
+        // JSON may escape one source byte into six; the absolute row ceiling
+        // is an explicit fail-closed selected API limit if capture exceeds it.
+        let graph_row_limit = native_bytes
+            .saturating_mul(6)
+            .saturating_add(16 * 1024)
+            .min(256 * 1024 * 1024 + 16 * 1024);
+        let graph_total_limit = native_bytes
+            .saturating_mul(64)
+            .saturating_add(256 * 1024)
+            .min(512 * 1024 * 1024);
+        ensure!(
+            graph_row >= 0
+                && graph_total >= 0
+                && graph_row <= graph_row_limit
+                && graph_total <= graph_total_limit,
+            "incompatible_index: selected graph row byte budget exceeded"
         );
         let file = Self::selected_source_row(db, path)?
             .context("incompatible_index: selected graph/native source missing")?;
@@ -1713,17 +2015,6 @@ impl Store {
                 .map(|row| Ok(serde_json::from_str::<T>(&row?)?))
                 .collect()
         }
-        let (node_bytes,call_bytes,region_bytes):(i64,i64,i64)=db.query_row(
-            "SELECT (SELECT COALESCE(max(length(CAST(payload AS BLOB))),0) FROM nodes WHERE path=?1),(SELECT COALESCE(max(length(CAST(payload AS BLOB))),0) FROM calls WHERE path=?1),(SELECT COALESCE(max(length(CAST(payload AS BLOB))),0) FROM regions WHERE path=?1)",
-            [path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        )?;
-        let row_limit = i64::try_from(file.text.len())?.saturating_add(16 * 1024);
-        ensure!(
-            [node_bytes, call_bytes, region_bytes]
-                .into_iter()
-                .all(|size| size <= row_limit),
-            "incompatible_index: selected graph row byte budget exceeded"
-        );
         let nodes: Vec<Symbol> = rows(db, "nodes", path)?;
         let calls: Vec<CallSite> = rows(db, "calls", path)?;
         let regions: Vec<ControlRegion> = rows(db, "regions", path)?;
@@ -2084,24 +2375,36 @@ impl Store {
     ) -> Result<Option<(crate::native_evidence::Document, Vec<u8>)>> {
         use crate::native_evidence::Document;
         self.native_at(pin, |db| {
-            let bytes:Option<i64> = db.query_row(
-                "SELECT length(source_bytes) FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
-                params![key.source_set_id,key.language,key.path],|row|row.get(0),
+            let sizes:Option<[i64;6]>=db.query_row(
+                "SELECT length(source_bytes),length(CAST(source_set_id AS BLOB)),length(CAST(language AS BLOB)),length(CAST(path AS BLOB)),length(CAST(revision_id AS BLOB)),length(CAST(content_hash AS BLOB)) FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
+                params![key.source_set_id,key.language,key.path],|r|Ok([
+                    r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?]),
             ).optional()?;
-            ensure!(bytes.is_none_or(|size|size<=256*1024*1024),
+            ensure!(sizes.is_none_or(|bytes|bytes[0]>=0 && bytes[0]<=256*1024*1024
+                && bytes[1..].iter().all(|length|*length>=0 && *length<=16*1024)),
                 "incompatible_index: selected native source byte budget exceeded");
-            let row=db.query_row("SELECT revision_id,content_hash,byte_length,source_bytes FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
-                params![key.source_set_id,key.language,key.path], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,Vec<u8>>(3)?)))
-                .optional()?.map(|(revision_id,content_hash,byte_length,bytes)| -> Result<_> {
+            type NativeSourceRow=(String,String,i64,Vec<u8>);
+            let row:Option<Result<NativeSourceRow>>=db.query_row(
+                "SELECT revision_id,content_hash,byte_length,source_bytes FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
+                params![key.source_set_id,key.language,key.path],|r|Ok((||->Result<_>{
                     use sha2::{Digest,Sha256};
-                    ensure!(byte_length == bytes.len() as i64 && content_hash == hex::encode(Sha256::digest(&bytes)), "incompatible_index: native source hash mismatch");
-                    let graph = Self::selected_source_row(db, &key.path)?
-                        .context("incompatible_index: paired graph source missing")?;
-                    ensure!(graph.path == key.path && graph.language == key.language
-                        && graph.hash == content_hash && graph.text.as_bytes() == bytes,
-                        "incompatible_index: native source differs from paired graph");
-                    Ok((Document {key:key.clone(),revision_id,content_hash,byte_length:usize::try_from(byte_length)?},bytes))
-                }).transpose()?;
+                    let revision_id:String=r.get(0)?;
+                    let hash:String=r.get(1)?;
+                    let length:i64=r.get(2)?;
+                    let raw=r.get_ref(3)?.as_blob()?;
+                    ensure!(length==raw.len() as i64 && hash==hex::encode(Sha256::digest(raw)),
+                        "incompatible_index: native source hash mismatch");
+                    Ok((revision_id,hash,length,r.get(3)?))
+                })()),
+            ).optional()?;
+            let row=row.transpose()?.map(|(revision_id,content_hash,byte_length,bytes)|->Result<_>{
+                let graph=Self::selected_source_row(db,&key.path)?
+                    .context("incompatible_index: paired graph source missing")?;
+                ensure!(graph.path==key.path && graph.language==key.language
+                    && graph.hash==content_hash && graph.text.as_bytes()==bytes,
+                    "incompatible_index: native source differs from paired graph");
+                Ok((Document {key:key.clone(),revision_id,content_hash,byte_length:usize::try_from(byte_length)?},bytes))
+            }).transpose()?;
             if row.is_none() {
                 let graph_file:bool=db.query_row(
                     "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",[&key.path],|r|r.get(0),
@@ -2402,7 +2705,7 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<crate::class_diagram::ClassPage> {
-        use crate::class_diagram::{ClassPage, INDEX_NOTICE, InvalidRequest};
+        use crate::class_diagram::{ClassPage, InvalidRequest};
         let path = path.filter(|path| !path.is_empty());
         ensure!(
             (1..=100).contains(&limit)
@@ -2426,16 +2729,7 @@ impl Store {
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
-        let Some((mut warnings, truncated)) = class_metadata(&tx)? else {
-            return Ok(ClassPage {
-                revision,
-                items: vec![],
-                next_offset: None,
-                truncated: false,
-                warnings: vec![INDEX_NOTICE.into()],
-                require_index: true,
-            });
-        };
+        let (mut warnings, truncated) = class_metadata(&tx)?;
         let pattern = format!(
             "%{}%",
             query
@@ -2512,12 +2806,7 @@ impl Store {
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(revision == request.expected_revision, "revision conflict");
-        let Some((warnings, truncated)) = class_metadata(&tx)? else {
-            return Ok(class_diagram::ClassDiagram::unindexed(
-                revision,
-                request.seed.clone(),
-            ));
-        };
+        let (warnings, truncated) = class_metadata(&tx)?;
         let (seed, clipped) = resolve_class(&tx, &request.seed)?;
         // Explicitly selected measured declarations are independent roots, never
         // connected by lexical type-name matches or candidate relationships.
@@ -2613,44 +2902,64 @@ impl Store {
         path: &str,
         max_bytes: i64,
     ) -> Result<Option<SourceFile>> {
+        // SQL bounds before copying either BLOB/JSON. The 256MiB+16KiB
+        // SourceFile JSON ceiling is also enforced on the immutable captured
+        // graph BEFORE paired CAS. Escaping above the ceiling refuses the new
+        // bundle atomically, so a public ready pair is never unreadable for it.
+        // Native-source bytes/hash are checked independently in this snapshot.
         // Check selected row byte lengths before copying a BLOB or decoding JSON.
-        let sizes: Option<(i64,i64)> = db.query_row(
-            "SELECT length(CAST(f.payload AS BLOB)),length(d.source_bytes) FROM files f JOIN native_documents d ON d.path=f.path WHERE f.path=?1",
-            [path], |row|Ok((row.get(0)?,row.get(1)?)),
+        let sizes:Option<[i64;9]>=db.query_row(
+            "SELECT length(CAST(f.payload AS BLOB)),length(d.source_bytes),length(CAST(f.path AS BLOB)),length(CAST(f.hash AS BLOB)),length(CAST(d.path AS BLOB)),length(CAST(d.content_hash AS BLOB)),length(CAST(d.source_set_id AS BLOB)),length(CAST(d.language AS BLOB)),length(CAST(d.revision_id AS BLOB)) FROM files f JOIN native_documents d ON d.path=f.path WHERE f.path=?1",
+            [path],|r|Ok([r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?]),
         ).optional()?;
-        if let Some((graph_bytes, native_bytes)) = sizes {
+        if let Some(bytes) = sizes {
+            let (graph_bytes, native_bytes) = (bytes[0], bytes[1]);
             ensure!(
-                graph_bytes <= max_bytes + 16 * 1024
-                    && graph_bytes <= native_bytes.saturating_mul(6) + 16 * 1024
-                    && native_bytes <= max_bytes,
+                graph_bytes >= 0
+                    && native_bytes >= 0
+                    && graph_bytes <= max_bytes.saturating_add(16 * 1024)
+                    && graph_bytes <= native_bytes.saturating_mul(6).saturating_add(16 * 1024)
+                    && native_bytes <= max_bytes
+                    && bytes[2..]
+                        .iter()
+                        .all(|length| *length >= 0 && *length <= 16 * 1024),
                 "incompatible_index: selected source byte budget exceeded"
             );
         }
-        let row: Option<(String, String, String, Vec<u8>, String, i64)> = db.query_row(
-            "SELECT f.payload,f.hash,d.content_hash,d.source_bytes,d.language,d.byte_length FROM native_documents d JOIN files f ON f.path=d.path WHERE d.path=?1", [path],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        type PairedSourceRow = (String, String, String, Vec<u8>, String, i64);
+        let row:Option<Result<PairedSourceRow>>=db.query_row(
+            "SELECT f.payload,f.hash,d.content_hash,d.source_bytes,d.language,d.byte_length FROM native_documents d JOIN files f ON f.path=d.path WHERE d.path=?1",
+            [path],|row|Ok((||->Result<_>{
+                use sha2::{Digest,Sha256};
+                let graph_hash:String=row.get(1)?;
+                let hash:String=row.get(2)?;
+                let source=row.get_ref(3)?.as_blob()?;
+                let length:i64=row.get(5)?;
+                // Hash SQLite's borrowed BLOB before allocating the Rust source
+                // Vec or graph JSON String. The earlier SQL caps bound this scan.
+                ensure!(length==source.len() as i64
+                    && hash==hex::encode(Sha256::digest(source))
+                    && graph_hash==hash,"incompatible_index: source hash mismatch");
+                Ok((row.get(0)?,graph_hash,hash,row.get(3)?,row.get(4)?,length))
+            })()),
         ).optional()?;
-        row.map(
-            |(payload, graph_hash, hash, bytes, language, length)| -> Result<_> {
-                use sha2::{Digest, Sha256};
-                ensure!(
-                    length == bytes.len() as i64 && hash == hex::encode(Sha256::digest(&bytes)),
-                    "incompatible_index: source hash mismatch"
-                );
-                let file: SourceFile = serde_json::from_str(&payload)?;
-                let text = String::from_utf8(bytes)?;
-                ensure!(
-                    file.path == path
-                        && file.text == text
-                        && file.hash == hash
-                        && graph_hash == hash
-                        && file.language == language,
-                    "incompatible_index: source bytes mismatch"
-                );
-                Ok(SourceFile { text, ..file })
-            },
-        )
-        .transpose()
+        row.transpose()?
+            .map(
+                |(payload, graph_hash, hash, bytes, language, _length)| -> Result<_> {
+                    let file: SourceFile = serde_json::from_str(&payload)?;
+                    let text = String::from_utf8(bytes)?;
+                    ensure!(
+                        file.path == path
+                            && file.text == text
+                            && file.hash == hash
+                            && graph_hash == hash
+                            && file.language == language,
+                        "incompatible_index: source bytes mismatch"
+                    );
+                    Ok(SourceFile { text, ..file })
+                },
+            )
+            .transpose()
     }
     pub fn source_at(
         &self,
@@ -3032,6 +3341,233 @@ mod rebaseline_fault_tests {
     use super::*;
     use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{fs, ptr, sync::atomic::AtomicBool};
+
+    #[test]
+    fn captured_long_call_exceeds_injected_small_graph_cap_and_remains_selectable() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = format!("function hello() {{ obj.{}(); }}\n", "a".repeat(48 * 1024));
+        fs::write(work.path().join("flow.js"), &source).unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(work.path().to_owned());
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        assert!(!graph.calls.is_empty(), "test must exercise long call JSON");
+        let leader = store.leader().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        let call_bytes: i64 = db
+            .query_row(
+                "SELECT max(length(CAST(payload AS BLOB))) FROM calls WHERE path='flow.js'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            call_bytes > 32 * 1024,
+            "genuine call JSON exceeds an injected 32KiB row cap"
+        );
+        assert!(
+            !store
+                .native_declarations_at(pin, "javascript", "hello")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .source_at("flow.js", Some(pin))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            source
+        );
+    }
+
+    #[test]
+    fn one_byte_over_encoded_source_cap_never_enters_paired_cas() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source_path = work.path().join("flow.js");
+        fs::write(&source_path, "function old() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(work.path().to_owned());
+        let (old_graph, old_native, old_capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let leader = store.leader().unwrap();
+        let pin = store
+            .publish_native(
+                &old_graph,
+                &old_capture,
+                &old_native,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let db_path = store.roots.index_db(&store.identity);
+        let before = fs::read(&db_path).unwrap();
+        // Raw capture stays far below the injected budget; sixfold JSON
+        // escaping puts its actual canonical stored payload one byte over.
+        let source = format!("/*{}*/", "\u{0001}".repeat(5450));
+        fs::write(&source_path, &source).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let encoded = json(&graph.files[0]).unwrap();
+        assert!(encoded.len() > 32 * 1024 && encoded.len() < 36 * 1024);
+        let injected_cap = encoded.len() - 1;
+        assert!(source.len() < injected_cap);
+        let error = store
+            .publish_inner_checked_with_source_cap(
+                (&graph, &capture, &native),
+                &leader,
+                pin,
+                &cancel,
+                injected_cap,
+                |_, _| panic!("encoded source must reject before opening the transaction"),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selected source byte budget exceeded before publication"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&db_path).unwrap(),
+            before,
+            "pre-CAS budget refusal must preserve the exact prior SQLite bytes"
+        );
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(
+            store
+                .source_at("flow.js", Some(pin))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function old() {}\n"
+        );
+    }
+
+    #[test]
+    fn captured_sixfold_escaped_source_is_selectable_below_explicit_json_ceiling() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = format!("/*{}*/", "\u{0001}".repeat(64 * 1024));
+        fs::write(work.path().join("flow.js"), &source).unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(work.path().to_owned());
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let leader = store.leader().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        let json_bytes: i64 = db
+            .query_row(
+                "SELECT length(CAST(payload AS BLOB)) FROM files WHERE path='flow.js'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            json_bytes > source.len() as i64 * 5,
+            "JSON source must exercise near-sixfold control-byte expansion"
+        );
+        assert_eq!(
+            store
+                .source_at("flow.js", Some(pin))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            source
+        );
+    }
+
+    #[test]
+    fn real_source_above_injected_ancillary_cap_keeps_selected_source_available() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = format!("/*{}*/", "a".repeat(64 * 1024));
+        fs::write(work.path().join("flow.js"), &source).unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(work.path().to_owned());
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let leader = store.leader().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        let (source_set_id,language,revision_id):(String,String,String)=db.query_row(
+            "SELECT source_set_id,language,revision_id FROM native_documents WHERE path='flow.js'",[],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let (max_ancillary, total_ancillary) = Store::selected_ancillary_byte_usage(
+            &db,
+            "flow.js",
+            &source_set_id,
+            &language,
+            &revision_id,
+        )
+        .unwrap();
+        let source_json_bytes: i64 = db
+            .query_row(
+                "SELECT length(CAST(payload AS BLOB)) FROM files WHERE path='flow.js'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Small injected 32KiB ancillary cap models a captured source above a
+        // narrower ancillary limit without a memory-heavy 33MiB fixture.
+        assert!(
+            source_json_bytes > 32 * 1024
+                && max_ancillary < 32 * 1024
+                && total_ancillary < 32 * 1024
+        );
+        assert!(
+            Store::selected_source_row_bounded(&db, "flow.js", 32 * 1024).is_err(),
+            "an explicit narrower source API cap must fail closed"
+        );
+        assert_eq!(
+            store
+                .source_at("flow.js", Some(pin))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            source
+        );
+    }
 
     unsafe extern "C" fn abort_commit(_: *mut std::ffi::c_void) -> i32 {
         1
