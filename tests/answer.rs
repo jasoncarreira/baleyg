@@ -26,18 +26,21 @@ fn packet(code: &str) -> QuestionPacket {
         |_| {},
     )
     .unwrap();
+    let session = store.leader_session().unwrap();
     let revision = store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
     let request = serde_json::from_value(json!({"seed": graph.nodes.iter().find(|n| n.name == "seed").unwrap().id,"question":"Which branches run?", "expectedRevision":revision})).unwrap();
-    prepare(&store, request).unwrap()
+    let packet = prepare(&store, request).unwrap();
+    drop(session);
+    packet
 }
 fn answer(p: &QuestionPacket) -> Value {
     json!({"packetId":p.packet_id,"summary":[{"text":"The flag controls the branch.","citations":[{"path":"a.js","startLine":1,"endLine":1,"quote":"function seed(flag) {"}]}],"branches":[],"limitations":[]})
@@ -277,12 +280,13 @@ function helper() {}
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let session = store.leader_session().unwrap();
     let pin = store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -301,15 +305,15 @@ function helper() {}
         .unwrap()
         .id
         .clone();
-    let app = http::router(
-        http::new(
-            store.clone(),
-            options,
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
     let preview = |seed: &str| {
         let body =
             json!({"seed":seed,"question":"What calls are measured?","expectedRevision":pin});
@@ -379,7 +383,7 @@ function helper() {}
         .await
         .unwrap();
     let refused: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(refused["error"]["code"], "index_not_ready");
+    assert_eq!(refused["error"]["code"], "incompatible_index");
     assert!(!refused.to_string().contains("sqlInventedCallee"));
 
     let unrelated = app.clone().oneshot(preview(&other)).await.unwrap();
@@ -388,6 +392,6 @@ function helper() {}
         .await
         .unwrap();
     let refused: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(refused["error"]["code"], "index_not_ready");
+    assert_eq!(refused["error"]["code"], "incompatible_index");
     assert!(!refused.to_string().contains("sqlInventedCallee"));
 }

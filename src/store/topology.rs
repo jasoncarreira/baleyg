@@ -8,11 +8,26 @@ use std::os::unix::{
 };
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use uuid::Uuid;
+
+#[derive(Debug)]
+pub struct IndexNotReady(&'static str);
+impl IndexNotReady {
+    pub(crate) fn new(reason: &'static str) -> Self {
+        Self(reason)
+    }
+}
+impl std::fmt::Display for IndexNotReady {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "index_not_ready: {}", self.0)
+    }
+}
+impl std::error::Error for IndexNotReady {}
 
 fn owner() -> u32 {
     unsafe { libc::geteuid() }
@@ -233,6 +248,42 @@ impl TopologyRoots {
             incarnation,
         })
     }
+    pub fn follower(&self, identity: Arc<WorkspaceIdentity>) -> Result<FollowerGuard> {
+        identity.verify()?;
+        let use_guard = self.index_use_existing(&identity)?;
+        let path = self.leader_lock(&identity);
+        let file = match open_file(&path, false) {
+            Ok(file) => file,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Err(IndexNotReady::new("missing leader lock").into());
+            }
+            Err(error) => return Err(error),
+        };
+        let incarnation = read_incarnation(&file)?;
+        let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if status == 0 {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return Err(IndexNotReady::new("leader lock is not held").into());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        let guard = FollowerGuard {
+            use_guard,
+            file,
+            path,
+            identity,
+            incarnation,
+        };
+        guard.verify(incarnation)?;
+        Ok(guard)
+    }
+
     pub fn validate_external(
         &self,
         identity: &WorkspaceIdentity,
@@ -792,6 +843,16 @@ pub struct LeaderGuard {
     path: PathBuf,
     pub incarnation: Uuid,
 }
+fn read_incarnation(file: &File) -> Result<Uuid> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.take(64).read_to_end(&mut bytes)?;
+    let value =
+        std::str::from_utf8(&bytes).context("index_not_ready: invalid leader incarnation")?;
+    Uuid::parse_str(value).context("index_not_ready: invalid leader incarnation")
+}
+
 impl LeaderGuard {
     pub fn belongs_to(&self, leader_path: &Path) -> Result<()> {
         ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
@@ -799,7 +860,107 @@ impl LeaderGuard {
     }
     pub fn verify(&self) -> Result<()> {
         self.use_guard.verify()?;
-        private_file(&self.path, &self.file)
+        private_file(&self.path, &self.file)?;
+        ensure!(
+            read_incarnation(&self.file)? == self.incarnation,
+            "index_not_ready: leader incarnation changed"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct FollowerGuard {
+    use_guard: UseGuard,
+    file: File,
+    path: PathBuf,
+    identity: Arc<WorkspaceIdentity>,
+    pub incarnation: Uuid,
+}
+impl FollowerGuard {
+    pub fn verify(&self, expected: Uuid) -> Result<()> {
+        self.identity.verify()?;
+        self.use_guard.verify()?;
+        private_file(&self.path, &self.file)?;
+        if self.incarnation != expected || read_incarnation(&self.file)? != expected {
+            return Err(IndexNotReady::new("leader incarnation changed").into());
+        }
+        let status = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if status == 0 {
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+            return Err(IndexNotReady::new("leader lock is not held").into());
+        }
+        let error = std::io::Error::last_os_error();
+        ensure!(
+            error.kind() == std::io::ErrorKind::WouldBlock,
+            "index_not_ready: cannot verify leader lock: {error}"
+        );
+        private_file(&self.path, &self.file)?;
+        if read_incarnation(&self.file)? != expected {
+            return Err(IndexNotReady::new("leader incarnation changed").into());
+        }
+        self.identity.verify()
+    }
+}
+
+#[derive(Debug)]
+pub enum LeaderSession {
+    Leader {
+        guard: LeaderGuard,
+        identity: Arc<WorkspaceIdentity>,
+    },
+    Follower(FollowerGuard),
+}
+impl LeaderSession {
+    pub fn leader(guard: LeaderGuard, identity: Arc<WorkspaceIdentity>) -> Self {
+        Self::Leader { guard, identity }
+    }
+    pub fn follower(guard: FollowerGuard) -> Self {
+        Self::Follower(guard)
+    }
+    pub fn leader_guard(&self) -> Result<&LeaderGuard> {
+        match self {
+            Self::Leader { guard, .. } => Ok(guard),
+            Self::Follower(_) => bail!("storage_busy: follower cannot publish"),
+        }
+    }
+    pub fn incarnation(&self) -> Uuid {
+        match self {
+            Self::Leader { guard, .. } => guard.incarnation,
+            Self::Follower(g) => g.incarnation,
+        }
+    }
+    pub fn verify(&self) -> Result<()> {
+        match self {
+            Self::Leader { guard, identity } => {
+                identity.verify()?;
+                guard.verify()
+            }
+            Self::Follower(guard) => guard.verify(guard.incarnation),
+        }
+    }
+    pub fn belongs_to(&self, identity: &WorkspaceIdentity, leader_path: &Path) -> Result<()> {
+        let Self::Leader {
+            guard,
+            identity: held,
+        } = self
+        else {
+            bail!("storage_busy: follower cannot publish");
+        };
+        identity.verify()?;
+        held.verify()?;
+        ensure!(
+            held.root == identity.root
+                && held.root_key == identity.root_key
+                && held.record_id == identity.record_id
+                && held.device == identity.device
+                && held.inode == identity.inode,
+            "storage_busy: leader session belongs to another workspace"
+        );
+        guard.belongs_to(leader_path)
+    }
+    pub fn is_leader(&self) -> bool {
+        matches!(self, Self::Leader { .. })
     }
 }
 

@@ -17,7 +17,16 @@ mod offline {
     use std::sync::{Arc, atomic::AtomicBool};
     use tower::ServiceExt;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    pub(super) fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
+    pub(super) fn setup(
+        padding: usize,
+    ) -> (
+        tempfile::TempDir,
+        Store,
+        Graph,
+        Router,
+        Value,
+        Arc<baleyg::store::topology::LeaderSession>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -35,12 +44,13 @@ mod offline {
             .unwrap()
             .id
             .clone();
+        let session = store.leader_session().unwrap();
         store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -52,6 +62,7 @@ mod offline {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
+        state.retain_serving_session(session.clone());
         let pin = store.status().unwrap().revision;
         (
             dir,
@@ -59,6 +70,7 @@ mod offline {
             graph,
             http::router(state),
             json!({"seed":seed,"question":"helper leaf", "expectedRevision":pin}),
+            session,
         )
     }
     pub(super) async fn call(
@@ -102,7 +114,7 @@ use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 #[tokio::test]
 async fn offline_constructor_exposes_disabled_status_and_never_runs() {
-    let (_d, _, _, app, _) = setup(0);
+    let (_d, _, _, app, _, _session) = setup(0);
     assert_eq!(
         call(&app, "GET", "/api/jev/status", Value::Null).await,
         (
@@ -119,7 +131,7 @@ async fn offline_constructor_exposes_disabled_status_and_never_runs() {
 }
 #[tokio::test]
 async fn new_routes_preserve_security_guards_and_limits() {
-    let (_d, _, _, app, _) = setup(0);
+    let (_d, _, _, app, _, _session) = setup(0);
     for (method, url) in [
         ("GET", "/api/jev/status"),
         ("POST", "/api/questions/p/jev-run"),
@@ -152,7 +164,7 @@ async fn new_routes_preserve_security_guards_and_limits() {
 }
 #[tokio::test]
 async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
-    let (dir, store, graph, _, request) = setup(0);
+    let (dir, store, graph, _, request, session) = setup(0);
     let workspace = dir.path().join("workspace");
     let ledger = dir.path().join("budget");
     let provider = Arc::new(
@@ -166,16 +178,16 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
     )
     .unwrap();
     drop(db);
-    let app = http::router(
-        http::new_with_jev(
-            store.clone(),
-            IndexOptions::new(workspace),
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-            Some(provider),
-        )
-        .unwrap(),
-    );
+    let state = http::new_with_jev(
+        store.clone(),
+        IndexOptions::new(workspace),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+        Some(provider),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
     let (code, status) = call(&app, "GET", "/api/jev/status", Value::Null).await;
     assert_eq!(code, 200);
     assert_eq!(status["budget"]["reservedCents"], 10);
@@ -218,11 +230,16 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
     )
     .unwrap();
     let expected = store.status().unwrap().revision;
-    let leader = store.leader().unwrap();
     store
-        .publish_native(&graph, &capture, &native, &leader, expected, &cancel)
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            session.leader_guard().unwrap(),
+            expected,
+            &cancel,
+        )
         .unwrap();
-    drop(leader);
     assert_eq!(call(&app, "POST", &url, json!({})).await.0, 409);
     assert_eq!(
         call(&app, "GET", "/api/jev/status", Value::Null).await.1["budget"]["attempts"],
@@ -232,7 +249,7 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
 
 #[tokio::test]
 async fn imported_rounded_response_adds_warning_only_after_validation() {
-    let (_dir, _, _, app, request) = setup(0);
+    let (_dir, _, _, app, request, _session) = setup(0);
     let (status, preview) = call(&app, "POST", "/api/questions/preview", request).await;
     assert_eq!(status, 200);
     let packet: baleyg::planning::QuestionPacket =

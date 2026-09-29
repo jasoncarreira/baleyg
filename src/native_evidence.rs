@@ -1479,12 +1479,13 @@ mod cached_executable_digest_tests {
             from_capture(&capture, &root, store.root_id(), &cancel).unwrap(),
             native
         );
+        let session = store.leader_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -1505,5 +1506,6 @@ mod cached_executable_digest_tests {
                 .iter()
                 .any(|expected| row.syntax_id == expected.syntax_id)
         }));
+        drop(session);
     }
 }

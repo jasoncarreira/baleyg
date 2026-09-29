@@ -47,7 +47,15 @@ fn index_db(state: &std::path::Path) -> std::path::PathBuf {
 fn cancel() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
 }
-fn setup_with(source: &str) -> (tempfile::TempDir, Store, Graph, Router) {
+fn setup_with(
+    source: &str,
+) -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Router,
+    Arc<baleyg::store::topology::LeaderSession>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -56,12 +64,13 @@ fn setup_with(source: &str) -> (tempfile::TempDir, Store, Graph, Router) {
     let options = IndexOptions::new(workspace.clone());
     let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let session = store.leader_session().unwrap();
     assert_eq!(
         publish_bundle(
             &store,
             &graph,
             &workspace,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             baleyg::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0
@@ -81,9 +90,15 @@ fn setup_with(source: &str) -> (tempfile::TempDir, Store, Graph, Router) {
         )
         .unwrap(),
     );
-    (dir, store, graph, app)
+    (dir, store, graph, app, session)
 }
-fn setup() -> (tempfile::TempDir, Store, Graph, Router) {
+fn setup() -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Router,
+    Arc<baleyg::store::topology::LeaderSession>,
+) {
     setup_with(JAVA)
 }
 fn id(graph: &Graph, name: &str) -> String {
@@ -129,7 +144,7 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCod
 
 #[tokio::test]
 async fn search_pagination_literal_wildcards_and_supported_languages() {
-    let (_dir, store, _graph, app) = setup();
+    let (_dir, store, _graph, app, _session) = setup();
     let pin = store.status().unwrap().revision;
     let (status, page) = call(
         &app,
@@ -172,7 +187,7 @@ async fn search_pagination_literal_wildcards_and_supported_languages() {
 }
 #[tokio::test]
 async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
-    let (_dir, store, graph, _app) = setup();
+    let (_dir, store, graph, _app, _session) = setup();
     let seed = id(&graph, "A");
     let mut request = request(seed.clone(), &store);
     request.include_hierarchy = true;
@@ -188,7 +203,7 @@ async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
 }
 #[tokio::test]
 async fn authentication_strict_requests_revision_and_disconnected_expansion() {
-    let (dir, store, graph, app) = setup();
+    let (dir, store, graph, app, session) = setup();
     let pin = store.status().unwrap().revision;
     for path in ["/api/classes", "/api/class-diagram"] {
         let req = Request::builder()
@@ -234,12 +249,11 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
     assert_eq!(independent["nodes"].as_array().unwrap().len(), 2);
     assert_eq!(independent["edges"], json!([]));
     let index_generation = store.status().unwrap().revision.index_generation;
-    let leader = store.leader().unwrap();
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &leader,
+        session.leader_guard().unwrap(),
         baleyg::model::IndexPin {
             index_generation,
             index_revision: 1,
@@ -247,7 +261,6 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
         &cancel(),
     )
     .unwrap();
-    drop(leader);
     assert_eq!(
         call(
             &app,
@@ -291,7 +304,7 @@ fn projection_bounds_preserve_expansion_roots_edges_and_cycles() {
             "class N{i} {{ Seed back; Next{i} next; }} class Next{i} {{}}\n"
         ));
     }
-    let (_dir, store, graph, _app) = setup_with(&source);
+    let (_dir, store, graph, _app, _session) = setup_with(&source);
     let seed = graph
         .nodes
         .iter()
@@ -313,7 +326,7 @@ fn projection_bounds_preserve_expansion_roots_edges_and_cycles() {
 }
 #[test]
 fn incompatible_index_refuses_without_migrating_durable_data() {
-    let (dir, store, graph, _app) = setup();
+    let (dir, store, graph, app, session) = setup();
     let state = dir.path().join("state");
     let workspace = dir.path().join("workspace");
     let saved = SavedView {
@@ -331,6 +344,8 @@ fn incompatible_index_refuses_without_migrating_durable_data() {
         .unwrap()
         .join("workspace.db");
     let before = std::fs::read(&record).unwrap();
+    drop(app);
+    drop(session);
     drop(store);
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.pragma_update(None, "user_version", 2).unwrap();
@@ -340,9 +355,11 @@ fn incompatible_index_refuses_without_migrating_durable_data() {
 }
 #[test]
 fn failed_publication_keeps_projection_atomic_with_graph() {
-    let (dir, store, graph, _app) = setup();
+    let (dir, store, graph, app, session) = setup();
     let q = request(id(&graph, "A"), &store);
     let before = serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap();
+    drop(app);
+    drop(session);
 
     let leader = store.leader().unwrap();
     let control = store.index_baseline().unwrap();
@@ -456,10 +473,14 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
         store.class_diagram_at(&q).unwrap_err(),
         store.graph().unwrap_err(),
     ] {
-        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+        assert!(
+            closed.to_string().contains("incompatible_index"),
+            "{closed:#}"
+        );
     }
 
     let control = store.index_baseline().unwrap();
+    assert_eq!(control, prior);
     let leader = store.leader().unwrap();
     let next = publish_bundle(
         &store,
@@ -470,12 +491,14 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
         &cancel(),
     )
     .unwrap();
-    assert!(
-        next.index_revision > 1,
-        "failed transaction consumes a durable revision token"
-    );
+    assert_ne!(next.index_generation, prior.index_generation);
+    assert_eq!(next.index_revision, 1);
     assert_eq!(store.status().unwrap().revision, next);
     assert_eq!(store.graph().unwrap().nodes, graph.nodes);
+    assert_eq!(
+        store.class_diagram_at(&q).unwrap_err().to_string(),
+        "revision conflict"
+    );
     let mut current = q.clone();
     current.expected_revision = next;
     let mut before_at_next = before.clone();
@@ -488,7 +511,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
 
 #[tokio::test]
 async fn terminal_hints_and_parent_cycles_fail_readably() {
-    let (_dir, store, graph, _app) = setup();
+    let (_dir, store, graph, _app, _session) = setup();
     let seed = graph
         .nodes
         .iter()
@@ -521,7 +544,7 @@ fn repeated_references_are_grouped_before_caps_with_real_evidence() {
         text.push_str(&format!("B field{i};\n"));
     }
     text.push_str("C other; Missing x; Missing y; } class B {} class C {}\n");
-    let (_dir, store, graph, _app) = setup_with(&text);
+    let (_dir, store, graph, _app, _session) = setup_with(&text);
     let seed = graph
         .nodes
         .iter()
@@ -553,7 +576,7 @@ fn edge_limit_is_explicit_without_dangling_nodes() {
         }
         text.push_str("}\n");
     }
-    let (_dir, store, graph, _app) = setup_with(&text);
+    let (_dir, store, graph, _app, _session) = setup_with(&text);
     let seed = id(&graph, "N0");
     let mut request = request(seed.clone(), &store);
     request.include_hierarchy = true;
@@ -584,6 +607,7 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
         std::fs::write(workspace.join(format!("N{i:03}.java")), text).unwrap();
     }
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let session = store.leader_session().unwrap();
     let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
         &IndexOptions::new(workspace.clone()),
         store.root_id(),
@@ -596,7 +620,7 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel(),
         )
@@ -690,7 +714,7 @@ fn diagram_byte_budget_preserves_expansion_bridges_and_exact_relation_evidence()
         }
         text.push_str("}\n");
     }
-    let (_dir, store, graph, _app) = setup_with(&text);
+    let (_dir, store, graph, _app, _session) = setup_with(&text);
     let seed = graph
         .nodes
         .iter()
@@ -716,7 +740,7 @@ fn outgoing_declarations_precede_high_fan_in_before_caps() {
     for i in 0..100 {
         source.push_str(&format!("class Incoming{i} {{ Focus field; }}\n"));
     }
-    let (_dir, store, graph, _app) = setup_with(&source);
+    let (_dir, store, graph, _app, _session) = setup_with(&source);
     let seed = graph
         .nodes
         .iter()
@@ -741,7 +765,7 @@ async fn automatic_hierarchy_is_opt_in_directional_transitive_and_cache_only() {
     let source = "interface Top {} interface Face extends Top {}\n
         class Base implements Face {} class Mid extends Base {}\n
         class Leaf extends Mid {} class Peer extends Base {} class Other implements Face {}";
-    let (_dir, store, graph, _app) = setup_with(source);
+    let (_dir, store, graph, _app, _session) = setup_with(source);
     let seed = graph
         .nodes
         .iter()
@@ -774,7 +798,7 @@ fn hierarchy_precedes_associations_and_reserves_deep_manual_neighbor_bridges() {
     for i in 0..100 {
         source.push_str(&format!("class N{i} {{}}\n"));
     }
-    let (_dir, store, graph, _app) = setup_with(&source);
+    let (_dir, store, graph, _app, _session) = setup_with(&source);
     let seed = graph
         .nodes
         .iter()
@@ -796,7 +820,7 @@ fn hierarchy_precedes_associations_and_reserves_deep_manual_neighbor_bridges() {
 }
 #[test]
 fn hierarchy_cycles_deduplicate_and_unknown_bases_stay_terminal_opt_in() {
-    let (_dir, store, graph, _app) = setup_with(
+    let (_dir, store, graph, _app, _session) = setup_with(
         "class A extends B {} class B extends C {} class C extends A {} class D extends Missing {} class Alone {}",
     );
     let seed = graph
@@ -824,7 +848,7 @@ fn hierarchy_node_search_caps_and_impossible_mandatory_paths_are_explicit() {
     for i in 1..60 {
         source.push_str(&format!("class N{i} extends N{} {{}}\n", i - 1));
     }
-    let (_dir, store, graph, _app) = setup_with(&source);
+    let (_dir, store, graph, _app, _session) = setup_with(&source);
     let seed = graph
         .nodes
         .iter()
@@ -854,7 +878,7 @@ fn hierarchy_edge_caps_are_connected_and_deterministic() {
             .join(",");
         source.push_str(&format!("interface I{i} extends {parents} {{}}\n"));
     }
-    let (_dir, store, graph, _app) = setup_with(&source);
+    let (_dir, store, graph, _app, _session) = setup_with(&source);
     let seed = graph
         .nodes
         .iter()
@@ -876,7 +900,7 @@ fn hierarchy_edge_caps_are_connected_and_deterministic() {
 }
 #[test]
 fn hierarchy_oversize_mandatory_evidence_fails_instead_of_stranding_roots() {
-    let (_dir, store, graph, _app) = setup_with(
+    let (_dir, store, graph, _app, _session) = setup_with(
         "class A {} class B extends A {} class C extends B { Chosen field; } class Chosen {}",
     );
     let seed = id(&graph, "A");
@@ -898,7 +922,7 @@ fn hierarchy_mandatory_paths_reject_total_response_byte_overflow() {
     for i in 1..24 {
         source.push_str(&format!("class N{i} extends N{} {{}}\n", i - 1));
     }
-    let (_dir, store, graph, _app) = setup_with(&source);
+    let (_dir, store, graph, _app, _session) = setup_with(&source);
     let seed = id(&graph, "N0");
     let mut request = request(seed.clone(), &store);
     request.include_hierarchy = true;
@@ -936,7 +960,7 @@ fn publish_bundle(
 
 #[tokio::test]
 async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes() {
-    let (dir, store, graph, app) = setup();
+    let (dir, store, graph, app, _session) = setup();
     let pin = store.status().unwrap().revision;
     let seed = id(&graph, "A");
     let class_url = format!("/api/classes?{}&q=A", pin_query(pin));
@@ -962,7 +986,7 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
-    for (request_index, (method, path, body)) in [
+    for (method, path, body) in [
         ("GET", class_url.as_str(), Value::Null),
         ("GET", symbol_url.as_str(), Value::Null),
         (
@@ -970,32 +994,27 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
             "/api/class-diagram",
             json!({"seed":seed,"expectedRevision":pin}),
         ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         let (status, value) = call(&app, method, path, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        let expected = if request_index == 0 {
-            "incompatible_index"
-        } else {
-            "index_not_ready"
-        };
-        assert_eq!(value["error"]["code"], expected, "{path}: {value}");
+        assert_eq!(
+            value["error"]["code"], "incompatible_index",
+            "{path}: {value}"
+        );
         assert!(!value.to_string().contains("Fabricated"));
     }
     let unrelated = store
         .symbol_at(&id(&graph, "Unsupported"), Some(pin))
         .unwrap_err();
     assert!(
-        unrelated.to_string().starts_with("index_not_ready"),
+        unrelated.to_string().starts_with("incompatible_index"),
         "{unrelated:#}"
     );
 }
 
 #[tokio::test]
 async fn selected_class_and_symbol_routes_reject_same_pin_graph_call_forgery() {
-    let (dir, store, graph, app) = setup_with(
+    let (dir, store, graph, app, _session) = setup_with(
         "class A { void run() { helper(); } void helper() {} }
 class B {}
 ",
@@ -1026,7 +1045,7 @@ class B {}
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
-    for (request_index, (method, path, body)) in [
+    for (method, path, body) in [
         ("GET", class_url.as_str(), Value::Null),
         ("GET", symbol_url.as_str(), Value::Null),
         (
@@ -1034,31 +1053,26 @@ class B {}
             "/api/class-diagram",
             json!({"seed":class_id,"expectedRevision":pin}),
         ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         let (status, value) = call(&app, method, path, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        let expected = if request_index == 0 {
-            "incompatible_index"
-        } else {
-            "index_not_ready"
-        };
-        assert_eq!(value["error"]["code"], expected, "{path}: {value}");
+        assert_eq!(
+            value["error"]["code"], "incompatible_index",
+            "{path}: {value}"
+        );
         assert!(!value.to_string().contains("fabricatedCall"));
     }
     let other_url = format!("/api/symbol?id={other_id}&{}", pin_query(pin));
     let (status, value) = call(&app, "GET", &other_url, Value::Null).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
-    assert_eq!(value["error"]["code"], "index_not_ready");
+    assert_eq!(value["error"]["code"], "incompatible_index");
     assert!(!value.to_string().contains("fabricatedCall"));
 }
 
 #[tokio::test]
 async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_invalid_requests() {
     // The first selected catalog decode is typed and closes pre-created clones.
-    let (dir, store, graph, app) = setup();
+    let (dir, store, graph, app, _session) = setup();
     let clone = store.clone();
     let pin = store.status().unwrap().revision;
     let class_id = id(&graph, "A");
@@ -1083,11 +1097,11 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // The diagram endpoint independently reports selected class decode corruption.
-    let (dir, store, graph, app) = setup();
+    let (dir, store, graph, app, _session) = setup();
     let clone = store.clone();
     let pin = store.status().unwrap().revision;
     let class_id = id(&graph, "A");
@@ -1112,11 +1126,11 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // A selected method seed reaches only the resolver's persisted Symbol decode.
-    let (dir, store, graph, app) = setup();
+    let (dir, store, graph, app, _session) = setup();
     let clone = store.clone();
     let pin = store.status().unwrap().revision;
     let method_id = id(&graph, "run");
@@ -1140,11 +1154,11 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // Valid top-level JSON with a non-object member is refused before clipped JSON1.
-    let (dir, store, graph, app) = setup();
+    let (dir, store, graph, app, _session) = setup();
     let clone = store.clone();
     let pin = store.status().unwrap().revision;
     let class_id = id(&graph, "A");
@@ -1168,11 +1182,11 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // A genuine request-domain failure stays HTTP 400 and does not close the Store.
-    let (_dir, store, graph, app) = setup();
+    let (_dir, store, graph, app, _session) = setup();
     let clone = store.clone();
     let pin = store.status().unwrap().revision;
     let (status, body) = call(

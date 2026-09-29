@@ -7,7 +7,13 @@ fn fixture() -> (TempDir, TempDir) {
     fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700)).unwrap();
     (state, tempfile::tempdir().unwrap())
 }
-fn projection_fixture() -> (TempDir, TempDir, Store, baleyg::model::IndexPin) {
+fn projection_fixture() -> (
+    TempDir,
+    TempDir,
+    Store,
+    baleyg::model::IndexPin,
+    std::sync::Arc<baleyg::store::topology::LeaderSession>,
+) {
     use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
     use std::sync::{Arc, atomic::AtomicBool};
     let (state, workspace) = fixture();
@@ -17,15 +23,16 @@ fn projection_fixture() -> (TempDir, TempDir, Store, baleyg::model::IndexPin) {
     )
     .unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let pin = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
+    let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = coordinator.session();
+    let pin = coordinator
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
             &Arc::new(AtomicBool::new(false)),
             |_| {},
         )
         .unwrap();
-    (state, workspace, store, pin)
+    (state, workspace, store, pin, session)
 }
 fn index_dir(state: &Path) -> std::path::PathBuf {
     fs::read_dir(state.join("cache/indexes"))
@@ -239,11 +246,12 @@ fn drift_refusal_preserves_populated_store_pair_and_graph() {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = Store::open_for_tests(state.path(), root).unwrap();
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
+    let leader = store.leader().unwrap();
     let before = publish_bundle(
         &store,
         &graph,
         root,
-        &store.leader().unwrap(),
+        &leader,
         store.index_baseline().unwrap(),
         &cancel,
     )
@@ -303,10 +311,9 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     let store = Store::open_for_tests(state.path(), root).unwrap();
     let options = IndexOptions::new(root.to_owned());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let first = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
     let (old_pin, old_file) = store.source_at("main.js", Some(first)).unwrap().unwrap();
     assert_eq!(old_pin, first);
     let original = old_file.text;
@@ -341,7 +348,8 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
             native_hash,
         )
     };
-    let cancelled = IndexJobCoordinator::prepare(&store, Some(first)).unwrap();
+    let cancelled =
+        IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone()).unwrap();
     cancel.store(true, Ordering::Release);
     assert!(
         cancelled
@@ -352,7 +360,10 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     );
     cancel.store(false, Ordering::Release);
     assert_eq!(store.index_baseline().unwrap(), first);
-    assert_public_closed();
+    assert_eq!(store.status().unwrap().revision, first);
+    let (served_pin, served_source) = store.source_at("main.js", Some(first)).unwrap().unwrap();
+    assert_eq!(served_pin, first);
+    assert_eq!(served_source.text, original);
     assert_eq!(
         persisted_source(),
         (
@@ -364,7 +375,8 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
 
     // Cancellation after admission and projection, before publication, also rolls back.
     fs::write(root.join("main.js"), "function late() {}\n").unwrap();
-    let late = IndexJobCoordinator::prepare(&store, Some(first)).unwrap();
+    let late =
+        IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone()).unwrap();
     let late_cancel = cancel.clone();
     let mut phases = Vec::new();
     let phase_log = std::sync::Mutex::new(&mut phases);
@@ -394,7 +406,8 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     );
     fs::write(root.join("main.js"), &original).unwrap();
 
-    let drift = IndexJobCoordinator::prepare(&store, Some(first)).unwrap();
+    let drift =
+        IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone()).unwrap();
     let error = drift
         .run(&options, &cancel, |p| {
             if p.phase == "parse" {
@@ -418,12 +431,13 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
             original_hash.clone()
         )
     );
-    let stale = IndexJobCoordinator::prepare(
+    let stale = IndexJobCoordinator::prepare_with_session(
         &store,
         Some(baleyg::model::IndexPin {
             index_generation: first.index_generation,
             index_revision: first.index_revision - 1,
         }),
+        session.clone(),
     );
     assert!(
         matches!(stale, Err(error) if error.to_string().contains("revision conflict")),
@@ -439,7 +453,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
             original_hash.clone()
         )
     );
-    let next = IndexJobCoordinator::prepare(&store, Some(first))
+    let next = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
@@ -561,10 +575,9 @@ fn schema_six_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(workspace.path().to_owned());
-    let current = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let current = job.run(&options, &cancel, |_| {}).unwrap();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     drop(store);
@@ -590,7 +603,7 @@ fn schema_six_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
             .to_string()
             .contains("index_not_ready")
     );
-    let rebuilt = IndexJobCoordinator::prepare(&store, Some(current))
+    let rebuilt = IndexJobCoordinator::prepare_with_session(&store, Some(current), session.clone())
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
@@ -736,10 +749,9 @@ fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(workspace.path().to_owned());
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let first = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
     let path = index_dir(state.path()).join("index.db");
     let read_stat = || {
         let db = rusqlite::Connection::open(&path).unwrap();
@@ -771,7 +783,7 @@ fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
         unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
         0
     );
-    let second = IndexJobCoordinator::prepare(&store, Some(first))
+    let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
@@ -820,10 +832,9 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let first = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     drop(store);
@@ -841,9 +852,9 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
-    let rebuilt = IndexJobCoordinator::prepare(&store, Some(first))
+    let rebuilt = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
@@ -902,7 +913,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     drop(separate);
 
     let failed_cancel: CancelFlag = Arc::new(AtomicBool::new(true));
-    let failure = IndexJobCoordinator::prepare(&store, Some(rebuilt))
+    let failure = IndexJobCoordinator::prepare_with_session(&store, Some(rebuilt), session.clone())
         .unwrap()
         .run(&options, &failed_cancel, |_| {})
         .unwrap_err();
@@ -918,10 +929,11 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     assert!(store.status().is_err());
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     failed_cancel.store(false, Ordering::Release);
-    let mut recovered = IndexJobCoordinator::prepare(&store, Some(rebuilt))
-        .unwrap()
-        .run(&options, &failed_cancel, |_| {})
-        .unwrap();
+    let mut recovered =
+        IndexJobCoordinator::prepare_with_session(&store, Some(rebuilt), session.clone())
+            .unwrap()
+            .run(&options, &failed_cancel, |_| {})
+            .unwrap();
     assert_eq!(recovered.index_revision, 1);
     assert_ne!(recovered.index_generation, rebuilt.index_generation);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
@@ -958,10 +970,11 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     );
     assert!(store.status().is_err());
     failed_cancel.store(true, Ordering::Release);
-    let failure = IndexJobCoordinator::prepare(&store, Some(recovered))
-        .unwrap()
-        .run(&options, &failed_cancel, |_| {})
-        .unwrap_err();
+    let failure =
+        IndexJobCoordinator::prepare_with_session(&store, Some(recovered), session.clone())
+            .unwrap()
+            .run(&options, &failed_cancel, |_| {})
+            .unwrap_err();
     assert!(failure.to_string().contains("cancelled"), "{failure:#}");
     let db = rusqlite::Connection::open(&path).unwrap();
     let stored_type: String = db
@@ -975,10 +988,11 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     drop(db);
     assert!(store.status().is_err());
     failed_cancel.store(false, Ordering::Release);
-    let typed_recovered = IndexJobCoordinator::prepare(&store, Some(recovered))
-        .unwrap()
-        .run(&options, &failed_cancel, |_| {})
-        .unwrap();
+    let typed_recovered =
+        IndexJobCoordinator::prepare_with_session(&store, Some(recovered), session.clone())
+            .unwrap()
+            .run(&options, &failed_cancel, |_| {})
+            .unwrap();
     assert_eq!(typed_recovered.index_revision, 1);
     assert_ne!(typed_recovered.index_generation, recovered.index_generation);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
@@ -988,6 +1002,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     // A newly acquired writer is a takeover until it completes publication.
     // The latch is shared by Store clones and remains closed after the guard drops.
     let clone = store.clone();
+    drop(session);
     drop(store.leader().unwrap());
     assert!(store.status().is_err());
     assert!(clone.status().is_err());
@@ -995,10 +1010,9 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let separate = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     assert_eq!(separate.index_baseline().unwrap(), recovered);
     drop(separate);
-    let next = IndexJobCoordinator::prepare(&clone, Some(recovered))
-        .unwrap()
-        .run(&options, &failed_cancel, |_| {})
-        .unwrap();
+    let job = IndexJobCoordinator::prepare(&clone, Some(recovered)).unwrap();
+    let _next_session = job.session();
+    let next = job.run(&options, &failed_cancel, |_| {}).unwrap();
     assert_eq!(clone.status().unwrap().revision, next);
     assert_eq!(store.status().unwrap().revision, next);
 }
@@ -1020,10 +1034,9 @@ fn bounded_control_decode_rebuilds_and_failed_attempt_stays_closed() {
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let pin = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let pin = job.run(&options, &cancel, |_| {}).unwrap();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     drop(store);
@@ -1038,10 +1051,10 @@ fn bounded_control_decode_rebuilds_and_failed_attempt_stays_closed() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     cancel.store(true, Ordering::Release);
-    let failure = IndexJobCoordinator::prepare(&store, Some(pin))
+    let failure = IndexJobCoordinator::prepare_with_session(&store, Some(pin), session.clone())
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap_err();
@@ -1056,7 +1069,7 @@ fn bounded_control_decode_rebuilds_and_failed_attempt_stays_closed() {
     assert!(store.status().is_err());
 
     cancel.store(false, Ordering::Release);
-    let repaired = IndexJobCoordinator::prepare(&store, Some(pin))
+    let repaired = IndexJobCoordinator::prepare_with_session(&store, Some(pin), session.clone())
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
@@ -1135,10 +1148,9 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         options.manifest_path = Some(manifest.clone());
         let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-        let pin = IndexJobCoordinator::prepare(&store, None)
-            .unwrap()
-            .run(&options, &cancel, |_| {})
-            .unwrap();
+        let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = job.session();
+        let pin = job.run(&options, &cancel, |_| {}).unwrap();
         let path = index_dir(state.path()).join("index.db");
         drop(store);
         let db = rusqlite::Connection::open(&path).unwrap();
@@ -1149,10 +1161,11 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
             store.status().is_err(),
             "invalid inventory was publicly readable: {mutation}"
         );
-        let repaired = IndexJobCoordinator::prepare(&store, Some(pin))
-            .unwrap()
-            .run(&options, &cancel, |_| {})
-            .unwrap();
+        let repaired =
+            IndexJobCoordinator::prepare_with_session(&store, Some(pin), session.clone())
+                .unwrap()
+                .run(&options, &cancel, |_| {})
+                .unwrap();
         assert_eq!(repaired.index_revision, 1);
         assert_ne!(repaired.index_generation, pin.index_generation);
         assert_eq!(store.status().unwrap().revision, repaired);
@@ -1174,7 +1187,7 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
 #[test]
 fn selected_projection_json_failures_latch_only_selected_reads() {
     // Selected file JSON is bounded to the requested page.
-    let (state, _workspace, store, pin) = projection_fixture();
+    let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
@@ -1192,11 +1205,11 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // A matching invalid node is selected by the page even when file JSON is valid.
-    let (state, _workspace, store, pin) = projection_fixture();
+    let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
@@ -1214,12 +1227,12 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // The methods route types both invalid JSON and valid JSON with bad Symbol shape.
     for payload in ["not-json", r#"{"kind":"function"}"#] {
-        let (state, _workspace, store, pin) = projection_fixture();
+        let (state, _workspace, store, pin, _session) = projection_fixture();
         let clone = store.clone();
         let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
         db.execute(
@@ -1237,13 +1250,13 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
                 .status()
                 .unwrap_err()
                 .to_string()
-                .contains("index_not_ready")
+                .contains("incompatible_index")
         );
     }
 
     // A valid selected file JSON value with a non-string language is a typed
     // SQLite extraction conversion, not a generic SQLITE_ERROR.
-    let (state, _workspace, store, pin) = projection_fixture();
+    let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
@@ -1261,11 +1274,11 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // Tree enrichment evaluates only its visible file and latches its invalid node.
-    let (state, workspace, store, _pin) = projection_fixture();
+    let (state, workspace, store, _pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
@@ -1292,11 +1305,11 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // Benign absence and a bad pin remain non-latching request outcomes.
-    let (_state, _workspace, store, pin) = projection_fixture();
+    let (_state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     assert!(store.methods_at("missing.js", Some(pin)).unwrap().is_none());
     let wrong = baleyg::model::IndexPin {
@@ -1325,7 +1338,7 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
         atomic::{AtomicBool, Ordering},
     };
 
-    let (state, workspace, store, pin) = projection_fixture();
+    let (state, workspace, store, pin, session) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
@@ -1346,11 +1359,11 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
-    let failed = IndexJobCoordinator::prepare(&store, Some(pin))
+    let failed = IndexJobCoordinator::prepare_with_session(&store, Some(pin), session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -1364,19 +1377,19 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert!(
         clone
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
 
     cancel.store(false, Ordering::Release);
-    let recovered = IndexJobCoordinator::prepare(&store, Some(pin))
+    let recovered = IndexJobCoordinator::prepare_with_session(&store, Some(pin), session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -1408,7 +1421,7 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
         },
     };
 
-    let (state, workspace, initial, old) = projection_fixture();
+    let (state, workspace, initial, old, session) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     drop(initial);
@@ -1424,18 +1437,19 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert!(
         clone
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert_eq!(store.index_baseline().unwrap(), old);
 
-    let stale = IndexJobCoordinator::prepare(&store, Some(old)).unwrap();
+    let stale =
+        IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone()).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
         "UPDATE index_metadata SET extractor_version='changed-after-admission'",
@@ -1460,7 +1474,7 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
     drop(db);
 
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
-    let error = IndexJobCoordinator::prepare(&store, Some(old))
+    let error = IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -1483,11 +1497,11 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     cancel.store(false, Ordering::Release);
-    let recovered = IndexJobCoordinator::prepare(&store, Some(old))
+    let recovered = IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -1501,7 +1515,7 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
     assert_eq!(store.status().unwrap().revision, recovered);
     assert_eq!(clone.status().unwrap().revision, recovered);
     assert!(
-        IndexJobCoordinator::prepare(&store, Some(old))
+        IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
             .err()
             .expect("old pin must conflict")
             .to_string()
@@ -1523,7 +1537,7 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
         },
     };
 
-    let (state, workspace, initial, old) = projection_fixture();
+    let (state, workspace, initial, old, session) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     drop(initial);
@@ -1542,7 +1556,7 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert!(
         store
@@ -1552,7 +1566,7 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
             .contains("not decodable")
     );
     assert!(
-        IndexJobCoordinator::prepare(&store, Some(old))
+        IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
             .err()
             .expect("undecodable pin must conflict")
             .to_string()
@@ -1560,7 +1574,7 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
     );
 
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
-    let error = IndexJobCoordinator::prepare(&store, None)
+    let error = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -1588,11 +1602,11 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     cancel.store(false, Ordering::Release);
-    let recovered = IndexJobCoordinator::prepare(&store, None)
+    let recovered = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -1620,14 +1634,15 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     };
 
     let conflict = |first: &str, mutate: &dyn Fn(&rusqlite::Connection)| {
-        let (state, workspace, initial, _old) = projection_fixture();
+        let (state, workspace, initial, _old, session) = projection_fixture();
         let path = index_dir(state.path()).join("index.db");
         drop(initial);
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute(first, []).unwrap();
         drop(db);
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-        let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let coordinator =
+            IndexJobCoordinator::prepare_with_session(&store, None, session.clone()).unwrap();
         let db = rusqlite::Connection::open(&path).unwrap();
         mutate(&db);
         drop(db);
@@ -1644,7 +1659,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
                 .status()
                 .unwrap_err()
                 .to_string()
-                .contains("index_not_ready")
+                .contains("incompatible_index")
         );
     };
 
@@ -1669,7 +1684,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
         },
     );
 
-    let (state, workspace, initial, _old) = projection_fixture();
+    let (state, workspace, initial, _old, session) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     drop(initial);
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1680,7 +1695,8 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     .unwrap();
     drop(db);
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let coordinator =
+        IndexJobCoordinator::prepare_with_session(&store, None, session.clone()).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
     let mut blob = db
         .blob_open(MAIN_DB, "index_metadata", "index_generation", 1, false)
@@ -1701,11 +1717,11 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     let inode = fs::metadata(&path).unwrap().ino();
     let cancel = Arc::new(AtomicBool::new(true));
-    let error = IndexJobCoordinator::prepare(&store, None)
+    let error = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -1716,7 +1732,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     assert!(error.to_string().contains("cancelled"), "{error:#}");
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     cancel.store(false, Ordering::Release);
-    let recovered = IndexJobCoordinator::prepare(&store, None)
+    let recovered = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -1728,7 +1744,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     assert_eq!(store.status().unwrap().revision, recovered);
 
-    let (state, workspace, initial, _old) = projection_fixture();
+    let (state, workspace, initial, _old, _session) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     drop(initial);
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1740,7 +1756,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
         "{error:#}"
     );
 
-    let (state, workspace, initial, _old) = projection_fixture();
+    let (state, workspace, initial, _old, _session) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     drop(initial);
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1752,7 +1768,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
         "{error:#}"
     );
 
-    let (state, workspace, initial, _old) = projection_fixture();
+    let (state, workspace, initial, _old, _session) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     drop(initial);
     let locker = rusqlite::Connection::open(&path).unwrap();
@@ -1766,7 +1782,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
 #[test]
 fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     // Malformed stats must be reported by a direct pinned read, not only status.
-    let (state, _workspace, store, pin) = projection_fixture();
+    let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1783,32 +1799,32 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert!(
         store
             .views()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert!(
         store
             .view("missing")
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert!(
         store
             .annotations()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // REAL revision must fail before pin comparison and close every clone.
-    let (state, _workspace, store, pin) = projection_fixture();
+    let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let symbol = store.symbols_at("go", 10).unwrap().1.remove(0).id;
     let path = index_dir(state.path()).join("index.db");
@@ -1829,11 +1845,11 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
             .views()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // Malformed persisted input is reached by the existing full-read inventory pass.
-    let (state, _workspace, store, pin) = projection_fixture();
+    let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1853,14 +1869,14 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
             .annotations()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 }
 
 #[test]
 fn live_structural_inventory_and_control_first_reads_fail_closed() {
     // This is an already executed structural check, not a new derived invariant.
-    let (state, _workspace, store, pin) = projection_fixture();
+    let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1880,25 +1896,25 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
             .views()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert!(
         clone
             .view("missing")
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
     assert!(
         clone
             .annotations()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     // A control-only read can also be the first observer of typed control corruption.
-    let (state, _workspace, store, _pin) = projection_fixture();
+    let (state, _workspace, store, _pin, _session) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1915,13 +1931,13 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 }
 
 #[test]
 fn live_root_mismatch_precedes_typed_control_corruption_without_latching() {
-    let (state, _workspace, store, pin) = projection_fixture();
+    let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1969,7 +1985,7 @@ fn live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin() {
         },
     };
 
-    let (state, workspace, store, old) = projection_fixture();
+    let (state, workspace, store, old, session) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
@@ -1986,7 +2002,7 @@ fn live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin() {
     );
 
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
-    let error = IndexJobCoordinator::prepare(&store, Some(old))
+    let error = IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -2009,11 +2025,11 @@ fn live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("index_not_ready")
+            .contains("incompatible_index")
     );
 
     cancel.store(false, Ordering::Release);
-    let recovered = IndexJobCoordinator::prepare(&store, Some(old))
+    let recovered = IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
         .unwrap()
         .run(
             &IndexOptions::new(workspace.path().to_owned()),
@@ -2027,7 +2043,7 @@ fn live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin() {
     assert_eq!(store.status().unwrap().revision, recovered);
     assert_eq!(clone.status().unwrap().revision, recovered);
     assert!(
-        IndexJobCoordinator::prepare(&store, Some(old))
+        IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
             .err()
             .expect("old pin must conflict")
             .to_string()
@@ -2042,7 +2058,7 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
         "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
         "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
     ] {
-        let (state, _workspace, store, pin) = projection_fixture();
+        let (state, _workspace, store, pin, _session) = projection_fixture();
         let clone = store.clone();
         let path = index_dir(state.path()).join("index.db");
         let db = rusqlite::Connection::open(path).unwrap();
@@ -2058,7 +2074,7 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
                 .source_at("flow.js", Some(pin))
                 .unwrap_err()
                 .to_string()
-                .contains("index_not_ready"),
+                .contains("incompatible_index"),
             "{sql}"
         );
     }

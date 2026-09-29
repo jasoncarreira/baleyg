@@ -21,6 +21,7 @@ fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
+    state.retain_serving_session(store.leader_session().unwrap());
     let router = http::router(state.clone());
     (dir, store, state, router)
 }
@@ -172,7 +173,7 @@ async fn validation_and_limit() {
 }
 #[tokio::test]
 async fn source_is_snapshot_and_revision_checked() {
-    let (_d, store, _state, app) = setup();
+    let (_d, store, state, app) = setup();
     let workspace = _d.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "cached secret-free source").unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -189,7 +190,11 @@ async fn source_is_snapshot_and_revision_checked() {
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            state
+                .retained_serving_session()
+                .unwrap()
+                .leader_guard()
+                .unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -380,7 +385,7 @@ async fn local_design_assets_preserve_same_origin_guards() {
 
 #[tokio::test]
 async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_comparison() {
-    let (dir, store, _state, app) = setup();
+    let (dir, store, state, app) = setup();
     let workspace = dir.path().join("workspace");
     std::fs::write(
         workspace.join("a.js"),
@@ -402,7 +407,11 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            state
+                .retained_serving_session()
+                .unwrap()
+                .leader_guard()
+                .unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -438,8 +447,8 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     assert_eq!(code, StatusCode::OK, "{preview}");
     let packet = preview["packet"]["packetId"].as_str().unwrap();
     let old_selection = preview["selection"].clone();
-    // Retain the valid leader lease across deliberate legacy metadata tampering.
-    let leader = store.leader().unwrap();
+    // Retain the daemon's verified leader session across deliberate legacy metadata tampering.
+    let leader = state.retained_serving_session().unwrap();
     let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -636,7 +645,14 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     let cancelled = Arc::new(AtomicBool::new(true));
     assert!(
         store
-            .publish_native(&graph, &capture, &native, &leader, pin, &cancelled)
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                leader.leader_guard().unwrap(),
+                pin,
+                &cancelled,
+            )
             .is_err()
     );
     assert_eq!(std::fs::read(&index).unwrap(), old_bytes);
@@ -968,9 +984,9 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
 }
 
 #[tokio::test]
-async fn live_control_corruption_returns_typed_503_before_clone_not_ready() {
+async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
     for case in ["stats-source", "real-symbol", "input-classes"] {
-        let (dir, store, _state, app) = setup();
+        let (dir, store, state, app) = setup();
         let workspace = dir.path().join("workspace");
         std::fs::write(workspace.join("a.js"), "function go() { measured(); }\n").unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -987,7 +1003,11 @@ async fn live_control_corruption_returns_typed_503_before_clone_not_ready() {
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                state
+                    .retained_serving_session()
+                    .unwrap()
+                    .leader_guard()
+                    .unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -1042,6 +1062,33 @@ async fn live_control_corruption_returns_typed_503_before_clone_not_ready() {
         );
         let (status, body) = call(&app, "GET", "/api/status", Value::Null).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
-        assert_eq!(body["error"]["code"], "index_not_ready", "{case}: {body}");
+        assert_eq!(
+            body["error"]["code"], "incompatible_index",
+            "{case}: {body}"
+        );
     }
+}
+
+#[tokio::test]
+async fn index_request_without_startup_session_does_not_reacquire_leadership() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let state = http::new(
+        store.clone(),
+        IndexOptions::new(workspace),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = http::router(state);
+    let (status, body) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "index_not_ready");
+    let session = store.leader_session().unwrap();
+    assert!(
+        session.is_leader(),
+        "HTTP request must not have retained or reacquired the lock"
+    );
 }
