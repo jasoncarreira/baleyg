@@ -114,8 +114,11 @@ every chunk below it.
   takes seconds, plus rebuilding the lexical index.
 - **Cache rules follow #71.**
   - Keep size-capped LRU eviction.
-  - A missing, evicted, corrupt or unavailable entry only means re-embedding. It never produces a
-    different answer.
+  - A missing, evicted, corrupt or unavailable entry is treated as *no vector* for that chunk.
+    The chunk counts as pending in `searchIndex` (`partial` or `building`, `pendingChunks`), is
+    served lexical-only until it is re-embedded, and is re-embedded in the background. Ranking can
+    therefore differ until re-embedding finishes. The guarantee is that such an entry never yields
+    a *wrong* vector, a wrong stable ID, or a response that claims complete vector coverage.
   - Validate an entry against its key before use.
   - Never share the cache across users or machines.
 - **Invalidate on text or context, not only on the declaration body.** A chunk's generated text
