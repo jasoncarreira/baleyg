@@ -24,7 +24,8 @@ bytes. There is no second parse and no file reread.
 Two document kinds:
 
 1. **Symbol cards.** A qualified name, kind, signature, doc comment and path, optionally with the
-   names of callers and callees for disambiguation. Cards match "which function does X" queries.
+   names of callers and callees for disambiguation (off at first; see
+   [Incremental updates](#incremental-updates)). Cards match "which function does X" queries.
 2. **Code chunks.** The declaration's source, so undocumented or misleadingly named code is still
    found.
 
@@ -60,7 +61,7 @@ without the filter, not guessed.
 | File path | Line and column range, derived from the byte range at the pinned revision |
 | AST breadcrumb and node kind | Byte range, stable declaration ID, revision, content hash |
 | Signature and language | Ancestor IDs, depth, sibling ordinal |
-| Optionally: imports used, caller and callee names | Flags: test or production, visibility, `async`, generated or vendored |
+| Optionally: imports used; caller and callee names (see fan-out note below) | Flags: test or production, visibility, `async`, generated or vendored |
 
 Line numbers and ordinals are never embedded. They carry no meaning, and embedding them would break
 the cache: one line added at the top of a file would change the text, and so the content hash, of
@@ -90,13 +91,26 @@ every chunk below it.
 
 ## Incremental updates
 
-- The cache is keyed by a hash of the embedded text and is path-neutral, like the native fact
-  cache (#71). A `git mv` or an unchanged declaration is never re-embedded.
-- Only chunks from changed declarations are re-embedded, driven by the incremental publication
-  deltas (#67).
-- Embedding runs as a **background job after publication** and never delays the index. Until it
-  completes, search reports partial embedding coverage through the existing coverage and freshness
-  fields instead of silently returning incomplete results.
+- **Cache key: the full generated text.** A vector is keyed by a hash of the exact text that was
+  embedded: breadcrumb, path, signature, body and any context fields. Unchanged text is reused
+  across revisions, worktrees and checkouts. The cache is **not** path-neutral. The path is in the
+  embedded text because it is a useful topic signal, so a rename or `git mv` re-embeds the
+  affected chunks. Renames are rare enough that this trade favours retrieval quality.
+- **Invalidate on text or context, not only on the declaration body.** A chunk's generated text
+  can change while its declaration body does not. The incremental deltas (#67) must therefore
+  select every chunk whose generated text would change:
+  - a class summary chunk, when any member signature is added, removed or changed;
+  - a file chunk, when imports or top-level statements change;
+  - a symbol card, when its breadcrumb or signature changes, or, if caller and callee names are
+    included, when those lists change.
+
+  Regenerating a candidate chunk and comparing text hashes is the check: an equal hash keeps the
+  vector.
+- **Keep fan-out bounded.** Caller names change whenever a new call site appears elsewhere, so
+  including them makes one edit invalidate cards in other files. Start without caller and callee
+  names in the embedded text, and measure whether adding them is worth the invalidation cost.
+  They are available to the lexical index and to boosts either way.
+- **Background job.** Embedding runs after publication and never delays the index.
 
 ## Contract fit
 
@@ -104,6 +118,16 @@ every chunk below it.
   declaration IDs with scores, byte and line ranges and breadcrumbs, labeled as retrieval. Agents
   verify through the exact `declaration` and `outgoing_calls` views. Nothing inferred by similarity
   becomes a #22 semantic record.
+- **Search-index coverage is its own state.** The #22 evidence coverage and freshness fields
+  describe evidence, not whether a background vector job has finished, and are not reused for
+  that. Search responses carry a separate search-index status, for example:
+  `searchIndex: { state: "complete" | "building" | "partial" | "unavailable", indexRevision,
+  embeddedRevision, pendingChunks, modelId }`.
+  - `building` or `partial` means some chunks at the pinned revision have no current vector.
+    Those candidates can still be returned from the lexical index, marked lexical-only.
+  - `unavailable` means no vectors exist, for example when no model is configured. Search then
+    degrades to lexical ranking and says so.
+  - A response never implies that vector coverage is complete when it isn't.
 - **Revision pinning.** The local topology already classifies "symbol search, ranked/global
   queries" as operations that conflict when stale. Search answers are pinned to one index revision
   and fail with a revision conflict when the pin is stale.
@@ -164,7 +188,7 @@ It would provide:
   and for deciding which chunks to re-embed;
 - a single fingerprint for "is this the same tree?";
 - reuse across worktrees, where identical subtrees have identical hashes. This complements the
-  per-file content cache (#71).
+  native per-file fact cache (#71).
 
 It is optional and separate from change detection. Add it only if delta computation or
 re-embedding shows a need.
