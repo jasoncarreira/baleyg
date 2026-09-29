@@ -78,8 +78,15 @@ every chunk below it.
 - A remote embedding API is available only as an explicit opt-in. The hosted candidate is
   **voyage-code-4**. Do not assume it shares voyage-4's embedding space: switching between it and a
   local model re-embeds, which the `modelId` in the cache key already enforces.
-- The model is **pinned like a producer**: its name, version and weight hash are recorded, so
-  vectors are reproducible and tied to the revision that produced them.
+- The model is **pinned like a producer**, and its pin is part of `modelId`, so vectors are tied to
+  the model that produced them.
+  - *Local models:* name, version and weight-file hash are recorded, and the vectors are
+    reproducible.
+  - *Hosted models:* weights can't be hashed. `modelId` records the provider, model name and the
+    provider's model version or release identifier where one is published. The vectors are treated
+    as reproducible only while that identifier is unchanged. A changed identifier, or a periodic
+    drift check that re-embeds a small canary set and finds changed vectors, invalidates that
+    `modelId`'s cache entries and re-embeds.
 
 ## Storage and ranking
 
@@ -110,22 +117,30 @@ every chunk below it.
   checkout's root identity and generation (local topology T01–T02, no state migration), so it is
   never copied between checkouts. A new worktree or copy of the same commit instead rebuilds from
   the shared caches:
-  - native extraction hits the fact cache (#71: "parses only files the cache has never seen");
+  - native extraction hits the fact cache for every fact *still cached* (#71: "parses only files
+    the cache has never seen");
   - every chunk's embedded text is identical, because embedded paths are relative to the root, so
-    every vector *still in the cache* is a hit. When all required entries are cached, **nothing is
-    re-embedded**.
+    every vector *still cached* is a hit.
 
-  In that case what remains is the capture's one read and hash per file, ID assembly and
-  publication, which takes seconds, plus rebuilding the lexical index. The vector cache is
-  size-capped LRU, so entries may have been evicted. An evicted chunk follows the cache-miss rule
-  below: it is pending, served lexical-only, and re-embedded in the background.
+  The fast path, where nothing is parsed or re-embedded, holds only when **both** caches still
+  hold every required entry. Then what remains is the capture's one read and hash per file, ID
+  assembly and publication, which takes seconds, plus rebuilding the lexical index. Both caches are
+  size-capped LRU, so entries may have been evicted. An evicted fact means that file is extracted
+  again as usual. An evicted vector follows the cache-miss rule below: it is pending, served
+  lexical-only, and re-embedded in the background.
 - **Cache rules follow #71.**
   - Keep size-capped LRU eviction.
+  - The key authenticates the *input*, not the stored vector. Each entry therefore also stores a
+    checksum of its vector blob, together with the `modelId`, dimension and quantization, and is
+    verified on read. An entry that fails verification counts as corrupt.
   - A missing, evicted, corrupt or unavailable entry is treated as *no vector* for that chunk.
     The chunk counts as pending in `searchIndex` (`partial` or `building`, `pendingChunks`), is
     served lexical-only until it is re-embedded, and is re-embedded in the background. Ranking can
-    therefore differ until re-embedding finishes. The guarantee is that such an entry never yields
-    a *wrong* vector, a wrong stable ID, or a response that claims complete vector coverage.
+    therefore differ until re-embedding finishes. The guarantee covers **detected** failures (a
+    missing, evicted or checksum-failing entry): such an entry never yields a wrong vector, a wrong
+    stable ID, or a response that claims complete vector coverage. Under
+    [T00](local-topology.md#threat-model), a vector deliberately rewritten together with a matching
+    checksum is out of scope.
   - Validate an entry against its key before use.
   - Never share the cache across users or machines.
 - **Invalidate on text or context, not only on the declaration body.** A chunk's generated text
@@ -153,16 +168,18 @@ every chunk below it.
 - **Search-index coverage is its own state.** The #22 evidence coverage and freshness fields
   describe evidence, not whether a background vector job has finished, and are not reused for
   that. Search responses carry a separate search-index status, for example:
-  `searchIndex: { state: "complete" | "building" | "partial" | "unavailable", indexRevision,
-  embeddedRevision, pendingChunks, modelId }`.
+  `searchIndex: { state: "complete" | "building" | "partial" | "unavailable", indexPin,
+  embeddedPin, pendingChunks, modelId }`. `indexPin` and `embeddedPin` are full
+  `{indexGeneration, indexRevision}` pairs (local topology T02), never bare revision numbers,
+  because a revision number can recur after a rebuild or recreation.
   - `building` or `partial` means some chunks at the pinned revision have no current vector.
     Those candidates can still be returned from the lexical index, marked lexical-only.
   - `unavailable` means no vectors exist, for example when no model is configured. Search then
     degrades to lexical ranking and says so.
   - A response never implies that vector coverage is complete when it isn't.
 - **Revision pinning.** The local topology already classifies "symbol search, ranked/global
-  queries" as operations that conflict when stale. Search answers are pinned to one index revision
-  and fail with a revision conflict when the pin is stale.
+  queries" as operations that conflict when stale. Search answers are pinned to one full
+  `{indexGeneration, indexRevision}` pair and fail with a revision conflict when the pin is stale.
 - **Catalog.** The first MCP release is closed at `declaration|outgoing_calls` (#17), so adding
   search is a versioned catalog extension (#24), like the later evidence views (#60).
 - **Threat model.** This falls under [T00](local-topology.md#threat-model). Repository content is
@@ -189,15 +206,16 @@ The model bake-off precedes item 2.
 
 This section records a design question that came up while planning incremental re-embedding.
 
-**How changes are tracked today.**
+**How changes are tracked.** Only capture is on `main` today; change detection and watching are
+planned.
 
-- **Capture (#64).** Each admitted file is opened, read and SHA-256-hashed exactly once per index.
+- **Capture (#64, on `main`).** Each admitted file is opened, read and SHA-256-hashed exactly once per index.
   The hash is stored with the file's size, mtime, ctime and inode.
-- **Change detection (#70, T05).** A full scan re-enumerates paths with the `ignore` walker and
+- **Change detection (#70, T05; planned, in progress).** A full scan re-enumerates paths with the `ignore` walker and
   compares each file's size, mtime, ctime and inode against the stored table. It re-reads and
   re-hashes only on a difference or an uncertain ("racily clean") timestamp. An unchanged file
   costs one `stat`.
-- **Watching (#16).** A filesystem watcher (FSEvents or inotify) marks changed paths, with periodic
+- **Watching (#16; planned).** A filesystem watcher (FSEvents or inotify) marks changed paths, with periodic
   full reconciliation as the safety net.
 
 **A Merkle tree does not speed up change detection.** It is a structure for *comparing* hashes you
