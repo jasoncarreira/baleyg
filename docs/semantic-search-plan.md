@@ -1,0 +1,170 @@
+# Semantic symbol and code search — plan
+
+Status: **proposed, not ratified**. This document is a design direction. It does not govern any
+issue, authorize implementation or a Feature Factory run, or amend the
+[semantic evidence contract](semantic-evidence/contract-v1.md), the
+[local topology](local-topology.md) or the [MCP contract](mcp-readonly-pilot-contract.md). The
+contract changes it implies (see [Contract fit](#contract-fit)) need their own review when the work
+is scheduled.
+
+## Goal
+
+Let agents and people find code by meaning — "where do we validate the pin?", "code that retries on
+SQLite BUSY" — and land on an exact, verifiable declaration. For agents this replaces the
+exploratory grep loop that usually precedes any change.
+
+Search results are **retrieval, not evidence**. A hit is a candidate to inspect, never a semantic
+fact.
+
+## What gets embedded
+
+Chunks are built during native extraction from the tree-sitter tree and the already captured
+bytes. There is no second parse and no file reread.
+
+Two document kinds:
+
+1. **Symbol cards.** A qualified name, kind, signature, doc comment and path, optionally with the
+   names of callers and callees for disambiguation. Cards match "which function does X" queries.
+2. **Code chunks.** The declaration's source, so undocumented or misleadingly named code is still
+   found.
+
+### AST chunking
+
+- The base unit is a function, method or class node, with its exact byte range.
+- An oversized body (over a token budget of roughly 512–1024) is split recursively along its
+  child nodes (statements, blocks, inner functions), then small adjacent pieces are merged back up
+  to the budget. Chunks stay syntactically whole; a loop is never cut in half.
+- Every chunk carries a breadcrumb header, for example
+  `src/store.rs › impl Store › fn declarations_for_anchor(...)`, so a fragment is meaningful on its
+  own.
+- A class summary chunk holds the class signature plus member signatures, without bodies. A file
+  chunk holds the imports and top-level statements.
+
+### Trivial declarations
+
+Getters, setters, pure delegations, empty or default constructors and derived or generated members
+get **no code-chunk vector**. Their bodies look alike in embedding space and crowd real hits out of
+the top-k. They remain findable: their signatures are in the class summary chunk and their names
+are in the lexical index.
+
+Triviality is scored from the syntax tree: statement and node counts, branch count, and
+recognizable shapes. Those shapes are a single `return` of a field, parameter or constant; a single
+field assignment; a single call that forwards its arguments; an empty or `super(...)` body; and a
+`#[derive]`-style or generated member. The threshold is tuned by measuring recall@k with and
+without the filter, not guessed.
+
+### Metadata
+
+| Embedded in the chunk text | Stored beside the vector |
+| --- | --- |
+| File path | Line and column range, derived from the byte range at the pinned revision |
+| AST breadcrumb and node kind | Byte range, stable declaration ID, revision, content hash |
+| Signature and language | Ancestor IDs, depth, sibling ordinal |
+| Optionally: imports used, caller and callee names | Flags: test or production, visibility, `async`, generated or vendored |
+
+Line numbers and ordinals are never embedded. They carry no meaning, and embedding them would break
+the cache: one line added at the top of a file would change the text, and so the content hash, of
+every chunk below it.
+
+## Model
+
+- **Local by default.** Code never leaves the machine. A small code-capable embedding model runs
+  in-process via ONNX Runtime or candle, using Metal on the reference host. Candidates are
+  jina-embeddings-v2-base-code, nomic-embed-code and Qwen3-Embedding-0.6B. Choose one with a
+  bake-off on real queries against this and other repositories.
+- A remote embedding API is available only as an explicit opt-in.
+- The model is **pinned like a producer**: its name, version and weight hash are recorded, so
+  vectors are reproducible and tied to the revision that produced them.
+
+## Storage and ranking
+
+- Vectors are stored as int8-quantized blobs in SQLite, next to the index. A brute-force cosine
+  scan is enough at first: 100k chunks × 768 dimensions is about 77 MB and takes milliseconds.
+  Add an ANN index (for example `sqlite-vec` or HNSW) only if large repositories need it.
+- **Hybrid ranking.** Vector similarity is fused with SQLite FTS5/BM25 over identifiers split at
+  camelCase and snake_case. On code, exact identifier matches matter, and hybrid retrieval
+  outperforms pure embeddings.
+- **Filters:** language, path prefix, node kind, and excluding tests or generated code.
+- **Boosts:** the same module as the caller's current file, public over private, production over
+  test code.
+
+## Incremental updates
+
+- The cache is keyed by a hash of the embedded text and is path-neutral, like the native fact
+  cache (#71). A `git mv` or an unchanged declaration is never re-embedded.
+- Only chunks from changed declarations are re-embedded, driven by the incremental publication
+  deltas (#67).
+- Embedding runs as a **background job after publication** and never delays the index. Until it
+  completes, search reports partial embedding coverage through the existing coverage and freshness
+  fields instead of silently returning incomplete results.
+
+## Contract fit
+
+- **Retrieval, not evidence.** A future `search_symbols(query, k, filters)` MCP tool returns stable
+  declaration IDs with scores, byte and line ranges and breadcrumbs, labeled as retrieval. Agents
+  verify through the exact `declaration` and `outgoing_calls` views. Nothing inferred by similarity
+  becomes a #22 semantic record.
+- **Revision pinning.** The local topology already classifies "symbol search, ranked/global
+  queries" as operations that conflict when stale. Search answers are pinned to one index revision
+  and fail with a revision conflict when the pin is stale.
+- **Catalog.** The first MCP release is closed at `declaration|outgoing_calls` (#17), so adding
+  search is a versioned catalog extension (#24), like the later evidence views (#60).
+- **Threat model.** This falls under [T00](local-topology.md#threat-model). Repository content is
+  untrusted input to chunking and embedding, which must stay bounded. Deliberate same-user edits to
+  stored vectors are out of scope.
+
+## Sequencing
+
+- After #67 (the durable queue and incremental publication), so updates are incremental from the
+  start.
+- Independent of #58 (SCIP import): chunks and cards come from the native syntax tier.
+- Ideally in place before the planned agent benchmark (with and without Baleyg). Exploration is
+  where agents spend most of their search calls.
+
+A likely split when scheduled:
+
+1. Chunking, triviality scoring and metadata.
+2. The embedding job, cache and vector storage, with hybrid ranking.
+3. The `search_symbols` MCP catalog extension.
+
+The model bake-off precedes item 2.
+
+## Note: file change tracking and Merkle trees
+
+This section records a design question that came up while planning incremental re-embedding.
+
+**How changes are tracked today.**
+
+- **Capture (#64).** Each admitted file is opened, read and SHA-256-hashed exactly once per index.
+  The hash is stored with the file's size, mtime, ctime and inode.
+- **Change detection (#70, T05).** A full scan re-enumerates paths with the `ignore` walker and
+  compares each file's size, mtime, ctime and inode against the stored table. It re-reads and
+  re-hashes only on a difference or an uncertain ("racily clean") timestamp. An unchanged file
+  costs one `stat`.
+- **Watching (#16).** A filesystem watcher (FSEvents or inotify) marks changed paths, with periodic
+  full reconciliation as the safety net.
+
+**A Merkle tree does not speed up change detection.** It is a structure for *comparing* hashes you
+already have. Keeping its root current still requires the per-file stat and hash work above,
+plus hashing up the directory levels. The effective speedups for detection are:
+
+1. the watcher, whose work scales with changed files rather than total files;
+2. optionally, a directory-listing cache keyed by directory mtime, which avoids re-enumerating
+   unchanged directories (the `ignore` walk is the costly part of a scan, not the stats). This is
+   like git's untracked cache. Content edits don't change a directory's mtime, so files are still
+   stat'ed.
+
+For scale, stat'ing 10k files on APFS takes tens of milliseconds, and 100k takes a few hundred.
+
+**Where a Merkle tree does help: comparing snapshots.** A Merkle tree over the file hashes
+*captured at each indexed revision* is cheap to build, because capture already computes every leaf.
+It would provide:
+
+- revision-to-revision diffs in O(changed × depth) rather than O(files), useful for #67 deltas
+  and for deciding which chunks to re-embed;
+- a single fingerprint for "is this the same tree?";
+- reuse across worktrees, where identical subtrees have identical hashes. This complements the
+  per-file content cache (#71).
+
+It is optional and separate from change detection. Add it only if delta computation or
+re-embedding shows a need.
