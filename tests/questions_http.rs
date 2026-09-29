@@ -743,7 +743,7 @@ async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
             StatusCode::SERVICE_UNAVAILABLE,
             "{action}: {result}"
         );
-        assert_eq!(result["error"]["code"], "incompatible_index");
+        assert_eq!(result["error"]["code"], "index_not_ready");
         assert!(!result.to_string().contains("function seed"));
     }
 }
