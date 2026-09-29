@@ -1089,17 +1089,26 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     assert_eq!(closed["error"]["code"], "index_not_ready");
     assert!(!closed.to_string().contains("forged.java"));
 
-    // A graph row with no selected native document is an independent typed
-    // corruption. Its first selected refusal closes this app for every path.
+    // A coherent graph-only row with no selected native document is an
+    // independent typed corruption. Its first refusal closes every app path.
     let (missing_dir, _missing_store, _graph, missing_app) = fixture();
     let missing_db = rusqlite::Connection::open(index_db(&missing_dir)).unwrap();
     assert_eq!(
         missing_db
-            .execute("DELETE FROM native_documents WHERE path='A.java'", [])
+            .execute(
+                "INSERT INTO files(path,hash,payload,capture_stat) SELECT 'orphan.java',hash,json_set(payload,'$.path','orphan.java'),capture_stat FROM files WHERE path='B.java'",
+                [],
+            )
             .unwrap(),
         1
     );
-    let (status, missing) = call(&missing_app, source("A.java", 3, &missing_dir)).await;
+    let fk_count: i64 = missing_db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_count, 0);
+    let (status, missing) = call(&missing_app, source("orphan.java", 1, &missing_dir)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{missing}");
     assert_eq!(missing["error"]["code"], "incompatible_index");
     assert!(missing.get("targets").is_none());
