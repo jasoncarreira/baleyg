@@ -10,7 +10,7 @@ use crate::{
     planning::{
         self, FocusedView, QuestionPacket, QuestionPreview, QuestionRequest, SelectionEnvelope,
     },
-    store::Store,
+    store::{EvidenceFence, Store},
 };
 use anyhow::Context;
 use axum::{
@@ -55,7 +55,7 @@ struct Jobs {
 const MAX_PACKETS: usize = 8;
 const MAX_PACKET_BYTES: usize = 1024 * 1024;
 const MAX_CACHE_BYTES: usize = 8 * MAX_PACKET_BYTES;
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PacketCache {
     packets: VecDeque<(Arc<QuestionPacket>, usize)>,
     bytes: usize,
@@ -74,6 +74,22 @@ impl PacketCache {
         }
         self.bytes += bytes;
         self.packets.push_back((packet, bytes));
+    }
+    // The final fence runs after admission while this mutex is held. A failed
+    // response cannot evict an earlier packet or replace its same-ID entry.
+    fn remember_fenced(
+        &mut self,
+        packet: Arc<QuestionPacket>,
+        bytes: usize,
+        finish: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let prior = self.clone();
+        self.remember(packet, bytes);
+        if let Err(error) = finish() {
+            *self = prior;
+            return Err(error);
+        }
+        Ok(())
     }
 }
 struct DependencyIndex {
@@ -108,6 +124,10 @@ pub struct DaemonState {
     rust_sources: Vec<crate::rust_sources::Root>,
     dependency_options: Option<CatalogOptions>,
     dependencies: Mutex<DependencyIndex>,
+    #[cfg(test)]
+    dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
@@ -226,6 +246,10 @@ pub fn new_with_dependency_options(
             catalog: None,
             warnings: Vec::new(),
         }),
+        #[cfg(test)]
+        dependency_capture_hook: Mutex::new(None),
+        #[cfg(test)]
+        outer_fence_hook: Mutex::new(None),
         dependency_options: catalog_options,
         token,
         hosts,
@@ -734,8 +758,72 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         )
         .fallback(|| async { missing().into_response() })
         .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            evidence_response_guard,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+// Only endpoints that include a native snapshot need this outer response fence.
+// Durable records and external-source-only routes keep their independent policy.
+fn native_response_route(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/status"
+            | "/api/tree"
+            | "/api/files"
+            | "/api/methods"
+            | "/api/sequence"
+            | "/api/classes"
+            | "/api/class-diagram"
+            | "/api/navigation"
+            | "/api/symbols"
+            | "/api/symbol"
+            | "/api/source"
+            | "/api/query"
+            | "/api/dependencies"
+            | "/api/dependencies/symbols"
+            | "/api/dependencies/source"
+            | "/api/rust-sources/tree"
+    )
+}
+async fn evidence_response_guard(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !native_response_route(request.uri().path()) {
+        return next.run(request).await;
+    }
+    // The snapshot is short: retain only its protected leader observation and
+    // full pin while the handler assembles/serializes the complete HTTP body.
+    let admitted = db(state.clone(), |store| {
+        let snapshot = store.evidence_response()?;
+        let pin = snapshot.status()?.revision;
+        Ok(snapshot.into_fence(pin))
+    })
+    .await;
+    let response = next.run(request).await;
+    if !response.status().is_success() {
+        // Preserve validation/materialization error precedence, but still check T03.
+        if let Ok(fence) = admitted {
+            let _ = fence.finish(());
+        }
+        return response;
+    }
+    let fence = match admitted {
+        Ok(fence) => fence,
+        Err(error) => return error.into_response(),
+    };
+    #[cfg(test)]
+    if let Some(hook) = state.outer_fence_hook.lock().unwrap().as_ref() {
+        hook();
+    }
+    match fence.finish(response) {
+        Ok(response) => response,
+        Err(error) => ApiError::from(error).into_response(),
+    }
 }
 fn dependency_stale() -> ApiError {
     ApiError(
@@ -770,27 +858,42 @@ impl DaemonState {
         Ok(())
     }
 }
-async fn dependency_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
-    dependency_work(move || {
-        let revision = s.store.status()?.revision;
-        let (state, catalog, mut warnings) = {
-            let index = s.dependencies.lock().unwrap();
-            (index.state, index.catalog.clone(), index.warnings.clone())
-        };
-        if let Some(catalog) = catalog {
-            if catalog.workspace_revision == revision {
-                return Ok(Json(json!({"state":state,"workspaceRevision":revision,
-                    "catalogId":catalog.id,"packages":catalog.packages,
-                    "symbolCount":catalog.symbols.len(),"warnings":catalog.warnings})));
-            }
+async fn dependency_status(State(s): State<Arc<DaemonState>>) -> Result<Response, ApiError> {
+    dependency_work(move || dependency_status_response(&s, || {}).map_err(ApiError::from)).await
+}
+fn dependency_status_response(
+    s: &DaemonState,
+    after_capture: impl FnOnce(),
+) -> anyhow::Result<Response> {
+    let response = s.store.evidence_response()?;
+    let revision = response.status()?.revision;
+    after_capture();
+    #[cfg(test)]
+    if let Some(hook) = s.dependency_capture_hook.lock().unwrap().as_ref() {
+        hook();
+    }
+    let (state, catalog, mut warnings) = {
+        let index = s.dependencies.lock().unwrap();
+        (index.state, index.catalog.clone(), index.warnings.clone())
+    };
+    let payload = if let Some(catalog) = catalog {
+        if catalog.workspace_revision == revision {
+            json!({"state":state,"workspaceRevision":revision,
+                "catalogId":catalog.id,"packages":catalog.packages,
+                "symbolCount":catalog.symbols.len(),"warnings":catalog.warnings})
+        } else {
             warnings.push("Workspace changed; refresh the dependency catalog".into());
-            return Ok(Json(json!({"state":"failed","workspaceRevision":revision,
-                "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})));
+            json!({"state":"failed","workspaceRevision":revision,
+                "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
         }
-        Ok(Json(json!({"state":state,"workspaceRevision":revision,
-            "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})))
-    })
-    .await
+    } else {
+        json!({"state":state,"workspaceRevision":revision,
+            "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
+    };
+    // IntoResponse serializes the owned JSON before the final T03 check. No
+    // evidence body can escape on a failed fence, including the failed-catalog branch.
+    let result = Json(payload).into_response();
+    response.finish(result)
 }
 async fn dependency_refresh(
     State(s): State<Arc<DaemonState>>,
@@ -1695,12 +1798,12 @@ async fn question_work<T: Send + 'static>(
 async fn question_preview(
     State(s): State<Arc<DaemonState>>,
     body: Result<Json<QuestionRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<QuestionPreview>, ApiError> {
+) -> Result<Response, ApiError> {
     let Json(request) = body.map_err(|_| invalid())?;
     request.validate().map_err(|_| invalid())?;
-    let worker = s.clone();
-    let (result, cached, bytes) = question_work(move || {
-        let packet = planning::prepare(&worker.store, request)?;
+    question_work(move || {
+        let response = s.store.evidence_response()?;
+        let packet = planning::prepare_in(&response, request)?;
         let selection = planning::preview(&packet)?;
         let view = planning::assemble(&packet, &selection, "localPreview")?;
         let bytes = serde_json::to_vec(&packet)?.len();
@@ -1709,24 +1812,28 @@ async fn question_preview(
             "complete question packet exceeds 1 MiB"
         );
         let cached = Arc::new(packet.clone());
-        Ok((
-            QuestionPreview {
-                packet,
-                selection,
-                view,
-            },
-            cached,
-            bytes,
-        ))
+        let result = Json(QuestionPreview {
+            packet,
+            selection,
+            view,
+        })
+        .into_response();
+        // Admission to the cache is part of response assembly, before the final fence.
+        s.packets
+            .lock()
+            .unwrap()
+            .remember_fenced(cached, bytes, || response.finish(()))?;
+        Ok(result)
     })
-    .await?;
-    // Only complete successful previews enter the cache. No mutex spans an await.
-    s.packets.lock().unwrap().remember(cached, bytes);
-    Ok(Json(result))
+    .await
 }
-async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPacket>, ApiError> {
+async fn cached_packet(
+    s: Arc<DaemonState>,
+    id: String,
+) -> Result<(Arc<QuestionPacket>, EvidenceFence), ApiError> {
     // Gate readiness before touching cached evidence, including stale packets.
-    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await?;
+    let response = s.store.evidence_response()?;
+    let revision = response.status()?.revision;
     let packet = {
         let cache = s.packets.lock().unwrap();
         cache
@@ -1747,20 +1854,34 @@ async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPa
     // selected graph and source witnesses under one pinned SQLite snapshot
     // before exporting, displaying, or sending cached evidence to a provider.
     let witness = packet.clone();
-    db(s, move |store| {
-        store.validate_selected_view(&witness.context, &witness.source_files)
-    })
-    .await?;
-    Ok(packet)
+    response.validate_selected_view(&witness.context, &witness.source_files)?;
+    let fence = response.into_fence(packet.revision);
+    Ok((packet, fence))
+}
+// Always run the post-materialization fence, even when assembly fails. Preserve
+// the original materialization error, as Store::with_evidence does.
+fn finish_packet_result(
+    fence: &EvidenceFence,
+    result: Result<Response, ApiError>,
+) -> Result<Response, ApiError> {
+    let checked = fence.finish(()).map_err(ApiError::from);
+    match result {
+        Err(error) => Err(error),
+        Ok(response) => {
+            checked?;
+            Ok(response)
+        }
+    }
 }
 async fn question_export(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let packet = cached_packet(s, id).await?;
-    Ok(Json(
-        question_work(move || jev::request_for(&packet)).await?,
-    ))
+) -> Result<Response, ApiError> {
+    let (packet, fence) = cached_packet(s, id).await?;
+    let result = question_work(move || jev::request_for(&packet))
+        .await
+        .map(|value| Json(value).into_response());
+    finish_packet_result(&fence, result)
 }
 #[derive(Serialize)]
 struct QuestionSelection {
@@ -1771,32 +1892,32 @@ async fn question_import(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Json(response): Json<Value>,
-) -> Result<Json<QuestionSelection>, ApiError> {
-    let packet = cached_packet(s, id).await?;
-    Ok(Json(
-        question_work(move || {
-            let selection = jev::parse_response(&packet, &response)?;
-            let warnings = jev::response_warnings(&response);
-            let mut view = planning::assemble(&packet, &selection, "importedJev")?;
-            view.warnings.extend(warnings);
-            Ok(QuestionSelection { selection, view })
-        })
-        .await?,
-    ))
+) -> Result<Response, ApiError> {
+    let (packet, fence) = cached_packet(s, id).await?;
+    let result = question_work(move || {
+        let selection = jev::parse_response(&packet, &response)?;
+        let warnings = jev::response_warnings(&response);
+        let mut view = planning::assemble(&packet, &selection, "importedJev")?;
+        view.warnings.extend(warnings);
+        Ok(QuestionSelection { selection, view })
+    })
+    .await
+    .map(|value| Json(value).into_response());
+    finish_packet_result(&fence, result)
 }
 async fn question_selection(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Json(selection): Json<SelectionEnvelope>,
-) -> Result<Json<QuestionSelection>, ApiError> {
-    let packet = cached_packet(s, id).await?;
-    Ok(Json(
-        question_work(move || {
-            let view = planning::assemble(&packet, &selection, "manual")?;
-            Ok(QuestionSelection { selection, view })
-        })
-        .await?,
-    ))
+) -> Result<Response, ApiError> {
+    let (packet, fence) = cached_packet(s, id).await?;
+    let result = question_work(move || {
+        let view = planning::assemble(&packet, &selection, "manual")?;
+        Ok(QuestionSelection { selection, view })
+    })
+    .await
+    .map(|value| Json(value).into_response());
+    finish_packet_result(&fence, result)
 }
 
 // Status only reads the local ledger. No endpoint other than jev-run contacts Jev.
@@ -1853,7 +1974,7 @@ async fn question_answer(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     // Accept only an empty object: never take client prompts, sources or provider overrides.
     let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
     if !request.as_object().is_some_and(|object| object.is_empty()) {
@@ -1865,10 +1986,13 @@ async fn question_answer(
         "acp_disabled",
         "Live ACP is disabled",
     ))?;
-    let packet = cached_packet(s.clone(), id).await?;
+    let (packet, fence) = cached_packet(s.clone(), id).await?;
     let response = provider.run(&packet).await;
     // A stale failure must not replace the state of a newer question either.
-    let revision = db(s, |store| Ok(store.status()?.revision)).await?;
+    let revision = db(s, |store| Ok(store.status()?.revision)).await;
+    let fence_check = fence.finish(()).map_err(ApiError::from);
+    let revision = revision?;
+    fence_check?;
     if revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1876,12 +2000,15 @@ async fn question_answer(
             "The index revision changed",
         ));
     }
-    let response = response.map_err(acp_error)?;
-    Ok(Json(
-        json!({"packetId":packet.packet_id,"revision":packet.revision,
-        "source":"liveAcp","attemptId":response.attempt_id,"answer":response.answer,
-        "latencyMs":response.latency_ms,"estimatedUsd":response.estimated_usd}),
-    ))
+    let result = response.map_err(acp_error).map(|response| {
+        Json(
+            json!({"packetId":packet.packet_id,"revision":packet.revision,
+            "source":"liveAcp","attemptId":response.attempt_id,"answer":response.answer,
+            "latencyMs":response.latency_ms,"estimatedUsd":response.estimated_usd}),
+        )
+        .into_response()
+    });
+    finish_packet_result(&fence, result)
 }
 
 async fn jev_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
@@ -1936,7 +2063,7 @@ async fn question_run(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     // No caller-supplied source, credentials, URL, or budget overrides.
     if !body.is_empty() && body.as_ref() != b"{}" {
         return Err(invalid());
@@ -1947,10 +2074,13 @@ async fn question_run(
         "jev_disabled",
         "Live Jev is disabled",
     ))?;
-    let packet = cached_packet(s.clone(), id).await?;
+    let (packet, fence) = cached_packet(s.clone(), id).await?;
     let response = provider.run(&packet).await;
     // Check even failed attempts. Reservations remain accounted on stale results.
-    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await?;
+    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await;
+    let fence_check = fence.finish(()).map_err(ApiError::from);
+    let revision = revision?;
+    fence_check?;
     if revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1958,14 +2088,23 @@ async fn question_run(
             "The index revision changed",
         ));
     }
-    let response = response.map_err(live_jev_error)?;
-    let selection = response.selection.clone();
-    let mut view =
-        question_work(move || planning::assemble(&packet, &selection, "liveJev")).await?;
-    view.warnings.extend(response.warnings.clone());
-    Ok(Json(json!({"selection":response.selection,"view":view,
-        "attemptId":response.attempt_id,"latencyMs":response.latency_ms,
-        "estimatedUsd":response.estimated_usd,"usage":response.usage,"warnings":response.warnings})))
+    let result = match response.map_err(live_jev_error) {
+        Err(error) => Err(error),
+        Ok(response) => {
+            let selection = response.selection.clone();
+            question_work(move || planning::assemble(&packet, &selection, "liveJev"))
+                .await
+                .map(|mut view| {
+                    view.warnings.extend(response.warnings.clone());
+                    Json(json!({"selection":response.selection,"view":view,
+                        "attemptId":response.attempt_id,"latencyMs":response.latency_ms,
+                        "estimatedUsd":response.estimated_usd,"usage":response.usage,
+                        "warnings":response.warnings}))
+                    .into_response()
+                })
+        }
+    };
+    finish_packet_result(&fence, result)
 }
 
 #[cfg(test)]
@@ -1974,6 +2113,39 @@ mod live_tests {
     use crate::indexer::index_workspace_bundle;
     use tower::ServiceExt;
 
+    #[test]
+    fn outer_http_fence_covers_native_composition_not_durable_payloads() {
+        for path in [
+            "/api/status",
+            "/api/tree",
+            "/api/files",
+            "/api/methods",
+            "/api/sequence",
+            "/api/classes",
+            "/api/class-diagram",
+            "/api/navigation",
+            "/api/symbols",
+            "/api/symbol",
+            "/api/source",
+            "/api/query",
+            "/api/dependencies",
+            "/api/dependencies/symbols",
+            "/api/dependencies/source",
+            "/api/rust-sources/tree",
+        ] {
+            assert!(native_response_route(path), "{path}");
+        }
+        for path in [
+            "/api/views",
+            "/api/views/saved",
+            "/api/annotations",
+            "/api/rust-sources/file",
+            "/api/healthz",
+            "/api/jobs/current",
+        ] {
+            assert!(!native_response_route(path), "{path}");
+        }
+    }
     #[test]
     fn acp_controlled_errors_are_exact_and_sanitized() {
         for (message, code) in [
@@ -1994,6 +2166,11 @@ mod live_tests {
     #[tokio::test]
     async fn live_response_is_rejected_if_snapshot_changes_during_call() {
         mock_run(true, "success").await;
+    }
+
+    #[tokio::test]
+    async fn packet_fence_survives_provider_await_and_takeover() {
+        mock_run(false, "takeover").await;
     }
 
     #[tokio::test]
@@ -2221,16 +2398,48 @@ mod live_tests {
             )
             .unwrap();
             let expected = store.status().unwrap().revision;
-            store
-                .publish_native(
+            let publisher = store.clone();
+            let owner = session.clone();
+            let publishing = tokio::task::spawn_blocking(move || {
+                publisher.publish_native(
                     &updated,
                     &captured,
                     &native,
-                    session.leader_guard().unwrap(),
+                    owner.leader_guard().unwrap(),
                     expected,
                     &cancel,
                 )
+            });
+            // The provider is still blocked. This commit must not wait for a
+            // SQLite read transaction held by the cached packet's outer fence.
+            tokio::time::timeout(std::time::Duration::from_secs(5), publishing)
+                .await
+                .unwrap()
+                .unwrap()
                 .unwrap();
+        }
+        if scenario == "takeover" {
+            use std::io::{Seek, SeekFrom, Write};
+            fn lock_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+                for entry in std::fs::read_dir(dir).ok()?.flatten() {
+                    let path = entry.path();
+                    if path.file_name().is_some_and(|name| name == "leader.lock") {
+                        return Some(path);
+                    }
+                    if path.is_dir()
+                        && let Some(found) = lock_in(&path)
+                    {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            let lock = lock_in(&dir.path().join("state")).unwrap();
+            let mut file = std::fs::OpenOptions::new().write(true).open(lock).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
         }
         release.notify_one();
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), run)
@@ -2240,6 +2449,15 @@ mod live_tests {
             .unwrap();
         if change_snapshot {
             assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("liveJev"));
+        } else if scenario == "takeover" {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "index_not_ready");
+            assert!(body.get("view").is_none());
         } else if scenario == "invalid_selection" {
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -2302,6 +2520,138 @@ mod dependency_lifecycle_tests {
             warnings: vec![],
             sources: Default::default(),
         }
+    }
+    #[tokio::test]
+    async fn dependency_status_whole_response_fence() {
+        use std::io::{Seek, SeekFrom, Write};
+        fn find_lock(path: &std::path::Path) -> Option<std::path::PathBuf> {
+            for entry in std::fs::read_dir(path).ok()?.flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "leader.lock") {
+                    return Some(path);
+                }
+                if path.is_dir()
+                    && let Some(found) = find_lock(&path)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        async fn call(app: &Router, path: &str) -> (StatusCode, Value) {
+            use tower::ServiceExt;
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .header("host", "127.0.0.1:7331")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let body =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            (status, body)
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(workspace.clone());
+        let (graph, native, capture) =
+            crate::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        let session = store.leader_session().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let state = new(
+            store,
+            options,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(session);
+        {
+            let mut deps = state.dependencies.lock().unwrap();
+            deps.state = "ready";
+            deps.catalog = Some(Arc::new(catalog("matching", pin)));
+        }
+        let app = router(state.clone());
+        let (valid_status, valid) = call(&app, "/api/dependencies").await;
+        assert_eq!(valid_status, StatusCode::OK);
+        assert_eq!(valid["workspaceRevision"], json!(pin));
+        assert_eq!(valid["catalogId"], "matching");
+        let mismatched = IndexPin {
+            index_revision: pin.index_revision + 1,
+            ..pin
+        };
+        state.dependencies.lock().unwrap().catalog = Some(Arc::new(catalog("old", mismatched)));
+        let (failed_status, failed) = call(&app, "/api/dependencies").await;
+        assert_eq!(failed_status, StatusCode::OK);
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(failed["catalogId"], Value::Null);
+        assert_eq!(failed["packages"], json!([]));
+        assert_eq!(failed["symbolCount"], 0);
+        assert_eq!(
+            failed["warnings"],
+            json!(["Workspace changed; refresh the dependency catalog"])
+        );
+        let lock = find_lock(&temp.path().join("state")).unwrap();
+        let (browse_status, browse) = call(&app, "/api/files").await;
+        assert_eq!(browse_status, StatusCode::OK);
+        assert_eq!(browse["revision"], json!(pin));
+        let hook_lock = lock.clone();
+        *state.outer_fence_hook.lock().unwrap() = Some(Arc::new(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&hook_lock)
+                .unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
+        }));
+        let (browse_status, browse) = call(&app, "/api/files").await;
+        assert_eq!(browse_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(browse["error"]["code"], "index_not_ready");
+        assert!(browse.get("revision").is_none());
+        assert!(browse.get("files").is_none());
+        *state.outer_fence_hook.lock().unwrap() = None;
+        let incarnation = state
+            .retained_serving_session()
+            .unwrap()
+            .leader_guard()
+            .unwrap()
+            .incarnation;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(incarnation.to_string().as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        *state.dependency_capture_hook.lock().unwrap() = Some(Arc::new(move || {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
+        }));
+        let (refused_status, refused) = call(&app, "/api/dependencies").await;
+        assert_eq!(refused_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused["error"]["code"], "index_not_ready");
+        assert!(refused.get("workspaceRevision").is_none());
+        assert!(refused.get("catalogId").is_none());
     }
     #[test]
     fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {
@@ -2409,6 +2759,92 @@ mod rebaseline_packet_cache_tests {
     use super::*;
     use crate::indexer::index_workspace_bundle;
     use std::{fs, sync::atomic::AtomicBool};
+
+    #[test]
+    fn preview_fence_failure_restores_evicted_and_same_id_packets() {
+        let revision = IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: 1,
+        };
+        let packet = QuestionPacket {
+            packet_id: "original".into(),
+            revision,
+            request: QuestionRequest {
+                seed: "seed".into(),
+                question: "what?".into(),
+                expected_revision: revision,
+                evidence_depth: 0,
+                max_visible: 1,
+                allow_deeper_display: false,
+                focus_terms: vec![],
+            },
+            context: ViewResult {
+                revision,
+                query: ViewQuery {
+                    seed: "seed".into(),
+                    depth: 0,
+                    max_nodes: 1,
+                    max_calls: 1,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                nodes: vec![],
+                calls: vec![],
+                regions: vec![],
+                truncated: false,
+                omitted_nodes: 0,
+                warnings: vec![],
+            },
+            source_files: vec![],
+            warnings: vec![],
+        };
+        let mut cache = PacketCache::default();
+        for i in 0..MAX_PACKETS {
+            let mut item = packet.clone();
+            item.packet_id = format!("packet-{i}");
+            cache.remember(Arc::new(item), MAX_PACKET_BYTES);
+        }
+        let original: Vec<_> = cache
+            .packets
+            .iter()
+            .map(|(p, bytes)| (p.clone(), *bytes))
+            .collect();
+        let original_bytes = cache.bytes;
+        let mut incoming = packet.clone();
+        incoming.packet_id = "new".into();
+        let failed = cache.remember_fenced(Arc::new(incoming), MAX_PACKET_BYTES, || {
+            anyhow::bail!("index_not_ready: incarnation lost")
+        });
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .starts_with("index_not_ready")
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+        let mut replacement = packet;
+        replacement.packet_id = "packet-3".into();
+        assert!(
+            cache
+                .remember_fenced(
+                    Arc::new(replacement),
+                    MAX_PACKET_BYTES + 1,
+                    || anyhow::bail!("root_changed: root replaced")
+                )
+                .is_err()
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+    }
 
     #[test]
     fn failed_known_old_commit_keeps_private_packet_cache_success_clears_it() {

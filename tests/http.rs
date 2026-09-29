@@ -235,6 +235,36 @@ async fn source_is_snapshot_and_revision_checked() {
     );
 }
 #[tokio::test]
+async fn dependency_status_whole_response_fence() {
+    let (dir, store, state, app) = setup();
+    std::fs::write(dir.path().join("workspace/a.js"), "function go() {}\n").unwrap();
+    let options = IndexOptions::new(dir.path().join("workspace"));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) =
+        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+            .unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            state
+                .retained_serving_session()
+                .unwrap()
+                .leader_guard()
+                .unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let (code, result) = call(&app, "GET", "/api/dependencies", Value::Null).await;
+    assert_eq!(code, StatusCode::OK, "{result}");
+    assert_eq!(result["workspaceRevision"], json!(pin));
+    assert_eq!(result["catalogId"], Value::Null);
+    assert_eq!(result["packages"], json!([]));
+    assert_eq!(result["symbolCount"], 0);
+}
+#[tokio::test]
 async fn jobs_publish_and_cancel() {
     let (_d, store, state, app) = setup();
     let (code, job) = call(&app, "POST", "/api/index", json!({})).await;
