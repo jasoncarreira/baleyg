@@ -30,6 +30,59 @@ enum RecoveryDisposition {
     Rebuild = 1,
     RecreatePending = 2,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataColumn {
+    SchemaVersion,
+    ExtractorVersion,
+    IndexGeneration,
+    IndexRevision,
+}
+impl MetadataColumn {
+    fn sql(self) -> (&'static str, &'static str, &'static str, &'static [u8]) {
+        match self {
+            Self::SchemaVersion => ("SELECT typeof(schema_version) FROM index_metadata WHERE singleton=1", "SELECT schema_version FROM index_metadata WHERE singleton=1", "schema_version", b"schema_version"),
+            Self::ExtractorVersion => ("SELECT typeof(extractor_version) FROM index_metadata WHERE singleton=1", "SELECT extractor_version FROM index_metadata WHERE singleton=1", "extractor_version", b"extractor_version"),
+            Self::IndexGeneration => ("SELECT typeof(index_generation) FROM index_metadata WHERE singleton=1", "SELECT index_generation FROM index_metadata WHERE singleton=1", "index_generation", b"index_generation"),
+            Self::IndexRevision => ("SELECT typeof(index_revision) FROM index_metadata WHERE singleton=1", "SELECT index_revision FROM index_metadata WHERE singleton=1", "index_revision", b"index_revision"),
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MetadataAtom {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Streamed {
+        column: MetadataColumn,
+        text: bool,
+        byte_length: usize,
+        sha256: [u8; 32],
+    },
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveryWitness {
+    pragma_schema: u32,
+    schema_version: MetadataAtom,
+    extractor_version: MetadataAtom,
+    index_generation: MetadataAtom,
+    index_revision: MetadataAtom,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryBaseline {
+    witness: RecoveryWitness,
+    pin: Option<IndexPin>,
+    compatible: bool,
+}
+impl RecoveryBaseline {
+    pub(crate) fn pin(&self) -> Option<IndexPin> {
+        self.pin
+    }
+}
+#[derive(Clone, Debug)]
+enum ExpectedPublication {
+    Pin(IndexPin),
+    Recovery(RecoveryBaseline),
+}
 #[derive(Debug)]
 struct ExceptionalIndexFormat;
 impl std::fmt::Display for ExceptionalIndexFormat {
@@ -1700,7 +1753,7 @@ impl Store {
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         before_write(&db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let (_, compatible) = self.recovery_baseline(&tx)?;
+        let compatible = self.recovery_baseline(&tx)?.compatible;
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
@@ -1862,33 +1915,190 @@ impl Store {
         Ok(())
     }
 
-    fn recovery_baseline(&self, db: &Connection) -> Result<(IndexPin, bool)> {
-        validate_cache_shape(db)?;
-        let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        let row: (i64, String, String, String, String, String, i64) = db.query_row(
-            "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision FROM index_metadata WHERE singleton=1",
+    fn verify_metadata_root(&self, db: &Connection) -> Result<()> {
+        let (count, typed): (i64, bool) = db.query_row(
+            "SELECT count(*),coalesce(min(singleton=1 AND typeof(root_spelling)='text' AND typeof(root_device)='text' AND typeof(root_inode)='text'),0) FROM index_metadata",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         ensure!(
-            row.0 == i64::from(schema),
-            "incompatible_index: schema and metadata mismatch"
+            count == 1 && typed,
+            "root_key_collision: index root identity is not a typed singleton"
         );
-        ensure!(
-            row.2 == self.workspace_root,
-            "root_key_collision: index belongs to a different spelling"
+        let device = self.identity.device.to_string();
+        let inode = self.identity.inode.to_string();
+        for (column, expected, mismatch) in [
+            (
+                "root_spelling",
+                self.workspace_root.as_bytes(),
+                "root_key_collision: index belongs to a different spelling",
+            ),
+            (
+                "root_device",
+                device.as_bytes(),
+                "root_changed: index root identity mismatch",
+            ),
+            (
+                "root_inode",
+                inode.as_bytes(),
+                "root_changed: index root identity mismatch",
+            ),
+        ] {
+            let blob = db.blob_open(
+                rusqlite::DatabaseName::Main,
+                "index_metadata",
+                column,
+                1,
+                true,
+            )?;
+            ensure!(blob.len() == expected.len(), "{mismatch}");
+            for (offset, chunk) in expected.chunks(64 * 1024).enumerate() {
+                let offset = offset
+                    .checked_mul(64 * 1024)
+                    .context("root identity offset overflow")?;
+                let mut actual = vec![0; chunk.len()];
+                blob.read_at_exact(&mut actual, offset)?;
+                ensure!(actual == chunk, "{mismatch}");
+            }
+            blob.close()?;
+        }
+        Ok(())
+    }
+
+    fn metadata_atom(&self, db: &Connection, column: MetadataColumn) -> Result<MetadataAtom> {
+        use rusqlite::types::ValueRef;
+        use sha2::{Digest, Sha256};
+        let (type_sql, value_sql, column_name, tag) = column.sql();
+        let storage: String = db.query_row(type_sql, [], |row| row.get(0))?;
+        match storage.as_str() {
+            "null" => Ok(MetadataAtom::Null),
+            "integer" => db
+                .query_row(value_sql, [], |row| match row.get_ref(0)? {
+                    ValueRef::Integer(value) => Ok(MetadataAtom::Integer(value)),
+                    _ => Err(rusqlite::Error::InvalidQuery),
+                })
+                .map_err(Into::into),
+            "real" => db
+                .query_row(value_sql, [], |row| match row.get_ref(0)? {
+                    ValueRef::Real(value) => Ok(MetadataAtom::Real(value.to_bits())),
+                    _ => Err(rusqlite::Error::InvalidQuery),
+                })
+                .map_err(Into::into),
+            "text" | "blob" => {
+                let text = storage == "text";
+                let blob = db.blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "index_metadata",
+                    column_name,
+                    1,
+                    true,
+                )?;
+                let byte_length = blob.len();
+                let mut digest = Sha256::new();
+                digest.update(b"baleyg-index-metadata-witness-v1\0");
+                digest.update(tag);
+                digest.update([u8::from(text)]);
+                digest.update((byte_length as u64).to_le_bytes());
+                let mut offset = 0usize;
+                let mut buffer = vec![0; (64 * 1024).min(byte_length)];
+                while offset < byte_length {
+                    let count = buffer.len().min(byte_length - offset);
+                    blob.read_at_exact(&mut buffer[..count], offset)?;
+                    digest.update(&buffer[..count]);
+                    offset = offset.checked_add(count).context("metadata offset overflow")?;
+                }
+                blob.close()?;
+                Ok(MetadataAtom::Streamed {
+                    column,
+                    text,
+                    byte_length,
+                    sha256: digest.finalize().into(),
+                })
+            }
+            _ => anyhow::bail!("incompatible_index: unknown SQLite metadata storage class"),
+        }
+    }
+
+    fn metadata_witness(&self, db: &Connection, schema: u32) -> Result<RecoveryWitness> {
+        Ok(RecoveryWitness {
+            pragma_schema: schema,
+            schema_version: self.metadata_atom(db, MetadataColumn::SchemaVersion)?,
+            extractor_version: self.metadata_atom(db, MetadataColumn::ExtractorVersion)?,
+            index_generation: self.metadata_atom(db, MetadataColumn::IndexGeneration)?,
+            index_revision: self.metadata_atom(db, MetadataColumn::IndexRevision)?,
+        })
+    }
+
+    fn recovery_baseline(&self, db: &Connection) -> Result<RecoveryBaseline> {
+        validate_cache_shape(db)?;
+        let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        self.verify_metadata_root(db)?;
+        let witness = self.metadata_witness(db, schema)?;
+        let bounded_text = |atom: &MetadataAtom, max: usize| {
+            matches!(atom, MetadataAtom::Streamed { text: true, byte_length, .. } if *byte_length <= max)
+        };
+        if !bounded_text(&witness.extractor_version, 256)
+            || !bounded_text(&witness.index_generation, 64)
+            || matches!(witness.schema_version, MetadataAtom::Streamed { .. } | MetadataAtom::Null)
+            || matches!(witness.index_revision, MetadataAtom::Streamed { .. } | MetadataAtom::Null)
+        {
+            self.mark_recovery(RecoveryDisposition::Rebuild);
+            return Ok(RecoveryBaseline {
+                witness,
+                pin: None,
+                compatible: false,
+            });
+        }
+        let decoded: rusqlite::Result<(i64, String, String, i64)> = db.query_row(
+            "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         );
-        ensure!(
-            row.3 == self.identity.device.to_string() && row.4 == self.identity.inode.to_string(),
-            "root_changed: index root identity mismatch"
-        );
-        let generation =
-            uuid::Uuid::parse_str(&row.5).context("incompatible_index: invalid generation")?;
-        ensure!(
-            (0..=9_007_199_254_740_991).contains(&row.6),
-            "incompatible_index: invalid revision"
-        );
-        let compatible = if schema == DATABASE_SCHEMA_VERSION && row.1 == EXTRACTOR_VERSION {
+        let (metadata_schema, extractor, generation, revision) = match decoded {
+            Ok(row) => row,
+            Err(error) => {
+                let compatible = self.classify_admission_error(error.into(), false)?;
+                debug_assert!(!compatible);
+                return Ok(RecoveryBaseline {
+                    witness,
+                    pin: None,
+                    compatible: false,
+                });
+            }
+        };
+        let generation = match uuid::Uuid::parse_str(&generation) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let compatible = self.classify_admission_error(
+                    SelectedIntegrity(format!("incompatible_index: invalid generation: {error}"))
+                        .into(),
+                    false,
+                )?;
+                debug_assert!(!compatible);
+                return Ok(RecoveryBaseline {
+                    witness,
+                    pin: None,
+                    compatible: false,
+                });
+            }
+        };
+        if !(0..=9_007_199_254_740_991).contains(&revision) {
+            self.mark_recovery(RecoveryDisposition::Rebuild);
+            return Ok(RecoveryBaseline {
+                witness,
+                pin: None,
+                compatible: false,
+            });
+        }
+        let pin = IndexPin {
+            index_generation: generation,
+            index_revision: revision as u64,
+        };
+        let marker_matches = metadata_schema == i64::from(schema);
+        let compatible = if marker_matches
+            && schema == DATABASE_SCHEMA_VERSION
+            && extractor == EXTRACTOR_VERSION
+        {
             match validate_bounded_control(db, &self.identity.record_id) {
                 Ok(()) => true,
                 Err(error) => self.classify_admission_error(error, true)?,
@@ -1897,13 +2107,11 @@ impl Store {
             self.mark_recovery(RecoveryDisposition::Rebuild);
             false
         };
-        Ok((
-            IndexPin {
-                index_generation: generation,
-                index_revision: row.6 as u64,
-            },
+        Ok(RecoveryBaseline {
+            witness,
+            pin: Some(pin),
             compatible,
-        ))
+        })
     }
 
     fn read_control_status(&self, db: &Connection) -> Result<IndexStatus> {
@@ -1987,10 +2195,15 @@ impl Store {
     }
     /// Internal control baseline, never returned by public status or evidence reads.
     pub fn index_baseline(&self) -> Result<IndexPin> {
+        self.recovery_index_baseline()?
+            .pin
+            .context("index_not_ready: prior index pin is not decodable")
+    }
+    pub(crate) fn recovery_index_baseline(&self) -> Result<RecoveryBaseline> {
         self.ensure_not_recreate_pending()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        Ok(self.recovery_baseline(&tx)?.0)
+        self.recovery_baseline(&tx)
     }
     pub fn root_id(&self) -> &str {
         &self.identity.record_id
@@ -2044,6 +2257,42 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        self.publish_native_expected(
+            graph,
+            capture,
+            native,
+            leader,
+            ExpectedPublication::Pin(expected_revision),
+            cancel,
+        )
+    }
+    pub(crate) fn publish_native_recovery(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        leader: &topology::LeaderGuard,
+        expected: RecoveryBaseline,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_native_expected(
+            graph,
+            capture,
+            native,
+            leader,
+            ExpectedPublication::Recovery(expected),
+            cancel,
+        )
+    }
+    fn publish_native_expected(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        leader: &topology::LeaderGuard,
+        expected: ExpectedPublication,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
         native.validate(
             capture,
             Path::new(&self.workspace_root),
@@ -2065,22 +2314,23 @@ impl Store {
             "native_evidence_required: each source must open, read, and hash once"
         );
         crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
-        self.publish_inner(graph, capture, native, leader, expected_revision, cancel)
+        self.publish_inner_expected(graph, capture, native, leader, expected, cancel)
     }
-    fn publish_inner(
+    fn publish_inner_expected(
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
         native: &crate::native_evidence::Artifact,
         leader: &topology::LeaderGuard,
-        expected_revision: IndexPin,
+        expected: ExpectedPublication,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
-        self.publish_inner_checked(
+        self.publish_inner_checked_expected(
             (graph, capture, native),
             leader,
-            expected_revision,
+            expected,
             cancel,
+            256 * 1024 * 1024 + 16 * 1024,
             |_, _| Ok(()),
         )
     }
@@ -2212,6 +2462,28 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
         max_graph_json_bytes: usize,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        self.publish_inner_checked_expected(
+            bundle,
+            leader,
+            ExpectedPublication::Pin(expected_revision),
+            cancel,
+            max_graph_json_bytes,
+            during_tx,
+        )
+    }
+    fn publish_inner_checked_expected(
+        &self,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
+        leader: &topology::LeaderGuard,
+        expected: ExpectedPublication,
+        cancel: &CancelFlag,
+        max_graph_json_bytes: usize,
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
         self.ensure_not_recreate_pending()?;
@@ -2246,17 +2518,27 @@ impl Store {
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         during_tx(PublishStage::BeforeTransaction, &db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let (old, compatible) = self.recovery_baseline(&tx)?;
+        let current = self.recovery_baseline(&tx)?;
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
             locked_version == admitted_version,
             "incompatible_index: cache changed after admission"
         );
-        ensure!(
-            expected_revision == old,
-            "revision conflict: expected {expected_revision:?}, found {old:?}"
-        );
+        match &expected {
+            ExpectedPublication::Pin(expected_pin) => ensure!(
+                current.pin == Some(*expected_pin),
+                "revision conflict: expected {expected_pin:?}, found {:?}",
+                current.pin
+            ),
+            ExpectedPublication::Recovery(expected_baseline) => ensure!(
+                current.witness == expected_baseline.witness
+                    && current.pin == expected_baseline.pin,
+                "revision conflict: private recovery baseline changed"
+            ),
+        }
+        let compatible = current.compatible;
+        let old_pin = current.pin;
         let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         let decoded = if compatible {
             match self.validate_recovery_decode_rows(&tx) {
@@ -2303,12 +2585,16 @@ impl Store {
             index_generation: if rebaseline {
                 uuid::Uuid::new_v4()
             } else {
-                old.index_generation
+                old_pin
+                    .context("index_not_ready: prior index pin is not decodable")?
+                    .index_generation
             },
             index_revision: if rebaseline {
                 1
             } else {
-                old.index_revision
+                old_pin
+                    .context("index_not_ready: prior index pin is not decodable")?
+                    .index_revision
                     .checked_add(1)
                     .filter(|n| *n <= 9_007_199_254_740_991)
                     .context("revision overflow")?
@@ -5231,6 +5517,109 @@ mod sqlite_schema_race_tests {
                 hashes: 1,
             }
         );
+    }
+
+    #[test]
+    fn real_revision_private_recovery_before_commit_error_rolls_back_same_inode() {
+        use rusqlite::types::ValueRef;
+        use std::os::unix::fs::MetadataExt;
+
+        let (_state, _work, store, graph, capture, native, _old, cancel) = ready();
+        let clone = store.clone();
+        let path = store.roots.index_db(&store.identity);
+        let inode = fs::metadata(&path).unwrap().ino();
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let logical = || {
+            let db = Connection::open(&path).unwrap();
+            let (schema, extractor, generation, files, nodes, documents, revisions, classes):
+                (i64, String, String, i64, i64, i64, i64, i64) = db
+                .query_row(
+                    "SELECT schema_version,extractor_version,index_generation,(SELECT count(*) FROM files),(SELECT count(*) FROM nodes),(SELECT count(*) FROM native_documents),(SELECT count(*) FROM native_revisions),(SELECT count(*) FROM class_catalog) FROM index_metadata",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                )
+                .unwrap();
+            let revision_bits = db
+                .query_row("SELECT index_revision FROM index_metadata", [], |row| {
+                    match row.get_ref(0)? {
+                        ValueRef::Real(value) => Ok(value.to_bits()),
+                        _ => Err(rusqlite::Error::InvalidQuery),
+                    }
+                })
+                .unwrap();
+            assert!(files > 0, "rollback fixture must contain a file row");
+            assert!(
+                documents > 0,
+                "rollback fixture must contain a native document row"
+            );
+            let selected_file: (String, String) = db
+                .query_row(
+                    "SELECT hash,payload FROM files ORDER BY path LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let selected_native: (String, Vec<u8>) = db
+                .query_row(
+                    "SELECT content_hash,source_bytes FROM native_documents ORDER BY revision_id,language,path LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            (
+                schema,
+                extractor,
+                generation,
+                revision_bits,
+                files,
+                nodes,
+                documents,
+                revisions,
+                classes,
+                selected_file,
+                selected_native,
+            )
+        };
+        let before = logical();
+        let baseline = {
+            let mut db = store.cache().unwrap();
+            let tx = db.transaction().unwrap();
+            store.recovery_baseline(&tx).unwrap()
+        };
+        assert!(baseline.pin().is_none());
+        let leader = store.leader().unwrap();
+        let error = store
+            .publish_inner_checked_expected(
+                (&graph, &capture, &native),
+                &leader,
+                ExpectedPublication::Recovery(baseline),
+                &cancel,
+                256 * 1024 * 1024 + 16 * 1024,
+                |stage, _tx| {
+                    if stage == PublishStage::BeforeCommit {
+                        anyhow::bail!("injected private metadata recovery failure");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected private metadata recovery failure"),
+            "{error:#}"
+        );
+        assert_eq!(logical(), before, "failed recovery changed logical pair");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
+        assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
     }
 
     #[test]
