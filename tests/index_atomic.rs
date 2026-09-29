@@ -1763,7 +1763,6 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     assert!(Store::open_for_tests(state.path(), workspace.path()).is_ok());
 }
 
-
 #[test]
 fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     // Malformed stats must be reported by a direct pinned read, not only status.
@@ -1771,14 +1770,42 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET stats='not-json'", []).unwrap();
+    db.execute("UPDATE index_metadata SET stats='not-json'", [])
+        .unwrap();
     drop(db);
     let error = store.source_at("flow.js", Some(pin)).unwrap_err();
-    assert!(error.to_string().starts_with("incompatible_index:"), "{error:#}");
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
-    assert!(store.views().unwrap_err().to_string().contains("index_not_ready"));
-    assert!(store.view("missing").unwrap_err().to_string().contains("index_not_ready"));
-    assert!(store.annotations().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().starts_with("incompatible_index:"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(
+        store
+            .views()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(
+        store
+            .view("missing")
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(
+        store
+            .annotations()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     // REAL revision must fail before pin comparison and close every clone.
     let (state, _workspace, store, pin) = projection_fixture();
@@ -1786,23 +1813,48 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     let symbol = store.symbols_at("go", 10).unwrap().1.remove(0).id;
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)", []).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
+        [],
+    )
+    .unwrap();
     drop(db);
     let error = store.symbol_at(&symbol, Some(pin)).unwrap_err();
-    assert!(error.to_string().starts_with("incompatible_index:"), "{error:#}");
-    assert!(clone.views().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().starts_with("incompatible_index:"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .views()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     // Malformed persisted input is reached by the existing full-read inventory pass.
     let (state, _workspace, store, pin) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'", [])
-        .unwrap();
+    db.execute(
+        "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
+        [],
+    )
+    .unwrap();
     drop(db);
     let error = store.classes_at(None, "", Some(pin), 0, 10).unwrap_err();
-    assert!(error.to_string().starts_with("incompatible_index:"), "{error:#}");
-    assert!(clone.annotations().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().starts_with("incompatible_index:"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .annotations()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 }
 
 #[test]
@@ -1819,21 +1871,52 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
     .unwrap();
     drop(db);
     let error = store.source_at("flow.js", Some(pin)).unwrap_err();
-    assert!(error.to_string().starts_with("incompatible_index:"), "{error:#}");
-    assert!(clone.views().unwrap_err().to_string().contains("index_not_ready"));
-    assert!(clone.view("missing").unwrap_err().to_string().contains("index_not_ready"));
-    assert!(clone.annotations().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().starts_with("incompatible_index:"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .views()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(
+        clone
+            .view("missing")
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(
+        clone
+            .annotations()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     // A control-only read can also be the first observer of typed control corruption.
     let (state, _workspace, store, _pin) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET stats='not-json'", []).unwrap();
+    db.execute("UPDATE index_metadata SET stats='not-json'", [])
+        .unwrap();
     drop(db);
     let error = store.views().unwrap_err();
-    assert!(error.to_string().starts_with("incompatible_index:"), "{error:#}");
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().starts_with("incompatible_index:"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 }
 
 #[test]
@@ -1843,7 +1926,9 @@ fn live_root_mismatch_precedes_typed_control_corruption_without_latching() {
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
     let original_root: String = db
-        .query_row("SELECT root_spelling FROM index_metadata", [], |row| row.get(0))
+        .query_row("SELECT root_spelling FROM index_metadata", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     db.execute(
         "UPDATE index_metadata SET root_spelling='wrong' || char(0) || 'root',index_revision=CAST(1.5 AS REAL)",
@@ -1852,7 +1937,10 @@ fn live_root_mismatch_precedes_typed_control_corruption_without_latching() {
     .unwrap();
     drop(db);
     let error = store.source_at("flow.js", Some(pin)).unwrap_err();
-    assert!(error.to_string().starts_with("root_key_collision:"), "{error:#}");
+    assert!(
+        error.to_string().starts_with("root_key_collision:"),
+        "{error:#}"
+    );
 
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
@@ -1861,21 +1949,33 @@ fn live_root_mismatch_precedes_typed_control_corruption_without_latching() {
     )
     .unwrap();
     drop(db);
-    assert_eq!(clone.status().unwrap().revision, pin, "root failure must not latch");
+    assert_eq!(
+        clone.status().unwrap().revision,
+        pin,
+        "root failure must not latch"
+    );
 }
-
 
 #[test]
 fn live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin() {
-    use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag};
-    use std::{os::unix::fs::MetadataExt, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     let (state, workspace, store, old) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET stats='not-json'", []).unwrap();
+    db.execute("UPDATE index_metadata SET stats='not-json'", [])
+        .unwrap();
     drop(db);
     assert!(
         store
@@ -1888,23 +1988,38 @@ fn live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin() {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
     let error = IndexJobCoordinator::prepare(&store, Some(old))
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error:#}");
     let db = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
-        db.query_row("SELECT stats FROM index_metadata", [], |row| row.get::<_, String>(0))
+        db.query_row("SELECT stats FROM index_metadata", [], |row| row
+            .get::<_, String>(0))
             .unwrap(),
         "not-json"
     );
     drop(db);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     cancel.store(false, Ordering::Release);
     let recovered = IndexJobCoordinator::prepare(&store, Some(old))
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap();
     assert_eq!(recovered.index_revision, 1);
     assert_ne!(recovered.index_generation, old.index_generation);
@@ -1920,7 +2035,6 @@ fn live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin() {
     );
 }
 
-
 #[test]
 fn live_control_corruption_status_first_is_typed_and_clone_shared() {
     for sql in [
@@ -1935,7 +2049,10 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
         db.execute(sql, []).unwrap();
         drop(db);
         let error = store.status().unwrap_err();
-        assert!(error.to_string().starts_with("incompatible_index:"), "{sql}: {error:#}");
+        assert!(
+            error.to_string().starts_with("incompatible_index:"),
+            "{sql}: {error:#}"
+        );
         assert!(
             clone
                 .source_at("flow.js", Some(pin))

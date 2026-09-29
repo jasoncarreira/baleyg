@@ -1360,9 +1360,8 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             "incompatible_index: invalid reconciled incarnation: {error}"
         ))
     })?;
-    let options = options.ok_or_else(|| {
-        ControlIntegrity("incompatible_index: missing reconcile options".into())
-    })?;
+    let options = options
+        .ok_or_else(|| ControlIntegrity("incompatible_index: missing reconcile options".into()))?;
     let decoded_options: crate::indexer::ReconcileOptions =
         serde_json::from_str(&options).context("incompatible_index: invalid reconcile options")?;
     control_ensure!(
@@ -1511,9 +1510,11 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
         expected.insert(format!("directory:{directory}"));
     }
-    expected.insert(executable.ok_or_else(|| {
-        ControlIntegrity("incompatible_index: missing executable input".into())
-    })?);
+    expected.insert(
+        executable.ok_or_else(|| {
+            ControlIntegrity("incompatible_index: missing executable input".into())
+        })?,
+    );
     match &decoded_options.scip_path {
         Some(path) => {
             control_ensure!(!path.is_empty(), "incompatible_index: empty SCIP option");
@@ -4494,7 +4495,11 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let views = self.records().views()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        if self.read_public_control_status(&tx)?.evidence_format.is_none() {
+        if self
+            .read_public_control_status(&tx)?
+            .evidence_format
+            .is_none()
+        {
             return Ok(views
                 .into_iter()
                 .map(|view| SavedViewState {
@@ -4515,7 +4520,11 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let view = self.records().view(id)?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        if self.read_public_control_status(&tx)?.evidence_format.is_none() {
+        if self
+            .read_public_control_status(&tx)?
+            .evidence_format
+            .is_none()
+        {
             return Ok(view.map(|view| SavedViewState {
                 orphaned_ids: std::iter::once(view.query.seed.clone())
                     .chain(view.pins.keys().cloned())
@@ -4538,7 +4547,11 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let annotations = self.records().annotations()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        if self.read_public_control_status(&tx)?.evidence_format.is_none() {
+        if self
+            .read_public_control_status(&tx)?
+            .evidence_format
+            .is_none()
+        {
             return Ok(annotations
                 .into_iter()
                 .map(|annotation| AnnotationState {
@@ -5486,9 +5499,18 @@ mod sqlite_schema_race_tests {
             let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
             let clone = store.clone();
             let error = store.report_live_read_failure(sqlite(code));
-            assert!(error.to_string().starts_with("recovery_required:"), "{error:#}");
+            assert!(
+                error.to_string().starts_with("recovery_required:"),
+                "{error:#}"
+            );
             assert_eq!(store.disposition(), RecoveryDisposition::RecreatePending);
-            assert!(clone.status().unwrap_err().to_string().starts_with("recovery_required:"));
+            assert!(
+                clone
+                    .status()
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("recovery_required:")
+            );
         }
         for code in [
             rusqlite::ffi::SQLITE_BUSY,
@@ -5512,7 +5534,13 @@ mod sqlite_schema_race_tests {
             .into(),
         );
         assert!(error.to_string().starts_with("incompatible_index:"));
-        assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
 
         let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
         let clone = store.clone();
@@ -5520,7 +5548,13 @@ mod sqlite_schema_race_tests {
             ControlIntegrity("incompatible_index: existing structural check".into()).into(),
         );
         assert!(error.to_string().starts_with("incompatible_index:"));
-        assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
 
         let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
         let error = store.report_live_read_failure(anyhow::anyhow!(

@@ -967,7 +967,6 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     }
 }
 
-
 #[tokio::test]
 async fn live_control_corruption_returns_typed_503_before_clone_not_ready() {
     for case in ["stats-source", "real-symbol", "input-classes"] {
@@ -1037,7 +1036,10 @@ async fn live_control_corruption_returns_typed_503_before_clone_not_ready() {
 
         let (status, body) = call(&app, "GET", &route, Value::Null).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
-        assert_eq!(body["error"]["code"], "incompatible_index", "{case}: {body}");
+        assert_eq!(
+            body["error"]["code"], "incompatible_index",
+            "{case}: {body}"
+        );
         let (status, body) = call(&app, "GET", "/api/status", Value::Null).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
         assert_eq!(body["error"]["code"], "index_not_ready", "{case}: {body}");
