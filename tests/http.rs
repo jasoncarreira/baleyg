@@ -253,15 +253,18 @@ async fn jobs_publish_and_cancel() {
     assert_eq!(store.status().unwrap().revision.index_revision, 1);
     state.cancel_active();
 }
-#[tokio::test]
-async fn index_start_waits_out_a_concurrent_reader_instead_of_storage_busy() {
-    let (dir, store, state, app) = setup();
-    let (code, job) = call(&app, "POST", "/api/index", json!({})).await;
+/// Publishes once and returns the pin plus the index database path.
+async fn published(
+    app: &Router,
+    store: &Store,
+    dir: &tempfile::TempDir,
+) -> (IndexPin, std::path::PathBuf) {
+    let (code, job) = call(app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, 202, "{job}");
     let id = job["id"].as_str().unwrap().to_owned();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let (_, j) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            let (_, j) = call(app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !j["finishedAt"].is_null() {
                 break;
             }
@@ -270,15 +273,20 @@ async fn index_start_waits_out_a_concurrent_reader_instead_of_storage_busy() {
     })
     .await
     .unwrap();
-    let pin = store.status().unwrap().revision;
     let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.is_dir())
         .unwrap()
         .join("index.db");
-    // Under rollback journaling an open read transaction blocks any writer's commit, as the
-    // startup dependency-catalog worker's status() read does while a client starts an index.
+    (store.status().unwrap().revision, index)
+}
+/// Holds a read transaction on `index` for `hold`. Under rollback journaling this blocks any
+/// writer's commit, as the startup dependency-catalog worker's status() read does.
+fn hold_reader(
+    index: std::path::PathBuf,
+    hold: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
     let reader =
         rusqlite::Connection::open_with_flags(&index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
@@ -286,10 +294,16 @@ async fn index_start_waits_out_a_concurrent_reader_instead_of_storage_busy() {
     let _: i64 = reader
         .query_row("SELECT count(*) FROM index_metadata", [], |row| row.get(0))
         .unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
         reader.execute_batch("COMMIT").unwrap();
-    });
+    })
+}
+#[tokio::test]
+async fn index_start_waits_out_a_concurrent_reader_instead_of_storage_busy() {
+    let (dir, store, state, app) = setup();
+    let (pin, index) = published(&app, &store, &dir).await;
+    let release = hold_reader(index, std::time::Duration::from_millis(300));
     let (code, body) = call(&app, "POST", "/api/index", json!({"expectedRevision": pin})).await;
     release.join().unwrap();
     assert_eq!(
@@ -297,6 +311,42 @@ async fn index_start_waits_out_a_concurrent_reader_instead_of_storage_busy() {
         "a transient reader must not surface as storage_busy: {body}"
     );
     state.cancel_active();
+}
+#[tokio::test]
+async fn persistent_sqlite_contention_still_returns_storage_busy_after_the_bound() {
+    let (dir, store, _state, app) = setup();
+    let (pin, index) = published(&app, &store, &dir).await;
+    let release = hold_reader(index, std::time::Duration::from_secs(4));
+    let started = std::time::Instant::now();
+    let (code, body) = call(&app, "POST", "/api/index", json!({"expectedRevision": pin})).await;
+    let waited = started.elapsed();
+    release.join().unwrap();
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "storage_busy", "{body}");
+    assert!(
+        waited >= std::time::Duration::from_secs(2) && waited < std::time::Duration::from_secs(4),
+        "bounded wait, then refusal before the reader releases: {waited:?}"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+}
+#[tokio::test]
+async fn held_leader_lock_refuses_index_start_without_waiting() {
+    let (dir, store, _state, app) = setup();
+    let (pin, _index) = published(&app, &store, &dir).await;
+    // An in-flight job (or another process) holds the leader lock; that is not SQLite
+    // contention and keeps its immediate refusal.
+    let leader = store.leader().unwrap();
+    let started = std::time::Instant::now();
+    let (code, body) = call(&app, "POST", "/api/index", json!({"expectedRevision": pin})).await;
+    let waited = started.elapsed();
+    drop(leader);
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "storage_busy", "{body}");
+    assert!(
+        waited < std::time::Duration::from_secs(1),
+        "leader contention must not be retried: {waited:?}"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
 }
 #[test]
 fn token_security() {

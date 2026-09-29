@@ -368,6 +368,16 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 struct ApiError(StatusCode, &'static str, &'static str);
 /// Upper bound on waiting out transient SQLite contention before an index job starts.
 const INDEX_START_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// SQLite reader/writer lock contention only, not a held leader lock or an active job.
+fn sqlite_contention(error: &anyhow::Error) -> bool {
+    error.to_string() == "storage_busy: SQLite lock contention"
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+                matches!(error, rusqlite::Error::SqliteFailure(info, _)
+                    if matches!(info.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+            })
+        })
+}
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         error(self.0, self.1, self.2)
@@ -1346,21 +1356,21 @@ async fn start_index(
         }
     }
     // Under rollback journaling any open reader (for example the startup dependency-catalog
-    // worker's status read) makes the leader's metadata commit fail with SQLITE_BUSY. Wait that
-    // transient contention out for a bounded time instead of rejecting the request.
-    let deadline = std::time::Instant::now() + INDEX_START_BUSY_WAIT;
-    let coordinator = loop {
-        match db(s.clone(), move |store| {
-            crate::index_coordinator::IndexJobCoordinator::prepare(store, requested)
-        })
-        .await
-        {
-            Err(ApiError(_, "storage_busy", _)) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // worker's status read) makes the leader's metadata commit fail with SQLITE_BUSY. Wait out
+    // only that SQLite contention, for a bounded time. A held leader lock or active job still
+    // fails immediately, so conflict precedence is unchanged.
+    let coordinator = db(s.clone(), move |store| {
+        let deadline = std::time::Instant::now() + INDEX_START_BUSY_WAIT;
+        loop {
+            match crate::index_coordinator::IndexJobCoordinator::prepare(store, requested) {
+                Err(error) if sqlite_contention(&error) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result,
             }
-            result => break result?,
         }
-    };
+    })
+    .await?;
     let cancel = Arc::new(AtomicBool::new(false));
     let job = IndexJob {
         id: uuid::Uuid::new_v4().to_string(),
