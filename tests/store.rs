@@ -1164,8 +1164,16 @@ fn legacy_rebaseline_capture_drift_after_partial_write_preserves_old_bytes() {
 fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists() {
     for rename in [false, true] {
         let (_state, work, store) = fixture();
-        std::fs::write(work.path().join("a.js"), "function stable() { return 1; }\n").unwrap();
-        std::fs::write(work.path().join("b.js"), "function target() { return 2; }\n").unwrap();
+        std::fs::write(
+            work.path().join("a.js"),
+            "function stable() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.path().join("b.js"),
+            "function target() { return 2; }\n",
+        )
+        .unwrap();
         let captured = bundle(&store, &work);
         let stable = captured
             .1
@@ -1237,7 +1245,10 @@ fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists
 
         let views = store.saved_views_at(Some(second)).unwrap();
         assert_eq!(views.len(), 2, "rename={rename}");
-        let missing = views.iter().find(|state| state.view.id == "target-view").unwrap();
+        let missing = views
+            .iter()
+            .find(|state| state.view.id == "target-view")
+            .unwrap();
         assert_eq!(
             missing.attachment.availability,
             AttachmentAvailability::Ready,
@@ -1258,7 +1269,10 @@ fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists
             missing_view_anchor,
             "rename={rename}"
         );
-        let unaffected = views.iter().find(|state| state.view.id == "stable-view").unwrap();
+        let unaffected = views
+            .iter()
+            .find(|state| state.view.id == "stable-view")
+            .unwrap();
         assert_eq!(
             unaffected.attachment.result.as_ref().unwrap().status,
             AnchorStatus::Attached,
@@ -1330,7 +1344,11 @@ fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists
 #[test]
 fn same_path_different_association_is_missing_but_dangling_revision_fails_closed() {
     let (state, work, store) = fixture();
-    std::fs::write(work.path().join("b.js"), "function target() { return 2; }\n").unwrap();
+    std::fs::write(
+        work.path().join("b.js"),
+        "function target() { return 2; }\n",
+    )
+    .unwrap();
     let captured = bundle(&store, &work);
     let target = captured
         .1
@@ -1392,7 +1410,10 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
         .iter()
         .find(|state| state.view.id == "association")
         .unwrap();
-    assert_eq!(listed.attachment.availability, AttachmentAvailability::Ready);
+    assert_eq!(
+        listed.attachment.availability,
+        AttachmentAvailability::Ready
+    );
     assert_eq!(
         listed.attachment.result.as_ref().unwrap().status,
         AnchorStatus::Orphaned

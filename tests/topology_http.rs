@@ -441,13 +441,9 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
     let options = IndexOptions::new(root.clone());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &options,
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
+    let (graph, native, capture) =
+        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+            .unwrap();
     let stable = native
         .declarations
         .iter()
@@ -539,13 +535,9 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
         .to_owned();
 
     std::fs::remove_file(root.join("b.js")).unwrap();
-    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &options,
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
+    let (graph, native, capture) =
+        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+            .unwrap();
     let second = store
         .publish_native(
             &graph,
@@ -569,15 +561,24 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
     assert_eq!(missing_view["attachment"]["availability"], "ready");
     assert_eq!(missing_view["attachment"]["result"]["status"], "orphaned");
     assert_eq!(missing_view["attachment"]["result"]["reason"], "missing");
-    assert_eq!(missing_view["view"]["anchor"], created_target_view["view"]["anchor"]);
+    assert_eq!(
+        missing_view["view"]["anchor"],
+        created_target_view["view"]["anchor"]
+    );
     let unaffected_view = views
         .as_array()
         .unwrap()
         .iter()
         .find(|state| state["view"]["id"] == "stable-view")
         .unwrap();
-    assert_eq!(unaffected_view["attachment"]["result"]["status"], "attached");
-    assert_eq!(unaffected_view["view"]["anchor"], created_stable_view["view"]["anchor"]);
+    assert_eq!(
+        unaffected_view["attachment"]["result"]["status"],
+        "attached"
+    );
+    assert_eq!(
+        unaffected_view["view"]["anchor"],
+        created_stable_view["view"]["anchor"]
+    );
     for (id, expected_status, expected_reason) in [
         ("target-view", "orphaned", "missing"),
         ("stable-view", "attached", "none"),
@@ -607,15 +608,24 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
     assert_eq!(missing_note["attachment"]["availability"], "ready");
     assert_eq!(missing_note["attachment"]["result"]["status"], "orphaned");
     assert_eq!(missing_note["attachment"]["result"]["reason"], "missing");
-    assert_eq!(missing_note["annotation"]["anchor"], created_target_note["annotation"]["anchor"]);
+    assert_eq!(
+        missing_note["annotation"]["anchor"],
+        created_target_note["annotation"]["anchor"]
+    );
     let unaffected_note = notes
         .as_array()
         .unwrap()
         .iter()
         .find(|state| state["annotation"]["id"] == "stable-note")
         .unwrap();
-    assert_eq!(unaffected_note["attachment"]["result"]["status"], "attached");
-    assert_eq!(unaffected_note["annotation"]["anchor"], created_stable_note["annotation"]["anchor"]);
+    assert_eq!(
+        unaffected_note["attachment"]["result"]["status"],
+        "attached"
+    );
+    assert_eq!(
+        unaffected_note["annotation"]["anchor"],
+        created_stable_note["annotation"]["anchor"]
+    );
 
     let target_view_after = store
         .saved_view_at("target-view", Some(second))
@@ -632,7 +642,12 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
         .find(|state| state.annotation.id == "target-note")
         .unwrap();
     assert_eq!(
-        target_note_after.annotation.anchor.as_deref().unwrap().get(),
+        target_note_after
+            .annotation
+            .anchor
+            .as_deref()
+            .unwrap()
+            .get(),
         target_note_raw
     );
 }
