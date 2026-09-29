@@ -373,11 +373,7 @@ function helper() {}
         503,
         "forged call must not enter sequence HTTP"
     );
-    let unrelated_sequence = app
-        .clone()
-        .oneshot(sequence_request(&other))
-        .await
-        .unwrap();
+    let unrelated_sequence = app.clone().oneshot(sequence_request(&other)).await.unwrap();
     assert_eq!(unrelated_sequence.status(), 503);
     let body = to_bytes(unrelated_sequence.into_body(), 4 * 1024 * 1024)
         .await
