@@ -40,10 +40,30 @@ enum MetadataColumn {
 impl MetadataColumn {
     fn sql(self) -> (&'static str, &'static str, &'static str, &'static [u8]) {
         match self {
-            Self::SchemaVersion => ("SELECT typeof(schema_version) FROM index_metadata WHERE singleton=1", "SELECT schema_version FROM index_metadata WHERE singleton=1", "schema_version", b"schema_version"),
-            Self::ExtractorVersion => ("SELECT typeof(extractor_version) FROM index_metadata WHERE singleton=1", "SELECT extractor_version FROM index_metadata WHERE singleton=1", "extractor_version", b"extractor_version"),
-            Self::IndexGeneration => ("SELECT typeof(index_generation) FROM index_metadata WHERE singleton=1", "SELECT index_generation FROM index_metadata WHERE singleton=1", "index_generation", b"index_generation"),
-            Self::IndexRevision => ("SELECT typeof(index_revision) FROM index_metadata WHERE singleton=1", "SELECT index_revision FROM index_metadata WHERE singleton=1", "index_revision", b"index_revision"),
+            Self::SchemaVersion => (
+                "SELECT typeof(schema_version) FROM index_metadata WHERE singleton=1",
+                "SELECT schema_version FROM index_metadata WHERE singleton=1",
+                "schema_version",
+                b"schema_version",
+            ),
+            Self::ExtractorVersion => (
+                "SELECT typeof(extractor_version) FROM index_metadata WHERE singleton=1",
+                "SELECT extractor_version FROM index_metadata WHERE singleton=1",
+                "extractor_version",
+                b"extractor_version",
+            ),
+            Self::IndexGeneration => (
+                "SELECT typeof(index_generation) FROM index_metadata WHERE singleton=1",
+                "SELECT index_generation FROM index_metadata WHERE singleton=1",
+                "index_generation",
+                b"index_generation",
+            ),
+            Self::IndexRevision => (
+                "SELECT typeof(index_revision) FROM index_metadata WHERE singleton=1",
+                "SELECT index_revision FROM index_metadata WHERE singleton=1",
+                "index_revision",
+                b"index_revision",
+            ),
         }
     }
 }
@@ -2005,7 +2025,9 @@ impl Store {
                     let count = buffer.len().min(byte_length - offset);
                     blob.read_at_exact(&mut buffer[..count], offset)?;
                     digest.update(&buffer[..count]);
-                    offset = offset.checked_add(count).context("metadata offset overflow")?;
+                    offset = offset
+                        .checked_add(count)
+                        .context("metadata offset overflow")?;
                 }
                 blob.close()?;
                 Ok(MetadataAtom::Streamed {
@@ -2034,13 +2056,17 @@ impl Store {
         let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         self.verify_metadata_root(db)?;
         let witness = self.metadata_witness(db, schema)?;
-        let bounded_text = |atom: &MetadataAtom, max: usize| {
-            matches!(atom, MetadataAtom::Streamed { text: true, byte_length, .. } if *byte_length <= max)
-        };
+        let bounded_text = |atom: &MetadataAtom, max: usize| matches!(atom, MetadataAtom::Streamed { text: true, byte_length, .. } if *byte_length <= max);
         if !bounded_text(&witness.extractor_version, 256)
             || !bounded_text(&witness.index_generation, 64)
-            || matches!(witness.schema_version, MetadataAtom::Streamed { .. } | MetadataAtom::Null)
-            || matches!(witness.index_revision, MetadataAtom::Streamed { .. } | MetadataAtom::Null)
+            || matches!(
+                witness.schema_version,
+                MetadataAtom::Streamed { .. } | MetadataAtom::Null
+            )
+            || matches!(
+                witness.index_revision,
+                MetadataAtom::Streamed { .. } | MetadataAtom::Null
+            )
         {
             self.mark_recovery(RecoveryDisposition::Rebuild);
             return Ok(RecoveryBaseline {
@@ -5547,12 +5573,14 @@ mod sqlite_schema_race_tests {
                 )
                 .unwrap();
             let revision_bits = db
-                .query_row("SELECT index_revision FROM index_metadata", [], |row| {
-                    match row.get_ref(0)? {
+                .query_row(
+                    "SELECT index_revision FROM index_metadata",
+                    [],
+                    |row| match row.get_ref(0)? {
                         ValueRef::Real(value) => Ok(value.to_bits()),
                         _ => Err(rusqlite::Error::InvalidQuery),
-                    }
-                })
+                    },
+                )
                 .unwrap();
             assert!(files > 0, "rollback fixture must contain a file row");
             assert!(
@@ -5618,8 +5646,20 @@ mod sqlite_schema_race_tests {
         );
         assert_eq!(logical(), before, "failed recovery changed logical pair");
         assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-        assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
-        assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
     }
 
     #[test]

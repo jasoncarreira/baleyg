@@ -1395,30 +1395,53 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
     );
 }
 
-
 #[test]
 fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
-    use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag};
-    use std::{os::unix::fs::MetadataExt, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     let (state, workspace, initial, old) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     drop(initial);
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET schema_version=6", []).unwrap();
+    db.execute("UPDATE index_metadata SET schema_version=6", [])
+        .unwrap();
     drop(db);
 
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let clone = store.clone();
-    assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     assert_eq!(store.index_baseline().unwrap(), old);
 
     let stale = IndexJobCoordinator::prepare(&store, Some(old)).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET extractor_version='changed-after-admission'", [])
-        .unwrap();
+    db.execute(
+        "UPDATE index_metadata SET extractor_version='changed-after-admission'",
+        [],
+    )
+    .unwrap();
     drop(db);
     let error = stale
         .run(
@@ -1429,75 +1452,153 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
         .unwrap_err();
     assert!(error.to_string().contains("revision conflict"), "{error:#}");
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET extractor_version='native-paired-v1'", [])
-        .unwrap();
+    db.execute(
+        "UPDATE index_metadata SET extractor_version='native-paired-v1'",
+        [],
+    )
+    .unwrap();
     drop(db);
 
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
     let error = IndexJobCoordinator::prepare(&store, Some(old))
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error:#}");
     let db = rusqlite::Connection::open(&path).unwrap();
-    assert_eq!(db.query_row("SELECT schema_version FROM index_metadata", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+    assert_eq!(
+        db.query_row("SELECT schema_version FROM index_metadata", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
     drop(db);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     cancel.store(false, Ordering::Release);
     let recovered = IndexJobCoordinator::prepare(&store, Some(old))
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap();
     assert_eq!(recovered.index_revision, 1);
     assert_ne!(recovered.index_generation, old.index_generation);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     assert_eq!(store.status().unwrap().revision, recovered);
     assert_eq!(clone.status().unwrap().revision, recovered);
-    assert!(IndexJobCoordinator::prepare(&store, Some(old)).err().expect("old pin must conflict").to_string().contains("revision conflict"));
+    assert!(
+        IndexJobCoordinator::prepare(&store, Some(old))
+            .err()
+            .expect("old pin must conflict")
+            .to_string()
+            .contains("revision conflict")
+    );
 }
 
 #[test]
 fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
-    use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag};
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
     use rusqlite::types::ValueRef;
-    use std::{os::unix::fs::MetadataExt, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     let (state, workspace, initial, old) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     drop(initial);
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)", []).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
+        [],
+    )
+    .unwrap();
     drop(db);
 
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let clone = store.clone();
-    assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
-    assert!(store.index_baseline().unwrap_err().to_string().contains("not decodable"));
-    assert!(IndexJobCoordinator::prepare(&store, Some(old)).err().expect("undecodable pin must conflict").to_string().contains("revision conflict"));
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(
+        store
+            .index_baseline()
+            .unwrap_err()
+            .to_string()
+            .contains("not decodable")
+    );
+    assert!(
+        IndexJobCoordinator::prepare(&store, Some(old))
+            .err()
+            .expect("undecodable pin must conflict")
+            .to_string()
+            .contains("revision conflict")
+    );
 
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
     let error = IndexJobCoordinator::prepare(&store, None)
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error:#}");
     let db = rusqlite::Connection::open(&path).unwrap();
-    let bits = db.query_row("SELECT index_revision FROM index_metadata", [], |row| match row.get_ref(0)? {
-        ValueRef::Real(value) => Ok(value.to_bits()),
-        _ => Err(rusqlite::Error::InvalidQuery),
-    }).unwrap();
+    let bits = db
+        .query_row(
+            "SELECT index_revision FROM index_metadata",
+            [],
+            |row| match row.get_ref(0)? {
+                ValueRef::Real(value) => Ok(value.to_bits()),
+                _ => Err(rusqlite::Error::InvalidQuery),
+            },
+        )
+        .unwrap();
     assert_eq!(bits, 1.5f64.to_bits());
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     drop(db);
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     cancel.store(false, Ordering::Release);
     let recovered = IndexJobCoordinator::prepare(&store, None)
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap();
     assert_eq!(recovered.index_revision, 1);
     assert_ne!(recovered.index_generation, old.index_generation);
@@ -1510,7 +1611,13 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
 fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
     use rusqlite::DatabaseName;
-    use std::{os::unix::fs::MetadataExt, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     let conflict = |first: &str, mutate: &dyn Fn(&rusqlite::Connection)| {
         let (state, workspace, initial, _old) = projection_fixture();
@@ -1525,51 +1632,103 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
         mutate(&db);
         drop(db);
         let error = coordinator
-            .run(&IndexOptions::new(workspace.path().to_owned()), &Arc::new(AtomicBool::new(false)), |_| {})
+            .run(
+                &IndexOptions::new(workspace.path().to_owned()),
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
             .unwrap_err();
         assert!(error.to_string().contains("revision conflict"), "{error:#}");
-        assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
     };
 
     conflict(
         "UPDATE index_metadata SET index_generation='bad' || char(0) || 'one'",
-        &|db| { db.execute("UPDATE index_metadata SET index_generation='bad' || char(0) || 'two'", []).unwrap(); },
+        &|db| {
+            db.execute(
+                "UPDATE index_metadata SET index_generation='bad' || char(0) || 'two'",
+                [],
+            )
+            .unwrap();
+        },
     );
     conflict(
         "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
-        &|db| { db.execute("UPDATE index_metadata SET index_revision=?1", [f64::from_bits(1.5f64.to_bits() + 1)]).unwrap(); },
+        &|db| {
+            db.execute(
+                "UPDATE index_metadata SET index_revision=?1",
+                [f64::from_bits(1.5f64.to_bits() + 1)],
+            )
+            .unwrap();
+        },
     );
 
     let (state, workspace, initial, _old) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
     drop(initial);
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET index_generation=zeroblob(131073)", []).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET index_generation=zeroblob(131073)",
+        [],
+    )
+    .unwrap();
     drop(db);
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
-    let mut blob = db.blob_open(DatabaseName::Main, "index_metadata", "index_generation", 1, false).unwrap();
+    let mut blob = db
+        .blob_open(
+            DatabaseName::Main,
+            "index_metadata",
+            "index_generation",
+            1,
+            false,
+        )
+        .unwrap();
     blob.write_at(&[1], 70_000).unwrap();
     blob.close().unwrap();
     drop(db);
     let error = coordinator
-        .run(&IndexOptions::new(workspace.path().to_owned()), &Arc::new(AtomicBool::new(false)), |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
         .unwrap_err();
     assert!(error.to_string().contains("revision conflict"), "{error:#}");
-    assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     let inode = fs::metadata(&path).unwrap().ino();
     let cancel = Arc::new(AtomicBool::new(true));
     let error = IndexJobCoordinator::prepare(&store, None)
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error:#}");
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     cancel.store(false, Ordering::Release);
     let recovered = IndexJobCoordinator::prepare(&store, None)
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap();
     assert_eq!(recovered.index_revision, 1);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
@@ -1582,7 +1741,10 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     db.execute("UPDATE index_metadata SET root_spelling='wrong' || char(0) || 'root',index_revision=CAST(1.5 AS REAL)", []).unwrap();
     drop(db);
     let error = Store::open_for_tests(state.path(), workspace.path()).unwrap_err();
-    assert!(error.to_string().contains("root_key_collision"), "{error:#}");
+    assert!(
+        error.to_string().contains("root_key_collision"),
+        "{error:#}"
+    );
 
     let (state, workspace, initial, _old) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
@@ -1591,7 +1753,10 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     db.execute("UPDATE index_metadata SET root_spelling=CAST(zeroblob(131073) AS TEXT),index_revision=CAST(1.5 AS REAL)", []).unwrap();
     drop(db);
     let error = Store::open_for_tests(state.path(), workspace.path()).unwrap_err();
-    assert!(error.to_string().contains("root_key_collision"), "{error:#}");
+    assert!(
+        error.to_string().contains("root_key_collision"),
+        "{error:#}"
+    );
 
     let (state, workspace, initial, _old) = projection_fixture();
     let path = index_dir(state.path()).join("index.db");
