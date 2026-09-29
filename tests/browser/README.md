@@ -4,16 +4,18 @@ This test drives the real Baleyg web shell in Playwright Chromium. It starts the
 
 ## Provision once per checkout
 
-From the repository root, use the run-local cache and browser directory:
+An absolute, writable run-cache directory outside the checkout is required. From the repository root, choose that directory and install the locked package and managed browser into it:
 
 ```sh
-npm_config_cache=/Users/jcarreira/projects/odin/baleyg-factory-65-operator/.factory-sandboxes/65/.factory/65/npm-cache \
+export BALEYG_RUN_CACHE=/path/to/external/run-cache
+mkdir -p "$BALEYG_RUN_CACHE/npm-cache" "$BALEYG_RUN_CACHE/playwright-browsers"
+npm_config_cache="$BALEYG_RUN_CACHE/npm-cache" \
   npm ci --prefix tests/browser --ignore-scripts
-PLAYWRIGHT_BROWSERS_PATH=/Users/jcarreira/projects/odin/baleyg-factory-65-operator/.factory-sandboxes/65/.factory/65/playwright-browsers \
+PLAYWRIGHT_BROWSERS_PATH="$BALEYG_RUN_CACHE/playwright-browsers" \
   node tests/browser/node_modules/playwright/cli.js install chromium
 ```
 
-The package lock pins `playwright` to exactly `1.55.1`. Do not use `npx`, `--with-deps`, a system browser install, or an external browser cache.
+The package lock pins `playwright` to exactly `1.55.1`. Do not use `npx`, a system browser install, or an unrelated shared browser cache. Local provisioning must not use `--with-deps`; the Linux CI job is the only exception because it uses `--with-deps` to install the required system libraries. The macOS CI job uses the normal `install chromium` command.
 
 The ACP verifier dependency is separate and still requires:
 
@@ -23,10 +25,11 @@ npm ci --prefix runtime/acp --ignore-scripts
 
 ## Run
 
-Keep the explicit browser path in the test environment:
+Keep the same explicit browser path in the test environment:
 
 ```sh
-PLAYWRIGHT_BROWSERS_PATH=/Users/jcarreira/projects/odin/baleyg-factory-65-operator/.factory-sandboxes/65/.factory/65/playwright-browsers \
+export BALEYG_RUN_CACHE=/path/to/external/run-cache
+PLAYWRIGHT_BROWSERS_PATH="$BALEYG_RUN_CACHE/playwright-browsers" \
   node tests/browser/saved-items.test.cjs
 ```
 

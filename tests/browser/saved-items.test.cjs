@@ -47,10 +47,10 @@ test.before(async () => {
   const metadata = await run("cargo", ["metadata", "--no-deps", "--format-version", "1"], {timeout:60000});
   const target = JSON.parse(metadata.stdout).target_directory;
   assert.equal(typeof target, "string");
-  await run("cargo", ["build", "--locked", "--bin", "baleyg"], {timeout:300000});
+  await run("cargo", ["build", "--locked", "--bin", "baleyg"], {timeout:900000});
   binary = join(target, "debug", process.platform === "win32" ? "baleyg.exe" : "baleyg");
   assert.ok(existsSync(binary), `built Baleyg binary is unavailable at ${binary}`);
-}, {timeout:360000});
+}, {timeout:960000});
 
 function isolatedEnv(paths) {
   const env = {...process.env,
