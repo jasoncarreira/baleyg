@@ -108,10 +108,13 @@ every chunk below it.
   the shared caches:
   - native extraction hits the fact cache (#71: "parses only files the cache has never seen");
   - every chunk's embedded text is identical, because embedded paths are relative to the root, so
-    every vector is a cache hit and **nothing is re-embedded**.
+    every vector *still in the cache* is a hit. When all required entries are cached, **nothing is
+    re-embedded**.
 
-  What remains is the capture's one read and hash per file, ID assembly and publication, which
-  takes seconds, plus rebuilding the lexical index.
+  In that case what remains is the capture's one read and hash per file, ID assembly and
+  publication, which takes seconds, plus rebuilding the lexical index. The vector cache is
+  size-capped LRU, so entries may have been evicted. An evicted chunk follows the cache-miss rule
+  below: it is pending, served lexical-only, and re-embedded in the background.
 - **Cache rules follow #71.**
   - Keep size-capped LRU eviction.
   - A missing, evicted, corrupt or unavailable entry is treated as *no vector* for that chunk.
