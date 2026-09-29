@@ -9,7 +9,7 @@ use baleyg::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::*,
-    store::Store,
+    store::{Store, topology::LeaderSession},
 };
 use serde_json::{Value, json};
 #[path = "common/jev_wire.rs"]
@@ -18,7 +18,17 @@ use jev_wire::decode_packet;
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
+fn setup(
+    padding: usize,
+) -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Arc<http::DaemonState>,
+    Router,
+    Value,
+    Arc<LeaderSession>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -36,11 +46,12 @@ fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
         .id
         .clone();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let session = store.leader_session().unwrap();
     publish_bundle(
         &store,
         &graph,
         &workspace,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         baleyg::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -60,8 +71,10 @@ fn setup(padding: usize) -> (tempfile::TempDir, Store, Graph, Router, Value) {
         dir,
         store,
         graph,
+        state.clone(),
         http::router(state),
         json!({"seed":seed,"question":"helper leaf", "expectedRevision":pin}),
+        session,
     )
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
@@ -109,7 +122,7 @@ fn response(export: &Value) -> Value {
 }
 #[tokio::test]
 async fn offline_roundtrip_is_stable_and_preserves_display_policy() {
-    let (_d, store, _g, app, request) = setup(0);
+    let (_d, store, _g, _state, app, request, _session) = setup(0);
     let (status, preview) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
     assert_eq!(status, 200, "{preview}");
     assert_eq!(preview["view"]["selectionSource"], "localPreview");
@@ -210,7 +223,7 @@ async fn offline_roundtrip_is_stable_and_preserves_display_policy() {
 }
 #[tokio::test]
 async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
-    let (dir, store, graph, app, request) = setup(0);
+    let (dir, store, graph, _state, app, request, session) = setup(0);
     let (_, preview) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
     let (status, export) = call(&app, "GET", &path(&preview, "jev-request"), Value::Null).await;
     assert_eq!(status, 200);
@@ -290,12 +303,11 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
         404
     );
     let index_generation = store.status().unwrap().revision.index_generation;
-    let leader = store.leader().unwrap();
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &leader,
+        session.leader_guard().unwrap(),
         baleyg::model::IndexPin {
             index_generation,
             index_revision: 1,
@@ -303,7 +315,6 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
         &Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
-    drop(leader);
     assert_eq!(
         call(&app, "POST", "/api/questions/preview", request)
             .await
@@ -323,7 +334,7 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
 }
 #[tokio::test]
 async fn cache_is_bounded_and_failed_previews_do_not_evict() {
-    let (_d, _store, _graph, app, mut request) = setup(0);
+    let (_d, _store, _graph, _state, app, mut request, _session) = setup(0);
     let mut previews = Vec::new();
     for i in 0..8 {
         request["question"] = json!(format!("helper question {i}"));
@@ -369,7 +380,7 @@ async fn cache_is_bounded_and_failed_previews_do_not_evict() {
 }
 #[tokio::test]
 async fn strict_inputs_guards_and_body_limits_apply_to_question_routes() {
-    let (_d, _s, _g, app, request) = setup(0);
+    let (_d, _s, _g, _state, app, request, _session) = setup(0);
     for field in [
         "context",
         "sourceFiles",
@@ -440,7 +451,7 @@ async fn strict_inputs_guards_and_body_limits_apply_to_question_routes() {
 }
 #[tokio::test]
 async fn oversized_export_explains_how_to_narrow_without_truncation() {
-    let (_d, _s, _g, app, request) = setup(180_000);
+    let (_d, _s, _g, _state, app, request, _session) = setup(180_000);
     let (status, p) = call(&app, "POST", "/api/questions/preview", request).await;
     assert_eq!(status, 200, "{p}");
     let (status, error) = call(&app, "GET", &path(&p, "jev-request"), Value::Null).await;
@@ -456,7 +467,7 @@ async fn oversized_export_explains_how_to_narrow_without_truncation() {
 #[tokio::test]
 async fn packet_operation_pair_matrix() {
     use baleyg::store::topology::UseGuard;
-    let (temp, _store, graph, app, request) = setup(0);
+    let (temp, _store, graph, _state, app, request, session) = setup(0);
     let (code, preview) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
     assert_eq!(code, 200, "{preview}");
     let old: IndexPin = serde_json::from_value(preview["packet"]["revision"].clone()).unwrap();
@@ -470,6 +481,7 @@ async fn packet_operation_pair_matrix() {
         "{}.lock",
         dir.file_name().unwrap().to_string_lossy()
     ));
+    drop(session);
     let exclusive = UseGuard::acquire_existing(&lock, true, true).unwrap();
     std::fs::remove_file(dir.join("index.db")).unwrap();
     std::fs::remove_file(dir.join("leader.lock")).unwrap();
@@ -478,11 +490,12 @@ async fn packet_operation_pair_matrix() {
     let recreated =
         crate::common::open_store(&temp.path().join("state"), &temp.path().join("workspace"))
             .unwrap();
+    let replacement_session = recreated.leader_session().unwrap();
     publish_bundle(
         &recreated,
         &graph,
         &temp.path().join("workspace"),
-        &recreated.leader().unwrap(),
+        replacement_session.leader_guard().unwrap(),
         recreated.index_baseline().unwrap(),
         &Arc::new(AtomicBool::new(false)),
     )
@@ -506,7 +519,7 @@ async fn packet_operation_pair_matrix() {
 
 #[tokio::test]
 async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_terminal_packet() {
-    let (temp, _store, _graph, app, request) = setup(0);
+    let (temp, _store, _graph, state, app, request, session) = setup(0);
     let (status, old) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
     assert_eq!(status, StatusCode::OK, "{old}");
     let old_pin = old["packet"]["revision"].clone();
@@ -564,6 +577,7 @@ async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_termina
         assert_eq!(result["error"]["code"], "index_not_ready");
         assert!(!result.to_string().contains("lexical-guess"));
     }
+    state.retain_serving_session(session.clone());
     let (status, job) = call(
         &app,
         "POST",
@@ -668,7 +682,7 @@ fn publish_bundle(
 
 #[tokio::test]
 async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
-    let (dir, store, _graph, app, request) = setup(0);
+    let (dir, store, _graph, _state, app, request, _session) = setup(0);
     let (status, preview) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
     assert_eq!(status, StatusCode::OK, "{preview}");
     let (status, export) = call(&app, "GET", &path(&preview, "jev-request"), Value::Null).await;
@@ -743,14 +757,14 @@ async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
             StatusCode::SERVICE_UNAVAILABLE,
             "{action}: {result}"
         );
-        assert_eq!(result["error"]["code"], "index_not_ready");
+        assert_eq!(result["error"]["code"], "incompatible_index");
         assert!(!result.to_string().contains("function seed"));
     }
 }
 
 #[tokio::test]
 async fn cached_packet_refuses_changed_selected_graph_call_under_same_pin() {
-    let (dir, store, _graph, app, request) = setup(0);
+    let (dir, store, _graph, _state, app, request, _session) = setup(0);
     let (status, preview) = call(&app, "POST", "/api/questions/preview", request).await;
     assert_eq!(status, StatusCode::OK, "{preview}");
     let id = preview["packet"]["context"]["calls"][0]["id"]

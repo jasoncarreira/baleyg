@@ -12,6 +12,7 @@ use crate::{
     },
     store::Store,
 };
+use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
@@ -101,6 +102,7 @@ impl DependencyIndex {
 }
 pub struct DaemonState {
     store: Store,
+    serving_session: Mutex<Option<Arc<crate::store::topology::LeaderSession>>>,
     options: IndexOptions,
     browser: crate::file_tree::SourceDir,
     rust_sources: Vec<crate::rust_sources::Root>,
@@ -207,6 +209,7 @@ pub fn new_with_dependency_options(
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
     Ok(Arc::new(DaemonState {
         store,
+        serving_session: Mutex::new(None),
         options: index_options,
         browser: crate::file_tree::SourceDir::open(&browse_root)?,
         rust_sources: crate::rust_sources::open_roots(source_roots)?,
@@ -238,6 +241,19 @@ pub fn new_with_dependency_options(
     }))
 }
 impl DaemonState {
+    pub fn retain_serving_session(&self, session: Arc<crate::store::topology::LeaderSession>) {
+        *self.serving_session.lock().unwrap() = Some(session);
+    }
+    pub fn retained_serving_session(
+        &self,
+    ) -> anyhow::Result<Arc<crate::store::topology::LeaderSession>> {
+        self.serving_session
+            .lock()
+            .unwrap()
+            .clone()
+            .context("index_not_ready: no verified daemon serving session")
+    }
+
     /// Start a replacement generation without doing filesystem or database work on the caller.
     /// A previous generation can finish, but can never publish over its replacement.
     pub fn start_dependency_index(self: &Arc<Self>) {
@@ -1336,8 +1352,15 @@ async fn start_index(
             ));
         }
     }
+    let retained = s.serving_session.lock().unwrap().clone().ok_or(ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "index_not_ready",
+        "No verified daemon serving session",
+    ))?;
     let coordinator = db(s.clone(), move |store| {
-        crate::index_coordinator::IndexJobCoordinator::prepare(store, requested)
+        crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+            store, requested, retained,
+        )
     })
     .await?;
     let cancel = Arc::new(AtomicBool::new(false));
@@ -2088,12 +2111,13 @@ mod live_tests {
             .unwrap()
             .id
             .clone();
+        let session = store.leader_session().unwrap();
         store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -2109,16 +2133,16 @@ mod live_tests {
             .with_test_endpoint(endpoint),
         );
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let app = router(
-            new_with_jev(
-                store.clone(),
-                options,
-                token.into(),
-                "127.0.0.1:7331".parse().unwrap(),
-                Some(provider.clone()),
-            )
-            .unwrap(),
-        );
+        let state = new_with_jev(
+            store.clone(),
+            options,
+            token.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+            Some(provider.clone()),
+        )
+        .unwrap();
+        state.retain_serving_session(session.clone());
+        let app = router(state);
         let request = |path: &str, body: Value| {
             axum::http::Request::builder()
                 .method("POST")
@@ -2197,9 +2221,15 @@ mod live_tests {
             )
             .unwrap();
             let expected = store.status().unwrap().revision;
-            let leader = store.leader().unwrap();
             store
-                .publish_native(&updated, &captured, &native, &leader, expected, &cancel)
+                .publish_native(
+                    &updated,
+                    &captured,
+                    &native,
+                    session.leader_guard().unwrap(),
+                    expected,
+                    &cancel,
+                )
                 .unwrap();
         }
         release.notify_one();
@@ -2314,12 +2344,13 @@ mod dependency_lifecycle_tests {
             |_| {},
         )
         .unwrap();
+        let session = store.leader_session().unwrap();
         let pin0 = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -2336,6 +2367,7 @@ mod dependency_lifecycle_tests {
             Some(CatalogOptions::default()),
         )
         .unwrap();
+        state.retain_serving_session(session.clone());
         let active = AtomicBool::new(false);
         state.dependencies.lock().unwrap().generation = 2;
         state.publish_dependency_index(2, &active, Ok(catalog("new", pin0)));
@@ -2356,7 +2388,7 @@ mod dependency_lifecycle_tests {
                 &updated,
                 &captured,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 pin0,
                 &cancel,
             )

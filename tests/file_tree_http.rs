@@ -13,7 +13,12 @@ use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-fn setup() -> (tempfile::TempDir, Store, Router) {
+fn setup() -> (
+    tempfile::TempDir,
+    Store,
+    Router,
+    Arc<baleyg::store::topology::LeaderSession>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("cwd");
     let workspace = root.join("sample");
@@ -26,29 +31,30 @@ fn setup() -> (tempfile::TempDir, Store, Router) {
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
         index_workspace_bundle(&opts, store.root_id(), &cancel, |_| {}).unwrap();
+    let session = store.leader_session().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
-    let app = http::router(
-        http::new_with_browser_root(
-            store.clone(),
-            opts,
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-            None,
-            None,
-            root,
-        )
-        .unwrap(),
-    );
-    (temp, store, app)
+    let state = http::new_with_browser_root(
+        store.clone(),
+        opts,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+        None,
+        None,
+        root,
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
+    (temp, store, app, session)
 }
 async fn call(app: &Router, path: &str) -> (u16, Value) {
     let req = Request::builder()
@@ -65,7 +71,7 @@ async fn call(app: &Router, path: &str) -> (u16, Value) {
 }
 #[tokio::test]
 async fn cwd_metadata_maps_nested_index_without_content_or_mutation() {
-    let (temp, store, app) = setup();
+    let (temp, store, app, _session) = setup();
     let before = store.status().unwrap();
     let (status, page) = call(&app, "/api/tree").await;
     assert_eq!(status, 200);
@@ -128,7 +134,7 @@ async fn cwd_metadata_maps_nested_index_without_content_or_mutation() {
 }
 #[tokio::test]
 async fn paths_errors_auth_and_guards() {
-    let (_temp, _store, app) = setup();
+    let (_temp, _store, app, _session) = setup();
     for path in [
         "/api/tree?path=..",
         "/api/tree?path=%2Ftmp",
@@ -176,7 +182,7 @@ async fn paths_errors_auth_and_guards() {
 #[cfg(unix)]
 #[tokio::test]
 async fn symlink_listing_and_intermediate_escape_rejected() {
-    let (temp, _store, app) = setup();
+    let (temp, _store, app, _session) = setup();
     std::os::unix::fs::symlink(
         temp.path().join("cwd/sample"),
         temp.path().join("cwd/alias"),
@@ -198,7 +204,7 @@ async fn symlink_listing_and_intermediate_escape_rejected() {
 
 #[tokio::test]
 async fn reasons_distinguish_languages_pending_files_and_workspace_boundary() {
-    let (temp, _store, app) = setup();
+    let (temp, _store, app, _session) = setup();
     let cases = [
         (
             "main.rs",

@@ -38,14 +38,111 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
         );
     }
     let output = cmd.output().unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("index_not_ready"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["stats"]["files"], 0);
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.odin.baleyg"
     } else {
         ".cache/baleyg"
     });
     assert!(cache.exists());
+}
+
+#[test]
+fn standalone_takeover_reuses_recorded_nondefault_file_cap() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    let mut boundary = vec![b' '; 2_621_440];
+    boundary.extend_from_slice(
+        b"
+function boundary() {}
+",
+    );
+    fs::write(root.join("boundary.js"), boundary).unwrap();
+
+    let indexed = command(&root, &home, "index")
+        .arg("--max-file-bytes")
+        .arg("3145728")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    assert_eq!(indexed["status"]["stats"]["files"], 1);
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let db_path = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let options: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let options: Value = serde_json::from_str(&options).unwrap();
+    assert_eq!(options["maxFileBytes"], 3_145_728);
+    drop(db);
+
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["stats"]["files"], 1);
+    assert_eq!(status["revision"]["indexRevision"], 2);
+    let exported = command(&root, &home, "export").output().unwrap();
+    assert!(exported.status.success());
+    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let files = graph["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "boundary.js");
+    assert_eq!(
+        files[0]["text"].as_str().unwrap().as_bytes(),
+        fs::read(root.join("boundary.js")).unwrap()
+    );
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let (options, revision): (String, i64) = db
+        .query_row(
+            "SELECT reconcile_options,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&options).unwrap()["maxFileBytes"],
+        3_145_728
+    );
+    assert_eq!(
+        revision, 3,
+        "export must perform exactly one recorded-option takeover"
+    );
+
+    let default_home = temp.path().join("default-home");
+    let default = command(&root, &default_home, "index").output().unwrap();
+    assert!(!default.status.success());
+    assert!(default.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&default.stderr).contains("unsafe or oversized input"),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
 }
 
 #[test]
@@ -65,7 +162,11 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     )
     .unwrap();
     let before = fs::read(root.join("flow.js")).unwrap();
-    let output = command(&root, &state, "index").output().unwrap();
+    let output = command(&root, &state, "index")
+        .arg("--max-file-bytes")
+        .arg("1048576")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -74,6 +175,14 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["status"]["stats"]["files"], 1);
     assert_eq!(result["status"]["stats"]["semanticState"], "unavailable");
+    let status = command(&root, &state, "status").output().unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["stats"]["files"], 1);
     let output = command(&root, &state, "symbols")
         .arg("--search")
         .arg("start")
@@ -271,9 +380,14 @@ fn fixed_locations_and_removed_flag() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let unready = command(&root, &home, "status").output().unwrap();
-    assert!(!unready.status.success());
-    assert!(String::from_utf8_lossy(&unready.stderr).contains("index_not_ready"));
+    let initial = command(&root, &home, "status").output().unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(initial["revision"]["indexRevision"], 1);
     let status = command(&root, &home, "index").output().unwrap();
     assert!(
         status.status.success(),
@@ -282,7 +396,11 @@ fn fixed_locations_and_removed_flag() {
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
     let first = &first["status"];
-    assert_eq!(first["revision"]["indexRevision"], 1);
+    assert_eq!(first["revision"]["indexRevision"], 2);
+    assert_eq!(
+        first["revision"]["indexGeneration"],
+        initial["revision"]["indexGeneration"]
+    );
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -307,11 +425,13 @@ fn fixed_locations_and_removed_flag() {
         .unwrap();
     assert!(!removed.status.success());
     assert!(String::from_utf8_lossy(&removed.stderr).contains("--state-dir"));
+    let final_status: Value =
+        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&command(&root, &home, "status").output().unwrap().stdout)
-            .unwrap()["revision"],
-        first["revision"]
+        final_status["revision"]["indexGeneration"],
+        first["revision"]["indexGeneration"]
     );
+    assert_eq!(final_status["revision"]["indexRevision"], 3);
 }
 #[test]
 fn index_forwards_pair_and_reports_pair() {
@@ -320,8 +440,9 @@ fn index_forwards_pair_and_reports_pair() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let unready = command(&root, &home, "status").output().unwrap();
-    assert!(!unready.status.success());
+    let initial = command(&root, &home, "status").output().unwrap();
+    assert!(initial.status.success());
+    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
     let result = command(&root, &home, "index").output().unwrap();
     assert!(
         result.status.success(),
@@ -337,7 +458,11 @@ fn index_forwards_pair_and_reports_pair() {
         published["status"]["evidenceFormat"],
         "terminal-native-graph-v1"
     );
-    assert_eq!(published["publishedRevision"]["indexRevision"], 1);
+    assert_eq!(published["publishedRevision"]["indexRevision"], 2);
+    assert_eq!(
+        published["publishedRevision"]["indexGeneration"],
+        initial["revision"]["indexGeneration"]
+    );
 }
 #[test]
 fn export_path_refusals() {
@@ -386,10 +511,18 @@ fn current_commands_pair_matrix() {
         serde_json::from_slice::<Value>(&index.stdout).unwrap()["publishedRevision"].clone();
     let status: Value =
         serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
-    assert_eq!(status["revision"], pin);
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(status["revision"]["indexRevision"], 2);
     let symbols: Value =
         serde_json::from_slice(&command(&root, &home, "symbols").output().unwrap().stdout).unwrap();
-    assert_eq!(symbols["revision"], pin);
+    assert_eq!(
+        symbols["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(symbols["revision"]["indexRevision"], 3);
     let seed = symbols["items"]
         .as_array()
         .unwrap()
@@ -407,7 +540,18 @@ fn current_commands_pair_matrix() {
             .stdout,
     )
     .unwrap();
-    assert_eq!(query["revision"], pin);
+    assert_eq!(query["revision"]["indexGeneration"], pin["indexGeneration"]);
+    assert_eq!(query["revision"]["indexRevision"], 4);
+    let exported: Value =
+        serde_json::from_slice(&command(&root, &home, "export").output().unwrap().stdout).unwrap();
+    assert_eq!(exported["files"].as_array().unwrap().len(), 1);
+    let status: Value =
+        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(status["revision"]["indexRevision"], 6);
 }
 
 #[test]
@@ -736,29 +880,53 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         db.pragma_update(None, "user_version", 4).unwrap();
         db.execute("UPDATE calls SET payload=json_set(payload,'$.target','lexical-guess','$.resolution','internal')",[]).unwrap();
     }
-    for sub in ["status", "symbols", "query", "export"] {
+    let mut rebuilt_generation = None;
+    for (ordinal, sub) in ["status", "symbols", "query", "export"]
+        .into_iter()
+        .enumerate()
+    {
         let mut cmd = command(&root, &home, sub);
         if sub == "query" {
             cmd.arg("--seed").arg(&valid_seed);
         }
-        let blocked_export = temp.path().join("old-export-must-not-exist.json");
+        let export_path = temp.path().join("rebuilt-export.json");
         if sub == "export" {
-            cmd.arg("--output").arg(&blocked_export);
+            cmd.arg("--output").arg(&export_path);
         }
         let result = cmd.output().unwrap();
-        assert!(!blocked_export.exists(), "old export wrote a destination");
         assert!(
-            !result.status.success(),
-            "{sub} unexpectedly read old index"
+            result.status.success(),
+            "{sub}: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let (generation, revision): (String, i64) = db
+            .query_row(
+                "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(generation, old_pin["indexGeneration"].as_str().unwrap());
+        if let Some(expected) = rebuilt_generation.as_ref() {
+            assert_eq!(&generation, expected);
+        } else {
+            rebuilt_generation = Some(generation.clone());
+        }
+        assert_eq!(revision, i64::try_from(ordinal + 1).unwrap());
         let visible = format!(
             "{}{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(visible.contains("index_not_ready"), "{sub}: {visible}");
-        assert!(!visible.contains(old_pin["indexGeneration"].as_str().unwrap()));
         assert!(!visible.contains("lexical-guess"));
+        if sub == "export" {
+            assert!(export_path.exists());
+            assert!(
+                !String::from_utf8_lossy(&fs::read(&export_path).unwrap())
+                    .contains("lexical-guess")
+            );
+        }
     }
     // Real CLI exploit regression: an exact legacy4 DB with an extra trigger
     // cannot rebaseline into a forged schema5 publication or write anything.
@@ -805,7 +973,17 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
     let status = command(&root, &home, "status").output().unwrap();
     assert!(status.status.success());
     let ready: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(ready["revision"], next["status"]["revision"]);
+    assert_eq!(
+        ready["revision"]["indexGeneration"],
+        next["status"]["revision"]["indexGeneration"]
+    );
+    assert_eq!(
+        ready["revision"]["indexRevision"].as_u64().unwrap(),
+        next["status"]["revision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            + 1
+    );
     let queried = command(&root, &home, "query")
         .arg("--seed")
         .arg(&valid_seed)
@@ -817,7 +995,14 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         String::from_utf8_lossy(&queried.stderr)
     );
     let view: Value = serde_json::from_slice(&queried.stdout).unwrap();
-    assert_eq!(view["revision"], ready["revision"]);
+    assert_eq!(
+        view["revision"]["indexGeneration"],
+        ready["revision"]["indexGeneration"]
+    );
+    assert_eq!(
+        view["revision"]["indexRevision"].as_u64().unwrap(),
+        ready["revision"]["indexRevision"].as_u64().unwrap() + 1
+    );
     assert!(
         view["calls"]
             .as_array()
@@ -1161,11 +1346,112 @@ def sink():
             let diagnostic = diagnostic.replace(TOKEN, "[redacted]");
             panic!("{name}: daemon did not start: status={status:?}, stderr={diagnostic}");
         }
+        let post_start_status: Value = client
+            .get(format!("{url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let post_start_pin = post_start_status["revision"].clone();
+        assert_eq!(
+            post_start_pin["indexGeneration"],
+            old_pin["indexGeneration"]
+        );
+        assert!(
+            post_start_pin["indexRevision"].as_u64().unwrap()
+                > old_pin["indexRevision"].as_u64().unwrap()
+        );
+        let native_as_leader = real_native_snapshot(&home);
+        let follower_status: Value =
+            serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout)
+                .unwrap();
+        assert_eq!(follower_status["revision"], post_start_pin, "{name}");
+        let follower_symbols = command(&root, &home, "symbols").output().unwrap();
+        assert!(follower_symbols.status.success(), "{name}");
+        let follower_symbols: Value = serde_json::from_slice(&follower_symbols.stdout).unwrap();
+        assert_eq!(follower_symbols["revision"], post_start_pin, "{name}");
+        if let Some(follower_seed) = follower_symbols["items"]
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item["id"].as_str())
+        {
+            let follower_query = command(&root, &home, "query")
+                .arg("--seed")
+                .arg(follower_seed)
+                .output()
+                .unwrap();
+            assert!(follower_query.status.success(), "{name}");
+            let follower_query: Value = serde_json::from_slice(&follower_query.stdout).unwrap();
+            assert_eq!(follower_query["revision"], post_start_pin, "{name}");
+        }
+        let follower_export = command(&root, &home, "export").output().unwrap();
+        assert!(follower_export.status.success(), "{name}");
+        assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
+
+        let follower_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let follower_port = follower_listener.local_addr().unwrap().port();
+        drop(follower_listener);
+        let follower_stderr = tmp.path().join("follower-daemon-stderr");
+        let mut follower_server = Server(
+            isolated_command(&home)
+                .arg("serve")
+                .arg("--workspace")
+                .arg(&root)
+                .arg("--bind")
+                .arg(format!("127.0.0.1:{follower_port}"))
+                .arg("--token-file")
+                .arg(&token_file)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(
+                    fs::File::create(&follower_stderr).unwrap(),
+                ))
+                .spawn()
+                .unwrap(),
+        );
+        let follower_url = format!("http://127.0.0.1:{follower_port}");
+        let mut follower_ready = false;
+        for _ in 0..100 {
+            if client
+                .get(format!("{follower_url}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                follower_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(follower_ready, "{name}: follower daemon did not start");
+        let follower_http_status: Value = client
+            .get(format!("{follower_url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(follower_http_status["revision"], post_start_pin, "{name}");
+        let refused = client
+            .post(format!("{follower_url}/api/index"))
+            .header("Origin", &follower_url)
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({"expectedRevision":post_start_pin.clone()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 409, "{name}");
+        assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
+        assert!(follower_server.0.try_wait().unwrap().is_none());
         let request = || {
             client
                 .post(format!("{url}/api/index"))
                 .header("Origin", &url)
-                .json(&serde_json::json!({"expectedRevision":old_pin}))
+                .json(&serde_json::json!({"expectedRevision":post_start_pin.clone()}))
         };
         let denied = request().bearer_auth("incorrect").send().await.unwrap();
         assert_eq!(denied.status(), 401, "{name}");
@@ -1216,8 +1502,15 @@ def sink():
         .unwrap();
         assert_eq!(completed["state"], "completed", "{name}: {completed}");
         let pin = completed["revision"].clone();
-        assert_eq!(pin["indexGeneration"], old_pin["indexGeneration"], "{name}");
-        assert_eq!(pin["indexRevision"], 2, "{name}");
+        assert_eq!(
+            pin["indexGeneration"], post_start_pin["indexGeneration"],
+            "{name}"
+        );
+        assert_eq!(
+            pin["indexRevision"].as_u64().unwrap(),
+            post_start_pin["indexRevision"].as_u64().unwrap() + 1,
+            "{name}"
+        );
         let status: Value = client
             .get(format!("{url}/api/status"))
             .bearer_auth(TOKEN)
@@ -2195,4 +2488,133 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         );
     }
     drop(server);
+}
+
+#[cfg(unix)]
+#[test]
+fn index_process_holds_leader_while_stdout_is_blocked() {
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let index_dir = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+            .join(&identity.root_key)
+    } else {
+        home.join(".cache/baleyg/indexes").join(&identity.root_key)
+    };
+
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut reader = unsafe { File::from_raw_fd(fds[0]) };
+    let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let fill = [b'x'; 4096];
+    let mut filler_bytes = 0usize;
+    loop {
+        match writer.write(&fill) {
+            Ok(bytes) => filler_bytes += bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("prefill stdout pipe: {error}"),
+        }
+    }
+    assert!(filler_bytes > 0);
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+        0
+    );
+
+    let stderr_path = temp.path().join("blocked-index-stderr");
+    let mut child = ChildGuard(
+        command(&root, &home, "index")
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::from(File::create(&stderr_path).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    let db_path = index_dir.join("index.db");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!(
+                "index exited before publication barrier ({status}): {}",
+                fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+        if db_path.exists()
+            && let Ok(db) = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+        {
+            db.busy_timeout(Duration::from_millis(50)).unwrap();
+            let published = db
+                .query_row(
+                    "SELECT reconciled_incarnation IS NOT NULL,index_revision FROM index_metadata WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .is_ok_and(|(reconciled, revision)| reconciled && revision == 1);
+            drop(db);
+            if published {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "index publication barrier timed out: {}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "child escaped the full stdout pipe"
+    );
+    let leader_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(index_dir.join("leader.lock"))
+        .unwrap();
+    let locked = unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_ne!(locked, 0, "index released leadership before writing stdout");
+
+    let mut filler = vec![0; filler_bytes];
+    reader.read_exact(&mut filler).unwrap();
+    assert!(filler.iter().all(|byte| *byte == b'x'));
+    let mut stdout = Vec::new();
+    reader.read_to_end(&mut stdout).unwrap();
+    assert!(child.0.wait().unwrap().success());
+    let output: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(output["publishedRevision"]["indexRevision"], 1);
+    assert_eq!(output["status"]["revision"]["indexRevision"], 1);
+    assert_eq!(output["status"]["stats"]["files"], 1);
+    assert_eq!(
+        unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_UN) };
 }

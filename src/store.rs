@@ -286,6 +286,21 @@ impl DerefMut for IndexConnection {
         &mut self.db
     }
 }
+
+/// One coherent native read snapshot retained until its owned result passes T03.
+struct EvidenceResponse {
+    store: Store,
+    db: IndexConnection,
+    follower: topology::FollowerGuard,
+    marker: uuid::Uuid,
+}
+impl EvidenceResponse {
+    fn finish<T>(&self, value: T) -> Result<T> {
+        self.store.identity.verify()?;
+        self.follower.verify(self.marker)?;
+        Ok(value)
+    }
+}
 fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         if suffix == "-journal" && !writable {
@@ -1626,6 +1641,17 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+fn native_index_unavailable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<topology::IndexNotReady>().is_some()
+}
+fn orphan_view(view: SavedView) -> SavedViewState {
+    let orphaned_ids = std::iter::once(view.query.seed.clone())
+        .chain(view.pins.keys().cloned())
+        .chain(view.hidden.iter().cloned())
+        .collect();
+    SavedViewState { view, orphaned_ids }
+}
 impl Store {
     pub fn open(
         roots: topology::TopologyRoots,
@@ -1794,19 +1820,27 @@ impl Store {
         before_write: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<topology::LeaderGuard> {
         self.ensure_not_recreate_pending()?;
-        drop(self.cache()?);
+        drop(
+            self.cache()
+                .map_err(|error| self.report_live_read_failure(error))?,
+        );
         let leader = self.roots.leader(&self.identity)?;
         // The leader incarnation is already durable. From this point every clone
         // must remain closed unless a complete paired publication commits.
         self.recovery_required.store(true, Ordering::Release);
         // Opening can race a second SQLite writer: repeat validation only AFTER
         // BEGIN IMMEDIATE excludes schema changes and before any metadata UPDATE.
-        let mut db = self.cache_write()?;
+        let mut db = self
+            .cache_write()
+            .map_err(|error| self.report_live_read_failure(error))?;
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         before_write(&db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let compatible = self.recovery_baseline(&tx)?.compatible;
+        let compatible = self
+            .recovery_baseline(&tx)
+            .map_err(|error| self.report_live_read_failure(error))?
+            .compatible;
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
@@ -2219,13 +2253,28 @@ impl Store {
                 .then(|| EVIDENCE_FORMAT.to_owned()),
         })
     }
+    fn ensure_public_read_ready(&self) -> Result<()> {
+        if !self.recovery_required.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self.disposition() {
+            RecoveryDisposition::Ready => {
+                Err(topology::IndexNotReady::new("reconciliation required").into())
+            }
+            RecoveryDisposition::Rebuild => {
+                anyhow::bail!(
+                    "incompatible_index: reconciliation required after invalid current index"
+                )
+            }
+            RecoveryDisposition::RecreatePending => {
+                anyhow::bail!("recovery_required: exceptional index recovery deferred")
+            }
+        }
+    }
     fn read_public_control_status(&self, db: &Connection) -> Result<IndexStatus> {
-        ensure!(
-            !self.recovery_required.load(Ordering::Acquire),
-            "index_not_ready: reconciliation required"
-        );
         self.verify_metadata_root(db)
             .map_err(|error| self.report_live_read_failure(error))?;
+        self.ensure_public_read_ready()?;
         self.decode_control_status_raw(db)
             .map_err(|error| self.report_live_read_failure(error))
     }
@@ -2275,8 +2324,145 @@ impl Store {
     pub fn root_id(&self) -> &str {
         &self.identity.record_id
     }
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace_root
+    }
+    pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
+        let db = self.cache()?;
+        let schema: u32 =
+            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+        if schema != DATABASE_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        let payload: Option<String> = storage_result(db.query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        ))?;
+        let payload = payload.context("incompatible_index: missing reconcile options")?;
+        let options: crate::indexer::ReconcileOptions = serde_json::from_str(&payload)
+            .context("incompatible_index: invalid reconcile options")?;
+        ensure!(
+            json(&options)? == payload && options.version == 1,
+            "incompatible_index: unsupported reconcile options"
+        );
+        let mut result =
+            crate::indexer::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
+        result.max_file_bytes = options.max_file_bytes;
+        result.scip_path = options.scip_path.map(Into::into);
+        result.manifest_path = options.manifest_path.map(Into::into);
+        Ok(Some(result))
+    }
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
+    }
+    pub fn leader_session(&self) -> Result<Arc<topology::LeaderSession>> {
+        Ok(Arc::new(topology::LeaderSession::leader(
+            self.leader()?,
+            self.identity.clone(),
+        )))
+    }
+    pub(crate) fn verify_leader_session(&self, session: &topology::LeaderSession) -> Result<()> {
+        session.belongs_to(&self.identity, &self.roots.leader_lock(&self.identity))
+    }
+    pub(crate) fn begin_leader_publication(&self, session: &topology::LeaderSession) -> Result<()> {
+        self.verify_leader_session(session)?;
+        self.recovery_required.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub fn follower_session(&self) -> Result<Arc<topology::LeaderSession>> {
+        let db = self
+            .cache()
+            .map_err(|error| self.report_live_read_failure(error))?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        let (_, marker) = self.admit_evidence_control(&db)?;
+        let follower = self.roots.follower(self.identity.clone())?;
+        self.verify_follower_marker(&follower, marker)?;
+        drop(db);
+        Ok(Arc::new(topology::LeaderSession::follower(follower)))
+    }
+    fn admit_evidence_control(&self, db: &Connection) -> Result<(IndexStatus, uuid::Uuid)> {
+        self.verify_metadata_root(db)
+            .map_err(|error| self.report_live_read_failure(error))?;
+        self.ensure_public_read_ready()?;
+        let schema: u32 =
+            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+        if schema != DATABASE_SCHEMA_VERSION {
+            return Err(topology::IndexNotReady::new("reconciliation required").into());
+        }
+        let status = self.read_status(db)?;
+        let marker: Option<String> = db
+            .query_row(
+                "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| self.report_live_read_failure(selected_integrity(error.into())))?;
+        let marker = marker
+            .context("incompatible_index: missing reconciled incarnation")
+            .and_then(|value| {
+                uuid::Uuid::parse_str(&value)
+                    .context("incompatible_index: invalid reconciled incarnation")
+            })
+            .map_err(|error| self.report_live_read_failure(selected_integrity(error)))?;
+        Ok((status, marker))
+    }
+    fn verify_follower_marker(
+        &self,
+        follower: &topology::FollowerGuard,
+        marker: uuid::Uuid,
+    ) -> Result<()> {
+        if follower.incarnation != marker {
+            return Err(topology::IndexNotReady::new("reconciled leader mismatch").into());
+        }
+        self.identity.verify()?;
+        follower.verify(marker)
+    }
+    fn evidence_response(&self) -> Result<EvidenceResponse> {
+        self.ensure_not_recreate_pending()?;
+        let db = self
+            .cache()
+            .map_err(|error| self.report_live_read_failure(error))?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        let (_, marker) = self.admit_evidence_control(&db)?;
+        let follower = self.roots.follower(self.identity.clone())?;
+        self.verify_follower_marker(&follower, marker)?;
+        Ok(EvidenceResponse {
+            store: self.clone(),
+            db,
+            follower,
+            marker,
+        })
+    }
+    fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.with_evidence_hook(read, || Ok(()))
+    }
+    fn with_evidence_hook<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+        before_finish: impl FnOnce() -> Result<()>,
+    ) -> Result<T> {
+        self.with_evidence_observed(read, before_finish, |_| {})
+    }
+    fn with_evidence_observed<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+        before_finish: impl FnOnce() -> Result<()>,
+        observe_finish: impl FnOnce(&Result<()>),
+    ) -> Result<T> {
+        let response = self.evidence_response()?;
+        let value = read(&response.db);
+        let hook = before_finish();
+        let fence = response.finish(());
+        observe_finish(&fence);
+        match value {
+            Err(error) => Err(error),
+            Ok(value) => {
+                hook?;
+                fence?;
+                Ok(value)
+            }
+        }
     }
     pub fn status(&self) -> Result<IndexStatus> {
         self.status_with_open_hook(|_| Ok(()))
@@ -2288,10 +2474,12 @@ impl Store {
         before_snapshot: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<IndexStatus> {
         self.ensure_not_recreate_pending()?;
-        let mut db = self.cache()?;
+        let db = self
+            .cache()
+            .map_err(|error| self.report_live_read_failure(error))?;
         before_snapshot(&db)?;
-        let tx = storage_result(db.transaction())?;
-        self.read_status(&tx)
+        drop(db);
+        self.with_evidence(|db| self.read_status(db))
     }
     pub fn publish(
         &self,
@@ -2581,12 +2769,16 @@ impl Store {
         check_cancel(cancel)?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
-        let mut db = self.cache_write()?;
+        let mut db = self
+            .cache_write()
+            .map_err(|error| self.report_live_read_failure(error))?;
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         during_tx(PublishStage::BeforeTransaction, &db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let current = self.recovery_baseline(&tx)?;
+        let current = self
+            .recovery_baseline(&tx)
+            .map_err(|error| self.report_live_read_failure(error))?;
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
@@ -2789,13 +2981,13 @@ impl Store {
         pin: IndexPin,
         read: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        ensure!(
-            self.read_status(&tx)?.revision == pin,
-            "revision conflict: stale native pin"
-        );
-        read(&tx).map_err(|error| self.report_selected_failure(error))
+        self.with_evidence(|db| {
+            ensure!(
+                self.read_status(db)?.revision == pin,
+                "revision conflict: stale native pin"
+            );
+            read(db).map_err(|error| self.report_selected_failure(error))
+        })
     }
 
     /// Reparse exactly one selected, paired source in this SQLite snapshot.
@@ -3804,9 +3996,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         request: &crate::navigation::NavigationRequest,
     ) -> Result<crate::navigation::NavigationResult> {
         request.validate()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(request.expected_revision() == revision, "revision conflict");
         // Navigation's source selector counts lines in the graph JSON, and its
         // member selector reads graph class/node rows. Before either consumes a
@@ -3853,7 +4044,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                         .into(),
                     ));
                 }
-                self.attest_selected_document(&tx, &path)?;
+                self.attest_selected_document(tx, &path)?;
             } else {
                 let graph_file: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",
@@ -3870,7 +4061,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 }
             }
         }
-        crate::navigation::navigate(&tx, request, revision)
+        crate::navigation::navigate(tx, request, revision)
+            })
     }
 
     pub fn classes_at(
@@ -3901,11 +4093,10 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 InvalidRequest("Choose a workspace-relative class source path.")
             );
         }
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
-        let (mut warnings, truncated) = class_metadata(&tx)
+        let (mut warnings, truncated) = class_metadata(tx)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
         let pattern = format!(
             "%{}%",
@@ -3929,7 +4120,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut bytes = 0;
         let mut byte_limited = false;
         for id in ids.iter().take(limit) {
-            let Some((class, size, clipped)) = presentation_class(self, &tx, id)? else {
+            let Some((class, size, clipped)) = presentation_class(self, tx, id)? else {
                 // Consume an individually oversized row so pagination always progresses.
                 consumed += 1;
                 byte_limited = true;
@@ -3961,7 +4152,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .map(|class| class.symbol.path.as_str())
             .collect();
         for path in paths {
-            self.attest_selected_class(&tx, path)?;
+            self.attest_selected_class(tx, path)?;
         }
         Ok(ClassPage {
             revision,
@@ -3971,6 +4162,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             warnings,
             require_index: false,
         })
+            })
     }
     /// Bounded one-hop relation reads and seed resolution share a revision-pinned
     /// read transaction. No filesystem access or graph/provider augmentation.
@@ -3980,58 +4172,57 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
     ) -> Result<crate::class_diagram::ClassDiagram> {
         use crate::class_diagram::{self, InvalidRequest};
         request.validate()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
-        ensure!(revision == request.expected_revision, "revision conflict");
-        let (warnings, truncated) = class_metadata(&tx)
-            .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
-        let (seed, clipped) = resolve_class(self, &tx, &request.seed)?;
-        // Explicitly selected measured declarations are independent roots, never
-        // connected by lexical type-name matches or candidate relationships.
-        let mut seeds = vec![seed.symbol.id.clone()];
-        let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
-        for expanded in &request.expanded {
-            let (class, _) = resolve_class(self, &tx, expanded)?;
-            if !classes.contains_key(&class.symbol.id) {
-                ensure!(
-                    classes.len() < class_diagram::MAX_NODES,
-                    InvalidRequest("Too many selected classes.")
-                );
-                seeds.push(class.symbol.id.clone());
-                classes.insert(class.symbol.id.clone(), class);
+        self.with_evidence(|tx| {
+            let revision = self.read_status(tx)?.revision;
+            ensure!(revision == request.expected_revision, "revision conflict");
+            let (warnings, truncated) = class_metadata(tx)
+                .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
+            let (seed, clipped) = resolve_class(self, tx, &request.seed)?;
+            // Explicitly selected measured declarations are independent roots, never
+            // connected by lexical type-name matches or candidate relationships.
+            let mut seeds = vec![seed.symbol.id.clone()];
+            let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
+            for expanded in &request.expanded {
+                let (class, _) = resolve_class(self, tx, expanded)?;
+                if !classes.contains_key(&class.symbol.id) {
+                    ensure!(
+                        classes.len() < class_diagram::MAX_NODES,
+                        InvalidRequest("Too many selected classes.")
+                    );
+                    seeds.push(class.symbol.id.clone());
+                    classes.insert(class.symbol.id.clone(), class);
+                }
             }
-        }
-        let paths: BTreeSet<_> = classes
-            .values()
-            .map(|class| class.symbol.path.as_str())
-            .collect();
-        for path in paths {
-            self.attest_selected_class(&tx, path)?;
-        }
-        class_diagram::project(
-            revision,
-            &seeds,
-            &classes,
-            vec![],
-            vec![],
-            warnings,
-            truncated || clipped,
-        )
+            let paths: BTreeSet<_> = classes
+                .values()
+                .map(|class| class.symbol.path.as_str())
+                .collect();
+            for path in paths {
+                self.attest_selected_class(tx, path)?;
+            }
+            class_diagram::project(
+                revision,
+                &seeds,
+                &classes,
+                vec![],
+                vec![],
+                warnings,
+                truncated || clipped,
+            )
+        })
     }
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
         Ok(self.symbols_at(query, limit)?.1)
     }
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         ensure!(query.len() <= 8192, "search query too long");
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         let selected_paths: BTreeSet<String> = tx.prepare("SELECT path FROM nodes WHERE instr(lower(name),lower(?1)) > 0 OR instr(lower(id),lower(?1)) > 0 ORDER BY CASE WHEN lower(name)=lower(?1) THEN 0 WHEN instr(lower(name),lower(?1))=1 THEN 1 ELSE 2 END,name,id LIMIT ?2")?
             .query_map(params![query,limit.min(150) as i64],|r|r.get::<_,String>(0))?
             .collect::<rusqlite::Result<_>>()?;
         for path in selected_paths {
-            self.attest_selected_document(&tx, &path)?;
+            self.attest_selected_document(tx, &path)?;
         }
         let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE instr(lower(name),lower(?1)) > 0 OR instr(lower(id),lower(?1)) > 0 ORDER BY CASE WHEN lower(name)=lower(?1) THEN 0 WHEN instr(lower(name),lower(?1))=1 THEN 1 ELSE 2 END,name,id LIMIT ?2")?;
         let values = stmt.query_map(params![query, limit.min(150) as i64], |r| {
@@ -4042,9 +4233,10 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .collect::<Result<Vec<Symbol>>>()?;
         let paths: BTreeSet<_> = values.iter().map(|node| node.path.as_str()).collect();
         for path in paths {
-            self.attest_selected_document(&tx, path)?;
+            self.attest_selected_document(tx, path)?;
         }
         Ok((revision, values))
+            })
     }
     pub fn symbol(&self, id: &str) -> Result<Option<Symbol>> {
         Ok(self.symbol_at(id, None)?.map(|(_, v)| v))
@@ -4057,21 +4249,21 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         id: &str,
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, Symbol)>> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
-        ensure!(
-            expected_revision.is_none_or(|pin| pin == revision),
-            "revision conflict"
-        );
-        let selected_path: Option<String> = tx
-            .query_row("SELECT path FROM nodes WHERE id=?1", [id], |r| r.get(0))
-            .optional()?;
-        if let Some(path) = selected_path {
-            self.attest_selected_document(&tx, &path)?;
-        }
-        let node: Option<Symbol> = one(&tx, "SELECT payload FROM nodes WHERE id=?1", id)?;
-        Ok(node.map(|node| (revision, node)))
+        self.with_evidence(|tx| {
+            let revision = self.read_status(tx)?.revision;
+            ensure!(
+                expected_revision.is_none_or(|pin| pin == revision),
+                "revision conflict"
+            );
+            let selected_path: Option<String> = tx
+                .query_row("SELECT path FROM nodes WHERE id=?1", [id], |r| r.get(0))
+                .optional()?;
+            if let Some(path) = selected_path {
+                self.attest_selected_document(tx, &path)?;
+            }
+            let node: Option<Symbol> = one(tx, "SELECT payload FROM nodes WHERE id=?1", id)?;
+            Ok(node.map(|node| (revision, node)))
+        })
     }
     fn selected_source_row(&self, db: &Connection, path: &str) -> Result<Option<SourceFile>> {
         Self::selected_source_row_bounded(db, path, 256 * 1024 * 1024)
@@ -4147,16 +4339,16 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         path: &str,
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, SourceFile)>> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
-        ensure!(
-            expected_revision.is_none_or(|pin| pin == revision),
-            "revision conflict"
-        );
-        Ok(self
-            .selected_source_row(&tx, path)?
-            .map(|file| (revision, file)))
+        self.with_evidence(|tx| {
+            let revision = self.read_status(tx)?.revision;
+            ensure!(
+                expected_revision.is_none_or(|pin| pin == revision),
+                "revision conflict"
+            );
+            Ok(self
+                .selected_source_row(tx, path)?
+                .map(|file| (revision, file)))
+        })
     }
     /// Catalog reads pin revision and rows to one SQLite read transaction.
     /// Enrich only the visible tree page from one cached index snapshot.
@@ -4165,42 +4357,50 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         root: &Path,
         items: &mut [crate::file_tree::Entry],
     ) -> Result<(IndexPin, String)> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
-        let workspace = Path::new(&self.workspace_root);
-        let mut valid_stmt = tx.prepare(
-            "SELECT NOT EXISTS(SELECT 1 FROM nodes n WHERE n.path=f.path AND json_valid(n.payload)=0) FROM files f WHERE f.path=?1",
-        )?;
-        let mut count_stmt = tx.prepare(
-            "SELECT (SELECT count(*) FROM nodes n WHERE n.path=f.path AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM files f WHERE f.path=?1",
-        )?;
-        for item in items.iter_mut().filter(|e| e.kind == "file") {
-            let absolute = root.join(&item.path);
-            let Ok(relative) = absolute.strip_prefix(workspace) else {
-                continue;
-            };
-            let Some(relative) = relative.to_str() else {
-                continue;
-            };
-            let valid: Option<bool> = valid_stmt
-                .query_row([relative], |r| r.get(0))
-                .optional()
-                .map_err(|error| self.report_selected_failure(error.into()))?;
-            let Some(valid) = valid else { continue };
-            if !valid {
-                return Err(self.report_selected_failure(
-                    SelectedIntegrity("incompatible_index: selected tree node JSON invalid".into())
-                        .into(),
-                ));
+        self.tree_metadata_with_finish_hook(root, items, || Ok(()))
+    }
+    fn tree_metadata_with_finish_hook(
+        &self,
+        root: &Path,
+        items: &mut [crate::file_tree::Entry],
+        before_finish: impl FnOnce() -> Result<()>,
+    ) -> Result<(IndexPin, String)> {
+        let (revision, workspace_root, overlays) = self.with_evidence_hook(|tx| {
+            let revision = self.read_status(tx)?.revision;
+            let workspace = Path::new(&self.workspace_root);
+            let mut valid_stmt = tx.prepare(
+                "SELECT NOT EXISTS(SELECT 1 FROM nodes n WHERE n.path=f.path AND json_valid(n.payload)=0) FROM files f WHERE f.path=?1",
+            )?;
+            let mut count_stmt = tx.prepare(
+                "SELECT (SELECT count(*) FROM nodes n WHERE n.path=f.path AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM files f WHERE f.path=?1",
+            )?;
+            let mut overlays = Vec::new();
+            for (index, item) in items.iter().enumerate().filter(|(_, entry)| entry.kind == "file") {
+                let absolute = root.join(&item.path);
+                let Ok(relative) = absolute.strip_prefix(workspace) else { continue };
+                let Some(relative) = relative.to_str() else { continue };
+                let valid: Option<bool> = valid_stmt
+                    .query_row([relative], |row| row.get(0))
+                    .optional()
+                    .map_err(|error| self.report_selected_failure(error.into()))?;
+                let Some(valid) = valid else { continue };
+                if !valid {
+                    return Err(self.report_selected_failure(
+                        SelectedIntegrity("incompatible_index: selected tree node JSON invalid".into()).into(),
+                    ));
+                }
+                let count: i64 = count_stmt
+                    .query_row([relative], |row| row.get(0))
+                    .map_err(|error| self.report_selected_failure(error.into()))?;
+                overlays.push((index, relative.to_owned(), usize::try_from(count)?));
             }
-            let count: i64 = count_stmt
-                .query_row([relative], |r| r.get(0))
-                .map_err(|error| self.report_selected_failure(error.into()))?;
-            item.indexed_path = Some(relative.into());
-            item.method_count = Some(usize::try_from(count)?);
+            Ok((revision, self.workspace_root.clone(), overlays))
+        }, before_finish)?;
+        for (index, path, count) in overlays {
+            items[index].indexed_path = Some(path);
+            items[index].method_count = Some(count);
         }
-        Ok((revision, self.workspace_root.clone()))
+        Ok((revision, workspace_root))
     }
     pub fn files_at(
         &self,
@@ -4212,9 +4412,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             (1..=200).contains(&limit) && offset <= i64::MAX as usize,
             "invalid catalog pagination"
         );
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         let selected_valid: bool = tx
             .query_row(
@@ -4246,15 +4445,15 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let next = (items.len() > limit).then_some(offset + limit);
         items.truncate(limit);
         Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
+            })
     }
     pub fn methods_at(
         &self,
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         if !tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",
@@ -4293,6 +4492,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         Ok(Some(
             serde_json::json!({"revision":revision,"items":items,"truncated":truncated}),
         ))
+            })
     }
     /// Only cached source and measured calls from the same snapshot are used.
     pub fn sequence_at(
@@ -4301,17 +4501,16 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(revision == expected, "revision conflict");
         let selected_path: Option<String> = tx
             .query_row("SELECT path FROM nodes WHERE id=?1", [seed], |r| r.get(0))
             .optional()?;
         if let Some(path) = selected_path {
-            self.attest_selected_document(&tx, &path)?;
+            self.attest_selected_document(tx, &path)?;
         }
-        let Some(symbol) = one::<Symbol>(&tx, "SELECT payload FROM nodes WHERE id=?1", seed)?
+        let Some(symbol) = one::<Symbol>(tx, "SELECT payload FROM nodes WHERE id=?1", seed)?
         else {
             return Ok(None);
         };
@@ -4319,8 +4518,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
             "invalid sequence symbol kind"
         );
-        self.attest_selected_document(&tx, &symbol.path)?;
-        let file = one::<SourceFile>(&tx, "SELECT payload FROM files WHERE path=?1", &symbol.path)?
+        self.attest_selected_document(tx, &symbol.path)?;
+        let file = one::<SourceFile>(tx, "SELECT payload FROM files WHERE path=?1", &symbol.path)?
             .context("sequence source missing")?;
         let mut stmt = tx.prepare("SELECT payload FROM calls WHERE path=?1 ORDER BY json_extract(payload,'$.range.startByte'),id")?;
         let values = stmt.query_map([&symbol.path], |r| r.get::<_, String>(0))?;
@@ -4328,6 +4527,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .map(|v| Ok(serde_json::from_str::<CallSite>(&v?)?))
             .collect::<Result<Vec<_>>>()?;
         crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
+            })
     }
     fn read_graph(&self, db: &Connection) -> Result<Graph> {
         let status = self.read_status(db)?;
@@ -4345,79 +4545,77 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         })
     }
     pub fn graph(&self) -> Result<Graph> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let graph = self.read_graph(&tx)?;
-        storage_result(tx.commit())?;
-        Ok(graph)
+        self.with_evidence(|tx| {
+            let graph = self.read_graph(tx)?;
+            Ok(graph)
+        })
     }
     /// Reauthenticate only a cached packet's selected evidence under one pin.
     /// Unrelated documents are not read; status still validates persisted capture inventory.
     pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        ensure!(
-            self.read_status(&tx)?.revision == view.revision,
-            "revision conflict: cached packet pin changed"
-        );
-        let paths: BTreeSet<_> = view
-            .nodes
-            .iter()
-            .map(|n| n.path.as_str())
-            .chain(view.calls.iter().map(|c| c.path.as_str()))
-            .chain(view.regions.iter().map(|r| r.path.as_str()))
-            .chain(sources.iter().map(|f| f.path.as_str()))
-            .collect();
-        for path in paths {
-            self.attest_selected_document(&tx, path)?;
-        }
-        for node in &view.nodes {
-            let actual: Option<Symbol> =
-                one(&tx, "SELECT payload FROM nodes WHERE id=?1", &node.id)?;
+        self.with_evidence(|tx| {
             ensure!(
-                actual.as_ref() == Some(node),
-                "incompatible_index: cached packet selected graph declaration changed"
+                self.read_status(tx)?.revision == view.revision,
+                "revision conflict: cached packet pin changed"
             );
-        }
-        for call in &view.calls {
-            let actual: Option<CallSite> =
-                one(&tx, "SELECT payload FROM calls WHERE id=?1", &call.id)?;
-            ensure!(
-                actual.as_ref() == Some(call),
-                "incompatible_index: cached packet selected graph call changed"
-            );
-        }
-        for region in &view.regions {
-            let actual: Option<ControlRegion> =
-                one(&tx, "SELECT payload FROM regions WHERE id=?1", &region.id)?;
-            ensure!(
-                actual.as_ref() == Some(region),
-                "incompatible_index: cached packet selected graph region changed"
-            );
-        }
-        for source in sources {
-            ensure!(
-                self.selected_source_row(&tx, &source.path)?.as_ref() == Some(source),
-                "incompatible_index: cached packet selected source changed"
-            );
-        }
-        Ok(())
+            let paths: BTreeSet<_> = view
+                .nodes
+                .iter()
+                .map(|n| n.path.as_str())
+                .chain(view.calls.iter().map(|c| c.path.as_str()))
+                .chain(view.regions.iter().map(|r| r.path.as_str()))
+                .chain(sources.iter().map(|f| f.path.as_str()))
+                .collect();
+            for path in paths {
+                self.attest_selected_document(tx, path)?;
+            }
+            for node in &view.nodes {
+                let actual: Option<Symbol> =
+                    one(tx, "SELECT payload FROM nodes WHERE id=?1", &node.id)?;
+                ensure!(
+                    actual.as_ref() == Some(node),
+                    "incompatible_index: cached packet selected graph declaration changed"
+                );
+            }
+            for call in &view.calls {
+                let actual: Option<CallSite> =
+                    one(tx, "SELECT payload FROM calls WHERE id=?1", &call.id)?;
+                ensure!(
+                    actual.as_ref() == Some(call),
+                    "incompatible_index: cached packet selected graph call changed"
+                );
+            }
+            for region in &view.regions {
+                let actual: Option<ControlRegion> =
+                    one(tx, "SELECT payload FROM regions WHERE id=?1", &region.id)?;
+                ensure!(
+                    actual.as_ref() == Some(region),
+                    "incompatible_index: cached packet selected graph region changed"
+                );
+            }
+            for source in sources {
+                ensure!(
+                    self.selected_source_row(tx, &source.path)?.as_ref() == Some(source),
+                    "incompatible_index: cached packet selected source changed"
+                );
+            }
+            Ok(())
+        })
     }
 
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
         query.validate()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         let selected_path: Option<String> = tx
             .query_row("SELECT path FROM nodes WHERE id=?1", [&query.seed], |r| {
                 r.get(0)
             })
             .optional()?;
         if let Some(path) = selected_path {
-            self.attest_selected_document(&tx, &path)?;
+            self.attest_selected_document(tx, &path)?;
         }
-        let seed: Option<Symbol> = one(&tx, "SELECT payload FROM nodes WHERE id=?1", &query.seed)?;
+        let seed: Option<Symbol> = one(tx, "SELECT payload FROM nodes WHERE id=?1", &query.seed)?;
         let Some(seed) = seed else { return Ok(None) };
         let mut calls = Vec::new();
         let mut region_ids = BTreeSet::new();
@@ -4443,7 +4641,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut regions = BTreeMap::new();
         while let Some(id) = region_ids.pop_first() {
             let region: Option<ControlRegion> =
-                one(&tx, "SELECT payload FROM regions WHERE id=?1", &id)?;
+                one(tx, "SELECT payload FROM regions WHERE id=?1", &id)?;
             if let Some(region) = region {
                 if let Some(parent) = &region.parent {
                     region_ids.insert(parent.clone());
@@ -4456,9 +4654,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .chain(regions.values().map(|r| r.path.as_str()))
             .collect();
         for path in paths {
-            self.attest_selected_document(&tx, path)?;
+            self.attest_selected_document(tx, path)?;
         }
-        storage_result(tx.commit())?;
         Ok(Some(ViewResult {
             revision,
             query: query.clone(),
@@ -4473,6 +4670,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 vec![]
             },
         }))
+            })
     }
     pub fn put_view(&self, view: &SavedView) -> Result<()> {
         view.validate()?;
@@ -4499,47 +4697,31 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
     }
     pub fn views(&self) -> Result<Vec<SavedViewState>> {
         let views = self.records().views()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        if self
-            .read_public_control_status(&tx)?
-            .evidence_format
-            .is_none()
-        {
-            return Ok(views
-                .into_iter()
-                .map(|view| SavedViewState {
-                    orphaned_ids: std::iter::once(view.query.seed.clone())
-                        .chain(view.pins.keys().cloned())
-                        .chain(view.hidden.iter().cloned())
-                        .collect(),
-                    view,
-                })
-                .collect());
+        match self.with_evidence(|db| {
+            views
+                .iter()
+                .cloned()
+                .map(|view| Self::resolve_view(db, view))
+                .collect()
+        }) {
+            Ok(states) => Ok(states),
+            Err(error) if native_index_unavailable(&error) => {
+                Ok(views.into_iter().map(orphan_view).collect())
+            }
+            Err(error) => Err(error),
         }
-        views
-            .into_iter()
-            .map(|v| Self::resolve_view(&tx, v))
-            .collect()
     }
     pub fn view(&self, id: &str) -> Result<Option<SavedViewState>> {
         let view = self.records().view(id)?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        if self
-            .read_public_control_status(&tx)?
-            .evidence_format
-            .is_none()
-        {
-            return Ok(view.map(|view| SavedViewState {
-                orphaned_ids: std::iter::once(view.query.seed.clone())
-                    .chain(view.pins.keys().cloned())
-                    .chain(view.hidden.iter().cloned())
-                    .collect(),
-                view,
-            }));
+        match self.with_evidence(|db| {
+            view.clone()
+                .map(|value| Self::resolve_view(db, value))
+                .transpose()
+        }) {
+            Ok(state) => Ok(state),
+            Err(error) if native_index_unavailable(&error) => Ok(view.map(orphan_view)),
+            Err(error) => Err(error),
         }
-        view.map(|v| Self::resolve_view(&tx, v)).transpose()
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
         self.records().delete_view(id)
@@ -4551,35 +4733,33 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
     }
     pub fn annotations(&self) -> Result<Vec<AnnotationState>> {
         let annotations = self.records().annotations()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        if self
-            .read_public_control_status(&tx)?
-            .evidence_format
-            .is_none()
-        {
-            return Ok(annotations
+        match self.with_evidence(|db| {
+            annotations
+                .iter()
+                .cloned()
+                .map(|annotation| {
+                    let exists: bool = db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1)",
+                        [&annotation.node_id],
+                        |row| row.get(0),
+                    )?;
+                    Ok(AnnotationState {
+                        annotation,
+                        orphaned: !exists,
+                    })
+                })
+                .collect()
+        }) {
+            Ok(states) => Ok(states),
+            Err(error) if native_index_unavailable(&error) => Ok(annotations
                 .into_iter()
                 .map(|annotation| AnnotationState {
                     annotation,
                     orphaned: true,
                 })
-                .collect());
+                .collect()),
+            Err(error) => Err(error),
         }
-        annotations
-            .into_iter()
-            .map(|annotation| {
-                let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1)",
-                    [&annotation.node_id],
-                    |r| r.get(0),
-                )?;
-                Ok(AnnotationState {
-                    annotation,
-                    orphaned: !exists,
-                })
-            })
-            .collect()
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
         self.records().delete_annotation(id)
@@ -4644,13 +4824,13 @@ mod rebaseline_fault_tests {
         let initial_cancel = Arc::new(AtomicBool::new(false));
         let (graph, native, capture) =
             index_workspace_bundle(&options, store.root_id(), &initial_cancel, |_| {}).unwrap();
-        let leader = store.leader().unwrap();
+        let session = store.leader_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &leader,
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &initial_cancel,
             )
@@ -4734,10 +4914,11 @@ mod rebaseline_fault_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_store = store.clone();
+        let worker_session = session.clone();
         let worker = std::thread::spawn(move || {
             worker_store.publish_inner_checked(
                 (&next, &next_capture, &next_native),
-                &leader,
+                worker_session.leader_guard().unwrap(),
                 pin,
                 &worker_cancel,
                 |stage, tx| {
@@ -4894,13 +5075,13 @@ mod rebaseline_fault_tests {
         let initial_cancel = Arc::new(AtomicBool::new(false));
         let (graph, native, capture) =
             index_workspace_bundle(&options, store.root_id(), &initial_cancel, |_| {}).unwrap();
-        let leader = store.leader().unwrap();
+        let session = store.leader_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &leader,
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &initial_cancel,
             )
@@ -4991,9 +5172,10 @@ mod rebaseline_fault_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_store = store.clone();
+        let worker_session = session.clone();
         let worker = std::thread::spawn(move || {
             worker_store.publish_inner_checked(
-                (&next,&next_capture,&next_native),&leader,pin,&worker_cancel,
+                (&next,&next_capture,&next_native),worker_session.leader_guard().unwrap(),pin,&worker_cancel,
                 |stage,tx|{
                     if stage!=PublishStage::BeforeCommit {return Ok(());}
                     // All graph/native/class inserts and paired checks precede
@@ -5440,6 +5622,7 @@ mod sqlite_schema_race_tests {
         crate::native_evidence::Artifact,
         IndexPin,
         CancelFlag,
+        Arc<topology::LeaderSession>,
     ) {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
@@ -5453,17 +5636,221 @@ mod sqlite_schema_race_tests {
         let options = IndexOptions::new(work.path().to_owned());
         let (graph, native, capture) =
             index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let session = store.leader_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
             .unwrap();
-        (state, work, store, graph, capture, native, pin, cancel)
+        (
+            state, work, store, graph, capture, native, pin, cancel, session,
+        )
+    }
+
+    #[test]
+    fn response_post_fence_discards_none_and_empty_results() {
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let none = store.with_evidence_hook(
+            |_db| Ok(None::<IndexStatus>),
+            || {
+                std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                Ok(())
+            },
+        );
+        assert!(none.is_err(), "post-fence failure must discard None");
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let empty = store.with_evidence_hook(
+            |_db| Ok(Vec::<Symbol>::new()),
+            || {
+                std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                Ok(())
+            },
+        );
+        assert!(
+            empty.is_err(),
+            "post-fence failure must discard an empty collection"
+        );
+    }
+
+    #[test]
+    fn direct_response_pre_fence_rejects_root_lock_and_incarnation_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let original = work.path().to_owned();
+        let moved = original.with_extension("moved-before-read");
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let root_error = store.status().unwrap_err();
+        assert!(
+            root_error.to_string().contains("root_changed"),
+            "{root_error:#}"
+        );
+        std::fs::remove_dir(&original).unwrap();
+        std::fs::rename(&moved, &original).unwrap();
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        std::fs::remove_file(&leader_path).unwrap();
+        std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string()).unwrap();
+        std::fs::set_permissions(&leader_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let lock_error = store.symbol_at("missing", None).unwrap_err();
+        assert!(
+            lock_error.to_string().contains("managed file")
+                || lock_error.to_string().contains("incarnation")
+                || lock_error.to_string().contains("leader lock is not held"),
+            "{lock_error:#}"
+        );
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string()).unwrap();
+        let incarnation_error = store.symbols_at("never", 10).unwrap_err();
+        assert!(
+            incarnation_error.to_string().contains("incarnation")
+                || incarnation_error.to_string().contains("mismatch"),
+            "{incarnation_error:#}"
+        );
+    }
+
+    #[test]
+    fn response_fences_root_lock_and_error_results_before_release() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let original = work.path().to_owned();
+        let moved = original.with_extension("moved-for-fence");
+        let root_error = store
+            .with_evidence_hook(
+                |_db| Ok(Some("owned".to_owned())),
+                || {
+                    std::fs::rename(&original, &moved)?;
+                    std::fs::create_dir(&original)?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            root_error.to_string().contains("root_changed"),
+            "{root_error:#}"
+        );
+        std::fs::remove_dir(&original).unwrap();
+        std::fs::rename(&moved, &original).unwrap();
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let lock_error = store
+            .with_evidence_hook(
+                |_db| Ok(Vec::<Symbol>::new()),
+                || {
+                    std::fs::remove_file(&leader_path)?;
+                    std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                    std::fs::set_permissions(&leader_path, std::fs::Permissions::from_mode(0o600))?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            lock_error.to_string().contains("managed file")
+                || lock_error.to_string().contains("incarnation"),
+            "{lock_error:#}"
+        );
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let finish_observed = std::cell::Cell::new(false);
+        let error = store
+            .with_evidence_observed::<()>(
+                |_db| anyhow::bail!("materialization sentinel"),
+                || {
+                    std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                    Ok(())
+                },
+                |fence| {
+                    finish_observed.set(true);
+                    assert!(
+                        fence.is_err(),
+                        "concurrent incarnation change must fail the final fence"
+                    );
+                },
+            )
+            .unwrap_err();
+        assert!(finish_observed.get(), "final fence was not attempted");
+        assert!(
+            error.to_string().contains("materialization sentinel"),
+            "original materialization error must win: {error:#}"
+        );
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let finish_observed = std::cell::Cell::new(false);
+        let io_error = store
+            .with_evidence_observed::<()>(
+                |_db| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+                || {
+                    std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                    Ok(())
+                },
+                |fence| {
+                    finish_observed.set(true);
+                    assert!(fence.is_err());
+                },
+            )
+            .unwrap_err();
+        assert!(finish_observed.get());
+        assert!(
+            io_error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(!native_index_unavailable(&io_error));
+    }
+
+    #[test]
+    fn tree_metadata_applies_no_overlay_before_post_fence() {
+        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let mut entries = vec![crate::file_tree::Entry {
+            name: "flow.js".into(),
+            path: "flow.js".into(),
+            kind: "file",
+            indexed_path: None,
+            method_count: None,
+            unindexed_reason: None,
+        }];
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let error = store
+            .tree_metadata_with_finish_hook(work.path(), &mut entries, || {
+                std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("incarnation"), "{error:#}");
+        assert!(entries[0].indexed_path.is_none());
+        assert!(entries[0].method_count.is_none());
+    }
+
+    #[test]
+    fn durable_fallback_classifier_excludes_operational_and_current_corruption_errors() {
+        let operational: anyhow::Error =
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
+        assert!(!native_index_unavailable(&operational));
+        let sqlite: anyhow::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            None,
+        )
+        .into();
+        assert!(!native_index_unavailable(&sqlite));
+        let corruption: anyhow::Error =
+            ControlIntegrity("incompatible_index: current marker".into()).into();
+        assert!(!native_index_unavailable(&corruption));
+        let safe: anyhow::Error = topology::IndexNotReady::new("reconciliation required").into();
+        assert!(native_index_unavailable(&safe));
     }
 
     #[test]
@@ -5502,7 +5889,8 @@ mod sqlite_schema_race_tests {
             rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into()
         };
         for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB] {
-            let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
+            let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) =
+                ready();
             let clone = store.clone();
             let error = store.report_live_read_failure(sqlite(code));
             assert!(
@@ -5524,12 +5912,12 @@ mod sqlite_schema_race_tests {
             rusqlite::ffi::SQLITE_IOERR,
             rusqlite::ffi::SQLITE_ERROR,
         ] {
-            let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+            let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
             let error = store.report_live_read_failure(sqlite(code));
             assert!(error.downcast_ref::<rusqlite::Error>().is_some());
             assert_eq!(store.status().unwrap().revision, pin);
         }
-        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let clone = store.clone();
         let error = store.report_live_read_failure(
             rusqlite::Error::InvalidColumnType(
@@ -5545,10 +5933,10 @@ mod sqlite_schema_race_tests {
                 .status()
                 .unwrap_err()
                 .to_string()
-                .contains("index_not_ready")
+                .contains("incompatible_index")
         );
 
-        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let clone = store.clone();
         let error = store.report_live_read_failure(
             ControlIntegrity("incompatible_index: existing structural check".into()).into(),
@@ -5559,10 +5947,10 @@ mod sqlite_schema_race_tests {
                 .status()
                 .unwrap_err()
                 .to_string()
-                .contains("index_not_ready")
+                .contains("incompatible_index")
         );
 
-        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
         let error = store.report_live_read_failure(anyhow::anyhow!(
             "root_key_collision: index belongs to a different spelling"
         ));
@@ -5582,7 +5970,7 @@ mod sqlite_schema_race_tests {
             rusqlite::ffi::SQLITE_NOMEM,
             rusqlite::ffi::SQLITE_ERROR,
         ] {
-            let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+            let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
             let clone = store.clone();
             let operational: anyhow::Error =
                 rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into();
@@ -5592,7 +5980,7 @@ mod sqlite_schema_race_tests {
             assert_eq!(clone.status().unwrap().revision, pin);
         }
 
-        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
         let clone = store.clone();
         let io: anyhow::Error =
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected").into();
@@ -5614,7 +6002,7 @@ mod sqlite_schema_race_tests {
         use std::ffi::CString;
         use std::os::unix::fs::MetadataExt;
 
-        let (_state, work, store, _graph, _capture, _native, _pin, cancel) = ready();
+        let (_state, work, store, _graph, _capture, _native, _pin, cancel, _session) = ready();
         let path = work.path().join("flow.js");
         let before_meta = fs::metadata(&path).unwrap();
         let before_stat: crate::capture::CaptureStat = {
@@ -5678,7 +6066,7 @@ mod sqlite_schema_race_tests {
         use rusqlite::types::ValueRef;
         use std::os::unix::fs::MetadataExt;
 
-        let (_state, _work, store, graph, capture, native, _old, cancel) = ready();
+        let (_state, _work, store, graph, capture, native, _old, cancel, session) = ready();
         let clone = store.clone();
         let path = store.roots.index_db(&store.identity);
         let inode = fs::metadata(&path).unwrap().ino();
@@ -5750,11 +6138,10 @@ mod sqlite_schema_race_tests {
             store.recovery_baseline(&tx).unwrap()
         };
         assert!(baseline.pin().is_none());
-        let leader = store.leader().unwrap();
         let error = store
             .publish_inner_checked_expected(
                 (&graph, &capture, &native),
-                &leader,
+                session.leader_guard().unwrap(),
                 ExpectedPublication::Recovery(Box::new(baseline)),
                 &cancel,
                 256 * 1024 * 1024 + 16 * 1024,
@@ -5779,21 +6166,22 @@ mod sqlite_schema_race_tests {
                 .status()
                 .unwrap_err()
                 .to_string()
-                .contains("index_not_ready")
+                .contains("incompatible_index")
         );
         assert!(
             clone
                 .status()
                 .unwrap_err()
                 .to_string()
-                .contains("index_not_ready")
+                .contains("incompatible_index")
         );
     }
 
     #[test]
     fn failed_takeover_before_writer_transaction_closes_every_clone() {
-        let (state, work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let (state, work, store, _graph, _capture, _native, pin, _cancel, session) = ready();
         let clone = store.clone();
+        drop(session);
         let error = store
             .leader_with_open_hook(|_| anyhow::bail!("injected pre-transaction takeover failure"))
             .unwrap_err();
@@ -5810,11 +6198,11 @@ mod sqlite_schema_race_tests {
 
     #[test]
     fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
-        let (_state, _work, store, graph, capture, native, old, cancel) = ready();
+        let (_state, _work, store, graph, capture, native, old, cancel, session) = ready();
+        let clone = store.clone();
         let path = store.roots.index_db(&store.identity);
-        let leader = store.leader().unwrap();
         let after_external = RefCell::new(None);
-        let error = store.publish_inner_checked((&graph, &capture, &native), &leader, old, &cancel,
+        let error = store.publish_inner_checked((&graph, &capture, &native), session.leader_guard().unwrap(), old, &cancel,
             |stage, _checked_connection| {
                 if stage == PublishStage::BeforeTransaction {
                     // The Store connection has passed open_index's exact object check,
@@ -5871,13 +6259,23 @@ mod sqlite_schema_race_tests {
                 .to_string()
                 .contains("incompatible_index")
         );
+        db.execute_batch("DROP TRIGGER forged_after_admission")
+            .unwrap();
+        drop(db);
+        for closed in [store.status().unwrap_err(), clone.status().unwrap_err()] {
+            assert_eq!(
+                closed.to_string(),
+                "incompatible_index: reconciliation required after invalid current index"
+            );
+        }
     }
 
     #[test]
     fn changed_metadata_between_admission_and_leader_lock_refuses_before_update() {
-        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, session) = ready();
         let path = store.roots.index_db(&store.identity);
         let after_external = RefCell::new(None);
+        drop(session);
         let error = store
             .leader_with_open_hook(|_checked| {
                 let attacker = Connection::open(&path)?;
@@ -5907,7 +6305,7 @@ mod sqlite_schema_race_tests {
 
     #[test]
     fn second_connection_adds_view_after_admission_before_status_and_leader_snapshot() {
-        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let status_clone = store.clone();
         let path = store.roots.index_db(&store.identity);
         let after_status_ddl = RefCell::new(None);
@@ -5940,7 +6338,7 @@ mod sqlite_schema_race_tests {
         ] {
             assert_eq!(
                 closed.to_string(),
-                "index_not_ready: reconciliation required"
+                "incompatible_index: reconciliation required after invalid current index"
             );
         }
 
@@ -5953,10 +6351,12 @@ mod sqlite_schema_race_tests {
             _leader_native,
             leader_pin,
             _leader_cancel,
+            leader_session,
         ) = ready();
         let leader_clone = leader_store.clone();
         let leader_path = leader_store.roots.index_db(&leader_store.identity);
         let after_leader_ddl = RefCell::new(None);
+        drop(leader_session);
         let leader_error = leader_store
             .leader_with_open_hook(|_checked| {
                 let attacker = Connection::open(&leader_path)?;
@@ -5989,9 +6389,12 @@ mod sqlite_schema_race_tests {
                 leader_pin.index_revision as i64
             )
         );
-        assert_eq!(
-            leader_store.status().unwrap_err().to_string(),
-            "incompatible_index: unknown cache object type, name or shape"
+        assert!(
+            leader_store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible_index: unknown cache object type, name or shape")
         );
         attacker
             .execute_batch("DROP VIEW leader_after_admission")
@@ -6003,7 +6406,7 @@ mod sqlite_schema_race_tests {
         ] {
             assert_eq!(
                 closed.to_string(),
-                "index_not_ready: reconciliation required"
+                "incompatible_index: reconciliation required after invalid current index"
             );
         }
     }

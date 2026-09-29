@@ -772,6 +772,32 @@ fn stale_leader_child() {
 }
 
 #[test]
+fn verified_follower_requires_held_matching_leader_inode_and_incarnation() {
+    use std::sync::Arc;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = Arc::new(WorkspaceIdentity::discover(Some(&work), &work).unwrap());
+    let leader = roots.leader(&identity).unwrap();
+    let follower = roots.follower(identity.clone()).unwrap();
+    follower.verify(leader.incarnation).unwrap();
+
+    drop(leader);
+    let error = follower.verify(follower.incarnation).unwrap_err();
+    assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+
+    let leader = roots.leader(&identity).unwrap();
+    let follower = roots.follower(identity.clone()).unwrap();
+    fs::write(
+        roots.leader_lock(&identity),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    let error = follower.verify(follower.incarnation).unwrap_err();
+    assert!(error.to_string().contains("incarnation"), "{error:#}");
+    drop(leader);
+}
+
+#[test]
 fn exclusive_deletion_waits_for_shared_process() {
     use std::io::{BufRead, BufReader};
     let (temp, roots) = common::fixture();

@@ -14,7 +14,14 @@ use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
+fn fixture_with_state() -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Arc<http::DaemonState>,
+    Router,
+    String,
+) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -37,25 +44,30 @@ fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
         .clone();
     assert!(store.status().is_err());
     let baseline = store.index_baseline().unwrap();
+    let session = store.leader_session().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             baseline,
             &cancel,
         )
         .unwrap();
-    let app = http::router(
-        http::new(
-            store.clone(),
-            options,
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session);
+    let app = http::router(state.clone());
+    (temp, store, graph, state, app, id)
+}
+fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
+    let (temp, store, graph, _state, app, id) = fixture_with_state();
     (temp, store, graph, app, id)
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (u16, Value) {
@@ -162,12 +174,13 @@ async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
     )
     .unwrap();
     assert_eq!(fresh_graph, graph);
+    let session = recreated.leader_session().unwrap();
     recreated
         .publish_native(
             &fresh_graph,
             &capture,
             &native,
-            &recreated.leader().unwrap(),
+            session.leader_guard().unwrap(),
             baseline,
             &cancel,
         )
@@ -175,15 +188,15 @@ async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
     let current = recreated.status().unwrap().revision;
     assert_eq!(current.index_revision, old.index_revision);
     assert_ne!(current.index_generation, old.index_generation);
-    let app = http::router(
-        http::new(
-            recreated,
-            IndexOptions::new(root),
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
+    let state = http::new(
+        recreated,
+        IndexOptions::new(root),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session);
+    let app = http::router(state);
 
     let (code, body) = call(&app, "GET", &old_source, Value::Null).await;
     assert_eq!(
@@ -381,7 +394,7 @@ fn sqlite_journal_child() {
 async fn active_and_hot_journal_keep_pinned_http_safe() {
     use std::io::BufRead;
     use std::process::{Command, Stdio};
-    let (temp, store, _graph, app, _id) = fixture();
+    let (temp, store, _graph, state, app, _id) = fixture_with_state();
     let previous = store.status().unwrap().revision;
     let db_path = std::fs::read_dir(temp.path().join("state/cache/indexes"))
         .unwrap()
@@ -391,7 +404,7 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         .join("index.db");
     let journal = db_path.with_file_name("index.db-journal");
     let leader_path = db_path.with_file_name("leader.lock");
-    let leader = store.leader().unwrap();
+    let leader = state.retained_serving_session().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "sqlite_journal_child", "--nocapture"])
         .env("BALEYG_SQLITE_JOURNAL_CHILD", &db_path)
@@ -427,8 +440,18 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         "SQLite did not flush a genuine hot journal"
     );
     drop(leader);
+    drop(app);
+    drop(state);
     let unrelated =
         baleyg::store::topology::UseGuard::acquire_existing(&leader_path, true, true).unwrap();
+    let state = http::new(
+        store.clone(),
+        IndexOptions::new(temp.path().join("workspace")),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = http::router(state);
     let before = [
         std::fs::read(&db_path).unwrap(),
         std::fs::read(&journal).unwrap(),

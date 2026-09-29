@@ -46,6 +46,7 @@ fn publish(
     root: &std::path::Path,
     cancel: &CancelFlag,
     expected: IndexPin,
+    leader: &baleyg::store::topology::LeaderGuard,
 ) -> anyhow::Result<IndexPin> {
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.to_owned()),
@@ -62,16 +63,15 @@ fn publish(
                 && operations.complete_reads == 1
                 && operations.hashes == 1)
     );
-    let revision = store.publish_native(
-        &graph,
-        &capture,
-        &native,
-        &store.leader()?,
-        expected,
-        cancel,
-    )?;
+    let revision = store.publish_native(&graph, &capture, &native, leader, expected, cancel)?;
     assert_eq!(capture.graph_projection_count(), 1);
     Ok(revision)
+}
+fn assert_current_corruption(error: anyhow::Error) {
+    assert_eq!(
+        error.to_string(),
+        "incompatible_index: reconciliation required after invalid current index"
+    );
 }
 #[test]
 fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
@@ -84,18 +84,32 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
             .contains("index_not_ready")
     );
     let baseline = store.index_baseline().unwrap();
-    let pin = publish(&store, root.path(), &cancel, baseline).unwrap();
+    let leader = store.leader().unwrap();
+    let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
     assert_ne!(baseline.index_generation, pin.index_generation);
     assert_eq!(
         store.status().unwrap().evidence_format.as_deref(),
         Some("terminal-native-graph-v1")
     );
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(&identity.root_key)
+        .join("index.db");
+    let before_gc = fs::read(&path).unwrap();
     let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
         state.path().join("cache"),
         state.path().join("data"),
     );
     let report = roots.gc_report().unwrap();
-    assert_eq!(report.derived[0].reason, "recent_open");
+    assert_eq!(
+        (report.derived[0].status, report.derived[0].reason),
+        ("busy", "use_lock_busy")
+    );
+    assert_eq!(fs::read(&path).unwrap(), before_gc);
     let (graph, artifact, capture) = index_workspace_bundle(
         &IndexOptions::new(root.path().to_owned()),
         store.root_id(),
@@ -166,15 +180,6 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
                 .collect::<Vec<_>>()
         );
     }
-    let path = state
-        .path()
-        .join("cache/indexes")
-        .join(
-            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
-                .unwrap()
-                .root_key,
-        )
-        .join("index.db");
     let db = Connection::open(&path).unwrap();
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
@@ -204,7 +209,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     }
     assert_eq!(
         store
-            .publish(&graph, &store.leader().unwrap(), pin, &cancel)
+            .publish(&graph, &leader, pin, &cancel)
             .unwrap_err()
             .to_string(),
         "native_evidence_required: graph-only publication refused"
@@ -212,9 +217,9 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     let closed = store
         .native_source_at(baseline, &artifact.revision.documents[0].key)
         .unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_eq!(closed.to_string(), "revision conflict: stale native pin");
     drop(db);
-    let next = publish(&store, root.path(), &cancel, pin).unwrap();
+    let next = publish(&store, root.path(), &cancel, pin, &leader).unwrap();
     assert_eq!(next.index_generation, pin.index_generation);
     assert_eq!(next.index_revision, pin.index_revision + 1);
     assert!(store.native_declarations_at(pin, "java", "Demo").is_err());
@@ -224,7 +229,8 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
 fn invalid_native_and_conflict_never_change_published_pair() {
     let (state, root, store, cancel) = fixture();
     let baseline = store.index_baseline().unwrap();
-    let pin = publish(&store, root.path(), &cancel, baseline).unwrap();
+    let leader = store.leader().unwrap();
+    let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
     let path = state
         .path()
         .join("cache/indexes")
@@ -234,7 +240,6 @@ fn invalid_native_and_conflict_never_change_published_pair() {
                 .root_key,
         )
         .join("index.db");
-    let leader = store.leader().unwrap();
     let before = fs::read(&path).unwrap();
     let (graph, mut native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.path().to_owned()),
@@ -273,8 +278,22 @@ fn invalid_native_and_conflict_never_change_published_pair() {
     value["calls"][0]["target"] = serde_json::json!("unmeasured");
     assert!(serde_json::from_value::<baleyg::native_evidence::Artifact>(value).is_err());
     assert_eq!(store.index_baseline().unwrap(), pin);
-    let closed = store.status().unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(store.graph().unwrap(), graph);
+    for document in &native.revision.documents {
+        let (stored, bytes) = store.native_source_at(pin, &document.key).unwrap().unwrap();
+        assert_eq!(stored, *document);
+        assert_eq!(
+            bytes,
+            capture
+                .files
+                .iter()
+                .find(|file| file.path == document.key.path)
+                .unwrap()
+                .text
+                .as_bytes()
+        );
+    }
 }
 
 #[test]
@@ -284,7 +303,8 @@ fn empty_workspace_has_native_pair_without_document_rows() {
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let original = store.index_baseline().unwrap();
-    let pin = publish(&store, root.path(), &cancel, original).unwrap();
+    let leader = store.leader().unwrap();
+    let pin = publish(&store, root.path(), &cancel, original, &leader).unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
     let db = Connection::open(
         state
@@ -383,11 +403,13 @@ fn known_old_schema_four_remains_unready_until_full_native_reindex() {
 #[test]
 fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let path = state
@@ -457,7 +479,7 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
         "{selected:#}"
     );
     let closed = original_clone.source_at("flow.rs", Some(pin)).unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(reopened.status().unwrap().revision, pin);
@@ -473,7 +495,7 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
         reopened_clone.status().unwrap_err(),
         reopened.source_at("flow.rs", Some(pin)).unwrap_err(),
     ] {
-        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+        assert_current_corruption(closed);
     }
 }
 
@@ -493,11 +515,13 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
     }
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db_path = state
@@ -549,11 +573,13 @@ fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::P
 #[test]
 fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -649,7 +675,7 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
             path: "flow.java".into(),
         };
         let closed = selected_clone.native_source_at(pin, &java).unwrap_err();
-        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+        assert_current_corruption(closed);
         let predicate = if table == "native_headers" {
             "syntax_id=(SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello')"
         } else if table == "native_coverage" {
@@ -669,11 +695,13 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
 fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
     use sha2::{Digest, Sha256};
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -708,7 +736,7 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
         "{native_error:#}"
     );
     let closed = native_clone.source_at("flow.java", Some(pin)).unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 
     let graph_store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(graph_store.status().unwrap().revision, pin);
@@ -720,7 +748,7 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
         "{graph_error:#}"
     );
     let closed = graph_clone.source_at("flow.java", Some(pin)).unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 
     db.execute_batch("BEGIN").unwrap();
     db.execute(
@@ -756,17 +784,19 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
         "{payload_error:#}"
     );
     let closed = payload_clone.source_at("flow.java", Some(pin)).unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 }
 
 #[test]
 fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -805,13 +835,7 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
                 .contains("selected native declarations differ"),
         "{error:#}"
     );
-    assert!(
-        declarations_clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("index_not_ready")
-    );
+    assert_current_corruption(declarations_clone.status().unwrap_err());
     db.execute(
         "UPDATE native_declarations SET end_byte=?1 WHERE syntax_id=?2",
         rusqlite::params![original_end, owner],
@@ -840,13 +864,7 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
             && error.to_string().contains("selected native regions differ"),
         "{error:#}"
     );
-    assert!(
-        regions_clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("index_not_ready")
-    );
+    assert_current_corruption(regions_clone.status().unwrap_err());
     db.execute(
         "UPDATE native_control_regions SET kind=?1 WHERE path='flow.js'",
         [&original_kind],
@@ -881,7 +899,7 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
             },
         )
         .unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
     db.execute(
         "UPDATE native_coverage SET state=?1,diagnostic=?2 WHERE document_path='flow.js'",
         rusqlite::params![original.0, original.1],
@@ -892,11 +910,13 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
 #[test]
 fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -945,13 +965,7 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
                 .contains("graph call differs from measured native row"),
         "{query_error:#}"
     );
-    assert!(
-        query_clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("index_not_ready")
-    );
+    assert_current_corruption(query_clone.status().unwrap_err());
 
     let sequence_store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(sequence_store.status().unwrap().revision, pin);
@@ -979,18 +993,20 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
         sequence_clone.query_view(&unaffected).unwrap_err(),
         sequence_store.sequence_at(&java, pin, true).unwrap_err(),
     ] {
-        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+        assert_current_corruption(closed);
     }
 }
 
 #[test]
 fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_witness() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -1034,17 +1050,19 @@ fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_wi
     let closed = selected_clone
         .native_declarations_at(pin, "java", "go")
         .unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 }
 
 #[test]
 fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -1081,19 +1099,21 @@ fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
         "{error:#}"
     );
     let closed = selected_clone.status().unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
     let closed = store.native_declarations_at(pin, "java", "go").unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 }
 
 #[test]
 fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -1125,19 +1145,21 @@ fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() 
         "{error:#}"
     );
     let closed = selected_clone.status().unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
     let closed = store.native_declarations_at(pin, "java", "go").unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 }
 
 #[test]
 fn selected_class_payload_oversize_refuses_before_json_decode() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -1169,17 +1191,19 @@ fn selected_class_payload_oversize_refuses_before_json_decode() {
         )
         .unwrap();
     let closed = selected_clone.symbol_at(&rust_id, Some(pin)).unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 }
 
 #[test]
 fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -1218,17 +1242,19 @@ fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
     let closed = selected_clone
         .native_declarations_at(pin, "java", "go")
         .unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 }
 
 #[test]
 fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -1258,7 +1284,7 @@ fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
         let closed = selected_clone
             .native_declarations_at(pin, "java", "go")
             .unwrap_err();
-        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+        assert_current_corruption(closed);
         db.execute(
             &format!("UPDATE {table} SET payload=?1 WHERE id=?2"),
             rusqlite::params![original, id],
@@ -1270,11 +1296,13 @@ fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
 #[test]
 fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
     let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
     let pin = publish(
         &store,
         root.path(),
         &cancel,
         store.index_baseline().unwrap(),
+        &leader,
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
@@ -1305,5 +1333,5 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
     let closed = selected_clone
         .native_declarations_at(pin, "java", "go")
         .unwrap_err();
-    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    assert_current_corruption(closed);
 }
