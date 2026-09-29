@@ -1610,7 +1610,7 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
 #[test]
 fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
-    use rusqlite::DatabaseName;
+    use rusqlite::MAIN_DB;
     use std::{
         os::unix::fs::MetadataExt,
         sync::{
@@ -1684,7 +1684,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     let db = rusqlite::Connection::open(&path).unwrap();
     let mut blob = db
         .blob_open(
-            DatabaseName::Main,
+            MAIN_DB,
             "index_metadata",
             "index_generation",
             1,

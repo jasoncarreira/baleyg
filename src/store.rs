@@ -1965,7 +1965,7 @@ impl Store {
             ),
         ] {
             let blob = db.blob_open(
-                rusqlite::DatabaseName::Main,
+                rusqlite::MAIN_DB,
                 "index_metadata",
                 column,
                 1,
@@ -2007,7 +2007,7 @@ impl Store {
             "text" | "blob" => {
                 let text = storage == "text";
                 let blob = db.blob_open(
-                    rusqlite::DatabaseName::Main,
+                    rusqlite::MAIN_DB,
                     "index_metadata",
                     column_name,
                     1,
