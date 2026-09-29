@@ -70,10 +70,14 @@ every chunk below it.
 ## Model
 
 - **Local by default.** Code never leaves the machine. A small code-capable embedding model runs
-  in-process via ONNX Runtime or candle, using Metal on the reference host. Candidates are
-  jina-embeddings-v2-base-code, nomic-embed-code and Qwen3-Embedding-0.6B. Choose one with a
-  bake-off on real queries against this and other repositories.
-- A remote embedding API is available only as an explicit opt-in.
+  in-process via ONNX Runtime or candle, using Metal on the reference host. Local candidates are
+  **voyage-4-nano** (open-weight, Apache 2.0; Matryoshka and int8/binary quantization; shares an
+  embedding space with the hosted voyage-4 family), jina-embeddings-v2-base-code, nomic-embed-code
+  and Qwen3-Embedding-0.6B. Choose one with a bake-off on real queries against this and other
+  repositories.
+- A remote embedding API is available only as an explicit opt-in. The hosted candidate is
+  **voyage-code-4**. Do not assume it shares voyage-4's embedding space: switching between it and a
+  local model re-embeds, which the `modelId` in the cache key already enforces.
 - The model is **pinned like a producer**: its name, version and weight hash are recorded, so
   vectors are reproducible and tied to the revision that produced them.
 
