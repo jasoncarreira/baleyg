@@ -196,6 +196,11 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   const indexed=await run(binary,["index","--workspace",paths.workspace],{env:paths.env,timeout:30000});
   const P=JSON.parse(indexed.stdout).status.revision;
   server=await startDaemon(paths);
+  let wrongToken; do { wrongToken = randomBytes(32).toString("hex"); } while (wrongToken === paths.token);
+  const denied = await fetch(`${server.base}/api/views`, {signal:AbortSignal.timeout(8000),
+    headers:{Origin:server.base,Authorization:`Bearer ${wrongToken}`}});
+  assert.equal(denied.status,401,"a wrong runtime bearer must not read saved items");
+  assert.deepEqual(findNamed(paths.temp,"workspace.db"),[],"denied saved reads must not create workspace.db");
   browser=await chromium.launch({headless:true});context=await browser.newContext();page=await context.newPage();
   page.on("pageerror",error=>pageErrors.push(error));
   const requests=[];page.on("request",request=>requests.push({url:request.url(),method:request.method(),body:request.postDataJSON?.()}));
