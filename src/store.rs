@@ -3300,15 +3300,6 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             params![anchor.document.source_set_id, anchor.document.language, anchor.document.path], |row| row.get(0),
         ).optional()?;
         let Some(revision) = revision else {
-            let path_still_exists: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1) OR EXISTS(SELECT 1 FROM native_documents WHERE path=?1)",
-                [&anchor.document.path],
-                |row| row.get(0),
-            )?;
-            ensure!(
-                !path_still_exists,
-                "invalid anchor document association"
-            );
             return Ok(None);
         };
         store.attest_selected_document(db, &anchor.document.path)?;

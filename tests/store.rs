@@ -1328,7 +1328,7 @@ fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists
 }
 
 #[test]
-fn inconsistent_anchor_document_association_still_fails_closed() {
+fn same_path_different_association_is_missing_but_dangling_revision_fails_closed() {
     let (state, work, store) = fixture();
     std::fs::write(work.path().join("b.js"), "function target() { return 2; }\n").unwrap();
     let captured = bundle(&store, &work);
@@ -1345,8 +1345,8 @@ fn inconsistent_anchor_document_association_still_fails_closed() {
         .save_view_at(
             pin,
             &SavedView {
-                id: "corrupt-association".into(),
-                title: "Corrupt association".into(),
+                id: "association".into(),
+                title: "Association".into(),
                 query: ViewQuery {
                     seed: target,
                     ..query()
@@ -1364,32 +1364,78 @@ fn inconsistent_anchor_document_association_still_fails_closed() {
         state.path().join("cache"),
         state.path().join("data"),
     );
-    let db = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
-    let payload: String = db
+    let records = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
+    let original_payload: String = records
         .query_row(
-            "SELECT payload FROM views WHERE id='corrupt-association'",
+            "SELECT payload FROM views WHERE id='association'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-    payload["anchor"]["document"]["sourceSetId"] = serde_json::json!("source-set:v1:tampered");
-    db.execute(
-        "UPDATE views SET payload=?1 WHERE id='corrupt-association'",
-        [serde_json::to_string(&payload).unwrap()],
-    )
-    .unwrap();
+    let mut changed_association: serde_json::Value =
+        serde_json::from_str(&original_payload).unwrap();
+    changed_association["anchor"]["document"]["sourceSetId"] =
+        serde_json::json!("source-set:v1:changed");
+    let changed_anchor = serde_json::value::to_raw_value(&changed_association["anchor"])
+        .unwrap()
+        .get()
+        .to_owned();
+    records
+        .execute(
+            "UPDATE views SET payload=?1 WHERE id='association'",
+            [serde_json::to_string(&changed_association).unwrap()],
+        )
+        .unwrap();
+
+    let listed = store.saved_views_at(Some(pin)).unwrap();
+    let listed = listed
+        .iter()
+        .find(|state| state.view.id == "association")
+        .unwrap();
+    assert_eq!(listed.attachment.availability, AttachmentAvailability::Ready);
+    assert_eq!(
+        listed.attachment.result.as_ref().unwrap().status,
+        AnchorStatus::Orphaned
+    );
+    assert_eq!(
+        listed.attachment.result.as_ref().unwrap().reason,
+        AnchorReason::Missing
+    );
+    assert_eq!(listed.view.anchor.as_deref().unwrap().get(), changed_anchor);
+    let opened = store
+        .saved_view_at("association", Some(pin))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        opened.attachment.result.as_ref().unwrap().reason,
+        AnchorReason::Missing
+    );
+    assert_eq!(opened.view.anchor.as_deref().unwrap().get(), changed_anchor);
+
+    records
+        .execute(
+            "UPDATE views SET payload=?1 WHERE id='association'",
+            [&original_payload],
+        )
+        .unwrap();
+    drop(records);
+    let cache = rusqlite::Connection::open(index_db(state.path())).unwrap();
+    cache.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    cache
+        .execute(
+            "UPDATE native_documents SET revision_id='revision:v1:dangling' WHERE path='b.js'",
+            [],
+        )
+        .unwrap();
+    cache.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    drop(cache);
 
     for error in [
         store.saved_views_at(Some(pin)).unwrap_err(),
-        store
-            .saved_view_at("corrupt-association", Some(pin))
-            .unwrap_err(),
+        store.saved_view_at("association", Some(pin)).unwrap_err(),
     ] {
         assert!(
-            error
-                .to_string()
-                .contains("invalid anchor document association"),
+            format!("{error:#}").contains("Query returned no rows"),
             "{error:#}"
         );
     }
