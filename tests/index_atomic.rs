@@ -832,13 +832,60 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     );
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     failed_cancel.store(false, Ordering::Release);
-    let recovered = IndexJobCoordinator::prepare(&store, Some(rebuilt))
+    let mut recovered = IndexJobCoordinator::prepare(&store, Some(rebuilt))
         .unwrap()
         .run(&options, &failed_cancel, |_| {})
         .unwrap();
     assert_eq!(recovered.index_revision, 1);
     assert_ne!(recovered.index_generation, rebuilt.index_generation);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(store.status().unwrap().revision, recovered);
+
+    // A SQLite type mismatch in any normalized derived row is replaceable
+    // derived corruption, not a hard Store-open failure.
+    drop(store);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE native_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=(SELECT syntax_id FROM native_declarations LIMIT 1)",
+            [],
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let type_error = store.status().unwrap_err();
+    assert!(
+        type_error.to_string().contains("index_not_ready"),
+        "{type_error:#}"
+    );
+    failed_cancel.store(true, Ordering::Release);
+    let failure = IndexJobCoordinator::prepare(&store, Some(recovered))
+        .unwrap()
+        .run(&options, &failed_cancel, |_| {})
+        .unwrap_err();
+    assert!(failure.to_string().contains("cancelled"), "{failure:#}");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let stored_type: String = db
+        .query_row(
+            "SELECT typeof(key_ordinal) FROM native_declarations LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_type, "real");
+    drop(db);
+    assert!(store.status().is_err());
+    failed_cancel.store(false, Ordering::Release);
+    let typed_recovered = IndexJobCoordinator::prepare(&store, Some(recovered))
+        .unwrap()
+        .run(&options, &failed_cancel, |_| {})
+        .unwrap();
+    assert_eq!(typed_recovered.index_revision, 1);
+    assert_ne!(typed_recovered.index_generation, recovered.index_generation);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    recovered = typed_recovered;
     assert_eq!(store.status().unwrap().revision, recovered);
 
     // A newly acquired writer is a takeover until it completes publication.
@@ -860,6 +907,96 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
 }
 
 #[test]
+fn typed_native_basis_mismatch_rebuilds_in_place() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    for (case, mutation) in [
+        "UPDATE native_producers SET version='native-v3'",
+        "PRAGMA ignore_check_constraints=ON; UPDATE native_producers SET position_encoding='utf16'; PRAGMA ignore_check_constraints=OFF;",
+        "UPDATE native_producers SET executable_hash='gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'",
+        "UPDATE native_producer_languages SET language='typescript' WHERE ordinal=0",
+        "UPDATE native_revisions SET toolchain_hash='gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (state, workspace) = fixture();
+        fs::write(
+            workspace.path().join("one.js"),
+            "function one() {}
+",
+        )
+        .unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let pin = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        let path = index_dir(state.path()).join("index.db");
+        let inode = fs::metadata(&path).unwrap().ino();
+        drop(store);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(mutation).unwrap();
+        if mutation.contains("position_encoding") {
+            let ignore_checks: i64 = db
+                .pragma_query_value(None, "ignore_check_constraints", |row| row.get(0))
+                .unwrap();
+            assert_eq!(ignore_checks, 0);
+            let encoding: String = db
+                .query_row("SELECT position_encoding FROM native_producers", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(encoding, "utf16");
+        }
+        drop(db);
+
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let refusal = store.status().unwrap_err();
+        assert!(
+            refusal.to_string().contains("index_not_ready"),
+            "invalid native basis was not closed: {mutation}: {refusal:#}"
+        );
+        if case == 0 {
+            cancel.store(true, Ordering::Release);
+            let failure = IndexJobCoordinator::prepare(&store, Some(pin))
+                .unwrap()
+                .run(&options, &cancel, |_| {})
+                .unwrap_err();
+            assert!(failure.to_string().contains("cancelled"), "{failure:#}");
+            let refusal = store.status().unwrap_err();
+            assert!(refusal.to_string().contains("index_not_ready"), "{refusal:#}");
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+            let db = rusqlite::Connection::open(&path).unwrap();
+            let persisted_version: String = db
+                .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(persisted_version, "native-v3");
+            drop(db);
+            cancel.store(false, Ordering::Release);
+        }
+        let repaired = IndexJobCoordinator::prepare(&store, Some(pin))
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        assert_eq!(repaired.index_revision, 1);
+        assert_ne!(repaired.index_generation, pin.index_generation);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(store.status().unwrap().revision, repaired);
+    }
+}
+
+#[test]
 fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_state() {
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
@@ -869,6 +1006,8 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         "DELETE FROM capture_inputs WHERE input_key='config:package.json'",
         "INSERT INTO capture_inputs(input_key,payload) VALUES('unknown:slot','{\"state\":\"absent\"}')",
         "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',2)",
+        "UPDATE files SET capture_stat=json_set(capture_stat,'$.size',999999) WHERE path='one.js'",
+        "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.maxFileBytes',1)",
     ] {
         let (state, workspace) = fixture();
         fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();

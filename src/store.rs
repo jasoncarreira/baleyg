@@ -967,17 +967,112 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ScanComparison {
-    examined: usize,
-    added: usize,
-    deleted: usize,
-    stat_changed: usize,
-    hash_changed: usize,
+pub(crate) struct ScanComparison {
+    pub(crate) examined: usize,
+    pub(crate) added: usize,
+    pub(crate) deleted: usize,
+    pub(crate) stat_changed: usize,
+    pub(crate) hash_changed: usize,
+    pub(crate) ctime_changed: usize,
+    pub(crate) unchanged_stat_input_hash_changed: usize,
+    pub(crate) uncertain_timestamp_hashed: usize,
 }
 impl ScanComparison {
     fn changed(self) -> bool {
         self.added + self.deleted + self.stat_changed + self.hash_changed > 0
     }
+}
+
+pub(crate) type SourceObservations = BTreeMap<String, (String, crate::capture::CaptureStat)>;
+pub(crate) type InputObservations = BTreeMap<String, crate::capture::CaptureInputObservation>;
+
+pub(crate) fn compare_capture_observations(
+    previous_sources: &SourceObservations,
+    current_sources: &SourceObservations,
+    previous_inputs: &InputObservations,
+    current_inputs: &InputObservations,
+) -> ScanComparison {
+    let uncertain = |stat: &crate::capture::CaptureStat| {
+        stat.mtime_seconds.is_none()
+            || stat.mtime_nanoseconds.is_none()
+            || stat.ctime_seconds.is_none()
+            || stat.ctime_nanoseconds.is_none()
+    };
+    let mut comparison = ScanComparison::default();
+    let source_keys: BTreeSet<_> = previous_sources
+        .keys()
+        .chain(current_sources.keys())
+        .cloned()
+        .collect();
+    for key in &source_keys {
+        comparison.examined += 1;
+        match (previous_sources.get(key), current_sources.get(key)) {
+            (None, Some(_)) => comparison.added += 1,
+            (Some(_), None) => comparison.deleted += 1,
+            (Some((old_hash, old_stat)), Some((new_hash, new_stat))) => {
+                comparison.stat_changed += usize::from(old_stat != new_stat);
+                comparison.hash_changed += usize::from(old_hash != new_hash);
+                comparison.ctime_changed += usize::from(
+                    old_stat.size == new_stat.size
+                        && old_stat.device == new_stat.device
+                        && old_stat.inode == new_stat.inode
+                        && old_stat.mtime_seconds == new_stat.mtime_seconds
+                        && old_stat.mtime_nanoseconds == new_stat.mtime_nanoseconds
+                        && (old_stat.ctime_seconds != new_stat.ctime_seconds
+                            || old_stat.ctime_nanoseconds != new_stat.ctime_nanoseconds),
+                );
+                comparison.uncertain_timestamp_hashed +=
+                    usize::from(uncertain(old_stat) || uncertain(new_stat));
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    let input_keys: BTreeSet<_> = previous_inputs
+        .keys()
+        .chain(current_inputs.keys())
+        .cloned()
+        .collect();
+    for key in &input_keys {
+        comparison.examined += 1;
+        match (previous_inputs.get(key), current_inputs.get(key)) {
+            (None, Some(_)) => comparison.added += 1,
+            (Some(_), None) => comparison.deleted += 1,
+            (Some(old), Some(new)) => match (old, new) {
+                (
+                    crate::capture::CaptureInputObservation::Present {
+                        stat: old_stat,
+                        hash: old_hash,
+                    },
+                    crate::capture::CaptureInputObservation::Present {
+                        stat: new_stat,
+                        hash: new_hash,
+                    },
+                ) => {
+                    comparison.stat_changed += usize::from(old_stat != new_stat);
+                    comparison.hash_changed += usize::from(old_hash != new_hash);
+                    comparison.unchanged_stat_input_hash_changed +=
+                        usize::from(old_stat == new_stat && old_hash != new_hash);
+                    comparison.uncertain_timestamp_hashed +=
+                        usize::from(uncertain(old_stat) || uncertain(new_stat));
+                }
+                (
+                    crate::capture::CaptureInputObservation::Directory { stat: old },
+                    crate::capture::CaptureInputObservation::Directory { stat: new },
+                )
+                | (
+                    crate::capture::CaptureInputObservation::Root { stat: old },
+                    crate::capture::CaptureInputObservation::Root { stat: new },
+                ) => comparison.stat_changed += usize::from(old != new),
+                (
+                    crate::capture::CaptureInputObservation::Absent,
+                    crate::capture::CaptureInputObservation::Absent,
+                ) => {}
+                _ => comparison.stat_changed += 1,
+            },
+            (None, None) => unreachable!(),
+        }
+    }
+    comparison
 }
 
 fn compare_capture_snapshot(
@@ -1024,66 +1119,12 @@ fn compare_capture_snapshot(
         );
     }
     let current_inputs = capture.persisted_inputs()?;
-    let mut comparison = ScanComparison::default();
-    let source_keys: BTreeSet<_> = previous_sources
-        .keys()
-        .chain(current_sources.keys())
-        .cloned()
-        .collect();
-    for key in &source_keys {
-        comparison.examined += 1;
-        match (previous_sources.get(key), current_sources.get(key)) {
-            (None, Some(_)) => comparison.added += 1,
-            (Some(_), None) => comparison.deleted += 1,
-            (Some((old_hash, old_stat)), Some((new_hash, new_stat))) => {
-                comparison.stat_changed += usize::from(old_stat != new_stat);
-                comparison.hash_changed += usize::from(old_hash != new_hash);
-            }
-            (None, None) => unreachable!(),
-        }
-    }
-    let input_keys: BTreeSet<_> = previous_inputs
-        .keys()
-        .chain(current_inputs.keys())
-        .cloned()
-        .collect();
-    for key in &input_keys {
-        comparison.examined += 1;
-        match (previous_inputs.get(key), current_inputs.get(key)) {
-            (None, Some(_)) => comparison.added += 1,
-            (Some(_), None) => comparison.deleted += 1,
-            (Some(old), Some(new)) => match (old, new) {
-                (
-                    crate::capture::CaptureInputObservation::Present {
-                        stat: old_stat,
-                        hash: old_hash,
-                    },
-                    crate::capture::CaptureInputObservation::Present {
-                        stat: new_stat,
-                        hash: new_hash,
-                    },
-                ) => {
-                    comparison.stat_changed += usize::from(old_stat != new_stat);
-                    comparison.hash_changed += usize::from(old_hash != new_hash);
-                }
-                (
-                    crate::capture::CaptureInputObservation::Directory { stat: old },
-                    crate::capture::CaptureInputObservation::Directory { stat: new },
-                )
-                | (
-                    crate::capture::CaptureInputObservation::Root { stat: old },
-                    crate::capture::CaptureInputObservation::Root { stat: new },
-                ) => comparison.stat_changed += usize::from(old != new),
-                (
-                    crate::capture::CaptureInputObservation::Absent,
-                    crate::capture::CaptureInputObservation::Absent,
-                ) => {}
-                _ => comparison.stat_changed += 1,
-            },
-            (None, None) => unreachable!(),
-        }
-    }
-    Ok(comparison)
+    Ok(compare_capture_observations(
+        &previous_sources,
+        &current_sources,
+        &previous_inputs,
+        &current_inputs,
+    ))
 }
 
 fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str) -> Result<()> {
@@ -1126,13 +1167,13 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     uuid::Uuid::parse_str(&incarnation)
         .context("incompatible_index: invalid reconciled incarnation")?;
     let options = options.context("incompatible_index: missing reconcile options")?;
-    let decoded: crate::indexer::ReconcileOptions =
+    let decoded_options: crate::indexer::ReconcileOptions =
         serde_json::from_str(&options).context("incompatible_index: invalid reconcile options")?;
     ensure!(
-        json(&decoded)? == options
-            && decoded.version == 1
-            && decoded.max_file_bytes > 0
-            && decoded.max_file_bytes <= 256 * 1024 * 1024,
+        json(&decoded_options)? == options
+            && decoded_options.version == 1
+            && decoded_options.max_file_bytes > 0
+            && decoded_options.max_file_bytes <= 256 * 1024 * 1024,
         "incompatible_index: unsupported reconcile options"
     );
 
@@ -1268,7 +1309,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         expected.insert(format!("directory:{directory}"));
     }
     expected.insert(executable.context("incompatible_index: missing executable input")?);
-    match &decoded.scip_path {
+    match &decoded_options.scip_path {
         Some(path) => {
             ensure!(!path.is_empty(), "incompatible_index: empty SCIP option");
             expected.insert(format!("presentation-scip:{path}"));
@@ -1280,7 +1321,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             "incompatible_index: unconfigured SCIP input"
         ),
     }
-    match &decoded.manifest_path {
+    match &decoded_options.manifest_path {
         Some(path) => {
             ensure!(
                 !path.is_empty(),
@@ -1299,6 +1340,40 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         actual == expected,
         "incompatible_index: incomplete or unknown capture inventory"
     );
+    Ok(())
+}
+
+fn validate_reconcile_source_sizes(db: &Connection) -> Result<()> {
+    let options: String = db.query_row(
+        "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let options: crate::indexer::ReconcileOptions =
+        serde_json::from_str(&options).context("incompatible_index: invalid reconcile options")?;
+    let mut statement = db.prepare(
+        "SELECT f.path,f.capture_stat,length(d.source_bytes)          FROM files f LEFT JOIN native_documents d ON d.path=f.path ORDER BY f.path",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (path, payload, source_bytes) = row?;
+        let stat: crate::capture::CaptureStat =
+            serde_json::from_str(&payload).context("incompatible_index: invalid capture stat")?;
+        let source_bytes = source_bytes
+            .with_context(|| format!("incompatible_index: native source absent for {path}"))?;
+        ensure!(
+            source_bytes >= 0
+                && stat.size == source_bytes as u64
+                && stat.size <= options.max_file_bytes,
+            "incompatible_index: captured source size/options mismatch"
+        );
+    }
     Ok(())
 }
 
@@ -1572,6 +1647,219 @@ impl Store {
     fn records(&self) -> topology::DurableRecords<'_> {
         topology::DurableRecords::new(&self.roots, &self.identity)
     }
+    fn validate_native_basis(&self, db: &Connection) -> Result<()> {
+        let valid_hash = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        let (producer_id, version, executable_hash, kind, encoding): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = db.query_row(
+            "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        ensure!(
+            producer_id == "baleyg.native.syntax"
+                && version == "native-v2"
+                && kind == "native"
+                && encoding == "utf8"
+                && valid_hash(&executable_hash),
+            "incompatible_index: invalid native producer"
+        );
+        let expected_languages = ["java", "rust", "python", "javascript"];
+        let expected_ordinals = expected_languages
+            .iter()
+            .enumerate()
+            .map(|(ordinal, language)| (ordinal as i64, (*language).to_owned()))
+            .collect::<Vec<_>>();
+        let producer_languages = db
+            .prepare(
+                "SELECT ordinal,language FROM native_producer_languages WHERE producer_id=?1 ORDER BY ordinal",
+            )?
+            .query_map([&producer_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
+        ensure!(
+            producer_languages == expected_ordinals,
+            "incompatible_index: invalid native producer languages"
+        );
+
+        let (source_set_id, root_id): (String, String) =
+            db.query_row("SELECT id,root_id FROM native_source_sets", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        let source_languages = db
+            .prepare(
+                "SELECT ordinal,language FROM native_source_set_languages WHERE source_set_id=?1 ORDER BY ordinal",
+            )?
+            .query_map([&source_set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
+        let dependencies = db
+            .prepare(
+                "SELECT ordinal,dependency_id FROM native_source_set_dependencies WHERE source_set_id=?1 ORDER BY ordinal",
+            )?
+            .query_map([&source_set_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            source_set_id == format!("source-set:v1:{}", self.root_id())
+                && root_id == self.root_id()
+                && source_languages == expected_ordinals
+                && dependencies.is_empty(),
+            "incompatible_index: invalid native source set"
+        );
+
+        let (revision_id, revision_source_set, toolchain_hash, config_hash, dependency_hash):
+            (String, String, String, String, String) = db.query_row(
+            "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        ensure!(
+            revision_source_set == source_set_id
+                && revision_id
+                    .strip_prefix("revision:v1:")
+                    .is_some_and(valid_hash)
+                && valid_hash(&toolchain_hash)
+                && valid_hash(&config_hash)
+                && valid_hash(&dependency_hash),
+            "incompatible_index: invalid native revision"
+        );
+        Ok(())
+    }
+
+    fn validate_recovery_snapshot(&self, db: &Connection) -> Result<()> {
+        validate_paired_rows(db)?;
+        validate_reconcile_source_sizes(db)?;
+        self.validate_native_basis(db)?;
+        let (stats_json, diagnostics_json): (String, String) = db.query_row(
+            "SELECT stats,diagnostics FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let persisted_stats: IndexStats = serde_json::from_str(&stats_json)
+            .context("incompatible_index: invalid persisted graph stats")?;
+        let diagnostics: Vec<Diagnostic> = serde_json::from_str(&diagnostics_json)
+            .context("incompatible_index: invalid persisted diagnostics")?;
+        let graph = Graph {
+            schema_version: SCHEMA_VERSION,
+            files: rows(db, "SELECT payload FROM files ORDER BY path")?,
+            nodes: rows(db, "SELECT payload FROM nodes ORDER BY id")?,
+            calls: rows(db, "SELECT payload FROM calls ORDER BY id")?,
+            regions: rows(db, "SELECT payload FROM regions ORDER BY id")?,
+            diagnostics,
+            stats: persisted_stats.clone(),
+        };
+        let mut derived_stats =
+            validate_graph(&graph, &Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .context("incompatible_index: invalid typed graph snapshot")?;
+
+        let paths = graph
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        for path in &paths {
+            self.attest_selected_document(db, path)?;
+        }
+        let mut expected_diagnostics = Vec::new();
+        let mut parse_error_files = 0;
+        let mut document_rows = db.prepare(
+            "SELECT source_set_id,language,path,revision_id FROM native_documents ORDER BY path,language",
+        )?;
+        let documents = document_rows.query_map([], |row| {
+            Ok((
+                crate::native_evidence::DocumentKey {
+                    source_set_id: row.get(0)?,
+                    language: row.get(1)?,
+                    path: row.get(2)?,
+                },
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for document in documents {
+            let (key, revision_id) = document?;
+            let coverage = Self::read_native_coverage(db, &key)?
+                .context("incompatible_index: native coverage missing")?;
+            ensure!(
+                coverage.revision_id == revision_id,
+                "incompatible_index: native coverage revision mismatch"
+            );
+            if coverage.state != "complete" {
+                let recovered = coverage
+                    .diagnostic
+                    .as_deref()
+                    .is_some_and(|message| message.contains("parser recovered"));
+                parse_error_files += usize::from(recovered);
+                expected_diagnostics.push(Diagnostic {
+                    path: Some(coverage.document_path),
+                    code: if recovered {
+                        "parse-error"
+                    } else {
+                        "native-coverage-partial"
+                    }
+                    .into(),
+                    message: coverage
+                        .diagnostic
+                        .unwrap_or_else(|| "Native extraction is incomplete".into()),
+                });
+            }
+        }
+        derived_stats.parse_error_files = parse_error_files;
+        ensure!(
+            derived_stats == persisted_stats && graph.diagnostics == expected_diagnostics,
+            "incompatible_index: persisted graph stats/diagnostics mismatch"
+        );
+
+        let expected_catalog = crate::classes::Catalog::build(
+            &graph.files,
+            &graph.nodes,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .context("incompatible_index: invalid class projection")?;
+        let mut actual_classes: Vec<crate::classes::ClassDefinition> =
+            rows(db, "SELECT payload FROM classes ORDER BY id")?;
+        let mut actual_relations: Vec<crate::classes::ClassRelation> =
+            rows(db, "SELECT payload FROM class_relations ORDER BY id")?;
+        let mut expected_classes = expected_catalog.classes;
+        let mut expected_relations = expected_catalog.relations;
+        actual_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+        expected_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+        actual_relations.sort_by(|a, b| a.id.cmp(&b.id));
+        expected_relations.sort_by(|a, b| a.id.cmp(&b.id));
+        let (warnings_json, truncated): (String, bool) = db.query_row(
+            "SELECT warnings,truncated FROM class_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let warnings: Vec<String> = serde_json::from_str(&warnings_json)
+            .context("incompatible_index: invalid class catalog warnings")?;
+        ensure!(
+            actual_classes == expected_classes
+                && actual_relations == expected_relations
+                && warnings == expected_catalog.warnings
+                && truncated == expected_catalog.truncated,
+            "incompatible_index: typed class projection mismatch"
+        );
+
+        Ok(())
+    }
+
     fn recovery_baseline(&self, db: &Connection) -> Result<(IndexPin, bool)> {
         validate_cache_shape(db)?;
         let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -1599,10 +1887,20 @@ impl Store {
             "incompatible_index: invalid revision"
         );
         let compatible = if schema == DATABASE_SCHEMA_VERSION && row.1 == EXTRACTOR_VERSION {
-            match validate_paired_rows(db) {
+            match self.validate_recovery_snapshot(db) {
                 Ok(()) => true,
-                Err(error) if error.downcast_ref::<rusqlite::Error>().is_none() => false,
-                Err(error) => return Err(error),
+                Err(error) => match error.downcast_ref::<rusqlite::Error>() {
+                    None => false,
+                    Some(
+                        rusqlite::Error::FromSqlConversionFailure(..)
+                        | rusqlite::Error::IntegralValueOutOfRange(..)
+                        | rusqlite::Error::Utf8Error(..)
+                        | rusqlite::Error::InvalidColumnType(..)
+                        | rusqlite::Error::QueryReturnedNoRows
+                        | rusqlite::Error::QueryReturnedMoreThanOneRow,
+                    ) => false,
+                    Some(_) => return Err(error),
+                },
             }
         } else {
             false
@@ -4683,6 +4981,71 @@ mod sqlite_schema_race_tests {
             )
             .unwrap();
         (state, work, store, graph, capture, native, pin, cancel)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_scan_classifies_same_size_preserved_mtime_edit_by_ctime() {
+        use std::ffi::CString;
+        use std::os::unix::fs::MetadataExt;
+
+        let (_state, work, store, _graph, _capture, _native, _pin, cancel) = ready();
+        let path = work.path().join("flow.js");
+        let before_meta = fs::metadata(&path).unwrap();
+        let before_stat: crate::capture::CaptureStat = {
+            let db = store.cache().unwrap();
+            let payload: String = db
+                .query_row(
+                    "SELECT capture_stat FROM files WHERE path='flow.js'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&payload).unwrap()
+        };
+        fs::write(&path, "function go() { observed(); }\n").unwrap();
+        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: before_meta.atime(),
+                tv_nsec: before_meta.atime_nsec(),
+            },
+            libc::timespec {
+                tv_sec: before_meta.mtime(),
+                tv_nsec: before_meta.mtime_nsec(),
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+        let options = IndexOptions::new(work.path().to_owned());
+        let (_next, _native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let after_stat = capture.source_stat("flow.js").unwrap();
+        assert_eq!(before_stat.size, after_stat.size);
+        assert_eq!(before_stat.device, after_stat.device);
+        assert_eq!(before_stat.inode, after_stat.inode);
+        assert_eq!(before_stat.mtime_seconds, after_stat.mtime_seconds);
+        assert_eq!(before_stat.mtime_nanoseconds, after_stat.mtime_nanoseconds);
+        assert_ne!(
+            (before_stat.ctime_seconds, before_stat.ctime_nanoseconds),
+            (after_stat.ctime_seconds, after_stat.ctime_nanoseconds)
+        );
+        let db = store.cache().unwrap();
+        let comparison = compare_capture_snapshot(&db, &capture).unwrap();
+        assert_eq!(comparison.ctime_changed, 1);
+        assert_eq!(comparison.hash_changed, 1);
+        assert!(comparison.changed());
+        assert_eq!(capture.files[0].text, "function go() { observed(); }\n");
+        assert_eq!(
+            capture.source_operations["flow.js"],
+            crate::capture::SourceOperations {
+                opens: 1,
+                complete_reads: 1,
+                hashes: 1,
+            }
+        );
     }
 
     #[test]

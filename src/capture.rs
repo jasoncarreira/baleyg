@@ -813,4 +813,74 @@ mod tests {
         assert_eq!(capture.executable_digest(&exe), Some(digest.as_str()));
         capture.verify(&cancel).unwrap();
     }
+    #[test]
+    fn required_inputs_and_uncertain_sources_take_unconditional_hash_path() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("fake-native-bin");
+        fs::write(&exe, "native-v1").unwrap();
+        fs::write(root.path().join("one.js"), "f();").unwrap();
+        fs::write(root.path().join("package.json"), "{\"a\":1}").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(root.path().to_owned());
+        let first =
+            Capture::admit_with_executable(&options, &cancel, &|_| {}, exe.clone()).unwrap();
+        fs::write(root.path().join("one.js"), "g();").unwrap();
+        fs::write(root.path().join("package.json"), "{\"b\":2}").unwrap();
+        let second = Capture::admit_with_executable(&options, &cancel, &|_| {}, exe).unwrap();
+
+        let mut previous_inputs = first.persisted_inputs().unwrap();
+        let mut current_inputs = second.persisted_inputs().unwrap();
+        let key = "config:package.json";
+        previous_inputs.retain(|candidate, _| candidate == key);
+        current_inputs.retain(|candidate, _| candidate == key);
+        let old_stat = match &previous_inputs[key] {
+            CaptureInputObservation::Present { stat, .. } => stat.clone(),
+            other => panic!("required config was not captured: {other:?}"),
+        };
+        match current_inputs.get_mut(key).unwrap() {
+            CaptureInputObservation::Present { stat, .. } => *stat = old_stat,
+            other => panic!("required config was not recaptured: {other:?}"),
+        }
+        let input_comparison = crate::store::compare_capture_observations(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &previous_inputs,
+            &current_inputs,
+        );
+        assert_eq!(input_comparison.stat_changed, 0);
+        assert_eq!(input_comparison.hash_changed, 1);
+        assert_eq!(input_comparison.unchanged_stat_input_hash_changed, 1);
+
+        let mut uncertain = second.source_stat("one.js").unwrap();
+        uncertain.mtime_seconds = None;
+        uncertain.mtime_nanoseconds = None;
+        uncertain.ctime_seconds = None;
+        uncertain.ctime_nanoseconds = None;
+        let previous_sources = BTreeMap::from([(
+            "one.js".to_owned(),
+            (first.files[0].hash.clone(), uncertain.clone()),
+        )]);
+        let current_sources = BTreeMap::from([(
+            "one.js".to_owned(),
+            (second.files[0].hash.clone(), uncertain),
+        )]);
+        let uncertain_comparison = crate::store::compare_capture_observations(
+            &previous_sources,
+            &current_sources,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(uncertain_comparison.stat_changed, 0);
+        assert_eq!(uncertain_comparison.hash_changed, 1);
+        assert_eq!(uncertain_comparison.uncertain_timestamp_hashed, 1);
+        assert_ne!(first.files[0].text, second.files[0].text);
+        assert_eq!(
+            second.source_operations["one.js"],
+            SourceOperations {
+                opens: 1,
+                complete_reads: 1,
+                hashes: 1,
+            }
+        );
+    }
 }
