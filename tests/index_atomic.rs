@@ -891,21 +891,21 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     // derived corruption, not a hard Store-open failure.
     drop(store);
     let db = rusqlite::Connection::open(&path).unwrap();
+    let (syntax_id, lookup_key): (String, String) = db
+        .query_row(
+            "SELECT syntax_id,lookup_key FROM native_declarations WHERE lookup_key IS NOT NULL AND language='javascript' ORDER BY syntax_id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE native_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=(SELECT syntax_id FROM native_declarations LIMIT 1)",
-            [],
+            "UPDATE native_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=?1",
+            [&syntax_id],
         )
         .unwrap(),
         1
     );
-    let lookup_key: String = db
-        .query_row(
-            "SELECT lookup_key FROM native_declarations WHERE lookup_key IS NOT NULL LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     drop(db);
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     assert_eq!(store.status().unwrap().revision, recovered);
@@ -926,8 +926,8 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let db = rusqlite::Connection::open(&path).unwrap();
     let stored_type: String = db
         .query_row(
-            "SELECT typeof(key_ordinal) FROM native_declarations LIMIT 1",
-            [],
+            "SELECT typeof(key_ordinal) FROM native_declarations WHERE syntax_id=?1",
+            [&syntax_id],
             |row| row.get(0),
         )
         .unwrap();
