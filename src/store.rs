@@ -640,9 +640,11 @@ fn presentation_class(
         return Ok(None);
     };
     let valid: bool = db
-        .query_row("SELECT json_valid(payload) FROM classes WHERE id=?1", [id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT json_valid(payload) FROM classes WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
         .map_err(|error| store.report_selected_failure(error.into()))?;
     if !valid {
         return Err(store.report_selected_failure(
@@ -651,7 +653,9 @@ fn presentation_class(
     }
     if size <= CLASS_BYTES as i64 {
         let payload: String = db
-            .query_row("SELECT payload FROM classes WHERE id=?1", [id], |r| r.get(0))
+            .query_row("SELECT payload FROM classes WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
             .map_err(|error| store.report_selected_failure(error.into()))?;
         let class = serde_json::from_str(&payload)
             .map_err(|error| store.report_selected_failure(error.into()))?;
@@ -670,7 +674,8 @@ fn presentation_class(
         .map_err(|error| store.report_selected_failure(error.into()))?;
     if !clip_shape {
         return Err(store.report_selected_failure(
-            SelectedIntegrity("incompatible_index: selected class member JSON invalid".into()).into(),
+            SelectedIntegrity("incompatible_index: selected class member JSON invalid".into())
+                .into(),
         ));
     }
     for count in [32, 16, 8, 4, 2, 1, 0] {
@@ -3831,10 +3836,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             let Some(valid) = valid else { continue };
             if !valid {
                 return Err(self.report_selected_failure(
-                    SelectedIntegrity(
-                        "incompatible_index: selected tree node JSON invalid".into(),
-                    )
-                    .into(),
+                    SelectedIntegrity("incompatible_index: selected tree node JSON invalid".into())
+                        .into(),
                 ));
             }
             let count: i64 = count_stmt
@@ -3873,7 +3876,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .map_err(|error| self.report_selected_failure(error.into()))?;
         if !selected_valid {
             return Err(self.report_selected_failure(
-                SelectedIntegrity("incompatible_index: selected file page JSON invalid".into()).into(),
+                SelectedIntegrity("incompatible_index: selected file page JSON invalid".into())
+                    .into(),
             ));
         }
         let mut stmt = tx.prepare("SELECT f.path,CASE WHEN json_valid(f.payload) THEN json_extract(f.payload,'$.language') ELSE NULL END,(SELECT count(*) FROM nodes n WHERE n.path=f.path AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM files f ORDER BY f.path LIMIT ?1 OFFSET ?2")?;
@@ -5140,11 +5144,8 @@ mod sqlite_schema_race_tests {
         ] {
             let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
             let clone = store.clone();
-            let operational: anyhow::Error = rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(code),
-                None,
-            )
-            .into();
+            let operational: anyhow::Error =
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into();
             let returned = store.report_selected_failure(operational);
             assert!(returned.downcast_ref::<rusqlite::Error>().is_some());
             assert_eq!(store.status().unwrap().revision, pin);

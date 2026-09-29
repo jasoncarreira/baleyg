@@ -1125,7 +1125,10 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     let selector = member(&selected_dir, &class_id, "first", 0);
     let selected_db = rusqlite::Connection::open(index_db(&selected_dir)).unwrap();
     selected_db
-        .execute("UPDATE nodes SET payload='not-json' WHERE id=?1", [&class_id])
+        .execute(
+            "UPDATE nodes SET payload='not-json' WHERE id=?1",
+            [&class_id],
+        )
         .unwrap();
     let (status, invalid) = call(&selected_app, selector).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{invalid}");

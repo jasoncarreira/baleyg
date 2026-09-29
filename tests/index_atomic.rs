@@ -1177,32 +1177,68 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let (state, _workspace, store, pin) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    db.execute("UPDATE files SET payload='not-json' WHERE path='flow.js'", [])
-        .unwrap();
+    db.execute(
+        "UPDATE files SET payload='not-json' WHERE path='flow.js'",
+        [],
+    )
+    .unwrap();
     let error = store.files_at(Some(pin), 0, 10).unwrap_err();
-    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     // A matching invalid node is selected by the page even when file JSON is valid.
     let (state, _workspace, store, pin) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    db.execute("UPDATE nodes SET payload='not-json' WHERE path='flow.js'", [])
-        .unwrap();
+    db.execute(
+        "UPDATE nodes SET payload='not-json' WHERE path='flow.js'",
+        [],
+    )
+    .unwrap();
     let error = store.files_at(Some(pin), 0, 10).unwrap_err();
-    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     // The methods route types both invalid JSON and valid JSON with bad Symbol shape.
     for payload in ["not-json", r#"{"kind":"function"}"#] {
         let (state, _workspace, store, pin) = projection_fixture();
         let clone = store.clone();
         let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-        db.execute("UPDATE nodes SET payload=?1 WHERE path='flow.js'", [payload])
-            .unwrap();
+        db.execute(
+            "UPDATE nodes SET payload=?1 WHERE path='flow.js'",
+            [payload],
+        )
+        .unwrap();
         let error = store.methods_at("flow.js", Some(pin)).unwrap_err();
-        assert!(error.to_string().contains("incompatible_index"), "{error:#}");
-        assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+        assert!(
+            error.to_string().contains("incompatible_index"),
+            "{error:#}"
+        );
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("index_not_ready")
+        );
     }
 
     // A valid selected file JSON value with a non-string language is a typed
@@ -1216,15 +1252,27 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     )
     .unwrap();
     let error = store.files_at(Some(pin), 0, 10).unwrap_err();
-    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     // Tree enrichment evaluates only its visible file and latches its invalid node.
     let (state, workspace, store, _pin) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    db.execute("UPDATE nodes SET payload='not-json' WHERE path='flow.js'", [])
-        .unwrap();
+    db.execute(
+        "UPDATE nodes SET payload='not-json' WHERE path='flow.js'",
+        [],
+    )
+    .unwrap();
     let mut items = vec![baleyg::file_tree::Entry {
         name: "flow.js".into(),
         path: "flow.js".into(),
@@ -1235,8 +1283,17 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     }];
     let tree_root = workspace.path().canonicalize().unwrap();
     let error = store.tree_metadata(&tree_root, &mut items).unwrap_err();
-    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     // Benign absence and a bad pin remain non-latching request outcomes.
     let (_state, _workspace, store, pin) = projection_fixture();
@@ -1246,43 +1303,86 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         index_generation: uuid::Uuid::new_v4(),
         index_revision: pin.index_revision,
     };
-    assert!(store.files_at(Some(wrong), 0, 10).unwrap_err().to_string().contains("revision conflict"));
+    assert!(
+        store
+            .files_at(Some(wrong), 0, 10)
+            .unwrap_err()
+            .to_string()
+            .contains("revision conflict")
+    );
     assert_eq!(store.status().unwrap().revision, pin);
     assert_eq!(clone.status().unwrap().revision, pin);
 }
 
 #[test]
 fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit() {
-    use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag};
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
     use std::os::unix::fs::MetadataExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     let (state, workspace, store, pin) = projection_fixture();
     let clone = store.clone();
     let path = index_dir(state.path()).join("index.db");
     let inode = fs::metadata(&path).unwrap().ino();
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE files SET payload='not-json' WHERE path='flow.js'", [])
-        .unwrap();
+    db.execute(
+        "UPDATE files SET payload='not-json' WHERE path='flow.js'",
+        [],
+    )
+    .unwrap();
     drop(db);
     let error = store.files_at(Some(pin), 0, 10).unwrap_err();
-    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
     let failed = IndexJobCoordinator::prepare(&store, Some(pin))
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap_err();
     assert!(failed.to_string().contains("cancelled"), "{failed:#}");
-    assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
-    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
 
     cancel.store(false, Ordering::Release);
     let recovered = IndexJobCoordinator::prepare(&store, Some(pin))
         .unwrap()
-        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap();
     assert_eq!(recovered.index_revision, 1);
     assert_ne!(recovered.index_generation, pin.index_generation);
