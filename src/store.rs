@@ -119,6 +119,21 @@ impl std::fmt::Display for SelectedIntegrity {
     }
 }
 impl std::error::Error for SelectedIntegrity {}
+#[derive(Debug)]
+struct ControlIntegrity(String);
+impl std::fmt::Display for ControlIntegrity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for ControlIntegrity {}
+macro_rules! control_ensure {
+    ($condition:expr, $message:expr $(,)?) => {
+        if !$condition {
+            return Err(ControlIntegrity($message.into()).into());
+        }
+    };
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublishStage {
@@ -379,7 +394,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
     if matches!(version, PREVIOUS_SCHEMA_VERSION | DATABASE_SCHEMA_VERSION) {
         expected.execute_batch(NATIVE_SCHEMA)?;
     } else {
-        ensure!(
+        control_ensure!(
             matches!(version, LEGACY_SCHEMA_VERSION | GRAPH_SCHEMA_VERSION),
             "incompatible_index: unknown schema version"
         );
@@ -395,7 +410,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
     } else {
         false
     };
-    ensure!(
+    control_ensure!(
         exact || known_recovery_hybrid,
         "incompatible_index: unknown cache object type, name or shape"
     );
@@ -456,6 +471,7 @@ fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
         return RecoveryClass::RecreatePending;
     }
     if error.downcast_ref::<SelectedIntegrity>().is_some()
+        || error.downcast_ref::<ControlIntegrity>().is_some()
         || error.downcast_ref::<serde_json::Error>().is_some()
         || error.downcast_ref::<std::string::FromUtf8Error>().is_some()
     {
@@ -1114,7 +1130,7 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
             .prepare(sql)?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
+        control_ensure!(
             rows.len() <= 1,
             "incompatible_index: duplicate native pair metadata"
         );
@@ -1124,7 +1140,7 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
     let source = one_row(db, "SELECT id,root_id FROM native_source_sets LIMIT 2")?;
     let revision = one_row(db, "SELECT id,source_set_id FROM native_revisions LIMIT 2")?;
     let expected_source = format!("source-set:v1:{root_id}");
-    ensure!(
+    control_ensure!(
         producer
             .as_ref()
             .is_some_and(|(id, kind)| id == "baleyg.native.syntax" && kind == "native")
@@ -1302,7 +1318,7 @@ fn compare_capture_snapshot(
 
 fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str) -> Result<()> {
     let nanos = |value: Option<i64>| value.is_some_and(|n| (0..1_000_000_000).contains(&n));
-    ensure!(
+    control_ensure!(
         stat.version == 1
             && stat.kind == expected_kind
             && stat.device.is_some() == stat.inode.is_some()
@@ -1312,7 +1328,7 @@ fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str
         "incompatible_index: invalid capture stat"
     );
     #[cfg(unix)]
-    ensure!(
+    control_ensure!(
         stat.device.is_some_and(|n| n > 0)
             && stat.inode.is_some_and(|n| n > 0)
             && nanos(stat.mtime_nanoseconds)
@@ -1320,7 +1336,7 @@ fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str
         "incompatible_index: incomplete Unix capture stat"
     );
     #[cfg(not(unix))]
-    ensure!(
+    control_ensure!(
         stat.device.is_none()
             && stat.inode.is_none()
             && stat.mtime_seconds.is_none()
@@ -1336,13 +1352,20 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let incarnation = incarnation.context("incompatible_index: missing reconciled incarnation")?;
-    uuid::Uuid::parse_str(&incarnation)
-        .context("incompatible_index: invalid reconciled incarnation")?;
-    let options = options.context("incompatible_index: missing reconcile options")?;
+    let incarnation = incarnation.ok_or_else(|| {
+        ControlIntegrity("incompatible_index: missing reconciled incarnation".into())
+    })?;
+    uuid::Uuid::parse_str(&incarnation).map_err(|error| {
+        ControlIntegrity(format!(
+            "incompatible_index: invalid reconciled incarnation: {error}"
+        ))
+    })?;
+    let options = options.ok_or_else(|| {
+        ControlIntegrity("incompatible_index: missing reconcile options".into())
+    })?;
     let decoded_options: crate::indexer::ReconcileOptions =
         serde_json::from_str(&options).context("incompatible_index: invalid reconcile options")?;
-    ensure!(
+    control_ensure!(
         json(&decoded_options)? == options
             && decoded_options.version == 1
             && decoded_options.max_file_bytes > 0
@@ -1355,13 +1378,13 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     let mut files = file_statement.query([])?;
     while let Some(row) = files.next()? {
         let path: String = row.get(0)?;
-        ensure!(
+        control_ensure!(
             !path.is_empty()
                 && !Path::new(&path).is_absolute()
                 && !path.split('/').any(|part| part.is_empty() || part == ".."),
             "incompatible_index: invalid captured source path"
         );
-        ensure!(
+        control_ensure!(
             source_paths.insert(path.clone()),
             "incompatible_index: duplicate captured source path"
         );
@@ -1369,7 +1392,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         let decoded: crate::capture::CaptureStat =
             serde_json::from_str(&payload).context("incompatible_index: invalid capture stat")?;
         validate_capture_stat(&decoded, "file")?;
-        ensure!(
+        control_ensure!(
             json(&decoded)? == payload,
             "incompatible_index: invalid capture stat"
         );
@@ -1384,13 +1407,13 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     while let Some(row) = inputs.next()? {
         let key: String = row.get(0)?;
         let payload: String = row.get(1)?;
-        ensure!(
+        control_ensure!(
             !key.is_empty() && key.len() <= 8192 && actual.insert(key.clone()),
             "incompatible_index: invalid capture input key"
         );
         let observation: crate::capture::CaptureInputObservation =
             serde_json::from_str(&payload).context("incompatible_index: invalid capture input")?;
-        ensure!(
+        control_ensure!(
             json(&observation)? == payload,
             "incompatible_index: noncanonical capture input"
         );
@@ -1403,7 +1426,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             {
                 validate_capture_stat(stat, "directory")?;
                 let relative = key.trim_start_matches("directory:");
-                ensure!(
+                control_ensure!(
                     relative.is_empty()
                         || (!Path::new(relative).is_absolute()
                             && !relative
@@ -1422,7 +1445,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                     || key.starts_with("executable:") =>
             {
                 validate_capture_stat(stat, "file")?;
-                ensure!(
+                control_ensure!(
                     hash.len() == 64
                         && hash
                             .bytes()
@@ -1430,7 +1453,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                     "incompatible_index: invalid capture input hash"
                 );
                 if key.starts_with("executable:") {
-                    ensure!(
+                    control_ensure!(
                         executable.replace(key.to_owned()).is_none(),
                         "incompatible_index: duplicate executable input"
                     );
@@ -1442,11 +1465,16 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                     || key.starts_with("ignore:")
                     || key.starts_with("presentation-scip:")
                     || key.starts_with("presentation-manifest:") => {}
-            _ => anyhow::bail!("incompatible_index: capture input role mismatch"),
+            _ => {
+                return Err(ControlIntegrity(
+                    "incompatible_index: capture input role mismatch".into(),
+                )
+                .into());
+            }
         }
     }
 
-    ensure!(
+    control_ensure!(
         directories.contains(""),
         "incompatible_index: missing root directory inventory"
     );
@@ -1455,9 +1483,11 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         while let Some(path) = parent {
             let relative = path
                 .to_str()
-                .context("incompatible_index: non-UTF8 source parent")?
+                .ok_or_else(|| {
+                    ControlIntegrity("incompatible_index: non-UTF8 source parent".into())
+                })?
                 .replace('\\', "/");
-            ensure!(
+            control_ensure!(
                 directories.contains(&relative),
                 "incompatible_index: missing source directory inventory"
             );
@@ -1481,13 +1511,15 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         }
         expected.insert(format!("directory:{directory}"));
     }
-    expected.insert(executable.context("incompatible_index: missing executable input")?);
+    expected.insert(executable.ok_or_else(|| {
+        ControlIntegrity("incompatible_index: missing executable input".into())
+    })?);
     match &decoded_options.scip_path {
         Some(path) => {
-            ensure!(!path.is_empty(), "incompatible_index: empty SCIP option");
+            control_ensure!(!path.is_empty(), "incompatible_index: empty SCIP option");
             expected.insert(format!("presentation-scip:{path}"));
         }
-        None => ensure!(
+        None => control_ensure!(
             !actual
                 .iter()
                 .any(|key| key.starts_with("presentation-scip:")),
@@ -1496,20 +1528,20 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     }
     match &decoded_options.manifest_path {
         Some(path) => {
-            ensure!(
+            control_ensure!(
                 !path.is_empty(),
                 "incompatible_index: empty manifest option"
             );
             expected.insert(format!("presentation-manifest:{path}"));
         }
-        None => ensure!(
+        None => control_ensure!(
             !actual
                 .iter()
                 .any(|key| key.starts_with("presentation-manifest:")),
             "incompatible_index: unconfigured manifest input"
         ),
     }
-    ensure!(
+    control_ensure!(
         actual == expected,
         "incompatible_index: incomplete or unknown capture inventory"
     );
@@ -1723,7 +1755,7 @@ impl Store {
         verify_index_file(&staged.path)?;
         let mut checked = open_index(&staged.path, true)?;
         let checked_snapshot = storage_result(checked.transaction())?;
-        self.read_control_status(&checked_snapshot)?;
+        self.decode_control_status_raw(&checked_snapshot)?;
         let integrity: String =
             storage_result(checked_snapshot.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
         ensure!(
@@ -1852,15 +1884,18 @@ impl Store {
             RecoveryClass::Hard => Err(error),
         }
     }
-    fn report_control_failure(&self, error: anyhow::Error) -> anyhow::Error {
+    fn report_live_read_failure(&self, error: anyhow::Error) -> anyhow::Error {
         match recovery_class(&error) {
-            RecoveryClass::Rebuild => self.mark_recovery(RecoveryDisposition::Rebuild),
-            RecoveryClass::RecreatePending => {
-                self.mark_recovery(RecoveryDisposition::RecreatePending)
+            RecoveryClass::Rebuild => {
+                self.mark_recovery(RecoveryDisposition::Rebuild);
+                anyhow::anyhow!("incompatible_index: live index decode failed: {error:#}")
             }
-            RecoveryClass::Hard => {}
+            RecoveryClass::RecreatePending => {
+                self.mark_recovery(RecoveryDisposition::RecreatePending);
+                anyhow::anyhow!("recovery_required: exceptional index recovery deferred")
+            }
+            RecoveryClass::Hard => error,
         }
-        error
     }
     fn report_selected_failure(&self, error: anyhow::Error) -> anyhow::Error {
         match recovery_class(&error) {
@@ -2129,7 +2164,7 @@ impl Store {
         })
     }
 
-    fn read_control_status(&self, db: &Connection) -> Result<IndexStatus> {
+    fn decode_control_status_raw(&self, db: &Connection) -> Result<IndexStatus> {
         // This check must run INSIDE the caller's read snapshot or writer lock.
         // The open_index admission check alone cannot protect against later DDL.
         validate_cache_shape(db)?;
@@ -2138,7 +2173,7 @@ impl Store {
         let row: (i64,String,String,String,String,String,i64,String,String,String) = storage_result(db.query_row(
             "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata WHERE singleton=1",
             [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))))?;
-        ensure!(
+        control_ensure!(
             (schema_version == i64::from(LEGACY_SCHEMA_VERSION)
                 && row.0 == schema_version
                 && row.1 == LEGACY_EXTRACTOR_VERSION)
@@ -2177,37 +2212,47 @@ impl Store {
                 .then(|| EVIDENCE_FORMAT.to_owned()),
         })
     }
-    fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
+    fn read_public_control_status(&self, db: &Connection) -> Result<IndexStatus> {
         ensure!(
             !self.recovery_required.load(Ordering::Acquire),
             "index_not_ready: reconciliation required"
         );
-        let status = self.read_control_status(db)?;
+        self.verify_metadata_root(db)
+            .map_err(|error| self.report_live_read_failure(error))?;
+        self.decode_control_status_raw(db)
+            .map_err(|error| self.report_live_read_failure(error))
+    }
+
+    fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
+        let status = self.read_public_control_status(db)?;
         ensure!(
             status.evidence_format.is_some(),
             "index_not_ready: reindex required"
         );
-        validate_reconcile_inventory(db)?;
-        // Every public schema-7 derived read needs the same bounded catalog
-        // singleton. Missing/oversized live metadata is corruption, never an
-        // old-index "requireIndex" fallback. This is one indexed metadata row.
-        let warnings_bytes: Option<i64> = db
-            .query_row(
-                "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if !warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)) {
-            return Err(self.report_control_failure(
-                SelectedIntegrity(
+        (|| -> Result<()> {
+            validate_reconcile_inventory(db)?;
+            // Every public schema-7 derived read needs the same bounded catalog
+            // singleton. Missing/oversized live metadata is corruption, never an
+            // old-index "requireIndex" fallback. This is one indexed metadata row.
+            let warnings_bytes: Option<i64> = db
+                .query_row(
+                    "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if !warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)) {
+                return Err(SelectedIntegrity(
                     "incompatible_index: class catalog byte budget exceeded or missing".into(),
                 )
-                .into(),
-            ));
-        }
+                .into());
+            }
+            Ok(())
+        })()
+        .map_err(|error| self.report_live_read_failure(error))?;
         Ok(status)
     }
+
     /// Internal control baseline, never returned by public status or evidence reads.
     pub fn index_baseline(&self) -> Result<IndexPin> {
         self.recovery_index_baseline()?
@@ -2240,7 +2285,6 @@ impl Store {
         before_snapshot(&db)?;
         let tx = storage_result(db.transaction())?;
         self.read_status(&tx)
-            .map_err(|error| self.report_control_failure(error))
     }
     pub fn publish(
         &self,
@@ -4301,7 +4345,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         Ok(graph)
     }
     /// Reauthenticate only a cached packet's selected evidence under one pin.
-    /// Unrelated documents are not read, so bounded status stays metadata-only.
+    /// Unrelated documents are not read; status still validates persisted capture inventory.
     pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
@@ -4450,7 +4494,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let views = self.records().views()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        if self.read_control_status(&tx)?.evidence_format.is_none() {
+        if self.read_public_control_status(&tx)?.evidence_format.is_none() {
             return Ok(views
                 .into_iter()
                 .map(|view| SavedViewState {
@@ -4471,7 +4515,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let view = self.records().view(id)?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        if self.read_control_status(&tx)?.evidence_format.is_none() {
+        if self.read_public_control_status(&tx)?.evidence_format.is_none() {
             return Ok(view.map(|view| SavedViewState {
                 orphaned_ids: std::iter::once(view.query.seed.clone())
                     .chain(view.pins.keys().cloned())
@@ -4494,7 +4538,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let annotations = self.records().annotations()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        if self.read_control_status(&tx)?.evidence_format.is_none() {
+        if self.read_public_control_status(&tx)?.evidence_format.is_none() {
             return Ok(annotations
                 .into_iter()
                 .map(|annotation| AnnotationState {
@@ -5431,6 +5475,59 @@ mod sqlite_schema_race_tests {
         ] {
             assert_eq!(classify(code), RecoveryClass::Hard);
         }
+    }
+
+    #[test]
+    fn live_read_reporter_separates_root_storage_corruption_from_operational_errors() {
+        let sqlite = |code| -> anyhow::Error {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into()
+        };
+        for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB] {
+            let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
+            let clone = store.clone();
+            let error = store.report_live_read_failure(sqlite(code));
+            assert!(error.to_string().starts_with("recovery_required:"), "{error:#}");
+            assert_eq!(store.disposition(), RecoveryDisposition::RecreatePending);
+            assert!(clone.status().unwrap_err().to_string().starts_with("recovery_required:"));
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_ERROR,
+        ] {
+            let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+            let error = store.report_live_read_failure(sqlite(code));
+            assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+            assert_eq!(store.status().unwrap().revision, pin);
+        }
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
+        let clone = store.clone();
+        let error = store.report_live_read_failure(
+            rusqlite::Error::InvalidColumnType(
+                0,
+                "root_spelling".into(),
+                rusqlite::types::Type::Real,
+            )
+            .into(),
+        );
+        assert!(error.to_string().starts_with("incompatible_index:"));
+        assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
+        let clone = store.clone();
+        let error = store.report_live_read_failure(
+            ControlIntegrity("incompatible_index: existing structural check".into()).into(),
+        );
+        assert!(error.to_string().starts_with("incompatible_index:"));
+        assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let error = store.report_live_read_failure(anyhow::anyhow!(
+            "root_key_collision: index belongs to a different spelling"
+        ));
+        assert!(error.to_string().starts_with("root_key_collision:"));
+        assert_eq!(store.status().unwrap().revision, pin);
     }
 
     #[test]
