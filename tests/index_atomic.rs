@@ -1233,9 +1233,8 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         method_count: None,
         unindexed_reason: None,
     }];
-    let error = store
-        .tree_metadata(workspace.path(), &mut items)
-        .unwrap_err();
+    let tree_root = workspace.path().canonicalize().unwrap();
+    let error = store.tree_metadata(&tree_root, &mut items).unwrap_err();
     assert!(error.to_string().contains("incompatible_index"), "{error:#}");
     assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
 
