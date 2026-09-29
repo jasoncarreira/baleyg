@@ -1122,7 +1122,7 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     let (selected_dir, selected_store, selected_graph, selected_app) = fixture();
     let selected_clone = selected_store.clone();
     let class_id = id(&selected_graph, "A");
-    let selector = member(&selected_dir, &class_id, "first", 0);
+    let selector = member(&selected_dir, class_id, "first", 0);
     let selected_db = rusqlite::Connection::open(index_db(&selected_dir)).unwrap();
     selected_db
         .execute(
