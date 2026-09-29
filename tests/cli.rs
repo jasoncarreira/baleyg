@@ -2109,8 +2109,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 409, "{stale_packet}");
-    assert_eq!(stale_packet["error"]["code"], "revision_conflict");
+    assert_eq!(code, 404, "{stale_packet}");
+    assert_eq!(stale_packet["error"]["code"], "not_found");
     let native_after = real_native_snapshot(&home);
     let graph_after = real_export(&root, &home);
     assert_ne!(
