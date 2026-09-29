@@ -253,6 +253,51 @@ async fn jobs_publish_and_cancel() {
     assert_eq!(store.status().unwrap().revision.index_revision, 1);
     state.cancel_active();
 }
+#[tokio::test]
+async fn index_start_waits_out_a_concurrent_reader_instead_of_storage_busy() {
+    let (dir, store, state, app) = setup();
+    let (code, job) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(code, 202, "{job}");
+    let id = job["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, j) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            if !j["finishedAt"].is_null() {
+                break;
+            }
+            tokio::task::yield_now().await
+        }
+    })
+    .await
+    .unwrap();
+    let pin = store.status().unwrap().revision;
+    let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    // Under rollback journaling an open read transaction blocks any writer's commit, as the
+    // startup dependency-catalog worker's status() read does while a client starts an index.
+    let reader =
+        rusqlite::Connection::open_with_flags(&index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM index_metadata", [], |row| row.get(0))
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        reader.execute_batch("COMMIT").unwrap();
+    });
+    let (code, body) = call(&app, "POST", "/api/index", json!({"expectedRevision": pin})).await;
+    release.join().unwrap();
+    assert_eq!(
+        code, 202,
+        "a transient reader must not surface as storage_busy: {body}"
+    );
+    state.cancel_active();
+}
 #[test]
 fn token_security() {
     use std::os::unix::fs::{PermissionsExt, symlink};

@@ -1350,7 +1350,11 @@ def sink():
             "{name}: rejected auth/origin must not start work"
         );
         let accepted = request().bearer_auth(TOKEN).send().await.unwrap();
-        assert_eq!(accepted.status(), 202, "{name}");
+        let status = accepted.status();
+        if status != 202 {
+            let body = accepted.text().await.unwrap_or_default();
+            panic!("{name}: expected 202, got {status}: {body}");
+        }
         let started: Value = accepted.json().await.unwrap();
         let id = started["id"].as_str().unwrap();
         let completed = tokio::time::timeout(Duration::from_secs(20), async {

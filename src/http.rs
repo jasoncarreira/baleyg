@@ -366,6 +366,8 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 struct ApiError(StatusCode, &'static str, &'static str);
+/// Upper bound on waiting out transient SQLite contention before an index job starts.
+const INDEX_START_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         error(self.0, self.1, self.2)
@@ -1343,10 +1345,22 @@ async fn start_index(
             ));
         }
     }
-    let coordinator = db(s.clone(), move |store| {
-        crate::index_coordinator::IndexJobCoordinator::prepare(store, requested)
-    })
-    .await?;
+    // Under rollback journaling any open reader (for example the startup dependency-catalog
+    // worker's status read) makes the leader's metadata commit fail with SQLITE_BUSY. Wait that
+    // transient contention out for a bounded time instead of rejecting the request.
+    let deadline = std::time::Instant::now() + INDEX_START_BUSY_WAIT;
+    let coordinator = loop {
+        match db(s.clone(), move |store| {
+            crate::index_coordinator::IndexJobCoordinator::prepare(store, requested)
+        })
+        .await
+        {
+            Err(ApiError(_, "storage_busy", _)) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            result => break result?,
+        }
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     let job = IndexJob {
         id: uuid::Uuid::new_v4().to_string(),
