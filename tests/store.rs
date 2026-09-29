@@ -1161,6 +1161,241 @@ fn legacy_rebaseline_capture_drift_after_partial_write_preserves_old_bytes() {
 }
 
 #[test]
+fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists() {
+    for rename in [false, true] {
+        let (_state, work, store) = fixture();
+        std::fs::write(work.path().join("a.js"), "function stable() { return 1; }\n").unwrap();
+        std::fs::write(work.path().join("b.js"), "function target() { return 2; }\n").unwrap();
+        let captured = bundle(&store, &work);
+        let stable = captured
+            .1
+            .declarations
+            .iter()
+            .find(|row| row.document.path == "a.js" && row.name.as_deref() == Some("stable"))
+            .unwrap()
+            .syntax_id
+            .clone();
+        let target = captured
+            .1
+            .declarations
+            .iter()
+            .find(|row| row.document.path == "b.js" && row.name.as_deref() == Some("target"))
+            .unwrap()
+            .syntax_id
+            .clone();
+        let first = publish_bundle(&store, &captured, store.index_baseline().unwrap());
+        let saved_view = |id: &str, title: &str, seed: &str| SavedView {
+            id: id.into(),
+            title: title.into(),
+            query: ViewQuery {
+                seed: seed.into(),
+                ..query()
+            },
+            pins: BTreeMap::new(),
+            hidden: vec![],
+        };
+        let missing_view = store
+            .save_view_at(first, &saved_view("target-view", "Target", &target))
+            .unwrap();
+        let stable_view = store
+            .save_view_at(first, &saved_view("stable-view", "Stable", &stable))
+            .unwrap();
+        let missing_note = store
+            .save_annotation_at(
+                first,
+                &AnnotationRequest {
+                    id: "target-note".into(),
+                    node_id: target.clone(),
+                    body: "target note".into(),
+                    title: None,
+                },
+            )
+            .unwrap();
+        let stable_note = store
+            .save_annotation_at(
+                first,
+                &AnnotationRequest {
+                    id: "stable-note".into(),
+                    node_id: stable,
+                    body: "stable note".into(),
+                    title: None,
+                },
+            )
+            .unwrap();
+        let missing_view_anchor = missing_view.view.anchor.unwrap().get().to_owned();
+        let stable_view_anchor = stable_view.view.anchor.unwrap().get().to_owned();
+        let missing_note_anchor = missing_note.annotation.anchor.unwrap().get().to_owned();
+        let stable_note_anchor = stable_note.annotation.anchor.unwrap().get().to_owned();
+
+        if rename {
+            std::fs::rename(work.path().join("b.js"), work.path().join("renamed.js")).unwrap();
+        } else {
+            std::fs::remove_file(work.path().join("b.js")).unwrap();
+        }
+        let fresh = bundle(&store, &work);
+        let second = publish_bundle(&store, &fresh, first);
+
+        let views = store.saved_views_at(Some(second)).unwrap();
+        assert_eq!(views.len(), 2, "rename={rename}");
+        let missing = views.iter().find(|state| state.view.id == "target-view").unwrap();
+        assert_eq!(
+            missing.attachment.availability,
+            AttachmentAvailability::Ready,
+            "rename={rename}"
+        );
+        assert_eq!(
+            missing.attachment.result.as_ref().unwrap().status,
+            AnchorStatus::Orphaned,
+            "rename={rename}"
+        );
+        assert_eq!(
+            missing.attachment.result.as_ref().unwrap().reason,
+            AnchorReason::Missing,
+            "rename={rename}"
+        );
+        assert_eq!(
+            missing.view.anchor.as_deref().unwrap().get(),
+            missing_view_anchor,
+            "rename={rename}"
+        );
+        let unaffected = views.iter().find(|state| state.view.id == "stable-view").unwrap();
+        assert_eq!(
+            unaffected.attachment.result.as_ref().unwrap().status,
+            AnchorStatus::Attached,
+            "rename={rename}"
+        );
+        assert_eq!(
+            unaffected.view.anchor.as_deref().unwrap().get(),
+            stable_view_anchor,
+            "rename={rename}"
+        );
+        let opened = store
+            .saved_view_at("target-view", Some(second))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            opened.attachment.result.as_ref().unwrap().reason,
+            AnchorReason::Missing,
+            "rename={rename}"
+        );
+        assert_eq!(
+            opened.view.anchor.as_deref().unwrap().get(),
+            missing_view_anchor,
+            "rename={rename}"
+        );
+
+        let notes = store.saved_annotations_at(Some(second)).unwrap();
+        assert_eq!(notes.len(), 2, "rename={rename}");
+        let missing = notes
+            .iter()
+            .find(|state| state.annotation.id == "target-note")
+            .unwrap();
+        assert_eq!(
+            missing.attachment.availability,
+            AttachmentAvailability::Ready,
+            "rename={rename}"
+        );
+        assert_eq!(
+            missing.attachment.result.as_ref().unwrap().status,
+            AnchorStatus::Orphaned,
+            "rename={rename}"
+        );
+        assert_eq!(
+            missing.attachment.result.as_ref().unwrap().reason,
+            AnchorReason::Missing,
+            "rename={rename}"
+        );
+        assert_eq!(
+            missing.annotation.anchor.as_deref().unwrap().get(),
+            missing_note_anchor,
+            "rename={rename}"
+        );
+        let unaffected = notes
+            .iter()
+            .find(|state| state.annotation.id == "stable-note")
+            .unwrap();
+        assert_eq!(
+            unaffected.attachment.result.as_ref().unwrap().status,
+            AnchorStatus::Attached,
+            "rename={rename}"
+        );
+        assert_eq!(
+            unaffected.annotation.anchor.as_deref().unwrap().get(),
+            stable_note_anchor,
+            "rename={rename}"
+        );
+    }
+}
+
+#[test]
+fn inconsistent_anchor_document_association_still_fails_closed() {
+    let (state, work, store) = fixture();
+    std::fs::write(work.path().join("b.js"), "function target() { return 2; }\n").unwrap();
+    let captured = bundle(&store, &work);
+    let target = captured
+        .1
+        .declarations
+        .iter()
+        .find(|row| row.document.path == "b.js" && row.name.as_deref() == Some("target"))
+        .unwrap()
+        .syntax_id
+        .clone();
+    let pin = publish_bundle(&store, &captured, store.index_baseline().unwrap());
+    store
+        .save_view_at(
+            pin,
+            &SavedView {
+                id: "corrupt-association".into(),
+                title: "Corrupt association".into(),
+                query: ViewQuery {
+                    seed: target,
+                    ..query()
+                },
+                pins: BTreeMap::new(),
+                hidden: vec![],
+            },
+        )
+        .unwrap();
+
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
+            .unwrap();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    let db = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
+    let payload: String = db
+        .query_row(
+            "SELECT payload FROM views WHERE id='corrupt-association'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    payload["anchor"]["document"]["sourceSetId"] = serde_json::json!("source-set:v1:tampered");
+    db.execute(
+        "UPDATE views SET payload=?1 WHERE id='corrupt-association'",
+        [serde_json::to_string(&payload).unwrap()],
+    )
+    .unwrap();
+
+    for error in [
+        store.saved_views_at(Some(pin)).unwrap_err(),
+        store
+            .saved_view_at("corrupt-association", Some(pin))
+            .unwrap_err(),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("invalid anchor document association"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
 fn saved_reads_without_records_are_conservative_and_write_nothing() {
     let (state, work, store) = fixture();
     let cache = index_db(state.path());

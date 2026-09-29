@@ -432,6 +432,212 @@ async fn saved_read_pin_and_ownership_matrix() {
 }
 
 #[tokio::test]
+async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function stable() { return 1; }\n").unwrap();
+    std::fs::write(root.join("b.js"), "function target() { return 2; }\n").unwrap();
+    let options = IndexOptions::new(root.clone());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
+    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &options,
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let stable = native
+        .declarations
+        .iter()
+        .find(|row| row.document.path == "a.js" && row.name.as_deref() == Some("stable"))
+        .unwrap()
+        .syntax_id
+        .clone();
+    let target = native
+        .declarations
+        .iter()
+        .find(|row| row.document.path == "b.js" && row.name.as_deref() == Some("target"))
+        .unwrap()
+        .syntax_id
+        .clone();
+    let first = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.leader().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let app = http::router(
+        http::new(
+            store.clone(),
+            options.clone(),
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let target_view = json!({"id":"target-view","title":"Target","query":{"seed":target}});
+    let stable_view = json!({"id":"stable-view","title":"Stable","query":{"seed":stable}});
+    let target_note = json!({"id":"target-note","nodeId":target,"body":"target note"});
+    let stable_note = json!({"id":"stable-note","nodeId":stable,"body":"stable note"});
+    let (status, created_target_view) = call(
+        &app,
+        "PUT",
+        &pinned("/api/views/target-view", &first),
+        target_view,
+    )
+    .await;
+    assert_eq!(status, 200, "{created_target_view}");
+    let (status, created_stable_view) = call(
+        &app,
+        "PUT",
+        &pinned("/api/views/stable-view", &first),
+        stable_view,
+    )
+    .await;
+    assert_eq!(status, 200, "{created_stable_view}");
+    let (status, created_target_note) = call(
+        &app,
+        "PUT",
+        &pinned("/api/annotations/target-note", &first),
+        target_note,
+    )
+    .await;
+    assert_eq!(status, 200, "{created_target_note}");
+    let (status, created_stable_note) = call(
+        &app,
+        "PUT",
+        &pinned("/api/annotations/stable-note", &first),
+        stable_note,
+    )
+    .await;
+    assert_eq!(status, 200, "{created_stable_note}");
+    let target_view_raw = store
+        .saved_view_at("target-view", Some(first))
+        .unwrap()
+        .unwrap()
+        .view
+        .anchor
+        .unwrap()
+        .get()
+        .to_owned();
+    let target_note_raw = store
+        .saved_annotations_at(Some(first))
+        .unwrap()
+        .into_iter()
+        .find(|state| state.annotation.id == "target-note")
+        .unwrap()
+        .annotation
+        .anchor
+        .unwrap()
+        .get()
+        .to_owned();
+
+    std::fs::remove_file(root.join("b.js")).unwrap();
+    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        &options,
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let second = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.leader().unwrap(),
+            first,
+            &cancel,
+        )
+        .unwrap();
+
+    let (status, views) = call(&app, "GET", &pinned("/api/views", &second), Value::Null).await;
+    assert_eq!(status, 200, "{views}");
+    assert_eq!(views.as_array().unwrap().len(), 2);
+    let missing_view = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["view"]["id"] == "target-view")
+        .unwrap();
+    assert_eq!(missing_view["attachment"]["availability"], "ready");
+    assert_eq!(missing_view["attachment"]["result"]["status"], "orphaned");
+    assert_eq!(missing_view["attachment"]["result"]["reason"], "missing");
+    assert_eq!(missing_view["view"]["anchor"], created_target_view["view"]["anchor"]);
+    let unaffected_view = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["view"]["id"] == "stable-view")
+        .unwrap();
+    assert_eq!(unaffected_view["attachment"]["result"]["status"], "attached");
+    assert_eq!(unaffected_view["view"]["anchor"], created_stable_view["view"]["anchor"]);
+    for (id, expected_status, expected_reason) in [
+        ("target-view", "orphaned", "missing"),
+        ("stable-view", "attached", "none"),
+    ] {
+        let route = pinned(&format!("/api/views/{id}"), &second);
+        let (status, opened) = call(&app, "GET", &route, Value::Null).await;
+        assert_eq!(status, 200, "{opened}");
+        assert_eq!(opened["attachment"]["result"]["status"], expected_status);
+        assert_eq!(opened["attachment"]["result"]["reason"], expected_reason);
+    }
+
+    let (status, notes) = call(
+        &app,
+        "GET",
+        &pinned("/api/annotations", &second),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{notes}");
+    assert_eq!(notes.as_array().unwrap().len(), 2);
+    let missing_note = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["annotation"]["id"] == "target-note")
+        .unwrap();
+    assert_eq!(missing_note["attachment"]["availability"], "ready");
+    assert_eq!(missing_note["attachment"]["result"]["status"], "orphaned");
+    assert_eq!(missing_note["attachment"]["result"]["reason"], "missing");
+    assert_eq!(missing_note["annotation"]["anchor"], created_target_note["annotation"]["anchor"]);
+    let unaffected_note = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["annotation"]["id"] == "stable-note")
+        .unwrap();
+    assert_eq!(unaffected_note["attachment"]["result"]["status"], "attached");
+    assert_eq!(unaffected_note["annotation"]["anchor"], created_stable_note["annotation"]["anchor"]);
+
+    let target_view_after = store
+        .saved_view_at("target-view", Some(second))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        target_view_after.view.anchor.as_deref().unwrap().get(),
+        target_view_raw
+    );
+    let target_note_after = store
+        .saved_annotations_at(Some(second))
+        .unwrap()
+        .into_iter()
+        .find(|state| state.annotation.id == "target-note")
+        .unwrap();
+    assert_eq!(
+        target_note_after.annotation.anchor.as_deref().unwrap().get(),
+        target_note_raw
+    );
+}
+
+#[tokio::test]
 async fn schema5_is_not_native_anchor_evidence() {
     let (_temp, store, _graph, app, seed) = fixture();
     let legacy_pin = store.index_baseline().unwrap();

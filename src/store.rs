@@ -3294,12 +3294,23 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         db: &Connection,
         store: &Self,
         anchor: &DurableAnchor,
-    ) -> Result<(String, Vec<crate::native_evidence::Declaration>)> {
+    ) -> Result<Option<(String, Vec<crate::native_evidence::Declaration>)>> {
         let revision: Option<String> = db.query_row(
             "SELECT revision_id FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
             params![anchor.document.source_set_id, anchor.document.language, anchor.document.path], |row| row.get(0),
         ).optional()?;
-        let revision = revision.context("invalid anchor document association")?;
+        let Some(revision) = revision else {
+            let path_still_exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1) OR EXISTS(SELECT 1 FROM native_documents WHERE path=?1)",
+                [&anchor.document.path],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                !path_still_exists,
+                "invalid anchor document association"
+            );
+            return Ok(None);
+        };
         store.attest_selected_document(db, &anchor.document.path)?;
         let declarations = Self::read_native_declarations(
             db,
@@ -3312,7 +3323,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             anchors::document_matches(&anchor.document, &declarations),
             "invalid anchor document association"
         );
-        Ok((revision, declarations))
+        Ok(Some((revision, declarations)))
     }
 
     fn anchor_attachment(
@@ -3328,11 +3339,15 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         };
         let anchor: DurableAnchor = serde_json::from_str(raw.get())?;
         anchor.validate()?;
-        let (revision, declarations) = Self::declarations_for_anchor(db, store, &anchor)?;
-        let current = declarations
-            .iter()
-            .find(|row| row.syntax_id == anchor.syntax_id);
-        let result = anchors::audit_anchor(&anchor, &revision, current, &declarations, None)?;
+        let result = match Self::declarations_for_anchor(db, store, &anchor)? {
+            Some((revision, declarations)) => {
+                let current = declarations
+                    .iter()
+                    .find(|row| row.syntax_id == anchor.syntax_id);
+                anchors::audit_anchor(&anchor, &revision, current, &declarations, None)?
+            }
+            None => AnchorResult::orphaned(AnchorReason::Missing),
+        };
         Ok(AnchorAttachment {
             availability: AttachmentAvailability::Ready,
             result: Some(result),
