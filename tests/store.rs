@@ -230,7 +230,9 @@ fn publication_is_atomic_and_reopens() {
                     .iter()
                     .find(|file| file.path == document.key.path)
                     .unwrap()
-                    .bytes
+                    .text
+                    .as_bytes()
+                    .to_vec()
             );
         }
     };
@@ -301,7 +303,9 @@ fn publication_is_atomic_and_reopens() {
                 .iter()
                 .find(|file| file.path == document.key.path)
                 .unwrap()
-                .bytes
+                .text
+                .as_bytes()
+                .to_vec()
         );
     }
     assert!(
@@ -587,7 +591,7 @@ fn concurrent_publish_cas_has_one_winner() {
 
 #[test]
 fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
-    let (_state, work, store) = fixture();
+    let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
     let first = publish_bundle(&store, &captured, store.index_baseline().unwrap());
@@ -641,7 +645,9 @@ fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
                     .iter()
                     .find(|file| file.path == document.key.path)
                     .unwrap()
-                    .bytes
+                    .text
+                    .as_bytes()
+                    .to_vec()
             );
         }
     }
