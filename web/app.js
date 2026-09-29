@@ -1,7 +1,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 let token = "", epoch = 0, querySerial = 0, sourceSerial = 0, searchSerial = 0;
-let status = null, result = null, seed = null, views = [], annotations = [], editingNote = null;
+let status = null, result = null, seed = null, views = [], annotations = [], editingView = null, editingNote = null;
 let statusSerial = 0, savedSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
 let job = null, pollTimer = null;
@@ -26,6 +26,87 @@ const IndexPin = Object.freeze({
   isConflict(error) { return error?.status === 409 && error.code === "revision_conflict"; },
 });
 window.BaleygIndexPin = IndexPin;
+const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+const objectValue = value => !!value && typeof value === "object" && !Array.isArray(value);
+const savedReasonText = Object.freeze({
+  missing: "The original declaration is missing from this index.",
+  headerMismatch: "The declaration header changed, so the original anchor no longer attaches.",
+  groupChanged: "The declaration's sibling group changed, so the original anchor no longer attaches.",
+  unprovenContinuity: "Continuity after this edit cannot be proved.",
+});
+function normalizeAnchorResult(value) {
+  if (!objectValue(value) || !["attached", "orphaned"].includes(value.status)) return null;
+  if (value.status === "attached") {
+    if (typeof value.targetId !== "string" || !value.targetId || value.reason !== "none") return null;
+    return {status:"attached", targetId:value.targetId, reason:"none"};
+  }
+  if (value.targetId !== null || !own(savedReasonText, value.reason)) return null;
+  return {status:"orphaned", targetId:null, reason:value.reason};
+}
+function savedInner(value, kind) {
+  const key = kind === "view" ? "view" : "annotation";
+  const wrapped = objectValue(value) && objectValue(value[key]);
+  const item = wrapped ? value[key] : value;
+  if (!objectValue(item) || typeof item.id !== "string") return null;
+  if (kind === "view" && (typeof item.title !== "string" || !objectValue(item.query) || typeof item.query.seed !== "string")) return null;
+  if (kind === "note" && (typeof item.nodeId !== "string" || typeof item.body !== "string")) return null;
+  return {key, wrapped, item};
+}
+function normalizeSavedState(value, kind) {
+  const inner = savedInner(value, kind);
+  if (!inner) throw new Error(`Invalid saved ${kind} response.`);
+  let pair = null, attachment = {availability:"anchorless", result:null}, invalidMetadata = false;
+  const hasMetadata = inner.wrapped && own(value, "indexGeneration") && own(value, "indexRevision") && own(value, "attachment");
+  if (hasMetadata) {
+    if (value.indexGeneration !== null || value.indexRevision !== null) {
+      try { pair = IndexPin.copy(value); } catch (_) { invalidMetadata = true; }
+    }
+    const candidate = value.attachment;
+    if (objectValue(candidate) && candidate.availability === "ready" && pair) {
+      const normalized = normalizeAnchorResult(candidate.result);
+      if (normalized) attachment = {availability:"ready", result:normalized};
+      else invalidMetadata = true;
+    } else if (objectValue(candidate) && candidate.availability === "anchorless" && candidate.result === null) {
+      attachment = {availability:"anchorless", result:null};
+    } else if (objectValue(candidate) && candidate.availability === "indexUnavailable" && candidate.result === null &&
+               value.indexGeneration === null && value.indexRevision === null) {
+      attachment = {availability:"indexUnavailable", result:null};
+    } else invalidMetadata = true;
+  }
+  if (invalidMetadata) { pair = null; attachment = {availability:"anchorless", result:null}; }
+  return {
+    [inner.key]:inner.item,
+    ...(kind === "view" ? {orphanedIds:inner.wrapped && Array.isArray(value.orphanedIds) ? value.orphanedIds.filter(id => typeof id === "string") : []}
+      : {orphaned:inner.wrapped && value.orphaned === true}),
+    indexGeneration:pair?.indexGeneration ?? null,
+    indexRevision:pair?.indexRevision ?? null,
+    attachment,
+    savedPair:pair,
+    originalId:inner.item.id,
+    originalTarget:kind === "view" ? inner.item.query.seed : inner.item.nodeId,
+    metadataInvalid:invalidMetadata,
+  };
+}
+function normalizeSavedList(value, kind) {
+  if (!Array.isArray(value)) throw new Error(`Invalid saved ${kind} list response.`);
+  return value.map(item => normalizeSavedState(item, kind));
+}
+function currentNativePin() {
+  if (!status || typeof status.evidenceFormat !== "string" || !status.evidenceFormat) return null;
+  try { return IndexPin.copy(status.revision); } catch (_) { return null; }
+}
+function savedTarget(state) { return state.originalTarget; }
+function savedLoadDecision(state, kind) {
+  const target = savedTarget(state), attachment = state.attachment;
+  if (state.metadataInvalid) return {enabled:false, reason:"Saved attachment metadata is invalid. Refresh before loading."};
+  if (attachment.availability === "indexUnavailable") return {enabled:false, reason:"Indexed anchor evidence is unavailable."};
+  if (attachment.availability === "anchorless") return {enabled:false, reason:"This legacy item has no durable anchor."};
+  const anchored = attachment.result;
+  if (anchored.status === "orphaned") return {enabled:false, reason:savedReasonText[anchored.reason]};
+  if (anchored.targetId !== target) return {enabled:false, reason:"The saved attachment does not match its original target."};
+  if (!state.savedPair || !IndexPin.equal(state.savedPair, status?.revision)) return {enabled:false, reason:"Saved evidence is stale. Refresh saved items at the current index."};
+  return {enabled:true, reason:"Attached to the original declaration.", pin:IndexPin.copy(state.savedPair), target};
+}
 const sourceCache = new Map();
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -46,7 +127,7 @@ function operationGuard() {
 }
 async function api(path, method = "GET", body) {
   const session = epoch, sourceAtStart = sourceSerial;
-  const guarded = path === "/api/query" || path.startsWith("/api/questions/") || path.startsWith("/api/source?");
+  const guarded = path === "/api/query" || path.startsWith("/api/query?") || path.startsWith("/api/questions/") || path.startsWith("/api/source?");
   const operationCurrent = operationGuard();
   const current = () => session === epoch && (!guarded || (operationCurrent() && (!path.startsWith("/api/source?") || sourceAtStart === sourceSerial)));
   let response, data, timer;
@@ -90,7 +171,7 @@ async function perform(action, control) {
     await pending;
   }
   catch (error) { if (error.name !== "AbortError" && current()) { if (IndexPin.isConflict(error)) { void refreshStatus().catch(() => {}); window.BaleygShell?.resetInspector(); diagramSerial++; invalidateFocus("Index changed. Preview again after refreshing."); clearSource(); renderResult(); stale("The index revision changed. Refresh this view before reading source."); } $("error").textContent = error.message; $("error").hidden = false; if ($("focus-state").textContent.startsWith("Preparing")) $("focus-state").textContent = "Preview failed. Check the error and try again."; } }
-  finally { if (control) control.disabled = false; syncFocusControls(); }
+  finally { if (control) control.disabled = false; syncFocusControls(); syncSavedControls(); }
 }
 function form(id, action) {
   $(id).addEventListener("submit", event => { event.preventDefault(); perform(action, $(id).querySelector("button")); });
@@ -111,15 +192,14 @@ async function refreshStatus(followup = false) {
   const workspaceChanged = status && status.workspaceRoot !== data.workspaceRoot;
   const nextPin = IndexPin.copy(data.revision);
   const browseChanged = !status || workspaceChanged || !IndexPin.equal(status.revision, nextPin);
+  const hadStatus = !!status;
   if (status && browseChanged) { clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); querySerial++; invalidateFocus("Index workspace or revision changed. Preview again."); clearSource(); }
   if (status && browseChanged) {
     result = null; seed = null; searchSerial++;
     $("symbols").replaceChildren();
     if (workspaceChanged) {
-      savedSerial++; views = []; annotations = []; resetNote();
+      savedSerial++; views = []; annotations = []; resetView(); resetNote();
       $("views").replaceChildren(); $("annotations").replaceChildren();
-    } else {
-      renderViews(); renderNotes();
     }
     $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
     renderResult();
@@ -127,6 +207,7 @@ async function refreshStatus(followup = false) {
   if (browseChanged) clearDependencyCatalog();
   status = {...data, revision:nextPin};
   data = status;
+  if (hadStatus && browseChanged && !workspaceChanged) { renderViews(); renderNotes(); }
   window.BaleygShell?.updateWorkspace(status);
   if (browseChanged) await loadTreeRoot();
   if (serial !== statusSerial || session !== epoch || status !== data) return;
@@ -178,10 +259,19 @@ function requireCurrentPair(value) {
   return value;
 }
 async function loadSaved() {
-  const serial = ++savedSerial;
-  const data = await Promise.all([api("/api/views"), api("/api/annotations")]);
-  if (serial !== savedSerial) return;
-  [views, annotations] = data;
+  const serial = ++savedSerial, session = epoch, workspace = status?.workspaceRoot;
+  const expected = currentNativePin();
+  const suffix = expected ? `?${IndexPin.query(expected)}` : "";
+  const data = await Promise.all([api(`/api/views${suffix}`), api(`/api/annotations${suffix}`)]);
+  if (serial !== savedSerial || session !== epoch || workspace !== status?.workspaceRoot ||
+      (expected && !IndexPin.equal(expected, status?.revision))) return;
+  views = normalizeSavedList(data[0], "view");
+  annotations = normalizeSavedList(data[1], "note");
+  if (!expected) {
+    const unpinned = state => ({...state, indexGeneration:null, indexRevision:null, savedPair:null,
+      attachment:state.attachment.availability === "anchorless" ? state.attachment : {availability:"indexUnavailable", result:null}});
+    views = views.map(unpinned); annotations = annotations.map(unpinned);
+  }
   renderViews(); renderNotes();
 }
 const tokenStorageKey = "baleyg.daemonToken.v1";
@@ -243,7 +333,7 @@ $("logout").addEventListener("click", () => {
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); statusSerial++; epoch++; querySerial++; searchSerial++; clearTimeout(pollTimer); token = ""; status = null; result = null; seed = null; job = null;
   acpStatusSerial++; acpStatus = null; acpRunning = false; $("acp-status").textContent = "ACP status unavailable.";
   jevStatusSerial++; jevStatus = null; jevRunning = false; $("jev-status").textContent = "Live Jev status unavailable.";
-  invalidateFocus(); views = []; annotations = []; sourceCache.clear(); clearSource(); resetNote();
+  invalidateFocus(); views = []; annotations = []; sourceCache.clear(); clearSource(); resetView(); resetNote();
   ["symbols", "calls", "nodes", "views", "annotations"].forEach(id => $(id).replaceChildren());
   ["status", "diagnostics", "job", "result-meta"].forEach(id => $(id).textContent = "");
   $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
@@ -269,23 +359,50 @@ form("search-form", async () => {
 async function selectSymbol(symbol) {
   diagramSerial++; window.BaleygShell?.resetInspector();
   seed = symbol.id; $("seed").textContent = `${symbol.name} · ${symbol.path}`;
-  $("depth").value = "1"; $("callbacks").checked = false; resetNote(); renderNotes(); await runQuery();
+  $("depth").value = "1"; $("callbacks").checked = false; renderNotes(); await runQuery();
 }
 function query() { return {seed, depth: Number($("depth").value), maxNodes: 40, maxCalls: 200, includeCallbacks: false, excludePaths: []}; }
-async function runQuery(savedQuery) {
+function savedQueryDto(value) {
+  return {
+    seed:value.seed,
+    depth:Number.isSafeInteger(value.depth) ? value.depth : 1,
+    maxNodes:Number.isSafeInteger(value.maxNodes) ? value.maxNodes : 40,
+    maxCalls:Number.isSafeInteger(value.maxCalls) ? value.maxCalls : 200,
+    includeCallbacks:value.includeCallbacks === true,
+    excludePaths:Array.isArray(value.excludePaths) ? value.excludePaths.filter(path => typeof path === "string") : [],
+  };
+}
+function savedViewDto(view, title = view.title) {
+  const pins = {};
+  if (objectValue(view.pins)) for (const [id, position] of Object.entries(view.pins)) {
+    if (objectValue(position)) pins[id] = {x:position.x, y:position.y};
+  }
+  return {id:view.id, title, query:savedQueryDto(view.query), pins,
+    hidden:Array.isArray(view.hidden) ? view.hidden.filter(id => typeof id === "string") : []};
+}
+function annotationDto(note, titleValue, titleSupplied) {
+  return {id:note.id, nodeId:note.nodeId, body:note.body, ...(titleSupplied ? {title:titleValue} : {})};
+}
+async function runQuery(savedQuery, savedReplayPin = null) {
   if (!seed && !savedQuery?.seed) throw new Error("Select a symbol first.");
+  const replayPin = savedReplayPin && IndexPin.copy(savedReplayPin);
+  const path = replayPin ? `/api/query?${IndexPin.query(replayPin)}` : "/api/query";
   invalidateFocus(); const serial = ++querySerial; clearSource();
   result = null; $("calls").replaceChildren(); $("nodes").replaceChildren();
   $("result-meta").textContent = "Loading interactions…";
-  const data = await api("/api/query", "POST", {...(savedQuery || query()), depth: 1, includeCallbacks: false});
+  const data = await api(path, "POST", {...(savedQuery || query()), depth: 1, includeCallbacks: false});
   if (serial !== querySerial) return;
+  if (replayPin && !IndexPin.equal(data?.revision, replayPin)) {
+    unexpectedPair("Saved replay returned a different index snapshot.", data?.revision);
+    throw new Error("Saved replay returned a different index snapshot.");
+  }
   result = requireCurrentPair(data); renderResult();
 }
 form("query-form", () => runQuery());
 function renderResult() {
   $("calls").replaceChildren(); $("nodes").replaceChildren();
   const view = focused || result;
-  syncFocusControls();
+  syncFocusControls(); syncSavedControls();
   if (!view) { $("result-meta").textContent = "Select a symbol to inspect outgoing calls."; return; }
   $("result-meta").textContent = `${view.calls.length} measured call sites · ${view.nodes.length} symbols · revision ${IndexPin.label(view.revision)}${view.truncated ? ` · Truncated: ${view.omittedNodes} nodes omitted` : ""}${view.warnings?.length ? ` · ${view.warnings.map(describe).join(" · ")}` : ""}`;
   if (focused) $("focus-counts").textContent = `Supporting: ${view.supportingCount} · Uncertain: ${view.uncertainCount} · Policy-hidden: ${view.policyHiddenCount} · Omitted: ${view.omittedCount}. Only essential calls that pass display limits are shown. Counts may overlap.`;
@@ -383,44 +500,142 @@ async function showSource(item, revision) {
   }
 }
 $("refresh").addEventListener("click", () => perform(async () => { clearSource(); const revision = status?.revision; await refreshStatus(); if (IndexPin.equal(revision, status?.revision)) await refreshTree(); if (selectedMethod) await loadSequence(); else if (seed) await runQuery(); await loadSaved(); await refreshJevStatus(); await refreshAcpStatus(); schedulePoll(); }, $("refresh")));
+function savedButton(text, action, kind, id, actionName) {
+  const control = button(text, action);
+  control.setAttribute("data-saved-kind", kind);
+  control.setAttribute("data-saved-id", id);
+  control.setAttribute("data-action", actionName);
+  return control;
+}
+function syncSavedControls() {
+  const pin = currentNativePin();
+  const currentResult = !!result && IndexPin.equal(result.revision, status?.revision);
+  $("save-view").disabled = !pin || (!editingView && (!currentResult || !!focused));
+  $("save-note").disabled = !pin || (!editingNote && (!currentResult || !seed || result?.query?.seed !== seed));
+}
+function resetView() {
+  editingView = null; $("view-title").value = ""; $("save-view").textContent = "Save raw query"; $("reset-view").hidden = true; syncSavedControls();
+}
+function beginViewEdit(state) {
+  const pin = currentNativePin();
+  if (!pin) throw new Error("Index a native snapshot before editing this saved view.");
+  const view = state.view, snapshot = savedViewDto(view);
+  snapshot.id = state.originalId; snapshot.query.seed = state.originalTarget;
+  editingView = {id:state.originalId, target:state.originalTarget, pin, view:snapshot};
+  $("view-title").value = view.title; $("save-view").textContent = "Save view title"; $("reset-view").hidden = false;
+  $("view-title").focus(); syncSavedControls();
+}
+async function loadSavedView(state) {
+  const decision = savedLoadDecision(state, "view");
+  if (!decision.enabled) throw new Error(decision.reason);
+  const view = state.view;
+  seed = decision.target; $("seed").textContent = `Saved view: ${view.title}`;
+  $("depth").value = String(Math.max(0, Math.min(5, Number(view.query.depth ?? 1)))); $("callbacks").checked = false;
+  const replay = savedQueryDto(view.query); replay.seed = decision.target;
+  renderNotes(); await runQuery(replay, decision.pin);
+}
 function renderViews() {
   $("views").replaceChildren();
   for (const state of views) {
-    const view = state.view; const li = element("li");
-    li.append(button(view.title, async () => {
-      seed = view.query.seed; $("seed").textContent = `Saved view: ${view.title}`;
-      $("depth").value = String(Math.max(0, Math.min(5, view.query.depth))); $("callbacks").checked = false;
-      resetNote(); renderNotes(); await runQuery({...view.query, depth: 1, includeCallbacks: false});
-    }), button("Delete", async () => { await api(`/api/views/${encodeURIComponent(view.id)}`, "DELETE"); await loadSaved(); }));
-    if (state.orphanedIds?.length) li.append(element("span", `${state.orphanedIds.length} orphaned references`, "detail"));
+    const view = state.view, decision = savedLoadDecision(state, "view"), li = element("li");
+    li.setAttribute("data-saved-kind", "view"); li.setAttribute("data-saved-id", view.id);
+    li.append(element("strong", view.title, "saved-title"));
+    const actions = element("div", undefined, "bar saved-actions");
+    const load = savedButton("Load", () => loadSavedView(state), "view", view.id, "load");
+    load.disabled = !decision.enabled; load.title = decision.reason;
+    const editView = savedButton("Edit title", () => beginViewEdit(state), "view", view.id, "edit");
+    editView.disabled = !currentNativePin();
+    editView.title = editView.disabled ? "Index a native snapshot before editing." : "Edit without loading this view.";
+    actions.append(load, editView, savedButton("Delete", async () => {
+      await api(`/api/views/${encodeURIComponent(view.id)}`, "DELETE");
+      if (editingView?.id === view.id) resetView(); await loadSaved();
+    }, "view", view.id, "delete"));
+    li.append(actions);
+    const reason = element("span", decision.reason, "detail saved-reason");
+    reason.id = `saved-view-${view.id}-reason`; load.setAttribute("aria-describedby", reason.id); li.append(reason);
+    if (state.orphanedIds.length) li.append(element("span", `${state.orphanedIds.length} saved layout reference${state.orphanedIds.length === 1 ? " is" : "s are"} unavailable.`, "detail"));
     $("views").append(li);
   }
-  if (!views.length) $("views").append(element("li", "Save a query to revisit it later."));
+  if (!views.length) $("views").append(element("li", "No saved views yet. Run a raw query, then save it here."));
+  syncSavedControls();
 }
+$("reset-view").addEventListener("click", resetView);
 form("save-form", async () => {
+  const title = $("view-title").value.trim();
+  if (editingView) {
+    const edit = editingView, dto = savedViewDto(edit.view, title);
+    if (dto.id !== edit.id || dto.query.seed !== edit.target) throw new Error("Saved view identity changed. Cancel and reopen the editor.");
+    await api(`/api/views/${encodeURIComponent(edit.id)}?${IndexPin.query(edit.pin)}`, "PUT", dto);
+    resetView(); await loadSaved(); return;
+  }
   if (focused) throw new Error("Focused selections cannot be saved as raw queries. Return to the raw hierarchy first.");
-  if (!result) throw new Error("Run a query before saving a view.");
-  const id = crypto.randomUUID();
-  await api(`/api/views/${id}`, "PUT", {id, title: $("view-title").value.trim(), query: {...result.query, depth: 1, includeCallbacks: false}, pins: {}, hidden: []});
-  $("view-title").value = ""; await loadSaved();
+  const pin = currentNativePin();
+  if (!pin || !result || !IndexPin.equal(result.revision, pin)) throw new Error("Run a current pinned query before saving a view.");
+  const id = crypto.randomUUID(), dto = savedViewDto({id, title, query:{...result.query, depth:1, includeCallbacks:false}, pins:{}, hidden:[]});
+  await api(`/api/views/${encodeURIComponent(id)}?${IndexPin.query(pin)}`, "PUT", dto);
+  resetView(); await loadSaved();
 });
-function resetNote() { editingNote = null; $("note").value = ""; $("save-note").textContent = "Add note"; $("reset-note").hidden = true; }
+function resetNote() {
+  editingNote = null; $("note-title").value = ""; $("note").value = ""; $("save-note").textContent = "Add note"; $("reset-note").hidden = true; syncSavedControls();
+}
 $("reset-note").addEventListener("click", resetNote);
+function beginNoteEdit(state) {
+  const pin = currentNativePin();
+  if (!pin) throw new Error("Index a native snapshot before editing this note.");
+  const note = state.annotation;
+  editingNote = {id:state.originalId, target:state.originalTarget, pin,
+    note:annotationDto({...note, id:state.originalId, nodeId:state.originalTarget}, note.title, typeof note.title === "string")};
+  $("note-title").value = note.title || ""; $("note").value = note.body;
+  $("save-note").textContent = "Save note"; $("reset-note").hidden = false; $("note").focus(); syncSavedControls();
+}
+async function loadSavedNote(state) {
+  const decision = savedLoadDecision(state, "note");
+  if (!decision.enabled) throw new Error(decision.reason);
+  seed = decision.target; $("seed").textContent = `Saved note target: ${state.annotation.title || state.annotation.id}`;
+  $("depth").value = "1"; $("callbacks").checked = false; renderNotes();
+  await runQuery({seed:decision.target, depth:1, maxNodes:40, maxCalls:200, includeCallbacks:false, excludePaths:[]}, decision.pin);
+}
 function renderNotes() {
-  $("annotation-target").textContent = seed ? `Notes for symbol ${seed}` : "Select a symbol to attach a note.";
+  $("annotation-target").textContent = editingNote ? `Editing note anchored to ${editingNote.target}. Selection changes will not retarget it.`
+    : seed ? `Notes for symbol ${seed}` : "Select a symbol to attach a note. Unavailable notes remain visible.";
   $("annotations").replaceChildren();
-  for (const state of annotations.filter(s => s.annotation.nodeId === seed || s.orphaned)) {
-    const note = state.annotation; const li = element("li"); li.append(element("p", note.body));
-    if (state.orphaned) li.append(element("span", "Orphaned · symbol no longer in the index", "detail"));
-    li.append(button("Edit", () => { editingNote = note; $("note").value = note.body; $("save-note").textContent = "Save note"; $("reset-note").hidden = false; $("note").focus(); }),
-      button("Delete", async () => { await api(`/api/annotations/${encodeURIComponent(note.id)}`, "DELETE"); if (editingNote?.id === note.id) resetNote(); await loadSaved(); }));
+  const displayed = annotations.filter(state => state.annotation.nodeId === seed || editingNote?.id === state.annotation.id || state.attachment.availability !== "ready" || state.attachment.result?.status === "orphaned");
+  for (const state of displayed) {
+    const note = state.annotation, decision = savedLoadDecision(state, "note"), li = element("li");
+    li.setAttribute("data-saved-kind", "note"); li.setAttribute("data-saved-id", note.id);
+    if (note.title) li.append(element("strong", note.title, "saved-title"));
+    li.append(element("p", note.body));
+    const actions = element("div", undefined, "bar saved-actions");
+    const load = savedButton("Load", () => loadSavedNote(state), "note", note.id, "load");
+    load.disabled = !decision.enabled; load.title = decision.reason;
+    const editNote = savedButton("Edit", () => beginNoteEdit(state), "note", note.id, "edit");
+    editNote.disabled = !currentNativePin();
+    editNote.title = editNote.disabled ? "Index a native snapshot before editing." : "Edit without changing the saved target.";
+    actions.append(load, editNote, savedButton("Delete", async () => {
+      await api(`/api/annotations/${encodeURIComponent(note.id)}`, "DELETE");
+      if (editingNote?.id === note.id) resetNote(); await loadSaved();
+    }, "note", note.id, "delete"));
+    li.append(actions);
+    const reason = element("span", decision.reason, "detail saved-reason");
+    reason.id = `saved-note-${note.id}-reason`; load.setAttribute("aria-describedby", reason.id); li.append(reason);
     $("annotations").append(li);
   }
+  if (!displayed.length) $("annotations").append(element("li", seed ? "No notes for this symbol." : "No saved notes yet."));
+  syncSavedControls();
 }
 form("annotation-form", async () => {
-  if (!seed && !editingNote) throw new Error("Select a symbol first.");
-  const id = editingNote?.id || crypto.randomUUID();
-  await api(`/api/annotations/${id}`, "PUT", {id, nodeId: editingNote?.nodeId || seed, body: $("note").value});
+  const title = $("note-title").value.trim(), body = $("note").value;
+  if (editingNote) {
+    const edit = editingNote;
+    const titleSupplied = !!title || own(edit.note, "title");
+    const dto = annotationDto({id:edit.id, nodeId:edit.target, body}, title, titleSupplied);
+    await api(`/api/annotations/${encodeURIComponent(edit.id)}?${IndexPin.query(edit.pin)}`, "PUT", dto);
+    resetNote(); await loadSaved(); return;
+  }
+  const pin = currentNativePin();
+  if (!pin || !seed || !result || result.query?.seed !== seed || !IndexPin.equal(result.revision, pin)) throw new Error("Run a current pinned query for the selected symbol before adding a note.");
+  const id = crypto.randomUUID(), dto = annotationDto({id, nodeId:seed, body}, title, !!title);
+  await api(`/api/annotations/${encodeURIComponent(id)}?${IndexPin.query(pin)}`, "PUT", dto);
   resetNote(); await loadSaved();
 });
 function activeJob(value) { return ["queued", "running", "cancelling", "canceling", "pending"].includes(value.state); }
@@ -804,7 +1019,7 @@ async function selectMethod(symbol) {
   if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
   selectedMethod = symbol; $("method-source").disabled = false; seed = symbol.id; querySerial++; invalidateFocus(); result = null;
   $("seed").textContent = `${symbol.name} · ${symbol.path}`;
-  clearSource(); resetNote(); renderNotes(); renderResult(); renderFiles();
+  clearSource(); renderNotes(); renderResult(); renderFiles();
   await loadSequence();
   if (selectedMethod === symbol && window.matchMedia?.("(max-width: 850px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
