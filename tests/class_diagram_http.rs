@@ -962,7 +962,7 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
-    for (method, path, body) in [
+    for (request_index, (method, path, body)) in [
         ("GET", class_url.as_str(), Value::Null),
         ("GET", symbol_url.as_str(), Value::Null),
         (
@@ -970,18 +970,26 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
             "/api/class-diagram",
             json!({"seed":seed,"expectedRevision":pin}),
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (status, value) = call(&app, method, path, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        assert_eq!(value["error"]["code"], "incompatible_index");
+        let expected = if request_index == 0 {
+            "incompatible_index"
+        } else {
+            "index_not_ready"
+        };
+        assert_eq!(value["error"]["code"], expected, "{path}: {value}");
         assert!(!value.to_string().contains("Fabricated"));
     }
+    let unrelated = store
+        .symbol_at(&id(&graph, "Unsupported"), Some(pin))
+        .unwrap_err();
     assert!(
-        store
-            .symbol_at(&id(&graph, "Unsupported"), Some(pin))
-            .unwrap()
-            .is_some(),
-        "a different document must remain selectable"
+        unrelated.to_string().starts_with("index_not_ready"),
+        "{unrelated:#}"
     );
 }
 
@@ -1018,7 +1026,7 @@ class B {}
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
-    for (method, path, body) in [
+    for (request_index, (method, path, body)) in [
         ("GET", class_url.as_str(), Value::Null),
         ("GET", symbol_url.as_str(), Value::Null),
         (
@@ -1026,12 +1034,23 @@ class B {}
             "/api/class-diagram",
             json!({"seed":class_id,"expectedRevision":pin}),
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (status, value) = call(&app, method, path, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        assert_eq!(value["error"]["code"], "incompatible_index");
+        let expected = if request_index == 0 {
+            "incompatible_index"
+        } else {
+            "index_not_ready"
+        };
+        assert_eq!(value["error"]["code"], expected, "{path}: {value}");
         assert!(!value.to_string().contains("fabricatedCall"));
     }
     let other_url = format!("/api/symbol?id={other_id}&{}", pin_query(pin));
-    assert_eq!(call(&app, "GET", &other_url, Value::Null).await.0, 200);
+    let (status, value) = call(&app, "GET", &other_url, Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["error"]["code"], "index_not_ready");
+    assert!(!value.to_string().contains("fabricatedCall"));
 }
