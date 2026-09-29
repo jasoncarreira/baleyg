@@ -1219,7 +1219,7 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(matches!(version, 4..=6), "incompatible index schema");
+    ensure!(matches!(version, 4..=7), "incompatible index schema");
     // GC may classify only the two exact cache formats this binary knows.
     // The same structural and extractor-marker check applies before it can
     // declare an index eligible for deletion or report it as recently opened.
@@ -1232,7 +1232,8 @@ fn inspect_index_with_open_hook(
     ensure!(
         ((version == 4 && schema == 4 && extractor == "native-v1")
             || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1")
-            || (version == 6 && schema == 6 && extractor == "native-paired-v1"))
+            || (version == 6 && schema == 6 && extractor == "native-paired-v1")
+            || (version == 7 && schema == 7 && extractor == "native-paired-v1"))
             && Path::new(&spelling).is_absolute()
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"

@@ -1,7 +1,7 @@
 mod common;
 use baleyg::{model::*, store::Store};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, atomic::AtomicBool},
 };
 use tempfile::TempDir;
@@ -42,6 +42,13 @@ fn downgrade_to_legacy(db: &rusqlite::Connection) {
     for index in ["nodes_path", "calls_path", "regions_path"] {
         db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
     }
+    db.execute_batch(
+        "DROP TABLE capture_inputs;
+         ALTER TABLE files DROP COLUMN capture_stat;
+         ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+         ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+    )
+    .unwrap();
     db.execute(
         "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
         [],
@@ -201,6 +208,34 @@ fn publication_is_atomic_and_reopens() {
     assert_eq!(first.index_revision, 1);
     let old = store.graph().unwrap();
     let a = symbol_id(&old, "a");
+    let assert_closed = || {
+        assert_eq!(store.index_baseline().unwrap(), first);
+        for error in [store.status().unwrap_err(), store.graph().unwrap_err()] {
+            assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+        }
+        let reopened = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(reopened.status().unwrap().revision, first);
+        assert_eq!(reopened.graph().unwrap(), old);
+        for document in &captured.1.revision.documents {
+            let (stored, bytes) = reopened
+                .native_source_at(first, &document.key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored, *document);
+            assert_eq!(
+                bytes,
+                captured
+                    .2
+                    .files
+                    .iter()
+                    .find(|file| file.path == document.key.path)
+                    .unwrap()
+                    .text
+                    .as_bytes()
+                    .to_vec()
+            );
+        }
+    };
     let mut duplicate = old.clone();
     duplicate.nodes.push(old.nodes[0].clone());
     assert!(
@@ -215,7 +250,7 @@ fn publication_is_atomic_and_reopens() {
             )
             .is_err()
     );
-    assert_eq!(store.graph().unwrap(), old);
+    assert_closed();
     assert!(
         store
             .publish_native(
@@ -230,6 +265,7 @@ fn publication_is_atomic_and_reopens() {
             .to_string()
             .starts_with("revision conflict")
     );
+    assert_closed();
     assert!(
         store
             .publish_native(
@@ -244,7 +280,7 @@ fn publication_is_atomic_and_reopens() {
             .to_string()
             .contains("cancelled")
     );
-    assert_eq!(store.status().unwrap().revision, first);
+    assert_closed();
     drop(store);
     let store = Store::open_for_tests(state.path(), work.path()).unwrap();
     assert_eq!(store.graph().unwrap(), old);
@@ -252,6 +288,25 @@ fn publication_is_atomic_and_reopens() {
         store.source("a.js").unwrap().unwrap().text,
         captured.0.files[0].text
     );
+    for document in &captured.1.revision.documents {
+        let (stored, bytes) = store
+            .native_source_at(first, &document.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, *document);
+        assert_eq!(
+            bytes,
+            captured
+                .2
+                .files
+                .iter()
+                .find(|file| file.path == document.key.path)
+                .unwrap()
+                .text
+                .as_bytes()
+                .to_vec()
+        );
+    }
     assert!(
         store
             .source_at("a.js", Some(pin(&store, 0)))
@@ -446,22 +501,32 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     let orphaned = store.view("view").unwrap().unwrap().orphaned_ids;
     assert_eq!(orphaned.len(), 3);
     assert!(orphaned.contains(&a) && orphaned.contains(&b) && orphaned.contains(&"missing".into()));
+    let saved = store.views().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].view, view);
+    assert_eq!(saved[0].orphaned_ids.len(), 3);
+    assert_eq!(
+        saved[0]
+            .orphaned_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([a.clone(), b.clone(), "missing".into()])
+    );
     let fresh = bundle(&store, &work);
     publish_bundle(&store, &fresh, store.index_baseline().unwrap());
     assert!(!store.annotations().unwrap()[0].orphaned);
     // Public graph-only writes cannot remove indexed symbols.
+    let expected = store.status().unwrap().revision;
+    let leader = store.leader().unwrap();
     assert!(
         store
-            .publish(
-                &Graph::default(),
-                &store.leader().unwrap(),
-                store.status().unwrap().revision,
-                &cancel()
-            )
+            .publish(&Graph::default(), &leader, expected, &cancel())
             .unwrap_err()
             .to_string()
             .contains("native_evidence_required")
     );
+    drop(leader);
     std::fs::write(
         work.path().join("a.js"),
         "function c() {}
@@ -469,7 +534,7 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     )
     .unwrap();
     let removed = bundle(&store, &work);
-    publish_bundle(&store, &removed, store.status().unwrap().revision);
+    publish_bundle(&store, &removed, store.index_baseline().unwrap());
     assert!(store.annotations().unwrap()[0].orphaned);
     assert!(store.delete_annotation("note").unwrap());
     assert!(!store.delete_annotation("note").unwrap());
@@ -489,6 +554,80 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
             })
             .is_err()
     );
+}
+
+#[test]
+fn legacy_admission_distinguishes_invalid_marker_from_live_decode() {
+    let seed_records = |store: &Store| {
+        store
+            .put_annotation(&Annotation {
+                id: "legacy-note".into(),
+                node_id: "a".into(),
+                body: "durable annotation".into(),
+            })
+            .unwrap();
+        store
+            .put_view(&SavedView {
+                id: "legacy-view".into(),
+                title: "Durable view".into(),
+                query: query(),
+                pins: BTreeMap::from([("missing".into(), Position { x: 1., y: 2. })]),
+                hidden: vec!["b".into()],
+            })
+            .unwrap();
+    };
+
+    let (marker_state, marker_work, marker_store) = fixture();
+    seed_records(&marker_store);
+    let marker_path = index_db(marker_state.path());
+    drop(marker_store);
+    let marker_db = rusqlite::Connection::open(&marker_path).unwrap();
+    marker_db
+        .execute(
+            "UPDATE index_metadata SET extractor_version='wrong-old-extractor'",
+            [],
+        )
+        .unwrap();
+    drop(marker_db);
+    let marker_store = Store::open_for_tests(marker_state.path(), marker_work.path()).unwrap();
+    for error in [
+        marker_store.annotations().unwrap_err(),
+        marker_store.view("legacy-view").unwrap_err(),
+        marker_store.views().unwrap_err(),
+    ] {
+        assert_eq!(
+            error.to_string(),
+            "index_not_ready: reconciliation required"
+        );
+    }
+
+    let (stats_state, stats_work, stats_store) = fixture();
+    seed_records(&stats_store);
+    let stats_path = index_db(stats_state.path());
+    drop(stats_store);
+    let stats_db = rusqlite::Connection::open(&stats_path).unwrap();
+    stats_db
+        .execute("UPDATE index_metadata SET stats='not-json'", [])
+        .unwrap();
+    drop(stats_db);
+    let stats_store = Store::open_for_tests(stats_state.path(), stats_work.path()).unwrap();
+    let stats_clone = stats_store.clone();
+    let first = stats_store.annotations().unwrap_err();
+    assert!(
+        first
+            .to_string()
+            .contains("incompatible_index: live index decode failed"),
+        "{first:#}"
+    );
+    for closed in [
+        stats_clone.view("legacy-view").unwrap_err(),
+        stats_clone.views().unwrap_err(),
+    ] {
+        assert_eq!(
+            closed.to_string(),
+            "index_not_ready: reconciliation required"
+        );
+    }
 }
 
 #[test]
@@ -537,7 +676,7 @@ fn concurrent_publish_cas_has_one_winner() {
 
 #[test]
 fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
-    let (_state, work, store) = fixture();
+    let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
     let first = publish_bundle(&store, &captured, store.index_baseline().unwrap());
@@ -570,9 +709,36 @@ fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
                 .is_err(),
             "case {kind}"
         );
-        assert_eq!(store.status().unwrap().revision, first);
-        assert_eq!(store.graph().unwrap(), baseline);
+        assert_eq!(store.index_baseline().unwrap(), first);
+        for error in [store.status().unwrap_err(), store.graph().unwrap_err()] {
+            assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+        }
+        let reopened = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(reopened.status().unwrap().revision, first);
+        assert_eq!(reopened.graph().unwrap(), baseline);
+        for document in &captured.1.revision.documents {
+            let (stored, bytes) = reopened
+                .native_source_at(first, &document.key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored, *document);
+            assert_eq!(
+                bytes,
+                captured
+                    .2
+                    .files
+                    .iter()
+                    .find(|file| file.path == document.key.path)
+                    .unwrap()
+                    .text
+                    .as_bytes()
+                    .to_vec()
+            );
+        }
     }
+    let next = publish_bundle(&store, &captured, store.index_baseline().unwrap());
+    assert_eq!(store.status().unwrap().revision, next);
+    assert_eq!(store.graph().unwrap(), baseline);
 }
 
 #[test]
@@ -659,8 +825,9 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let path = index_db(state.path());
+    let writer_path = path.clone();
     let writer = std::thread::spawn(move || {
-        let db = rusqlite::Connection::open(path).unwrap();
+        let db = rusqlite::Connection::open(writer_path).unwrap();
         db.execute_batch(
             "BEGIN IMMEDIATE; UPDATE index_metadata SET index_revision=2 WHERE singleton=1",
         )
@@ -671,28 +838,70 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         drop(leader);
     });
     ready_rx.recv().unwrap();
-    assert!(
-        index_db(state.path())
-            .with_file_name("index.db-journal")
-            .exists()
-    );
-    match store.status() {
-        Ok(status) => assert_eq!(status.revision, previous),
-        Err(e) => assert!(e.to_string().contains("storage_busy"), "{e:#}"),
-    }
-    match store.source_at("a.js", Some(previous)) {
-        Ok(Some((pin, source))) => {
-            assert_eq!(pin, previous);
-            assert_eq!(source.text, captured.0.files[0].text);
-        }
-        Err(e) => assert!(e.to_string().contains("storage_busy"), "{e:#}"),
-        Ok(other) => panic!("unexpected pinned source: {other:?}"),
-    }
+
+    // Capture every active-journal outcome before releasing the writer, so no
+    // assertion can strand the writer thread or its leader guard.
+    let journal = path.with_file_name("index.db-journal");
+    let active_journal_exists = journal.exists();
+    let active_status = store.status();
+    let active_source = store.source_at("a.js", Some(previous));
+    let raw_pair = (|| -> rusqlite::Result<(String, i64, String, String, Vec<u8>, String)> {
+        let db = rusqlite::Connection::open(&path)?;
+        db.busy_timeout(std::time::Duration::ZERO)?;
+        db.query_row(
+            "SELECT m.index_generation,m.index_revision,f.payload,f.hash,d.source_bytes,d.content_hash FROM index_metadata m JOIN files f ON f.path='a.js' JOIN native_documents d ON d.path=f.path WHERE m.singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+    })();
     done_tx.send(()).unwrap();
     writer.join().unwrap();
-    let journal = index_db(state.path()).with_file_name("index.db-journal");
+
+    assert!(active_journal_exists);
+    for error in [active_status.unwrap_err(), active_source.unwrap_err()] {
+        let text = error.to_string();
+        assert!(
+            text.contains("index_not_ready") || text.contains("storage_busy"),
+            "{error:#}"
+        );
+    }
+    match raw_pair {
+        Ok((generation, revision, payload, file_hash, native_bytes, native_hash)) => {
+            assert_eq!(generation, previous.index_generation.to_string());
+            assert_eq!(revision, previous.index_revision as i64);
+            let source: SourceFile = serde_json::from_str(&payload).unwrap();
+            assert_eq!(source.text, captured.0.files[0].text);
+            assert_eq!(source.hash, captured.0.files[0].hash);
+            assert_eq!(file_hash, captured.0.files[0].hash);
+            assert_eq!(native_hash, captured.0.files[0].hash);
+            assert_eq!(native_bytes, source.text.as_bytes().to_vec());
+        }
+        Err(error) => assert!(
+            matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            ),
+            "{error}"
+        ),
+    }
+    assert_eq!(store.index_baseline().unwrap(), previous);
+    for error in [
+        store.status().unwrap_err(),
+        store.source_at("a.js", Some(previous)).unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+    }
+
     std::fs::write(&journal, [0u8; 512]).unwrap();
-    assert_eq!(store.status().unwrap().revision, previous);
     assert!(
         store
             .leader()
@@ -846,7 +1055,7 @@ fn legacy_cache_is_control_only_until_lock_safe_rebaseline_rotates_full_pair() {
         )
         .unwrap();
     assert_ne!(next.index_generation, first.index_generation);
-    assert_eq!(next.index_revision, first.index_revision + 1);
+    assert_eq!(next.index_revision, 1);
     assert_eq!(
         store.status().unwrap().evidence_format.as_deref(),
         Some("terminal-native-graph-v1")
@@ -1022,7 +1231,16 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("DROP VIEW unapproved_view").unwrap();
-    assert_eq!(store.status().unwrap().revision, before);
+    drop(db);
+    drop(leader);
+    assert_eq!(store.index_baseline().unwrap(), before);
+    for error in [
+        store.status().unwrap_err(),
+        store.source("a.js").unwrap_err(),
+        store.graph().unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+    }
 }
 
 #[test]

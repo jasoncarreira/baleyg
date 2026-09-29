@@ -135,13 +135,15 @@ impl Fixture {
         std::fs::write(self.dir.path().join("response.json"), value.to_string()).unwrap();
     }
     fn advance(&self) {
+        let index_generation = self.store.status().unwrap().revision.index_generation;
+        let leader = self.store.leader().unwrap();
         publish_bundle(
             &self.store,
             &self.graph,
             &self.dir.path().join("workspace"),
-            &self.store.leader().unwrap(),
+            &leader,
             baleyg::model::IndexPin {
-                index_generation: self.store.status().unwrap().revision.index_generation,
+                index_generation,
                 index_revision: 1,
             },
             &Arc::new(AtomicBool::new(false)),

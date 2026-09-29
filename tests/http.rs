@@ -462,6 +462,13 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         for index in ["nodes_path", "calls_path", "regions_path"] {
             db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
         }
+        db.execute_batch(
+            "DROP TABLE capture_inputs;
+             ALTER TABLE files DROP COLUMN capture_stat;
+             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+        )
+        .unwrap();
         // An old index holds lexical class adjacency and lexical call targets.
         let base: String = db
             .query_row("SELECT id FROM classes WHERE name='Base'", [], |row| {
@@ -957,5 +964,84 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         let (status, body) = call(&app, "GET", route, Value::Null).await;
         assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
         assert_eq!(body["error"]["code"], "stale_catalog");
+    }
+}
+
+#[tokio::test]
+async fn live_control_corruption_returns_typed_503_before_clone_not_ready() {
+    for case in ["stats-source", "real-symbol", "input-classes"] {
+        let (dir, store, _state, app) = setup();
+        let workspace = dir.path().join("workspace");
+        std::fs::write(workspace.join("a.js"), "function go() { measured(); }\n").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let symbol_id = graph.nodes[0].id.clone();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &store.leader().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap()
+            .join("index.db");
+        let db = rusqlite::Connection::open(index).unwrap();
+        let route = match case {
+            "stats-source" => {
+                db.execute("UPDATE index_metadata SET stats='not-json'", [])
+                    .unwrap();
+                format!(
+                    "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                )
+            }
+            "real-symbol" => {
+                db.execute(
+                    "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
+                    [],
+                )
+                .unwrap();
+                format!(
+                    "/api/symbol?id={symbol_id}&indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                )
+            }
+            "input-classes" => {
+                db.execute(
+                    "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
+                    [],
+                )
+                .unwrap();
+                format!(
+                    "/api/classes?indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                )
+            }
+            _ => unreachable!(),
+        };
+        drop(db);
+
+        let (status, body) = call(&app, "GET", &route, Value::Null).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
+        assert_eq!(
+            body["error"]["code"], "incompatible_index",
+            "{case}: {body}"
+        );
+        let (status, body) = call(&app, "GET", "/api/status", Value::Null).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
+        assert_eq!(body["error"]["code"], "index_not_ready", "{case}: {body}");
     }
 }

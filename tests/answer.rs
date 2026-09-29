@@ -373,18 +373,21 @@ function helper() {}
         503,
         "forged call must not enter sequence HTTP"
     );
-    assert_eq!(
-        app.clone()
-            .oneshot(sequence_request(&other))
-            .await
-            .unwrap()
-            .status(),
-        200
-    );
+    let unrelated_sequence = app.clone().oneshot(sequence_request(&other)).await.unwrap();
+    assert_eq!(unrelated_sequence.status(), 503);
+    let body = to_bytes(unrelated_sequence.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let refused: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(refused["error"]["code"], "index_not_ready");
+    assert!(!refused.to_string().contains("sqlInventedCallee"));
+
     let unrelated = app.clone().oneshot(preview(&other)).await.unwrap();
-    assert_eq!(
-        unrelated.status(),
-        200,
-        "unrelated selected document remains readable"
-    );
+    assert_eq!(unrelated.status(), 503);
+    let body = to_bytes(unrelated.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let refused: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(refused["error"]["code"], "index_not_ready");
+    assert!(!refused.to_string().contains("sqlInventedCallee"));
 }

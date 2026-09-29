@@ -289,18 +289,21 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
         call(&app, "POST", "/api/questions/preview", absent).await.0,
         404
     );
+    let index_generation = store.status().unwrap().revision.index_generation;
+    let leader = store.leader().unwrap();
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &store.leader().unwrap(),
+        &leader,
         baleyg::model::IndexPin {
-            index_generation: store.status().unwrap().revision.index_generation,
+            index_generation,
             index_revision: 1,
         },
         &Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
+    drop(leader);
     assert_eq!(
         call(&app, "POST", "/api/questions/preview", request)
             .await
@@ -532,6 +535,13 @@ async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_termina
         for index in ["nodes_path", "calls_path", "regions_path"] {
             db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
         }
+        db.execute_batch(
+            "DROP TABLE capture_inputs;
+             ALTER TABLE files DROP COLUMN capture_stat;
+             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+        )
+        .unwrap();
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],
@@ -733,7 +743,7 @@ async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
             StatusCode::SERVICE_UNAVAILABLE,
             "{action}: {result}"
         );
-        assert_eq!(result["error"]["code"], "incompatible_index");
+        assert_eq!(result["error"]["code"], "index_not_ready");
         assert!(!result.to_string().contains("function seed"));
     }
 }

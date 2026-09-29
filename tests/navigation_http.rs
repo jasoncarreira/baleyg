@@ -214,18 +214,21 @@ async fn strict_selectors_validation_and_revision() {
         assert_eq!(status, 400, "{body}: {value}");
     }
     let old_source = source("A.java", 3, &dir);
+    let index_generation = store.status().unwrap().revision.index_generation;
+    let leader = store.leader().unwrap();
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &store.leader().unwrap(),
+        &leader,
         baleyg::model::IndexPin {
-            index_generation: store.status().unwrap().revision.index_generation,
+            index_generation,
             index_revision: 1,
         },
         &cancel(),
     )
     .unwrap();
+    drop(leader);
     assert_eq!(call(&app, good).await.0, 409);
     assert_eq!(call(&app, old_source).await.0, 409);
 }
@@ -310,9 +313,9 @@ async fn ambiguity_preserves_all_cached_candidates_and_unresolved_calls_are_not_
 }
 #[tokio::test]
 async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
-    let refusal = |(status, body): (StatusCode, Value)| {
+    let refusal = |(status, body): (StatusCode, Value), expected: &str| {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "incompatible_index", "{body}");
+        assert_eq!(body["error"]["code"], expected, "{body}");
         assert!(
             body["targets"].is_null(),
             "no forged navigation targets: {body}"
@@ -335,13 +338,14 @@ async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
         rusqlite::params![huge, id(&graph, "A")],
     )
     .unwrap();
-    refusal(call(&app, selector).await);
-    refusal(call(&app, member(&dir, id(&graph, "A"), "padding", 0)).await);
-    let (status, other) = call(&app, source("B.java", 1, &dir)).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "unaffected native document: {other}"
+    refusal(call(&app, selector).await, "incompatible_index");
+    refusal(
+        call(&app, member(&dir, id(&graph, "A"), "padding", 0)).await,
+        "index_not_ready",
+    );
+    refusal(
+        call(&app, source("B.java", 1, &dir)).await,
+        "index_not_ready",
     );
 
     // Catalog warnings are global metadata, so corruption refuses every
@@ -353,23 +357,62 @@ async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
         [json!(["x".repeat(2 * 1024 * 1024)]).to_string()],
     )
     .unwrap();
-    refusal(call(&app, member(&dir, id(&graph, "A"), "first", 0)).await);
+    refusal(
+        call(&app, member(&dir, id(&graph, "A"), "first", 0)).await,
+        "incompatible_index",
+    );
     assert!(
         store
             .classes_at(None, "", None, 0, 20)
             .unwrap_err()
             .to_string()
-            .contains("incompatible_index")
+            .contains("index_not_ready")
     );
+
+    // Under-budget malformed catalog JSON reaches class_metadata. Its first
+    // authenticated class request is typed, then the shared Store stays closed.
+    let (dir, store, _graph, app) = fixture();
+    let pin = store.status().unwrap().revision;
+    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
+    db.execute("UPDATE class_catalog SET warnings='not-json'", [])
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/classes?q=A&indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                ))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
+    refusal((status, body), "incompatible_index");
+    let closed = store.classes_at(None, "", None, 0, 20).unwrap_err();
+    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
 
     // Selected class relationships are scoped by their owner and file.
     let (dir, _store, graph, app) = fixture();
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     db.execute("UPDATE class_relations SET payload=json_set(payload,'$.candidateIds',json(?1)) WHERE owner=?2",
         rusqlite::params![json!(["x".repeat(100000)]).to_string(),id(&graph,"A")]).unwrap();
-    refusal(call(&app, member(&dir, id(&graph, "A"), "first", 0)).await);
-    let (status, other) = call(&app, source("B.java", 1, &dir)).await;
-    assert_eq!(status, StatusCode::OK, "unrelated native document: {other}");
+    refusal(
+        call(&app, member(&dir, id(&graph, "A"), "first", 0)).await,
+        "incompatible_index",
+    );
+    refusal(
+        call(&app, source("B.java", 1, &dir)).await,
+        "index_not_ready",
+    );
 
     // Deleting the live schema-6 catalog is corruption, not a truthful old4
     // private baseline or a public requireIndex fallback.
@@ -379,13 +422,16 @@ async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
         "DELETE FROM class_relations; DELETE FROM classes; DELETE FROM class_catalog;",
     )
     .unwrap();
-    refusal(call(&app, source("A.java", 6, &dir)).await);
+    refusal(
+        call(&app, source("A.java", 6, &dir)).await,
+        "incompatible_index",
+    );
     assert!(
         store
             .classes_at(None, "", None, 0, 20)
             .unwrap_err()
             .to_string()
-            .contains("incompatible_index")
+            .contains("index_not_ready")
     );
 }
 #[tokio::test]
@@ -432,6 +478,21 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     let mut text = String::from("class A { B value; } class B {}\n");
     text.push_str(&" ".repeat(300_000));
     let (dir, store, graph, app) = setup(&[("Large.java", &text)]);
+    let reopen = || {
+        let root = dir.path().join("workspace");
+        let options = IndexOptions::new(root.clone());
+        let reopened = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
+        let router = http::router(
+            http::new(
+                reopened.clone(),
+                options,
+                TOKEN.into(),
+                "127.0.0.1:7331".parse().unwrap(),
+            )
+            .unwrap(),
+        );
+        (reopened, router)
+    };
     let selector = member(&dir, id(&graph, "A"), "value", 0);
     let (status, within_budget) = call(&app, selector.clone()).await;
     assert_eq!(status, 200, "{within_budget}");
@@ -451,12 +512,22 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     assert_eq!(status, 503, "{limited}");
     assert_eq!(limited["error"]["code"], "incompatible_index");
     assert!(limited.get("targets").is_none());
-    // The source selector would count forged lines in files.payload.text. Gate
-    // that read in the same pinned transaction, before any false line is admitted.
+
+    // Exercise the source selector independently against the same persisted
+    // oversized graph mutation, never as an escape from the first app's latch.
+    let (_source_store, source_app) = reopen();
+    let (status, source_refusal) = call(&source_app, source("Large.java", 2, &dir)).await;
+    assert_eq!(status, 503, "{source_refusal}");
+    assert_eq!(source_refusal["error"]["code"], "incompatible_index");
+    assert!(source_refusal.get("targets").is_none());
+    assert!(!source_refusal.to_string().contains("forged()"));
+
+    // The first selected failure closes the original app and its Store clones.
     let (status, forged_line) = call(&app, source("Large.java", 2, &dir)).await;
     assert_eq!(status, 503, "{forged_line}");
-    assert_eq!(forged_line["error"]["code"], "incompatible_index");
-    assert!(store.source_at("Large.java", None).is_err());
+    assert_eq!(forged_line["error"]["code"], "index_not_ready");
+    let closed = store.source_at("Large.java", None).unwrap_err();
+    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
     let response = app
         .clone()
         .oneshot(
@@ -472,19 +543,30 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     assert_eq!(response.status(), 503);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "incompatible_index");
+    assert_eq!(body["error"]["code"], "index_not_ready");
+
+    // Restore the first corruption before installing and independently selecting
+    // the different unproven-member graph mismatch.
+    db.execute(
+        "UPDATE files SET payload=json_set(payload,'$.text',?1)",
+        [&original_text],
+    )
+    .unwrap();
     db.execute(
         "UPDATE files SET payload=json_set(payload,'$.text','class A { C other; } class B {}')",
         [],
     )
     .unwrap();
-    let (status, unproven) = call(&app, selector.clone()).await;
+    let (unproven_store, unproven_app) = reopen();
+    let (status, unproven) = call(&unproven_app, selector.clone()).await;
     assert_eq!(status, 503, "{unproven}");
     assert_eq!(unproven["error"]["code"], "incompatible_index");
     assert!(unproven.get("targets").is_none());
-    assert!(store.source_at("Large.java", None).is_err());
-    // Restore graph JSON, then tamper the actual selected native BLOB. A pinned
-    // typed read must reject it, while unrelated member navigation stays inert.
+    let closed = unproven_store.source_at("Large.java", None).unwrap_err();
+    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+
+    // Restore graph JSON, then tamper the actual selected native BLOB. Exercise
+    // direct-native and HTTP selection independently; each handle then closes.
     db.execute(
         "UPDATE files SET payload=json_set(payload,'$.text',?1)",
         [&original_text],
@@ -508,17 +590,28 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
         language: "java".into(),
         path: "Large.java".into(),
     };
+    let (native_store, _) = reopen();
+    let native_pin = native_store.status().unwrap().revision;
+    let native_clone = native_store.clone();
+    let native_error = native_store
+        .native_source_at(native_pin, &native_key)
+        .unwrap_err();
     assert!(
-        store
-            .native_source_at(store.status().unwrap().revision, &native_key)
-            .is_err()
+        native_error.to_string().contains("incompatible_index")
+            && native_error
+                .to_string()
+                .contains("native source hash mismatch"),
+        "{native_error:#}"
     );
-    assert!(store.source_at("Large.java", None).is_err());
-    let (status, corrupted) = call(&app, selector).await;
+    let closed = native_clone.source_at("Large.java", None).unwrap_err();
+    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+
+    let (_http_store, http_app) = reopen();
+    let (status, corrupted) = call(&http_app, selector).await;
     assert_eq!(status, 503, "{corrupted}");
     assert_eq!(corrupted["error"]["code"], "incompatible_index");
     assert!(corrupted.get("targets").is_none());
-    let response = app
+    let response = http_app
         .oneshot(
             Request::builder()
                 .uri("/api/source?path=Large.java")
@@ -532,7 +625,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     assert_eq!(response.status(), 503);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "incompatible_index");
+    assert_eq!(body["error"]["code"], "index_not_ready");
 }
 
 #[tokio::test]
@@ -990,9 +1083,67 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     let (status, result) = call(&app, source("A.java", 3, &dir)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{result}");
     assert_eq!(result["error"]["code"], "incompatible_index");
+    assert!(!result.to_string().contains("forged.java"));
+    let (status, closed) = call(&app, source("B.java", 1, &dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
+    assert_eq!(closed["error"]["code"], "index_not_ready");
+    assert!(!closed.to_string().contains("forged.java"));
+
+    // A coherent graph-only row with no selected native document is an
+    // independent typed corruption. Its first refusal closes every app path.
+    let (missing_dir, _missing_store, _graph, missing_app) = fixture();
+    let missing_db = rusqlite::Connection::open(index_db(&missing_dir)).unwrap();
     assert_eq!(
-        call(&app, source("B.java", 1, &dir)).await.0,
-        StatusCode::OK,
-        "unselected B.java stays usable despite A.java tamper"
+        missing_db
+            .execute(
+                "INSERT INTO files(path,hash,payload,capture_stat) SELECT 'orphan.java',hash,json_set(payload,'$.path','orphan.java'),capture_stat FROM files WHERE path='B.java'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    let fk_count: i64 = missing_db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_count, 0);
+    let (status, missing) = call(&missing_app, source("orphan.java", 1, &missing_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{missing}");
+    assert_eq!(missing["error"]["code"], "incompatible_index");
+    assert!(missing.get("targets").is_none());
+    assert!(!missing.to_string().contains("forged.java"));
+    let (status, closed) = call(&missing_app, source("B.java", 1, &missing_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
+    assert_eq!(closed["error"]["code"], "index_not_ready");
+    assert!(!closed.to_string().contains("forged.java"));
+
+    // Member selection authenticates the exact node JSON before using its kind.
+    let (selected_dir, selected_store, selected_graph, selected_app) = fixture();
+    let selected_clone = selected_store.clone();
+    let class_id = id(&selected_graph, "A");
+    let selector = member(&selected_dir, class_id, "first", 0);
+    let selected_db = rusqlite::Connection::open(index_db(&selected_dir)).unwrap();
+    selected_db
+        .execute(
+            "UPDATE nodes SET payload='not-json' WHERE id=?1",
+            [&class_id],
+        )
+        .unwrap();
+    let (status, invalid) = call(&selected_app, selector).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{invalid}");
+    assert_eq!(invalid["error"]["code"], "incompatible_index");
+    assert!(invalid.get("targets").is_none());
+    assert!(!invalid.to_string().contains("not-json"));
+    let (status, closed) = call(&selected_app, source("B.java", 1, &selected_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
+    assert_eq!(closed["error"]["code"], "index_not_ready");
+    assert!(closed.get("targets").is_none());
+    assert!(
+        selected_clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
     );
 }

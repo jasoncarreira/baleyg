@@ -4,14 +4,14 @@ use crate::{
     capture::Capture,
     indexer::{self, IndexOptions},
     model::{CancelFlag, IndexPin, IndexProgress},
-    store::{Store, topology::LeaderGuard},
+    store::{RecoveryBaseline, Store, topology::LeaderGuard},
 };
 use anyhow::{Result, ensure};
 use std::sync::atomic::Ordering;
 
 pub struct IndexJobCoordinator {
     store: Store,
-    expected: IndexPin,
+    expected: RecoveryBaseline,
     leader: LeaderGuard,
 }
 
@@ -19,10 +19,10 @@ impl IndexJobCoordinator {
     /// The control baseline admits known old indexes without exposing their evidence to readers.
     /// A supplied HTTP pair is checked before any source admission or worker is started.
     pub fn prepare(store: &Store, requested: Option<IndexPin>) -> Result<Self> {
-        let expected = store.index_baseline()?;
+        let expected = store.recovery_index_baseline()?;
         ensure!(
-            requested.is_none_or(|pin| pin == expected),
-            "revision conflict"
+            requested.is_none_or(|pin| expected.pin() == Some(pin)),
+            "revision conflict: prior index pin is not decodable or changed"
         );
         let leader = store.leader()?;
         Ok(Self {
@@ -56,7 +56,7 @@ impl IndexJobCoordinator {
             indexer::index_workspace_bundle(options, self.store.root_id(), cancel, progress)?;
         observe(&capture);
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
-        self.store.publish_native(
+        self.store.publish_native_recovery(
             &graph,
             &capture,
             &native,
@@ -156,6 +156,8 @@ mod tests {
         assert!(error.to_string().contains("cancelled"), "{error:#}");
         let (files, ops) = cancelled.expect("capture observed before cancel");
         assert_eq!(ops, expected(&files));
-        assert_eq!(store.status().unwrap().revision, first);
+        assert_eq!(store.index_baseline().unwrap(), first);
+        let closed = store.status().unwrap_err();
+        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
     }
 }

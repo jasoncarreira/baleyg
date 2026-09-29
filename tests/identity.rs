@@ -194,18 +194,16 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     db.execute_batch("DROP TRIGGER abort_second_call").unwrap();
     drop(db);
     drop(leader);
-    assert_eq!(store.status().unwrap().revision, revision);
-    assert_eq!(store.graph().unwrap(), first);
-    let next_revision = publish_bundle(
-        &store,
-        &next,
-        &root,
-        &store.leader().unwrap(),
-        revision,
-        &cancel,
-    )
-    .unwrap();
+    assert_eq!(store.index_baseline().unwrap(), revision);
+    for error in [store.status().unwrap_err(), store.graph().unwrap_err()] {
+        assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+    }
+    let leader = store.leader().unwrap();
+    let next_revision = publish_bundle(&store, &next, &root, &leader, revision, &cancel).unwrap();
+    drop(leader);
     assert_eq!(next_revision.index_revision, revision.index_revision + 1);
+    assert_eq!(store.status().unwrap().revision, next_revision);
+    assert_eq!(store.graph().unwrap(), next);
 }
 
 fn publish_bundle(

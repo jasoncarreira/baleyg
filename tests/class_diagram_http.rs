@@ -233,18 +233,21 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
     assert_eq!(status, 200);
     assert_eq!(independent["nodes"].as_array().unwrap().len(), 2);
     assert_eq!(independent["edges"], json!([]));
+    let index_generation = store.status().unwrap().revision.index_generation;
+    let leader = store.leader().unwrap();
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &store.leader().unwrap(),
+        &leader,
         baleyg::model::IndexPin {
-            index_generation: store.status().unwrap().revision.index_generation,
+            index_generation,
             index_revision: 1,
         },
         &cancel(),
     )
     .unwrap();
+    drop(leader);
     assert_eq!(
         call(
             &app,
@@ -340,35 +343,44 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     let (dir, store, graph, _app) = setup();
     let q = request(id(&graph, "A"), &store);
     let before = serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap();
+
+    let leader = store.leader().unwrap();
+    let control = store.index_baseline().unwrap();
     assert!(
         publish_bundle(
             &store,
             &graph,
             &dir.path().join("workspace"),
-            &store.leader().unwrap(),
+            &leader,
             baleyg::model::IndexPin {
-                index_generation: store.index_baseline().unwrap().index_generation,
+                index_generation: control.index_generation,
                 index_revision: 0
             },
             &cancel()
         )
         .is_err()
     );
+    drop(leader);
+
+    let leader = store.leader().unwrap();
+    let control = store.index_baseline().unwrap();
     assert!(
         publish_bundle(
             &store,
             &graph,
             &dir.path().join("workspace"),
-            &store.leader().unwrap(),
+            &leader,
             baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
+                index_generation: control.index_generation,
                 index_revision: 1
             },
             &Arc::new(AtomicBool::new(true))
         )
         .is_err()
     );
-    let prior = store.status().unwrap().revision;
+    drop(leader);
+
+    let prior = store.index_baseline().unwrap();
     let leader = store.leader().unwrap();
     let path = index_db(&dir.path().join("state"));
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -403,7 +415,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            6,
+            7,
             "native-paired-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
@@ -412,7 +424,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     assert!(
         store
@@ -438,28 +450,39 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     db.execute_batch("DROP TRIGGER fail_projection").unwrap();
     drop(db);
     drop(leader);
-    assert_eq!(store.status().unwrap().revision, prior);
-    assert_eq!(
-        serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap(),
-        before
-    );
-    assert_eq!(store.graph().unwrap().nodes, graph.nodes);
+
+    for closed in [
+        store.status().unwrap_err(),
+        store.class_diagram_at(&q).unwrap_err(),
+        store.graph().unwrap_err(),
+    ] {
+        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    }
+
+    let control = store.index_baseline().unwrap();
+    let leader = store.leader().unwrap();
+    let next = publish_bundle(
+        &store,
+        &graph,
+        &dir.path().join("workspace"),
+        &leader,
+        control,
+        &cancel(),
+    )
+    .unwrap();
     assert!(
-        publish_bundle(
-            &store,
-            &graph,
-            &dir.path().join("workspace"),
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1
-            },
-            &cancel()
-        )
-        .unwrap()
-        .index_revision
-            > 1,
+        next.index_revision > 1,
         "failed transaction consumes a durable revision token"
+    );
+    assert_eq!(store.status().unwrap().revision, next);
+    assert_eq!(store.graph().unwrap().nodes, graph.nodes);
+    let mut current = q.clone();
+    current.expected_revision = next;
+    let mut before_at_next = before.clone();
+    before_at_next["revision"] = serde_json::to_value(next).unwrap();
+    assert_eq!(
+        serde_json::to_value(store.class_diagram_at(&current).unwrap()).unwrap(),
+        before_at_next
     );
 }
 
@@ -939,7 +962,7 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
-    for (method, path, body) in [
+    for (request_index, (method, path, body)) in [
         ("GET", class_url.as_str(), Value::Null),
         ("GET", symbol_url.as_str(), Value::Null),
         (
@@ -947,18 +970,26 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
             "/api/class-diagram",
             json!({"seed":seed,"expectedRevision":pin}),
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (status, value) = call(&app, method, path, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        assert_eq!(value["error"]["code"], "incompatible_index");
+        let expected = if request_index == 0 {
+            "incompatible_index"
+        } else {
+            "index_not_ready"
+        };
+        assert_eq!(value["error"]["code"], expected, "{path}: {value}");
         assert!(!value.to_string().contains("Fabricated"));
     }
+    let unrelated = store
+        .symbol_at(&id(&graph, "Unsupported"), Some(pin))
+        .unwrap_err();
     assert!(
-        store
-            .symbol_at(&id(&graph, "Unsupported"), Some(pin))
-            .unwrap()
-            .is_some(),
-        "a different document must remain selectable"
+        unrelated.to_string().starts_with("index_not_ready"),
+        "{unrelated:#}"
     );
 }
 
@@ -995,7 +1026,7 @@ class B {}
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
-    for (method, path, body) in [
+    for (request_index, (method, path, body)) in [
         ("GET", class_url.as_str(), Value::Null),
         ("GET", symbol_url.as_str(), Value::Null),
         (
@@ -1003,12 +1034,156 @@ class B {}
             "/api/class-diagram",
             json!({"seed":class_id,"expectedRevision":pin}),
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (status, value) = call(&app, method, path, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        assert_eq!(value["error"]["code"], "incompatible_index");
+        let expected = if request_index == 0 {
+            "incompatible_index"
+        } else {
+            "index_not_ready"
+        };
+        assert_eq!(value["error"]["code"], expected, "{path}: {value}");
         assert!(!value.to_string().contains("fabricatedCall"));
     }
     let other_url = format!("/api/symbol?id={other_id}&{}", pin_query(pin));
-    assert_eq!(call(&app, "GET", &other_url, Value::Null).await.0, 200);
+    let (status, value) = call(&app, "GET", &other_url, Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["error"]["code"], "index_not_ready");
+    assert!(!value.to_string().contains("fabricatedCall"));
+}
+
+#[tokio::test]
+async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_invalid_requests() {
+    // The first selected catalog decode is typed and closes pre-created clones.
+    let (dir, store, graph, app) = setup();
+    let clone = store.clone();
+    let pin = store.status().unwrap().revision;
+    let class_id = id(&graph, "A");
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    db.execute(
+        "UPDATE classes SET payload='not-json' WHERE id=?1",
+        [&class_id],
+    )
+    .unwrap();
+    let (status, body) = call(
+        &app,
+        "GET",
+        &format!("/api/classes?{}&q=A", pin_query(pin)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "incompatible_index");
+    assert!(body.get("items").is_none());
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+
+    // The diagram endpoint independently reports selected class decode corruption.
+    let (dir, store, graph, app) = setup();
+    let clone = store.clone();
+    let pin = store.status().unwrap().revision;
+    let class_id = id(&graph, "A");
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    db.execute(
+        "UPDATE classes SET payload='not-json' WHERE id=?1",
+        [&class_id],
+    )
+    .unwrap();
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":class_id,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "incompatible_index");
+    assert!(body.get("nodes").is_none());
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+
+    // A selected method seed reaches only the resolver's persisted Symbol decode.
+    let (dir, store, graph, app) = setup();
+    let clone = store.clone();
+    let pin = store.status().unwrap().revision;
+    let method_id = id(&graph, "run");
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    db.execute(
+        "UPDATE nodes SET payload='not-json' WHERE id=?1",
+        [&method_id],
+    )
+    .unwrap();
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":method_id,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "incompatible_index");
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+
+    // Valid top-level JSON with a non-object member is refused before clipped JSON1.
+    let (dir, store, graph, app) = setup();
+    let clone = store.clone();
+    let pin = store.status().unwrap().revision;
+    let class_id = id(&graph, "A");
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    db.execute(
+        "UPDATE classes SET payload=json_set(payload,'$.fields',json_array('wrong'),'$.padding',?1) WHERE id=?2",
+        rusqlite::params!["x".repeat(70 * 1024), class_id],
+    )
+    .unwrap();
+    let (status, body) = call(
+        &app,
+        "GET",
+        &format!("/api/classes?{}&q=A", pin_query(pin)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "incompatible_index");
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+
+    // A genuine request-domain failure stays HTTP 400 and does not close the Store.
+    let (_dir, store, graph, app) = setup();
+    let clone = store.clone();
+    let pin = store.status().unwrap().revision;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":id(&graph,"Unsupported"),"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_class_request");
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
 }
