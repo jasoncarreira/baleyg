@@ -432,7 +432,7 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     let selected = store.native_source_at(pin, &corrupted).unwrap_err();
     assert!(
         selected.to_string().contains("incompatible_index")
-            && selected.to_string().contains("native source hash mismatch"),
+            && selected.to_string().contains("source hash mismatch"),
         "{selected:#}"
     );
     let closed = original_clone.source_at("flow.rs", Some(pin)).unwrap_err();
@@ -685,7 +685,7 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
         native_error.to_string().contains("incompatible_index")
             && native_error
                 .to_string()
-                .contains("native source differs from paired graph"),
+                .contains("source hash mismatch"),
         "{native_error:#}"
     );
     let closed = native_clone.source_at("flow.java", Some(pin)).unwrap_err();
