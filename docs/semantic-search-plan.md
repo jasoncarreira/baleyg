@@ -79,9 +79,15 @@ every chunk below it.
 
 ## Storage and ranking
 
-- Vectors are stored as int8-quantized blobs in SQLite, next to the index. A brute-force cosine
-  scan is enough at first: 100k chunks × 768 dimensions is about 77 MB and takes milliseconds.
-  Add an ANN index (for example `sqlite-vec` or HNSW) only if large repositories need it.
+- **Two stores.**
+  - *Shared vector cache.* Vectors live in a per-user, content-addressed cache beside the native
+    fact cache (#71's `<cache>/facts.db`), keyed by `(modelId, hash of the embedded text)`. They
+    are int8-quantized blobs in SQLite.
+  - *Per-index search tables.* Each checkout's index holds only references: chunk → text hash,
+    plus stable declaration ID, byte range and flags. It also holds the lexical (FTS5) index.
+- A brute-force cosine scan over the referenced vectors is enough at first: 100k chunks × 768
+  dimensions is about 77 MB and takes milliseconds. Add an ANN index (for example `sqlite-vec` or
+  HNSW) only if large repositories need it.
 - **Hybrid ranking.** Vector similarity is fused with SQLite FTS5/BM25 over identifiers split at
   camelCase and snake_case. On code, exact identifier matches matter, and hybrid retrieval
   outperforms pure embeddings.
@@ -96,6 +102,22 @@ every chunk below it.
   across revisions, worktrees and checkouts. The cache is **not** path-neutral. The path is in the
   embedded text because it is a useful topic signal, so a rename or `git mv` re-embeds the
   affected chunks. Renames are rare enough that this trade favours retrieval quality.
+- **New worktrees and repository copies reuse, never copy.** `index.db` is bound to its
+  checkout's root identity and generation (local topology T01–T02, no state migration), so it is
+  never copied between checkouts. A new worktree or copy of the same commit instead rebuilds from
+  the shared caches:
+  - native extraction hits the fact cache (#71: "parses only files the cache has never seen");
+  - every chunk's embedded text is identical, because embedded paths are relative to the root, so
+    every vector is a cache hit and **nothing is re-embedded**.
+
+  What remains is the capture's one read and hash per file, ID assembly and publication, which
+  takes seconds, plus rebuilding the lexical index.
+- **Cache rules follow #71.**
+  - Keep size-capped LRU eviction.
+  - A missing, evicted, corrupt or unavailable entry only means re-embedding. It never produces a
+    different answer.
+  - Validate an entry against its key before use.
+  - Never share the cache across users or machines.
 - **Invalidate on text or context, not only on the declaration body.** A chunk's generated text
   can change while its declaration body does not. The incremental deltas (#67) must therefore
   select every chunk whose generated text would change:
