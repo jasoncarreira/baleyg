@@ -105,6 +105,21 @@ every chunk below it.
 - **Filters:** language, path prefix, node kind, and excluding tests or generated code.
 - **Boosts:** the same module as the caller's current file, public over private, production over
   test code.
+- **Optional Jev rerank (opt-in, off by default).** Jev is a single-forward-pass relevance
+  decision model that Baleyg already calls for live sequence-diagram call selection
+  ([live Jev](live-jev.md)). A rerank stage would send the query and the top ~50 hybrid candidates
+  (symbol card plus a bounded code excerpt each) for one relevance judgment per candidate, and
+  reorder by that judgment. This is the per-candidate judgment that
+  [jevgrep](https://github.com/dzhng/jevgrep) applies across a whole folder → file → declaration
+  crawl, limited here to candidates the local index already found.
+  - It sends source to the hosted provider, so it follows the live-Jev rules: explicit opt-in, a
+    `JEV_KEY` from the environment, the existing reservation budget ledger, and validated labels.
+    Search without it stays fully local.
+  - It reorders only. It never adds candidates, and a failed, over-budget or invalid judgment falls
+    back to the hybrid order and says so in the response. Its labels are retrieval metadata, not
+    evidence.
+  - Include it only if the bake-off shows hybrid ranking alone falls short. Measure it by recall@k
+    gain against its per-query cost.
 
 ## Incremental updates
 
