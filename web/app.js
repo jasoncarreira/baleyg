@@ -599,7 +599,8 @@ function renderNotes() {
   $("annotation-target").textContent = editingNote ? `Editing note anchored to ${editingNote.target}. Selection changes will not retarget it.`
     : seed ? `Notes for symbol ${seed}` : "Select a symbol to attach a note. Unavailable notes remain visible.";
   $("annotations").replaceChildren();
-  const displayed = annotations.filter(state => state.annotation.nodeId === seed || editingNote?.id === state.annotation.id || state.attachment.availability !== "ready" || state.attachment.result?.status === "orphaned");
+  const displayed = annotations.filter(state => state.annotation.nodeId === seed || editingNote?.id === state.annotation.id ||
+    state.attachment.availability !== "ready" || state.attachment.result?.status === "orphaned" || !IndexPin.equal(state.savedPair, status?.revision));
   for (const state of displayed) {
     const note = state.annotation, decision = savedLoadDecision(state, "note"), li = element("li");
     li.setAttribute("data-saved-kind", "note"); li.setAttribute("data-saved-id", note.id);

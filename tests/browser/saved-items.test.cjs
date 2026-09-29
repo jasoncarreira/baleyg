@@ -160,7 +160,7 @@ async function selectSymbol(page, name) {
   const query=page.waitForResponse(response=>new URL(response.url()).pathname==="/api/query"&&response.status()===200);
   await pick.click();await query;
 }
-const row = (page, kind, id) => page.locator(`[data-saved-kind="${kind}"][data-saved-id="${id}"]`);
+const row = (page, kind, id) => page.locator(`li[data-saved-kind="${kind}"][data-saved-id="${id}"]`);
 function readPayload(dbPath, kind, id) {
   assert.ok(["view","note"].includes(kind));
   const db=new DatabaseSync(dbPath,{readOnly:true});
