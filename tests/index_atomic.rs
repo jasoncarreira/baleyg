@@ -1061,8 +1061,7 @@ fn exceptional_format_is_typed_deferred_refusal_without_file_mutation() {
         store.index_baseline().unwrap_err(),
         store
             .leader()
-            .err()
-            .expect("exceptional format leader refusal"),
+            .expect_err("exceptional format leader refusal"),
     ] {
         let text = refusal.to_string();
         assert!(
