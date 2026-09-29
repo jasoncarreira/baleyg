@@ -1936,10 +1936,14 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        ensure!(
-            warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)),
-            "incompatible_index: class catalog byte budget exceeded or missing"
-        );
+        if !warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)) {
+            return Err(self.report_control_failure(
+                SelectedIntegrity(
+                    "incompatible_index: class catalog byte budget exceeded or missing".into(),
+                )
+                .into(),
+            ));
+        }
         Ok(status)
     }
     /// Internal control baseline, never returned by public status or evidence reads.
@@ -3482,7 +3486,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
-        let (mut warnings, truncated) = class_metadata(&tx)?;
+        let (mut warnings, truncated) = class_metadata(&tx)
+            .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
         let pattern = format!(
             "%{}%",
             query
@@ -3559,7 +3564,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(revision == request.expected_revision, "revision conflict");
-        let (warnings, truncated) = class_metadata(&tx)?;
+        let (warnings, truncated) = class_metadata(&tx)
+            .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
         let (seed, clipped) = resolve_class(&tx, &request.seed)?;
         // Explicitly selected measured declarations are independent roots, never
         // connected by lexical type-name matches or candidate relationships.

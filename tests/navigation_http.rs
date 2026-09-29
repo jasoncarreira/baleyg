@@ -369,6 +369,37 @@ async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
             .contains("index_not_ready")
     );
 
+    // Under-budget malformed catalog JSON reaches class_metadata. Its first
+    // authenticated class request is typed, then the shared Store stays closed.
+    let (dir, store, _graph, app) = fixture();
+    let pin = store.status().unwrap().revision;
+    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
+    db.execute("UPDATE class_catalog SET warnings='not-json'", [])
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/classes?q=A&indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                ))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
+    refusal((status, body), "incompatible_index");
+    let closed = store.classes_at(None, "", None, 0, 20).unwrap_err();
+    assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+
     // Selected class relationships are scoped by their owner and file.
     let (dir, _store, graph, app) = fixture();
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
@@ -450,7 +481,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     let reopen = || {
         let root = dir.path().join("workspace");
         let options = IndexOptions::new(root.clone());
-        let reopened = crate::common::open_store(&dir.path().join("state"), &root).unwrap();
+        let reopened = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
         let router = http::router(
             http::new(
                 reopened.clone(),
