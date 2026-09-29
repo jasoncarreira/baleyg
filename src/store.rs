@@ -5948,6 +5948,7 @@ mod sqlite_schema_race_tests {
             leader_pin,
             _leader_cancel,
         ) = ready();
+        let leader_clone = leader_store.clone();
         let leader_path = leader_store.roots.index_db(&leader_store.identity);
         let after_leader_ddl = RefCell::new(None);
         let leader_error = leader_store
@@ -5984,8 +5985,21 @@ mod sqlite_schema_race_tests {
         );
         assert_eq!(
             leader_store.status().unwrap_err().to_string(),
-            "index_not_ready: reconciliation required"
+            "incompatible_index: unknown cache object type, name or shape"
         );
+        attacker
+            .execute_batch("DROP VIEW leader_after_admission")
+            .unwrap();
+        drop(attacker);
+        for closed in [
+            leader_store.status().unwrap_err(),
+            leader_clone.status().unwrap_err(),
+        ] {
+            assert_eq!(
+                closed.to_string(),
+                "index_not_ready: reconciliation required"
+            );
+        }
     }
 }
 
