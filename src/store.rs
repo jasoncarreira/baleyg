@@ -3110,9 +3110,12 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 params![key.source_set_id,key.language,key.path],|r|Ok([
                     r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?]),
             ).optional()?;
-            ensure!(sizes.is_none_or(|bytes|bytes[0]>=0 && bytes[0]<=256*1024*1024
-                && bytes[1..].iter().all(|length|*length>=0 && *length<=16*1024)),
-                "incompatible_index: selected native source byte budget exceeded");
+            if !sizes.is_none_or(|bytes|bytes[0]>=0 && bytes[0]<=256*1024*1024
+                && bytes[1..].iter().all(|length|*length>=0 && *length<=16*1024)) {
+                return Err(SelectedIntegrity(
+                    "incompatible_index: selected native source byte budget exceeded".into(),
+                ).into());
+            }
             type NativeSourceRow=(String,String,i64,Vec<u8>);
             let row:Option<Result<NativeSourceRow>>=db.query_row(
                 "SELECT revision_id,content_hash,byte_length,source_bytes FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
@@ -3121,25 +3124,45 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                     let revision_id:String=r.get(0)?;
                     let hash:String=r.get(1)?;
                     let length:i64=r.get(2)?;
-                    let raw=r.get_ref(3)?.as_blob()?;
-                    ensure!(length==raw.len() as i64 && hash==hex::encode(Sha256::digest(raw)),
-                        "incompatible_index: native source hash mismatch");
+                    let raw=r.get_ref(3)?;
+                    let raw=raw.as_blob().map_err(|error| selected_integrity(error.into()))?;
+                    if length!=raw.len() as i64 || hash!=hex::encode(Sha256::digest(raw)) {
+                        return Err(SelectedIntegrity(
+                            "incompatible_index: native source hash mismatch".into(),
+                        ).into());
+                    }
                     Ok((revision_id,hash,length,r.get(3)?))
                 })()),
             ).optional()?;
             let row=row.transpose()?.map(|(revision_id,content_hash,byte_length,bytes)|->Result<_>{
-                let graph=self.selected_source_row(db,&key.path)?
-                    .context("incompatible_index: paired graph source missing")?;
-                ensure!(graph.path==key.path && graph.language==key.language
-                    && graph.hash==content_hash && graph.text.as_bytes()==bytes,
-                    "incompatible_index: native source differs from paired graph");
-                Ok((Document {key:key.clone(),revision_id,content_hash,byte_length:usize::try_from(byte_length)?},bytes))
+                let graph=match self.selected_source_row(db,&key.path)? {
+                    Some(graph)=>graph,
+                    None=>return Err(SelectedIntegrity(
+                        "incompatible_index: paired graph source missing".into(),
+                    ).into()),
+                };
+                if graph.path!=key.path || graph.language!=key.language
+                    || graph.hash!=content_hash || graph.text.as_bytes()!=bytes {
+                    return Err(SelectedIntegrity(
+                        "incompatible_index: native source differs from paired graph".into(),
+                    ).into());
+                }
+                let byte_length=usize::try_from(byte_length).map_err(|error| -> anyhow::Error {
+                    SelectedIntegrity(format!(
+                        "incompatible_index: selected native byte length conversion failed: {error}"
+                    )).into()
+                })?;
+                Ok((Document {key:key.clone(),revision_id,content_hash,byte_length},bytes))
             }).transpose()?;
             if row.is_none() {
                 let graph_file:bool=db.query_row(
                     "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",[&key.path],|r|r.get(0),
                 )?;
-                ensure!(!graph_file,"incompatible_index: selected native source absent");
+                if graph_file {
+                    return Err(SelectedIntegrity(
+                        "incompatible_index: selected native source absent".into(),
+                    ).into());
+                }
             }
             Ok(row)
         })

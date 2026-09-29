@@ -400,6 +400,38 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
         )
         .join("index.db");
     let db = Connection::open(path).unwrap();
+    let source_set_id = format!("source-set:v1:{}", store.root_id());
+    let unaffected = baleyg::native_evidence::DocumentKey {
+        source_set_id: source_set_id.clone(),
+        language: "java".into(),
+        path: "flow.java".into(),
+    };
+    let corrupted = baleyg::native_evidence::DocumentKey {
+        source_set_id,
+        language: "rust".into(),
+        path: "flow.rs".into(),
+    };
+
+    // Operational lock contention may fail before the selected query. It must
+    // never authorize recovery or close a pre-existing Store clone.
+    let operational_clone = store.clone();
+    db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let operational = store.native_source_at(pin, &corrupted).unwrap_err();
+    let raw_lock = matches!(
+        operational.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(info, _))
+            if matches!(
+                info.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    );
+    assert!(
+        operational.to_string().starts_with("storage_busy:") || raw_lock,
+        "{operational:#}"
+    );
+    db.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(operational_clone.status().unwrap().revision, pin);
+
     let mut bytes: Vec<u8> = db
         .query_row(
             "SELECT source_bytes FROM native_documents WHERE path='flow.rs'",
@@ -416,23 +448,14 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     drop(db);
     // Status is a bounded metadata/pin check; selected reads validate the exact stored BLOB.
     assert_eq!(store.status().unwrap().revision, pin);
-    let source_set_id = format!("source-set:v1:{}", store.root_id());
-    let unaffected = baleyg::native_evidence::DocumentKey {
-        source_set_id: source_set_id.clone(),
-        language: "java".into(),
-        path: "flow.java".into(),
-    };
-    let corrupted = baleyg::native_evidence::DocumentKey {
-        source_set_id,
-        language: "rust".into(),
-        path: "flow.rs".into(),
-    };
     assert!(store.native_source_at(pin, &unaffected).unwrap().is_some());
     let original_clone = store.clone();
     let selected = store.native_source_at(pin, &corrupted).unwrap_err();
     assert!(
         selected.to_string().contains("incompatible_index")
-            && selected.to_string().contains("source hash mismatch"),
+            && selected
+                .to_string()
+                .contains("native source hash mismatch"),
         "{selected:#}"
     );
     let closed = original_clone.source_at("flow.rs", Some(pin)).unwrap_err();
