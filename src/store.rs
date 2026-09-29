@@ -101,7 +101,7 @@ impl RecoveryBaseline {
 #[derive(Clone, Debug)]
 enum ExpectedPublication {
     Pin(IndexPin),
-    Recovery(RecoveryBaseline),
+    Recovery(Box<RecoveryBaseline>),
 }
 #[derive(Debug)]
 struct ExceptionalIndexFormat;
@@ -2295,7 +2295,7 @@ impl Store {
             capture,
             native,
             leader,
-            ExpectedPublication::Recovery(expected),
+            ExpectedPublication::Recovery(Box::new(expected)),
             cancel,
         )
     }
@@ -2443,6 +2443,7 @@ impl Store {
     }
     // Private transaction seam used by the in-module rollback tests. Normal callers
     // always pass a no-op; no SQL-fault control is exposed to API or CLI clients.
+    #[cfg(test)]
     fn publish_inner_checked(
         &self,
         bundle: (
@@ -2466,6 +2467,7 @@ impl Store {
     }
     // This test-only injection exercises the production admission path with a
     // small graph-JSON cap, without creating a 256MiB escaped source fixture.
+    #[cfg(test)]
     fn publish_inner_checked_with_source_cap(
         &self,
         bundle: (
@@ -5616,7 +5618,7 @@ mod sqlite_schema_race_tests {
             .publish_inner_checked_expected(
                 (&graph, &capture, &native),
                 &leader,
-                ExpectedPublication::Recovery(baseline),
+                ExpectedPublication::Recovery(Box::new(baseline)),
                 &cancel,
                 256 * 1024 * 1024 + 16 * 1024,
                 |stage, _tx| {
