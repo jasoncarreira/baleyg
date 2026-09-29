@@ -776,6 +776,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     };
     let (state, workspace) = fixture();
     fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
+    fs::write(workspace.path().join("good.js"), "function good() {}\n").unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
