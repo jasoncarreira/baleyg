@@ -90,7 +90,9 @@ fn truncated_stage_is_rejected_before_publication() {
         })
         .unwrap_err();
     assert!(
-        error.to_string().contains("incompatible_index:"),
+        error
+            .to_string()
+            .contains("exceptional index format recovery deferred"),
         "{error:#}"
     );
     let dir = index_dir(state.path());
@@ -132,21 +134,39 @@ fn crash_left_partial_stage_is_not_published_or_mistaken_for_the_index() {
 
 #[test]
 fn preexisting_corrupt_index_is_not_reinitialized() {
+    use std::os::unix::fs::MetadataExt;
+
     let (state, workspace) = fixture();
     drop(Store::open_for_tests(state.path(), workspace.path()).unwrap());
-    let index = index_dir(state.path()).join("index.db");
+    let dir = index_dir(state.path());
+    let index = dir.join("index.db");
     fs::OpenOptions::new()
         .write(true)
         .open(&index)
         .unwrap()
         .set_len(0)
         .unwrap();
-    let error = Store::open_for_tests(state.path(), workspace.path()).unwrap_err();
-    assert!(
-        error.to_string().contains("incompatible_index:"),
-        "{error:#}"
-    );
-    assert_eq!(fs::metadata(index).unwrap().len(), 0);
+    let before = fs::metadata(&index).unwrap();
+    assert_eq!(before.len(), 0);
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    for refusal in [
+        store.status().unwrap_err(),
+        store.index_baseline().unwrap_err(),
+        store
+            .leader()
+            .expect_err("exceptional format leader refusal"),
+    ] {
+        assert!(
+            refusal
+                .to_string()
+                .contains("exceptional index recovery deferred"),
+            "{refusal:#}"
+        );
+    }
+    let after = fs::metadata(&index).unwrap();
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.len(), 0);
+    assert!(staged_files(&dir).is_empty());
 }
 
 #[test]
