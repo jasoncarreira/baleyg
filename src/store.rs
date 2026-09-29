@@ -10,7 +10,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -21,7 +21,32 @@ pub struct Store {
     identity: Arc<topology::WorkspaceIdentity>,
     workspace_root: String,
     recovery_required: Arc<AtomicBool>,
+    recovery_disposition: Arc<AtomicU8>,
 }
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryDisposition {
+    Ready = 0,
+    Rebuild = 1,
+    RecreatePending = 2,
+}
+#[derive(Debug)]
+struct ExceptionalIndexFormat;
+impl std::fmt::Display for ExceptionalIndexFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("exceptional index format recovery deferred")
+    }
+}
+impl std::error::Error for ExceptionalIndexFormat {}
+#[derive(Debug)]
+struct SelectedIntegrity(String);
+impl std::fmt::Display for SelectedIntegrity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for SelectedIntegrity {}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublishStage {
     BeforeTransaction,
@@ -216,12 +241,16 @@ fn verify_index_file(path: &Path) -> Result<()> {
         path.display()
     );
     let mut header = [0u8; 20];
-    file.read_exact(&mut header)
-        .context("incompatible_index: invalid database header")?;
-    ensure!(
-        &header[..16] == b"SQLite format 3\0" && header[18] == 1 && header[19] == 1,
-        "incompatible_index: rollback header required"
-    );
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(ExceptionalIndexFormat.into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if &header[..16] != b"SQLite format 3\0" || header[18] != 1 || header[19] != 1 {
+        return Err(ExceptionalIndexFormat.into());
+    }
     let _ = file.as_raw_fd();
     Ok(())
 }
@@ -341,22 +370,56 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     storage_result(db.prepare("SELECT id,name,qualified_name,path,payload FROM classes"))?;
     storage_result(db.prepare("SELECT id,owner,target,payload FROM class_relations"))?;
     validate_cache_shape(&db)?;
-    let metadata: (i64, String) = db.query_row(
-        "SELECT schema_version,extractor_version FROM index_metadata WHERE singleton=1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    ensure!(
-        metadata.0 == i64::from(version)
-            && !metadata.1.is_empty()
-            && metadata.1.len() <= 256
-            && !metadata.1.chars().any(char::is_control),
-        "incompatible_index: schema and metadata mismatch"
-    );
-    let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
-    ensure!(count == 1, "incompatible_index: metadata cardinality");
     Ok(db)
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryClass {
+    Rebuild,
+    RecreatePending,
+    Hard,
+}
+fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
+    if error.downcast_ref::<ExceptionalIndexFormat>().is_some() {
+        return RecoveryClass::RecreatePending;
+    }
+    if error.downcast_ref::<SelectedIntegrity>().is_some()
+        || error.downcast_ref::<serde_json::Error>().is_some()
+        || error.downcast_ref::<std::string::FromUtf8Error>().is_some()
+    {
+        return RecoveryClass::Rebuild;
+    }
+    if let Some(sqlite) = error.downcast_ref::<rusqlite::Error>() {
+        return match sqlite {
+            rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::Utf8Error(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::QueryReturnedNoRows
+            | rusqlite::Error::QueryReturnedMoreThanOneRow => RecoveryClass::Rebuild,
+            rusqlite::Error::SqliteFailure(info, _)
+                if matches!(
+                    info.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                ) =>
+            {
+                RecoveryClass::RecreatePending
+            }
+            _ => RecoveryClass::Hard,
+        };
+    }
+    RecoveryClass::Hard
+}
+fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
+    if recovery_class(&error) != RecoveryClass::Hard
+        || error.downcast_ref::<rusqlite::Error>().is_some()
+        || error.downcast_ref::<std::io::Error>().is_some()
+    {
+        error
+    } else {
+        SelectedIntegrity(format!("{error:#}")).into()
+    }
+}
+
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     match result {
         Err(rusqlite::Error::SqliteFailure(info, _))
@@ -528,13 +591,11 @@ fn validate_graph(graph: &Graph, cancel: &CancelFlag) -> Result<IndexStats> {
 }
 
 fn class_metadata(db: &Connection) -> Result<(Vec<String>, bool)> {
-    let length: i64 = db
-        .query_row(
-            "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("incompatible_index: class catalog missing: {e}"))?;
+    let length: i64 = db.query_row(
+        "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
     ensure!(
         (0..=256 * 1024).contains(&length),
         "incompatible_index: class catalog byte budget exceeded"
@@ -933,8 +994,8 @@ fn write_native(
 }
 
 /// Bounded readiness check for a pair installed by the verified writer. This does not
-/// attest every stored BLOB after out-of-band SQLite mutation. Opening the Store checks
-/// all rows; pinned source reads verify the selected BLOB inside their read snapshot.
+/// attest every stored BLOB after out-of-band SQLite mutation. Ordinary Store open stays
+/// bounded; pinned source reads verify the selected BLOB inside their read snapshot.
 fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
     fn one_row(db: &Connection, sql: &str) -> Result<Option<(String, String)>> {
         let mut rows = db
@@ -1343,37 +1404,27 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn validate_reconcile_source_sizes(db: &Connection) -> Result<()> {
-    let options: String = db.query_row(
-        "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+fn validate_bounded_control(db: &Connection, root_id: &str) -> Result<()> {
+    let (stats, diagnostics): (String, String) = db.query_row(
+        "SELECT stats,diagnostics FROM index_metadata WHERE singleton=1",
         [],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let options: crate::indexer::ReconcileOptions =
-        serde_json::from_str(&options).context("incompatible_index: invalid reconcile options")?;
-    let mut statement = db.prepare(
-        "SELECT f.path,f.capture_stat,length(d.source_bytes)          FROM files f LEFT JOIN native_documents d ON d.path=f.path ORDER BY f.path",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (path, payload, source_bytes) = row?;
-        let stat: crate::capture::CaptureStat =
-            serde_json::from_str(&payload).context("incompatible_index: invalid capture stat")?;
-        let source_bytes = source_bytes
-            .with_context(|| format!("incompatible_index: native source absent for {path}"))?;
-        ensure!(
-            source_bytes >= 0
-                && stat.size == source_bytes as u64
-                && stat.size <= options.max_file_bytes,
-            "incompatible_index: captured source size/options mismatch"
-        );
-    }
+    let _: IndexStats = serde_json::from_str(&stats)?;
+    let _: Vec<Diagnostic> = serde_json::from_str(&diagnostics)?;
+    validate_paired_metadata(db, root_id)?;
+    validate_reconcile_inventory(db)?;
+    let warnings_bytes: Option<i64> = db
+        .query_row(
+            "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    ensure!(
+        warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)),
+        "incompatible_index: class catalog byte budget exceeded or missing"
+    );
     Ok(())
 }
 
@@ -1453,23 +1504,26 @@ impl Store {
             roots,
             identity: Arc::new(identity),
             recovery_required: Arc::new(AtomicBool::new(false)),
+            recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
         };
         if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.leader(&store.identity)?;
             store.initialize(&leader, before_publish)?;
         }
-        let mut db = store.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let (_, compatible) = store.recovery_baseline(&tx)?;
-        if compatible {
-            // A current-format index may still contain invalid derived rows. Recovery
-            // admission keeps the topology usable for a verified owner, while every
-            // evidence read remains closed until a complete rebuild succeeds.
-            let _ = store.read_control_status(&tx)?;
+        let admission = (|| -> Result<()> {
+            let mut db = store.cache()?;
+            let tx = storage_result(db.transaction())?;
+            let _ = store.recovery_baseline(&tx)?;
+            Ok(())
+        })();
+        match admission {
+            Ok(()) => Ok(store),
+            Err(error) if recovery_class(&error) == RecoveryClass::RecreatePending => {
+                store.mark_recovery(RecoveryDisposition::RecreatePending);
+                Ok(store)
+            }
+            Err(error) => Err(error),
         }
-        drop(tx);
-        drop(db);
-        Ok(store)
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
     pub fn open_for_tests(state: &Path, workspace: &Path) -> Result<Self> {
@@ -1594,6 +1648,7 @@ impl Store {
         &self,
         before_write: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<topology::LeaderGuard> {
+        self.ensure_not_recreate_pending()?;
         drop(self.cache()?);
         let leader = self.roots.leader(&self.identity)?;
         // The leader incarnation is already durable. From this point every clone
@@ -1634,6 +1689,7 @@ impl Store {
         self.connect_index(true)
     }
     fn connect_index(&self, writable: bool) -> Result<IndexConnection> {
+        self.ensure_not_recreate_pending()?;
         self.identity.verify()?;
         let use_guard = self.roots.index_use_existing(&self.identity)?;
         let db = open_index(&self.roots.index_db(&self.identity), writable)?;
@@ -1647,216 +1703,123 @@ impl Store {
     fn records(&self) -> topology::DurableRecords<'_> {
         topology::DurableRecords::new(&self.roots, &self.identity)
     }
-    fn validate_native_basis(&self, db: &Connection) -> Result<()> {
-        let valid_hash = |value: &str| {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        };
-        let (producer_id, version, executable_hash, kind, encoding): (
-            String,
-            String,
-            String,
-            String,
-            String,
-        ) = db.query_row(
-            "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )?;
+    fn disposition(&self) -> RecoveryDisposition {
+        match self.recovery_disposition.load(Ordering::Acquire) {
+            0 => RecoveryDisposition::Ready,
+            1 => RecoveryDisposition::Rebuild,
+            _ => RecoveryDisposition::RecreatePending,
+        }
+    }
+    fn mark_recovery(&self, disposition: RecoveryDisposition) {
+        self.recovery_disposition
+            .fetch_max(disposition as u8, Ordering::AcqRel);
+        self.recovery_required.store(true, Ordering::Release);
+    }
+    fn ensure_not_recreate_pending(&self) -> Result<()> {
         ensure!(
-            producer_id == "baleyg.native.syntax"
-                && version == "native-v2"
-                && kind == "native"
-                && encoding == "utf8"
-                && valid_hash(&executable_hash),
-            "incompatible_index: invalid native producer"
-        );
-        let expected_languages = ["java", "rust", "python", "javascript"];
-        let expected_ordinals = expected_languages
-            .iter()
-            .enumerate()
-            .map(|(ordinal, language)| (ordinal as i64, (*language).to_owned()))
-            .collect::<Vec<_>>();
-        let producer_languages = db
-            .prepare(
-                "SELECT ordinal,language FROM native_producer_languages WHERE producer_id=?1 ORDER BY ordinal",
-            )?
-            .query_map([&producer_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
-        ensure!(
-            producer_languages == expected_ordinals,
-            "incompatible_index: invalid native producer languages"
-        );
-
-        let (source_set_id, root_id): (String, String) =
-            db.query_row("SELECT id,root_id FROM native_source_sets", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?;
-        let source_languages = db
-            .prepare(
-                "SELECT ordinal,language FROM native_source_set_languages WHERE source_set_id=?1 ORDER BY ordinal",
-            )?
-            .query_map([&source_set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
-        let dependencies = db
-            .prepare(
-                "SELECT ordinal,dependency_id FROM native_source_set_dependencies WHERE source_set_id=?1 ORDER BY ordinal",
-            )?
-            .query_map([&source_set_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
-            source_set_id == format!("source-set:v1:{}", self.root_id())
-                && root_id == self.root_id()
-                && source_languages == expected_ordinals
-                && dependencies.is_empty(),
-            "incompatible_index: invalid native source set"
-        );
-
-        let (revision_id, revision_source_set, toolchain_hash, config_hash, dependency_hash):
-            (String, String, String, String, String) = db.query_row(
-            "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )?;
-        ensure!(
-            revision_source_set == source_set_id
-                && revision_id
-                    .strip_prefix("revision:v1:")
-                    .is_some_and(valid_hash)
-                && valid_hash(&toolchain_hash)
-                && valid_hash(&config_hash)
-                && valid_hash(&dependency_hash),
-            "incompatible_index: invalid native revision"
+            self.disposition() != RecoveryDisposition::RecreatePending,
+            "recovery_required: exceptional index recovery deferred"
         );
         Ok(())
     }
-
-    fn validate_recovery_snapshot(&self, db: &Connection) -> Result<()> {
-        validate_paired_rows(db)?;
-        validate_reconcile_source_sizes(db)?;
-        self.validate_native_basis(db)?;
-        let (stats_json, diagnostics_json): (String, String) = db.query_row(
-            "SELECT stats,diagnostics FROM index_metadata WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let persisted_stats: IndexStats = serde_json::from_str(&stats_json)
-            .context("incompatible_index: invalid persisted graph stats")?;
-        let diagnostics: Vec<Diagnostic> = serde_json::from_str(&diagnostics_json)
-            .context("incompatible_index: invalid persisted diagnostics")?;
-        let graph = Graph {
-            schema_version: SCHEMA_VERSION,
-            files: rows(db, "SELECT payload FROM files ORDER BY path")?,
-            nodes: rows(db, "SELECT payload FROM nodes ORDER BY id")?,
-            calls: rows(db, "SELECT payload FROM calls ORDER BY id")?,
-            regions: rows(db, "SELECT payload FROM regions ORDER BY id")?,
-            diagnostics,
-            stats: persisted_stats.clone(),
+    fn classify_admission_error(&self, error: anyhow::Error, typed: bool) -> Result<bool> {
+        let error = if typed {
+            selected_integrity(error)
+        } else {
+            error
         };
-        let mut derived_stats =
-            validate_graph(&graph, &Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .context("incompatible_index: invalid typed graph snapshot")?;
-
-        let paths = graph
-            .files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect::<Vec<_>>();
-        for path in &paths {
-            self.attest_selected_document(db, path)?;
-        }
-        let mut expected_diagnostics = Vec::new();
-        let mut parse_error_files = 0;
-        let mut document_rows = db.prepare(
-            "SELECT source_set_id,language,path,revision_id FROM native_documents ORDER BY path,language",
-        )?;
-        let documents = document_rows.query_map([], |row| {
-            Ok((
-                crate::native_evidence::DocumentKey {
-                    source_set_id: row.get(0)?,
-                    language: row.get(1)?,
-                    path: row.get(2)?,
-                },
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for document in documents {
-            let (key, revision_id) = document?;
-            let coverage = Self::read_native_coverage(db, &key)?
-                .context("incompatible_index: native coverage missing")?;
-            ensure!(
-                coverage.revision_id == revision_id,
-                "incompatible_index: native coverage revision mismatch"
-            );
-            if coverage.state != "complete" {
-                let recovered = coverage
-                    .diagnostic
-                    .as_deref()
-                    .is_some_and(|message| message.contains("parser recovered"));
-                parse_error_files += usize::from(recovered);
-                expected_diagnostics.push(Diagnostic {
-                    path: Some(coverage.document_path),
-                    code: if recovered {
-                        "parse-error"
-                    } else {
-                        "native-coverage-partial"
-                    }
-                    .into(),
-                    message: coverage
-                        .diagnostic
-                        .unwrap_or_else(|| "Native extraction is incomplete".into()),
-                });
+        match recovery_class(&error) {
+            RecoveryClass::Rebuild => {
+                self.mark_recovery(RecoveryDisposition::Rebuild);
+                Ok(false)
             }
+            RecoveryClass::RecreatePending => {
+                self.mark_recovery(RecoveryDisposition::RecreatePending);
+                Ok(false)
+            }
+            RecoveryClass::Hard => Err(error),
         }
-        derived_stats.parse_error_files = parse_error_files;
-        ensure!(
-            derived_stats == persisted_stats && graph.diagnostics == expected_diagnostics,
-            "incompatible_index: persisted graph stats/diagnostics mismatch"
-        );
-
-        let expected_catalog = crate::classes::Catalog::build(
-            &graph.files,
-            &graph.nodes,
-            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
-        .context("incompatible_index: invalid class projection")?;
-        let mut actual_classes: Vec<crate::classes::ClassDefinition> =
-            rows(db, "SELECT payload FROM classes ORDER BY id")?;
-        let mut actual_relations: Vec<crate::classes::ClassRelation> =
-            rows(db, "SELECT payload FROM class_relations ORDER BY id")?;
-        let mut expected_classes = expected_catalog.classes;
-        let mut expected_relations = expected_catalog.relations;
-        actual_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
-        expected_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
-        actual_relations.sort_by(|a, b| a.id.cmp(&b.id));
-        expected_relations.sort_by(|a, b| a.id.cmp(&b.id));
-        let (warnings_json, truncated): (String, bool) = db.query_row(
-            "SELECT warnings,truncated FROM class_catalog WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+    }
+    fn report_control_failure(&self, error: anyhow::Error) -> anyhow::Error {
+        match recovery_class(&error) {
+            RecoveryClass::Rebuild => self.mark_recovery(RecoveryDisposition::Rebuild),
+            RecoveryClass::RecreatePending => {
+                self.mark_recovery(RecoveryDisposition::RecreatePending)
+            }
+            RecoveryClass::Hard => {}
+        }
+        error
+    }
+    fn report_selected_failure(&self, error: anyhow::Error) -> anyhow::Error {
+        match recovery_class(&error) {
+            RecoveryClass::Rebuild => {
+                self.mark_recovery(RecoveryDisposition::Rebuild);
+                anyhow::anyhow!("incompatible_index: selected evidence decode failed: {error:#}")
+            }
+            RecoveryClass::RecreatePending => {
+                self.mark_recovery(RecoveryDisposition::RecreatePending);
+                anyhow::anyhow!("incompatible_index: exceptional index recovery deferred")
+            }
+            RecoveryClass::Hard => error,
+        }
+    }
+    fn validate_recovery_decode_rows(&self, db: &Connection) -> Result<()> {
+        fn json_rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<()> {
+            let mut statement = db.prepare(sql)?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for payload in rows {
+                let _: T = serde_json::from_str(&payload?)?;
+            }
+            Ok(())
+        }
+        json_rows::<SourceFile>(db, "SELECT payload FROM files ORDER BY path")?;
+        json_rows::<Symbol>(db, "SELECT payload FROM nodes ORDER BY id")?;
+        json_rows::<CallSite>(db, "SELECT payload FROM calls ORDER BY id")?;
+        json_rows::<ControlRegion>(db, "SELECT payload FROM regions ORDER BY id")?;
+        json_rows::<crate::classes::ClassDefinition>(
+            db,
+            "SELECT payload FROM classes ORDER BY id",
         )?;
-        let warnings: Vec<String> = serde_json::from_str(&warnings_json)
-            .context("incompatible_index: invalid class catalog warnings")?;
-        ensure!(
-            actual_classes == expected_classes
-                && actual_relations == expected_relations
-                && warnings == expected_catalog.warnings
-                && truncated == expected_catalog.truncated,
-            "incompatible_index: typed class projection mismatch"
-        );
+        json_rows::<crate::classes::ClassRelation>(
+            db,
+            "SELECT payload FROM class_relations ORDER BY id",
+        )?;
+        let (stats, diagnostics, warnings): (String, String, String) = db.query_row(
+            "SELECT m.stats,m.diagnostics,c.warnings FROM index_metadata m JOIN class_catalog c ON c.singleton=m.singleton WHERE m.singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let _: IndexStats = serde_json::from_str(&stats)?;
+        let _: Vec<Diagnostic> = serde_json::from_str(&diagnostics)?;
+        let _: Vec<String> = serde_json::from_str(&warnings)?;
 
+        macro_rules! scan {
+            ($sql:expr, $( $index:literal => $kind:ty ),+ $(,)?) => {{
+                let mut statement = db.prepare($sql)?;
+                let rows = statement.query_map([], |row| {
+                    $(let _: $kind = row.get($index)?;)+
+                    Ok(())
+                })?;
+                for row in rows { row?; }
+            }};
+        }
+        scan!("SELECT ordinal FROM native_producer_languages", 0 => i64);
+        scan!("SELECT ordinal FROM native_source_set_languages", 0 => i64);
+        scan!("SELECT ordinal FROM native_source_set_dependencies", 0 => i64);
+        scan!("SELECT byte_length FROM native_documents", 0 => i64);
+        scan!("SELECT requested,selected,diagnostic FROM native_coverage", 0 => bool, 1 => bool, 2 => Option<String>);
+        scan!("SELECT ordinal FROM native_coverage_roles", 0 => i64);
+        scan!("SELECT key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_declarations",
+            0 => bool, 1 => Option<i64>, 2 => Option<bool>, 3 => i64, 4 => i64, 5 => i64, 6 => Option<i64>, 7 => Option<i64>);
+        scan!("SELECT ordinal,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_declaration_ancestors",
+            0 => i64, 1 => i64, 2 => bool, 3 => Option<i64>, 4 => Option<bool>);
+        scan!("SELECT ancestor_ordinal,ordinal FROM native_signature_parameter_types", 0 => i64, 1 => i64);
+        scan!("SELECT ordinal FROM native_header_items", 0 => i64);
+        scan!("SELECT ordinal,variadic FROM native_parameters", 0 => i64, 1 => bool);
+        scan!("SELECT ordinal,start_byte,end_byte,callee_start,callee_end FROM native_calls",
+            0 => i64, 1 => i64, 2 => i64, 3 => Option<i64>, 4 => Option<i64>);
+        scan!("SELECT ordinal FROM native_call_regions", 0 => i64);
+        scan!("SELECT ordinal,start_byte,end_byte FROM native_control_regions", 0 => i64, 1 => i64, 2 => i64);
         Ok(())
     }
 
@@ -1887,27 +1850,14 @@ impl Store {
             "incompatible_index: invalid revision"
         );
         let compatible = if schema == DATABASE_SCHEMA_VERSION && row.1 == EXTRACTOR_VERSION {
-            match self.validate_recovery_snapshot(db) {
+            match validate_bounded_control(db, &self.identity.record_id) {
                 Ok(()) => true,
-                Err(error) => match error.downcast_ref::<rusqlite::Error>() {
-                    None => false,
-                    Some(
-                        rusqlite::Error::FromSqlConversionFailure(..)
-                        | rusqlite::Error::IntegralValueOutOfRange(..)
-                        | rusqlite::Error::Utf8Error(..)
-                        | rusqlite::Error::InvalidColumnType(..)
-                        | rusqlite::Error::QueryReturnedNoRows
-                        | rusqlite::Error::QueryReturnedMoreThanOneRow,
-                    ) => false,
-                    Some(_) => return Err(error),
-                },
+                Err(error) => self.classify_admission_error(error, true)?,
             }
         } else {
+            self.mark_recovery(RecoveryDisposition::Rebuild);
             false
         };
-        if !compatible {
-            self.recovery_required.store(true, Ordering::Release);
-        }
         Ok((
             IndexPin {
                 index_generation: generation,
@@ -1966,14 +1916,14 @@ impl Store {
         })
     }
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
+        ensure!(
+            !self.recovery_required.load(Ordering::Acquire),
+            "index_not_ready: reconciliation required"
+        );
         let status = self.read_control_status(db)?;
         ensure!(
             status.evidence_format.is_some(),
             "index_not_ready: reindex required"
-        );
-        ensure!(
-            !self.recovery_required.load(Ordering::Acquire),
-            "index_not_ready: reconciliation required"
         );
         validate_reconcile_inventory(db)?;
         // Every public schema-7 derived read needs the same bounded catalog
@@ -1994,6 +1944,7 @@ impl Store {
     }
     /// Internal control baseline, never returned by public status or evidence reads.
     pub fn index_baseline(&self) -> Result<IndexPin> {
+        self.ensure_not_recreate_pending()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
         Ok(self.recovery_baseline(&tx)?.0)
@@ -2013,10 +1964,12 @@ impl Store {
         &self,
         before_snapshot: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<IndexStatus> {
+        self.ensure_not_recreate_pending()?;
         let mut db = self.cache()?;
         before_snapshot(&db)?;
         let tx = storage_result(db.transaction())?;
         self.read_status(&tx)
+            .map_err(|error| self.report_control_failure(error))
     }
     pub fn publish(
         &self,
@@ -2218,6 +2171,7 @@ impl Store {
         max_graph_json_bytes: usize,
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
+        self.ensure_not_recreate_pending()?;
         let (graph, capture, native) = bundle;
         Self::enforce_selected_source_admission(graph, max_graph_json_bytes)?;
         ensure!(
@@ -2261,8 +2215,20 @@ impl Store {
             "revision conflict: expected {expected_revision:?}, found {old:?}"
         );
         let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        let rebaseline = schema != DATABASE_SCHEMA_VERSION || !compatible;
-        let prior_scan = compatible
+        let decoded = if compatible {
+            match self.validate_recovery_decode_rows(&tx) {
+                Ok(()) => true,
+                Err(error) => self.classify_admission_error(error, true)?,
+            }
+        } else {
+            false
+        };
+        self.ensure_not_recreate_pending()?;
+        let rebaseline = schema != DATABASE_SCHEMA_VERSION
+            || !compatible
+            || !decoded
+            || self.disposition() == RecoveryDisposition::Rebuild;
+        let prior_scan = (!rebaseline)
             .then(|| compare_capture_snapshot(&tx, capture))
             .transpose()?;
         if let Some(comparison) = prior_scan {
@@ -2415,6 +2381,8 @@ impl Store {
         leader.verify()?;
         self.identity.verify()?;
         storage_result(tx.commit())?;
+        self.recovery_disposition
+            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
         self.recovery_required.store(false, Ordering::Release);
         Ok(revision)
     }
@@ -2430,7 +2398,7 @@ impl Store {
             self.read_status(&tx)?.revision == pin,
             "revision conflict: stale native pin"
         );
-        read(&tx)
+        read(&tx).map_err(|error| self.report_selected_failure(error))
     }
 
     /// Reparse exactly one selected, paired source in this SQLite snapshot.
@@ -2453,7 +2421,7 @@ impl Store {
             source_set_id == format!("source-set:v1:{}", self.root_id()),
             "incompatible_index: selected source set mismatch"
         );
-        let file = Self::selected_source_row(db, path)?
+        let file = Self::selected_source_row_bounded(db, path, 256 * 1024 * 1024)?
             .context("incompatible_index: selected graph source absent")?;
         let mut producer:Producer=db.query_row(
             "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",[],
@@ -2513,16 +2481,18 @@ impl Store {
         language: &str,
         revision_id: &str,
     ) -> Result<(i64, i64)> {
-        db.query_row(
+        Ok(db.query_row(
             SELECTED_ANCILLARY_BYTE_SQL,
             params![path, source_set_id, language, revision_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|e| {
-            anyhow::anyhow!("incompatible_index: selected evidence byte budget exceeded: {e}")
-        })
+        )?)
     }
     fn attest_selected_document(&self, db: &Connection, path: &str) -> Result<()> {
+        self.attest_selected_document_inner(db, path)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))
+    }
+    fn attest_selected_document_inner(&self, db: &Connection, path: &str) -> Result<()> {
         // SQLite lengths and bounded row counts precede BLOB/JSON allocation and
         // selected tree-sitter extraction. All predicates stay on this source set,
         // revision, language and path; no workspace-wide payload scan.
@@ -2641,11 +2611,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.caller AS B
 UNION ALL
 SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BLOB)),0)+COALESCE(length(CAST(g.path AS BLOB)),0)+COALESCE(length(CAST(g.payload AS BLOB)),0) AS row_bytes FROM regions g WHERE g.path=?1
 )"#;
-        let (graph_row, graph_total): (i64, i64) = db
-            .query_row(graph_sql, [path], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(|e| {
-                anyhow::anyhow!("incompatible_index: selected graph row byte budget exceeded: {e}")
-            })?;
+        let (graph_row, graph_total): (i64, i64) =
+            db.query_row(graph_sql, [path], |r| Ok((r.get(0)?, r.get(1)?)))?;
         // JSON may escape one source byte into six; the absolute row ceiling
         // is an explicit fail-closed selected API limit if capture exceeds it.
         let graph_row_limit = native_bytes
@@ -2663,7 +2630,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 && graph_total <= graph_total_limit,
             "incompatible_index: selected graph row byte budget exceeded"
         );
-        let file = Self::selected_source_row(db, path)?
+        let file = Self::selected_source_row_bounded(db, path, 256 * 1024 * 1024)?
             .context("incompatible_index: selected graph/native source missing")?;
         let witness = self.selected_native_witness(db, path)?;
         let mut stored:Vec<(String,Option<String>)>=db.prepare(
@@ -2826,18 +2793,14 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             &witness,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "incompatible_index: selected graph evidence differs from source: {e:#}"
-            )
-        })
     }
 
     /// Class DTOs are selected presentation projections; compare only this
     /// document's rows with a bounded in-memory class build from attested bytes.
     fn attest_selected_class(&self, db: &Connection, path: &str) -> Result<()> {
         self.attest_selected_document(db, path)?;
-        let file = Self::selected_source_row(db, path)?
+        let file = self
+            .selected_source_row(db, path)?
             .context("incompatible_index: selected class source missing")?;
         if !matches!(file.language.as_str(), "java" | "python") {
             return Ok(());
@@ -3165,7 +3128,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 })()),
             ).optional()?;
             let row=row.transpose()?.map(|(revision_id,content_hash,byte_length,bytes)|->Result<_>{
-                let graph=Self::selected_source_row(db,&key.path)?
+                let graph=self.selected_source_row(db,&key.path)?
                     .context("incompatible_index: paired graph source missing")?;
                 ensure!(graph.path==key.path && graph.language==key.language
                     && graph.hash==content_hash && graph.text.as_bytes()==bytes,
@@ -3661,8 +3624,10 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let node: Option<Symbol> = one(&tx, "SELECT payload FROM nodes WHERE id=?1", id)?;
         Ok(node.map(|node| (revision, node)))
     }
-    fn selected_source_row(db: &Connection, path: &str) -> Result<Option<SourceFile>> {
+    fn selected_source_row(&self, db: &Connection, path: &str) -> Result<Option<SourceFile>> {
         Self::selected_source_row_bounded(db, path, 256 * 1024 * 1024)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))
     }
     fn selected_source_row_bounded(
         db: &Connection,
@@ -3740,7 +3705,9 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             expected_revision.is_none_or(|pin| pin == revision),
             "revision conflict"
         );
-        Ok(Self::selected_source_row(&tx, path)?.map(|file| (revision, file)))
+        Ok(self
+            .selected_source_row(&tx, path)?
+            .map(|file| (revision, file)))
     }
     /// Catalog reads pin revision and rows to one SQLite read transaction.
     /// Enrich only the visible tree page from one cached index snapshot.
@@ -3926,7 +3893,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         }
         for source in sources {
             ensure!(
-                Self::selected_source_row(&tx, &source.path)?.as_ref() == Some(source),
+                self.selected_source_row(&tx, &source.path)?.as_ref() == Some(source),
                 "incompatible_index: cached packet selected source changed"
             );
         }
@@ -4981,6 +4948,63 @@ mod sqlite_schema_race_tests {
             )
             .unwrap();
         (state, work, store, graph, capture, native, pin, cancel)
+    }
+
+    #[test]
+    fn recovery_classifier_separates_corruption_from_operational_storage_errors() {
+        let classify = |extended_code| {
+            let error: anyhow::Error =
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(extended_code), None)
+                    .into();
+            recovery_class(&error)
+        };
+        assert_eq!(
+            classify(rusqlite::ffi::SQLITE_CORRUPT),
+            RecoveryClass::RecreatePending
+        );
+        assert_eq!(
+            classify(rusqlite::ffi::SQLITE_NOTADB),
+            RecoveryClass::RecreatePending
+        );
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_READONLY,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_IOERR,
+        ] {
+            assert_eq!(classify(code), RecoveryClass::Hard);
+        }
+    }
+
+    #[test]
+    fn selected_busy_does_not_latch_but_integrity_failure_closes_clones() {
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let clone = store.clone();
+        let busy: anyhow::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        )
+        .into();
+        let returned = store.report_selected_failure(busy);
+        assert_eq!(
+            returned
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(|error| match error {
+                    rusqlite::Error::SqliteFailure(info, _) => Some(info.code),
+                    _ => None,
+                }),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(clone.status().unwrap().revision, pin);
+
+        let integrity: anyhow::Error = SelectedIntegrity("selected mismatch".into()).into();
+        let returned = store.report_selected_failure(integrity);
+        assert!(returned.to_string().contains("incompatible_index"));
+        assert!(store.status().is_err());
+        assert!(clone.status().is_err());
     }
 
     #[cfg(unix)]
