@@ -2146,6 +2146,10 @@ impl Store {
             index_revision: revision as u64,
         };
         let marker_matches = metadata_schema == i64::from(schema);
+        let recognized_legacy = marker_matches
+            && ((schema == LEGACY_SCHEMA_VERSION && extractor == LEGACY_EXTRACTOR_VERSION)
+                || (schema == GRAPH_SCHEMA_VERSION && extractor == GRAPH_EXTRACTOR_VERSION)
+                || (schema == PREVIOUS_SCHEMA_VERSION && extractor == EXTRACTOR_VERSION));
         let compatible = if marker_matches
             && schema == DATABASE_SCHEMA_VERSION
             && extractor == EXTRACTOR_VERSION
@@ -2154,6 +2158,8 @@ impl Store {
                 Ok(()) => true,
                 Err(error) => self.classify_admission_error(error, true)?,
             }
+        } else if recognized_legacy {
+            false
         } else {
             self.mark_recovery(RecoveryDisposition::Rebuild);
             false

@@ -1,7 +1,7 @@
 mod common;
 use baleyg::{model::*, store::Store};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, atomic::AtomicBool},
 };
 use tempfile::TempDir;
@@ -501,6 +501,18 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     let orphaned = store.view("view").unwrap().unwrap().orphaned_ids;
     assert_eq!(orphaned.len(), 3);
     assert!(orphaned.contains(&a) && orphaned.contains(&b) && orphaned.contains(&"missing".into()));
+    let saved = store.views().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].view, view);
+    assert_eq!(saved[0].orphaned_ids.len(), 3);
+    assert_eq!(
+        saved[0]
+            .orphaned_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([a.clone(), b.clone(), "missing".into()])
+    );
     let fresh = bundle(&store, &work);
     publish_bundle(&store, &fresh, store.index_baseline().unwrap());
     assert!(!store.annotations().unwrap()[0].orphaned);
@@ -542,6 +554,80 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
             })
             .is_err()
     );
+}
+
+#[test]
+fn legacy_admission_distinguishes_invalid_marker_from_live_decode() {
+    let seed_records = |store: &Store| {
+        store
+            .put_annotation(&Annotation {
+                id: "legacy-note".into(),
+                node_id: "a".into(),
+                body: "durable annotation".into(),
+            })
+            .unwrap();
+        store
+            .put_view(&SavedView {
+                id: "legacy-view".into(),
+                title: "Durable view".into(),
+                query: query(),
+                pins: BTreeMap::from([("missing".into(), Position { x: 1., y: 2. })]),
+                hidden: vec!["b".into()],
+            })
+            .unwrap();
+    };
+
+    let (marker_state, marker_work, marker_store) = fixture();
+    seed_records(&marker_store);
+    let marker_path = index_db(marker_state.path());
+    drop(marker_store);
+    let marker_db = rusqlite::Connection::open(&marker_path).unwrap();
+    marker_db
+        .execute(
+            "UPDATE index_metadata SET extractor_version='wrong-old-extractor'",
+            [],
+        )
+        .unwrap();
+    drop(marker_db);
+    let marker_store = Store::open_for_tests(marker_state.path(), marker_work.path()).unwrap();
+    for error in [
+        marker_store.annotations().unwrap_err(),
+        marker_store.view("legacy-view").unwrap_err(),
+        marker_store.views().unwrap_err(),
+    ] {
+        assert_eq!(
+            error.to_string(),
+            "index_not_ready: reconciliation required"
+        );
+    }
+
+    let (stats_state, stats_work, stats_store) = fixture();
+    seed_records(&stats_store);
+    let stats_path = index_db(stats_state.path());
+    drop(stats_store);
+    let stats_db = rusqlite::Connection::open(&stats_path).unwrap();
+    stats_db
+        .execute("UPDATE index_metadata SET stats='not-json'", [])
+        .unwrap();
+    drop(stats_db);
+    let stats_store = Store::open_for_tests(stats_state.path(), stats_work.path()).unwrap();
+    let stats_clone = stats_store.clone();
+    let first = stats_store.annotations().unwrap_err();
+    assert!(
+        first
+            .to_string()
+            .contains("incompatible_index: live index decode failed"),
+        "{first:#}"
+    );
+    for closed in [
+        stats_clone.view("legacy-view").unwrap_err(),
+        stats_clone.views().unwrap_err(),
+    ] {
+        assert_eq!(
+            closed.to_string(),
+            "index_not_ready: reconciliation required"
+        );
+    }
 }
 
 #[test]
