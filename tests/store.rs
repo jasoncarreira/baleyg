@@ -281,7 +281,6 @@ fn publication_is_atomic_and_reopens() {
             .contains("cancelled")
     );
     assert_closed();
-    drop(assert_closed);
     drop(store);
     let store = Store::open_for_tests(state.path(), work.path()).unwrap();
     assert_eq!(store.graph().unwrap(), old);
@@ -628,7 +627,7 @@ fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
         for error in [store.status().unwrap_err(), store.graph().unwrap_err()] {
             assert!(error.to_string().contains("index_not_ready"), "{error:#}");
         }
-        let reopened = crate::common::open_store(state.path(), work.path()).unwrap();
+        let reopened = Store::open_for_tests(state.path(), work.path()).unwrap();
         assert_eq!(reopened.status().unwrap().revision, first);
         assert_eq!(reopened.graph().unwrap(), baseline);
         for document in &captured.1.revision.documents {
@@ -740,8 +739,9 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let path = index_db(state.path());
+    let writer_path = path.clone();
     let writer = std::thread::spawn(move || {
-        let db = rusqlite::Connection::open(path).unwrap();
+        let db = rusqlite::Connection::open(writer_path).unwrap();
         db.execute_batch(
             "BEGIN IMMEDIATE; UPDATE index_metadata SET index_revision=2 WHERE singleton=1",
         )
@@ -752,28 +752,70 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         drop(leader);
     });
     ready_rx.recv().unwrap();
-    assert!(
-        index_db(state.path())
-            .with_file_name("index.db-journal")
-            .exists()
-    );
-    match store.status() {
-        Ok(status) => assert_eq!(status.revision, previous),
-        Err(e) => assert!(e.to_string().contains("storage_busy"), "{e:#}"),
-    }
-    match store.source_at("a.js", Some(previous)) {
-        Ok(Some((pin, source))) => {
-            assert_eq!(pin, previous);
-            assert_eq!(source.text, captured.0.files[0].text);
-        }
-        Err(e) => assert!(e.to_string().contains("storage_busy"), "{e:#}"),
-        Ok(other) => panic!("unexpected pinned source: {other:?}"),
-    }
+
+    // Capture every active-journal outcome before releasing the writer, so no
+    // assertion can strand the writer thread or its leader guard.
+    let journal = path.with_file_name("index.db-journal");
+    let active_journal_exists = journal.exists();
+    let active_status = store.status();
+    let active_source = store.source_at("a.js", Some(previous));
+    let raw_pair = (|| -> rusqlite::Result<(String, i64, String, String, Vec<u8>, String)> {
+        let db = rusqlite::Connection::open(&path)?;
+        db.busy_timeout(std::time::Duration::ZERO)?;
+        db.query_row(
+            "SELECT m.index_generation,m.index_revision,f.payload,f.hash,d.source_bytes,d.content_hash FROM index_metadata m JOIN files f ON f.path='a.js' JOIN native_documents d ON d.path=f.path WHERE m.singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+    })();
     done_tx.send(()).unwrap();
     writer.join().unwrap();
-    let journal = index_db(state.path()).with_file_name("index.db-journal");
+
+    assert!(active_journal_exists);
+    for error in [active_status.unwrap_err(), active_source.unwrap_err()] {
+        let text = error.to_string();
+        assert!(
+            text.contains("index_not_ready") || text.contains("storage_busy"),
+            "{error:#}"
+        );
+    }
+    match raw_pair {
+        Ok((generation, revision, payload, file_hash, native_bytes, native_hash)) => {
+            assert_eq!(generation, previous.index_generation.to_string());
+            assert_eq!(revision, previous.index_revision as i64);
+            let source: SourceFile = serde_json::from_str(&payload).unwrap();
+            assert_eq!(source.text, captured.0.files[0].text);
+            assert_eq!(source.hash, captured.0.files[0].hash);
+            assert_eq!(file_hash, captured.0.files[0].hash);
+            assert_eq!(native_hash, captured.0.files[0].hash);
+            assert_eq!(native_bytes, source.text.as_bytes().to_vec());
+        }
+        Err(error) => assert!(
+            matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            ),
+            "{error}"
+        ),
+    }
+    assert_eq!(store.index_baseline().unwrap(), previous);
+    for error in [
+        store.status().unwrap_err(),
+        store.source_at("a.js", Some(previous)).unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+    }
+
     std::fs::write(&journal, [0u8; 512]).unwrap();
-    assert_eq!(store.status().unwrap().revision, previous);
     assert!(
         store
             .leader()
