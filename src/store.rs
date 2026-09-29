@@ -623,6 +623,7 @@ fn class_metadata(db: &Connection) -> Result<(Vec<String>, bool)> {
 /// clipped in SQLite, without materializing their full strings in the API.
 /// IDs, class metadata, and source ranges remain exact; only member arrays shrink.
 fn presentation_class(
+    store: &Store,
     db: &Connection,
     id: &str,
 ) -> Result<Option<(crate::classes::ClassDefinition, usize, bool)>> {
@@ -633,20 +634,44 @@ fn presentation_class(
             [id],
             |r| r.get(0),
         )
-        .optional()?;
+        .optional()
+        .map_err(|error| store.report_selected_failure(error.into()))?;
     let Some(size) = size else {
         return Ok(None);
     };
+    let valid: bool = db
+        .query_row("SELECT json_valid(payload) FROM classes WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .map_err(|error| store.report_selected_failure(error.into()))?;
+    if !valid {
+        return Err(store.report_selected_failure(
+            SelectedIntegrity("incompatible_index: selected class JSON invalid".into()).into(),
+        ));
+    }
     if size <= CLASS_BYTES as i64 {
-        let payload: String =
-            db.query_row("SELECT payload FROM classes WHERE id=?1", [id], |r| {
-                r.get(0)
-            })?;
-        return Ok(Some((
-            serde_json::from_str(&payload)?,
-            payload.len(),
-            false,
-        )));
+        let payload: String = db
+            .query_row("SELECT payload FROM classes WHERE id=?1", [id], |r| r.get(0))
+            .map_err(|error| store.report_selected_failure(error.into()))?;
+        let class = serde_json::from_str(&payload)
+            .map_err(|error| store.report_selected_failure(error.into()))?;
+        return Ok(Some((class, payload.len(), false)));
+    }
+    let clip_shape: bool = db
+        .query_row(
+            "SELECT json_type(payload,'$.fields')='array'
+                AND json_type(payload,'$.methods')='array'
+                AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.fields') WHERE type!='object')
+                AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.methods') WHERE type!='object')
+             FROM classes WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|error| store.report_selected_failure(error.into()))?;
+    if !clip_shape {
+        return Err(store.report_selected_failure(
+            SelectedIntegrity("incompatible_index: selected class member JSON invalid".into()).into(),
+        ));
     }
     for count in [32, 16, 8, 4, 2, 1, 0] {
         let payload: Option<String> = db.query_row("WITH clipped AS (
@@ -655,15 +680,18 @@ fn presentation_class(
                 '$.methods',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.methods') WHERE key < ?2),
                 '$.truncated',json('true')) AS payload FROM classes WHERE id=?1)
             SELECT CASE WHEN length(CAST(payload AS BLOB)) <= ?3 THEN payload ELSE NULL END FROM clipped",
-            params![id, count, CLASS_BYTES as i64], |r| r.get(0))?;
+            params![id, count, CLASS_BYTES as i64], |r| r.get(0))
+            .map_err(|error| store.report_selected_failure(error.into()))?;
         if let Some(payload) = payload {
-            return Ok(Some((serde_json::from_str(&payload)?, payload.len(), true)));
+            let class = serde_json::from_str(&payload)
+                .map_err(|error| store.report_selected_failure(error.into()))?;
+            return Ok(Some((class, payload.len(), true)));
         }
     }
     // Pathological non-member metadata cannot fit without changing identity.
     Ok(None)
 }
-fn resolve_class_id(db: &Connection, id: &str) -> Result<String> {
+fn resolve_class_id(store: &Store, db: &Connection, id: &str) -> Result<String> {
     use crate::class_diagram::InvalidRequest;
     let mut current = id.to_owned();
     let mut seen = BTreeSet::new();
@@ -679,9 +707,11 @@ fn resolve_class_id(db: &Connection, id: &str) -> Result<String> {
         )? {
             return Ok(current);
         }
-        let symbol = one::<Symbol>(db, "SELECT payload FROM nodes WHERE id=?1", &current)?.ok_or(
-            InvalidRequest("Choose an indexed Java or Python class or method."),
-        )?;
+        let symbol = one::<Symbol>(db, "SELECT payload FROM nodes WHERE id=?1", &current)
+            .map_err(|error| store.report_selected_failure(error))?
+            .ok_or(InvalidRequest(
+                "Choose an indexed Java or Python class or method.",
+            ))?;
         ensure!(
             depth > 0 || matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function),
             InvalidRequest("Choose an indexed Java or Python class or method.")
@@ -693,9 +723,13 @@ fn resolve_class_id(db: &Connection, id: &str) -> Result<String> {
     Err(InvalidRequest("The selected symbol exceeds the class ancestry limit.").into())
 }
 
-fn resolve_class(db: &Connection, id: &str) -> Result<(crate::classes::ClassDefinition, bool)> {
-    let id = resolve_class_id(db, id)?;
-    let (class, _, clipped) = presentation_class(db, &id)?.ok_or(
+fn resolve_class(
+    store: &Store,
+    db: &Connection,
+    id: &str,
+) -> Result<(crate::classes::ClassDefinition, bool)> {
+    let id = resolve_class_id(store, db, id)?;
+    let (class, _, clipped) = presentation_class(store, db, &id)?.ok_or(
         crate::class_diagram::InvalidRequest("Class metadata exceeds the presentation byte limit."),
     )?;
     Ok((class, clipped))
@@ -3421,10 +3455,28 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         // in this same read transaction. Never scan the entire workspace here.
         let selected_path: Option<String> = match request {
             crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
-            crate::navigation::NavigationRequest::Member(s) => tx.query_row(
-                "SELECT path FROM nodes WHERE id=?1 AND json_extract(payload,'$.kind')='class' LIMIT 1",
-                [&s.class_id], |row| row.get(0),
-            ).optional()?,
+            crate::navigation::NavigationRequest::Member(s) => {
+                let selected: Option<(String, bool, Option<String>)> = tx
+                    .query_row(
+                        "SELECT path,json_valid(payload),CASE WHEN json_valid(payload) THEN json_extract(payload,'$.kind') ELSE NULL END FROM nodes WHERE id=?1 LIMIT 1",
+                        [&s.class_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|error| self.report_selected_failure(error.into()))?;
+                match selected {
+                    Some((_path, false, _)) => {
+                        return Err(self.report_selected_failure(
+                            SelectedIntegrity(
+                                "incompatible_index: selected navigation node JSON invalid".into(),
+                            )
+                            .into(),
+                        ));
+                    }
+                    Some((path, true, Some(kind))) if kind == "class" => Some(path),
+                    _ => None,
+                }
+            }
         };
         if let Some(path) = selected_path {
             // Gate allocation of the selected JSON/BLOB before decoding either.
@@ -3511,13 +3563,14 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 params![path, pattern, query, (limit + 1) as i64, offset as i64],
                 |r| r.get::<_, String>(0),
             )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.report_selected_failure(error.into()))?;
         let mut items = Vec::new();
         let mut consumed = 0;
         let mut bytes = 0;
         let mut byte_limited = false;
         for id in ids.iter().take(limit) {
-            let Some((class, size, clipped)) = presentation_class(&tx, id)? else {
+            let Some((class, size, clipped)) = presentation_class(self, &tx, id)? else {
                 // Consume an individually oversized row so pagination always progresses.
                 consumed += 1;
                 byte_limited = true;
@@ -3574,13 +3627,13 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         ensure!(revision == request.expected_revision, "revision conflict");
         let (warnings, truncated) = class_metadata(&tx)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
-        let (seed, clipped) = resolve_class(&tx, &request.seed)?;
+        let (seed, clipped) = resolve_class(self, &tx, &request.seed)?;
         // Explicitly selected measured declarations are independent roots, never
         // connected by lexical type-name matches or candidate relationships.
         let mut seeds = vec![seed.symbol.id.clone()];
         let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
         for expanded in &request.expanded {
-            let (class, _) = resolve_class(&tx, expanded)?;
+            let (class, _) = resolve_class(self, &tx, expanded)?;
             if !classes.contains_key(&class.symbol.id) {
                 ensure!(
                     classes.len() < class_diagram::MAX_NODES,
@@ -3757,7 +3810,12 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         let workspace = Path::new(&self.workspace_root);
-        let mut stmt = tx.prepare("SELECT (SELECT count(*) FROM nodes n WHERE n.path=f.path AND json_extract(n.payload,'$.kind') IN ('function','method')) FROM files f WHERE f.path=?1")?;
+        let mut valid_stmt = tx.prepare(
+            "SELECT NOT EXISTS(SELECT 1 FROM nodes n WHERE n.path=f.path AND json_valid(n.payload)=0) FROM files f WHERE f.path=?1",
+        )?;
+        let mut count_stmt = tx.prepare(
+            "SELECT (SELECT count(*) FROM nodes n WHERE n.path=f.path AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM files f WHERE f.path=?1",
+        )?;
         for item in items.iter_mut().filter(|e| e.kind == "file") {
             let absolute = root.join(&item.path);
             let Ok(relative) = absolute.strip_prefix(workspace) else {
@@ -3766,11 +3824,24 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             let Some(relative) = relative.to_str() else {
                 continue;
             };
-            let count: Option<i64> = stmt.query_row([relative], |r| r.get(0)).optional()?;
-            if let Some(count) = count {
-                item.indexed_path = Some(relative.into());
-                item.method_count = Some(usize::try_from(count)?);
+            let valid: Option<bool> = valid_stmt
+                .query_row([relative], |r| r.get(0))
+                .optional()
+                .map_err(|error| self.report_selected_failure(error.into()))?;
+            let Some(valid) = valid else { continue };
+            if !valid {
+                return Err(self.report_selected_failure(
+                    SelectedIntegrity(
+                        "incompatible_index: selected tree node JSON invalid".into(),
+                    )
+                    .into(),
+                ));
             }
+            let count: i64 = count_stmt
+                .query_row([relative], |r| r.get(0))
+                .map_err(|error| self.report_selected_failure(error.into()))?;
+            item.indexed_path = Some(relative.into());
+            item.method_count = Some(usize::try_from(count)?);
         }
         Ok((revision, self.workspace_root.clone()))
     }
@@ -3788,10 +3859,32 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let tx = storage_result(db.transaction())?;
         let revision = self.read_status(&tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
-        let mut stmt = tx.prepare("SELECT f.path,json_extract(f.payload,'$.language'),(SELECT count(*) FROM nodes n WHERE n.path=f.path AND json_extract(n.payload,'$.kind') IN ('function','method')) FROM files f ORDER BY f.path LIMIT ?1 OFFSET ?2")?;
-        let mut items = stmt.query_map(params![(limit + 1) as i64, offset as i64], |r| {
-            Ok(serde_json::json!({"path":r.get::<_,String>(0)?,"language":r.get::<_,String>(1)?,"methodCount":r.get::<_,i64>(2)?}))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let selected_valid: bool = tx
+            .query_row(
+                "WITH selected AS (SELECT path,payload FROM files ORDER BY path LIMIT ?1 OFFSET ?2)
+                 SELECT NOT EXISTS(
+                    SELECT 1 FROM selected WHERE json_valid(payload)=0
+                    UNION ALL
+                    SELECT 1 FROM nodes n JOIN selected f ON f.path=n.path WHERE json_valid(n.payload)=0
+                 )",
+                params![(limit + 1) as i64, offset as i64],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.report_selected_failure(error.into()))?;
+        if !selected_valid {
+            return Err(self.report_selected_failure(
+                SelectedIntegrity("incompatible_index: selected file page JSON invalid".into()).into(),
+            ));
+        }
+        let mut stmt = tx.prepare("SELECT f.path,CASE WHEN json_valid(f.payload) THEN json_extract(f.payload,'$.language') ELSE NULL END,(SELECT count(*) FROM nodes n WHERE n.path=f.path AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM files f ORDER BY f.path LIMIT ?1 OFFSET ?2")?;
+        let values = stmt
+            .query_map(params![(limit + 1) as i64, offset as i64], |r| {
+                Ok(serde_json::json!({"path":r.get::<_,String>(0)?,"language":r.get::<_,String>(1)?,"methodCount":r.get::<_,i64>(2)?}))
+            })
+            .map_err(|error| self.report_selected_failure(error.into()))?;
+        let mut items = values
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.report_selected_failure(error.into()))?;
         let next = (items.len() > limit).then_some(offset + limit);
         items.truncate(limit);
         Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
@@ -3812,11 +3905,27 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         )? {
             return Ok(None);
         }
-        let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE path=?1 AND json_extract(payload,'$.kind') IN ('function','method') ORDER BY json_extract(payload,'$.range.startByte'),id LIMIT 1001")?;
-        let values = stmt.query_map([path], |r| r.get::<_, String>(0))?;
+        let selected_valid: bool = tx
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE path=?1 AND json_valid(payload)=0)",
+                [path],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.report_selected_failure(error.into()))?;
+        if !selected_valid {
+            return Err(self.report_selected_failure(
+                SelectedIntegrity("incompatible_index: selected method JSON invalid".into()).into(),
+            ));
+        }
+        let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE path=?1 AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.kind') IN ('function','method') ELSE 0 END ORDER BY CASE WHEN json_valid(payload) THEN json_extract(payload,'$.range.startByte') ELSE NULL END,id LIMIT 1001")?;
+        let values = stmt
+            .query_map([path], |r| r.get::<_, String>(0))
+            .map_err(|error| self.report_selected_failure(error.into()))?;
         let mut items = Vec::new();
         for value in values {
-            let symbol: Symbol = serde_json::from_str(&value?)?;
+            let value = value.map_err(|error| self.report_selected_failure(error.into()))?;
+            let symbol: Symbol = serde_json::from_str(&value)
+                .map_err(|error| self.report_selected_failure(error.into()))?;
             // Accessor syntax alone does not prove a body is trivial. Without
             // semantic proof retain it, including zero-call validations/checks.
             items.push(serde_json::json!({"symbol":symbol,"consequential":true,"reason":"Conservative heuristic: retained; triviality is not proven"}));
@@ -5010,30 +5119,44 @@ mod sqlite_schema_race_tests {
             rusqlite::ffi::SQLITE_READONLY,
             rusqlite::ffi::SQLITE_CANTOPEN,
             rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_NOMEM,
+            rusqlite::ffi::SQLITE_ERROR,
         ] {
             assert_eq!(classify(code), RecoveryClass::Hard);
         }
     }
 
     #[test]
-    fn selected_busy_does_not_latch_but_integrity_failure_closes_clones() {
+    fn selected_operational_errors_do_not_latch_but_integrity_failure_closes_clones() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_READONLY,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_NOMEM,
+            rusqlite::ffi::SQLITE_ERROR,
+        ] {
+            let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+            let clone = store.clone();
+            let operational: anyhow::Error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            )
+            .into();
+            let returned = store.report_selected_failure(operational);
+            assert!(returned.downcast_ref::<rusqlite::Error>().is_some());
+            assert_eq!(store.status().unwrap().revision, pin);
+            assert_eq!(clone.status().unwrap().revision, pin);
+        }
+
         let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
         let clone = store.clone();
-        let busy: anyhow::Error = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            None,
-        )
-        .into();
-        let returned = store.report_selected_failure(busy);
-        assert_eq!(
-            returned
-                .downcast_ref::<rusqlite::Error>()
-                .and_then(|error| match error {
-                    rusqlite::Error::SqliteFailure(info, _) => Some(info.code),
-                    _ => None,
-                }),
-            Some(rusqlite::ErrorCode::DatabaseBusy)
-        );
+        let io: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected").into();
+        let returned = store.report_selected_failure(io);
+        assert!(returned.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(store.status().unwrap().revision, pin);
         assert_eq!(clone.status().unwrap().revision, pin);
 

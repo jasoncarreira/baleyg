@@ -1117,4 +1117,30 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
     assert_eq!(closed["error"]["code"], "index_not_ready");
     assert!(!closed.to_string().contains("forged.java"));
+
+    // Member selection authenticates the exact node JSON before using its kind.
+    let (selected_dir, selected_store, selected_graph, selected_app) = fixture();
+    let selected_clone = selected_store.clone();
+    let class_id = id(&selected_graph, "A");
+    let selector = member(&selected_dir, &class_id, "first", 0);
+    let selected_db = rusqlite::Connection::open(index_db(&selected_dir)).unwrap();
+    selected_db
+        .execute("UPDATE nodes SET payload='not-json' WHERE id=?1", [&class_id])
+        .unwrap();
+    let (status, invalid) = call(&selected_app, selector).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{invalid}");
+    assert_eq!(invalid["error"]["code"], "incompatible_index");
+    assert!(invalid.get("targets").is_none());
+    assert!(!invalid.to_string().contains("not-json"));
+    let (status, closed) = call(&selected_app, source("B.java", 1, &selected_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
+    assert_eq!(closed["error"]["code"], "index_not_ready");
+    assert!(closed.get("targets").is_none());
+    assert!(
+        selected_clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 }

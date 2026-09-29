@@ -7,6 +7,26 @@ fn fixture() -> (TempDir, TempDir) {
     fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700)).unwrap();
     (state, tempfile::tempdir().unwrap())
 }
+fn projection_fixture() -> (TempDir, TempDir, Store, baleyg::model::IndexPin) {
+    use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    fs::write(
+        workspace.path().join("flow.js"),
+        "function go() { measured(); }\n",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let pin = IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+    (state, workspace, store, pin)
+}
 fn index_dir(state: &Path) -> std::path::PathBuf {
     fs::read_dir(state.join("cache/indexes"))
         .unwrap()
@@ -1149,4 +1169,129 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         assert!(keys.contains(&"config:package.json".to_owned()));
         assert!(!keys.iter().any(|key| key.starts_with("unknown:")));
     }
+}
+
+#[test]
+fn selected_projection_json_failures_latch_only_selected_reads() {
+    // Selected file JSON is bounded to the requested page.
+    let (state, _workspace, store, pin) = projection_fixture();
+    let clone = store.clone();
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    db.execute("UPDATE files SET payload='not-json' WHERE path='flow.js'", [])
+        .unwrap();
+    let error = store.files_at(Some(pin), 0, 10).unwrap_err();
+    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
+    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+
+    // A matching invalid node is selected by the page even when file JSON is valid.
+    let (state, _workspace, store, pin) = projection_fixture();
+    let clone = store.clone();
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    db.execute("UPDATE nodes SET payload='not-json' WHERE path='flow.js'", [])
+        .unwrap();
+    let error = store.files_at(Some(pin), 0, 10).unwrap_err();
+    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
+    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+
+    // The methods route types both invalid JSON and valid JSON with bad Symbol shape.
+    for payload in ["not-json", r#"{"kind":"function"}"#] {
+        let (state, _workspace, store, pin) = projection_fixture();
+        let clone = store.clone();
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        db.execute("UPDATE nodes SET payload=?1 WHERE path='flow.js'", [payload])
+            .unwrap();
+        let error = store.methods_at("flow.js", Some(pin)).unwrap_err();
+        assert!(error.to_string().contains("incompatible_index"), "{error:#}");
+        assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    }
+
+    // A valid selected file JSON value with a non-string language is a typed
+    // SQLite extraction conversion, not a generic SQLITE_ERROR.
+    let (state, _workspace, store, pin) = projection_fixture();
+    let clone = store.clone();
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    db.execute(
+        "UPDATE files SET payload=json_set(payload,'$.language',7) WHERE path='flow.js'",
+        [],
+    )
+    .unwrap();
+    let error = store.files_at(Some(pin), 0, 10).unwrap_err();
+    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
+    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+
+    // Tree enrichment evaluates only its visible file and latches its invalid node.
+    let (state, workspace, store, _pin) = projection_fixture();
+    let clone = store.clone();
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    db.execute("UPDATE nodes SET payload='not-json' WHERE path='flow.js'", [])
+        .unwrap();
+    let mut items = vec![baleyg::file_tree::Entry {
+        name: "flow.js".into(),
+        path: "flow.js".into(),
+        kind: "file",
+        indexed_path: None,
+        method_count: None,
+        unindexed_reason: None,
+    }];
+    let error = store
+        .tree_metadata(workspace.path(), &mut items)
+        .unwrap_err();
+    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
+    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+
+    // Benign absence and a bad pin remain non-latching request outcomes.
+    let (_state, _workspace, store, pin) = projection_fixture();
+    let clone = store.clone();
+    assert!(store.methods_at("missing.js", Some(pin)).unwrap().is_none());
+    let wrong = baleyg::model::IndexPin {
+        index_generation: uuid::Uuid::new_v4(),
+        index_revision: pin.index_revision,
+    };
+    assert!(store.files_at(Some(wrong), 0, 10).unwrap_err().to_string().contains("revision conflict"));
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+}
+
+#[test]
+fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit() {
+    use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::os::unix::fs::MetadataExt;
+
+    let (state, workspace, store, pin) = projection_fixture();
+    let clone = store.clone();
+    let path = index_dir(state.path()).join("index.db");
+    let inode = fs::metadata(&path).unwrap().ino();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("UPDATE files SET payload='not-json' WHERE path='flow.js'", [])
+        .unwrap();
+    drop(db);
+    let error = store.files_at(Some(pin), 0, 10).unwrap_err();
+    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
+    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
+    let failed = IndexJobCoordinator::prepare(&store, Some(pin))
+        .unwrap()
+        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .unwrap_err();
+    assert!(failed.to_string().contains("cancelled"), "{failed:#}");
+    assert!(store.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+
+    cancel.store(false, Ordering::Release);
+    let recovered = IndexJobCoordinator::prepare(&store, Some(pin))
+        .unwrap()
+        .run(&IndexOptions::new(workspace.path().to_owned()), &cancel, |_| {})
+        .unwrap();
+    assert_eq!(recovered.index_revision, 1);
+    assert_ne!(recovered.index_generation, pin.index_generation);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(store.status().unwrap().revision, recovered);
+    assert_eq!(clone.status().unwrap().revision, recovered);
+    assert_eq!(
+        store.files_at(Some(recovered), 0, 10).unwrap()["items"][0]["path"],
+        "flow.js"
+    );
 }
