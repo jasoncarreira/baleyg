@@ -1683,13 +1683,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
     let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
     let mut blob = db
-        .blob_open(
-            MAIN_DB,
-            "index_metadata",
-            "index_generation",
-            1,
-            false,
-        )
+        .blob_open(MAIN_DB, "index_metadata", "index_generation", 1, false)
         .unwrap();
     blob.write_at(&[1], 70_000).unwrap();
     blob.close().unwrap();

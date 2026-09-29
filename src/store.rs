@@ -1964,13 +1964,7 @@ impl Store {
                 "root_changed: index root identity mismatch",
             ),
         ] {
-            let blob = db.blob_open(
-                rusqlite::MAIN_DB,
-                "index_metadata",
-                column,
-                1,
-                true,
-            )?;
+            let blob = db.blob_open(rusqlite::MAIN_DB, "index_metadata", column, 1, true)?;
             ensure!(blob.len() == expected.len(), "{mismatch}");
             for (offset, chunk) in expected.chunks(64 * 1024).enumerate() {
                 let offset = offset
@@ -2006,13 +2000,8 @@ impl Store {
                 .map_err(Into::into),
             "text" | "blob" => {
                 let text = storage == "text";
-                let blob = db.blob_open(
-                    rusqlite::MAIN_DB,
-                    "index_metadata",
-                    column_name,
-                    1,
-                    true,
-                )?;
+                let blob =
+                    db.blob_open(rusqlite::MAIN_DB, "index_metadata", column_name, 1, true)?;
                 let byte_length = blob.len();
                 let mut digest = Sha256::new();
                 digest.update(b"baleyg-index-metadata-witness-v1\0");
