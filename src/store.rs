@@ -5901,7 +5901,8 @@ mod sqlite_schema_race_tests {
 
     #[test]
     fn second_connection_adds_view_after_admission_before_status_and_leader_snapshot() {
-        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel) = ready();
+        let status_clone = store.clone();
         let path = store.roots.index_db(&store.identity);
         let after_status_ddl = RefCell::new(None);
         let status_error = store
@@ -5927,15 +5928,34 @@ mod sqlite_schema_race_tests {
             .execute_batch("DROP VIEW status_after_admission")
             .unwrap();
         drop(attacker);
-        assert_eq!(store.status().unwrap().revision, pin);
+        for closed in [
+            store.status().unwrap_err(),
+            status_clone.status().unwrap_err(),
+        ] {
+            assert_eq!(
+                closed.to_string(),
+                "index_not_ready: reconciliation required"
+            );
+        }
 
+        let (
+            _leader_state,
+            _leader_work,
+            leader_store,
+            _leader_graph,
+            _leader_capture,
+            _leader_native,
+            leader_pin,
+            _leader_cancel,
+        ) = ready();
+        let leader_path = leader_store.roots.index_db(&leader_store.identity);
         let after_leader_ddl = RefCell::new(None);
-        let leader_error = store
+        let leader_error = leader_store
             .leader_with_open_hook(|_checked| {
-                let attacker = Connection::open(&path)?;
+                let attacker = Connection::open(&leader_path)?;
                 attacker.execute_batch("CREATE VIEW leader_after_admission AS SELECT 1")?;
                 drop(attacker);
-                *after_leader_ddl.borrow_mut() = Some(fs::read(&path)?);
+                *after_leader_ddl.borrow_mut() = Some(fs::read(&leader_path)?);
                 Ok(())
             })
             .unwrap_err();
@@ -5945,11 +5965,11 @@ mod sqlite_schema_race_tests {
                 .contains("incompatible_index: unknown cache object")
         );
         assert_eq!(
-            fs::read(&path).unwrap(),
+            fs::read(&leader_path).unwrap(),
             after_leader_ddl.into_inner().unwrap(),
             "leader metadata update must not write after external DDL"
         );
-        let attacker = Connection::open(&path).unwrap();
+        let attacker = Connection::open(&leader_path).unwrap();
         let (schema, marker, generation, revision): (i64,String,String,i64) = attacker.query_row(
             "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata", [],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
@@ -5958,16 +5978,13 @@ mod sqlite_schema_race_tests {
             (
                 7,
                 "native-paired-v1",
-                pin.index_generation.to_string(),
-                pin.index_revision as i64
+                leader_pin.index_generation.to_string(),
+                leader_pin.index_revision as i64
             )
         );
-        assert!(
-            store
-                .status()
-                .unwrap_err()
-                .to_string()
-                .contains("incompatible_index")
+        assert_eq!(
+            leader_store.status().unwrap_err().to_string(),
+            "index_not_ready: reconciliation required"
         );
     }
 }
