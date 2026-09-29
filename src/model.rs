@@ -296,12 +296,7 @@ pub struct SavedView {
     #[serde(default)]
     pub hidden: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct SavedViewState {
-    pub view: SavedView,
-    pub orphaned_ids: Vec<String>,
-}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Annotation {
@@ -309,11 +304,304 @@ pub struct Annotation {
     pub node_id: String,
     pub body: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableAnchor {
+    pub syntax_id: String,
+    pub document: crate::native_evidence::DocumentKey,
+    pub captured_revision_id: String,
+    pub header_hash: String,
+    pub sibling_group_hash: String,
+    pub sibling_count: usize,
+    pub identical_header_count: usize,
+}
+impl DurableAnchor {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        fn hash(value: &str) -> bool {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        anyhow::ensure!(
+            self.syntax_id.len() == 39
+                && self.syntax_id.starts_with("sid:v1:")
+                && self.syntax_id[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid durable anchor syntaxId"
+        );
+        anyhow::ensure!(
+            !self.document.source_set_id.is_empty() && !self.captured_revision_id.is_empty(),
+            "invalid durable anchor document/revision"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.document.language.as_str(),
+                "java" | "rust" | "python" | "javascript"
+            ),
+            "invalid durable anchor document language"
+        );
+        let path = &self.document.path;
+        anyhow::ensure!(
+            !path.is_empty()
+                && !path.starts_with('/')
+                && !path.contains('\\')
+                && !path.contains('\0')
+                && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
+            "invalid durable anchor document path"
+        );
+        anyhow::ensure!(
+            hash(&self.header_hash) && hash(&self.sibling_group_hash),
+            "invalid durable anchor hash"
+        );
+        anyhow::ensure!(
+            self.sibling_count > 0
+                && self.identical_header_count > 0
+                && self.identical_header_count <= self.sibling_count,
+            "invalid durable anchor counts"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AnchorStatus {
+    Attached,
+    Orphaned,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AnchorReason {
+    None,
+    Missing,
+    HeaderMismatch,
+    GroupChanged,
+    UnprovenContinuity,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnchorResult {
+    pub status: AnchorStatus,
+    pub target_id: Option<String>,
+    pub reason: AnchorReason,
+}
+impl AnchorResult {
+    pub fn attached(id: String) -> Self {
+        Self {
+            status: AnchorStatus::Attached,
+            target_id: Some(id),
+            reason: AnchorReason::None,
+        }
+    }
+    pub fn orphaned(reason: AnchorReason) -> Self {
+        Self {
+            status: AnchorStatus::Orphaned,
+            target_id: None,
+            reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SavedViewRecord {
+    pub id: String,
+    pub title: String,
+    pub query: ViewQuery,
+    #[serde(default)]
+    pub pins: BTreeMap<String, Position>,
+    #[serde(default)]
+    pub hidden: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Box<serde_json::value::RawValue>>,
+}
+impl PartialEq for SavedViewRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.base() == other.base()
+            && self.anchor.as_deref().map(|raw| raw.get())
+                == other.anchor.as_deref().map(|raw| raw.get())
+    }
+}
+impl PartialEq<SavedView> for SavedViewRecord {
+    fn eq(&self, other: &SavedView) -> bool {
+        self.base() == *other
+    }
+}
+impl PartialEq<SavedViewRecord> for SavedView {
+    fn eq(&self, other: &SavedViewRecord) -> bool {
+        *self == other.base()
+    }
+}
+impl SavedViewRecord {
+    pub fn base(&self) -> SavedView {
+        SavedView {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            query: self.query.clone(),
+            pins: self.pins.clone(),
+            hidden: self.hidden.clone(),
+        }
+    }
+    pub fn from_base(view: SavedView, anchor: Option<Box<serde_json::value::RawValue>>) -> Self {
+        Self {
+            id: view.id,
+            title: view.title,
+            query: view.query,
+            pins: view.pins,
+            hidden: view.hidden,
+            anchor,
+        }
+    }
+    pub fn typed_anchor(&self) -> anyhow::Result<Option<DurableAnchor>> {
+        self.anchor
+            .as_ref()
+            .map(|raw| {
+                let value: DurableAnchor = serde_json::from_str(raw.get())?;
+                value.validate()?;
+                Ok(value)
+            })
+            .transpose()
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.base().validate()?;
+        self.typed_anchor()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnnotationRecord {
+    pub id: String,
+    pub node_id: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Box<serde_json::value::RawValue>>,
+}
+impl PartialEq for AnnotationRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.base() == other.base()
+            && self.title == other.title
+            && self.anchor.as_deref().map(|raw| raw.get())
+                == other.anchor.as_deref().map(|raw| raw.get())
+    }
+}
+impl Eq for AnnotationRecord {}
+impl PartialEq<Annotation> for AnnotationRecord {
+    fn eq(&self, other: &Annotation) -> bool {
+        self.base() == *other
+    }
+}
+impl PartialEq<AnnotationRecord> for Annotation {
+    fn eq(&self, other: &AnnotationRecord) -> bool {
+        *self == other.base()
+    }
+}
+impl AnnotationRecord {
+    pub fn base(&self) -> Annotation {
+        Annotation {
+            id: self.id.clone(),
+            node_id: self.node_id.clone(),
+            body: self.body.clone(),
+        }
+    }
+    pub fn from_base(
+        annotation: Annotation,
+        title: Option<String>,
+        anchor: Option<Box<serde_json::value::RawValue>>,
+    ) -> Self {
+        Self {
+            id: annotation.id,
+            node_id: annotation.node_id,
+            body: annotation.body,
+            title,
+            anchor,
+        }
+    }
+    pub fn typed_anchor(&self) -> anyhow::Result<Option<DurableAnchor>> {
+        self.anchor
+            .as_ref()
+            .map(|raw| {
+                let value: DurableAnchor = serde_json::from_str(raw.get())?;
+                value.validate()?;
+                Ok(value)
+            })
+            .transpose()
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.base().validate()?;
+        anyhow::ensure!(
+            self.title.as_ref().is_none_or(|title| title.len() <= 256),
+            "annotation title must be at most 256 bytes"
+        );
+        self.typed_anchor()?;
+        Ok(())
+    }
+}
+
+pub type SavedViewRequest = SavedView;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnnotationRequest {
+    pub id: String,
+    pub node_id: String,
+    pub body: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+impl AnnotationRequest {
+    pub fn base(&self) -> Annotation {
+        Annotation {
+            id: self.id.clone(),
+            node_id: self.node_id.clone(),
+            body: self.body.clone(),
+        }
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.base().validate()?;
+        anyhow::ensure!(
+            self.title.as_ref().is_none_or(|title| title.len() <= 256),
+            "annotation title must be at most 256 bytes"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AttachmentAvailability {
+    Ready,
+    Anchorless,
+    IndexUnavailable,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnchorAttachment {
+    pub availability: AttachmentAvailability,
+    pub result: Option<AnchorResult>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedViewState {
+    pub view: SavedViewRecord,
+    pub orphaned_ids: Vec<String>,
+    pub index_generation: Option<String>,
+    pub index_revision: Option<u64>,
+    pub attachment: AnchorAttachment,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationState {
-    pub annotation: Annotation,
+    pub annotation: AnnotationRecord,
     pub orphaned: bool,
+    pub index_generation: Option<String>,
+    pub index_revision: Option<u64>,
+    pub attachment: AnchorAttachment,
 }
 
 impl SavedView {
@@ -362,6 +650,7 @@ impl Annotation {
         Ok(())
     }
 }
+
 pub fn validate_record_id(id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !id.is_empty()

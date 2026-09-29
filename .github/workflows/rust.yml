@@ -17,4 +17,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - run: npm ci --prefix tests/browser --ignore-scripts
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
+      - name: Install Playwright Chromium with system dependencies
+        if: runner.os == 'Linux'
+        run: node tests/browser/node_modules/playwright/cli.js install --with-deps chromium
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
+      - name: Install Playwright Chromium
+        if: runner.os == 'macOS'
+        run: node tests/browser/node_modules/playwright/cli.js install chromium
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
       - run: ./tools/verify
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
