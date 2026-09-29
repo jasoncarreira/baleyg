@@ -1088,4 +1088,24 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
     assert_eq!(closed["error"]["code"], "index_not_ready");
     assert!(!closed.to_string().contains("forged.java"));
+
+    // A graph row with no selected native document is an independent typed
+    // corruption. Its first selected refusal closes this app for every path.
+    let (missing_dir, _missing_store, _graph, missing_app) = fixture();
+    let missing_db = rusqlite::Connection::open(index_db(&missing_dir)).unwrap();
+    assert_eq!(
+        missing_db
+            .execute("DELETE FROM native_documents WHERE path='A.java'", [])
+            .unwrap(),
+        1
+    );
+    let (status, missing) = call(&missing_app, source("A.java", 3, &missing_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{missing}");
+    assert_eq!(missing["error"]["code"], "incompatible_index");
+    assert!(missing.get("targets").is_none());
+    assert!(!missing.to_string().contains("forged.java"));
+    let (status, closed) = call(&missing_app, source("B.java", 1, &missing_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
+    assert_eq!(closed["error"]["code"], "index_not_ready");
+    assert!(!closed.to_string().contains("forged.java"));
 }

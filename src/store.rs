@@ -3434,10 +3434,14 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 [&path], |row| Ok((row.get(0)?, row.get(1)?)),
             ).optional()?;
             if let Some((graph_len, native_len)) = sizes {
-                ensure!(
-                    graph_len <= 2 * 1024 * 1024 && native_len <= 2 * 1024 * 1024,
-                    "incompatible_index: selected navigation source exceeds budget"
-                );
+                if graph_len > 2 * 1024 * 1024 || native_len > 2 * 1024 * 1024 {
+                    return Err(self.report_selected_failure(
+                        SelectedIntegrity(
+                            "incompatible_index: selected navigation source exceeds budget".into(),
+                        )
+                        .into(),
+                    ));
+                }
                 self.attest_selected_document(&tx, &path)?;
             } else {
                 let graph_file: bool = tx.query_row(
@@ -3445,10 +3449,14 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                     [&path],
                     |row| row.get(0),
                 )?;
-                ensure!(
-                    !graph_file,
-                    "incompatible_index: selected native document missing"
-                );
+                if graph_file {
+                    return Err(self.report_selected_failure(
+                        SelectedIntegrity(
+                            "incompatible_index: selected native document missing".into(),
+                        )
+                        .into(),
+                    ));
+                }
             }
         }
         crate::navigation::navigate(&tx, request, revision)
