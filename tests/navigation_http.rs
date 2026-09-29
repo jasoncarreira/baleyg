@@ -214,18 +214,21 @@ async fn strict_selectors_validation_and_revision() {
         assert_eq!(status, 400, "{body}: {value}");
     }
     let old_source = source("A.java", 3, &dir);
+    let index_generation = store.status().unwrap().revision.index_generation;
+    let leader = store.leader().unwrap();
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &store.leader().unwrap(),
+        &leader,
         baleyg::model::IndexPin {
-            index_generation: store.status().unwrap().revision.index_generation,
+            index_generation,
             index_revision: 1,
         },
         &cancel(),
     )
     .unwrap();
+    drop(leader);
     assert_eq!(call(&app, good).await.0, 409);
     assert_eq!(call(&app, old_source).await.0, 409);
 }

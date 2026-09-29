@@ -289,18 +289,21 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
         call(&app, "POST", "/api/questions/preview", absent).await.0,
         404
     );
+    let index_generation = store.status().unwrap().revision.index_generation;
+    let leader = store.leader().unwrap();
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &store.leader().unwrap(),
+        &leader,
         baleyg::model::IndexPin {
-            index_generation: store.status().unwrap().revision.index_generation,
+            index_generation,
             index_revision: 1,
         },
         &Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
+    drop(leader);
     assert_eq!(
         call(&app, "POST", "/api/questions/preview", request)
             .await

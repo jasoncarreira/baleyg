@@ -217,16 +217,12 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
         |_| {},
     )
     .unwrap();
+    let expected = store.status().unwrap().revision;
+    let leader = store.leader().unwrap();
     store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            &store.leader().unwrap(),
-            store.status().unwrap().revision,
-            &cancel,
-        )
+        .publish_native(&graph, &capture, &native, &leader, expected, &cancel)
         .unwrap();
+    drop(leader);
     assert_eq!(call(&app, "POST", &url, json!({})).await.0, 409);
     assert_eq!(
         call(&app, "GET", "/api/jev/status", Value::Null).await.1["budget"]["attempts"],

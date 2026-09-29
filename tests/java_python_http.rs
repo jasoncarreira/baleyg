@@ -436,14 +436,16 @@ async fn declarations_without_bodies_are_navigable_without_fabricated_calls() {
 async fn java_python_cached_endpoints_enforce_revision_and_auth() {
     let f = setup();
     let cancel = Arc::new(AtomicBool::new(false));
+    let index_generation = f.store.status().unwrap().revision.index_generation;
+    let leader = f.store.leader().unwrap();
     assert_eq!(
         publish_bundle(
             &f.store,
             &f.graph,
             &f.workspace,
-            &f.store.leader().unwrap(),
+            &leader,
             baleyg::model::IndexPin {
-                index_generation: f.store.status().unwrap().revision.index_generation,
+                index_generation,
                 index_revision: 1
             },
             &cancel
@@ -452,6 +454,7 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
         .index_revision,
         2
     );
+    drop(leader);
     for path in ["Worker.java", "worker.py"] {
         let seed = &f
             .graph

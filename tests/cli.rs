@@ -1838,7 +1838,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         pin["indexGeneration"].as_str().unwrap(),
         pin["indexRevision"].as_u64().unwrap()
     );
-    let (code, source_before) = real_api(
+    let (code, _source_before) = real_api(
         &client,
         &url,
         TOKEN,
@@ -1847,7 +1847,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{source_before}");
+    assert_eq!(code, 200, "{_source_before}");
     let (code, symbols) = real_api(
         &client,
         &url,
@@ -1878,7 +1878,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     assert_eq!(code, 200, "{preview}");
     let packet_id = preview["packet"]["packetId"].as_str().unwrap();
     let packet_route = format!("/api/questions/{packet_id}/jev-request");
-    let (code, packet_before) = real_api(
+    let (code, _packet_before) = real_api(
         &client,
         &url,
         TOKEN,
@@ -1887,7 +1887,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{packet_before}");
+    assert_eq!(code, 200, "{_packet_before}");
 
     // A bounded multi-file scan lets the client acquire a real SQLite writer lock
     // after the HTTP job is accepted but before projection completes.
@@ -2009,11 +2009,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{current}");
-    assert_eq!(
-        current["revision"], pin,
-        "failed job may not advance full pair"
-    );
+    assert_eq!(code, 503, "{current}");
+    assert_eq!(current["error"]["code"], "index_not_ready");
     assert_eq!(
         real_native_snapshot(&home),
         native_before,
@@ -2033,11 +2030,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{source_after}");
-    assert_eq!(
-        source_after, source_before,
-        "previous pinned source remains usable"
-    );
+    assert_eq!(code, 503, "{source_after}");
+    assert_eq!(source_after["error"]["code"], "index_not_ready");
     let (code, packet_after) = real_api(
         &client,
         &url,
@@ -2047,11 +2041,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{packet_after}");
-    assert_eq!(
-        packet_after, packet_before,
-        "cached packet must remain usable after failed publication"
-    );
+    assert_eq!(code, 503, "{packet_after}");
+    assert_eq!(packet_after["error"]["code"], "index_not_ready");
     let (code, retry) = real_api(
         &client,
         &url,
@@ -2109,6 +2100,17 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         "retry must publish full new pin"
     );
     assert_eq!(published["stats"]["files"], 81);
+    let (code, stale_packet) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &packet_route,
+        None,
+    )
+    .await;
+    assert_eq!(code, 409, "{stale_packet}");
+    assert_eq!(stale_packet["error"]["code"], "revision_conflict");
     let native_after = real_native_snapshot(&home);
     let graph_after = real_export(&root, &home);
     assert_ne!(

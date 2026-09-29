@@ -233,18 +233,21 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
     assert_eq!(status, 200);
     assert_eq!(independent["nodes"].as_array().unwrap().len(), 2);
     assert_eq!(independent["edges"], json!([]));
+    let index_generation = store.status().unwrap().revision.index_generation;
+    let leader = store.leader().unwrap();
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &store.leader().unwrap(),
+        &leader,
         baleyg::model::IndexPin {
-            index_generation: store.status().unwrap().revision.index_generation,
+            index_generation,
             index_revision: 1,
         },
         &cancel(),
     )
     .unwrap();
+    drop(leader);
     assert_eq!(
         call(
             &app,
@@ -340,35 +343,44 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     let (dir, store, graph, _app) = setup();
     let q = request(id(&graph, "A"), &store);
     let before = serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap();
+
+    let leader = store.leader().unwrap();
+    let control = store.index_baseline().unwrap();
     assert!(
         publish_bundle(
             &store,
             &graph,
             &dir.path().join("workspace"),
-            &store.leader().unwrap(),
+            &leader,
             baleyg::model::IndexPin {
-                index_generation: store.index_baseline().unwrap().index_generation,
+                index_generation: control.index_generation,
                 index_revision: 0
             },
             &cancel()
         )
         .is_err()
     );
+    drop(leader);
+
+    let leader = store.leader().unwrap();
+    let control = store.index_baseline().unwrap();
     assert!(
         publish_bundle(
             &store,
             &graph,
             &dir.path().join("workspace"),
-            &store.leader().unwrap(),
+            &leader,
             baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
+                index_generation: control.index_generation,
                 index_revision: 1
             },
             &Arc::new(AtomicBool::new(true))
         )
         .is_err()
     );
-    let prior = store.status().unwrap().revision;
+    drop(leader);
+
+    let prior = store.index_baseline().unwrap();
     let leader = store.leader().unwrap();
     let path = index_db(&dir.path().join("state"));
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -438,28 +450,39 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     db.execute_batch("DROP TRIGGER fail_projection").unwrap();
     drop(db);
     drop(leader);
-    assert_eq!(store.status().unwrap().revision, prior);
-    assert_eq!(
-        serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap(),
-        before
-    );
-    assert_eq!(store.graph().unwrap().nodes, graph.nodes);
+
+    for closed in [
+        store.status().unwrap_err(),
+        store.class_diagram_at(&q).unwrap_err(),
+        store.graph().unwrap_err(),
+    ] {
+        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+    }
+
+    let control = store.index_baseline().unwrap();
+    let leader = store.leader().unwrap();
+    let next = publish_bundle(
+        &store,
+        &graph,
+        &dir.path().join("workspace"),
+        &leader,
+        control,
+        &cancel(),
+    )
+    .unwrap();
     assert!(
-        publish_bundle(
-            &store,
-            &graph,
-            &dir.path().join("workspace"),
-            &store.leader().unwrap(),
-            baleyg::model::IndexPin {
-                index_generation: store.status().unwrap().revision.index_generation,
-                index_revision: 1
-            },
-            &cancel()
-        )
-        .unwrap()
-        .index_revision
-            > 1,
+        next.index_revision > 1,
         "failed transaction consumes a durable revision token"
+    );
+    assert_eq!(store.status().unwrap().revision, next);
+    assert_eq!(store.graph().unwrap().nodes, graph.nodes);
+    let mut current = q.clone();
+    current.expected_revision = next;
+    let mut before_at_next = before.clone();
+    before_at_next["revision"] = serde_json::to_value(next).unwrap();
+    assert_eq!(
+        serde_json::to_value(store.class_diagram_at(&current).unwrap()).unwrap(),
+        before_at_next
     );
 }
 

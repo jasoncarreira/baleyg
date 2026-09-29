@@ -208,6 +208,32 @@ fn publication_is_atomic_and_reopens() {
     assert_eq!(first.index_revision, 1);
     let old = store.graph().unwrap();
     let a = symbol_id(&old, "a");
+    let assert_closed = || {
+        assert_eq!(store.index_baseline().unwrap(), first);
+        for error in [store.status().unwrap_err(), store.graph().unwrap_err()] {
+            assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+        }
+        let reopened = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(reopened.status().unwrap().revision, first);
+        assert_eq!(reopened.graph().unwrap(), old);
+        for document in &captured.1.revision.documents {
+            let (stored, bytes) = reopened
+                .native_source_at(first, &document.key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored, *document);
+            assert_eq!(
+                bytes,
+                captured
+                    .2
+                    .files
+                    .iter()
+                    .find(|file| file.path == document.key.path)
+                    .unwrap()
+                    .bytes
+            );
+        }
+    };
     let mut duplicate = old.clone();
     duplicate.nodes.push(old.nodes[0].clone());
     assert!(
@@ -222,7 +248,7 @@ fn publication_is_atomic_and_reopens() {
             )
             .is_err()
     );
-    assert_eq!(store.graph().unwrap(), old);
+    assert_closed();
     assert!(
         store
             .publish_native(
@@ -237,6 +263,7 @@ fn publication_is_atomic_and_reopens() {
             .to_string()
             .starts_with("revision conflict")
     );
+    assert_closed();
     assert!(
         store
             .publish_native(
@@ -251,7 +278,8 @@ fn publication_is_atomic_and_reopens() {
             .to_string()
             .contains("cancelled")
     );
-    assert_eq!(store.status().unwrap().revision, first);
+    assert_closed();
+    drop(assert_closed);
     drop(store);
     let store = Store::open_for_tests(state.path(), work.path()).unwrap();
     assert_eq!(store.graph().unwrap(), old);
@@ -259,6 +287,23 @@ fn publication_is_atomic_and_reopens() {
         store.source("a.js").unwrap().unwrap().text,
         captured.0.files[0].text
     );
+    for document in &captured.1.revision.documents {
+        let (stored, bytes) = store
+            .native_source_at(first, &document.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, *document);
+        assert_eq!(
+            bytes,
+            captured
+                .2
+                .files
+                .iter()
+                .find(|file| file.path == document.key.path)
+                .unwrap()
+                .bytes
+        );
+    }
     assert!(
         store
             .source_at("a.js", Some(pin(&store, 0)))
@@ -457,18 +502,16 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     publish_bundle(&store, &fresh, store.index_baseline().unwrap());
     assert!(!store.annotations().unwrap()[0].orphaned);
     // Public graph-only writes cannot remove indexed symbols.
+    let expected = store.status().unwrap().revision;
+    let leader = store.leader().unwrap();
     assert!(
         store
-            .publish(
-                &Graph::default(),
-                &store.leader().unwrap(),
-                store.status().unwrap().revision,
-                &cancel()
-            )
+            .publish(&Graph::default(), &leader, expected, &cancel())
             .unwrap_err()
             .to_string()
             .contains("native_evidence_required")
     );
+    drop(leader);
     std::fs::write(
         work.path().join("a.js"),
         "function c() {}
@@ -476,7 +519,7 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     )
     .unwrap();
     let removed = bundle(&store, &work);
-    publish_bundle(&store, &removed, store.status().unwrap().revision);
+    publish_bundle(&store, &removed, store.index_baseline().unwrap());
     assert!(store.annotations().unwrap()[0].orphaned);
     assert!(store.delete_annotation("note").unwrap());
     assert!(!store.delete_annotation("note").unwrap());
@@ -577,9 +620,34 @@ fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
                 .is_err(),
             "case {kind}"
         );
-        assert_eq!(store.status().unwrap().revision, first);
-        assert_eq!(store.graph().unwrap(), baseline);
+        assert_eq!(store.index_baseline().unwrap(), first);
+        for error in [store.status().unwrap_err(), store.graph().unwrap_err()] {
+            assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+        }
+        let reopened = crate::common::open_store(state.path(), work.path()).unwrap();
+        assert_eq!(reopened.status().unwrap().revision, first);
+        assert_eq!(reopened.graph().unwrap(), baseline);
+        for document in &captured.1.revision.documents {
+            let (stored, bytes) = reopened
+                .native_source_at(first, &document.key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored, *document);
+            assert_eq!(
+                bytes,
+                captured
+                    .2
+                    .files
+                    .iter()
+                    .find(|file| file.path == document.key.path)
+                    .unwrap()
+                    .bytes
+            );
+        }
     }
+    let next = publish_bundle(&store, &captured, store.index_baseline().unwrap());
+    assert_eq!(store.status().unwrap().revision, next);
+    assert_eq!(store.graph().unwrap(), baseline);
 }
 
 #[test]
@@ -1029,7 +1097,16 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("DROP VIEW unapproved_view").unwrap();
-    assert_eq!(store.status().unwrap().revision, before);
+    drop(db);
+    drop(leader);
+    assert_eq!(store.index_baseline().unwrap(), before);
+    for error in [
+        store.status().unwrap_err(),
+        store.source("a.js").unwrap_err(),
+        store.graph().unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+    }
 }
 
 #[test]
