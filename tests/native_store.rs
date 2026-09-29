@@ -453,9 +453,7 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     let selected = store.native_source_at(pin, &corrupted).unwrap_err();
     assert!(
         selected.to_string().contains("incompatible_index")
-            && selected
-                .to_string()
-                .contains("native source hash mismatch"),
+            && selected.to_string().contains("native source hash mismatch"),
         "{selected:#}"
     );
     let closed = original_clone.source_at("flow.rs", Some(pin)).unwrap_err();
@@ -706,9 +704,7 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
     let native_error = store.native_source_at(pin, &key).unwrap_err();
     assert!(
         native_error.to_string().contains("incompatible_index")
-            && native_error
-                .to_string()
-                .contains("source hash mismatch"),
+            && native_error.to_string().contains("source hash mismatch"),
         "{native_error:#}"
     );
     let closed = native_clone.source_at("flow.java", Some(pin)).unwrap_err();
@@ -809,7 +805,13 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
                 .contains("selected native declarations differ"),
         "{error:#}"
     );
-    assert!(declarations_clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        declarations_clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     db.execute(
         "UPDATE native_declarations SET end_byte=?1 WHERE syntax_id=?2",
         rusqlite::params![original_end, owner],
@@ -838,7 +840,13 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
             && error.to_string().contains("selected native regions differ"),
         "{error:#}"
     );
-    assert!(regions_clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        regions_clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
     db.execute(
         "UPDATE native_control_regions SET kind=?1 WHERE path='flow.js'",
         [&original_kind],
@@ -858,7 +866,9 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
     let error = coverage_store.native_coverage_at(pin, &key).unwrap_err();
     assert!(
         error.to_string().contains("incompatible_index")
-            && error.to_string().contains("selected native coverage differs"),
+            && error
+                .to_string()
+                .contains("selected native coverage differs"),
         "{error:#}"
     );
     let closed = coverage_clone
@@ -935,14 +945,22 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
                 .contains("graph call differs from measured native row"),
         "{query_error:#}"
     );
-    assert!(query_clone.status().unwrap_err().to_string().contains("index_not_ready"));
+    assert!(
+        query_clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
 
     let sequence_store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(sequence_store.status().unwrap().revision, pin);
     let sequence_clone = sequence_store.clone();
     let sequence_error = sequence_store.sequence_at(&owner, pin, true).unwrap_err();
     assert!(
-        sequence_error.to_string().contains("native_evidence_required")
+        sequence_error
+            .to_string()
+            .contains("native_evidence_required")
             && sequence_error
                 .to_string()
                 .contains("graph call differs from measured native row"),
@@ -1064,9 +1082,7 @@ fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
     );
     let closed = selected_clone.status().unwrap_err();
     assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
-    let closed = store
-        .native_declarations_at(pin, "java", "go")
-        .unwrap_err();
+    let closed = store.native_declarations_at(pin, "java", "go").unwrap_err();
     assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
 }
 
@@ -1110,9 +1126,7 @@ fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() 
     );
     let closed = selected_clone.status().unwrap_err();
     assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
-    let closed = store
-        .native_declarations_at(pin, "java", "go")
-        .unwrap_err();
+    let closed = store.native_declarations_at(pin, "java", "go").unwrap_err();
     assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
 }
 
