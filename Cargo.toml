@@ -40,5 +40,14 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
-[profile.dev.package.sha2]
+# Debug-profile speed for the verify suite. Only codegen optimization changes:
+# debug assertions, overflow checks and debuginfo keep their dev defaults.
+# Dependencies (sqlite, tree-sitter grammars, sha2, serde_json, ...) build once
+# and are cached, so optimize them fully.
+[profile.dev.package."*"]
 opt-level = 3
+
+# Light optimization of the crate itself makes its heavy indexing and publish
+# tests several times faster for a modest rebuild cost.
+[profile.dev.package.baleyg]
+opt-level = 1
