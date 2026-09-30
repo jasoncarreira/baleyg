@@ -3142,6 +3142,7 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -3201,6 +3202,20 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
             .unwrap(),
     );
     let db_path = index_dir.join("index.db");
+    let journal_path = index_dir.join("index.db-journal");
+    // SQLite immutable URI connections never take SH locks against the writer.
+    // Percent-encode raw path bytes so %, ?, #, spaces and non-UTF8 cannot
+    // change the URI query or select another database.
+    let mut db_uri = String::from("file:");
+    for &byte in db_path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/._-~".contains(&byte) {
+            db_uri.push(char::from(byte));
+        } else {
+            db_uri.push('%');
+            db_uri.push_str(&format!("{byte:02X}"));
+        }
+    }
+    db_uri.push_str("?immutable=1");
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
@@ -3209,24 +3224,42 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
                 fs::read_to_string(&stderr_path).unwrap_or_default()
             );
         }
-        if db_path.exists()
-            && let Ok(db) = rusqlite::Connection::open_with_flags(
-                &db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-        {
-            db.busy_timeout(Duration::from_millis(50)).unwrap();
-            let published = db
-                .query_row(
-                    "SELECT reconciled_incarnation IS NOT NULL,index_revision FROM index_metadata WHERE singleton=1",
-                    [],
-                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
+        if db_path.exists() {
+            // A partially initialized file or an unsupported WAL-mode header is
+            // never a commit signal. This plain file read takes no SQLite lock.
+            let delete_mode = File::open(&db_path)
+                .and_then(|mut file| {
+                    let mut header = [0u8; 20];
+                    file.read_exact(&mut header)?;
+                    Ok(&header[..16] == b"SQLite format 3\0" && header[18] == 1 && header[19] == 1)
+                })
+                .unwrap_or(false);
+            if delete_mode
+                && let Ok(db) = rusqlite::Connection::open_with_flags(
+                    db_uri.as_str(),
+                    rusqlite::OpenFlags::SQLITE_OPEN_URI
+                        | rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
-                .is_ok_and(|(reconciled, revision)| reconciled && revision == 1);
-            drop(db);
-            if published {
-                break;
+            {
+                let published = db
+                    .query_row(
+                        "SELECT reconciled_incarnation IS NOT NULL,index_revision FROM index_metadata WHERE singleton=1",
+                        [],
+                        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .is_ok_and(|(reconciled, revision)| reconciled && revision == 1);
+                drop(db);
+                // In this repository's enforced DELETE mode, removing the
+                // rollback journal is the commit point, after database sync.
+                // A dangling symlink or metadata error must not count as absent.
+                let journal_absent = matches!(
+                    fs::symlink_metadata(&journal_path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                );
+                if published && journal_absent {
+                    break;
+                }
             }
         }
         assert!(
