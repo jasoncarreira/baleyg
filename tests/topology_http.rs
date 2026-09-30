@@ -8,13 +8,20 @@ use baleyg::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::{CancelFlag, Graph},
-    store::Store,
+    store::{Store, topology::LeaderSession},
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
+fn fixture() -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Router,
+    String,
+    Arc<LeaderSession>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -34,16 +41,17 @@ fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
         .id
         .clone();
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let app = http::router(
-        http::new(
-            store.clone(),
-            options,
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
-    (temp, store, graph, app, seed)
+    let session = store.leader_session().unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
+    (temp, store, graph, app, seed, session)
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (u16, Value) {
     let req = Request::builder()
@@ -71,7 +79,7 @@ fn pinned(route: &str, pin: &baleyg::model::IndexPin) -> String {
 
 #[tokio::test]
 async fn durable_crud_matrix() {
-    let (temp, store, graph, app, seed) = fixture();
+    let (temp, store, graph, app, seed, session) = fixture();
     let durable = temp.path().join("state/data/workspaces");
     assert_eq!(
         call(&app, "GET", "/api/views", Value::Null).await.1,
@@ -97,7 +105,7 @@ async fn durable_crud_matrix() {
         &store,
         &graph,
         &temp.path().join("workspace"),
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         baseline,
         &Arc::new(AtomicBool::new(false)),
     )
@@ -183,13 +191,13 @@ async fn durable_crud_matrix() {
 
 #[tokio::test]
 async fn query_optional_pin_matrix() {
-    let (temp, store, graph, app, seed) = fixture();
+    let (temp, store, graph, app, seed, session) = fixture();
     let root = temp.path().join("workspace");
     let pin = publish_bundle(
         &store,
         &graph,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         store.index_baseline().unwrap(),
         &Arc::new(AtomicBool::new(false)),
     )
@@ -232,7 +240,7 @@ async fn query_optional_pin_matrix() {
         &store,
         &graph,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         pin,
         &Arc::new(AtomicBool::new(false)),
     )
@@ -249,7 +257,7 @@ async fn query_optional_pin_matrix() {
 
 #[tokio::test]
 async fn saved_read_pin_and_ownership_matrix() {
-    let (temp, store, graph, app, seed) = fixture();
+    let (temp, store, graph, app, seed, session) = fixture();
     let root = temp.path().join("workspace");
     let other = graph
         .nodes
@@ -262,7 +270,7 @@ async fn saved_read_pin_and_ownership_matrix() {
         &store,
         &graph,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         store.index_baseline().unwrap(),
         &Arc::new(AtomicBool::new(false)),
     )
@@ -411,7 +419,7 @@ async fn saved_read_pin_and_ownership_matrix() {
         &store,
         &graph,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         pin,
         &Arc::new(AtomicBool::new(false)),
     )
@@ -441,6 +449,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
     let options = IndexOptions::new(root.clone());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
+    let session = store.leader_session().unwrap();
     let (graph, native, capture) =
         baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
             .unwrap();
@@ -463,20 +472,20 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
-    let app = http::router(
-        http::new(
-            store.clone(),
-            options.clone(),
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
+    let state = http::new(
+        store.clone(),
+        options.clone(),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
     let target_view = json!({"id":"target-view","title":"Target","query":{"seed":target}});
     let stable_view = json!({"id":"stable-view","title":"Stable","query":{"seed":stable}});
     let target_note = json!({"id":"target-note","nodeId":target,"body":"target note"});
@@ -543,7 +552,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             first,
             &cancel,
         )
@@ -654,7 +663,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
 
 #[tokio::test]
 async fn schema5_is_not_native_anchor_evidence() {
-    let (_temp, store, _graph, app, seed) = fixture();
+    let (_temp, store, _graph, app, seed, _session) = fixture();
     let legacy_pin = store.index_baseline().unwrap();
     let legacy: baleyg::model::SavedView = serde_json::from_value(json!({
         "id":"legacy","title":"Legacy","query":{"seed":seed}
@@ -678,15 +687,17 @@ async fn schema5_is_not_native_anchor_evidence() {
         Value::Null,
     )
     .await;
-    assert_eq!(status, 409, "{error}");
+    assert_eq!(status, 503, "{error}");
+    assert_eq!(error["error"]["code"], "index_not_ready");
     let body = json!({"id":"new","title":"No capture","query":{"seed":seed}});
     let (status, error) = call(&app, "PUT", &pinned("/api/views/new", &legacy_pin), body).await;
-    assert_eq!(status, 409, "{error}");
+    assert_eq!(status, 503, "{error}");
+    assert_eq!(error["error"]["code"], "index_not_ready");
 }
 
 #[tokio::test]
 async fn workspace_root_changed() {
-    let (temp, store, _graph, app, _seed) = fixture();
+    let (temp, store, _graph, app, _seed, _session) = fixture();
     let original = temp.path().join("workspace");
     let moved = temp.path().join("moved");
     std::fs::rename(&original, &moved).unwrap();

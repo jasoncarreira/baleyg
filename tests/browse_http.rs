@@ -15,7 +15,13 @@ use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-fn setup() -> (tempfile::TempDir, Store, Graph, Router) {
+fn setup() -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Router,
+    Arc<baleyg::store::topology::LeaderSession>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -26,26 +32,27 @@ fn setup() -> (tempfile::TempDir, Store, Graph, Router) {
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let session = store.leader_session().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
-    let app = http::router(
-        http::new(
-            store.clone(),
-            options,
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
-    (dir, store, graph, app)
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
+    (dir, store, graph, app, session)
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
     let request = Request::builder()
@@ -66,7 +73,7 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCod
 }
 #[tokio::test]
 async fn catalog_pages_inline_methods_and_conservative_checks() {
-    let (_dir, store, graph, app) = setup();
+    let (_dir, store, graph, app, _session) = setup();
     let pin = store.status().unwrap().revision;
     let (status, page) = call(
         &app,
@@ -135,7 +142,7 @@ async fn catalog_pages_inline_methods_and_conservative_checks() {
 }
 #[tokio::test]
 async fn strict_errors_revisions_and_auth() {
-    let (_dir, store, graph, app) = setup();
+    let (_dir, store, graph, app, session) = setup();
     let pin = store.status().unwrap().revision;
     for path in [
         "/api/files?limit=0",
@@ -203,7 +210,7 @@ async fn strict_errors_revisions_and_auth() {
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             pin,
             &cancel,
         )
@@ -242,7 +249,7 @@ async fn strict_errors_revisions_and_auth() {
 }
 #[tokio::test]
 async fn cached_snapshot_is_independent_of_workspace_and_raw_query() {
-    let (dir, store, graph, app) = setup();
+    let (dir, store, graph, app, _session) = setup();
     let pin = store.status().unwrap().revision;
     let seed = &graph.nodes.iter().find(|n| n.name == "seed").unwrap().id;
     let query = json!({"seed":seed});

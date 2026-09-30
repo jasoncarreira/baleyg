@@ -21,6 +21,7 @@ struct Fixture {
     store: Store,
     state: Arc<http::DaemonState>,
     app: Router,
+    session: Arc<baleyg::store::topology::LeaderSession>,
 }
 fn setup(enabled: bool) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
@@ -50,12 +51,13 @@ fn setup(enabled: bool) -> Fixture {
         |_| {},
     )
     .unwrap();
+    let session = store.leader_session().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -81,6 +83,7 @@ fn setup(enabled: bool) -> Fixture {
         store,
         state,
         app,
+        session,
     }
 }
 async fn request(app: &Router, method: &str, path: &str, body: &str) -> (u16, Value) {
@@ -263,7 +266,7 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
         .store
         .publish(
             &Graph::default(),
-            &fixture.store.leader().unwrap(),
+            fixture.session.leader_guard().unwrap(),
             before,
             &Arc::new(AtomicBool::new(false)),
         )
@@ -288,7 +291,7 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
             &graph,
             &capture,
             &native,
-            &fixture.store.leader().unwrap(),
+            fixture.session.leader_guard().unwrap(),
             before,
             &cancel,
         )
@@ -467,6 +470,9 @@ async fn successful_workspace_index_automatically_rebuilds_catalog() {
     let fixture = setup(true);
     fixture.state.start_dependency_index();
     let old = ready(&fixture.app).await;
+    fixture
+        .state
+        .retain_serving_session(fixture.session.clone());
     assert_eq!(
         request(&fixture.app, "POST", "/api/index", "{}").await.0,
         202
@@ -518,12 +524,18 @@ async fn sources_keep_pinned_roots_and_reject_symlink_replacement() {
 #[tokio::test]
 async fn workspace_generation_reuse() {
     use baleyg::store::topology::UseGuard;
-    let fixture = setup(true);
-    fixture.state.start_dependency_index();
-    let catalog = ready(&fixture.app).await;
-    let old = fixture.store.status().unwrap().revision;
-    let source = source_url(&fixture.app, &catalog).await;
-    let indexes = fixture.temp.path().join("state/cache/indexes");
+    let Fixture {
+        temp,
+        store,
+        state,
+        app,
+        session,
+    } = setup(true);
+    state.start_dependency_index();
+    let catalog = ready(&app).await;
+    let old = store.status().unwrap().revision;
+    let source = source_url(&app, &catalog).await;
+    let indexes = temp.path().join("state/cache/indexes");
     let index = std::fs::read_dir(&indexes)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -533,45 +545,40 @@ async fn workspace_generation_reuse() {
         "{}.lock",
         index.file_name().unwrap().to_string_lossy()
     ));
+    drop(session);
     let exclusive = UseGuard::acquire_existing(&lock, true, true).unwrap();
     std::fs::remove_file(index.join("index.db")).unwrap();
     std::fs::remove_file(index.join("leader.lock")).unwrap();
     std::fs::remove_dir(index).unwrap();
     exclusive.remove_last().unwrap();
-    let replacement = crate::common::open_store(
-        &fixture.temp.path().join("state"),
-        &fixture.temp.path().join("workspace"),
-    )
-    .unwrap();
+    let replacement =
+        crate::common::open_store(&temp.path().join("state"), &temp.path().join("workspace"))
+            .unwrap();
     assert!(replacement.status().is_err());
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
-        &IndexOptions::new(fixture.temp.path().join("workspace")),
+        &IndexOptions::new(temp.path().join("workspace")),
         replacement.root_id(),
         &cancel,
         |_| {},
     )
     .unwrap();
+    let replacement_session = replacement.leader_session().unwrap();
     let fresh = replacement
         .publish_native(
             &graph,
             &capture,
             &native,
-            &replacement.leader().unwrap(),
+            replacement_session.leader_guard().unwrap(),
             replacement.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
     assert_eq!(fresh.index_revision, old.index_revision);
     assert_ne!(fresh.index_generation, old.index_generation);
-    assert_eq!(
-        request(&fixture.app, "GET", &symbol_url(&catalog), "")
-            .await
-            .0,
-        409
-    );
-    assert_eq!(request(&fixture.app, "GET", &source, "").await.0, 409);
-    let (_, status) = request(&fixture.app, "GET", "/api/dependencies", "").await;
+    assert_eq!(request(&app, "GET", &symbol_url(&catalog), "").await.0, 409);
+    assert_eq!(request(&app, "GET", &source, "").await.0, 409);
+    let (_, status) = request(&app, "GET", "/api/dependencies", "").await;
     assert_eq!(status["workspaceRevision"], serde_json::json!(fresh));
     assert_eq!(status["state"], "failed");
 }

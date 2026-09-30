@@ -468,12 +468,13 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        let session = store.leader_session().unwrap();
         let revision = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -484,7 +485,9 @@ mod tests {
             "question":question,"expectedRevision":revision
         }))
         .unwrap();
-        prepare(&store, request).unwrap()
+        let packet = prepare(&store, request).unwrap();
+        drop(session);
+        packet
     }
     fn packet() -> QuestionPacket {
         packet_with(CODE, "How is the request checked?")

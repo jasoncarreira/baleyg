@@ -597,19 +597,22 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        let session = store.leader_session().unwrap();
         let revision = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
             .unwrap();
         assert_eq!(store.status().unwrap().revision, revision);
         let request:QuestionRequest=serde_json::from_value(serde_json::json!({"seed":graph.nodes.iter().find(|n| n.name=="seed").unwrap().id,"question":"What does seed call?","expectedRevision":revision})).unwrap();
-        prepare(&store, request).unwrap()
+        let packet = prepare(&store, request).unwrap();
+        drop(session);
+        packet
     }
     #[tokio::test]
     async fn validated_success_invalid_failure_and_shutdown_retain_attempts() {

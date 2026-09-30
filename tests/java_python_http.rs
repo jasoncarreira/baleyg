@@ -11,7 +11,7 @@ use baleyg::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::{Graph, SymbolKind},
-    store::Store,
+    store::{Store, topology::LeaderSession},
 };
 use serde_json::{Value, json};
 use std::{
@@ -50,6 +50,7 @@ struct Fixture {
     pin: baleyg::model::IndexPin,
     graph: Graph,
     app: Router,
+    session: Arc<LeaderSession>,
 }
 fn setup() -> Fixture {
     let temp = tempfile::tempdir().unwrap();
@@ -103,12 +104,13 @@ fn setup() -> Fixture {
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
     assert!(!sentinel.exists(), "indexing executed workspace code");
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    let session = store.leader_session().unwrap();
     assert_eq!(
         publish_bundle(
             &store,
             &graph,
             &workspace,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             baleyg::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0
@@ -119,15 +121,15 @@ fn setup() -> Fixture {
         .index_revision,
         1
     );
-    let app = http::router(
-        http::new(
-            store.clone(),
-            options,
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
     Fixture {
         temp,
         workspace,
@@ -136,6 +138,7 @@ fn setup() -> Fixture {
         store,
         graph,
         app,
+        session,
     }
 }
 fn pinned(f: &Fixture, path: &str) -> String {
@@ -436,14 +439,15 @@ async fn declarations_without_bodies_are_navigable_without_fabricated_calls() {
 async fn java_python_cached_endpoints_enforce_revision_and_auth() {
     let f = setup();
     let cancel = Arc::new(AtomicBool::new(false));
+    let index_generation = f.store.status().unwrap().revision.index_generation;
     assert_eq!(
         publish_bundle(
             &f.store,
             &f.graph,
             &f.workspace,
-            &f.store.leader().unwrap(),
+            f.session.leader_guard().unwrap(),
             baleyg::model::IndexPin {
-                index_generation: f.store.status().unwrap().revision.index_generation,
+                index_generation,
                 index_revision: 1
             },
             &cancel

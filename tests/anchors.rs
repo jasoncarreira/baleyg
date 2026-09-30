@@ -515,12 +515,13 @@ fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits()
         .find(|row| row.name.is_none())
         .expect("fixture must expose an unnamed native declaration")
         .clone();
+    let leader = store.leader().unwrap();
     let pin = store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            &leader,
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -592,12 +593,13 @@ fn production_duplicate_cross_revision_is_never_inferred_unchanged() {
         .find(|row| row.name.as_deref() == Some("same") && row.key.ordinal == 0)
         .unwrap()
         .clone();
+    let leader = store.leader().unwrap();
     let first = store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            &leader,
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -636,14 +638,7 @@ fn production_duplicate_cross_revision_is_never_inferred_unchanged() {
     .unwrap();
     let (graph, native, capture) = build(&store);
     let second = store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            &store.leader().unwrap(),
-            first,
-            &cancel,
-        )
+        .publish_native(&graph, &capture, &native, &leader, first, &cancel)
         .unwrap();
     let reread = store
         .saved_view_at("duplicate", Some(second))

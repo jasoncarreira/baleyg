@@ -190,13 +190,86 @@ impl IndexArgs {
         let mut options = IndexOptions::new(root);
         options.scip_path = self.scip.clone();
         options.manifest_path = self.manifest.clone();
+        options.anchor_optional_inputs(&std::env::current_dir()?)?;
         options.max_file_bytes = self.max_file_bytes;
         Ok((store, options, cache))
     }
 }
 fn print_json(value: &impl Serialize) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
     Ok(())
+}
+
+fn write_session_json(
+    value: &impl Serialize,
+    session: &Arc<baleyg::store::topology::LeaderSession>,
+    mut writer: impl std::io::Write,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    session.verify()?;
+    writer.write_all(&bytes)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod session_output_tests {
+    use super::*;
+    use baleyg::store::topology::{LeaderSession, TopologyRoots, WorkspaceIdentity};
+    use std::io::Write;
+
+    struct ProbeWriter {
+        roots: TopologyRoots,
+        workspace: PathBuf,
+        bytes: Vec<u8>,
+        probed: bool,
+    }
+    impl Write for ProbeWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.probed {
+                self.probed = true;
+                let identity = WorkspaceIdentity::discover(Some(&self.workspace), &self.workspace)
+                    .map_err(std::io::Error::other)?;
+                let error = self.roots.leader(&identity).unwrap_err();
+                assert!(error.to_string().contains("storage_busy"), "{error:#}");
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn index_output_holds_leader_until_write_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let identity = Arc::new(WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap());
+        let session = Arc::new(LeaderSession::leader(
+            roots.leader(&identity).unwrap(),
+            identity,
+        ));
+        let mut writer = ProbeWriter {
+            roots: roots.clone(),
+            workspace: workspace.clone(),
+            bytes: vec![],
+            probed: false,
+        };
+        write_session_json(&serde_json::json!({"ok":true}), &session, &mut writer).unwrap();
+        assert!(writer.probed);
+        drop(session);
+        let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
+        roots.leader(&identity).unwrap();
+    }
 }
 
 async fn shutdown_signal() {
@@ -263,8 +336,7 @@ async fn main() -> Result<()> {
         }
         Command::Index(args) => {
             let (store, options, _) = args.resolve()?;
-            let coordinator =
-                baleyg::index_coordinator::IndexJobCoordinator::prepare(&store, None)?;
+            let worker_store = store.clone();
             let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
             let signal = tokio::spawn(async move {
@@ -272,19 +344,23 @@ async fn main() -> Result<()> {
                 flag.store(true, Ordering::Release);
             });
             let work = tokio::task::spawn_blocking(move || {
-                coordinator.run(&options, &cancel, |p| {
-                    if p.completed == p.total {
-                        eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
-                    }
-                })
+                baleyg::index_coordinator::reconcile_workspace(
+                    &worker_store,
+                    &options,
+                    &cancel,
+                    |p| {
+                        if p.completed == p.total {
+                            eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
+                        }
+                    },
+                )
             })
             .await
             .context("index worker panicked")?;
             signal.abort();
-            let revision = work?;
-            print_json(
-                &serde_json::json!({"publishedRevision":revision,"status":store.status()?}),
-            )?;
+            let (revision, session) = work?;
+            let output = serde_json::json!({"publishedRevision":revision,"status":store.status()?});
+            write_session_json(&output, &session, std::io::stdout().lock())?;
         }
         Command::Serve(args) => {
             ensure!(
@@ -311,9 +387,22 @@ async fn main() -> Result<()> {
             let mut options = IndexOptions::new(identity.root.clone());
             options.scip_path = args.index.scip.clone();
             options.manifest_path = args.index.manifest.clone();
+            options.anchor_optional_inputs(&std::env::current_dir()?)?;
             options.max_file_bytes = args.index.max_file_bytes;
             let dir = roots.cache.clone();
             let store = Store::open(roots, identity)?;
+            let startup_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+            let serving_session = match baleyg::index_coordinator::establish_serving_session(
+                &store,
+                Some(&options),
+                &startup_cancel,
+            ) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    eprintln!("Evidence unavailable at startup: {error:#}");
+                    None
+                }
+            };
             let token = auth::load_or_create_token(&token_path)?;
             let listener = tokio::net::TcpListener::bind(args.bind)
                 .await
@@ -385,6 +474,9 @@ async fn main() -> Result<()> {
                     rust_library,
                 }),
             )?;
+            if let Some(session) = serving_session {
+                state.retain_serving_session(session);
+            }
             state.start_dependency_index();
             eprintln!(
                 "Baleyg: http://{address}/\nState: {}\nToken file: {}\nRefresh is explicit. No repository commands run.\n{inference_notice}",
@@ -400,14 +492,25 @@ async fn main() -> Result<()> {
                 .await
                 .context("serve daemon")?;
         }
-        Command::Status(args) => print_json(&args.store()?.status()?)?,
+        Command::Status(args) => {
+            let store = args.store()?;
+            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+            let session =
+                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
+            write_session_json(&store.status()?, &session, std::io::stdout().lock())?;
+        }
         Command::Symbols(args) => {
             ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
-            let (revision, items) = args
-                .workspace
-                .store()?
-                .symbols_at(&args.search, args.limit)?;
-            print_json(&serde_json::json!({"revision":revision,"items":items}))?;
+            let store = args.workspace.store()?;
+            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+            let session =
+                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
+            let (revision, items) = store.symbols_at(&args.search, args.limit)?;
+            write_session_json(
+                &serde_json::json!({"revision":revision,"items":items}),
+                &session,
+                std::io::stdout().lock(),
+            )?;
         }
         Command::Query(args) => {
             let query = ViewQuery {
@@ -419,21 +522,26 @@ async fn main() -> Result<()> {
                 exclude_paths: args.exclude_path,
             };
             query.validate()?;
-            let view = args
-                .workspace
-                .store()?
+            let store = args.workspace.store()?;
+            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+            let session =
+                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
+            let view = store
                 .query_view(&query)?
                 .context("seed not found in current index")?;
-            print_json(&view)?;
+            write_session_json(&view, &session, std::io::stdout().lock())?;
         }
         Command::Export(args) => {
             let (roots, identity) = args.workspace.resolve_unattached()?;
             if let Some(path) = args.output.as_ref() {
                 roots.validate_external(&identity, std::slice::from_ref(path))?;
             }
-            let graph = Store::open(roots, identity.attach_marker()?)?.graph()?;
+            let store = Store::open(roots, identity.attach_marker()?)?;
+            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+            let session =
+                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
+            let graph = store.graph()?;
             if let Some(path) = args.output {
-                use std::io::Write;
                 let mut options = std::fs::OpenOptions::new();
                 options.write(true).create_new(true);
                 #[cfg(unix)]
@@ -444,10 +552,9 @@ async fn main() -> Result<()> {
                 let mut file = options
                     .open(path)
                     .context("create export (existing files are never overwritten)")?;
-                serde_json::to_writer_pretty(&mut file, &graph)?;
-                file.write_all(b"\n")?;
+                write_session_json(&graph, &session, &mut file)?;
             } else {
-                print_json(&graph)?;
+                write_session_json(&graph, &session, std::io::stdout().lock())?;
             }
         }
     }

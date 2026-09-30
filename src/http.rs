@@ -10,8 +10,9 @@ use crate::{
     planning::{
         self, FocusedView, QuestionPacket, QuestionPreview, QuestionRequest, SelectionEnvelope,
     },
-    store::Store,
+    store::{EvidenceFence, EvidenceFencePolicy, Store},
 };
+use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
@@ -54,7 +55,7 @@ struct Jobs {
 const MAX_PACKETS: usize = 8;
 const MAX_PACKET_BYTES: usize = 1024 * 1024;
 const MAX_CACHE_BYTES: usize = 8 * MAX_PACKET_BYTES;
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PacketCache {
     packets: VecDeque<(Arc<QuestionPacket>, usize)>,
     bytes: usize,
@@ -73,6 +74,22 @@ impl PacketCache {
         }
         self.bytes += bytes;
         self.packets.push_back((packet, bytes));
+    }
+    // The final fence runs after admission while this mutex is held. A failed
+    // response cannot evict an earlier packet or replace its same-ID entry.
+    fn remember_fenced(
+        &mut self,
+        packet: Arc<QuestionPacket>,
+        bytes: usize,
+        finish: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let prior = self.clone();
+        self.remember(packet, bytes);
+        if let Err(error) = finish() {
+            *self = prior;
+            return Err(error);
+        }
+        Ok(())
     }
 }
 struct DependencyIndex {
@@ -101,11 +118,22 @@ impl DependencyIndex {
 }
 pub struct DaemonState {
     store: Store,
+    serving_session: Mutex<Option<Arc<crate::store::topology::LeaderSession>>>,
     options: IndexOptions,
     browser: crate::file_tree::SourceDir,
     rust_sources: Vec<crate::rust_sources::Root>,
     dependency_options: Option<CatalogOptions>,
     dependencies: Mutex<DependencyIndex>,
+    #[cfg(test)]
+    dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    normal_index_worker_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    normal_index_post_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
@@ -207,6 +235,7 @@ pub fn new_with_dependency_options(
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
     Ok(Arc::new(DaemonState {
         store,
+        serving_session: Mutex::new(None),
         options: index_options,
         browser: crate::file_tree::SourceDir::open(&browse_root)?,
         rust_sources: crate::rust_sources::open_roots(source_roots)?,
@@ -223,6 +252,16 @@ pub fn new_with_dependency_options(
             catalog: None,
             warnings: Vec::new(),
         }),
+        #[cfg(test)]
+        dependency_capture_hook: Mutex::new(None),
+        #[cfg(test)]
+        outer_fence_hook: Mutex::new(None),
+        #[cfg(test)]
+        preview_finish_hook: Mutex::new(None),
+        #[cfg(test)]
+        normal_index_worker_hook: Mutex::new(None),
+        #[cfg(test)]
+        normal_index_post_capture_hook: Mutex::new(None),
         dependency_options: catalog_options,
         token,
         hosts,
@@ -238,6 +277,19 @@ pub fn new_with_dependency_options(
     }))
 }
 impl DaemonState {
+    pub fn retain_serving_session(&self, session: Arc<crate::store::topology::LeaderSession>) {
+        *self.serving_session.lock().unwrap() = Some(session);
+    }
+    pub fn retained_serving_session(
+        &self,
+    ) -> anyhow::Result<Arc<crate::store::topology::LeaderSession>> {
+        self.serving_session
+            .lock()
+            .unwrap()
+            .clone()
+            .context("index_not_ready: no verified daemon serving session")
+    }
+
     /// Start a replacement generation without doing filesystem or database work on the caller.
     /// A previous generation can finish, but can never publish over its replacement.
     pub fn start_dependency_index(self: &Arc<Self>) {
@@ -725,8 +777,72 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         )
         .fallback(|| async { missing().into_response() })
         .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            evidence_response_guard,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+// Only endpoints that include a native snapshot need this outer response fence.
+// Durable records and external-source-only routes keep their independent policy.
+fn native_response_route(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/status"
+            | "/api/tree"
+            | "/api/files"
+            | "/api/methods"
+            | "/api/sequence"
+            | "/api/classes"
+            | "/api/class-diagram"
+            | "/api/navigation"
+            | "/api/symbols"
+            | "/api/symbol"
+            | "/api/source"
+            | "/api/query"
+            | "/api/dependencies"
+            | "/api/dependencies/symbols"
+            | "/api/dependencies/source"
+            | "/api/rust-sources/tree"
+    )
+}
+async fn evidence_response_guard(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !native_response_route(request.uri().path()) {
+        return next.run(request).await;
+    }
+    // The snapshot is short: retain its protected leader observation through
+    // serialization. An ordinary same-incarnation publish does not reject an
+    // already-materialized coherent unpinned response.
+    let admitted = db(state.clone(), |store| {
+        let snapshot = store.evidence_response()?;
+        Ok(snapshot.into_fence(EvidenceFencePolicy::T03))
+    })
+    .await;
+    let response = next.run(request).await;
+    if !response.status().is_success() {
+        // Preserve validation/materialization error precedence, but still check T03.
+        if let Ok(fence) = admitted {
+            let _ = fence.finish(());
+        }
+        return response;
+    }
+    let fence = match admitted {
+        Ok(fence) => fence,
+        Err(error) => return error.into_response(),
+    };
+    #[cfg(test)]
+    if let Some(hook) = state.outer_fence_hook.lock().unwrap().as_ref() {
+        hook();
+    }
+    match fence.finish(response) {
+        Ok(response) => response,
+        Err(error) => ApiError::from(error).into_response(),
+    }
 }
 fn dependency_stale() -> ApiError {
     ApiError(
@@ -761,27 +877,42 @@ impl DaemonState {
         Ok(())
     }
 }
-async fn dependency_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
-    dependency_work(move || {
-        let revision = s.store.status()?.revision;
-        let (state, catalog, mut warnings) = {
-            let index = s.dependencies.lock().unwrap();
-            (index.state, index.catalog.clone(), index.warnings.clone())
-        };
-        if let Some(catalog) = catalog {
-            if catalog.workspace_revision == revision {
-                return Ok(Json(json!({"state":state,"workspaceRevision":revision,
-                    "catalogId":catalog.id,"packages":catalog.packages,
-                    "symbolCount":catalog.symbols.len(),"warnings":catalog.warnings})));
-            }
+async fn dependency_status(State(s): State<Arc<DaemonState>>) -> Result<Response, ApiError> {
+    dependency_work(move || dependency_status_response(&s, || {}).map_err(ApiError::from)).await
+}
+fn dependency_status_response(
+    s: &DaemonState,
+    after_capture: impl FnOnce(),
+) -> anyhow::Result<Response> {
+    let response = s.store.evidence_response()?;
+    let revision = response.status()?.revision;
+    after_capture();
+    #[cfg(test)]
+    if let Some(hook) = s.dependency_capture_hook.lock().unwrap().as_ref() {
+        hook();
+    }
+    let (state, catalog, mut warnings) = {
+        let index = s.dependencies.lock().unwrap();
+        (index.state, index.catalog.clone(), index.warnings.clone())
+    };
+    let payload = if let Some(catalog) = catalog {
+        if catalog.workspace_revision == revision {
+            json!({"state":state,"workspaceRevision":revision,
+                "catalogId":catalog.id,"packages":catalog.packages,
+                "symbolCount":catalog.symbols.len(),"warnings":catalog.warnings})
+        } else {
             warnings.push("Workspace changed; refresh the dependency catalog".into());
-            return Ok(Json(json!({"state":"failed","workspaceRevision":revision,
-                "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})));
+            json!({"state":"failed","workspaceRevision":revision,
+                "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
         }
-        Ok(Json(json!({"state":state,"workspaceRevision":revision,
-            "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})))
-    })
-    .await
+    } else {
+        json!({"state":state,"workspaceRevision":revision,
+            "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
+    };
+    // IntoResponse serializes the owned JSON before the final T03 check. No
+    // evidence body can escape on a failed fence, including the failed-catalog branch.
+    let result = Json(payload).into_response();
+    response.finish(result)
 }
 async fn dependency_refresh(
     State(s): State<Arc<DaemonState>>,
@@ -1328,6 +1459,14 @@ async fn start_index(
         serde_json::from_value(value).map_err(|_| invalid())?
     };
     let requested = request.expected_revision;
+    if s.store.is_recreate_pending() {
+        if requested.is_some() {
+            return Err(ApiError::from(anyhow::anyhow!(
+                "revision conflict: exceptional recovery has no decodable prior pin"
+            )));
+        }
+        return start_exceptional_index(s);
+    }
     {
         let jobs = s.jobs.lock().unwrap();
         if jobs
@@ -1343,8 +1482,15 @@ async fn start_index(
             ));
         }
     }
+    let retained = s.serving_session.lock().unwrap().clone().ok_or(ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "index_not_ready",
+        "No verified daemon serving session",
+    ))?;
     let coordinator = db(s.clone(), move |store| {
-        crate::index_coordinator::IndexJobCoordinator::prepare(store, requested)
+        crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+            store, requested, retained,
+        )
     })
     .await?;
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1371,6 +1517,15 @@ async fn start_index(
                 "An index job is already active",
             ));
         }
+        // An ordinary coordinator prepared before a concurrent corruption must
+        // never reserve a stale owner after an exceptional job has taken its slot.
+        if s.store.is_recreate_pending() {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recovery_required",
+                "Explicit index recovery now required",
+            ));
+        }
         if jobs.jobs.len() >= 100 {
             let old = jobs
                 .jobs
@@ -1391,11 +1546,30 @@ async fn start_index(
         let worker_id = id.clone();
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            coordinator.run(&worker.options, &worker_cancel, |p| {
+            #[cfg(test)]
+            if let Some(hook) = worker.normal_index_worker_hook.lock().unwrap().clone() {
+                hook();
+            }
+            let progress = |p| {
                 if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
                     j.progress = p;
                 }
-            })
+            };
+            #[cfg(test)]
+            let result =
+                coordinator.run_observed(&worker.options, &worker_cancel, progress, |_| {
+                    let hook = worker
+                        .normal_index_post_capture_hook
+                        .lock()
+                        .unwrap()
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                });
+            #[cfg(not(test))]
+            let result = coordinator.run(&worker.options, &worker_cancel, progress);
+            result
         })
         .await;
         let outcome = match result {
@@ -1406,6 +1580,156 @@ async fn start_index(
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
+// Exceptional recovery has no decodable prior pin. Reserve the only job and detach
+// any old daemon owner atomically, then drop that owner before the worker tries EX.
+// An unrelated protected reader remains in control of BUSY; no retry is implicit.
+fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let job = IndexJob {
+        id: uuid::Uuid::new_v4().to_string(),
+        state: "running".into(),
+        progress: IndexProgress::default(),
+        revision: None,
+        error: None,
+        started_at: now(),
+        finished_at: None,
+    };
+    let old_owner = {
+        let mut jobs = s.jobs.lock().unwrap();
+        if jobs
+            .current
+            .as_ref()
+            .and_then(|id| jobs.jobs.get(id))
+            .is_some_and(|j| j.finished_at.is_none())
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "job_active",
+                "An index job is already active",
+            ));
+        }
+        if !s.store.is_recreate_pending() {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "index_not_ready",
+                "Exceptional recovery disposition changed; retry explicit indexing",
+            ));
+        }
+        // All admission paths touching both locks use jobs -> serving_session.
+        let old_owner = s.serving_session.lock().unwrap().take();
+        if jobs.jobs.len() >= 100 {
+            let old = jobs
+                .jobs
+                .iter()
+                .min_by_key(|(_, j)| &j.started_at)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = old {
+                jobs.jobs.remove(&id);
+            }
+        }
+        jobs.current = Some(job.id.clone());
+        jobs.cancel = cancel.clone();
+        jobs.jobs.insert(job.id.clone(), job.clone());
+        old_owner
+    };
+    drop(old_owner);
+    let id = job.id.clone();
+    tokio::spawn(async move {
+        let worker = s.clone();
+        let worker_id = id.clone();
+        let worker_cancel = cancel.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::index_coordinator::reconcile_workspace(
+                &worker.store,
+                &worker.options,
+                &worker_cancel,
+                |p| {
+                    if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
+                        j.progress = p;
+                    }
+                },
+            )
+        })
+        .await;
+        let outcome = match result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("index worker failed")),
+        };
+        finish_exceptional_index_job(&s, &id, outcome, &cancel, |_| {});
+    });
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+// A successful worker keeps its leader guard inside the returned Arc even across
+// spawn_blocking handoff. Validation and any test barrier run while that Arc lives.
+// Install it before completing the job; never publish a success without an owner.
+fn finish_exceptional_index_job(
+    s: &Arc<DaemonState>,
+    id: &str,
+    result: anyhow::Result<(IndexPin, Arc<crate::store::topology::LeaderSession>)>,
+    cancel: &CancelFlag,
+    before_install: impl FnOnce(&Arc<crate::store::topology::LeaderSession>),
+) {
+    let result = result.and_then(|(pin, session)| {
+        s.store.verify_leader_session(&session)?;
+        anyhow::ensure!(
+            s.store.status()?.revision == pin,
+            "revision conflict: exceptional recovery pin changed before owner installation"
+        );
+        before_install(&session);
+        s.store.verify_leader_session(&session)?;
+        Ok((pin, session))
+    });
+    let mut abandoned = None;
+    let mut jobs = s.jobs.lock().unwrap();
+    let mut serving = s.serving_session.lock().unwrap();
+    let job = jobs
+        .jobs
+        .get_mut(id)
+        .expect("started exceptional index job");
+    let published = match result {
+        Ok((_pin, session)) if serving.is_some() => {
+            abandoned = Some(session);
+            job.state = "failed".into();
+            job.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
+            false
+        }
+        Ok((pin, session)) => {
+            // A late cancellation cannot undo durable activation. Retain the
+            // verified owner and report the committed revision as completed.
+            *serving = Some(session);
+            job.revision = Some(pin);
+            job.state = "completed".into();
+            true
+        }
+        Err(error) if cancel.load(Ordering::Acquire) => {
+            let _ = error;
+            job.state = "cancelled".into();
+            false
+        }
+        Err(error) => {
+            job.state = "failed".into();
+            let code = if error.to_string().starts_with("revision conflict") {
+                "revision_conflict"
+            } else if error.to_string().starts_with("storage_busy") {
+                "storage_busy"
+            } else {
+                "index_failed"
+            };
+            job.error = Some(json!({"code":code,"message":"Index job failed"}));
+            false
+        }
+    };
+    job.finished_at = Some(now());
+    drop(serving);
+    drop(jobs);
+    drop(abandoned);
+    if published {
+        *s.packets.lock().unwrap() = PacketCache::default();
+        s.start_dependency_index();
+    }
+}
+
 // A failed publication cannot release cached packet ownership. Only a committed
 // revision transition clears packets; old barriers still block their public reads.
 fn finish_index_job(
@@ -1646,8 +1970,28 @@ async fn delete_annotation(
 fn question_error(e: anyhow::Error) -> ApiError {
     let message = e.to_string();
     if message.starts_with("revision conflict")
-        || message.starts_with("index_not_ready")
-        || message.starts_with("incompatible_index")
+        || [
+            "root_changed",
+            "root_key_collision",
+            "workspace_id_changed",
+            "index_not_ready",
+            "storage_busy",
+            "incompatible_index",
+            "incompatible_record",
+            "incomplete_record",
+            "recovery_required",
+            "unsafe_index",
+        ]
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+        || e.chain().any(|cause| {
+            cause
+                .downcast_ref::<rusqlite::Error>()
+                .is_some_and(|error| {
+                    matches!(error, rusqlite::Error::SqliteFailure(info, _) if matches!(info.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+                })
+        })
     {
         e.into()
     } else if message == "question seed not found" {
@@ -1689,12 +2033,12 @@ async fn question_work<T: Send + 'static>(
 async fn question_preview(
     State(s): State<Arc<DaemonState>>,
     body: Result<Json<QuestionRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<QuestionPreview>, ApiError> {
+) -> Result<Response, ApiError> {
     let Json(request) = body.map_err(|_| invalid())?;
     request.validate().map_err(|_| invalid())?;
-    let worker = s.clone();
-    let (result, cached, bytes) = question_work(move || {
-        let packet = planning::prepare(&worker.store, request)?;
+    question_work(move || {
+        let response = s.store.evidence_response()?;
+        let packet = planning::prepare_in(&response, request)?;
         let selection = planning::preview(&packet)?;
         let view = planning::assemble(&packet, &selection, "localPreview")?;
         let bytes = serde_json::to_vec(&packet)?.len();
@@ -1703,24 +2047,34 @@ async fn question_preview(
             "complete question packet exceeds 1 MiB"
         );
         let cached = Arc::new(packet.clone());
-        Ok((
-            QuestionPreview {
-                packet,
-                selection,
-                view,
-            },
-            cached,
-            bytes,
-        ))
+        let result = Json(QuestionPreview {
+            packet,
+            selection,
+            view,
+        })
+        .into_response();
+        // Admission to the cache is part of response assembly, before the final fence.
+        s.packets
+            .lock()
+            .unwrap()
+            .remember_fenced(cached, bytes, || {
+                #[cfg(test)]
+                if let Some(hook) = s.preview_finish_hook.lock().unwrap().as_ref() {
+                    hook();
+                }
+                response.finish(())
+            })?;
+        Ok(result)
     })
-    .await?;
-    // Only complete successful previews enter the cache. No mutex spans an await.
-    s.packets.lock().unwrap().remember(cached, bytes);
-    Ok(Json(result))
+    .await
 }
-async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPacket>, ApiError> {
+async fn cached_packet(
+    s: Arc<DaemonState>,
+    id: String,
+) -> Result<(Arc<QuestionPacket>, EvidenceFence), ApiError> {
     // Gate readiness before touching cached evidence, including stale packets.
-    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await?;
+    let response = s.store.evidence_response()?;
+    let revision = response.status()?.revision;
     let packet = {
         let cache = s.packets.lock().unwrap();
         cache
@@ -1741,20 +2095,34 @@ async fn cached_packet(s: Arc<DaemonState>, id: String) -> Result<Arc<QuestionPa
     // selected graph and source witnesses under one pinned SQLite snapshot
     // before exporting, displaying, or sending cached evidence to a provider.
     let witness = packet.clone();
-    db(s, move |store| {
-        store.validate_selected_view(&witness.context, &witness.source_files)
-    })
-    .await?;
-    Ok(packet)
+    response.validate_selected_view(&witness.context, &witness.source_files)?;
+    let fence = response.into_fence(EvidenceFencePolicy::ExactPin(packet.revision));
+    Ok((packet, fence))
+}
+// Always run the post-materialization fence, even when assembly fails. Preserve
+// the original materialization error, as Store::with_evidence does.
+fn finish_packet_result(
+    fence: &EvidenceFence,
+    result: Result<Response, ApiError>,
+) -> Result<Response, ApiError> {
+    let checked = fence.finish(()).map_err(ApiError::from);
+    match result {
+        Err(error) => Err(error),
+        Ok(response) => {
+            checked?;
+            Ok(response)
+        }
+    }
 }
 async fn question_export(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let packet = cached_packet(s, id).await?;
-    Ok(Json(
-        question_work(move || jev::request_for(&packet)).await?,
-    ))
+) -> Result<Response, ApiError> {
+    let (packet, fence) = cached_packet(s, id).await?;
+    let result = question_work(move || jev::request_for(&packet))
+        .await
+        .map(|value| Json(value).into_response());
+    finish_packet_result(&fence, result)
 }
 #[derive(Serialize)]
 struct QuestionSelection {
@@ -1765,32 +2133,32 @@ async fn question_import(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Json(response): Json<Value>,
-) -> Result<Json<QuestionSelection>, ApiError> {
-    let packet = cached_packet(s, id).await?;
-    Ok(Json(
-        question_work(move || {
-            let selection = jev::parse_response(&packet, &response)?;
-            let warnings = jev::response_warnings(&response);
-            let mut view = planning::assemble(&packet, &selection, "importedJev")?;
-            view.warnings.extend(warnings);
-            Ok(QuestionSelection { selection, view })
-        })
-        .await?,
-    ))
+) -> Result<Response, ApiError> {
+    let (packet, fence) = cached_packet(s, id).await?;
+    let result = question_work(move || {
+        let selection = jev::parse_response(&packet, &response)?;
+        let warnings = jev::response_warnings(&response);
+        let mut view = planning::assemble(&packet, &selection, "importedJev")?;
+        view.warnings.extend(warnings);
+        Ok(QuestionSelection { selection, view })
+    })
+    .await
+    .map(|value| Json(value).into_response());
+    finish_packet_result(&fence, result)
 }
 async fn question_selection(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     Json(selection): Json<SelectionEnvelope>,
-) -> Result<Json<QuestionSelection>, ApiError> {
-    let packet = cached_packet(s, id).await?;
-    Ok(Json(
-        question_work(move || {
-            let view = planning::assemble(&packet, &selection, "manual")?;
-            Ok(QuestionSelection { selection, view })
-        })
-        .await?,
-    ))
+) -> Result<Response, ApiError> {
+    let (packet, fence) = cached_packet(s, id).await?;
+    let result = question_work(move || {
+        let view = planning::assemble(&packet, &selection, "manual")?;
+        Ok(QuestionSelection { selection, view })
+    })
+    .await
+    .map(|value| Json(value).into_response());
+    finish_packet_result(&fence, result)
 }
 
 // Status only reads the local ledger. No endpoint other than jev-run contacts Jev.
@@ -1847,7 +2215,7 @@ async fn question_answer(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     // Accept only an empty object: never take client prompts, sources or provider overrides.
     let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
     if !request.as_object().is_some_and(|object| object.is_empty()) {
@@ -1859,10 +2227,13 @@ async fn question_answer(
         "acp_disabled",
         "Live ACP is disabled",
     ))?;
-    let packet = cached_packet(s.clone(), id).await?;
+    let (packet, fence) = cached_packet(s.clone(), id).await?;
     let response = provider.run(&packet).await;
     // A stale failure must not replace the state of a newer question either.
-    let revision = db(s, |store| Ok(store.status()?.revision)).await?;
+    let revision = db(s, |store| Ok(store.status()?.revision)).await;
+    let fence_check = fence.finish(()).map_err(ApiError::from);
+    let revision = revision?;
+    fence_check?;
     if revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1870,12 +2241,15 @@ async fn question_answer(
             "The index revision changed",
         ));
     }
-    let response = response.map_err(acp_error)?;
-    Ok(Json(
-        json!({"packetId":packet.packet_id,"revision":packet.revision,
-        "source":"liveAcp","attemptId":response.attempt_id,"answer":response.answer,
-        "latencyMs":response.latency_ms,"estimatedUsd":response.estimated_usd}),
-    ))
+    let result = response.map_err(acp_error).map(|response| {
+        Json(
+            json!({"packetId":packet.packet_id,"revision":packet.revision,
+            "source":"liveAcp","attemptId":response.attempt_id,"answer":response.answer,
+            "latencyMs":response.latency_ms,"estimatedUsd":response.estimated_usd}),
+        )
+        .into_response()
+    });
+    finish_packet_result(&fence, result)
 }
 
 async fn jev_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
@@ -1930,7 +2304,7 @@ async fn question_run(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     // No caller-supplied source, credentials, URL, or budget overrides.
     if !body.is_empty() && body.as_ref() != b"{}" {
         return Err(invalid());
@@ -1941,10 +2315,13 @@ async fn question_run(
         "jev_disabled",
         "Live Jev is disabled",
     ))?;
-    let packet = cached_packet(s.clone(), id).await?;
+    let (packet, fence) = cached_packet(s.clone(), id).await?;
     let response = provider.run(&packet).await;
     // Check even failed attempts. Reservations remain accounted on stale results.
-    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await?;
+    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await;
+    let fence_check = fence.finish(()).map_err(ApiError::from);
+    let revision = revision?;
+    fence_check?;
     if revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -1952,14 +2329,23 @@ async fn question_run(
             "The index revision changed",
         ));
     }
-    let response = response.map_err(live_jev_error)?;
-    let selection = response.selection.clone();
-    let mut view =
-        question_work(move || planning::assemble(&packet, &selection, "liveJev")).await?;
-    view.warnings.extend(response.warnings.clone());
-    Ok(Json(json!({"selection":response.selection,"view":view,
-        "attemptId":response.attempt_id,"latencyMs":response.latency_ms,
-        "estimatedUsd":response.estimated_usd,"usage":response.usage,"warnings":response.warnings})))
+    let result = match response.map_err(live_jev_error) {
+        Err(error) => Err(error),
+        Ok(response) => {
+            let selection = response.selection.clone();
+            question_work(move || planning::assemble(&packet, &selection, "liveJev"))
+                .await
+                .map(|mut view| {
+                    view.warnings.extend(response.warnings.clone());
+                    Json(json!({"selection":response.selection,"view":view,
+                        "attemptId":response.attempt_id,"latencyMs":response.latency_ms,
+                        "estimatedUsd":response.estimated_usd,"usage":response.usage,
+                        "warnings":response.warnings}))
+                    .into_response()
+                })
+        }
+    };
+    finish_packet_result(&fence, result)
 }
 
 #[cfg(test)]
@@ -1967,6 +2353,135 @@ mod live_tests {
     use super::*;
     use crate::indexer::index_workspace_bundle;
     use tower::ServiceExt;
+
+    #[test]
+    fn outer_http_fence_covers_native_composition_not_durable_payloads() {
+        for path in [
+            "/api/status",
+            "/api/tree",
+            "/api/files",
+            "/api/methods",
+            "/api/sequence",
+            "/api/classes",
+            "/api/class-diagram",
+            "/api/navigation",
+            "/api/symbols",
+            "/api/symbol",
+            "/api/source",
+            "/api/query",
+            "/api/dependencies",
+            "/api/dependencies/symbols",
+            "/api/dependencies/source",
+            "/api/rust-sources/tree",
+        ] {
+            assert!(native_response_route(path), "{path}");
+        }
+        for path in [
+            "/api/views",
+            "/api/views/saved",
+            "/api/annotations",
+            "/api/rust-sources/file",
+            "/api/healthz",
+            "/api/jobs/current",
+        ] {
+            assert!(!native_response_route(path), "{path}");
+        }
+    }
+    #[test]
+    fn question_error_keeps_typed_refusals_and_selection_errors() {
+        for (message, code) in [
+            ("root_changed: fixture", "root_changed"),
+            ("recovery_required: fixture", "recovery_required"),
+            ("unsafe_index: fixture", "unsafe_index"),
+            ("index_not_ready: fixture", "index_not_ready"),
+        ] {
+            assert_eq!(question_error(anyhow::anyhow!("{message}")).1, code);
+        }
+        assert_eq!(
+            question_error(anyhow::anyhow!("revision conflict")).1,
+            "revision_conflict"
+        );
+        assert_eq!(
+            question_error(anyhow::anyhow!("invalid selection")).1,
+            "invalid_question_selection"
+        );
+        assert_eq!(
+            question_error(anyhow::anyhow!("complete question packet exceeds 1 MiB")).1,
+            "evidence_too_large"
+        );
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert_eq!(question_error(busy.into()).1, "storage_busy");
+    }
+
+    #[tokio::test]
+    async fn preview_root_change_after_serialization_discards_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.js"), "function go() { measured(); }\n").unwrap();
+        let options = IndexOptions::new(workspace.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let seed = graph
+            .nodes
+            .iter()
+            .find(|node| node.name == "go")
+            .unwrap()
+            .id
+            .clone();
+        let session = store.leader_session().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let state = new(
+            store,
+            options,
+            "0123456789abcdef".repeat(4),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(session);
+        let root = workspace.clone();
+        *state.preview_finish_hook.lock().unwrap() = Some(Arc::new(move || {
+            std::fs::rename(&root, root.with_file_name("replaced-workspace")).unwrap();
+            std::fs::create_dir(&root).unwrap();
+        }));
+        let app = router(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/questions/preview")
+            .header("host", "127.0.0.1:7331")
+            .header(
+                "authorization",
+                "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"seed":seed,"question":"what does go do?","expectedRevision":pin})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "root_changed");
+        assert!(body.get("packet").is_none());
+        assert!(state.packets.lock().unwrap().packets.is_empty());
+    }
 
     #[test]
     fn acp_controlled_errors_are_exact_and_sanitized() {
@@ -1988,6 +2503,16 @@ mod live_tests {
     #[tokio::test]
     async fn live_response_is_rejected_if_snapshot_changes_during_call() {
         mock_run(true, "success").await;
+    }
+
+    #[tokio::test]
+    async fn pinned_packet_conflicts_even_when_provider_fails() {
+        mock_run(true, "context_exceeded").await;
+    }
+
+    #[tokio::test]
+    async fn packet_fence_survives_provider_await_and_takeover() {
+        mock_run(false, "takeover").await;
     }
 
     #[tokio::test]
@@ -2105,12 +2630,13 @@ mod live_tests {
             .unwrap()
             .id
             .clone();
+        let session = store.leader_session().unwrap();
         store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -2126,16 +2652,16 @@ mod live_tests {
             .with_test_endpoint(endpoint),
         );
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let app = router(
-            new_with_jev(
-                store.clone(),
-                options,
-                token.into(),
-                "127.0.0.1:7331".parse().unwrap(),
-                Some(provider.clone()),
-            )
-            .unwrap(),
-        );
+        let state = new_with_jev(
+            store.clone(),
+            options,
+            token.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+            Some(provider.clone()),
+        )
+        .unwrap();
+        state.retain_serving_session(session.clone());
+        let app = router(state);
         let request = |path: &str, body: Value| {
             axum::http::Request::builder()
                 .method("POST")
@@ -2213,16 +2739,49 @@ mod live_tests {
                 |_| {},
             )
             .unwrap();
-            store
-                .publish_native(
+            let expected = store.status().unwrap().revision;
+            let publisher = store.clone();
+            let owner = session.clone();
+            let publishing = tokio::task::spawn_blocking(move || {
+                publisher.publish_native(
                     &updated,
                     &captured,
                     &native,
-                    &store.leader().unwrap(),
-                    store.status().unwrap().revision,
+                    owner.leader_guard().unwrap(),
+                    expected,
                     &cancel,
                 )
+            });
+            // The provider is still blocked. This commit must not wait for a
+            // SQLite read transaction held by the cached packet's outer fence.
+            tokio::time::timeout(std::time::Duration::from_secs(5), publishing)
+                .await
+                .unwrap()
+                .unwrap()
                 .unwrap();
+        }
+        if scenario == "takeover" {
+            use std::io::{Seek, SeekFrom, Write};
+            fn lock_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+                for entry in std::fs::read_dir(dir).ok()?.flatten() {
+                    let path = entry.path();
+                    if path.file_name().is_some_and(|name| name == "leader.lock") {
+                        return Some(path);
+                    }
+                    if path.is_dir()
+                        && let Some(found) = lock_in(&path)
+                    {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            let lock = lock_in(&dir.path().join("state")).unwrap();
+            let mut file = std::fs::OpenOptions::new().write(true).open(lock).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
         }
         release.notify_one();
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), run)
@@ -2232,6 +2791,15 @@ mod live_tests {
             .unwrap();
         if change_snapshot {
             assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("liveJev"));
+        } else if scenario == "takeover" {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "index_not_ready");
+            assert!(body.get("view").is_none());
         } else if scenario == "invalid_selection" {
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -2283,6 +2851,679 @@ mod live_tests {
 }
 
 #[cfg(test)]
+mod exceptional_recovery_tests {
+    use super::*;
+    use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        Store,
+        Arc<DaemonState>,
+        TopologyRoots,
+        WorkspaceIdentity,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            tmp.path().join("state/cache"),
+            tmp.path().join("state/data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        drop(old);
+        std::fs::write(roots.index_db(&identity), b"bad sqlite index header").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        assert!(store.is_recreate_pending());
+        let state = new(
+            store.clone(),
+            IndexOptions::new(root),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        (tmp, store, state, roots, identity)
+    }
+
+    #[tokio::test]
+    async fn concurrent_posts_admit_one_exceptional_worker() {
+        // The current-thread executor cannot poll the spawned worker between
+        // these synchronous admissions. No timer or filesystem race is needed.
+        let (_tmp, _store, state, _roots, _identity) = fixture();
+        let (status, first) = start_exceptional_index(state.clone())
+            .unwrap_or_else(|error| panic!("unexpected admission: {} {}", error.1, error.2));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let error = start_index(State(state.clone()), Bytes::from_static(b"{}"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1, "job_active");
+        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
+        let id = first.0.id;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_job_racing_a_new_pending_disposition_blocks_exceptional_post() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            tmp.path().join("state/cache"),
+            tmp.path().join("state/data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let index = roots.index_db(&identity);
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root);
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let (_, owner) =
+            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
+                .unwrap();
+        let state = new(
+            store.clone(),
+            options,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(owner);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *state.normal_index_worker_hook.lock().unwrap() = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
+        let (status, normal) = start_index(State(state.clone()), Bytes::new())
+            .await
+            .unwrap_or_else(|error| panic!("normal admission: {} {}", error.1, error.2));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::write(&index, b"bad sqlite index header").unwrap();
+        assert!(store.status().is_err());
+        assert!(store.is_recreate_pending());
+        let second = start_index(State(state.clone()), Bytes::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(second.0, StatusCode::CONFLICT);
+        assert_eq!(second.1, "job_active");
+        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
+        release_tx.send(()).unwrap();
+        let id = normal.0.id;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(store.is_recreate_pending());
+    }
+
+    #[tokio::test]
+    async fn leader_remains_locked_across_worker_result_and_atomic_install() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let options = state.options.clone();
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            jobs.current = Some(id.clone());
+            jobs.cancel = cancel.clone();
+            jobs.jobs.insert(
+                id.clone(),
+                IndexJob {
+                    id: id.clone(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            );
+        }
+        let result =
+            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
+                .unwrap();
+        let pin = result.0;
+        let before = &state;
+        finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |session| {
+            assert!(session.is_leader());
+            assert!(before.retained_serving_session().is_err());
+            assert!(
+                roots
+                    .leader(&identity)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("storage_busy")
+            );
+            assert_eq!(store.status().unwrap().revision, pin);
+        });
+        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "completed");
+        assert_eq!(state.jobs.lock().unwrap().jobs[&id].revision, Some(pin));
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(
+            roots
+                .leader(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("storage_busy")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_durable_recovery_reports_completed_with_new_owner() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            jobs.current = Some(id.clone());
+            jobs.cancel = cancel.clone();
+            jobs.jobs.insert(
+                id.clone(),
+                IndexJob {
+                    id: id.clone(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            );
+        }
+        let result =
+            crate::index_coordinator::reconcile_workspace(&store, &state.options, &cancel, |_| {})
+                .unwrap();
+        let pin = result.0;
+        cancel.store(true, Ordering::Release);
+        finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |_| {});
+        let job = state.jobs.lock().unwrap().jobs[&id].clone();
+        assert_eq!(job.state, "completed");
+        assert_eq!(job.revision, Some(pin));
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert!(
+            roots
+                .leader(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("storage_busy")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_worker_never_installs_owner_or_reports_completed() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let before = std::fs::read(roots.index_db(&identity)).unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            jobs.current = Some(id.clone());
+            jobs.jobs.insert(
+                id.clone(),
+                IndexJob {
+                    id: id.clone(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            );
+        }
+        // The Store's own fault tests cover actual post-rename failures. Here
+        // exercise the HTTP handoff for their error result: no false success.
+        finish_exceptional_index_job(
+            &state,
+            &id,
+            Err(anyhow::anyhow!("after rename fsync failed")),
+            &cancel,
+            |_| panic!("failed worker cannot cross install barrier"),
+        );
+        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "failed");
+        assert!(state.jobs.lock().unwrap().jobs[&id].revision.is_none());
+        assert!(state.retained_serving_session().is_err());
+        assert!(store.evidence_response().is_err());
+        assert_eq!(std::fs::read(roots.index_db(&identity)).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod normal_post_capture_cancellation_tests {
+    use super::*;
+    use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
+    use rusqlite::{OpenFlags, types::Value as SqlValue};
+    use std::{
+        fs,
+        sync::{atomic::AtomicUsize, mpsc},
+        time::Duration,
+    };
+    use tower::ServiceExt;
+
+    #[derive(Debug, PartialEq)]
+    struct PairSnapshot {
+        pin: IndexPin,
+        rows: BTreeMap<String, Vec<String>>,
+    }
+
+    // Read all derived graph, native, class and source rows in one SQLite snapshot.
+    fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
+        let db =
+            rusqlite::Connection::open_with_flags(index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.execute_batch("BEGIN DEFERRED").unwrap();
+        let (generation, revision): (String, i64) = db
+            .query_row(
+                "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let pin = IndexPin {
+            index_generation: uuid::Uuid::parse_str(&generation).unwrap(),
+            index_revision: u64::try_from(revision).unwrap(),
+        };
+        let mut tables = vec![
+            "files".to_owned(),
+            "nodes".to_owned(),
+            "calls".to_owned(),
+            "regions".to_owned(),
+            "class_catalog".to_owned(),
+            "classes".to_owned(),
+            "class_relations".to_owned(),
+        ];
+        let mut names = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'native_*' ORDER BY name")
+            .unwrap();
+        tables.extend(
+            names
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+        );
+        drop(names);
+        assert!(tables.iter().any(|table| table == "native_documents"));
+        let mut rows = BTreeMap::new();
+        for table in tables {
+            assert!(
+                table
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            );
+            let mut stmt = db.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = stmt.column_count();
+            let mut values = stmt
+                .query_map([], |row| {
+                    let cells = (0..columns)
+                        .map(|column| row.get::<_, SqlValue>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(format!("{cells:?}"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            values.sort();
+            rows.insert(table, values);
+        }
+        db.execute_batch("ROLLBACK").unwrap();
+        PairSnapshot { pin, rows }
+    }
+
+    async fn api(
+        app: &Router,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "127.0.0.1:7331")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                body.map(|value| value.to_string()).unwrap_or_default(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    // A panicking test must cancel and release its blocked spawn_blocking worker.
+    struct ReleaseOnDrop {
+        state: Arc<DaemonState>,
+        sender: Option<mpsc::Sender<()>>,
+    }
+    impl ReleaseOnDrop {
+        fn release(&mut self) {
+            self.sender.as_ref().unwrap().send(()).unwrap();
+            self.sender.take();
+        }
+    }
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.sender.take() {
+                let jobs = self
+                    .state
+                    .jobs
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                jobs.cancel.store(true, Ordering::Release);
+                drop(jobs);
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_job_cancelled_after_capture_keeps_protected_pair_and_packet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("one.js");
+        fs::write(
+            &source,
+            "function seed() { sink(); } function sink() {}
+",
+        )
+        .unwrap();
+        let state_root = tmp.path().join("state");
+        let roots =
+            TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let index = roots.index_db(&identity);
+        let store = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let initial_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let (old_pin, serving) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &initial_cancel,
+            |_| {},
+        )
+        .unwrap();
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let state = new(
+            store.clone(),
+            options,
+            token.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(serving);
+        let app = router(state.clone());
+        let before = pair_snapshot(&index);
+        assert_eq!(before.pin, old_pin);
+        assert!(!before.rows["nodes"].is_empty());
+        assert!(!before.rows["native_documents"].is_empty());
+        let seed = store
+            .symbols_at("seed", 10)
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|symbol| symbol.name == "seed")
+            .unwrap()
+            .id;
+        let (status, preview) = api(
+            &app,
+            token,
+            "POST",
+            "/api/questions/preview",
+            Some(json!({"seed":seed,"question":"what happens?","expectedRevision":old_pin})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        let packet_id = preview["packet"]["packetId"].as_str().unwrap().to_owned();
+        let packet_path = format!("/api/questions/{packet_id}/jev-request");
+        let source_path = format!(
+            "/api/source?path=one.js&indexGeneration={}&indexRevision={}",
+            old_pin.index_generation, old_pin.index_revision
+        );
+        assert_eq!(
+            api(&app, token, "GET", &source_path, None).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            api(&app, token, "GET", &packet_path, None).await.0,
+            StatusCode::OK
+        );
+        assert!(
+            state
+                .packets
+                .lock()
+                .unwrap()
+                .packets
+                .iter()
+                .any(|(packet, _)| packet.packet_id == packet_id)
+        );
+        fs::write(
+            &source,
+            "function seed() { fresh(); } function fresh() {}
+",
+        )
+        .unwrap();
+        fs::write(
+            root.join("two.js"),
+            "function extra() {}
+",
+        )
+        .unwrap();
+
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let calls = hook_calls.clone();
+        let mut release = ReleaseOnDrop {
+            state: state.clone(),
+            sender: Some(release_tx),
+        };
+        *state.normal_index_post_capture_hook.lock().unwrap() = Some(Arc::new(move || {
+            calls.fetch_add(1, Ordering::AcqRel);
+            captured_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap();
+        }));
+        let (status, accepted) = start_index(
+            State(state.clone()),
+            Bytes::from(json!({"expectedRevision":old_pin}).to_string()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("normal admission: {} {}", error.1, error.2));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = accepted.0.id;
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::task::spawn_blocking(move || captured_rx.recv_timeout(Duration::from_secs(12))),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let during = state.jobs.lock().unwrap().jobs[&id].clone();
+        assert_eq!(during.progress.phase, "complete");
+        assert_eq!((during.progress.completed, during.progress.total), (2, 2));
+        assert!(during.finished_at.is_none());
+        assert!(during.revision.is_none());
+        assert_eq!(pair_snapshot(&index), before);
+        let cancelling = cancel_job(State(state.clone()), Path(id.clone()))
+            .await
+            .unwrap_or_else(|error| panic!("cancel job: {} {}", error.1, error.2))
+            .0;
+        assert_eq!(cancelling.state, "cancelling");
+        release.release();
+        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let finished = {
+                    let jobs = state.jobs.lock().unwrap();
+                    let job = jobs.jobs[&id].clone();
+                    job.finished_at.is_some().then_some(job)
+                };
+                if let Some(job) = finished {
+                    break job;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal.state, "cancelled");
+        assert!(terminal.revision.is_none());
+        assert_eq!(terminal.progress.phase, "complete");
+        assert_eq!(
+            (terminal.progress.completed, terminal.progress.total),
+            (2, 2)
+        );
+        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+        assert_eq!(pair_snapshot(&index), before);
+        for path in ["/api/status", &source_path, &packet_path] {
+            let (status, response) = api(&app, token, "GET", path, None).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {response}"
+            );
+            assert_eq!(
+                response["error"]["code"], "index_not_ready",
+                "{path}: {response}"
+            );
+        }
+        assert!(
+            state
+                .packets
+                .lock()
+                .unwrap()
+                .packets
+                .iter()
+                .any(|(packet, _)| packet.packet_id == packet_id)
+        );
+        assert!(
+            state
+                .normal_index_post_capture_hook
+                .lock()
+                .unwrap()
+                .take()
+                .is_some()
+        );
+        assert!(
+            state
+                .normal_index_post_capture_hook
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+
+        let (status, retry) = start_index(
+            State(state.clone()),
+            Bytes::from(json!({"expectedRevision":old_pin}).to_string()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("index retry: {} {}", error.1, error.2));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let retry_id = retry.0.id;
+        let completed = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let finished = {
+                    let jobs = state.jobs.lock().unwrap();
+                    let job = jobs.jobs[&retry_id].clone();
+                    job.finished_at.is_some().then_some(job)
+                };
+                if let Some(job) = finished {
+                    break job;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.state, "completed");
+        let next = completed.revision.unwrap();
+        assert_eq!(next.index_generation, old_pin.index_generation);
+        assert_eq!(next.index_revision, old_pin.index_revision + 1);
+        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+        let after = pair_snapshot(&index);
+        assert_eq!(after.pin, next);
+        assert_ne!(after.rows["files"], before.rows["files"]);
+        assert_ne!(
+            after.rows["native_documents"],
+            before.rows["native_documents"]
+        );
+        assert!(after.rows["files"].iter().any(|row| row.contains("two.js")));
+        assert!(
+            after.rows["native_documents"]
+                .iter()
+                .any(|row| row.contains("two.js"))
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state.packets.lock().unwrap().packets.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful worker must clear cached packets");
+        assert!(state.packets.lock().unwrap().packets.is_empty());
+        let (status, stale) = api(&app, token, "GET", &source_path, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+        assert_eq!(stale["error"]["code"], "revision_conflict");
+        let updated_source = format!(
+            "/api/source?path=one.js&indexGeneration={}&indexRevision={}",
+            next.index_generation, next.index_revision
+        );
+        let (status, source_response) = api(&app, token, "GET", &updated_source, None).await;
+        assert_eq!(status, StatusCode::OK, "{source_response}");
+        assert!(
+            source_response["file"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fresh")
+        );
+        let (status, old_packet) = api(&app, token, "GET", &packet_path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{old_packet}");
+        assert_eq!(old_packet["error"]["code"], "not_found");
+    }
+}
+
+#[cfg(test)]
 mod dependency_lifecycle_tests {
     use super::*;
     fn catalog(id: &str, revision: IndexPin) -> Catalog {
@@ -2294,6 +3535,182 @@ mod dependency_lifecycle_tests {
             warnings: vec![],
             sources: Default::default(),
         }
+    }
+    #[tokio::test]
+    async fn dependency_status_whole_response_fence() {
+        use std::io::{Seek, SeekFrom, Write};
+        fn find_lock(path: &std::path::Path) -> Option<std::path::PathBuf> {
+            for entry in std::fs::read_dir(path).ok()?.flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "leader.lock") {
+                    return Some(path);
+                }
+                if path.is_dir()
+                    && let Some(found) = find_lock(&path)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        async fn call(app: &Router, path: &str) -> (StatusCode, Value) {
+            use tower::ServiceExt;
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .header("host", "127.0.0.1:7331")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let body =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            (status, body)
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(workspace.clone());
+        let (graph, native, capture) =
+            crate::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        let session = store.leader_session().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let state = new(
+            store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(session);
+        {
+            let mut deps = state.dependencies.lock().unwrap();
+            deps.state = "ready";
+            deps.catalog = Some(Arc::new(catalog("matching", pin)));
+        }
+        let app = router(state.clone());
+        let (valid_status, valid) = call(&app, "/api/dependencies").await;
+        assert_eq!(valid_status, StatusCode::OK);
+        assert_eq!(valid["workspaceRevision"], json!(pin));
+        assert_eq!(valid["catalogId"], "matching");
+        let lock = find_lock(&temp.path().join("state")).unwrap();
+        let matching_lock = lock.clone();
+        *state.dependency_capture_hook.lock().unwrap() = Some(Arc::new(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&matching_lock)
+                .unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
+        }));
+        let (refused_status, refused) = call(&app, "/api/dependencies").await;
+        assert_eq!(refused_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused["error"]["code"], "index_not_ready");
+        assert!(refused.get("workspaceRevision").is_none());
+        assert!(refused.get("catalogId").is_none());
+        *state.dependency_capture_hook.lock().unwrap() = None;
+        let incarnation = state
+            .retained_serving_session()
+            .unwrap()
+            .leader_guard()
+            .unwrap()
+            .incarnation;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(incarnation.to_string().as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        let mismatched = IndexPin {
+            index_revision: pin.index_revision + 1,
+            ..pin
+        };
+        state.dependencies.lock().unwrap().catalog = Some(Arc::new(catalog("old", mismatched)));
+        let (failed_status, failed) = call(&app, "/api/dependencies").await;
+        assert_eq!(failed_status, StatusCode::OK);
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(failed["catalogId"], Value::Null);
+        assert_eq!(failed["packages"], json!([]));
+        assert_eq!(failed["symbolCount"], 0);
+        assert_eq!(
+            failed["warnings"],
+            json!(["Workspace changed; refresh the dependency catalog"])
+        );
+        let (browse_status, browse) = call(&app, "/api/files").await;
+        assert_eq!(browse_status, StatusCode::OK);
+        assert_eq!(browse["revision"], json!(pin));
+        let publishing_store = store.clone();
+        let publishing_options = options.clone();
+        let publishing_session = state.retained_serving_session().unwrap();
+        *state.outer_fence_hook.lock().unwrap() = Some(Arc::new(move || {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (graph, native, capture) = crate::indexer::index_workspace_bundle(
+                &publishing_options,
+                publishing_store.root_id(),
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
+            publishing_store
+                .publish_native(
+                    &graph,
+                    &capture,
+                    &native,
+                    publishing_session.leader_guard().unwrap(),
+                    pin,
+                    &cancel,
+                )
+                .unwrap();
+        }));
+        let (published_status, old_response) = call(&app, "/api/files").await;
+        assert_eq!(published_status, StatusCode::OK);
+        assert_eq!(old_response["revision"], json!(pin));
+        *state.outer_fence_hook.lock().unwrap() = None;
+        let current = store.status().unwrap().revision;
+        assert_eq!(current.index_revision, pin.index_revision + 1);
+        let hook_lock = lock.clone();
+        *state.outer_fence_hook.lock().unwrap() = Some(Arc::new(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&hook_lock)
+                .unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
+        }));
+        let (browse_status, browse) = call(&app, "/api/files").await;
+        assert_eq!(browse_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(browse["error"]["code"], "index_not_ready");
+        assert!(browse.get("revision").is_none());
+        assert!(browse.get("files").is_none());
+        *state.outer_fence_hook.lock().unwrap() = None;
+        let incarnation = state
+            .retained_serving_session()
+            .unwrap()
+            .leader_guard()
+            .unwrap()
+            .incarnation;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(incarnation.to_string().as_bytes()).unwrap();
+        file.sync_all().unwrap();
     }
     #[test]
     fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {
@@ -2336,12 +3753,13 @@ mod dependency_lifecycle_tests {
             |_| {},
         )
         .unwrap();
+        let session = store.leader_session().unwrap();
         let pin0 = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -2358,6 +3776,7 @@ mod dependency_lifecycle_tests {
             Some(CatalogOptions::default()),
         )
         .unwrap();
+        state.retain_serving_session(session.clone());
         let active = AtomicBool::new(false);
         state.dependencies.lock().unwrap().generation = 2;
         state.publish_dependency_index(2, &active, Ok(catalog("new", pin0)));
@@ -2378,7 +3797,7 @@ mod dependency_lifecycle_tests {
                 &updated,
                 &captured,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 pin0,
                 &cancel,
             )
@@ -2399,6 +3818,92 @@ mod rebaseline_packet_cache_tests {
     use super::*;
     use crate::indexer::index_workspace_bundle;
     use std::{fs, sync::atomic::AtomicBool};
+
+    #[test]
+    fn preview_fence_failure_restores_evicted_and_same_id_packets() {
+        let revision = IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: 1,
+        };
+        let packet = QuestionPacket {
+            packet_id: "original".into(),
+            revision,
+            request: QuestionRequest {
+                seed: "seed".into(),
+                question: "what?".into(),
+                expected_revision: revision,
+                evidence_depth: 0,
+                max_visible: 1,
+                allow_deeper_display: false,
+                focus_terms: vec![],
+            },
+            context: ViewResult {
+                revision,
+                query: ViewQuery {
+                    seed: "seed".into(),
+                    depth: 0,
+                    max_nodes: 1,
+                    max_calls: 1,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                nodes: vec![],
+                calls: vec![],
+                regions: vec![],
+                truncated: false,
+                omitted_nodes: 0,
+                warnings: vec![],
+            },
+            source_files: vec![],
+            warnings: vec![],
+        };
+        let mut cache = PacketCache::default();
+        for i in 0..MAX_PACKETS {
+            let mut item = packet.clone();
+            item.packet_id = format!("packet-{i}");
+            cache.remember(Arc::new(item), MAX_PACKET_BYTES);
+        }
+        let original: Vec<_> = cache
+            .packets
+            .iter()
+            .map(|(p, bytes)| (p.clone(), *bytes))
+            .collect();
+        let original_bytes = cache.bytes;
+        let mut incoming = packet.clone();
+        incoming.packet_id = "new".into();
+        let failed = cache.remember_fenced(Arc::new(incoming), MAX_PACKET_BYTES, || {
+            anyhow::bail!("index_not_ready: incarnation lost")
+        });
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .starts_with("index_not_ready")
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+        let mut replacement = packet;
+        replacement.packet_id = "packet-3".into();
+        assert!(
+            cache
+                .remember_fenced(
+                    Arc::new(replacement),
+                    MAX_PACKET_BYTES + 1,
+                    || anyhow::bail!("root_changed: root replaced")
+                )
+                .is_err()
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+    }
 
     #[test]
     fn failed_known_old_commit_keeps_private_packet_cache_success_clears_it() {

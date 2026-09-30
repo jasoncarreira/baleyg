@@ -326,12 +326,13 @@ fn candidate_terminal_id_cannot_be_used_as_workspace_sequence_root() {
     assert_eq!(bundle_graph.calls.len(), graph.calls.len());
     assert_eq!(bundle_graph.calls[0].range, graph.calls[0].range);
     assert!(!bundle_graph.nodes.iter().any(|node| node.id == id));
+    let session = store.leader_session().unwrap();
     let revision = store
         .publish_native(
             &bundle_graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )

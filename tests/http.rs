@@ -21,6 +21,7 @@ fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
+    state.retain_serving_session(store.leader_session().unwrap());
     let router = http::router(state.clone());
     (dir, store, state, router)
 }
@@ -172,7 +173,7 @@ async fn validation_and_limit() {
 }
 #[tokio::test]
 async fn source_is_snapshot_and_revision_checked() {
-    let (_d, store, _state, app) = setup();
+    let (_d, store, state, app) = setup();
     let workspace = _d.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "cached secret-free source").unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -189,7 +190,11 @@ async fn source_is_snapshot_and_revision_checked() {
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            state
+                .retained_serving_session()
+                .unwrap()
+                .leader_guard()
+                .unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -228,6 +233,36 @@ async fn source_is_snapshot_and_revision_checked() {
             .0,
         404
     );
+}
+#[tokio::test]
+async fn dependency_status_whole_response_fence() {
+    let (dir, store, state, app) = setup();
+    std::fs::write(dir.path().join("workspace/a.js"), "function go() {}\n").unwrap();
+    let options = IndexOptions::new(dir.path().join("workspace"));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) =
+        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+            .unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            state
+                .retained_serving_session()
+                .unwrap()
+                .leader_guard()
+                .unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let (code, result) = call(&app, "GET", "/api/dependencies", Value::Null).await;
+    assert_eq!(code, StatusCode::OK, "{result}");
+    assert_eq!(result["workspaceRevision"], json!(pin));
+    assert_eq!(result["catalogId"], Value::Null);
+    assert_eq!(result["packages"], json!([]));
+    assert_eq!(result["symbolCount"], 0);
 }
 #[tokio::test]
 async fn jobs_publish_and_cancel() {
@@ -380,7 +415,7 @@ async fn local_design_assets_preserve_same_origin_guards() {
 
 #[tokio::test]
 async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_comparison() {
-    let (dir, store, _state, app) = setup();
+    let (dir, store, state, app) = setup();
     let workspace = dir.path().join("workspace");
     std::fs::write(
         workspace.join("a.js"),
@@ -402,7 +437,11 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            state
+                .retained_serving_session()
+                .unwrap()
+                .leader_guard()
+                .unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -438,8 +477,8 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     assert_eq!(code, StatusCode::OK, "{preview}");
     let packet = preview["packet"]["packetId"].as_str().unwrap();
     let old_selection = preview["selection"].clone();
-    // Retain the valid leader lease across deliberate legacy metadata tampering.
-    let leader = store.leader().unwrap();
+    // Retain the daemon's verified leader session across deliberate legacy metadata tampering.
+    let leader = state.retained_serving_session().unwrap();
     let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -462,6 +501,13 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         for index in ["nodes_path", "calls_path", "regions_path"] {
             db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
         }
+        db.execute_batch(
+            "DROP TABLE capture_inputs;
+             ALTER TABLE files DROP COLUMN capture_stat;
+             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+        )
+        .unwrap();
         // An old index holds lexical class adjacency and lexical call targets.
         let base: String = db
             .query_row("SELECT id FROM classes WHERE name='Base'", [], |row| {
@@ -629,7 +675,14 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     let cancelled = Arc::new(AtomicBool::new(true));
     assert!(
         store
-            .publish_native(&graph, &capture, &native, &leader, pin, &cancelled)
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                leader.leader_guard().unwrap(),
+                pin,
+                &cancelled,
+            )
             .is_err()
     );
     assert_eq!(std::fs::read(&index).unwrap(), old_bytes);
@@ -958,4 +1011,256 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
         assert_eq!(body["error"]["code"], "stale_catalog");
     }
+}
+
+#[tokio::test]
+async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
+    for case in ["stats-source", "real-symbol", "input-classes"] {
+        let (dir, store, state, app) = setup();
+        let workspace = dir.path().join("workspace");
+        std::fs::write(workspace.join("a.js"), "function go() { measured(); }\n").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let symbol_id = graph.nodes[0].id.clone();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                state
+                    .retained_serving_session()
+                    .unwrap()
+                    .leader_guard()
+                    .unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let index = std::fs::read_dir(dir.path().join("state/cache/indexes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap()
+            .join("index.db");
+        let db = rusqlite::Connection::open(index).unwrap();
+        let route = match case {
+            "stats-source" => {
+                db.execute("UPDATE index_metadata SET stats='not-json'", [])
+                    .unwrap();
+                format!(
+                    "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                )
+            }
+            "real-symbol" => {
+                db.execute(
+                    "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
+                    [],
+                )
+                .unwrap();
+                format!(
+                    "/api/symbol?id={symbol_id}&indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                )
+            }
+            "input-classes" => {
+                db.execute(
+                    "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
+                    [],
+                )
+                .unwrap();
+                format!(
+                    "/api/classes?indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                )
+            }
+            _ => unreachable!(),
+        };
+        drop(db);
+
+        let (status, body) = call(&app, "GET", &route, Value::Null).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
+        assert_eq!(
+            body["error"]["code"], "incompatible_index",
+            "{case}: {body}"
+        );
+        let (status, body) = call(&app, "GET", "/api/status", Value::Null).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
+        assert_eq!(
+            body["error"]["code"], "incompatible_index",
+            "{case}: {body}"
+        );
+    }
+}
+
+fn corrupt_recovery_fixture(
+    retain_old: bool,
+) -> (
+    tempfile::TempDir,
+    Store,
+    Arc<http::DaemonState>,
+    Router,
+    std::path::PathBuf,
+    baleyg::store::topology::TopologyRoots,
+    baleyg::store::topology::WorkspaceIdentity,
+    IndexPin,
+) {
+    use baleyg::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let roots = TopologyRoots::isolated_for_tests(
+        dir.path().join("state/cache"),
+        dir.path().join("state/data"),
+    );
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let index = roots.index_db(&identity);
+    let initial = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
+    let mut options = IndexOptions::new(root.clone());
+    options.max_file_bytes = 2_097_152;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (pin, old_owner) =
+        baleyg::index_coordinator::reconcile_workspace(&initial, &options, &cancel, |_| {})
+            .unwrap();
+    std::fs::write(&index, b"bad sqlite index header").unwrap();
+    let pending = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
+    let state = http::new(
+        pending.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    if retain_old {
+        state.retain_serving_session(old_owner);
+    }
+    let app = http::router(state.clone());
+    (dir, pending, state, app, index, roots, identity, pin)
+}
+
+async fn finished_index_job(app: &Router, id: &str) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, job) = call(app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            if !job["finishedAt"].is_null() {
+                break job;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("index job did not finish")
+}
+
+#[tokio::test]
+async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_new_leader() {
+    let (_dir, store, state, app, index, roots, identity, old) = corrupt_recovery_fixture(false);
+    assert!(state.retained_serving_session().is_err());
+    let bytes = std::fs::read(&index).unwrap();
+    let (conflict, rejected) =
+        call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
+    assert_eq!(conflict, StatusCode::CONFLICT);
+    assert_eq!(rejected["error"]["code"], "revision_conflict");
+    assert_eq!(std::fs::read(&index).unwrap(), bytes);
+    assert_eq!(
+        call(&app, "GET", "/api/jobs/current", Value::Null).await.1,
+        Value::Null
+    );
+    let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
+    let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["revision"]["indexRevision"], 1);
+    assert_ne!(
+        done["revision"]["indexGeneration"],
+        json!(old)["indexGeneration"]
+    );
+    assert!(state.retained_serving_session().unwrap().is_leader());
+    assert_eq!(
+        store.status().unwrap().revision,
+        serde_json::from_value(done["revision"].clone()).unwrap()
+    );
+    assert!(
+        roots
+            .leader(&identity)
+            .unwrap_err()
+            .to_string()
+            .contains("storage_busy")
+    );
+    let (ready, status) = call(&app, "GET", "/api/status", Value::Null).await;
+    assert_eq!(ready, StatusCode::OK);
+    assert_eq!(status["revision"], done["revision"]);
+    let (conflict, rejected) =
+        call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
+    assert_eq!(conflict, StatusCode::CONFLICT);
+    assert_eq!(rejected["error"]["code"], "revision_conflict");
+}
+
+#[tokio::test]
+async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_foreign_reader() {
+    let (_dir, store, state, app, index, roots, identity, old) = corrupt_recovery_fixture(true);
+    let bytes = std::fs::read(&index).unwrap();
+    let (conflict, rejected) =
+        call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
+    assert_eq!(conflict, StatusCode::CONFLICT);
+    assert_eq!(rejected["error"]["code"], "revision_conflict");
+    assert!(state.retained_serving_session().is_ok());
+    assert_eq!(std::fs::read(&index).unwrap(), bytes);
+    let reader = roots.index_use_existing(&identity).unwrap();
+    let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
+    let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
+    assert_eq!(done["state"], "failed", "{done}");
+    assert_eq!(done["error"]["code"], "storage_busy", "{done}");
+    assert!(state.retained_serving_session().is_err());
+    assert_eq!(std::fs::read(&index).unwrap(), bytes);
+    assert!(store.status().is_err());
+    drop(reader);
+    let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
+    let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_ne!(
+        done["revision"]["indexGeneration"],
+        json!(old)["indexGeneration"]
+    );
+    assert!(state.retained_serving_session().unwrap().is_leader());
+    assert!(
+        roots
+            .leader(&identity)
+            .unwrap_err()
+            .to_string()
+            .contains("storage_busy")
+    );
+}
+
+#[tokio::test]
+async fn index_request_without_startup_session_does_not_reacquire_leadership() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let state = http::new(
+        store.clone(),
+        IndexOptions::new(workspace),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = http::router(state);
+    let (status, body) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "index_not_ready");
+    let session = store.leader_session().unwrap();
+    assert!(
+        session.is_leader(),
+        "HTTP request must not have retained or reacquired the lock"
+    );
 }
