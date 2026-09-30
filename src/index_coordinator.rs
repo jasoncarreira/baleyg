@@ -130,19 +130,63 @@ pub fn drain_requests_observed(
     store.verify_leader_session(session)?;
     let mut completed = 0;
     while let Some(request) = store.claim_request(session)? {
+        #[cfg(debug_assertions)]
+        let mut diagnostic_stage = "options";
         let outcome = (|| {
             let options = request.options(std::path::Path::new(store.workspace_root()))?;
+            #[cfg(debug_assertions)]
+            {
+                diagnostic_stage = "prepare";
+            }
             let coordinator = IndexJobCoordinator::prepare_with_session(
                 store,
                 request.expected,
                 session.clone(),
             )?;
+            #[cfg(debug_assertions)]
+            {
+                diagnostic_stage = "reconcile";
+            }
             coordinator.run(
                 &options,
                 &Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 |p| progress(&request.id, p),
             )
         })();
+        #[cfg(debug_assertions)]
+        if std::env::var("BALEYG_TEST_ONLY_QUEUE_DIAGNOSTIC")
+            .ok()
+            .as_deref()
+            == Some("1")
+            && let Err(ref error) = outcome
+        {
+            // Static taxonomy only: never print source, paths, bearer, provider text or
+            // the raw error chain. The gate is test-only and absent in release builds.
+            let reason = error.to_string();
+            let sqlite = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<rusqlite::Error>());
+            let category = match sqlite {
+                Some(rusqlite::Error::SqliteFailure(info, _))
+                    if matches!(
+                        info.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    "sqlite_busy"
+                }
+                Some(_) => "sqlite_error",
+                None if reason.starts_with("revision conflict") => "revision_conflict",
+                None if reason.starts_with("root_changed") => "root_changed",
+                None if reason.starts_with("index_not_ready") => "index_not_ready",
+                None if reason.starts_with("storage_busy") => "storage_busy",
+                None if reason.starts_with("incompatible_index") => "incompatible_index",
+                None if reason.contains("capture") => "capture_error",
+                None if reason.contains("cancel") => "cancelled",
+                None => "other_error",
+            };
+            eprintln!("queue_test_diag stage={diagnostic_stage} category={category}");
+        }
         // No unverified worker can mark a request terminal. On fencing loss leave it running
         // for the next incarnation to reclaim after its complete root reconciliation.
         store.finish_request(session, &request, outcome)?;
