@@ -149,20 +149,46 @@ pub fn index_workspace_bundle(
     Ok((graph, native, capture))
 }
 
-fn location(text: &str, byte: usize) -> Result<(usize, usize)> {
-    ensure!(
-        byte <= text.len() && text.is_char_boundary(byte),
-        "invalid measured graph range"
-    );
-    let prefix = &text[..byte];
-    Ok((
-        prefix.bytes().filter(|c| *c == b'\n').count() + 1,
-        byte - prefix.rfind('\n').map_or(0, |i| i + 1) + 1,
-    ))
+/// Byte offsets where each line starts, built once per file so every range maps by binary
+/// search instead of rescanning the file prefix (#86).
+struct LineIndex(Vec<usize>);
+impl LineIndex {
+    fn new(text: &str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter(|(_, b)| *b == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        Self(starts)
+    }
+    /// 1-based line and 1-based byte column; only `\n` ends a line.
+    fn location(&self, text: &str, byte: usize) -> Result<(usize, usize)> {
+        ensure!(
+            byte <= text.len() && text.is_char_boundary(byte),
+            "invalid measured graph range"
+        );
+        let line = self.0.partition_point(|&start| start <= byte);
+        Ok((line, byte - self.0[line - 1] + 1))
+    }
 }
-fn measured_range(file: &SourceFile, range: &native_evidence::Range) -> Result<SourceRange> {
-    let (start_line, start_column) = location(&file.text, range.start)?;
-    let (end_line, end_column) = location(&file.text, range.end)?;
+fn line_indexes<'a>(files: &BTreeMap<&'a str, &SourceFile>) -> BTreeMap<&'a str, LineIndex> {
+    files
+        .iter()
+        .map(|(path, file)| (*path, LineIndex::new(&file.text)))
+        .collect()
+}
+fn measured_range(
+    file: &SourceFile,
+    lines: &BTreeMap<&str, LineIndex>,
+    range: &native_evidence::Range,
+) -> Result<SourceRange> {
+    let lines = lines
+        .get(file.path.as_str())
+        .context("missing measured source lines")?;
+    let (start_line, start_column) = lines.location(&file.text, range.start)?;
+    let (end_line, end_column) = lines.location(&file.text, range.end)?;
     ensure!(range.start <= range.end, "inverted measured graph range");
     Ok(SourceRange {
         start_byte: range.start,
@@ -332,6 +358,7 @@ fn project_native(
     ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
     capture.claim_graph_projection()?;
     let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let lines = line_indexes(&files);
     let mut graph = Graph {
         files: capture.files.clone(),
         ..Graph::default()
@@ -374,7 +401,7 @@ fn project_native(
             display_label: display_labels.get(&d.syntax_id).cloned(),
             kind: graph_kind(&d.kind)?,
             path: d.document.path.clone(),
-            range: measured_range(file, &d.range)?,
+            range: measured_range(file, &lines, &d.range)?,
             parent,
             accessor: d.header.modifiers.iter().any(|m| m == "get" || m == "set"),
             provenance: graph_provenance(),
@@ -395,7 +422,7 @@ fn project_native(
             parent: r.parent_id.clone(),
             owner: r.owner_syntax_id.clone(),
             path: r.document.path.clone(),
-            range: measured_range(file, &r.range)?,
+            range: measured_range(file, &lines, &r.range)?,
         });
     }
     for c in &native.calls {
@@ -407,11 +434,11 @@ fn project_native(
             caller: c.owner_syntax_id.clone(),
             callee_text: c.spelling.clone(),
             path: c.document.path.clone(),
-            range: measured_range(file, &c.range)?,
+            range: measured_range(file, &lines, &c.range)?,
             callee_range: c
                 .callee_range
                 .as_ref()
-                .map(|r| measured_range(file, r))
+                .map(|r| measured_range(file, &lines, r))
                 .transpose()?,
             ordinal: c.ordinal,
             regions: c.region_ids.clone(),
@@ -496,6 +523,7 @@ pub(crate) fn validate_native_graph_records(
     cancel: &CancelFlag,
 ) -> Result<()> {
     let files: BTreeMap<_, _> = graph.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let lines = line_indexes(&files);
     let mut declaration_keys = BTreeMap::new();
     for d in &native.declarations {
         let key = (
@@ -547,7 +575,7 @@ pub(crate) fn validate_native_graph_records(
                 })
                 && symbol.kind == graph_kind(&d.kind)?
                 && symbol.path == d.document.path
-                && symbol.range == measured_range(f, &d.range)?
+                && symbol.range == measured_range(f, &lines, &d.range)?
                 && symbol.parent.as_deref() == owner
                 && symbol.accessor == d.header.modifiers.iter().any(|m| m == "get" || m == "set")
                 && symbol.provenance == graph_provenance(),
@@ -577,7 +605,7 @@ pub(crate) fn validate_native_graph_records(
                 && region.parent == r.parent_id
                 && region.owner == r.owner_syntax_id
                 && region.path == r.document.path
-                && region.range == measured_range(f, &r.range)?,
+                && region.range == measured_range(f, &lines, &r.range)?,
             "native_evidence_required: graph region differs from measured native row"
         );
     }
@@ -598,11 +626,11 @@ pub(crate) fn validate_native_graph_records(
             call.caller == c.owner_syntax_id
                 && call.callee_text == c.spelling
                 && call.path == c.document.path
-                && call.range == measured_range(f, &c.range)?
+                && call.range == measured_range(f, &lines, &c.range)?
                 && call.callee_range
                     == c.callee_range
                         .as_ref()
-                        .map(|range| measured_range(f, range))
+                        .map(|range| measured_range(f, &lines, range))
                         .transpose()?
                 && call.ordinal == c.ordinal
                 && call.regions == c.region_ids
@@ -665,4 +693,60 @@ pub(crate) fn native_js_kind(n: Node<'_>) -> Option<&'static str> {
         "formal_parameter" => "parameter",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod line_index_tests {
+    use super::LineIndex;
+
+    /// The previous prefix-scan implementation, kept as the equivalence oracle.
+    fn prefix_scan(text: &str, byte: usize) -> anyhow::Result<(usize, usize)> {
+        anyhow::ensure!(
+            byte <= text.len() && text.is_char_boundary(byte),
+            "invalid measured graph range"
+        );
+        let prefix = &text[..byte];
+        Ok((
+            prefix.bytes().filter(|c| *c == b'\n').count() + 1,
+            byte - prefix.rfind('\n').map_or(0, |i| i + 1) + 1,
+        ))
+    }
+
+    #[test]
+    fn line_index_matches_prefix_scan_on_every_offset() {
+        let texts = [
+            "",
+            "a",
+            "\n",
+            "\n\n",
+            "one line, no trailing newline",
+            "first\nsecond\nthird\n",
+            "crlf\r\nline\r\n\r\nend",
+            "lone\rcarriage\rreturns",
+            "é\n😀x\n日本語\n\nz",
+            "\u{301}combining\n\u{feff}bom",
+        ];
+        for text in texts {
+            let lines = LineIndex::new(text);
+            for byte in 0..=text.len() + 2 {
+                let expected = prefix_scan(text, byte);
+                let actual = lines.location(text, byte);
+                match (expected, actual) {
+                    (Ok(expected), Ok(actual)) => {
+                        assert_eq!(actual, expected, "{text:?} at byte {byte}")
+                    }
+                    (Err(expected), Err(actual)) => {
+                        assert_eq!(
+                            actual.to_string(),
+                            expected.to_string(),
+                            "{text:?} at {byte}"
+                        )
+                    }
+                    (expected, actual) => {
+                        panic!("{text:?} at byte {byte}: expected {expected:?}, got {actual:?}")
+                    }
+                }
+            }
+        }
+    }
 }
