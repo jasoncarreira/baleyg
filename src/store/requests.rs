@@ -221,6 +221,16 @@ impl Store {
         self.verify_request_root(&row)?;
         Ok(row)
     }
+    pub fn earliest_unfinished_request(&self) -> Result<Option<Request>> {
+        let (_guard, db) = self.request_connection()?;
+        let row = db.query_row(
+            &format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') ORDER BY seq LIMIT 1"),
+            [],
+            read,
+        ).optional()?;
+        self.verify_request_root(&row)?;
+        Ok(row)
+    }
     pub fn current_request(&self) -> Result<Option<Request>> {
         let (_guard, db) = self.request_connection()?;
         let row = db

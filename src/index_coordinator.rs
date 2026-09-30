@@ -158,6 +158,11 @@ pub fn enqueue_and_wait(
     options: &IndexOptions,
     cancel: &CancelFlag,
 ) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
+    // Preserve the existing exceptional index-only recovery entry until the next
+    // slice introduces queue quiescence and handle-drop barriers for this path.
+    if store.is_recreate_pending() {
+        return reconcile_workspace(store, options, cancel, |_| {});
+    }
     let request = store.enqueue_request(options, None)?;
     let mut held: Option<Arc<LeaderSession>> = None;
     loop {
@@ -186,10 +191,33 @@ pub fn enqueue_and_wait(
         if held.is_none() {
             match store.leader_session() {
                 Ok(session) => {
-                    // The takeover reconciliation is part of the same ordered native stream.
+                    // The takeover reconciliation precedes claims and may itself satisfy
+                    // the FIFO head: it captured after acceptance using that request's
+                    // exact options. Claim only after the full root-checked publication.
+                    let earliest = store.earliest_unfinished_request()?;
+                    let reconcile_options = earliest
+                        .as_ref()
+                        .and_then(|row| {
+                            row.options(std::path::Path::new(store.workspace_root()))
+                                .ok()
+                        })
+                        .unwrap_or_else(|| options.clone());
                     let startup =
                         IndexJobCoordinator::prepare_with_session(store, None, session.clone())?;
-                    startup.run(options, cancel, |_| {})?;
+                    let takeover_pin = startup.run(&reconcile_options, cancel, |_| {})?;
+                    if let Some(head) = earliest
+                        && head.expected.is_none()
+                        && head
+                            .options(std::path::Path::new(store.workspace_root()))
+                            .is_ok()
+                        && let Some(claimed) = store.claim_request(&session)?
+                    {
+                        ensure!(
+                            claimed.id == head.id,
+                            "storage_busy: FIFO head changed during takeover"
+                        );
+                        store.finish_request(&session, &claimed, Ok(takeover_pin))?;
+                    }
                     held = Some(session);
                 }
                 Err(error) if format!("{error:#}").contains("storage_busy") => {}

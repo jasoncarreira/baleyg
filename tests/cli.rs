@@ -2911,9 +2911,36 @@ def sink():
         let stale = request().bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(
             stale.status(),
-            409,
-            "{name}: stale entire pair refused before work"
+            202,
+            "{name}: stale request durably accepted"
         );
+        let stale: Value = stale.json().await.unwrap();
+        assert_eq!(
+            stale["state"], "queued",
+            "{name}: accepted before claim-time CAS"
+        );
+        let stale_id = stale["id"].as_str().unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let row: Value = client
+                    .get(format!("{url}/api/jobs/{stale_id}"))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !row["finishedAt"].is_null() {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(failed["state"], "failed", "{name}: {failed}");
+        assert_eq!(failed["error"]["code"], "revision_conflict", "{name}");
         assert_eq!(real_native_snapshot(&home), native_before, "{name}");
         drop(server);
     }

@@ -73,3 +73,21 @@ fn request_rejects_symlink_to_captured_workspace() {
     assert!(store.enqueue_request(&options, None).is_err());
     assert!(store.current_request().unwrap().is_none());
 }
+
+#[test]
+fn first_cli_takeover_capture_satisfies_fifo_head_once() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function seed() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (pin, session) =
+        baleyg::index_coordinator::enqueue_and_wait(&store, &options, &cancel).unwrap();
+    assert_eq!(pin.index_revision, 1);
+    assert!(session.is_leader());
+    assert_eq!(store.status().unwrap().revision, pin);
+    let head = store.current_request().unwrap().unwrap();
+    assert_eq!(head.state, "done");
+    assert_eq!(head.revision, Some(pin));
+}
