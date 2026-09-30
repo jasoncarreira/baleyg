@@ -682,23 +682,142 @@ test("revision_conflict reloads the complete new pair after clearing browse", as
 
 const oldPair = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
 const newPair = {indexGeneration:"87654321-4321-4321-8321-abcdef123456", indexRevision:1};
-test("same-workspace conflict refresh keeps persisted views and notes while invalidating the index", async () => {
+
+function canonicalSaved(kind, attachment, pair = oldPair) {
+  if (kind === "view") return {view:{id:"view-a",title:"Saved A",query:{seed:"target-a",depth:2,maxNodes:41,maxCalls:201,includeCallbacks:false,excludePaths:["vendor/"]},pins:{"target-a":{x:1,y:2}},hidden:["hidden-a"],anchor:{never:"echo"}},orphanedIds:[],...pair,attachment};
+  return {annotation:{id:"note-a",nodeId:"target-a",title:"Note A",body:"Body A",anchor:{never:"echo"}},orphaned:false,...pair,attachment};
+}
+const attached = () => ({availability:"ready",result:{status:"attached",targetId:"target-a",reason:"none"}});
+
+for (const kind of ["view", "note"]) test(`${kind} saved response normalization fails closed for legacy and malformed metadata`, () => {
+  const h=harness();
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'}`);
+  const raw=kind==="view"
+    ? {id:"raw",title:"Raw",query:{seed:"target-a"},anchor:{untrusted:true}}
+    : {id:"raw",nodeId:"target-a",body:"Raw",anchor:{untrusted:true}};
+  h.context.saved=raw;
+  assert.equal(h.run(`normalizeSavedState(saved,'${kind}').attachment.availability`),"anchorless");
+  const nested=kind==="view" ? {view:raw,orphanedIds:[]} : {annotation:raw,orphaned:false};
+  h.context.saved=nested;
+  assert.equal(h.run(`normalizeSavedState(saved,'${kind}').attachment.availability`),"anchorless");
+  const valid=canonicalSaved(kind,attached());h.context.saved=valid;
+  assert.equal(h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}').enabled`),true);
+  const partial={...valid,indexRevision:null};h.context.saved=partial;
+  assert.equal(h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}').enabled`),false);
+  const mismatch=canonicalSaved(kind,{availability:"ready",result:{status:"attached",targetId:"other",reason:"none"}});h.context.saved=mismatch;
+  assert.match(h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}').reason`),/does not match/);
+  for(const reason of ["missing","headerMismatch","groupChanged","unprovenContinuity"]){
+    h.context.saved=canonicalSaved(kind,{availability:"ready",result:{status:"orphaned",targetId:null,reason}});
+    const decision=h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}')`);
+    assert.equal(decision.enabled,false,reason);assert.notEqual(decision.reason,"",reason);
+  }
+  h.context.saved=canonicalSaved(kind,{availability:"indexUnavailable",result:null},{indexGeneration:null,indexRevision:null});
+  assert.match(h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}').reason`),/unavailable/);
+});
+
+test("attached view and note Load send one immutable full-pin query for the original target", async () => {
+  const h=harness(), requests=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};seed='target-a'`);
+  h.context.viewSaved=canonicalSaved("view",attached());h.context.noteSaved=canonicalSaved("note",attached());
+  h.run("views=[normalizeSavedState(viewSaved,'view')];annotations=[normalizeSavedState(noteSaved,'note')];renderViews();renderNotes()");
+  h.context.fetch=async(url,opts)=>{requests.push({url,body:opts.body&&JSON.parse(opts.body)});return response({revision:oldPair,query:JSON.parse(opts.body),calls:[],nodes:[]});};
+  const viewLoad=descendants(h.get("views")).find(n=>n.attrs?.['data-action']==='load');
+  await viewLoad.listeners.click();
+  h.run("seed='wrong-selection'");
+  const noteLoad=descendants(h.get("annotations")).find(n=>n.attrs?.['data-action']==='load');
+  await noteLoad.listeners.click();
+  assert.equal(requests.length,2);
+  for(const request of requests){
+    const url=new URL(request.url,"http://local");
+    assert.equal(url.pathname,"/api/query");assert.equal(url.searchParams.get("indexGeneration"),oldPair.indexGeneration);assert.equal(url.searchParams.get("indexRevision"),"1");
+    assert.equal(request.body.seed,"target-a");assert.equal(request.body.depth,1);assert.equal(request.body.includeCallbacks,false);
+  }
+});
+
+for (const kind of ["view","note"]) test(`${kind} stale replay race keeps copied P and never retries at Q`, async () => {
+  const h=harness(), requests=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};seed='target-a'`);
+  h.context.saved=canonicalSaved(kind,attached());
+  h.run(kind==="view" ? "views=[normalizeSavedState(saved,'view')];renderViews()" : "annotations=[normalizeSavedState(saved,'note')];renderNotes()");
+  h.context.fetch=async(url,opts)=>{
+    requests.push({url,method:opts.method});
+    if(url.startsWith('/api/query?')) return {ok:false,status:409,json:async()=>({error:{code:'revision_conflict',message:'Index changed'}})};
+    if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',evidenceFormat:'native-v6',stats:{}});
+    if(url.startsWith('/api/tree?')) return response({...treePage('',[]),revision:newPair});
+    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
+    throw Error(`Unexpected request ${url}`);
+  };
+  h.run("globalThis.originalRunQuery=runQuery;runQuery=(query,pin)=>{status={...status,revision:"+JSON.stringify(newPair)+"};return globalThis.originalRunQuery(query,pin)}");
+  const load=descendants(h.get(kind==="view"?"views":"annotations")).find(n=>n.attrs?.['data-action']==='load');
+  await load.listeners.click();await new Promise(setImmediate);await new Promise(setImmediate);
+  const queries=requests.filter(r=>r.url.startsWith('/api/query?'));
+  assert.equal(queries.length,1);
+  const url=new URL(queries[0].url,"http://local");assert.equal(url.searchParams.get('indexGeneration'),oldPair.indexGeneration);assert.equal(url.searchParams.get('indexRevision'),'1');
+  assert.equal(h.run('result'),null);assert.match(h.get('error').textContent,/Index changed/);
+});
+
+for (const kind of ["view","note"]) test(`${kind} edit uses original identity, strips server metadata, and preserves a 409 draft`, async () => {
+  const h=harness(), requests=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};seed='wrong-selection';result={revision:status.revision,query:{seed:'wrong-selection'},calls:[],nodes:[]}`);
+  h.context.saved=canonicalSaved(kind,attached());
+  h.run(kind==="view" ? "views=[normalizeSavedState(saved,'view')];renderViews()" : "seed='target-a';annotations=[normalizeSavedState(saved,'note')];renderNotes()");
+  h.run("seed='wrong-selection'");
+  const listId=kind==="view"?"views":"annotations";
+  const editControl=descendants(h.get(listId)).find(n=>n.attrs?.['data-action']==='edit');
+  await editControl.listeners.click();
+  if(kind==="view") h.get('view-title').value='Edited title';
+  else {h.get('note-title').value='Edited note';h.get('note').value='Edited body';}
+  h.context.fetch=async(url,opts)=>{
+    const parsed=new URL(url,'http://local');requests.push({url,pathname:parsed.pathname,method:opts.method,body:opts.body&&JSON.parse(opts.body)});
+    if(opts.method==='PUT') return {ok:false,status:409,json:async()=>({error:{code:'revision_conflict',message:'Index changed'}})};
+    if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',evidenceFormat:'native-v6',stats:{}});
+    if(url.startsWith('/api/tree?')) return response({...treePage('',[]),revision:newPair});
+    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
+    throw Error(`Unexpected request ${url}`);
+  };
+  h.get(kind==="view"?'save-form':'annotation-form').listeners.submit({preventDefault(){}});
+  await new Promise(setImmediate);await new Promise(setImmediate);
+  const puts=requests.filter(r=>r.method==='PUT');assert.equal(puts.length,1);
+  const put=puts[0], parsed=new URL(put.url,'http://local');assert.equal(parsed.searchParams.get('indexGeneration'),oldPair.indexGeneration);assert.equal(parsed.searchParams.get('indexRevision'),'1');
+  if(kind==="view"){
+    assert.deepEqual(put.body,{id:'view-a',title:'Edited title',query:{seed:'target-a',depth:2,maxNodes:41,maxCalls:201,includeCallbacks:false,excludePaths:['vendor/']},pins:{'target-a':{x:1,y:2}},hidden:['hidden-a']});
+    assert.equal(h.run('editingView.id'),'view-a');assert.equal(h.get('view-title').value,'Edited title');
+  } else {
+    assert.deepEqual(put.body,{id:'note-a',nodeId:'target-a',body:'Edited body',title:'Edited note'});
+    assert.equal(h.run('editingNote.id'),'note-a');assert.equal(h.get('note').value,'Edited body');
+  }
+  assert.equal(JSON.stringify(put.body).includes('anchor'),false);assert.equal(requests.filter(r=>r.method==='PUT').length,1);
+});
+
+test("saved list requests share one copied pin and a racing P batch cannot paint after Q", async () => {
+  const h=harness(), pendingViews=deferred(), pendingNotes=deferred(), urls=[];
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};views=[normalizeSavedState({id:'old',title:'Old',query:{seed:'target-a'}},'view')]`);
+  h.context.fetch=url=>{urls.push(url);return url.startsWith('/api/views?')?pendingViews.promise:pendingNotes.promise;};
+  const pending=h.run('loadSaved()');h.run(`status={...status,revision:${JSON.stringify(newPair)}}`);
+  pendingViews.resolve(response([canonicalSaved('view',attached())]));pendingNotes.resolve(response([canonicalSaved('note',attached())]));await pending;
+  assert.equal(h.run('views[0].view.id'),'old');
+  assert.equal(urls.length,2);
+  for(const raw of urls){const url=new URL(raw,'http://local');assert.equal(url.searchParams.get('indexGeneration'),oldPair.indexGeneration);assert.equal(url.searchParams.get('indexRevision'),'1');}
+});
+test("same-workspace conflict refresh keeps persisted views and notes while invalidating Load", async () => {
   const h = harness(), requests = [];
-  const savedView = {view:{id:"v",title:"Keep view",query:{seed:"root",depth:1,includeCallbacks:false}}};
-  const savedNote = {annotation:{id:"n",nodeId:"root",body:"Keep note"}};
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root';result={revision:status.revision,calls:[],nodes:[]}`);
+  const savedView = {view:{id:"v",title:"Keep view",query:{seed:"root",depth:1,includeCallbacks:false}},orphanedIds:[],...oldPair,
+    attachment:{availability:"ready",result:{status:"attached",targetId:"root",reason:"none"}}};
+  const savedNote = {annotation:{id:"n",nodeId:"root",body:"Keep note"},orphaned:false,...oldPair,
+    attachment:{availability:"ready",result:{status:"attached",targetId:"root",reason:"none"}}};
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};seed='root';result={revision:status.revision,calls:[],nodes:[]}`);
   h.context.fetch = async url => {
     requests.push(url);
-    if (url === "/api/views") return response([savedView]);
-    if (url === "/api/annotations") return response([savedNote]);
-    if (url === "/api/status") return response({revision:newPair,workspaceRoot:"/same",stats:{}});
+    if (url.startsWith("/api/views?")) return response([savedView]);
+    if (url.startsWith("/api/annotations?")) return response([savedNote]);
+    if (url === "/api/status") return response({revision:newPair,workspaceRoot:"/same",evidenceFormat:"native-v6",stats:{}});
     if (url === "/api/tree?path=&offset=0&limit=200") return response({...treePage("",[]),revision:newPair});
     if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:newPair,catalogId:null,packages:[],warnings:[]});
     return {ok:false,status:409,json:async()=>({error:{code:"revision_conflict",message:"Index changed"}})};
   };
   await h.run("loadSaved()");
-  assert.match(text(h.get("views")), /Keep view/);
-  assert.match(text(h.get("annotations")), /Keep note/);
+  assert.equal(descendants(h.get("views")).find(n=>n.attrs?.['data-action']==='load').disabled,false);
+  assert.equal(descendants(h.get("annotations")).find(n=>n.attrs?.['data-action']==='load').disabled,false);
   await h.run("perform(() => api('/api/query','POST',{seed:'root'}))");
   await new Promise(setImmediate);
   assert.equal(h.run("status.revision.indexGeneration"),newPair.indexGeneration);
@@ -706,6 +825,8 @@ test("same-workspace conflict refresh keeps persisted views and notes while inva
   assert.match(text(h.get("views")),/Keep view/);
   assert.equal(h.run("views[0].view.id"),"v");
   assert.equal(h.run("annotations[0].annotation.body"),"Keep note");
+  assert.equal(descendants(h.get("views")).find(n=>n.attrs?.['data-action']==='load').disabled,true);
+  assert.equal(descendants(h.get("annotations")).find(n=>n.attrs?.['data-action']==='load').disabled,true);
   assert.ok(requests.includes("/api/status"));
 });
 
@@ -834,37 +955,44 @@ test("later tree page cannot mix equal numeric revisions from distinct generatio
 });
 
 
-test("same-workspace automatic Pair refresh retains list/save/delete payloads for views and notes", async () => {
+test("same-workspace automatic pair refresh retains list/save/delete payloads for views and notes", async () => {
  const h=harness(), calls=[];
  let viewsData=[], notesData=[];
- h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}; seed='root'; result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:0,includeCallbacks:false}}`);
+ h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'}; seed='root'; result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:0,includeCallbacks:false}}`);
  h.context.crypto={randomUUID:(()=>{let n=0;return ()=>`item-${++n}`;})()};
  h.context.fetch=async(url,opts)=>{
-   calls.push({url,method:opts.method,body:opts.body && JSON.parse(opts.body)});
-   if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',stats:{}});
+   const parsed=new URL(url,'http://local');
+   calls.push({url,pathname:parsed.pathname,params:parsed.searchParams,method:opts.method,body:opts.body && JSON.parse(opts.body)});
+   if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',evidenceFormat:'native-v6',stats:{}});
    if(url.startsWith('/api/tree?')) return response({...treePage('',[]),revision:newPair});
    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
-   if(url==='/api/views') return response(viewsData);
-   if(url==='/api/annotations') return response(notesData);
-   if(url==='/api/views/item-1' && opts.method==='PUT') {viewsData=[{view:opts.body&&JSON.parse(opts.body)}];return response({});}
-   if(url==='/api/annotations/item-2' && opts.method==='PUT') {notesData=[{annotation:JSON.parse(opts.body)}];return response({});}
-   if(url==='/api/views/item-1' && opts.method==='DELETE') {viewsData=[];return response(null);}
-   if(url==='/api/annotations/item-2' && opts.method==='DELETE') {notesData=[];return response(null);}
+   if(parsed.pathname==='/api/views' && opts.method==='GET') return response(viewsData);
+   if(parsed.pathname==='/api/annotations' && opts.method==='GET') return response(notesData);
+   if(parsed.pathname==='/api/views/item-1' && opts.method==='PUT') {viewsData=[{view:JSON.parse(opts.body)}];return response({});}
+   if(parsed.pathname==='/api/annotations/item-2' && opts.method==='PUT') {notesData=[{annotation:JSON.parse(opts.body)}];return response({});}
+   if(parsed.pathname==='/api/views/item-1' && opts.method==='DELETE') {viewsData=[];return response(null);}
+   if(parsed.pathname==='/api/annotations/item-2' && opts.method==='DELETE') {notesData=[];return response(null);}
    return response({revision:newPair,items:[],nextOffset:null});
  };
  await h.run('loadFiles(true)'); await new Promise(setImmediate);
  assert.equal(h.run('status.revision.indexGeneration'),newPair.indexGeneration);
  await h.run('loadSaved()');
- h.run(`result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:1}}; seed='root'`);
- h.get('view-title').value='Keep';h.get('save-form').listeners.submit({preventDefault(){}}); await new Promise(setImmediate);
- h.get('note').value='Remember';h.get('annotation-form').listeners.submit({preventDefault(){}});await new Promise(setImmediate);
- assert.deepEqual(calls.find(c=>c.url==='/api/views/item-1'&&c.method==='PUT').body,{id:'item-1',title:'Keep',query:{seed:'root',depth:1,includeCallbacks:false},pins:{},hidden:[]});
- assert.deepEqual(calls.find(c=>c.url==='/api/annotations/item-2'&&c.method==='PUT').body,{id:'item-2',nodeId:'root',body:'Remember'});
+ const listCalls=calls.filter(c=>['/api/views','/api/annotations'].includes(c.pathname)&&c.method==='GET');
+ assert.equal(listCalls.length,2);
+ for(const call of listCalls){assert.equal(call.params.get('indexGeneration'),newPair.indexGeneration);assert.equal(call.params.get('indexRevision'),'1');}
+ h.run(`result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:1}}; seed='root'; renderResult()`);
+ h.get('view-title').value='Keep';h.get('save-form').listeners.submit({preventDefault(){}}); await new Promise(setImmediate); await new Promise(setImmediate);
+ h.get('note').value='Remember';h.get('annotation-form').listeners.submit({preventDefault(){}});await new Promise(setImmediate);await new Promise(setImmediate);
+ const viewPut=calls.find(c=>c.pathname==='/api/views/item-1'&&c.method==='PUT');
+ const notePut=calls.find(c=>c.pathname==='/api/annotations/item-2'&&c.method==='PUT');
+ for(const call of [viewPut,notePut]){assert.equal(call.params.get('indexGeneration'),newPair.indexGeneration);assert.equal(call.params.get('indexRevision'),'1');}
+ assert.deepEqual(viewPut.body,{id:'item-1',title:'Keep',query:{seed:'root',depth:1,maxNodes:40,maxCalls:200,includeCallbacks:false,excludePaths:[]},pins:{},hidden:[]});
+ assert.deepEqual(notePut.body,{id:'item-2',nodeId:'root',body:'Remember'});
  const viewDelete=descendants(h.get('views')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
  const noteDelete=descendants(h.get('annotations')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
- await viewDelete.listeners.click();await noteDelete.listeners.click();
- assert.equal(calls.find(c=>c.url==='/api/views/item-1'&&c.method==='DELETE').body,undefined);
- assert.equal(calls.find(c=>c.url==='/api/annotations/item-2'&&c.method==='DELETE').body,undefined);
+ viewDelete.listeners.click();noteDelete.listeners.click();await new Promise(setImmediate);await new Promise(setImmediate);
+ assert.equal(calls.find(c=>c.pathname==='/api/views/item-1'&&c.method==='DELETE').body,undefined);
+ assert.equal(calls.find(c=>c.pathname==='/api/annotations/item-2'&&c.method==='DELETE').body,undefined);
  assert.equal(h.run('views.length + annotations.length'),0);
 });
 

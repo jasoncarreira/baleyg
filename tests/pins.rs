@@ -180,6 +180,62 @@ fn current_store_producer_matrix() {
         pin
     );
 }
+
+#[test]
+fn query_replay_pin_is_checked_in_target_snapshot() {
+    let (temp, store, graph, id) = fixture();
+    let root = temp.path().join("workspace");
+    let session = store.leader_session().unwrap();
+    let pin = publish(
+        &store,
+        &graph,
+        session.leader_guard().unwrap(),
+        store.index_baseline().unwrap(),
+        &root,
+    );
+    let query: ViewQuery = serde_json::from_value(json!({"seed":id})).unwrap();
+
+    let at_pin = store
+        .query_view_at(&query, Some(&pin))
+        .unwrap()
+        .expect("seed at original pin");
+    assert_eq!(at_pin.revision, pin);
+    assert_eq!(at_pin.nodes[0].id, query.seed);
+
+    let next = publish(&store, &graph, session.leader_guard().unwrap(), pin, &root);
+    assert_ne!(next, pin);
+    assert_eq!(
+        store.query_view(&query).unwrap().unwrap().revision,
+        next,
+        "ordinary unpinned queries retain current-snapshot behavior"
+    );
+    assert!(
+        store
+            .query_view(&query)
+            .unwrap()
+            .is_some_and(|result| result.nodes[0].id == query.seed),
+        "the old ordinal target still exists in the new snapshot"
+    );
+
+    for stale in [
+        IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: next.index_revision,
+        },
+        IndexPin {
+            index_generation: next.index_generation,
+            index_revision: pin.index_revision,
+        },
+        pin,
+    ] {
+        let error = store.query_view_at(&query, Some(&stale)).unwrap_err();
+        assert!(
+            error.to_string().starts_with("revision conflict"),
+            "{stale:?}: {error:#}"
+        );
+    }
+}
+
 #[test]
 fn pair_recreation_cas() {
     let (temp, store, graph, _id) = fixture();

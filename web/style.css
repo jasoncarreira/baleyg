@@ -236,7 +236,12 @@ main:has(#workspace[hidden]) { overflow: auto; }
 .layout section { padding: 14px 0; border-bottom: 1px solid var(--line); }
 .layout h2 { margin-bottom: 10px; }
 .symbol { width: 100%; }
-#question-form > label { display: block; margin-top: 8px; }
+#question-form > label, #annotation-form > label { display: block; margin-top: 8px; }
+#note-title { display: block; width: min(100%, 560px); margin: 6px 0 10px; }
+.saved-title { display: block; color: var(--ink); overflow-wrap: anywhere; }
+.saved-actions { margin-top: 6px; }
+.saved-actions button { font-size: 12px; padding: 4px 8px; }
+.saved-reason { margin-top: 4px; max-width: 65ch; }
 #focus-terms { width: min(100%, 560px); }
 .question-options { margin: 12px 0 6px; }
 #max-visible { width: 5em; }

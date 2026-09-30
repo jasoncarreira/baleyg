@@ -132,6 +132,8 @@ pub struct DaemonState {
     preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     normal_index_worker_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    normal_index_post_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
@@ -258,6 +260,8 @@ pub fn new_with_dependency_options(
         preview_finish_hook: Mutex::new(None),
         #[cfg(test)]
         normal_index_worker_hook: Mutex::new(None),
+        #[cfg(test)]
+        normal_index_post_capture_hook: Mutex::new(None),
         dependency_options: catalog_options,
         token,
         hosts,
@@ -440,6 +444,13 @@ impl From<anyhow::Error> for ApiError {
                 "revision_conflict",
                 "The index revision changed",
             )
+        } else if matches!(
+            e.to_string().as_str(),
+            "saved view target replacement is not allowed"
+                | "saved annotation target replacement is not allowed"
+                | "native declaration target missing"
+        ) {
+            invalid()
         } else {
             let text = e.to_string();
             for (prefix, status, code) in [
@@ -1539,11 +1550,26 @@ async fn start_index(
             if let Some(hook) = worker.normal_index_worker_hook.lock().unwrap().clone() {
                 hook();
             }
-            coordinator.run(&worker.options, &worker_cancel, |p| {
+            let progress = |p| {
                 if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
                     j.progress = p;
                 }
-            })
+            };
+            #[cfg(test)]
+            let result =
+                coordinator.run_observed(&worker.options, &worker_cancel, progress, |_| {
+                    let hook = worker
+                        .normal_index_post_capture_hook
+                        .lock()
+                        .unwrap()
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                });
+            #[cfg(not(test))]
+            let result = coordinator.run(&worker.options, &worker_cancel, progress);
+            result
         })
         .await;
         let outcome = match result {
@@ -1848,45 +1874,55 @@ async fn source(
 }
 async fn query(
     State(s): State<Arc<DaemonState>>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
     body: Result<Json<ViewQuery>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ViewResult>, ApiError> {
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let expected = pin.pin()?;
     let Json(q) = body.map_err(|_| invalid())?;
     q.validate().map_err(|_| invalid())?;
     Ok(Json(
-        db(s, move |s| s.query_view(&q))
+        db(s, move |s| s.query_view_at(&q, expected.as_ref()))
             .await?
             .ok_or_else(missing)?,
     ))
 }
-async fn views(State(s): State<Arc<DaemonState>>) -> Result<Json<Vec<SavedViewState>>, ApiError> {
-    Ok(Json(db(s, |s| s.views()).await?))
+async fn views(
+    State(s): State<Arc<DaemonState>>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<Vec<SavedViewState>>, ApiError> {
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let expected = pin.pin()?;
+    Ok(Json(db(s, move |s| s.saved_views_at(expected)).await?))
 }
 async fn view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<SavedViewState>, ApiError> {
     validate_record_id(&id).map_err(|_| invalid())?;
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let expected = pin.pin()?;
     Ok(Json(
-        db(s, move |s| s.view(&id)).await?.ok_or_else(missing)?,
+        db(s, move |s| s.saved_view_at(&id, expected))
+            .await?
+            .ok_or_else(missing)?,
     ))
 }
 async fn save_view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-    Json(v): Json<SavedView>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
+    body: Result<Json<SavedViewRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<SavedViewState>, ApiError> {
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let pin = pin.pin()?.ok_or_else(invalid)?;
+    let Json(v) = body.map_err(|_| invalid())?;
     if v.id != id {
         return Err(invalid());
     }
     v.validate().map_err(|_| invalid())?;
-    Ok(Json(
-        db(s, move |s| {
-            s.put_view(&v)?;
-            s.view(&id)?
-                .ok_or_else(|| anyhow::anyhow!("saved view missing"))
-        })
-        .await?,
-    ))
+    Ok(Json(db(s, move |s| s.save_view_at(pin, &v)).await?))
 }
 async fn delete_view(
     State(s): State<Arc<DaemonState>>,
@@ -1898,28 +1934,28 @@ async fn delete_view(
 }
 async fn annotations(
     State(s): State<Arc<DaemonState>>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<Vec<AnnotationState>>, ApiError> {
-    Ok(Json(db(s, |s| s.annotations()).await?))
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let expected = pin.pin()?;
+    Ok(Json(
+        db(s, move |s| s.saved_annotations_at(expected)).await?,
+    ))
 }
 async fn save_annotation(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
-    Json(a): Json<Annotation>,
+    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
+    body: Result<Json<AnnotationRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<AnnotationState>, ApiError> {
+    let Query(pin) = pin.map_err(|_| invalid())?;
+    let pin = pin.pin()?.ok_or_else(invalid)?;
+    let Json(a) = body.map_err(|_| invalid())?;
     if a.id != id {
         return Err(invalid());
     }
     a.validate().map_err(|_| invalid())?;
-    Ok(Json(
-        db(s, move |s| {
-            s.put_annotation(&a)?;
-            s.annotations()?
-                .into_iter()
-                .find(|v| v.annotation.id == id)
-                .ok_or_else(|| anyhow::anyhow!("saved annotation missing"))
-        })
-        .await?,
-    ))
+    Ok(Json(db(s, move |s| s.save_annotation_at(pin, &a)).await?))
 }
 async fn delete_annotation(
     State(s): State<Arc<DaemonState>>,
@@ -3077,6 +3113,413 @@ mod exceptional_recovery_tests {
         assert!(state.retained_serving_session().is_err());
         assert!(store.evidence_response().is_err());
         assert_eq!(std::fs::read(roots.index_db(&identity)).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod normal_post_capture_cancellation_tests {
+    use super::*;
+    use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
+    use rusqlite::{OpenFlags, types::Value as SqlValue};
+    use std::{
+        fs,
+        sync::{atomic::AtomicUsize, mpsc},
+        time::Duration,
+    };
+    use tower::ServiceExt;
+
+    #[derive(Debug, PartialEq)]
+    struct PairSnapshot {
+        pin: IndexPin,
+        rows: BTreeMap<String, Vec<String>>,
+    }
+
+    // Read all derived graph, native, class and source rows in one SQLite snapshot.
+    fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
+        let db =
+            rusqlite::Connection::open_with_flags(index, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.execute_batch("BEGIN DEFERRED").unwrap();
+        let (generation, revision): (String, i64) = db
+            .query_row(
+                "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let pin = IndexPin {
+            index_generation: uuid::Uuid::parse_str(&generation).unwrap(),
+            index_revision: u64::try_from(revision).unwrap(),
+        };
+        let mut tables = vec![
+            "files".to_owned(),
+            "nodes".to_owned(),
+            "calls".to_owned(),
+            "regions".to_owned(),
+            "class_catalog".to_owned(),
+            "classes".to_owned(),
+            "class_relations".to_owned(),
+        ];
+        let mut names = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'native_*' ORDER BY name")
+            .unwrap();
+        tables.extend(
+            names
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+        );
+        drop(names);
+        assert!(tables.iter().any(|table| table == "native_documents"));
+        let mut rows = BTreeMap::new();
+        for table in tables {
+            assert!(
+                table
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            );
+            let mut stmt = db.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = stmt.column_count();
+            let mut values = stmt
+                .query_map([], |row| {
+                    let cells = (0..columns)
+                        .map(|column| row.get::<_, SqlValue>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(format!("{cells:?}"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            values.sort();
+            rows.insert(table, values);
+        }
+        db.execute_batch("ROLLBACK").unwrap();
+        PairSnapshot { pin, rows }
+    }
+
+    async fn api(
+        app: &Router,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "127.0.0.1:7331")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                body.map(|value| value.to_string()).unwrap_or_default(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    // A panicking test must cancel and release its blocked spawn_blocking worker.
+    struct ReleaseOnDrop {
+        state: Arc<DaemonState>,
+        sender: Option<mpsc::Sender<()>>,
+    }
+    impl ReleaseOnDrop {
+        fn release(&mut self) {
+            self.sender.as_ref().unwrap().send(()).unwrap();
+            self.sender.take();
+        }
+    }
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.sender.take() {
+                let jobs = self
+                    .state
+                    .jobs
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                jobs.cancel.store(true, Ordering::Release);
+                drop(jobs);
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_job_cancelled_after_capture_keeps_protected_pair_and_packet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("one.js");
+        fs::write(
+            &source,
+            "function seed() { sink(); } function sink() {}
+",
+        )
+        .unwrap();
+        let state_root = tmp.path().join("state");
+        let roots =
+            TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let index = roots.index_db(&identity);
+        let store = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let initial_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let (old_pin, serving) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &initial_cancel,
+            |_| {},
+        )
+        .unwrap();
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let state = new(
+            store.clone(),
+            options,
+            token.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(serving);
+        let app = router(state.clone());
+        let before = pair_snapshot(&index);
+        assert_eq!(before.pin, old_pin);
+        assert!(!before.rows["nodes"].is_empty());
+        assert!(!before.rows["native_documents"].is_empty());
+        let seed = store
+            .symbols_at("seed", 10)
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|symbol| symbol.name == "seed")
+            .unwrap()
+            .id;
+        let (status, preview) = api(
+            &app,
+            token,
+            "POST",
+            "/api/questions/preview",
+            Some(json!({"seed":seed,"question":"what happens?","expectedRevision":old_pin})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        let packet_id = preview["packet"]["packetId"].as_str().unwrap().to_owned();
+        let packet_path = format!("/api/questions/{packet_id}/jev-request");
+        let source_path = format!(
+            "/api/source?path=one.js&indexGeneration={}&indexRevision={}",
+            old_pin.index_generation, old_pin.index_revision
+        );
+        assert_eq!(
+            api(&app, token, "GET", &source_path, None).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            api(&app, token, "GET", &packet_path, None).await.0,
+            StatusCode::OK
+        );
+        assert!(
+            state
+                .packets
+                .lock()
+                .unwrap()
+                .packets
+                .iter()
+                .any(|(packet, _)| packet.packet_id == packet_id)
+        );
+        fs::write(
+            &source,
+            "function seed() { fresh(); } function fresh() {}
+",
+        )
+        .unwrap();
+        fs::write(
+            root.join("two.js"),
+            "function extra() {}
+",
+        )
+        .unwrap();
+
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let calls = hook_calls.clone();
+        let mut release = ReleaseOnDrop {
+            state: state.clone(),
+            sender: Some(release_tx),
+        };
+        *state.normal_index_post_capture_hook.lock().unwrap() = Some(Arc::new(move || {
+            calls.fetch_add(1, Ordering::AcqRel);
+            captured_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap();
+        }));
+        let (status, accepted) = start_index(
+            State(state.clone()),
+            Bytes::from(json!({"expectedRevision":old_pin}).to_string()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("normal admission: {} {}", error.1, error.2));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = accepted.0.id;
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::task::spawn_blocking(move || captured_rx.recv_timeout(Duration::from_secs(12))),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let during = state.jobs.lock().unwrap().jobs[&id].clone();
+        assert_eq!(during.progress.phase, "complete");
+        assert_eq!((during.progress.completed, during.progress.total), (2, 2));
+        assert!(during.finished_at.is_none());
+        assert!(during.revision.is_none());
+        assert_eq!(pair_snapshot(&index), before);
+        let cancelling = cancel_job(State(state.clone()), Path(id.clone()))
+            .await
+            .unwrap_or_else(|error| panic!("cancel job: {} {}", error.1, error.2))
+            .0;
+        assert_eq!(cancelling.state, "cancelling");
+        release.release();
+        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let finished = {
+                    let jobs = state.jobs.lock().unwrap();
+                    let job = jobs.jobs[&id].clone();
+                    job.finished_at.is_some().then_some(job)
+                };
+                if let Some(job) = finished {
+                    break job;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal.state, "cancelled");
+        assert!(terminal.revision.is_none());
+        assert_eq!(terminal.progress.phase, "complete");
+        assert_eq!(
+            (terminal.progress.completed, terminal.progress.total),
+            (2, 2)
+        );
+        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+        assert_eq!(pair_snapshot(&index), before);
+        for path in ["/api/status", &source_path, &packet_path] {
+            let (status, response) = api(&app, token, "GET", path, None).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {response}"
+            );
+            assert_eq!(
+                response["error"]["code"], "index_not_ready",
+                "{path}: {response}"
+            );
+        }
+        assert!(
+            state
+                .packets
+                .lock()
+                .unwrap()
+                .packets
+                .iter()
+                .any(|(packet, _)| packet.packet_id == packet_id)
+        );
+        assert!(
+            state
+                .normal_index_post_capture_hook
+                .lock()
+                .unwrap()
+                .take()
+                .is_some()
+        );
+        assert!(
+            state
+                .normal_index_post_capture_hook
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+
+        let (status, retry) = start_index(
+            State(state.clone()),
+            Bytes::from(json!({"expectedRevision":old_pin}).to_string()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("index retry: {} {}", error.1, error.2));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let retry_id = retry.0.id;
+        let completed = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let finished = {
+                    let jobs = state.jobs.lock().unwrap();
+                    let job = jobs.jobs[&retry_id].clone();
+                    job.finished_at.is_some().then_some(job)
+                };
+                if let Some(job) = finished {
+                    break job;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.state, "completed");
+        let next = completed.revision.unwrap();
+        assert_eq!(next.index_generation, old_pin.index_generation);
+        assert_eq!(next.index_revision, old_pin.index_revision + 1);
+        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+        let after = pair_snapshot(&index);
+        assert_eq!(after.pin, next);
+        assert_ne!(after.rows["files"], before.rows["files"]);
+        assert_ne!(
+            after.rows["native_documents"],
+            before.rows["native_documents"]
+        );
+        assert!(after.rows["files"].iter().any(|row| row.contains("two.js")));
+        assert!(
+            after.rows["native_documents"]
+                .iter()
+                .any(|row| row.contains("two.js"))
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state.packets.lock().unwrap().packets.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful worker must clear cached packets");
+        assert!(state.packets.lock().unwrap().packets.is_empty());
+        let (status, stale) = api(&app, token, "GET", &source_path, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+        assert_eq!(stale["error"]["code"], "revision_conflict");
+        let updated_source = format!(
+            "/api/source?path=one.js&indexGeneration={}&indexRevision={}",
+            next.index_generation, next.index_revision
+        );
+        let (status, source_response) = api(&app, token, "GET", &updated_source, None).await;
+        assert_eq!(status, StatusCode::OK, "{source_response}");
+        assert!(
+            source_response["file"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fresh")
+        );
+        let (status, old_packet) = api(&app, token, "GET", &packet_path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{old_packet}");
+        assert_eq!(old_packet["error"]["code"], "not_found");
     }
 }
 

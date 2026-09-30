@@ -8,17 +8,28 @@ use baleyg::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::{CancelFlag, Graph},
-    store::Store,
+    store::{Store, topology::LeaderSession},
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
+fn fixture() -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Router,
+    String,
+    Arc<LeaderSession>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("a.js"), "function seed() { save(); }").unwrap();
+    std::fs::write(
+        root.join("a.js"),
+        "function seed() { other(); } function other() {}",
+    )
+    .unwrap();
     let options = IndexOptions::new(root.clone());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
@@ -30,16 +41,17 @@ fn fixture() -> (tempfile::TempDir, Store, Graph, Router, String) {
         .id
         .clone();
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let app = http::router(
-        http::new(
-            store.clone(),
-            options,
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
-    (temp, store, graph, app, seed)
+    let session = store.leader_session().unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
+    (temp, store, graph, app, seed, session)
 }
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (u16, Value) {
     let req = Request::builder()
@@ -57,9 +69,17 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (u16, Valu
         .unwrap();
     (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
+fn pinned(route: &str, pin: &baleyg::model::IndexPin) -> String {
+    let separator = if route.contains('?') { '&' } else { '?' };
+    format!(
+        "{route}{separator}indexGeneration={}&indexRevision={}",
+        pin.index_generation, pin.index_revision
+    )
+}
+
 #[tokio::test]
 async fn durable_crud_matrix() {
-    let (temp, store, graph, app, seed) = fixture();
+    let (temp, store, graph, app, seed, session) = fixture();
     let durable = temp.path().join("state/data/workspaces");
     assert_eq!(
         call(&app, "GET", "/api/views", Value::Null).await.1,
@@ -79,28 +99,69 @@ async fn durable_crud_matrix() {
         !durable.exists(),
         "absent reads/deletes do not create durable records"
     );
+
+    let baseline = store.index_baseline().unwrap();
+    let pin = publish_bundle(
+        &store,
+        &graph,
+        &temp.path().join("workspace"),
+        session.leader_guard().unwrap(),
+        baseline,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     let view = json!({"id":"view","title":"Keep","query":{"seed":seed},"pins":{},"hidden":[]});
     let canonical = serde_json::to_value(
         serde_json::from_value::<baleyg::model::SavedView>(view.clone()).unwrap(),
     )
     .unwrap();
-    let (status, saved) = call(&app, "PUT", "/api/views/view", view.clone()).await;
+    assert_eq!(
+        call(&app, "PUT", "/api/views/view", view.clone()).await.0,
+        400
+    );
+    let (status, saved) = call(&app, "PUT", &pinned("/api/views/view", &pin), view.clone()).await;
     assert_eq!(status, 200, "{saved}");
-    assert_eq!(saved["view"], canonical);
+    assert_eq!(saved["view"]["id"], "view");
+    assert_eq!(saved["view"]["title"], "Keep");
+    assert_eq!(saved["view"]["query"], canonical["query"]);
+    assert_eq!(saved["view"]["anchor"]["syntaxId"], seed);
+    assert_eq!(saved["indexGeneration"], pin.index_generation.to_string());
+    assert_eq!(saved["indexRevision"], pin.index_revision);
+    assert_eq!(saved["attachment"]["availability"], "ready");
+    assert_eq!(saved["attachment"]["result"]["status"], "attached");
     assert_eq!(
         call(&app, "GET", "/api/views/view", Value::Null).await.1["view"],
-        canonical
+        saved["view"]
     );
+
     let note = json!({"id":"note","nodeId":seed,"body":"Preserved"});
-    let (status, saved) = call(&app, "PUT", "/api/annotations/note", note.clone()).await;
-    assert_eq!(status, 200, "{saved}");
-    assert_eq!(saved["annotation"], note);
+    assert_eq!(
+        call(&app, "PUT", "/api/annotations/note", note.clone())
+            .await
+            .0,
+        400
+    );
+    let (status, saved_note) = call(
+        &app,
+        "PUT",
+        &pinned("/api/annotations/note", &pin),
+        note.clone(),
+    )
+    .await;
+    assert_eq!(status, 200, "{saved_note}");
+    assert_eq!(saved_note["annotation"]["id"], "note");
+    assert_eq!(saved_note["annotation"]["nodeId"], seed);
+    assert_eq!(saved_note["annotation"]["body"], "Preserved");
+    assert_eq!(saved_note["annotation"]["anchor"]["syntaxId"], seed);
+    assert_eq!(saved_note["attachment"]["availability"], "ready");
     assert_eq!(
         call(&app, "GET", "/api/annotations", Value::Null).await.1[0]["annotation"],
-        note
+        saved_note["annotation"]
     );
     assert_eq!(
-        call(&app, "PUT", "/api/views/wrong", view.clone()).await.0,
+        call(&app, "PUT", &pinned("/api/views/wrong", &pin), view.clone())
+            .await
+            .0,
         400
     );
     assert_eq!(
@@ -126,19 +187,517 @@ async fn durable_crud_matrix() {
         record.join("workspace.db").exists(),
         "empty record remains durable"
     );
-    publish_bundle(
+}
+
+#[tokio::test]
+async fn query_optional_pin_matrix() {
+    let (temp, store, graph, app, seed, session) = fixture();
+    let root = temp.path().join("workspace");
+    let pin = publish_bundle(
         &store,
         &graph,
-        &temp.path().join("workspace"),
-        &store.leader().unwrap(),
+        &root,
+        session.leader_guard().unwrap(),
         store.index_baseline().unwrap(),
         &Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
+    let body = json!({"seed":seed});
+
+    let (status, unpinned) = call(&app, "POST", "/api/query", body.clone()).await;
+    assert_eq!(status, 200, "{unpinned}");
+    assert_eq!(unpinned["revision"], json!(pin));
+    let (status, current) = call(&app, "POST", &pinned("/api/query", &pin), body.clone()).await;
+    assert_eq!(status, 200, "{current}");
+    assert_eq!(current["revision"], json!(pin));
+
+    for route in [
+        format!("/api/query?indexGeneration={}", pin.index_generation),
+        format!("/api/query?indexRevision={}", pin.index_revision),
+        "/api/query?1".to_owned(),
+        format!(
+            "/api/query?indexGeneration={}&indexRevision={}&extra=true",
+            pin.index_generation, pin.index_revision
+        ),
+    ] {
+        assert_eq!(
+            call(&app, "POST", &route, body.clone()).await.0,
+            400,
+            "{route}"
+        );
+    }
+    let wrong_generation = format!(
+        "/api/query?indexGeneration={}&indexRevision={}",
+        uuid::Uuid::new_v4(),
+        pin.index_revision
+    );
+    assert_eq!(
+        call(&app, "POST", &wrong_generation, body.clone()).await.0,
+        409
+    );
+
+    let next = publish_bundle(
+        &store,
+        &graph,
+        &root,
+        session.leader_guard().unwrap(),
+        pin,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let (status, stale) = call(&app, "POST", &pinned("/api/query", &pin), body.clone()).await;
+    assert_eq!(status, 409, "{stale}");
+    let (status, current) = call(&app, "POST", &pinned("/api/query", &next), body.clone()).await;
+    assert_eq!(status, 200, "{current}");
+    assert_eq!(current["revision"], json!(next));
+    let (status, ordinary) = call(&app, "POST", "/api/query", body).await;
+    assert_eq!(status, 200, "{ordinary}");
+    assert_eq!(ordinary["revision"], json!(next));
 }
+
+#[tokio::test]
+async fn saved_read_pin_and_ownership_matrix() {
+    let (temp, store, graph, app, seed, session) = fixture();
+    let root = temp.path().join("workspace");
+    let other = graph
+        .nodes
+        .iter()
+        .find(|node| node.name == "other")
+        .unwrap()
+        .id
+        .clone();
+    let pin = publish_bundle(
+        &store,
+        &graph,
+        &root,
+        session.leader_guard().unwrap(),
+        store.index_baseline().unwrap(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let view = json!({"id":"owned","title":"Original","query":{"seed":seed}});
+    let (status, created) =
+        call(&app, "PUT", &pinned("/api/views/owned", &pin), view.clone()).await;
+    assert_eq!(status, 200, "{created}");
+    let view_anchor = created["view"]["anchor"].clone();
+    assert_eq!(created["attachment"]["result"]["targetId"], seed);
+
+    let note = json!({"id":"owned-note","nodeId":seed,"body":"body","title":"Heading"});
+    let (status, created_note) = call(
+        &app,
+        "PUT",
+        &pinned("/api/annotations/owned-note", &pin),
+        note.clone(),
+    )
+    .await;
+    assert_eq!(status, 200, "{created_note}");
+    let note_anchor = created_note["annotation"]["anchor"].clone();
+
+    for route in [
+        format!("/api/views?indexGeneration={}", pin.index_generation),
+        format!("/api/views?indexRevision={}", pin.index_revision),
+        "/api/views?1".to_owned(),
+        format!("/api/annotations?indexRevision={}", pin.index_revision),
+    ] {
+        assert_eq!(
+            call(&app, "GET", &route, Value::Null).await.0,
+            400,
+            "{route}"
+        );
+    }
+    let (status, listed) = call(&app, "GET", &pinned("/api/views", &pin), Value::Null).await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(listed[0]["view"]["anchor"], view_anchor);
+    assert_eq!(
+        listed[0]["indexGeneration"],
+        pin.index_generation.to_string()
+    );
+    assert_eq!(listed[0]["indexRevision"], pin.index_revision);
+    let (status, opened) = call(&app, "GET", &pinned("/api/views/owned", &pin), Value::Null).await;
+    assert_eq!(status, 200, "{opened}");
+    assert_eq!(opened["view"]["anchor"], view_anchor);
+
+    let replacement = json!({"id":"owned","title":"No","query":{"seed":other}});
+    assert_eq!(
+        call(&app, "PUT", &pinned("/api/views/owned", &pin), replacement)
+            .await
+            .0,
+        400
+    );
+    let note_replacement = json!({"id":"owned-note","nodeId":other,"body":"No"});
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            &pinned("/api/annotations/owned-note", &pin),
+            note_replacement
+        )
+        .await
+        .0,
+        400
+    );
+
+    let offered_anchor = json!({
+        "id":"owned",
+        "title":"No",
+        "query":{"seed":seed},
+        "anchor":view_anchor
+    });
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            &pinned("/api/views/owned", &pin),
+            offered_anchor
+        )
+        .await
+        .0,
+        400
+    );
+    let offered_metadata = json!({
+        "id":"owned-note",
+        "nodeId":seed,
+        "body":"No",
+        "attachment":{"availability":"ready"}
+    });
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            &pinned("/api/annotations/owned-note", &pin),
+            offered_metadata
+        )
+        .await
+        .0,
+        400
+    );
+
+    let edit = json!({"id":"owned","title":"Edited","query":{"seed":seed}});
+    let (status, edited) = call(&app, "PUT", &pinned("/api/views/owned", &pin), edit).await;
+    assert_eq!(status, 200, "{edited}");
+    assert_eq!(edited["view"]["anchor"], created["view"]["anchor"]);
+    let note_edit = json!({"id":"owned-note","nodeId":seed,"body":"edited"});
+    let (status, edited_note) = call(
+        &app,
+        "PUT",
+        &pinned("/api/annotations/owned-note", &pin),
+        note_edit,
+    )
+    .await;
+    assert_eq!(status, 200, "{edited_note}");
+    assert_eq!(edited_note["annotation"]["anchor"], note_anchor);
+    assert_eq!(
+        edited_note["annotation"]["title"], "Heading",
+        "omitted optional title preserves the stored title"
+    );
+
+    let legacy: baleyg::model::SavedView = serde_json::from_value(json!({
+        "id":"legacy","title":"Legacy","query":{"seed":seed}
+    }))
+    .unwrap();
+    store.put_view(&legacy).unwrap();
+    let (status, legacy_state) =
+        call(&app, "GET", &pinned("/api/views/legacy", &pin), Value::Null).await;
+    assert_eq!(status, 200, "{legacy_state}");
+    assert!(legacy_state["view"].get("anchor").is_none());
+    assert_eq!(legacy_state["attachment"]["availability"], "anchorless");
+    assert!(
+        legacy_state["orphanedIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == &json!(seed))
+    );
+    let legacy_edit = json!({"id":"legacy","title":"Still legacy","query":{"seed":seed}});
+    let (status, legacy_edited) =
+        call(&app, "PUT", &pinned("/api/views/legacy", &pin), legacy_edit).await;
+    assert_eq!(status, 200, "{legacy_edited}");
+    assert!(legacy_edited["view"].get("anchor").is_none());
+    assert_eq!(legacy_edited["attachment"]["availability"], "anchorless");
+
+    let next = publish_bundle(
+        &store,
+        &graph,
+        &root,
+        session.leader_guard().unwrap(),
+        pin,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    for route in [pinned("/api/views", &pin), pinned("/api/annotations", &pin)] {
+        let (status, error) = call(&app, "GET", &route, Value::Null).await;
+        assert_eq!(status, 409, "{route}: {error}");
+    }
+    assert_eq!(
+        call(&app, "PUT", &pinned("/api/views/owned", &pin), view)
+            .await
+            .0,
+        409
+    );
+    let (status, current) = call(&app, "GET", &pinned("/api/views", &next), Value::Null).await;
+    assert_eq!(status, 200, "{current}");
+    assert!(current.as_array().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function stable() { return 1; }\n").unwrap();
+    std::fs::write(root.join("b.js"), "function target() { return 2; }\n").unwrap();
+    let options = IndexOptions::new(root.clone());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
+    let session = store.leader_session().unwrap();
+    let (graph, native, capture) =
+        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+            .unwrap();
+    let stable = native
+        .declarations
+        .iter()
+        .find(|row| row.document.path == "a.js" && row.name.as_deref() == Some("stable"))
+        .unwrap()
+        .syntax_id
+        .clone();
+    let target = native
+        .declarations
+        .iter()
+        .find(|row| row.document.path == "b.js" && row.name.as_deref() == Some("target"))
+        .unwrap()
+        .syntax_id
+        .clone();
+    let first = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            session.leader_guard().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let state = http::new(
+        store.clone(),
+        options.clone(),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
+    let target_view = json!({"id":"target-view","title":"Target","query":{"seed":target}});
+    let stable_view = json!({"id":"stable-view","title":"Stable","query":{"seed":stable}});
+    let target_note = json!({"id":"target-note","nodeId":target,"body":"target note"});
+    let stable_note = json!({"id":"stable-note","nodeId":stable,"body":"stable note"});
+    let (status, created_target_view) = call(
+        &app,
+        "PUT",
+        &pinned("/api/views/target-view", &first),
+        target_view,
+    )
+    .await;
+    assert_eq!(status, 200, "{created_target_view}");
+    let (status, created_stable_view) = call(
+        &app,
+        "PUT",
+        &pinned("/api/views/stable-view", &first),
+        stable_view,
+    )
+    .await;
+    assert_eq!(status, 200, "{created_stable_view}");
+    let (status, created_target_note) = call(
+        &app,
+        "PUT",
+        &pinned("/api/annotations/target-note", &first),
+        target_note,
+    )
+    .await;
+    assert_eq!(status, 200, "{created_target_note}");
+    let (status, created_stable_note) = call(
+        &app,
+        "PUT",
+        &pinned("/api/annotations/stable-note", &first),
+        stable_note,
+    )
+    .await;
+    assert_eq!(status, 200, "{created_stable_note}");
+    let target_view_raw = store
+        .saved_view_at("target-view", Some(first))
+        .unwrap()
+        .unwrap()
+        .view
+        .anchor
+        .unwrap()
+        .get()
+        .to_owned();
+    let target_note_raw = store
+        .saved_annotations_at(Some(first))
+        .unwrap()
+        .into_iter()
+        .find(|state| state.annotation.id == "target-note")
+        .unwrap()
+        .annotation
+        .anchor
+        .unwrap()
+        .get()
+        .to_owned();
+
+    std::fs::remove_file(root.join("b.js")).unwrap();
+    let (graph, native, capture) =
+        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+            .unwrap();
+    let second = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            session.leader_guard().unwrap(),
+            first,
+            &cancel,
+        )
+        .unwrap();
+
+    let (status, views) = call(&app, "GET", &pinned("/api/views", &second), Value::Null).await;
+    assert_eq!(status, 200, "{views}");
+    assert_eq!(views.as_array().unwrap().len(), 2);
+    let missing_view = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["view"]["id"] == "target-view")
+        .unwrap();
+    assert_eq!(missing_view["attachment"]["availability"], "ready");
+    assert_eq!(missing_view["attachment"]["result"]["status"], "orphaned");
+    assert_eq!(missing_view["attachment"]["result"]["reason"], "missing");
+    assert_eq!(
+        missing_view["view"]["anchor"],
+        created_target_view["view"]["anchor"]
+    );
+    let unaffected_view = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["view"]["id"] == "stable-view")
+        .unwrap();
+    assert_eq!(
+        unaffected_view["attachment"]["result"]["status"],
+        "attached"
+    );
+    assert_eq!(
+        unaffected_view["view"]["anchor"],
+        created_stable_view["view"]["anchor"]
+    );
+    for (id, expected_status, expected_reason) in [
+        ("target-view", "orphaned", "missing"),
+        ("stable-view", "attached", "none"),
+    ] {
+        let route = pinned(&format!("/api/views/{id}"), &second);
+        let (status, opened) = call(&app, "GET", &route, Value::Null).await;
+        assert_eq!(status, 200, "{opened}");
+        assert_eq!(opened["attachment"]["result"]["status"], expected_status);
+        assert_eq!(opened["attachment"]["result"]["reason"], expected_reason);
+    }
+
+    let (status, notes) = call(
+        &app,
+        "GET",
+        &pinned("/api/annotations", &second),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{notes}");
+    assert_eq!(notes.as_array().unwrap().len(), 2);
+    let missing_note = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["annotation"]["id"] == "target-note")
+        .unwrap();
+    assert_eq!(missing_note["attachment"]["availability"], "ready");
+    assert_eq!(missing_note["attachment"]["result"]["status"], "orphaned");
+    assert_eq!(missing_note["attachment"]["result"]["reason"], "missing");
+    assert_eq!(
+        missing_note["annotation"]["anchor"],
+        created_target_note["annotation"]["anchor"]
+    );
+    let unaffected_note = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["annotation"]["id"] == "stable-note")
+        .unwrap();
+    assert_eq!(
+        unaffected_note["attachment"]["result"]["status"],
+        "attached"
+    );
+    assert_eq!(
+        unaffected_note["annotation"]["anchor"],
+        created_stable_note["annotation"]["anchor"]
+    );
+
+    let target_view_after = store
+        .saved_view_at("target-view", Some(second))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        target_view_after.view.anchor.as_deref().unwrap().get(),
+        target_view_raw
+    );
+    let target_note_after = store
+        .saved_annotations_at(Some(second))
+        .unwrap()
+        .into_iter()
+        .find(|state| state.annotation.id == "target-note")
+        .unwrap();
+    assert_eq!(
+        target_note_after
+            .annotation
+            .anchor
+            .as_deref()
+            .unwrap()
+            .get(),
+        target_note_raw
+    );
+}
+
+#[tokio::test]
+async fn schema5_is_not_native_anchor_evidence() {
+    let (_temp, store, _graph, app, seed, _session) = fixture();
+    let legacy_pin = store.index_baseline().unwrap();
+    let legacy: baleyg::model::SavedView = serde_json::from_value(json!({
+        "id":"legacy","title":"Legacy","query":{"seed":seed}
+    }))
+    .unwrap();
+    store.put_view(&legacy).unwrap();
+
+    let (status, response) = call(&app, "GET", "/api/views/legacy", Value::Null).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["view"]["query"]["seed"], seed);
+    assert!(response["view"].get("anchor").is_none());
+    assert!(response["indexGeneration"].is_null());
+    assert!(response["indexRevision"].is_null());
+    assert_eq!(response["attachment"]["availability"], "indexUnavailable");
+    assert!(response["attachment"]["result"].is_null());
+
+    let (status, error) = call(
+        &app,
+        "GET",
+        &pinned("/api/views/legacy", &legacy_pin),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 503, "{error}");
+    assert_eq!(error["error"]["code"], "index_not_ready");
+    let body = json!({"id":"new","title":"No capture","query":{"seed":seed}});
+    let (status, error) = call(&app, "PUT", &pinned("/api/views/new", &legacy_pin), body).await;
+    assert_eq!(status, 503, "{error}");
+    assert_eq!(error["error"]["code"], "index_not_ready");
+}
+
 #[tokio::test]
 async fn workspace_root_changed() {
-    let (temp, store, _graph, app, _seed) = fixture();
+    let (temp, store, _graph, app, _seed, _session) = fixture();
     let original = temp.path().join("workspace");
     let moved = temp.path().join("moved");
     std::fs::rename(&original, &moved).unwrap();

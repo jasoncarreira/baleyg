@@ -2271,3 +2271,590 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
         .unwrap();
     assert_eq!(inspect(), ("eligible", "root_replaced"));
 }
+
+#[test]
+fn saved_anchor_raw_bytes_survive_edits() {
+    use baleyg::{
+        model::{Annotation, AnnotationRecord},
+        store::topology::DurableRecords,
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let raw = serde_json::value::RawValue::from_string(
+        r#"{ "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef", "document":{"sourceSetId":"set","language":"rust","path":"src/lib.rs"}, "capturedRevisionId":"rev", "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "siblingGroupHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "siblingCount":1, "identicalHeaderCount":1 }"#.into(),
+    ).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    records
+        .put_annotation_record(
+            &AnnotationRecord::from_base(
+                Annotation {
+                    id: "note".into(),
+                    node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(),
+                    body: "first".into(),
+                },
+                Some("Title".into()),
+                Some(raw),
+            ),
+            false,
+        )
+        .unwrap();
+    let before = records
+        .annotation_record("note")
+        .unwrap()
+        .unwrap()
+        .anchor
+        .unwrap()
+        .get()
+        .to_owned();
+    let edited = AnnotationRecord::from_base(
+        Annotation {
+            id: "note".into(),
+            node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(),
+            body: "edited body".into(),
+        },
+        Some("Edited title".into()),
+        None,
+    );
+    let response = records
+        .update_annotation_record(&edited, false, || {
+            panic!("existing edit must not recapture")
+        })
+        .unwrap();
+    assert_eq!(response.anchor.as_ref().unwrap().get(), before);
+    assert_eq!(response.title.as_deref(), Some("Edited title"));
+    assert_eq!(response.body, "edited body");
+    let after = records.annotation_record("note").unwrap().unwrap();
+    assert_eq!(after.anchor.unwrap().get(), before);
+    assert_eq!(after.title.as_deref(), Some("Edited title"));
+    assert_eq!(after.body, "edited body");
+}
+
+#[test]
+fn saved_anchor_rejects_target_replacement() {
+    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    records
+        .put_annotation(&Annotation {
+            id: "note".into(),
+            node_id: "old".into(),
+            body: "first".into(),
+        })
+        .unwrap();
+    let error = records
+        .put_annotation(&Annotation {
+            id: "note".into(),
+            node_id: "new".into(),
+            body: "second".into(),
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("target replacement"));
+    assert_eq!(records.annotation("note").unwrap().unwrap().node_id, "old");
+}
+
+fn assert_expected_storage_busy(error: &anyhow::Error) {
+    if error.to_string().starts_with("storage_busy") {
+        return;
+    }
+    match error.downcast_ref::<rusqlite::Error>() {
+        Some(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::DatabaseBusy => {}
+        _ => panic!("unexpected contention error: {error:#}"),
+    }
+}
+
+fn test_anchor_raw(target: &str, hash_byte: char) -> Box<serde_json::value::RawValue> {
+    let hash: String = std::iter::repeat_n(hash_byte, 64).collect();
+    serde_json::value::to_raw_value(&baleyg::model::DurableAnchor {
+        syntax_id: target.into(),
+        document: baleyg::native_evidence::DocumentKey {
+            source_set_id: "set".into(),
+            language: "rust".into(),
+            path: "src/lib.rs".into(),
+        },
+        captured_revision_id: "revision".into(),
+        header_hash: hash.clone(),
+        sibling_group_hash: hash,
+        sibling_count: 1,
+        identical_header_count: 1,
+    })
+    .unwrap()
+}
+
+#[test]
+fn malformed_anchor_documents_fail_before_persistence() {
+    use baleyg::{
+        model::{Annotation, AnnotationRecord},
+        store::topology::DurableRecords,
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    for (language, path) in [
+        ("typescript", "src/lib.rs"),
+        ("rust", "/src/lib.rs"),
+        ("rust", "src\\lib.rs"),
+        ("rust", "src//lib.rs"),
+        ("rust", "src/./lib.rs"),
+        ("rust", "src/../lib.rs"),
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(
+            test_anchor_raw("sid:v1:0123456789abcdef0123456789abcdef", 'a').get(),
+        )
+        .unwrap();
+        value["document"]["language"] = language.into();
+        value["document"]["path"] = path.into();
+        let raw = serde_json::value::to_raw_value(&value).unwrap();
+        let record = AnnotationRecord::from_base(
+            Annotation {
+                id: "bad".into(),
+                node_id: "node".into(),
+                body: "body".into(),
+            },
+            None,
+            Some(raw),
+        );
+        assert!(
+            records.put_annotation_record(&record, false).is_err(),
+            "accepted {language}:{path}"
+        );
+    }
+    assert!(!roots.record_db(&identity).exists());
+}
+
+#[test]
+fn view_anchor_raw_bytes_survive_edits() {
+    use baleyg::{
+        model::{SavedView, SavedViewRecord, ViewQuery},
+        store::topology::DurableRecords,
+    };
+    use std::collections::BTreeMap;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let target = "sid:v1:0123456789abcdef0123456789abcdef";
+    let records = DurableRecords::new(&roots, &identity);
+    let view = SavedView {
+        id: "view".into(),
+        title: "First".into(),
+        query: ViewQuery {
+            seed: target.into(),
+            depth: 1,
+            max_nodes: 40,
+            max_calls: 200,
+            include_callbacks: false,
+            exclude_paths: vec![],
+        },
+        pins: BTreeMap::new(),
+        hidden: vec![],
+    };
+    let raw = serde_json::value::RawValue::from_string(
+        r#"{ "siblingCount":1, "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef", "document": {"path":"src/lib.rs","language":"rust","sourceSetId":"set"}, "capturedRevisionId":"revision", "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "siblingGroupHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "identicalHeaderCount":1 }"#.into(),
+    ).unwrap();
+    records
+        .put_view_record(&SavedViewRecord::from_base(view.clone(), Some(raw)))
+        .unwrap();
+    let before = records
+        .view_record("view")
+        .unwrap()
+        .unwrap()
+        .anchor
+        .unwrap()
+        .get()
+        .to_owned();
+    let mut edited = view;
+    edited.title = "Edited".into();
+    records.put_view(&edited).unwrap();
+    let after = records.view_record("view").unwrap().unwrap();
+    assert_eq!(after.anchor.unwrap().get(), before);
+    assert_eq!(after.title, "Edited");
+}
+
+#[test]
+fn saved_anchor_atomic_first_save_and_delete_edit_races() {
+    use baleyg::{
+        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
+        store::topology::DurableRecords,
+    };
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Barrier},
+        thread,
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let target = "sid:v1:0123456789abcdef0123456789abcdef";
+    let make_view = |title: char| {
+        SavedViewRecord::from_base(
+            SavedView {
+                id: "view-race".into(),
+                title: title.to_string(),
+                query: ViewQuery {
+                    seed: target.into(),
+                    depth: 1,
+                    max_nodes: 40,
+                    max_calls: 200,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                pins: BTreeMap::new(),
+                hidden: vec![],
+            },
+            None,
+        )
+    };
+
+    // Whole-record creation intentionally uses a nonblocking exclusive use lock.
+    // One contender wins; retry the typed busy loser only after the winner released it.
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = vec![];
+    for hash in ['a', 'b'] {
+        let roots = roots.clone();
+        let work = work.clone();
+        let barrier = barrier.clone();
+        let record = make_view(hash);
+        workers.push(thread::spawn(move || {
+            let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+            barrier.wait();
+            let result = DurableRecords::new(&roots, &identity)
+                .update_view_record(&record, || Ok(test_anchor_raw(target, hash)));
+            (hash, result)
+        }));
+    }
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    let winner = outcomes
+        .iter()
+        .find_map(|(_, result)| result.as_ref().ok())
+        .expect("one creator must win");
+    let winner_raw = winner.anchor.as_ref().unwrap().get().to_owned();
+    let losers: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, result)| result.is_err())
+        .collect();
+    assert!(losers.len() <= 1, "only the nonblocking creator may lose");
+    for (_, result) in outcomes.iter().filter(|(_, result)| result.is_ok()) {
+        assert_eq!(
+            result.as_ref().unwrap().anchor.as_ref().unwrap().get(),
+            winner_raw
+        );
+    }
+    if let Some((loser_hash, loser)) = losers.first() {
+        assert_expected_storage_busy(loser.as_ref().unwrap_err());
+        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+        let retried = DurableRecords::new(&roots, &identity)
+            .update_view_record(&make_view(*loser_hash), || {
+                Ok(test_anchor_raw(target, *loser_hash))
+            })
+            .unwrap();
+        assert_eq!(retried.anchor.as_ref().unwrap().get(), winner_raw);
+    }
+
+    // Once the durable DB exists, same-ID note contenders either serialize in SQLite
+    // or report typed busy. Retry any loser after both contenders have completed.
+    let make_note = |body: char| {
+        AnnotationRecord::from_base(
+            Annotation {
+                id: "note-race".into(),
+                node_id: target.into(),
+                body: body.to_string(),
+            },
+            None,
+            None,
+        )
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = vec![];
+    for hash in ['c', 'd'] {
+        let roots = roots.clone();
+        let work = work.clone();
+        let barrier = barrier.clone();
+        let record = make_note(hash);
+        workers.push(thread::spawn(move || {
+            let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+            barrier.wait();
+            let result = DurableRecords::new(&roots, &identity).update_annotation_record(
+                &record,
+                false,
+                || Ok(test_anchor_raw(target, hash)),
+            );
+            (hash, result)
+        }));
+    }
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    let winner = outcomes
+        .iter()
+        .find_map(|(_, result)| result.as_ref().ok())
+        .expect("one note writer must win");
+    let note_winner_raw = winner.anchor.as_ref().unwrap().get().to_owned();
+    for (hash, result) in outcomes {
+        match result {
+            Ok(record) => assert_eq!(record.anchor.unwrap().get(), note_winner_raw),
+            Err(error) => {
+                assert_expected_storage_busy(&error);
+                let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+                let retried = DurableRecords::new(&roots, &identity)
+                    .update_annotation_record(&make_note(hash), false, || {
+                        Ok(test_anchor_raw(target, hash))
+                    })
+                    .unwrap();
+                assert_eq!(retried.anchor.unwrap().get(), note_winner_raw);
+            }
+        }
+    }
+
+    // Delete/edit contention may expose the same documented typed busy result.
+    // Complete the loser only after the winner releases the transaction and prove
+    // that every successful edit response carries a real immutable anchor.
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    let existing = records.view_record("view-race").unwrap().unwrap();
+    let old_raw = existing.anchor.as_ref().unwrap().get().to_owned();
+    let edit = SavedViewRecord {
+        title: "edit".into(),
+        anchor: None,
+        ..existing
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let edit_roots = roots.clone();
+    let edit_work = work.clone();
+    let edit_barrier = barrier.clone();
+    let edit_copy = edit.clone();
+    let editor = thread::spawn(move || {
+        let identity = WorkspaceIdentity::discover(Some(&edit_work), &edit_work).unwrap();
+        edit_barrier.wait();
+        DurableRecords::new(&edit_roots, &identity)
+            .update_view_record(&edit_copy, || Ok(test_anchor_raw(target, 'e')))
+    });
+    let delete_roots = roots.clone();
+    let delete_work = work.clone();
+    let delete_barrier = barrier.clone();
+    let deleter = thread::spawn(move || {
+        let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
+        delete_barrier.wait();
+        DurableRecords::new(&delete_roots, &identity).delete_view("view-race")
+    });
+    let replacement_raw = test_anchor_raw(target, 'e').get().to_owned();
+    let edit_result = editor.join().unwrap();
+    let delete_result = deleter.join().unwrap();
+    let edit_was_busy = edit_result.is_err();
+    let edit_response = match edit_result {
+        Ok(record) => record,
+        Err(error) => {
+            assert_expected_storage_busy(&error);
+            records
+                .update_view_record(&edit, || Ok(test_anchor_raw(target, 'e')))
+                .unwrap()
+        }
+    };
+    let delete_was_busy = delete_result.is_err();
+    match delete_result {
+        Ok(deleted) => assert!(deleted),
+        Err(error) => {
+            assert_expected_storage_busy(&error);
+            assert!(records.delete_view("view-race").unwrap());
+        }
+    }
+    let response_raw = edit_response.anchor.as_ref().unwrap().get();
+    assert!(response_raw == old_raw || response_raw == replacement_raw);
+    assert!(edit_response.typed_anchor().unwrap().is_some());
+    let final_record = records.view_record("view-race").unwrap();
+    match (edit_was_busy, delete_was_busy, final_record) {
+        // The edit retry runs first; the delete retry then removes that exact row.
+        (_, true, None) => assert_eq!(response_raw, old_raw),
+        // The completed delete ran first; the edit retry is a fresh server capture.
+        (true, false, Some(final_record)) => {
+            assert_eq!(response_raw, replacement_raw);
+            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+        }
+        // With no retry, final presence proves delete-before-edit.
+        (false, false, Some(final_record)) => {
+            assert_eq!(response_raw, replacement_raw);
+            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+        }
+        // With no retry, final absence proves edit-before-delete.
+        (false, false, None) => assert_eq!(response_raw, old_raw),
+        chronology => panic!("impossible view contention chronology: {chronology:?}"),
+    }
+
+    let existing = records.annotation_record("note-race").unwrap().unwrap();
+    let old_raw = existing.anchor.as_ref().unwrap().get().to_owned();
+    let edit = AnnotationRecord {
+        body: "edit".into(),
+        anchor: None,
+        ..existing
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let edit_roots = roots.clone();
+    let edit_work = work.clone();
+    let edit_barrier = barrier.clone();
+    let edit_copy = edit.clone();
+    let editor = thread::spawn(move || {
+        let identity = WorkspaceIdentity::discover(Some(&edit_work), &edit_work).unwrap();
+        edit_barrier.wait();
+        DurableRecords::new(&edit_roots, &identity).update_annotation_record(
+            &edit_copy,
+            false,
+            || Ok(test_anchor_raw(target, 'f')),
+        )
+    });
+    let delete_roots = roots.clone();
+    let delete_work = work.clone();
+    let delete_barrier = barrier.clone();
+    let deleter = thread::spawn(move || {
+        let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
+        delete_barrier.wait();
+        DurableRecords::new(&delete_roots, &identity).delete_annotation("note-race")
+    });
+    let replacement_raw = test_anchor_raw(target, 'f').get().to_owned();
+    let edit_result = editor.join().unwrap();
+    let delete_result = deleter.join().unwrap();
+    let edit_was_busy = edit_result.is_err();
+    let edit_response = match edit_result {
+        Ok(record) => record,
+        Err(error) => {
+            assert_expected_storage_busy(&error);
+            records
+                .update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f')))
+                .unwrap()
+        }
+    };
+    let delete_was_busy = delete_result.is_err();
+    match delete_result {
+        Ok(deleted) => assert!(deleted),
+        Err(error) => {
+            assert_expected_storage_busy(&error);
+            assert!(records.delete_annotation("note-race").unwrap());
+        }
+    }
+    let response_raw = edit_response.anchor.as_ref().unwrap().get();
+    assert!(response_raw == old_raw || response_raw == replacement_raw);
+    assert!(edit_response.typed_anchor().unwrap().is_some());
+    let final_record = records.annotation_record("note-race").unwrap();
+    match (edit_was_busy, delete_was_busy, final_record) {
+        // The edit retry runs first; the delete retry then removes that exact row.
+        (_, true, None) => assert_eq!(response_raw, old_raw),
+        // The completed delete ran first; the edit retry is a fresh server capture.
+        (true, false, Some(final_record)) => {
+            assert_eq!(response_raw, replacement_raw);
+            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+        }
+        // With no retry, final presence proves delete-before-edit.
+        (false, false, Some(final_record)) => {
+            assert_eq!(response_raw, replacement_raw);
+            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
+        }
+        // With no retry, final absence proves edit-before-delete.
+        (false, false, None) => assert_eq!(response_raw, old_raw),
+        chronology => panic!("impossible view contention chronology: {chronology:?}"),
+    }
+}
+
+#[test]
+fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() {
+    use baleyg::{
+        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
+        store::topology::DurableRecords,
+    };
+    use std::{
+        collections::BTreeMap,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    let target = "sid:v1:0123456789abcdef0123456789abcdef";
+
+    let stale_view = SavedViewRecord::from_base(
+        SavedView {
+            id: "view-recreate".into(),
+            title: "old".into(),
+            query: ViewQuery {
+                seed: target.into(),
+                depth: 1,
+                max_nodes: 40,
+                max_calls: 200,
+                include_callbacks: false,
+                exclude_paths: vec![],
+            },
+            pins: BTreeMap::new(),
+            hidden: vec![],
+        },
+        Some(test_anchor_raw(target, 'a')),
+    );
+    records.put_view_record(&stale_view).unwrap();
+    assert!(records.delete_view("view-recreate").unwrap());
+    assert!(records.view_record("view-recreate").unwrap().is_none());
+    let view_capture_called = AtomicBool::new(false);
+    let recreated_view = records
+        .update_view_record(&stale_view, || {
+            assert!(!view_capture_called.swap(true, Ordering::SeqCst));
+            Ok(test_anchor_raw(target, 'e'))
+        })
+        .unwrap();
+    assert!(view_capture_called.load(Ordering::SeqCst));
+    assert_eq!(
+        recreated_view.anchor.as_ref().unwrap().get(),
+        test_anchor_raw(target, 'e').get()
+    );
+    assert_eq!(
+        records
+            .view_record("view-recreate")
+            .unwrap()
+            .unwrap()
+            .anchor
+            .unwrap()
+            .get(),
+        test_anchor_raw(target, 'e').get()
+    );
+
+    let stale_note = AnnotationRecord::from_base(
+        Annotation {
+            id: "note-recreate".into(),
+            node_id: target.into(),
+            body: "old".into(),
+        },
+        Some("Title".into()),
+        Some(test_anchor_raw(target, 'b')),
+    );
+    records.put_annotation_record(&stale_note, false).unwrap();
+    assert!(records.delete_annotation("note-recreate").unwrap());
+    assert!(
+        records
+            .annotation_record("note-recreate")
+            .unwrap()
+            .is_none()
+    );
+    let note_capture_called = AtomicBool::new(false);
+    let recreated_note = records
+        .update_annotation_record(&stale_note, false, || {
+            assert!(!note_capture_called.swap(true, Ordering::SeqCst));
+            Ok(test_anchor_raw(target, 'f'))
+        })
+        .unwrap();
+    assert!(note_capture_called.load(Ordering::SeqCst));
+    assert_eq!(
+        recreated_note.anchor.as_ref().unwrap().get(),
+        test_anchor_raw(target, 'f').get()
+    );
+    assert_eq!(
+        records
+            .annotation_record("note-recreate")
+            .unwrap()
+            .unwrap()
+            .anchor
+            .unwrap()
+            .get(),
+        test_anchor_raw(target, 'f').get()
+    );
+}

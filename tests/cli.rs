@@ -652,11 +652,7 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
 #[tokio::test]
 async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_when_busy() {
     use baleyg::store::topology::UseGuard;
-    use std::{
-        io::{BufRead, BufReader},
-        os::unix::fs::PermissionsExt,
-        process::Stdio,
-    };
+    use std::{os::unix::fs::PermissionsExt, process::Stdio};
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     struct Server(std::process::Child);
     impl Drop for Server {
@@ -665,15 +661,36 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
             let _ = self.0.wait();
         }
     }
+    fn startup_diagnostic(server: &mut Server, stderr_path: &std::path::Path, port: u16) -> String {
+        let status = format!("{:?}", server.0.try_wait());
+        let stderr = fs::read(stderr_path)
+            .map(|bytes| {
+                let redacted = String::from_utf8_lossy(&bytes).replace(TOKEN, "[REDACTED]");
+                redacted
+                    .chars()
+                    .rev()
+                    .take(1024)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|error| format!("<stderr unreadable: {error}>"));
+        format!("port={port}, child_status={status}, stderr_tail={stderr:?}")
+    }
     async fn serve(
         root: &std::path::Path,
         home: &std::path::Path,
         token: &std::path::Path,
-    ) -> (Server, String) {
+        phase: &str,
+    ) -> (Server, String, reqwest::Client) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let mut child = isolated_command(home)
+        fs::create_dir_all(home).unwrap();
+        let stderr_path = home.join(format!("daemon-{phase}-{port}.stderr"));
+        let stderr = fs::File::create(&stderr_path).unwrap();
+        let child = isolated_command(home)
             .arg("serve")
             .arg("--workspace")
             .arg(root)
@@ -684,38 +701,63 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
             .arg("--max-file-bytes")
             .arg("3145728")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let server = Server(child);
-        let boot = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            tokio::task::spawn_blocking(move || {
-                let mut reader = BufReader::new(stderr);
-                let mut lines = String::new();
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap() == 0 {
-                        return Err(lines);
-                    }
-                    lines.push_str(&line);
-                    if line.contains("Baleyg:") {
-                        return Ok(lines);
-                    }
+        let mut server = Server(child);
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut last_transport = String::new();
+        loop {
+            match server.0.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => panic!(
+                    "daemon exited before /healthz readiness ({status}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                ),
+                Err(error) => panic!(
+                    "daemon liveness check failed ({error}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                ),
+            }
+            match tokio::time::timeout_at(deadline, client.get(format!("{base}/healthz")).send())
+                .await
+            {
+                Ok(Ok(response)) => {
+                    assert_eq!(
+                        response.status(),
+                        reqwest::StatusCode::OK,
+                        "daemon /healthz returned wrong HTTP status; {}",
+                        startup_diagnostic(&mut server, &stderr_path, port)
+                    );
+                    return (server, base, client);
                 }
-            }),
-        )
-        .await
-        .expect("daemon startup timed out")
-        .unwrap();
-        assert!(
-            boot.is_ok(),
-            "daemon failed before binding: {:?}",
-            boot.err()
-        );
-        (server, format!("http://127.0.0.1:{port}"))
+                Ok(Err(error)) if error.is_connect() || error.is_timeout() => {
+                    last_transport = error.to_string();
+                }
+                Ok(Err(error)) => panic!(
+                    "daemon /healthz non-transport error ({error}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                ),
+                Err(_) => panic!(
+                    "daemon /healthz readiness timed out (last transport: {last_transport}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                ),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "daemon /healthz readiness timed out (last transport: {last_transport}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
+
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
@@ -745,12 +787,8 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
         dir.file_name().unwrap().to_string_lossy()
     ));
     let reader = UseGuard::acquire_existing(&use_lock, false, true).unwrap();
-    let (busy_server, busy_url) = serve(&root, &home, &token).await;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let busy = client
+    let (busy_server, busy_url, busy_client) = serve(&root, &home, &token, "busy").await;
+    let busy = busy_client
         .get(format!("{busy_url}/api/status"))
         .bearer_auth(TOKEN)
         .send()
@@ -761,9 +799,10 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
     assert_eq!(body["error"]["code"], "recovery_required");
     assert_eq!(fs::read(&index).unwrap(), corrupt);
     drop(busy_server);
+    drop(busy_client);
     drop(reader);
-    let (ready_server, url) = serve(&root, &home, &token).await;
-    let ready = client
+    let (ready_server, url, ready_client) = serve(&root, &home, &token, "ready").await;
+    let ready = ready_client
         .get(format!("{url}/api/status"))
         .bearer_auth(TOKEN)
         .send()
@@ -1777,6 +1816,171 @@ async fn real_api(
     let response = request.send().await.unwrap();
     let status = response.status();
     (status, response.json().await.unwrap())
+}
+
+struct SavedItemServer(std::process::Child);
+impl Drop for SavedItemServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+async fn start_saved_item_server(
+    temp: &std::path::Path,
+    root: &std::path::Path,
+    home: &std::path::Path,
+    token: &str,
+) -> (SavedItemServer, reqwest::Client, String) {
+    use std::{io::Read, os::unix::fs::PermissionsExt, time::Duration};
+    let token_file = temp.join("saved-item-token");
+    fs::write(&token_file, token).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let stderr_path = temp.join(format!("saved-item-daemon-{port}.stderr"));
+    let mut server = SavedItemServer(
+        isolated_command(home)
+            .arg("serve")
+            .arg("--workspace")
+            .arg(root)
+            .arg("--bind")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--token-file")
+            .arg(&token_file)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(
+                fs::File::create(&stderr_path).unwrap(),
+            ))
+            .spawn()
+            .unwrap(),
+    );
+    let url = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(format!("{url}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        let status = server.0.try_wait().unwrap();
+        let mut diagnostic = String::new();
+        fs::File::open(&stderr_path)
+            .unwrap()
+            .take(4096)
+            .read_to_string(&mut diagnostic)
+            .unwrap();
+        panic!(
+            "saved-item daemon did not start: status={status:?}, stderr={}",
+            diagnostic.replace(token, "[redacted]")
+        );
+    }
+    (server, client, url)
+}
+
+async fn real_index_job(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    expected: &Value,
+) -> Value {
+    use std::time::Duration;
+    let (status, accepted) = real_api(
+        client,
+        url,
+        token,
+        reqwest::Method::POST,
+        "/api/index",
+        Some(serde_json::json!({"expectedRevision":expected})),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{accepted}");
+    let id = accepted["id"].as_str().unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, job) = real_api(
+                client,
+                url,
+                token,
+                reqwest::Method::GET,
+                &format!("/api/jobs/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, reqwest::StatusCode::OK, "{job}");
+            if !job["finishedAt"].is_null() {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("saved-item index job");
+    assert_eq!(completed["state"], "completed", "{completed}");
+    completed["revision"].clone()
+}
+
+fn saved_pin_route(route: &str, pin: &Value) -> String {
+    let separator = if route.contains('?') { '&' } else { '?' };
+    format!(
+        "{route}{separator}indexGeneration={}&indexRevision={}",
+        pin["indexGeneration"].as_str().unwrap(),
+        pin["indexRevision"].as_u64().unwrap()
+    )
+}
+
+fn find_workspace_db(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "workspace.db") {
+                return Some(path);
+            }
+            if path.is_dir()
+                && let Some(db) = find(&path)
+            {
+                return Some(db);
+            }
+        }
+        None
+    }
+    find(home)
+}
+
+fn stored_payload(db_path: &std::path::Path, table: &str, id: &str) -> String {
+    assert!(matches!(table, "views" | "annotations"));
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    db.query_row(
+        &format!("SELECT payload FROM {table} WHERE id=?1"),
+        [id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn raw_anchor(payload: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        anchor: Option<Box<serde_json::value::RawValue>>,
+    }
+    serde_json::from_str::<Envelope>(payload)
+        .unwrap()
+        .anchor
+        .map(|raw| raw.get().to_owned())
 }
 
 // Reverse the lossless Jev table encoding to check the real cached export against
@@ -2828,8 +3032,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 200, "{_packet_before}");
 
-    // A bounded multi-file scan lets the client acquire a real SQLite writer lock
-    // after the HTTP job is accepted but before projection completes.
+    // A SQLite RESERVED writer allows HTTP admission and the complete source capture,
+    // but denies the publisher its write lock after projection completes.
     let padding = "x".repeat(48 * 1024);
     for i in 0..80 {
         fs::write(
@@ -2838,6 +3042,9 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         )
         .unwrap();
     }
+    let writer = Writer(rusqlite::Connection::open(real_index_db(&home)).unwrap());
+    writer.0.busy_timeout(Duration::from_secs(1)).unwrap();
+    writer.0.execute_batch("BEGIN IMMEDIATE").unwrap();
     let (code, accepted) = real_api(
         &client,
         &url,
@@ -2849,72 +3056,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 202, "{accepted}");
     let id = accepted["id"].as_str().unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let (code, job) = real_api(
-                &client,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                &format!("/api/jobs/{id}"),
-                None,
-            )
-            .await;
-            assert_eq!(code, 200, "{job}");
-            assert!(
-                job["finishedAt"].is_null(),
-                "job finished before lock: {job}"
-            );
-            if job["progress"]["phase"] == "scan"
-                && job["progress"]["completed"].as_u64().unwrap() < 81
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("scan progress before SQLite lock");
-    let writer = Writer(rusqlite::Connection::open(real_index_db(&home)).unwrap());
-    writer.0.busy_timeout(Duration::from_secs(1)).unwrap();
-    writer.0.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let after_capture = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let (code, job) = real_api(
-                &client,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                &format!("/api/jobs/{id}"),
-                None,
-            )
-            .await;
-            assert_eq!(code, 200, "{job}");
-            if job["progress"]["phase"] == "complete" {
-                break job;
-            }
-            assert!(
-                job["finishedAt"].is_null(),
-                "failed before captured graph: {job}"
-            );
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("captured graph must complete before cancellation");
-    assert_eq!(after_capture["progress"]["completed"], 81);
-    let (code, _) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        &format!("/api/jobs/{id}/cancel"),
-        None,
-    )
-    .await;
-    assert_eq!(code, 200);
-    drop(writer); // Always rolls back the external writer lock, including on panic.
-    let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+    let terminal = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let (code, job) = real_api(
                 &client,
@@ -2929,16 +3071,31 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
             if !job["finishedAt"].is_null() {
                 break job;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("failed or cancelled job terminal");
-    assert!(
-        matches!(terminal["state"].as_str(), Some("failed" | "cancelled")),
-        "{terminal}"
+    .expect("complete capture followed by publication contention");
+    assert_eq!(terminal["state"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["code"], "index_failed", "{terminal}");
+    assert!(terminal["revision"].is_null(), "{terminal}");
+    assert_eq!(terminal["progress"]["phase"], "complete", "{terminal}");
+    assert_eq!(terminal["progress"]["completed"], 81, "{terminal}");
+    assert_eq!(terminal["progress"]["total"], 81, "{terminal}");
+    drop(writer); // Always rolls back the external writer lock, including on panic.
+    let (generation, revision): (String, i64) = rusqlite::Connection::open(real_index_db(&home))
+        .unwrap()
+        .query_row(
+            "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(generation, pin["indexGeneration"].as_str().unwrap());
+    assert_eq!(
+        revision,
+        i64::try_from(pin["indexRevision"].as_u64().unwrap()).unwrap()
     );
-    assert_eq!(terminal["progress"]["phase"], "complete");
     let (code, current) = real_api(
         &client,
         &url,
@@ -3296,4 +3453,570 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
         0
     );
     unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[tokio::test]
+async fn saved_items_real_index_matrix() {
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    let source_path = root.join("flow.rs");
+    fs::write(
+        &source_path,
+        "fn seed(value: i32) { sink(); }\nfn sink() {}\nfn other() {}\n",
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let initial_pin = indexed["status"]["revision"].clone();
+    let (server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
+    let (status, serving_status) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{serving_status}");
+    let pin = serving_status["revision"].clone();
+    assert_eq!(pin["indexGeneration"], initial_pin["indexGeneration"]);
+    assert_eq!(
+        pin["indexRevision"].as_u64().unwrap(),
+        initial_pin["indexRevision"].as_u64().unwrap() + 1
+    );
+
+    for route in ["/api/views", "/api/views/absent", "/api/annotations"] {
+        let (status, response) =
+            real_api(&client, &url, TOKEN, reqwest::Method::GET, route, None).await;
+        if route.ends_with("absent") {
+            assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{response}");
+        } else {
+            assert_eq!(status, reqwest::StatusCode::OK, "{response}");
+            assert_eq!(response, serde_json::json!([]));
+        }
+    }
+    assert!(
+        find_workspace_db(&home).is_none(),
+        "saved reads before first write must not create workspace.db"
+    );
+
+    let (status, symbols) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/symbols?q=",
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{symbols}");
+    let seed = symbols["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "seed")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let other = symbols["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "other")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let view_body = serde_json::json!({
+        "id":"real-view","title":"Original","query":{"seed":seed}
+    });
+    let (status, saved_view) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::PUT,
+        &saved_pin_route("/api/views/real-view", &pin),
+        Some(view_body.clone()),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{saved_view}");
+    assert_eq!(saved_view["indexGeneration"], pin["indexGeneration"]);
+    assert_eq!(saved_view["indexRevision"], pin["indexRevision"]);
+    assert_eq!(saved_view["view"]["query"]["seed"], seed);
+    assert_eq!(saved_view["view"]["pins"], serde_json::json!({}));
+    assert_eq!(saved_view["view"]["hidden"], serde_json::json!([]));
+    assert_eq!(saved_view["attachment"]["availability"], "ready");
+    assert_eq!(saved_view["attachment"]["result"]["status"], "attached");
+    assert_eq!(saved_view["attachment"]["result"]["targetId"], seed);
+
+    let note_body = serde_json::json!({
+        "id":"real-note","nodeId":seed,"body":"First body","title":"First title"
+    });
+    let (status, saved_note) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::PUT,
+        &saved_pin_route("/api/annotations/real-note", &pin),
+        Some(note_body.clone()),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{saved_note}");
+    assert_eq!(saved_note["indexGeneration"], pin["indexGeneration"]);
+    assert_eq!(saved_note["indexRevision"], pin["indexRevision"]);
+    assert_eq!(saved_note["annotation"]["nodeId"], seed);
+    assert_eq!(saved_note["annotation"]["title"], "First title");
+    assert_eq!(saved_note["attachment"]["availability"], "ready");
+    assert_eq!(saved_note["attachment"]["result"]["targetId"], seed);
+
+    let record_db = find_workspace_db(&home).expect("schema-1 saved record database");
+    let record = rusqlite::Connection::open(&record_db).unwrap();
+    let metadata: (i64, i64) = record
+        .query_row(
+            "SELECT schema_version,initialized FROM record_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(metadata, (1, 1), "saved payload is schema 1");
+    let record_version: i64 = record
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(record_version, 1);
+    drop(record);
+    let original_view_payload = stored_payload(&record_db, "views", "real-view");
+    let original_note_payload = stored_payload(&record_db, "annotations", "real-note");
+    let original_view_anchor = raw_anchor(&original_view_payload).unwrap();
+    let original_note_anchor = raw_anchor(&original_note_payload).unwrap();
+    for (payload, target) in [
+        (&original_view_payload, &seed),
+        (&original_note_payload, &seed),
+    ] {
+        let value: Value = serde_json::from_str(payload).unwrap();
+        let fields = value["anchor"].as_object().unwrap();
+        let mut keys = fields.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "capturedRevisionId",
+                "document",
+                "headerHash",
+                "identicalHeaderCount",
+                "siblingCount",
+                "siblingGroupHash",
+                "syntaxId",
+            ]
+        );
+        assert_eq!(fields["syntaxId"], target.as_str());
+        assert_eq!(fields["headerHash"].as_str().unwrap().len(), 64);
+        assert_eq!(fields["siblingGroupHash"].as_str().unwrap().len(), 64);
+    }
+    let index_version: i64 = rusqlite::Connection::open(real_index_db(&home))
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(index_version, 7, "derived index inspection is separate");
+
+    let edited_view_body = serde_json::json!({
+        "id":"real-view","title":"Edited","query":{"seed":seed}
+    });
+    let (status, edited_view) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::PUT,
+        &saved_pin_route("/api/views/real-view", &pin),
+        Some(edited_view_body.clone()),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{edited_view}");
+    assert_eq!(edited_view["view"]["anchor"], saved_view["view"]["anchor"]);
+    let edited_note_body = serde_json::json!({
+        "id":"real-note","nodeId":seed,"body":"Edited body"
+    });
+    let (status, edited_note) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::PUT,
+        &saved_pin_route("/api/annotations/real-note", &pin),
+        Some(edited_note_body.clone()),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{edited_note}");
+    assert_eq!(edited_note["annotation"]["title"], "First title");
+    assert_eq!(
+        edited_note["annotation"]["anchor"],
+        saved_note["annotation"]["anchor"]
+    );
+    assert_eq!(
+        raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
+        Some(original_view_anchor.as_str())
+    );
+    assert_eq!(
+        raw_anchor(&stored_payload(&record_db, "annotations", "real-note")).as_deref(),
+        Some(original_note_anchor.as_str())
+    );
+
+    for (route, body) in [
+        (
+            saved_pin_route("/api/views/real-view", &pin),
+            serde_json::json!({
+                "id":"real-view","title":"Injected","query":{"seed":seed},
+                "anchor":saved_view["view"]["anchor"]
+            }),
+        ),
+        (
+            saved_pin_route("/api/annotations/real-note", &pin),
+            serde_json::json!({
+                "id":"real-note","nodeId":seed,"body":"Injected",
+                "attachment":saved_note["attachment"]
+            }),
+        ),
+        (
+            saved_pin_route("/api/views/real-view", &pin),
+            serde_json::json!({"id":"real-view","title":"Retarget","query":{"seed":other}}),
+        ),
+        (
+            saved_pin_route("/api/annotations/real-note", &pin),
+            serde_json::json!({"id":"real-note","nodeId":other,"body":"Retarget"}),
+        ),
+    ] {
+        let (status, error) = real_api(
+            &client,
+            &url,
+            TOKEN,
+            reqwest::Method::PUT,
+            &route,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{error}");
+    }
+    assert_eq!(
+        raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
+        Some(original_view_anchor.as_str())
+    );
+    assert_eq!(
+        raw_anchor(&stored_payload(&record_db, "annotations", "real-note")).as_deref(),
+        Some(original_note_anchor.as_str())
+    );
+
+    fs::write(
+        &source_path,
+        "fn seed(value: i64) { sink(); }\nfn sink() {}\nfn other() {}\n",
+    )
+    .unwrap();
+    let next = real_index_job(&client, &url, TOKEN, &pin).await;
+    assert_eq!(next["indexGeneration"], pin["indexGeneration"]);
+    assert_eq!(
+        next["indexRevision"].as_u64().unwrap(),
+        pin["indexRevision"].as_u64().unwrap() + 1
+    );
+
+    let routes = [
+        saved_pin_route("/api/views/real-view", &next),
+        saved_pin_route("/api/views", &next),
+        saved_pin_route("/api/annotations", &next),
+    ];
+    for route in routes {
+        let (status, response) =
+            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{route}: {response}");
+        let state = if route.contains("/real-view") {
+            &response
+        } else if route.contains("annotations") {
+            &response[0]
+        } else {
+            response
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|state| state["view"]["id"] == "real-view")
+                .unwrap()
+        };
+        assert_eq!(state["indexGeneration"], next["indexGeneration"]);
+        assert_eq!(state["indexRevision"], next["indexRevision"]);
+        assert_eq!(state["attachment"]["availability"], "ready");
+        assert_eq!(state["attachment"]["result"]["status"], "orphaned");
+        assert_eq!(state["attachment"]["result"]["reason"], "headerMismatch");
+        assert!(state["attachment"]["result"]["targetId"].is_null());
+        if route.contains("annotations") {
+            assert_eq!(state["annotation"]["nodeId"], seed);
+            assert!(state["orphaned"].as_bool().unwrap());
+        } else {
+            assert_eq!(state["view"]["query"]["seed"], seed);
+            assert!(
+                state["orphanedIds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == &serde_json::json!(seed))
+            );
+        }
+    }
+    assert_eq!(
+        raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
+        Some(original_view_anchor.as_str())
+    );
+    assert_eq!(
+        raw_anchor(&stored_payload(&record_db, "annotations", "real-note")).as_deref(),
+        Some(original_note_anchor.as_str())
+    );
+
+    for route in [
+        saved_pin_route("/api/views/real-view", &pin),
+        saved_pin_route("/api/views", &pin),
+        saved_pin_route("/api/annotations", &pin),
+    ] {
+        let (status, error) =
+            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{route}: {error}");
+    }
+    for (route, body) in [
+        (
+            saved_pin_route("/api/views/real-view", &pin),
+            edited_view_body,
+        ),
+        (
+            saved_pin_route("/api/annotations/real-note", &pin),
+            edited_note_body,
+        ),
+    ] {
+        let (status, error) = real_api(
+            &client,
+            &url,
+            TOKEN,
+            reqwest::Method::PUT,
+            &route,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{error}");
+    }
+
+    let query = serde_json::json!({"seed":seed});
+    let (status, stale_query) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        &saved_pin_route("/api/query", &pin),
+        Some(query.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CONFLICT,
+        "stale replay must not resolve the surviving ordinal in Q: {stale_query}"
+    );
+    let (status, current_query) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        &saved_pin_route("/api/query", &next),
+        Some(query.clone()),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{current_query}");
+    assert_eq!(current_query["revision"], next);
+    assert_eq!(current_query["nodes"][0]["id"], seed);
+    let (status, ordinary_query) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::POST,
+        "/api/query",
+        Some(query),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{ordinary_query}");
+    assert_eq!(ordinary_query["revision"], next);
+
+    let orphan_view_edit = serde_json::json!({
+        "id":"real-view","title":"Edited while orphaned","query":{"seed":seed}
+    });
+    let (status, orphan_view) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::PUT,
+        &saved_pin_route("/api/views/real-view", &next),
+        Some(orphan_view_edit),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{orphan_view}");
+    assert_eq!(
+        orphan_view["attachment"]["result"]["reason"],
+        "headerMismatch"
+    );
+    let orphan_note_edit = serde_json::json!({
+        "id":"real-note","nodeId":seed,"body":"Edited while orphaned","title":"New title"
+    });
+    let (status, orphan_note) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::PUT,
+        &saved_pin_route("/api/annotations/real-note", &next),
+        Some(orphan_note_edit),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{orphan_note}");
+    assert_eq!(
+        orphan_note["attachment"]["result"]["reason"],
+        "headerMismatch"
+    );
+    assert_eq!(
+        raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
+        Some(original_view_anchor.as_str())
+    );
+    assert_eq!(
+        raw_anchor(&stored_payload(&record_db, "annotations", "real-note")).as_deref(),
+        Some(original_note_anchor.as_str())
+    );
+
+    drop(server);
+    let db = rusqlite::Connection::open(&record_db).unwrap();
+    db.execute(
+        "INSERT INTO views(id,payload) VALUES(?1,?2)",
+        rusqlite::params![
+            "legacy-view",
+            serde_json::json!({
+                "id":"legacy-view","title":"Legacy","query":{"seed":seed},
+                "pins":{},"hidden":[]
+            })
+            .to_string()
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO annotations(id,node_id,payload) VALUES(?1,?2,?3)",
+        rusqlite::params![
+            "legacy-note",
+            seed,
+            serde_json::json!({"id":"legacy-note","nodeId":seed,"body":"Legacy body"}).to_string()
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    let (server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
+    let (status, reopened_status) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{reopened_status}");
+    let reopened_pin = reopened_status["revision"].clone();
+    assert_eq!(reopened_pin["indexGeneration"], next["indexGeneration"]);
+    assert_eq!(
+        reopened_pin["indexRevision"].as_u64().unwrap(),
+        next["indexRevision"].as_u64().unwrap() + 1
+    );
+    let (status, views) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &saved_pin_route("/api/views", &reopened_pin),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{views}");
+    let reopened = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["view"]["id"] == "real-view")
+        .unwrap();
+    assert_eq!(reopened["view"]["title"], "Edited while orphaned");
+    assert_eq!(reopened["attachment"]["result"]["reason"], "headerMismatch");
+    let legacy_view = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["view"]["id"] == "legacy-view")
+        .unwrap();
+    assert!(legacy_view["view"].get("anchor").is_none());
+    assert_eq!(legacy_view["attachment"]["availability"], "anchorless");
+    let (status, notes) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &saved_pin_route("/api/annotations", &reopened_pin),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{notes}");
+    let reopened_note = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["annotation"]["id"] == "real-note")
+        .unwrap();
+    assert_eq!(reopened_note["annotation"]["title"], "New title");
+    assert_eq!(reopened_note["annotation"]["body"], "Edited while orphaned");
+    let legacy_note = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["annotation"]["id"] == "legacy-note")
+        .unwrap();
+    assert!(legacy_note["annotation"].get("anchor").is_none());
+    assert!(legacy_note["annotation"].get("title").is_none());
+    assert_eq!(legacy_note["attachment"]["availability"], "anchorless");
+    assert!(legacy_note["orphaned"].as_bool().unwrap());
+
+    let legacy_view_edit = serde_json::json!({
+        "id":"legacy-view","title":"Legacy edited","query":{"seed":seed}
+    });
+    let (status, legacy_view) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::PUT,
+        &saved_pin_route("/api/views/legacy-view", &reopened_pin),
+        Some(legacy_view_edit),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{legacy_view}");
+    assert!(legacy_view["view"].get("anchor").is_none());
+    assert_eq!(legacy_view["attachment"]["availability"], "anchorless");
+    let legacy_note_edit = serde_json::json!({
+        "id":"legacy-note","nodeId":seed,"body":"Legacy edited","title":"Legacy title"
+    });
+    let (status, legacy_note) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::PUT,
+        &saved_pin_route("/api/annotations/legacy-note", &reopened_pin),
+        Some(legacy_note_edit),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{legacy_note}");
+    assert!(legacy_note["annotation"].get("anchor").is_none());
+    assert_eq!(legacy_note["annotation"]["title"], "Legacy title");
+    assert_eq!(legacy_note["attachment"]["availability"], "anchorless");
+    assert!(raw_anchor(&stored_payload(&record_db, "views", "legacy-view")).is_none());
+    assert!(raw_anchor(&stored_payload(&record_db, "annotations", "legacy-note")).is_none());
+    drop(server);
 }
