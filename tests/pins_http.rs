@@ -452,9 +452,22 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
         "SQLite did not flush a genuine hot journal"
     );
+    let hot_journal = std::fs::read(&journal).unwrap();
+    let retired = Arc::downgrade(&state);
     drop(leader);
     drop(app);
     drop(state);
+    // The queue ticker's in-flight blocking worker may still own the old state.
+    // Wait for actual owner release, never a guessed delay or a relaxed fence.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while retired.upgrade().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "old daemon owner leaked"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(std::fs::read(&journal).unwrap(), hot_journal);
     let unrelated =
         baleyg::store::topology::UseGuard::acquire_existing(&leader_path, true, true).unwrap();
     let state = http::new(
