@@ -31,6 +31,7 @@ fn fixture() -> (tempfile::TempDir, Store, baleyg::model::Graph, String) {
 fn publish(
     store: &Store,
     graph: &baleyg::model::Graph,
+    leader: &baleyg::store::topology::LeaderGuard,
     expected: IndexPin,
     root: &std::path::Path,
 ) -> IndexPin {
@@ -44,14 +45,7 @@ fn publish(
     .unwrap();
     assert_eq!(&bundle_graph, graph);
     store
-        .publish_native(
-            &bundle_graph,
-            &capture,
-            &native,
-            &store.leader().unwrap(),
-            expected,
-            &cancel,
-        )
+        .publish_native(&bundle_graph, &capture, &native, leader, expected, &cancel)
         .unwrap()
 }
 #[test]
@@ -86,7 +80,14 @@ fn pin_shape_and_status() {
             "{malformed}"
         );
     }
-    let next = publish(&store, &graph, first, &temp.path().join("workspace"));
+    let session = store.leader_session().unwrap();
+    let next = publish(
+        &store,
+        &graph,
+        session.leader_guard().unwrap(),
+        first,
+        &temp.path().join("workspace"),
+    );
     assert_ne!(next.index_generation, first.index_generation); // First native publish rebaselines the legacy schema.
     assert_eq!(next.index_revision, 1);
     assert_eq!(store.status().unwrap().revision, next);
@@ -95,7 +96,14 @@ fn pin_shape_and_status() {
 fn store_pinned_read_matrix() {
     let (temp, store, graph, id) = fixture();
     let first = store.index_baseline().unwrap();
-    let pin = publish(&store, &graph, first, &temp.path().join("workspace"));
+    let session = store.leader_session().unwrap();
+    let pin = publish(
+        &store,
+        &graph,
+        session.leader_guard().unwrap(),
+        first,
+        &temp.path().join("workspace"),
+    );
     let stale = IndexPin {
         index_generation: pin.index_generation,
         index_revision: 0,
@@ -148,9 +156,11 @@ fn store_pinned_read_matrix() {
 #[test]
 fn current_store_producer_matrix() {
     let (temp, store, graph, id) = fixture();
+    let session = store.leader_session().unwrap();
     let pin = publish(
         &store,
         &graph,
+        session.leader_guard().unwrap(),
         store.index_baseline().unwrap(),
         &temp.path().join("workspace"),
     );
@@ -175,7 +185,14 @@ fn current_store_producer_matrix() {
 fn query_replay_pin_is_checked_in_target_snapshot() {
     let (temp, store, graph, id) = fixture();
     let root = temp.path().join("workspace");
-    let pin = publish(&store, &graph, store.index_baseline().unwrap(), &root);
+    let session = store.leader_session().unwrap();
+    let pin = publish(
+        &store,
+        &graph,
+        session.leader_guard().unwrap(),
+        store.index_baseline().unwrap(),
+        &root,
+    );
     let query: ViewQuery = serde_json::from_value(json!({"seed":id})).unwrap();
 
     let at_pin = store
@@ -185,7 +202,7 @@ fn query_replay_pin_is_checked_in_target_snapshot() {
     assert_eq!(at_pin.revision, pin);
     assert_eq!(at_pin.nodes[0].id, query.seed);
 
-    let next = publish(&store, &graph, pin, &root);
+    let next = publish(&store, &graph, session.leader_guard().unwrap(), pin, &root);
     assert_ne!(next, pin);
     assert_eq!(
         store.query_view(&query).unwrap().unwrap().revision,
@@ -223,7 +240,14 @@ fn query_replay_pin_is_checked_in_target_snapshot() {
 fn pair_recreation_cas() {
     let (temp, store, graph, _id) = fixture();
     let first = store.index_baseline().unwrap();
-    let old = publish(&store, &graph, first, &temp.path().join("workspace"));
+    let old_session = store.leader_session().unwrap();
+    let old = publish(
+        &store,
+        &graph,
+        old_session.leader_guard().unwrap(),
+        first,
+        &temp.path().join("workspace"),
+    );
     let index_root = temp.path().join("state/cache/indexes");
     let dir = std::fs::read_dir(&index_root)
         .unwrap()
@@ -234,6 +258,7 @@ fn pair_recreation_cas() {
         "{}.lock",
         dir.file_name().unwrap().to_string_lossy()
     ));
+    drop(old_session);
     drop(store);
     for child in ["index.db", "leader.lock"] {
         std::fs::remove_file(dir.join(child)).unwrap();
@@ -255,18 +280,29 @@ fn pair_recreation_cas() {
     )
     .unwrap();
     assert_eq!(graph, bundle_graph);
+    let replacement_session = recreated.leader_session().unwrap();
     assert!(
         recreated
             .publish_native(
                 &bundle_graph,
                 &capture,
                 &native,
-                &recreated.leader().unwrap(),
+                replacement_session.leader_guard().unwrap(),
                 first,
                 &cancel
             )
             .is_err()
     );
-    assert_eq!(publish(&recreated, &graph, fresh, &root).index_revision, 1);
+    assert_eq!(
+        publish(
+            &recreated,
+            &graph,
+            replacement_session.leader_guard().unwrap(),
+            fresh,
+            &root,
+        )
+        .index_revision,
+        1
+    );
     assert!(recreated.source_at("Types.java", Some(old)).is_err());
 }

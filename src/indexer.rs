@@ -3,9 +3,10 @@
 use crate::{capture::Capture, model::*, native_evidence};
 use anyhow::{Context, Result, ensure};
 use protobuf::Message;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::Ordering,
 };
 use tree_sitter::Node;
@@ -17,6 +18,31 @@ pub struct IndexOptions {
     pub manifest_path: Option<PathBuf>,
     pub max_file_bytes: u64,
 }
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ReconcileOptions {
+    pub version: u8,
+    pub max_file_bytes: u64,
+    pub scip_path: Option<String>,
+    pub manifest_path: Option<String>,
+}
+impl From<&IndexOptions> for ReconcileOptions {
+    fn from(options: &IndexOptions) -> Self {
+        Self {
+            version: 1,
+            max_file_bytes: options.max_file_bytes.min(256 * 1024 * 1024),
+            scip_path: options
+                .scip_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            manifest_path: options
+                .manifest_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 impl IndexOptions {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
@@ -25,6 +51,44 @@ impl IndexOptions {
             manifest_path: None,
             max_file_bytes: 2 * 1024 * 1024,
         }
+    }
+
+    /// Fix optional input identity at explicit CLI ingress, even when the input
+    /// does not exist. Never canonicalize: absence is a valid captured state.
+    pub fn anchor_optional_inputs(&mut self, cwd: &Path) -> Result<()> {
+        ensure!(cwd.is_absolute(), "index input cwd must be absolute");
+        for path in [&mut self.scip_path, &mut self.manifest_path]
+            .into_iter()
+            .flatten()
+        {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(&*path)
+            };
+            ensure!(
+                absolute.to_str().is_some(),
+                "optional index input path cannot be persisted without UTF-8 identity"
+            );
+            *path = absolute;
+        }
+        Ok(())
+    }
+}
+
+impl ReconcileOptions {
+    /// Legacy relative options cannot be replayed from a different process cwd.
+    pub fn require_absolute_optional_inputs(&self) -> Result<()> {
+        for path in [self.scip_path.as_deref(), self.manifest_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                Path::new(path).is_absolute(),
+                "incompatible_index: relative optional index input identity"
+            );
+        }
+        Ok(())
     }
 }
 

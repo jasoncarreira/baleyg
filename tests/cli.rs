@@ -20,6 +20,25 @@ fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Comman
     c
 }
 
+fn write_optional_presentation(dir: &std::path::Path, label: &str, source_hash: &str) {
+    use protobuf::Message;
+    let mut index = scip::types::Index::new();
+    let mut document = scip::types::Document::new();
+    document.relative_path = "main.js".into();
+    let mut occurrence = scip::types::Occurrence::new();
+    occurrence.range = vec![0, 9, 10];
+    occurrence.symbol_roles = 1;
+    occurrence.symbol = label.into();
+    document.occurrences.push(occurrence);
+    index.documents.push(document);
+    fs::write(dir.join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
+    fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"main.js":source_hash})).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     let temp = TempDir::new().unwrap();
@@ -38,14 +57,777 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
         );
     }
     let output = cmd.output().unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("index_not_ready"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["stats"]["files"], 0);
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.odin.baleyg"
     } else {
         ".cache/baleyg"
     });
     assert!(cache.exists());
+}
+
+#[test]
+fn standalone_takeover_reuses_recorded_nondefault_file_cap() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    let mut boundary = vec![b' '; 2_621_440];
+    boundary.extend_from_slice(
+        b"
+function boundary() {}
+",
+    );
+    fs::write(root.join("boundary.js"), boundary).unwrap();
+
+    let indexed = command(&root, &home, "index")
+        .arg("--max-file-bytes")
+        .arg("3145728")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    assert_eq!(indexed["status"]["stats"]["files"], 1);
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let db_path = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let options: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let options: Value = serde_json::from_str(&options).unwrap();
+    assert_eq!(options["maxFileBytes"], 3_145_728);
+    drop(db);
+
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["stats"]["files"], 1);
+    assert_eq!(status["revision"]["indexRevision"], 2);
+    let exported = command(&root, &home, "export").output().unwrap();
+    assert!(exported.status.success());
+    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let files = graph["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "boundary.js");
+    assert_eq!(
+        files[0]["text"].as_str().unwrap().as_bytes(),
+        fs::read(root.join("boundary.js")).unwrap()
+    );
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let (options, revision): (String, i64) = db
+        .query_row(
+            "SELECT reconcile_options,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&options).unwrap()["maxFileBytes"],
+        3_145_728
+    );
+    assert_eq!(
+        revision, 3,
+        "export must perform exactly one recorded-option takeover"
+    );
+
+    let default_home = temp.path().join("default-home");
+    let default = command(&root, &default_home, "index").output().unwrap();
+    assert!(!default.status.success());
+    assert!(default.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&default.stderr).contains("unsafe or oversized input"),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+}
+
+#[test]
+fn standalone_takeover_replays_original_relative_presentation_from_another_cwd() {
+    use sha2::{Digest, Sha256};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let first_cwd = temp.path().join("ingress");
+    let second_cwd = temp.path().join("takeover");
+    for dir in [&root, &first_cwd, &second_cwd] {
+        fs::create_dir(dir).unwrap();
+    }
+    let ingress_cwd = first_cwd.canonicalize().unwrap();
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    let original_label = "scip npm display 1 main.js/f().";
+    write_optional_presentation(&first_cwd, original_label, &source_hash);
+    // A cwd-rebound replay would use this same-name but wrong presentation.
+    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
+    let indexed = command(&root, &home, "index")
+        .current_dir(&first_cwd)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let initial: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    assert_eq!(initial["publishedRevision"]["indexRevision"], 1);
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let index_db = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let recorded_options = || -> Value {
+        let db = rusqlite::Connection::open(&index_db).unwrap();
+        let text: String = db
+            .query_row(
+                "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    let recorded = recorded_options();
+    assert_eq!(
+        recorded["scipPath"],
+        ingress_cwd.join("index.scip").to_str().unwrap()
+    );
+    assert_eq!(
+        recorded["manifestPath"],
+        ingress_cwd.join("manifest.json").to_str().unwrap()
+    );
+    let status = command(&root, &home, "status")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        initial["publishedRevision"]["indexGeneration"]
+    );
+    let export = command(&root, &home, "export")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let f = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "f")
+        .unwrap();
+    assert_eq!(f["displayLabel"], original_label);
+    assert_eq!(
+        recorded_options(),
+        recorded,
+        "takeovers must retain ingress identities"
+    );
+}
+
+#[test]
+fn standalone_takeover_keeps_configured_missing_presentation_absent() {
+    use sha2::{Digest, Sha256};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let first_cwd = temp.path().join("ingress");
+    let second_cwd = temp.path().join("takeover");
+    for dir in [&root, &first_cwd, &second_cwd] {
+        fs::create_dir(dir).unwrap();
+    }
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    // Inputs with these names exist only in B, never in the configured A.
+    write_optional_presentation(&second_cwd, "scip npm display 1 main.js/f().", &source_hash);
+    let indexed = command(&root, &home, "index")
+        .current_dir(&first_cwd)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(!first_cwd.join("index.scip").exists());
+    assert!(!first_cwd.join("manifest.json").exists());
+    let export = command(&root, &home, "export")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let f = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "f")
+        .unwrap();
+    assert!(
+        f["displayLabel"].is_null(),
+        "absent A inputs must not become B labels"
+    );
+}
+
+#[tokio::test]
+async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_takeover() {
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+    };
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let first_cwd = temp.path().join("ingress");
+    let second_cwd = temp.path().join("takeover");
+    for dir in [&root, &first_cwd, &second_cwd] {
+        fs::create_dir(dir).unwrap();
+    }
+    let ingress_cwd = first_cwd.canonicalize().unwrap();
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    let original_label = "scip npm display 1 main.js/f().";
+    write_optional_presentation(&first_cwd, original_label, &source_hash);
+    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let token = temp.path().join("token");
+    fs::write(&token, TOKEN).unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut child = isolated_command(&home)
+        .arg("serve")
+        .arg("--workspace")
+        .arg(&root)
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--token-file")
+        .arg(&token)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .current_dir(&first_cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let server = Server(child);
+    let startup = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut text = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    return Err(text);
+                }
+                text.push_str(&line);
+                if line.contains("Baleyg:") {
+                    return Ok(text);
+                }
+            }
+        }),
+    )
+    .await
+    .expect("daemon startup timed out")
+    .unwrap()
+    .unwrap_or_else(|text| panic!("daemon exited before binding: {text}"));
+    assert!(
+        !startup.contains("Evidence unavailable at startup"),
+        "{startup}"
+    );
+    drop(server);
+    let export = command(&root, &home, "export")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let f = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "f")
+        .unwrap();
+    assert_eq!(f["displayLabel"], original_label);
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let index_db = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    let recorded: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let recorded: Value = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(
+        recorded["scipPath"],
+        ingress_cwd.join("index.scip").to_str().unwrap()
+    );
+    assert_eq!(
+        recorded["manifestPath"],
+        ingress_cwd.join("manifest.json").to_str().unwrap()
+    );
+}
+
+#[test]
+fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
+    use sha2::{Digest, Sha256};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let first_cwd = temp.path().join("ingress");
+    let second_cwd = temp.path().join("takeover");
+    for dir in [&root, &first_cwd, &second_cwd] {
+        fs::create_dir(dir).unwrap();
+    }
+    let ingress_cwd = first_cwd.canonicalize().unwrap();
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    write_optional_presentation(&first_cwd, "scip npm display 1 main.js/f().", &source_hash);
+    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
+    let indexed = command(&root, &home, "index")
+        .current_dir(&first_cwd)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let index_db = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    // Model one previously persisted relative record with a matching inventory;
+    // changing only reconcile_options would be rejected earlier as torn metadata.
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    let raw: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut previous: baleyg::indexer::ReconcileOptions = serde_json::from_str(&raw).unwrap();
+    previous.scip_path = Some("index.scip".into());
+    previous.manifest_path = Some("manifest.json".into());
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    db.execute(
+        "UPDATE index_metadata SET reconcile_options=?1 WHERE singleton=1",
+        [serde_json::to_string(&previous).unwrap()],
+    )
+    .unwrap();
+    for (role, name) in [("scip", "index.scip"), ("manifest", "manifest.json")] {
+        let old_key = format!("presentation-{role}:{}", ingress_cwd.join(name).display());
+        let new_key = format!("presentation-{role}:{name}");
+        assert_eq!(
+            db.execute(
+                "UPDATE capture_inputs SET input_key=?1 WHERE input_key=?2",
+                rusqlite::params![new_key, old_key],
+            )
+            .unwrap(),
+            1
+        );
+    }
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    let rejected = command(&root, &home, "status")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        !rejected.status.success(),
+        "legacy relative options were replayed"
+    );
+    assert!(
+        rejected.stdout.is_empty(),
+        "no cwd-rebound evidence may escape"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("run explicit baleyg index"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    let revision: i64 = db
+        .query_row(
+            "SELECT index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        revision, 1,
+        "relative legacy record cannot republish from B"
+    );
+}
+
+#[test]
+fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_options() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let first = command(&root, &home, "index")
+        .arg("--max-file-bytes")
+        .arg("2097152")
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let dir = fs::read_dir(&indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let index = dir.join("index.db");
+    let leader = dir.join("leader.lock");
+    let old_inode = fs::symlink_metadata(&leader).unwrap();
+    fs::write(&index, b"invalid-sqlite-header-with-at-least-20-bytes").unwrap();
+    let corrupt = fs::read(&index).unwrap();
+    for sub in ["status", "symbols", "query", "export"] {
+        let mut cmd = command(&root, &home, sub);
+        match sub {
+            "symbols" => {
+                cmd.arg("--search").arg("a");
+            }
+            "query" => {
+                cmd.arg("--seed").arg("unknown");
+            }
+            _ => {}
+        }
+        let refused = cmd.output().unwrap();
+        assert!(!refused.status.success(), "{sub} unexpectedly succeeded");
+        assert!(
+            refused.stdout.is_empty(),
+            "{sub} emitted unverified evidence"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("explicit baleyg index"),
+            "{sub}: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(fs::read(&index).unwrap(), corrupt);
+    }
+    let recovered = command(&root, &home, "index")
+        .arg("--max-file-bytes")
+        .arg("2097152")
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let output: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(output["publishedRevision"], output["status"]["revision"]);
+    assert_eq!(output["publishedRevision"]["indexRevision"], 1);
+    assert_ne!(
+        output["publishedRevision"]["indexGeneration"],
+        first["publishedRevision"]["indexGeneration"]
+    );
+    let new_inode = fs::symlink_metadata(&leader).unwrap();
+    assert_eq!(
+        (old_inode.dev(), old_inode.ino()),
+        (new_inode.dev(), new_inode.ino())
+    );
+    let db = rusqlite::Connection::open(&index).unwrap();
+    let recorded: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&recorded).unwrap()["maxFileBytes"],
+        2_097_152
+    );
+}
+
+#[tokio::test]
+async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_when_busy() {
+    use baleyg::store::topology::UseGuard;
+    use std::{os::unix::fs::PermissionsExt, process::Stdio};
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn startup_diagnostic(server: &mut Server, stderr_path: &std::path::Path, port: u16) -> String {
+        let status = format!("{:?}", server.0.try_wait());
+        let stderr = fs::read(stderr_path)
+            .map(|bytes| {
+                let redacted = String::from_utf8_lossy(&bytes).replace(TOKEN, "[REDACTED]");
+                redacted
+                    .chars()
+                    .rev()
+                    .take(1024)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|error| format!("<stderr unreadable: {error}>"));
+        format!("port={port}, child_status={status}, stderr_tail={stderr:?}")
+    }
+    async fn serve(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        token: &std::path::Path,
+        phase: &str,
+    ) -> (Server, String, reqwest::Client) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        fs::create_dir_all(home).unwrap();
+        let stderr_path = home.join(format!("daemon-{phase}-{port}.stderr"));
+        let stderr = fs::File::create(&stderr_path).unwrap();
+        let child = isolated_command(home)
+            .arg("serve")
+            .arg("--workspace")
+            .arg(root)
+            .arg("--bind")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--token-file")
+            .arg(token)
+            .arg("--max-file-bytes")
+            .arg("3145728")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .unwrap();
+        let mut server = Server(child);
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut last_transport = String::new();
+        loop {
+            match server.0.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => panic!(
+                    "daemon exited before /healthz readiness ({status}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                ),
+                Err(error) => panic!(
+                    "daemon liveness check failed ({error}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                ),
+            }
+            match tokio::time::timeout_at(deadline, client.get(format!("{base}/healthz")).send())
+                .await
+            {
+                Ok(Ok(response)) => {
+                    assert_eq!(
+                        response.status(),
+                        reqwest::StatusCode::OK,
+                        "daemon /healthz returned wrong HTTP status; {}",
+                        startup_diagnostic(&mut server, &stderr_path, port)
+                    );
+                    return (server, base, client);
+                }
+                Ok(Err(error)) if error.is_connect() || error.is_timeout() => {
+                    last_transport = error.to_string();
+                }
+                Ok(Err(error)) => panic!(
+                    "daemon /healthz non-transport error ({error}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                ),
+                Err(_) => panic!(
+                    "daemon /healthz readiness timed out (last transport: {last_transport}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                ),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "daemon /healthz readiness timed out (last transport: {last_transport}); {}",
+                    startup_diagnostic(&mut server, &stderr_path, port)
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let initial = command(&root, &home, "index").output().unwrap();
+    assert!(initial.status.success());
+    let old_pin: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let dir = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let index = dir.join("index.db");
+    fs::write(&index, b"broken sqlite index header").unwrap();
+    let corrupt = fs::read(&index).unwrap();
+    let token = temp.path().join("token");
+    fs::write(&token, TOKEN).unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let use_lock = dir.parent().unwrap().join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let reader = UseGuard::acquire_existing(&use_lock, false, true).unwrap();
+    let (busy_server, busy_url, busy_client) = serve(&root, &home, &token, "busy").await;
+    let busy = busy_client
+        .get(format!("{busy_url}/api/status"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = busy.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "recovery_required");
+    assert_eq!(fs::read(&index).unwrap(), corrupt);
+    drop(busy_server);
+    drop(busy_client);
+    drop(reader);
+    let (ready_server, url, ready_client) = serve(&root, &home, &token, "ready").await;
+    let ready = ready_client
+        .get(format!("{url}/api/status"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+    let status: Value = ready.json().await.unwrap();
+    assert_eq!(status["revision"]["indexRevision"], 1);
+    assert_ne!(
+        status["revision"]["indexGeneration"],
+        old_pin["publishedRevision"]["indexGeneration"]
+    );
+    let db = rusqlite::Connection::open(&index).unwrap();
+    let options: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&options).unwrap()["maxFileBytes"],
+        3_145_728
+    );
+    drop(ready_server);
 }
 
 #[test]
@@ -65,7 +847,11 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     )
     .unwrap();
     let before = fs::read(root.join("flow.js")).unwrap();
-    let output = command(&root, &state, "index").output().unwrap();
+    let output = command(&root, &state, "index")
+        .arg("--max-file-bytes")
+        .arg("1048576")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -74,6 +860,14 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["status"]["stats"]["files"], 1);
     assert_eq!(result["status"]["stats"]["semanticState"], "unavailable");
+    let status = command(&root, &state, "status").output().unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["stats"]["files"], 1);
     let output = command(&root, &state, "symbols")
         .arg("--search")
         .arg("start")
@@ -271,9 +1065,14 @@ fn fixed_locations_and_removed_flag() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let unready = command(&root, &home, "status").output().unwrap();
-    assert!(!unready.status.success());
-    assert!(String::from_utf8_lossy(&unready.stderr).contains("index_not_ready"));
+    let initial = command(&root, &home, "status").output().unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(initial["revision"]["indexRevision"], 1);
     let status = command(&root, &home, "index").output().unwrap();
     assert!(
         status.status.success(),
@@ -282,7 +1081,11 @@ fn fixed_locations_and_removed_flag() {
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
     let first = &first["status"];
-    assert_eq!(first["revision"]["indexRevision"], 1);
+    assert_eq!(first["revision"]["indexRevision"], 2);
+    assert_eq!(
+        first["revision"]["indexGeneration"],
+        initial["revision"]["indexGeneration"]
+    );
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -307,11 +1110,13 @@ fn fixed_locations_and_removed_flag() {
         .unwrap();
     assert!(!removed.status.success());
     assert!(String::from_utf8_lossy(&removed.stderr).contains("--state-dir"));
+    let final_status: Value =
+        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&command(&root, &home, "status").output().unwrap().stdout)
-            .unwrap()["revision"],
-        first["revision"]
+        final_status["revision"]["indexGeneration"],
+        first["revision"]["indexGeneration"]
     );
+    assert_eq!(final_status["revision"]["indexRevision"], 3);
 }
 #[test]
 fn index_forwards_pair_and_reports_pair() {
@@ -320,8 +1125,9 @@ fn index_forwards_pair_and_reports_pair() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let unready = command(&root, &home, "status").output().unwrap();
-    assert!(!unready.status.success());
+    let initial = command(&root, &home, "status").output().unwrap();
+    assert!(initial.status.success());
+    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
     let result = command(&root, &home, "index").output().unwrap();
     assert!(
         result.status.success(),
@@ -337,7 +1143,11 @@ fn index_forwards_pair_and_reports_pair() {
         published["status"]["evidenceFormat"],
         "terminal-native-graph-v1"
     );
-    assert_eq!(published["publishedRevision"]["indexRevision"], 1);
+    assert_eq!(published["publishedRevision"]["indexRevision"], 2);
+    assert_eq!(
+        published["publishedRevision"]["indexGeneration"],
+        initial["revision"]["indexGeneration"]
+    );
 }
 #[test]
 fn export_path_refusals() {
@@ -386,10 +1196,18 @@ fn current_commands_pair_matrix() {
         serde_json::from_slice::<Value>(&index.stdout).unwrap()["publishedRevision"].clone();
     let status: Value =
         serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
-    assert_eq!(status["revision"], pin);
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(status["revision"]["indexRevision"], 2);
     let symbols: Value =
         serde_json::from_slice(&command(&root, &home, "symbols").output().unwrap().stdout).unwrap();
-    assert_eq!(symbols["revision"], pin);
+    assert_eq!(
+        symbols["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(symbols["revision"]["indexRevision"], 3);
     let seed = symbols["items"]
         .as_array()
         .unwrap()
@@ -407,7 +1225,18 @@ fn current_commands_pair_matrix() {
             .stdout,
     )
     .unwrap();
-    assert_eq!(query["revision"], pin);
+    assert_eq!(query["revision"]["indexGeneration"], pin["indexGeneration"]);
+    assert_eq!(query["revision"]["indexRevision"], 4);
+    let exported: Value =
+        serde_json::from_slice(&command(&root, &home, "export").output().unwrap().stdout).unwrap();
+    assert_eq!(exported["files"].as_array().unwrap().len(), 1);
+    let status: Value =
+        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(status["revision"]["indexRevision"], 6);
 }
 
 #[test]
@@ -721,6 +1550,13 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         for index in ["nodes_path", "calls_path", "regions_path"] {
             db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
         }
+        db.execute_batch(
+            "DROP TABLE capture_inputs;
+             ALTER TABLE files DROP COLUMN capture_stat;
+             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
+             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+        )
+        .unwrap();
         db.execute(
             "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
             [],
@@ -729,29 +1565,53 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         db.pragma_update(None, "user_version", 4).unwrap();
         db.execute("UPDATE calls SET payload=json_set(payload,'$.target','lexical-guess','$.resolution','internal')",[]).unwrap();
     }
-    for sub in ["status", "symbols", "query", "export"] {
+    let mut rebuilt_generation = None;
+    for (ordinal, sub) in ["status", "symbols", "query", "export"]
+        .into_iter()
+        .enumerate()
+    {
         let mut cmd = command(&root, &home, sub);
         if sub == "query" {
             cmd.arg("--seed").arg(&valid_seed);
         }
-        let blocked_export = temp.path().join("old-export-must-not-exist.json");
+        let export_path = temp.path().join("rebuilt-export.json");
         if sub == "export" {
-            cmd.arg("--output").arg(&blocked_export);
+            cmd.arg("--output").arg(&export_path);
         }
         let result = cmd.output().unwrap();
-        assert!(!blocked_export.exists(), "old export wrote a destination");
         assert!(
-            !result.status.success(),
-            "{sub} unexpectedly read old index"
+            result.status.success(),
+            "{sub}: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let (generation, revision): (String, i64) = db
+            .query_row(
+                "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(generation, old_pin["indexGeneration"].as_str().unwrap());
+        if let Some(expected) = rebuilt_generation.as_ref() {
+            assert_eq!(&generation, expected);
+        } else {
+            rebuilt_generation = Some(generation.clone());
+        }
+        assert_eq!(revision, i64::try_from(ordinal + 1).unwrap());
         let visible = format!(
             "{}{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(visible.contains("index_not_ready"), "{sub}: {visible}");
-        assert!(!visible.contains(old_pin["indexGeneration"].as_str().unwrap()));
         assert!(!visible.contains("lexical-guess"));
+        if sub == "export" {
+            assert!(export_path.exists());
+            assert!(
+                !String::from_utf8_lossy(&fs::read(&export_path).unwrap())
+                    .contains("lexical-guess")
+            );
+        }
     }
     // Real CLI exploit regression: an exact legacy4 DB with an extra trigger
     // cannot rebaseline into a forged schema5 publication or write anything.
@@ -798,7 +1658,17 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
     let status = command(&root, &home, "status").output().unwrap();
     assert!(status.status.success());
     let ready: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(ready["revision"], next["status"]["revision"]);
+    assert_eq!(
+        ready["revision"]["indexGeneration"],
+        next["status"]["revision"]["indexGeneration"]
+    );
+    assert_eq!(
+        ready["revision"]["indexRevision"].as_u64().unwrap(),
+        next["status"]["revision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            + 1
+    );
     let queried = command(&root, &home, "query")
         .arg("--seed")
         .arg(&valid_seed)
@@ -810,7 +1680,14 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         String::from_utf8_lossy(&queried.stderr)
     );
     let view: Value = serde_json::from_slice(&queried.stdout).unwrap();
-    assert_eq!(view["revision"], ready["revision"]);
+    assert_eq!(
+        view["revision"]["indexGeneration"],
+        ready["revision"]["indexGeneration"]
+    );
+    assert_eq!(
+        view["revision"]["indexRevision"].as_u64().unwrap(),
+        ready["revision"]["indexRevision"].as_u64().unwrap() + 1
+    );
     assert!(
         view["calls"]
             .as_array()
@@ -1319,11 +2196,112 @@ def sink():
             let diagnostic = diagnostic.replace(TOKEN, "[redacted]");
             panic!("{name}: daemon did not start: status={status:?}, stderr={diagnostic}");
         }
+        let post_start_status: Value = client
+            .get(format!("{url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let post_start_pin = post_start_status["revision"].clone();
+        assert_eq!(
+            post_start_pin["indexGeneration"],
+            old_pin["indexGeneration"]
+        );
+        assert!(
+            post_start_pin["indexRevision"].as_u64().unwrap()
+                > old_pin["indexRevision"].as_u64().unwrap()
+        );
+        let native_as_leader = real_native_snapshot(&home);
+        let follower_status: Value =
+            serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout)
+                .unwrap();
+        assert_eq!(follower_status["revision"], post_start_pin, "{name}");
+        let follower_symbols = command(&root, &home, "symbols").output().unwrap();
+        assert!(follower_symbols.status.success(), "{name}");
+        let follower_symbols: Value = serde_json::from_slice(&follower_symbols.stdout).unwrap();
+        assert_eq!(follower_symbols["revision"], post_start_pin, "{name}");
+        if let Some(follower_seed) = follower_symbols["items"]
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item["id"].as_str())
+        {
+            let follower_query = command(&root, &home, "query")
+                .arg("--seed")
+                .arg(follower_seed)
+                .output()
+                .unwrap();
+            assert!(follower_query.status.success(), "{name}");
+            let follower_query: Value = serde_json::from_slice(&follower_query.stdout).unwrap();
+            assert_eq!(follower_query["revision"], post_start_pin, "{name}");
+        }
+        let follower_export = command(&root, &home, "export").output().unwrap();
+        assert!(follower_export.status.success(), "{name}");
+        assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
+
+        let follower_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let follower_port = follower_listener.local_addr().unwrap().port();
+        drop(follower_listener);
+        let follower_stderr = tmp.path().join("follower-daemon-stderr");
+        let mut follower_server = Server(
+            isolated_command(&home)
+                .arg("serve")
+                .arg("--workspace")
+                .arg(&root)
+                .arg("--bind")
+                .arg(format!("127.0.0.1:{follower_port}"))
+                .arg("--token-file")
+                .arg(&token_file)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(
+                    fs::File::create(&follower_stderr).unwrap(),
+                ))
+                .spawn()
+                .unwrap(),
+        );
+        let follower_url = format!("http://127.0.0.1:{follower_port}");
+        let mut follower_ready = false;
+        for _ in 0..100 {
+            if client
+                .get(format!("{follower_url}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                follower_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(follower_ready, "{name}: follower daemon did not start");
+        let follower_http_status: Value = client
+            .get(format!("{follower_url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(follower_http_status["revision"], post_start_pin, "{name}");
+        let refused = client
+            .post(format!("{follower_url}/api/index"))
+            .header("Origin", &follower_url)
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({"expectedRevision":post_start_pin.clone()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 409, "{name}");
+        assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
+        assert!(follower_server.0.try_wait().unwrap().is_none());
         let request = || {
             client
                 .post(format!("{url}/api/index"))
                 .header("Origin", &url)
-                .json(&serde_json::json!({"expectedRevision":old_pin}))
+                .json(&serde_json::json!({"expectedRevision":post_start_pin.clone()}))
         };
         let denied = request().bearer_auth("incorrect").send().await.unwrap();
         assert_eq!(denied.status(), 401, "{name}");
@@ -1374,8 +2352,15 @@ def sink():
         .unwrap();
         assert_eq!(completed["state"], "completed", "{name}: {completed}");
         let pin = completed["revision"].clone();
-        assert_eq!(pin["indexGeneration"], old_pin["indexGeneration"], "{name}");
-        assert_eq!(pin["indexRevision"], 2, "{name}");
+        assert_eq!(
+            pin["indexGeneration"], post_start_pin["indexGeneration"],
+            "{name}"
+        );
+        assert_eq!(
+            pin["indexRevision"].as_u64().unwrap(),
+            post_start_pin["indexRevision"].as_u64().unwrap() + 1,
+            "{name}"
+        );
         let status: Value = client
             .get(format!("{url}/api/status"))
             .bearer_auth(TOKEN)
@@ -1996,7 +2981,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         pin["indexGeneration"].as_str().unwrap(),
         pin["indexRevision"].as_u64().unwrap()
     );
-    let (code, source_before) = real_api(
+    let (code, _source_before) = real_api(
         &client,
         &url,
         TOKEN,
@@ -2005,7 +2990,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{source_before}");
+    assert_eq!(code, 200, "{_source_before}");
     let (code, symbols) = real_api(
         &client,
         &url,
@@ -2036,7 +3021,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     assert_eq!(code, 200, "{preview}");
     let packet_id = preview["packet"]["packetId"].as_str().unwrap();
     let packet_route = format!("/api/questions/{packet_id}/jev-request");
-    let (code, packet_before) = real_api(
+    let (code, _packet_before) = real_api(
         &client,
         &url,
         TOKEN,
@@ -2045,10 +3030,10 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{packet_before}");
+    assert_eq!(code, 200, "{_packet_before}");
 
-    // A bounded multi-file scan lets the client acquire a real SQLite writer lock
-    // after the HTTP job is accepted but before projection completes.
+    // A SQLite RESERVED writer allows HTTP admission and the complete source capture,
+    // but denies the publisher its write lock after projection completes.
     let padding = "x".repeat(48 * 1024);
     for i in 0..80 {
         fs::write(
@@ -2057,6 +3042,9 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         )
         .unwrap();
     }
+    let writer = Writer(rusqlite::Connection::open(real_index_db(&home)).unwrap());
+    writer.0.busy_timeout(Duration::from_secs(1)).unwrap();
+    writer.0.execute_batch("BEGIN IMMEDIATE").unwrap();
     let (code, accepted) = real_api(
         &client,
         &url,
@@ -2068,72 +3056,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 202, "{accepted}");
     let id = accepted["id"].as_str().unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let (code, job) = real_api(
-                &client,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                &format!("/api/jobs/{id}"),
-                None,
-            )
-            .await;
-            assert_eq!(code, 200, "{job}");
-            assert!(
-                job["finishedAt"].is_null(),
-                "job finished before lock: {job}"
-            );
-            if job["progress"]["phase"] == "scan"
-                && job["progress"]["completed"].as_u64().unwrap() < 81
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("scan progress before SQLite lock");
-    let writer = Writer(rusqlite::Connection::open(real_index_db(&home)).unwrap());
-    writer.0.busy_timeout(Duration::from_secs(1)).unwrap();
-    writer.0.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let after_capture = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let (code, job) = real_api(
-                &client,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                &format!("/api/jobs/{id}"),
-                None,
-            )
-            .await;
-            assert_eq!(code, 200, "{job}");
-            if job["progress"]["phase"] == "complete" {
-                break job;
-            }
-            assert!(
-                job["finishedAt"].is_null(),
-                "failed before captured graph: {job}"
-            );
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("captured graph must complete before cancellation");
-    assert_eq!(after_capture["progress"]["completed"], 81);
-    let (code, _) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        &format!("/api/jobs/{id}/cancel"),
-        None,
-    )
-    .await;
-    assert_eq!(code, 200);
-    drop(writer); // Always rolls back the external writer lock, including on panic.
-    let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+    let terminal = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let (code, job) = real_api(
                 &client,
@@ -2148,16 +3071,31 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
             if !job["finishedAt"].is_null() {
                 break job;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("failed or cancelled job terminal");
-    assert!(
-        matches!(terminal["state"].as_str(), Some("failed" | "cancelled")),
-        "{terminal}"
+    .expect("complete capture followed by publication contention");
+    assert_eq!(terminal["state"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["code"], "index_failed", "{terminal}");
+    assert!(terminal["revision"].is_null(), "{terminal}");
+    assert_eq!(terminal["progress"]["phase"], "complete", "{terminal}");
+    assert_eq!(terminal["progress"]["completed"], 81, "{terminal}");
+    assert_eq!(terminal["progress"]["total"], 81, "{terminal}");
+    drop(writer); // Always rolls back the external writer lock, including on panic.
+    let (generation, revision): (String, i64) = rusqlite::Connection::open(real_index_db(&home))
+        .unwrap()
+        .query_row(
+            "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(generation, pin["indexGeneration"].as_str().unwrap());
+    assert_eq!(
+        revision,
+        i64::try_from(pin["indexRevision"].as_u64().unwrap()).unwrap()
     );
-    assert_eq!(terminal["progress"]["phase"], "complete");
     let (code, current) = real_api(
         &client,
         &url,
@@ -2167,11 +3105,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{current}");
-    assert_eq!(
-        current["revision"], pin,
-        "failed job may not advance full pair"
-    );
+    assert_eq!(code, 503, "{current}");
+    assert_eq!(current["error"]["code"], "index_not_ready");
     assert_eq!(
         real_native_snapshot(&home),
         native_before,
@@ -2191,11 +3126,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{source_after}");
-    assert_eq!(
-        source_after, source_before,
-        "previous pinned source remains usable"
-    );
+    assert_eq!(code, 503, "{source_after}");
+    assert_eq!(source_after["error"]["code"], "index_not_ready");
     let (code, packet_after) = real_api(
         &client,
         &url,
@@ -2205,11 +3137,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         None,
     )
     .await;
-    assert_eq!(code, 200, "{packet_after}");
-    assert_eq!(
-        packet_after, packet_before,
-        "cached packet must remain usable after failed publication"
-    );
+    assert_eq!(code, 503, "{packet_after}");
+    assert_eq!(packet_after["error"]["code"], "index_not_ready");
     let (code, retry) = real_api(
         &client,
         &url,
@@ -2267,6 +3196,17 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         "retry must publish full new pin"
     );
     assert_eq!(published["stats"]["files"], 81);
+    let (code, stale_packet) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        &packet_route,
+        None,
+    )
+    .await;
+    assert_eq!(code, 404, "{stale_packet}");
+    assert_eq!(stale_packet["error"]["code"], "not_found");
     let native_after = real_native_snapshot(&home);
     let graph_after = real_export(&root, &home);
     assert_ne!(
@@ -2353,6 +3293,168 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     drop(server);
 }
 
+#[cfg(unix)]
+#[test]
+fn index_process_holds_leader_while_stdout_is_blocked() {
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let index_dir = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+            .join(&identity.root_key)
+    } else {
+        home.join(".cache/baleyg/indexes").join(&identity.root_key)
+    };
+
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut reader = unsafe { File::from_raw_fd(fds[0]) };
+    let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let fill = [b'x'; 4096];
+    let mut filler_bytes = 0usize;
+    loop {
+        match writer.write(&fill) {
+            Ok(bytes) => filler_bytes += bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("prefill stdout pipe: {error}"),
+        }
+    }
+    assert!(filler_bytes > 0);
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+        0
+    );
+
+    let stderr_path = temp.path().join("blocked-index-stderr");
+    let mut child = ChildGuard(
+        command(&root, &home, "index")
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::from(File::create(&stderr_path).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    let db_path = index_dir.join("index.db");
+    let journal_path = index_dir.join("index.db-journal");
+    // SQLite immutable URI connections never take SH locks against the writer.
+    // Percent-encode raw path bytes so %, ?, #, spaces and non-UTF8 cannot
+    // change the URI query or select another database.
+    let mut db_uri = String::from("file:");
+    for &byte in db_path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/._-~".contains(&byte) {
+            db_uri.push(char::from(byte));
+        } else {
+            db_uri.push('%');
+            db_uri.push_str(&format!("{byte:02X}"));
+        }
+    }
+    db_uri.push_str("?immutable=1");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!(
+                "index exited before publication barrier ({status}): {}",
+                fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+        if db_path.exists() {
+            // A partially initialized file or an unsupported WAL-mode header is
+            // never a commit signal. This plain file read takes no SQLite lock.
+            let delete_mode = File::open(&db_path)
+                .and_then(|mut file| {
+                    let mut header = [0u8; 20];
+                    file.read_exact(&mut header)?;
+                    Ok(&header[..16] == b"SQLite format 3\0" && header[18] == 1 && header[19] == 1)
+                })
+                .unwrap_or(false);
+            if delete_mode
+                && let Ok(db) = rusqlite::Connection::open_with_flags(
+                    db_uri.as_str(),
+                    rusqlite::OpenFlags::SQLITE_OPEN_URI
+                        | rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+            {
+                let published = db
+                    .query_row(
+                        "SELECT reconciled_incarnation IS NOT NULL,index_revision FROM index_metadata WHERE singleton=1",
+                        [],
+                        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .is_ok_and(|(reconciled, revision)| reconciled && revision == 1);
+                drop(db);
+                // In this repository's enforced DELETE mode, removing the
+                // rollback journal is the commit point, after database sync.
+                // A dangling symlink or metadata error must not count as absent.
+                let journal_absent = matches!(
+                    fs::symlink_metadata(&journal_path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                );
+                if published && journal_absent {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "index publication barrier timed out: {}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "child escaped the full stdout pipe"
+    );
+    let leader_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(index_dir.join("leader.lock"))
+        .unwrap();
+    let locked = unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_ne!(locked, 0, "index released leadership before writing stdout");
+
+    let mut filler = vec![0; filler_bytes];
+    reader.read_exact(&mut filler).unwrap();
+    assert!(filler.iter().all(|byte| *byte == b'x'));
+    let mut stdout = Vec::new();
+    reader.read_to_end(&mut stdout).unwrap();
+    assert!(child.0.wait().unwrap().success());
+    let output: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(output["publishedRevision"]["indexRevision"], 1);
+    assert_eq!(output["status"]["revision"]["indexRevision"], 1);
+    assert_eq!(output["status"]["stats"]["files"], 1);
+    assert_eq!(
+        unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_UN) };
+}
+
 #[tokio::test]
 async fn saved_items_real_index_matrix() {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -2373,8 +3475,24 @@ async fn saved_items_real_index_matrix() {
         String::from_utf8_lossy(&indexed.stderr)
     );
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
-    let pin = indexed["status"]["revision"].clone();
+    let initial_pin = indexed["status"]["revision"].clone();
     let (server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
+    let (status, serving_status) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{serving_status}");
+    let pin = serving_status["revision"].clone();
+    assert_eq!(pin["indexGeneration"], initial_pin["indexGeneration"]);
+    assert_eq!(
+        pin["indexRevision"].as_u64().unwrap(),
+        initial_pin["indexRevision"].as_u64().unwrap() + 1
+    );
 
     for route in ["/api/views", "/api/views/absent", "/api/annotations"] {
         let (status, response) =
@@ -2508,7 +3626,7 @@ async fn saved_items_real_index_matrix() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(index_version, 6, "derived index inspection is separate");
+    assert_eq!(index_version, 7, "derived index inspection is separate");
 
     let edited_view_body = serde_json::json!({
         "id":"real-view","title":"Edited","query":{"seed":seed}
@@ -2796,12 +3914,28 @@ async fn saved_items_real_index_matrix() {
     drop(db);
 
     let (server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
+    let (status, reopened_status) = real_api(
+        &client,
+        &url,
+        TOKEN,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{reopened_status}");
+    let reopened_pin = reopened_status["revision"].clone();
+    assert_eq!(reopened_pin["indexGeneration"], next["indexGeneration"]);
+    assert_eq!(
+        reopened_pin["indexRevision"].as_u64().unwrap(),
+        next["indexRevision"].as_u64().unwrap() + 1
+    );
     let (status, views) = real_api(
         &client,
         &url,
         TOKEN,
         reqwest::Method::GET,
-        &saved_pin_route("/api/views", &next),
+        &saved_pin_route("/api/views", &reopened_pin),
         None,
     )
     .await;
@@ -2827,7 +3961,7 @@ async fn saved_items_real_index_matrix() {
         &url,
         TOKEN,
         reqwest::Method::GET,
-        &saved_pin_route("/api/annotations", &next),
+        &saved_pin_route("/api/annotations", &reopened_pin),
         None,
     )
     .await;
@@ -2859,7 +3993,7 @@ async fn saved_items_real_index_matrix() {
         &url,
         TOKEN,
         reqwest::Method::PUT,
-        &saved_pin_route("/api/views/legacy-view", &next),
+        &saved_pin_route("/api/views/legacy-view", &reopened_pin),
         Some(legacy_view_edit),
     )
     .await;
@@ -2874,7 +4008,7 @@ async fn saved_items_real_index_matrix() {
         &url,
         TOKEN,
         reqwest::Method::PUT,
-        &saved_pin_route("/api/annotations/legacy-note", &next),
+        &saved_pin_route("/api/annotations/legacy-note", &reopened_pin),
         Some(legacy_note_edit),
     )
     .await;

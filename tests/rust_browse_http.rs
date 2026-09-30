@@ -83,26 +83,27 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             .iter()
             .any(|f| f.path == "helper.js" && f.language == "javascript")
     );
+    let session = store.leader_session().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
     let pin = store.status().unwrap().revision;
-    let app = http::router(
-        http::new(
-            store.clone(),
-            options,
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-        )
-        .unwrap(),
-    );
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
     let (code, tree) = request(&app, "GET", "/api/tree", Value::Null).await;
     assert_eq!(code, 200);
     let entry = tree["items"]
@@ -177,7 +178,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             &refreshed_graph,
             &refreshed_capture,
             &refreshed_native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             pin,
             &cancel,
         )

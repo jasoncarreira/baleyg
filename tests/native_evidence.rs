@@ -1037,3 +1037,167 @@ fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
         "{error:#}"
     );
 }
+
+#[test]
+fn max_file_bytes_and_previously_absent_required_input_change_native_basis() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let first_options = IndexOptions::new(root.path().to_owned());
+    let (_, first) =
+        index_workspace_with_native(&first_options, &identity.record_id, &cancel, |_| {}).unwrap();
+    let mut changed_cap = first_options.clone();
+    changed_cap.max_file_bytes += 1;
+    let (_, second) =
+        index_workspace_with_native(&changed_cap, &identity.record_id, &cancel, |_| {}).unwrap();
+    assert_ne!(first.revision.config_hash, second.revision.config_hash);
+    assert_ne!(first.revision.id, second.revision.id);
+    assert_eq!(
+        first.revision.dependency_hash,
+        second.revision.dependency_hash
+    );
+
+    fs::write(root.path().join("package.json"), "{\"name\":\"new\"}\n").unwrap();
+    let (_, third) =
+        index_workspace_with_native(&changed_cap, &identity.record_id, &cancel, |_| {}).unwrap();
+    assert_ne!(
+        second.revision.dependency_hash,
+        third.revision.dependency_hash
+    );
+    assert_ne!(second.revision.id, third.revision.id);
+}
+
+#[cfg(unix)]
+#[test]
+fn required_inputs_are_rehashed_when_stats_look_unchanged_and_ignore_changes_are_native_config() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
+    use std::{
+        fs,
+        os::unix::{ffi::OsStrExt, fs::MetadataExt},
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
+    let package = root.path().join("package.json");
+    fs::write(&package, "{\"name\":\"aaaa\"}\n").unwrap();
+    let ignore = root.path().join(".gitignore");
+    fs::write(&ignore, "first.js\n").unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.path().to_owned());
+    let (_, first) =
+        index_workspace_with_native(&options, &identity.record_id, &cancel, |_| {}).unwrap();
+
+    let metadata = fs::metadata(&package).unwrap();
+    fs::write(&package, "{\"name\":\"bbbb\"}\n").unwrap();
+    let c_path = std::ffi::CString::new(package.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: metadata.atime(),
+            tv_nsec: metadata.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: metadata.mtime(),
+            tv_nsec: metadata.mtime_nsec(),
+        },
+    ];
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+        0
+    );
+    let (_, second) =
+        index_workspace_with_native(&options, &identity.record_id, &cancel, |_| {}).unwrap();
+    assert_ne!(
+        first.revision.dependency_hash,
+        second.revision.dependency_hash
+    );
+    assert_ne!(first.revision.id, second.revision.id);
+
+    fs::write(&ignore, "second.js\n").unwrap();
+    let (_, third) =
+        index_workspace_with_native(&options, &identity.record_id, &cancel, |_| {}).unwrap();
+    assert_ne!(second.revision.config_hash, third.revision.config_hash);
+    assert_ne!(second.revision.id, third.revision.id);
+}
+
+#[test]
+fn presentation_inputs_are_recaptured_but_excluded_from_native_revision_identity() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
+    let scip = root.path().join("labels.scip");
+    let manifest = root.path().join("labels.json");
+    fs::write(&scip, b"first presentation").unwrap();
+    fs::write(&manifest, b"{}").unwrap();
+    let mut options = IndexOptions::new(root.path().to_owned());
+    options.scip_path = Some(scip.clone());
+    options.manifest_path = Some(manifest.clone());
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let (_, first) =
+        index_workspace_with_native(&options, &identity.record_id, &cancel, |_| {}).unwrap();
+    fs::write(&scip, b"second presentation").unwrap();
+    fs::write(&manifest, b"{\"changed\":\"yes\"}").unwrap();
+    let (_, second) =
+        index_workspace_with_native(&options, &identity.record_id, &cancel, |_| {}).unwrap();
+    assert_eq!(first.revision, second.revision);
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_required_input_fails_closed() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
+    let package = root.path().join("package.json");
+    fs::write(&package, "{}").unwrap();
+    fs::set_permissions(&package, fs::Permissions::from_mode(0o000)).unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let result = index_workspace_with_native(
+        &IndexOptions::new(root.path().to_owned()),
+        &identity.record_id,
+        &cancel,
+        |_| {},
+    );
+    fs::set_permissions(&package, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        result.is_err(),
+        "unreadable required input was treated as absent"
+    );
+}

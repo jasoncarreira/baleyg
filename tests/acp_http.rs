@@ -11,7 +11,7 @@ use baleyg::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::Graph,
-    store::Store,
+    store::{Store, topology::LeaderSession},
 };
 use serde_json::{Value, json};
 use std::{
@@ -26,6 +26,7 @@ struct Fixture {
     store: Store,
     graph: Graph,
     app: Router,
+    session: Arc<LeaderSession>,
     provider: Option<Arc<Acp>>,
     seed: String,
 }
@@ -46,11 +47,12 @@ impl Fixture {
             .id
             .clone();
         let store = crate::common::open_store(&dir.path().join("index"), &workspace).unwrap();
+        let session = store.leader_session().unwrap();
         publish_bundle(
             &store,
             &graph,
             &workspace,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             baleyg::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0,
@@ -97,22 +99,23 @@ impl Fixture {
                 .unwrap(),
             )
         });
-        let app = http::router(
-            http::new_with_providers(
-                store.clone(),
-                options,
-                TOKEN.into(),
-                "127.0.0.1:7331".parse().unwrap(),
-                None,
-                provider.clone(),
-            )
-            .unwrap(),
-        );
+        let state = http::new_with_providers(
+            store.clone(),
+            options,
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+            None,
+            provider.clone(),
+        )
+        .unwrap();
+        state.retain_serving_session(session.clone());
+        let app = http::router(state);
         Self {
             dir,
             store,
             graph,
             app,
+            session,
             provider,
             seed,
         }
@@ -135,13 +138,14 @@ impl Fixture {
         std::fs::write(self.dir.path().join("response.json"), value.to_string()).unwrap();
     }
     fn advance(&self) {
+        let index_generation = self.store.status().unwrap().revision.index_generation;
         publish_bundle(
             &self.store,
             &self.graph,
             &self.dir.path().join("workspace"),
-            &self.store.leader().unwrap(),
+            self.session.leader_guard().unwrap(),
             baleyg::model::IndexPin {
-                index_generation: self.store.status().unwrap().revision.index_generation,
+                index_generation,
                 index_revision: 1,
             },
             &Arc::new(AtomicBool::new(false)),

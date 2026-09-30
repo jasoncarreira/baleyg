@@ -1003,11 +1003,12 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
     }
     let state = tempfile::tempdir().unwrap();
     let store = baleyg::store::Store::open_for_tests(state.path(), d.path()).unwrap();
+    let session = store.leader_session().unwrap();
     let pin = publish_bundle(
         &store,
         &graph,
         d.path(),
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         store.index_baseline().unwrap(),
         &cancel(),
     )

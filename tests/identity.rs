@@ -24,11 +24,12 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     let symbol = graph.nodes.iter().find(|n| n.name == "first").unwrap();
     let old_id = symbol.id.clone();
     let store = crate::common::open_store(&state, &root).unwrap();
+    let session = store.leader_session().unwrap();
     let rev = publish_bundle(
         &store,
         &graph,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         baleyg::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -68,7 +69,7 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
         &store,
         &changed,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         rev,
         &cancel,
     )
@@ -156,11 +157,12 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let cancel = Arc::new(AtomicBool::new(false));
     let first = index_workspace(&options, &cancel, |_| {}).unwrap();
     let store = crate::common::open_store(&state, &root).unwrap();
+    let session = store.leader_session().unwrap();
     let revision = publish_bundle(
         &store,
         &first,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         baleyg::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -171,12 +173,19 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     fs::write(root.join("flow.js"), "function after() { c(); d(); }\n").unwrap();
     let next = index_workspace(&options, &cancel, |_| {}).unwrap();
     let id = next.calls[1].id.replace('\'', "''");
-    let leader = store.leader().unwrap();
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch(&format!("CREATE TRIGGER abort_second_call BEFORE INSERT ON calls WHEN NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'injected post-write failure'); END;")).unwrap();
     drop(db);
     let unchanged = fs::read(index_db(&state)).unwrap();
-    let failure = publish_bundle(&store, &next, &root, &leader, revision, &cancel).unwrap_err();
+    let failure = publish_bundle(
+        &store,
+        &next,
+        &root,
+        session.leader_guard().unwrap(),
+        revision,
+        &cancel,
+    )
+    .unwrap_err();
     assert!(
         failure
             .to_string()
@@ -193,19 +202,26 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch("DROP TRIGGER abort_second_call").unwrap();
     drop(db);
-    drop(leader);
-    assert_eq!(store.status().unwrap().revision, revision);
-    assert_eq!(store.graph().unwrap(), first);
+    assert_eq!(store.index_baseline().unwrap(), revision);
+    for error in [store.status().unwrap_err(), store.graph().unwrap_err()] {
+        assert_eq!(
+            error.to_string(),
+            "incompatible_index: reconciliation required after invalid current index"
+        );
+    }
     let next_revision = publish_bundle(
         &store,
         &next,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         revision,
         &cancel,
     )
     .unwrap();
-    assert_eq!(next_revision.index_revision, revision.index_revision + 1);
+    assert_ne!(next_revision.index_generation, revision.index_generation);
+    assert_eq!(next_revision.index_revision, 1);
+    assert_eq!(store.status().unwrap().revision, next_revision);
+    assert_eq!(store.graph().unwrap(), next);
 }
 
 fn publish_bundle(
