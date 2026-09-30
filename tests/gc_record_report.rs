@@ -98,7 +98,11 @@ fn report_continues_past_busy_and_hot_journal_records_without_writes() {
     // A hot journal left by a crashed writer is recovery, not contention, and is not rolled back.
     let journal_bytes = fs::read(&journal).unwrap();
     let error = DurableRecords::new(&roots, hot).views().unwrap_err();
-    assert_eq!(error.to_string(), "incomplete_record: recovery required", "{error:#}");
+    assert_eq!(
+        error.to_string(),
+        "incomplete_record: recovery required",
+        "{error:#}"
+    );
     assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
     let held = UseGuard::acquire_existing(&roots.record_use_lock(busy), false, true).unwrap();
     let before = snapshot(temp.path());
