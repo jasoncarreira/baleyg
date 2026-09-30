@@ -82,7 +82,8 @@ authorized work.
 
 See the [local topology](docs/local-topology.md), [integration plan](docs/agent-integration-plan.md), [MCP contract](docs/mcp-readonly-pilot-contract.md),
 [terminal workbench](docs/terminal-workbench-contract.md), [SCIP roadmap](docs/scip-multilanguage-plan.md),
-and [optional LSP assessment](docs/lsp-integration-plan.md).
+[optional LSP assessment](docs/lsp-integration-plan.md), and the proposed
+[semantic search plan](docs/semantic-search-plan.md).
 
 ## Development
 
