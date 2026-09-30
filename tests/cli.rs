@@ -2086,16 +2086,6 @@ fn assert_fixture_declaration(
 async fn real_cli_and_authenticated_daemon_share_native_pair_for_every_language_and_empty_root() {
     use std::{io::Read, os::unix::fs::PermissionsExt, time::Duration};
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    fn queue_diag(path: &std::path::Path) -> String {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| line.starts_with("queue_test_diag stage="))
-            .take(8)
-            .map(|line| line.chars().take(80).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
     struct Server(std::process::Child);
     impl Drop for Server {
         fn drop(&mut self) {
@@ -2167,7 +2157,6 @@ def sink():
         let mut server = Server(
             isolated_command(&home)
                 .arg("serve")
-                .env("BALEYG_TEST_ONLY_QUEUE_DIAGNOSTIC", "1")
                 .arg("--workspace")
                 .arg(&root)
                 .arg("--bind")
@@ -2259,7 +2248,6 @@ def sink():
         let mut follower_server = Server(
             isolated_command(&home)
                 .arg("serve")
-                .env("BALEYG_TEST_ONLY_QUEUE_DIAGNOSTIC", "1")
                 .arg("--workspace")
                 .arg(&root)
                 .arg("--bind")
@@ -2330,13 +2318,7 @@ def sink():
         })
         .await
         .unwrap();
-        assert_eq!(
-            follower_done["state"],
-            "done",
-            "{name}: {follower_done}; leader={} follower={}",
-            queue_diag(&stderr_path),
-            queue_diag(&follower_stderr)
-        );
+        assert_eq!(follower_done["state"], "done", "{name}: {follower_done}");
         let follower_pin = follower_done["revision"].clone();
         assert_eq!(
             follower_pin["indexRevision"],

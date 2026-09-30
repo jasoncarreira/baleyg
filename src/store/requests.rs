@@ -146,20 +146,30 @@ impl Store {
         )?;
         db.busy_timeout(std::time::Duration::from_secs(3))?;
         db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON")?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        // A current queue read needs no reserved SQLite writer lock. The first opener
+        // alone enters IMMEDIATE, then rechecks after the lock to race safely with
+        // another process initializing the same private file. Even read-only callers
+        // still open SQLite normally (hot-journal recovery), validate user_version,
+        // root singleton and quick_check before interpreting any row.
+        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
-            let count: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r|r.get(0))?;
-            ensure!(count == 0, "incompatible_queue: unexpected schema");
-            tx.execute_batch(SCHEMA)?;
-            tx.execute(
-                "INSERT INTO queue_identity VALUES (1,?1,?2)",
-                params![self.workspace_root, self.identity.root_key],
-            )?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let locked_version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            if locked_version == 0 {
+                let count: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r|r.get(0))?;
+                ensure!(count == 0, "incompatible_queue: unexpected schema");
+                tx.execute_batch(SCHEMA)?;
+                tx.execute(
+                    "INSERT INTO queue_identity VALUES (1,?1,?2)",
+                    params![self.workspace_root, self.identity.root_key],
+                )?;
+            } else {
+                ensure!(locked_version == 1, "incompatible_queue: schema version");
+            }
+            tx.commit()?;
         } else {
             ensure!(version == 1, "incompatible_queue: schema version");
         }
-        tx.commit()?;
         let identity: (String, String) = db.query_row(
             "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
             [],

@@ -91,3 +91,115 @@ fn first_cli_takeover_capture_satisfies_fifo_head_once() {
     assert_eq!(head.state, "done");
     assert_eq!(head.revision, Some(pin));
 }
+
+#[test]
+fn concurrent_first_queue_open_is_atomic_and_fifo() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers = (0..2)
+        .map(|_| {
+            let store = store.clone();
+            let options = options.clone();
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                gate.wait();
+                store.enqueue_request(&options, None).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut accepted = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    accepted.sort_by_key(|request| request.seq);
+    assert_eq!((accepted[0].seq, accepted[1].seq), (1, 2));
+    assert_eq!(store.current_request().unwrap().unwrap().id, accepted[1].id);
+    assert_eq!(
+        store.earliest_unfinished_request().unwrap().unwrap().id,
+        accepted[0].id
+    );
+}
+
+#[test]
+fn incompatible_or_corrupt_existing_queue_never_gets_fresh_ack() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let accepted = store.enqueue_request(&options, None).unwrap();
+    let path = store.request_db_path();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.pragma_update(None, "user_version", 2).unwrap();
+    drop(db);
+    assert!(
+        store
+            .enqueue_request(&options, None)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_queue")
+    );
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.pragma_update(None, "user_version", 1).unwrap();
+    db.execute(
+        "UPDATE queue_identity SET root_key='wrong' WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    assert!(
+        store
+            .enqueue_request(&options, None)
+            .unwrap_err()
+            .to_string()
+            .contains("root_key_collision")
+    );
+    fs::write(&path, b"not a sqlite queue").unwrap();
+    assert!(store.enqueue_request(&options, None).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"not a sqlite queue");
+    assert!(!accepted.id.is_empty());
+}
+
+#[test]
+fn queue_hot_journal_child() {
+    let Some(path) = std::env::var_os("BALEYG_QUEUE_HOT_JOURNAL_CHILD") else {
+        return;
+    };
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA cache_size=1; BEGIN IMMEDIATE; UPDATE queue_identity SET root_key='bad'; UPDATE requests SET options_json=zeroblob(65536)").unwrap();
+    // Abrupt process exit intentionally leaves SQLite's actual uncommitted rollback journal.
+    unsafe { libc::_exit(17) }
+}
+
+#[test]
+fn hot_journal_rolls_back_before_queue_identity_and_ack() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let accepted = store.enqueue_request(&options, None).unwrap();
+    let db_path = store.request_db_path();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("queue_hot_journal_child")
+        .env("BALEYG_QUEUE_HOT_JOURNAL_CHILD", &db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        child.status.code(),
+        Some(17),
+        "journal helper did not exit as planned"
+    );
+    let journal = db_path.with_file_name(format!(
+        "{}-journal",
+        db_path.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(journal.exists(), "helper must leave an actual hot journal");
+    let next = store.enqueue_request(&options, None).unwrap();
+    assert!(next.seq > accepted.seq);
+    let original = store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(original.options_json, accepted.options_json);
+    assert_eq!(original.state, "queued");
+}

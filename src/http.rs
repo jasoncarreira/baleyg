@@ -25,6 +25,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{BTreeMap, VecDeque},
     net::SocketAddr,
@@ -136,6 +138,8 @@ pub struct DaemonState {
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
     queue_tick_started: AtomicBool,
+    #[cfg(test)]
+    queue_takeover_attempts: AtomicUsize,
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
     native_stream: Mutex<()>,
@@ -267,6 +271,8 @@ pub fn new_with_dependency_options(
         acp,
         packets: Mutex::new(PacketCache::default()),
         queue_tick_started: AtomicBool::new(false),
+        #[cfg(test)]
+        queue_takeover_attempts: AtomicUsize::new(0),
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
         native_stream: Mutex::new(()),
@@ -341,6 +347,16 @@ impl DaemonState {
         if !pending_local {
             return Ok(());
         }
+        // A retained follower verifies both the held leader flock and incarnation
+        // without opening index.db. Retry acquisition only after that proof fails.
+        if let Some(ref session) = retained
+            && !session.is_leader()
+            && session.verify().is_ok()
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.queue_takeover_attempts.fetch_add(1, Ordering::AcqRel);
         match self.store.leader_session() {
             Ok(session) => {
                 let outcome = (|| {
@@ -2894,6 +2910,71 @@ mod live_tests {
         assert_eq!(provider.budget().unwrap().reserved_cents, 10);
         assert_eq!(provider.budget().unwrap().attempts, 1);
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod queue_idle_follower_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn verified_holder_needs_no_index_open_and_lost_holder_triggers_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let store = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root);
+        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &options.workspace_root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let state = new(
+            follower_store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let accepted = follower_store.enqueue_request(&options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(accepted.id.clone());
+        for _ in 0..3 {
+            state.queue_tick().unwrap();
+        }
+        assert_eq!(
+            state.queue_takeover_attempts.load(Ordering::Acquire),
+            0,
+            "verified follower must never reopen index.db to probe leadership"
+        );
+        assert_eq!(
+            follower_store
+                .request_by_id(&accepted.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+        drop(owner);
+        state.queue_tick().unwrap();
+        assert_eq!(state.queue_takeover_attempts.load(Ordering::Acquire), 1);
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        let completed = follower_store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(completed.state, "done");
+        assert!(completed.revision.unwrap().index_revision > old_pin.index_revision);
     }
 }
 
