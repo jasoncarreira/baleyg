@@ -302,7 +302,9 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   await page.locator(kind==="view"?"#save-view":"#save-note").click();const legacyPut=await legacyPutPromise;
   const legacyPutResponse=await legacyPut.response();assert.ok(legacyPutResponse);assert.equal(legacyPutResponse.status(),200);assertPinnedUrl(legacyPut.url(),R);
   assert.equal(kind==="view"?legacyPut.postDataJSON().query.seed:legacyPut.postDataJSON().nodeId,seed);assert.equal(Object.hasOwn(JSON.parse(readPayload(dbPath,kind,legacyId)),"anchor"),false);
-  const legacyLoadAfter=row(page,kind,legacyId).getByRole("button",{name:"Load",exact:true});const legacyBox=await legacyLoadAfter.boundingBox();assert.ok(legacyBox);
+  // The list is replaced after a later loadSaved(); wait for the re-rendered row carrying the edited title, never the pre-PUT row.
+  const legacyRowAfter=row(page,kind,legacyId).filter({hasText:kind==="view"?"Legacy view edited":"Legacy note"});await legacyRowAfter.waitFor({state:"visible"});
+  const legacyLoadAfter=legacyRowAfter.getByRole("button",{name:"Load",exact:true});await legacyLoadAfter.waitFor({state:"visible"});const legacyBox=await legacyLoadAfter.boundingBox();assert.ok(legacyBox);
   const legacyQueryBaseline=legacyRequests.filter(request=>new URL(request.url).pathname==="/api/query").length;await page.mouse.click(legacyBox.x+legacyBox.width/2,legacyBox.y+legacyBox.height/2);await delay(250);
   assert.equal(legacyRequests.filter(request=>new URL(request.url).pathname==="/api/query").length,legacyQueryBaseline);
   const deleteResponse=page.waitForResponse(response=>response.request().method()==="DELETE"&&new URL(response.url()).pathname===`${putPath}${legacyId}`);
