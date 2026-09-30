@@ -3288,14 +3288,7 @@ mod normal_post_capture_cancellation_tests {
         )
         .unwrap();
         let app = router(state.clone());
-        let (code, accepted) = api(
-            &app,
-            token,
-            "POST",
-            "/api/index",
-            Some(json!({"expectedRevision":before.pin})),
-        )
-        .await;
+        let (code, accepted) = api(&app, token, "POST", "/api/index", Some(json!({}))).await;
         assert_eq!(code, StatusCode::ACCEPTED, "{accepted}");
         assert_eq!(accepted["state"], "queued");
         let id = accepted["id"].as_str().unwrap();
