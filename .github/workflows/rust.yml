@@ -8,6 +8,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # CI-only: line tables keep file:line in panics and backtraces while
+      # cutting debug-build compile and link time.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,6 +21,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The synthetic-cohorts composition helper builds its tree-sitter grammars
+      # in its own target directory under the OS temp dir; cache it with the
+      # main workspace's dependencies.
+      - name: Locate composition helper target
+        run: echo "COMPOSITION_TARGET=$(node -p 'require("node:path").join(require("node:os").tmpdir(), "baleyg-synthetic-composition-cargo-target")')" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-directories: ${{ env.COMPOSITION_TARGET }}
       - run: npm ci --prefix tests/browser --ignore-scripts
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
