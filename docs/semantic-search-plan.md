@@ -113,8 +113,16 @@ every chunk below it.
   [jevgrep](https://github.com/dzhng/jevgrep) applies across a whole folder → file → declaration
   crawl, limited here to candidates the local index already found.
   - It sends source to the hosted provider, so it follows the live-Jev rules: explicit opt-in, a
-    `JEV_KEY` from the environment, the existing reservation budget ledger, and validated labels.
-    Search without it stays fully local.
+    `JEV_KEY` from the environment, a reservation budget ledger, and validated labels. Search
+    without it stays fully local.
+  - **Batch, and budget per query.** Live Jev reserves 10 cents per outbound attempt against a
+    capped ledger (the documented cap is $5, so at most 50 attempts). One attempt per candidate
+    would spend the whole cap on a single query, so that design is ruled out. The rerank sends
+    **one batched attempt per query**, with all candidates in one bounded packet, labelled together.
+    Candidates that don't fit the packet bounds are cut, never split across extra attempts. Search
+    reranking gets its own ledger, separate from sequence-diagram selection, and shows the
+    remaining budget. When the ledger can't cover an attempt, search uses the hybrid order and
+    says so.
   - It reorders only. It never adds candidates, and a failed, over-budget or invalid judgment falls
     back to the hybrid order and says so in the response. Its labels are retrieval metadata, not
     evidence.
