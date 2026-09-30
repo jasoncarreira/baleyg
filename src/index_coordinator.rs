@@ -128,7 +128,9 @@ pub fn drain_requests_observed(
     progress: impl Fn(&str, IndexProgress) + Sync,
 ) -> Result<usize> {
     store.verify_leader_session(session)?;
-    let mut completed = 0;
+    // A prior attempt may have published but failed its queue terminal write. Resolve
+    // that exact cached result before any new claim or native publication.
+    let mut completed = usize::from(store.retry_recorded_completion(session)?);
     while let Some(request) = store.claim_request(session)? {
         let outcome = (|| {
             let options = request.options(std::path::Path::new(store.workspace_root()))?;
@@ -145,7 +147,7 @@ pub fn drain_requests_observed(
         })();
         // No unverified worker can mark a request terminal. On fencing loss leave it running
         // for the next incarnation to reclaim after its complete root reconciliation.
-        store.finish_request(session, &request, outcome)?;
+        store.record_and_finish_request(session, &request, outcome)?;
         completed += 1;
     }
     Ok(completed)
@@ -216,7 +218,7 @@ pub fn enqueue_and_wait(
                             claimed.id == head.id,
                             "storage_busy: FIFO head changed during takeover"
                         );
-                        store.finish_request(&session, &claimed, Ok(takeover_pin))?;
+                        store.record_and_finish_request(&session, &claimed, Ok(takeover_pin))?;
                     }
                     held = Some(session);
                 }
@@ -544,5 +546,85 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    }
+}
+
+#[cfg(test)]
+mod queue_completion_retry_tests {
+    use super::*;
+    use std::fs;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        Store,
+        IndexOptions,
+        IndexPin,
+        Arc<LeaderSession>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root);
+        let (baseline, session) = reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        (tmp, store, options, baseline, session)
+    }
+
+    #[test]
+    fn failed_terminal_write_retries_exact_published_head_before_next_fifo_claim() {
+        let (_tmp, store, options, baseline, session) = fixture();
+        let first = store.enqueue_request(&options, None).unwrap();
+        let second = store.enqueue_request(&options, None).unwrap();
+        assert!(first.seq < second.seq);
+        store.inject_queue_finish_failure(false);
+        let error = drain_requests(&store, &session).unwrap_err();
+        assert!(error.to_string().contains("storage_busy"));
+        let published = store.status().unwrap().revision;
+        assert_eq!(published.index_revision, baseline.index_revision + 1);
+        assert_eq!(
+            store.request_by_id(&first.id).unwrap().unwrap().state,
+            "running"
+        );
+        assert_eq!(
+            store.request_by_id(&second.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(drain_requests(&store, &session).unwrap(), 2);
+        let q1 = store.request_by_id(&first.id).unwrap().unwrap();
+        let q2 = store.request_by_id(&second.id).unwrap().unwrap();
+        assert_eq!((q1.state.as_str(), q2.state.as_str()), ("done", "done"));
+        assert_eq!(q1.revision.unwrap(), published);
+        assert_eq!(
+            q2.revision.unwrap().index_revision,
+            published.index_revision + 1
+        );
+        assert_eq!(store.status().unwrap().revision, q2.revision.unwrap());
+    }
+
+    #[test]
+    fn ambiguous_committed_terminal_is_verified_without_republishing_head() {
+        let (_tmp, store, options, baseline, session) = fixture();
+        let first = store.enqueue_request(&options, None).unwrap();
+        let second = store.enqueue_request(&options, None).unwrap();
+        store.inject_queue_finish_failure(true);
+        assert_eq!(drain_requests(&store, &session).unwrap(), 2);
+        let q1 = store.request_by_id(&first.id).unwrap().unwrap();
+        let q2 = store.request_by_id(&second.id).unwrap().unwrap();
+        assert_eq!((q1.state.as_str(), q2.state.as_str()), ("done", "done"));
+        assert_eq!(
+            q1.revision.unwrap().index_revision,
+            baseline.index_revision + 1
+        );
+        assert_eq!(
+            q2.revision.unwrap().index_revision,
+            baseline.index_revision + 2
+        );
     }
 }

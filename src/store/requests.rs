@@ -41,6 +41,41 @@ pub struct Request {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CompletionOutcome {
+    Done(IndexPin),
+    Failed(&'static str),
+}
+impl CompletionOutcome {
+    fn from_result(result: Result<IndexPin>) -> Self {
+        match result {
+            Ok(pin) => Self::Done(pin),
+            Err(error) if error.to_string().starts_with("revision conflict") => {
+                Self::Failed("revision_conflict")
+            }
+            Err(_) => Self::Failed("index_failed"),
+        }
+    }
+    fn matches_terminal(&self, row: &Request) -> bool {
+        match self {
+            Self::Done(pin) => {
+                row.state == "done" && row.revision == Some(*pin) && row.error_code.is_none()
+            }
+            Self::Failed(code) => {
+                row.state == "failed"
+                    && row.error_code.as_deref() == Some(*code)
+                    && row.revision.is_none()
+            }
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub(crate) struct PendingCompletion {
+    request: Request,
+    outcome: CompletionOutcome,
+    incarnation: String,
+}
+
 impl Request {
     pub fn options(&self, root: &Path) -> Result<IndexOptions> {
         ensure!(
@@ -308,41 +343,161 @@ impl Store {
         tx.commit()?;
         Ok(Some(claimed))
     }
-    pub fn finish_request(
+    pub(crate) fn record_and_finish_request(
         &self,
         session: &LeaderSession,
         request: &Request,
         result: Result<IndexPin>,
     ) -> Result<()> {
         self.verify_leader_session(session)?;
+        {
+            let mut slot = self.pending_request_completion.lock().unwrap();
+            ensure!(slot.is_none(), "storage_busy: unresolved FIFO completion");
+            *slot = Some(PendingCompletion {
+                request: request.clone(),
+                outcome: CompletionOutcome::from_result(result),
+                incarnation: session.incarnation().to_string(),
+            });
+        }
+        // Cache the exact result before attempting any SQLite terminal write. A transient
+        // failure must not let a subsequent tick re-publish this already executed head.
+        self.retry_recorded_completion(session)?;
+        Ok(())
+    }
+
+    /// Resolve the one in-flight FIFO head before claiming any newer row. A terminal
+    /// reread handles an ambiguous SQLite COMMIT; it must match our cached result.
+    pub(crate) fn retry_recorded_completion(&self, session: &LeaderSession) -> Result<bool> {
+        self.verify_leader_session(session)?;
+        let mut slot = self.pending_request_completion.lock().unwrap();
+        let Some(pending) = slot.as_ref() else {
+            return Ok(false);
+        };
+        if pending.incarnation != session.incarnation().to_string() {
+            // A successor has a new incarnation and must have reconciled before drain.
+            // Its ordinary claim path reclaims the old running head under that fence.
+            *slot = None;
+            return Ok(false);
+        }
+        let row = self
+            .request_by_id(&pending.request.id)?
+            .ok_or_else(|| anyhow::anyhow!("storage_busy: cached request disappeared"))?;
+        ensure!(
+            row.id == pending.request.id
+                && row.seq == pending.request.seq
+                && row.root_device == pending.request.root_device
+                && row.root_inode == pending.request.root_inode
+                && row.claim_incarnation.as_deref() == Some(pending.incarnation.as_str()),
+            "storage_busy: cached claim changed"
+        );
+        if row.state == "done" || row.state == "failed" {
+            ensure!(
+                pending.outcome.matches_terminal(&row),
+                "revision conflict: cached completion differs from durable terminal"
+            );
+            *slot = None;
+            return Ok(true);
+        }
+        ensure!(
+            row.state == "running",
+            "storage_busy: cached FIFO head is not running"
+        );
+        if let Err(error) = self.finish_request_outcome(session, &pending.request, &pending.outcome)
+        {
+            // The write may have committed before returning an error. Confirm the full
+            // id/seq/root/incarnation and exact terminal result before treating it as done.
+            let reread = self
+                .request_by_id(&pending.request.id)?
+                .ok_or_else(|| anyhow::anyhow!("storage_busy: cached request disappeared"))?;
+            ensure!(
+                reread.id == pending.request.id
+                    && reread.seq == pending.request.seq
+                    && reread.root_device == pending.request.root_device
+                    && reread.root_inode == pending.request.root_inode
+                    && reread.claim_incarnation.as_deref() == Some(pending.incarnation.as_str()),
+                "storage_busy: cached claim changed"
+            );
+            if reread.state == "done" || reread.state == "failed" {
+                ensure!(
+                    pending.outcome.matches_terminal(&reread),
+                    "revision conflict: cached completion differs from durable terminal"
+                );
+            } else {
+                return Err(error);
+            }
+        }
+        *slot = None;
+        Ok(true)
+    }
+
+    pub fn finish_request(
+        &self,
+        session: &LeaderSession,
+        request: &Request,
+        result: Result<IndexPin>,
+    ) -> Result<()> {
+        self.finish_request_outcome(session, request, &CompletionOutcome::from_result(result))
+    }
+    fn finish_request_outcome(
+        &self,
+        session: &LeaderSession,
+        request: &Request,
+        outcome: &CompletionOutcome,
+    ) -> Result<()> {
+        self.verify_leader_session(session)?;
+        #[cfg(test)]
+        if self
+            .test_queue_finish_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| (count > 0).then_some(count - 1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("storage_busy: injected terminal write failure");
+        }
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.verify_leader_session(session)?;
-        if let Ok(pin) = &result {
+        if let CompletionOutcome::Done(pin) = outcome {
             ensure!(
                 self.status()?.revision == *pin,
                 "revision conflict: request result is not current index"
             );
         }
-        let (generation, revision, code) = match result {
-            Ok(pin) => (
+        let (generation, revision, code) = match outcome {
+            CompletionOutcome::Done(pin) => (
                 Some(pin.index_generation.to_string()),
                 Some(pin.index_revision as i64),
                 None,
             ),
-            Err(e) => (
-                None,
-                None,
-                Some(if e.to_string().starts_with("revision conflict") {
-                    "revision_conflict"
-                } else {
-                    "index_failed"
-                }),
-            ),
+            CompletionOutcome::Failed(code) => (None, None, Some(*code)),
         };
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
         tx.commit()?;
+        #[cfg(test)]
+        if self
+            .test_queue_post_commit_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| (count > 0).then_some(count - 1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("storage_busy: injected ambiguous terminal commit");
+        }
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_queue_finish_failure(&self, after_commit: bool) {
+        let counter = if after_commit {
+            &self.test_queue_post_commit_failures
+        } else {
+            &self.test_queue_finish_failures
+        };
+        counter.store(1, std::sync::atomic::Ordering::Release);
     }
 }

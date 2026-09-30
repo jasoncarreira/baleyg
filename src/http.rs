@@ -140,6 +140,8 @@ pub struct DaemonState {
     queue_tick_started: AtomicBool,
     #[cfg(test)]
     queue_takeover_attempts: AtomicUsize,
+    #[cfg(test)]
+    test_pending_read_failures: AtomicUsize,
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
     native_stream: Mutex<()>,
@@ -273,6 +275,8 @@ pub fn new_with_dependency_options(
         queue_tick_started: AtomicBool::new(false),
         #[cfg(test)]
         queue_takeover_attempts: AtomicUsize::new(0),
+        #[cfg(test)]
+        test_pending_read_failures: AtomicUsize::new(0),
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
         native_stream: Mutex::new(()),
@@ -322,11 +326,24 @@ impl DaemonState {
         let _stream = self.native_stream.lock().unwrap();
         let mut pending = self.pending_requests.lock().unwrap();
         pending.retain(|id| {
-            self.store
-                .request_by_id(id)
-                .ok()
-                .flatten()
-                .is_some_and(|r| r.finished_at.is_none())
+            #[cfg(test)]
+            if self
+                .test_pending_read_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count > 0).then_some(count - 1)
+                })
+                .is_ok()
+            {
+                // Model a transient requests.db read failure without changing a live
+                // queue file or the protected index controls.
+                return true;
+            }
+            match self.store.request_by_id(id) {
+                Ok(Some(row)) => row.finished_at.is_none(),
+                // A failed or inconclusive read cannot erase the only request-driven
+                // follower retry trigger. Only an observed terminal removes this ID.
+                Ok(None) | Err(_) => true,
+            }
         });
         let pending_local = !pending.is_empty();
         drop(pending);
@@ -2973,6 +2990,65 @@ mod queue_idle_follower_tests {
         let completed = follower_store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(completed.state, "done");
         assert!(completed.revision.unwrap().index_revision > old_pin.index_revision);
+    }
+    #[tokio::test]
+    async fn failed_pending_read_keeps_same_id_for_holder_loss_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let owner_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root);
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
+            &owner_store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &options.workspace_root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let state = new(
+            follower_store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let request = follower_store.enqueue_request(&options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(request.id.clone());
+        state.test_pending_read_failures.store(1, Ordering::Release);
+        state.queue_tick().unwrap();
+        assert_eq!(
+            *state.pending_requests.lock().unwrap(),
+            vec![request.id.clone()]
+        );
+        assert_eq!(
+            follower_store
+                .request_by_id(&request.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+        drop(owner);
+        state.queue_tick().unwrap();
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert_eq!(
+            follower_store
+                .request_by_id(&request.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "done"
+        );
+        assert_eq!(state.queue_takeover_attempts.load(Ordering::Acquire), 1);
     }
 }
 
