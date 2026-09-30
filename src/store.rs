@@ -2740,6 +2740,9 @@ impl Store {
             json(&options)? == payload && options.version == 1,
             "incompatible_index: unsupported reconcile options"
         );
+        options.require_absolute_optional_inputs().context(
+            "recovery_required: recorded relative index input; run explicit baleyg index",
+        )?;
         let mut result =
             crate::indexer::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
         result.max_file_bytes = options.max_file_bytes;
@@ -3002,7 +3005,12 @@ impl Store {
                         && counts.hashes == 1),
             "native_evidence_required: each source must open, read, and hash once"
         );
-        crate::indexer::validate_native_graph(graph, capture, native, cancel)
+        crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
+        // A capture from a direct library caller must not persist cwd-relative
+        // presentation identities even if it bypassed the explicit CLI ingress.
+        capture
+            .reconcile_options()
+            .require_absolute_optional_inputs()
     }
     /// Publish to an unpublished private bootstrap while the caller retains EX use.
     /// This stages the full pair without admitting evidence from the corrupt live DB.

@@ -6,7 +6,7 @@ use protobuf::Message;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::Ordering,
 };
 use tree_sitter::Node;
@@ -51,6 +51,44 @@ impl IndexOptions {
             manifest_path: None,
             max_file_bytes: 2 * 1024 * 1024,
         }
+    }
+
+    /// Fix optional input identity at explicit CLI ingress, even when the input
+    /// does not exist. Never canonicalize: absence is a valid captured state.
+    pub fn anchor_optional_inputs(&mut self, cwd: &Path) -> Result<()> {
+        ensure!(cwd.is_absolute(), "index input cwd must be absolute");
+        for path in [&mut self.scip_path, &mut self.manifest_path]
+            .into_iter()
+            .flatten()
+        {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(&*path)
+            };
+            ensure!(
+                absolute.to_str().is_some(),
+                "optional index input path cannot be persisted without UTF-8 identity"
+            );
+            *path = absolute;
+        }
+        Ok(())
+    }
+}
+
+impl ReconcileOptions {
+    /// Legacy relative options cannot be replayed from a different process cwd.
+    pub fn require_absolute_optional_inputs(&self) -> Result<()> {
+        for path in [self.scip_path.as_deref(), self.manifest_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                Path::new(path).is_absolute(),
+                "incompatible_index: relative optional index input identity"
+            );
+        }
+        Ok(())
     }
 }
 

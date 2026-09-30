@@ -190,6 +190,7 @@ impl IndexArgs {
         let mut options = IndexOptions::new(root);
         options.scip_path = self.scip.clone();
         options.manifest_path = self.manifest.clone();
+        options.anchor_optional_inputs(&std::env::current_dir()?)?;
         options.max_file_bytes = self.max_file_bytes;
         Ok((store, options, cache))
     }
@@ -386,6 +387,7 @@ async fn main() -> Result<()> {
             let mut options = IndexOptions::new(identity.root.clone());
             options.scip_path = args.index.scip.clone();
             options.manifest_path = args.index.manifest.clone();
+            options.anchor_optional_inputs(&std::env::current_dir()?)?;
             options.max_file_bytes = args.index.max_file_bytes;
             let dir = roots.cache.clone();
             let store = Store::open(roots, identity)?;
