@@ -2941,8 +2941,6 @@ mod queue_idle_follower_tests {
             options.clone(),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             "127.0.0.1:7331".parse().unwrap(),
-            None,
-            None,
         )
         .unwrap();
         *state.serving_session.lock().unwrap() = Some(follower);
