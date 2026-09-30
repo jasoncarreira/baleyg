@@ -288,19 +288,87 @@ impl DerefMut for IndexConnection {
 }
 
 /// One coherent native read snapshot retained until its owned result passes T03.
-struct EvidenceResponse {
+pub struct EvidenceResponse {
     store: Store,
     db: IndexConnection,
     follower: topology::FollowerGuard,
     marker: uuid::Uuid,
 }
 impl EvidenceResponse {
-    fn finish<T>(&self, value: T) -> Result<T> {
+    pub fn finish<T>(&self, value: T) -> Result<T> {
         self.store.identity.verify()?;
         self.follower.verify(self.marker)?;
         Ok(value)
     }
+    pub fn status(&self) -> Result<IndexStatus> {
+        self.store.read_status(&self.db)
+    }
+    pub fn source_at(
+        &self,
+        path: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<(IndexPin, SourceFile)>> {
+        let revision = self.status()?.revision;
+        ensure!(
+            expected.is_none_or(|pin| pin == revision),
+            "revision conflict"
+        );
+        Ok(self
+            .store
+            .selected_source_row(&self.db, path)?
+            .map(|source| (revision, source)))
+    }
+    pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
+        self.store
+            .validate_selected_view_in(&self.db, view, sources)
+    }
+    pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
+        query.validate()?;
+        self.store.query_view_in(&self.db, query)
+    }
+    /// Release the SQLite snapshot before slow response assembly or provider work.
+    /// The follower guard retains protected use and the snapshot's incarnation.
+    pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
+        let Self {
+            store,
+            db,
+            follower,
+            marker,
+        } = self;
+        drop(db);
+        EvidenceFence {
+            store,
+            follower,
+            marker,
+            policy,
+        }
+    }
 }
+/// Unpinned responses need T03 only; cached packets also require their exact pin.
+#[derive(Clone, Copy)]
+pub enum EvidenceFencePolicy {
+    T03,
+    ExactPin(IndexPin),
+}
+pub struct EvidenceFence {
+    store: Store,
+    follower: topology::FollowerGuard,
+    marker: uuid::Uuid,
+    policy: EvidenceFencePolicy,
+}
+impl EvidenceFence {
+    pub fn finish<T>(&self, value: T) -> Result<T> {
+        self.store.identity.verify()?;
+        self.follower.verify(self.marker)?;
+        if let EvidenceFencePolicy::ExactPin(pin) = self.policy {
+            ensure!(self.store.status()?.revision == pin, "revision conflict");
+            self.store.identity.verify()?;
+            self.follower.verify(self.marker)?;
+        }
+        Ok(value)
+    }
+}
+
 fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         if suffix == "-journal" && !writable {
@@ -2418,7 +2486,7 @@ impl Store {
         self.identity.verify()?;
         follower.verify(marker)
     }
-    fn evidence_response(&self) -> Result<EvidenceResponse> {
+    pub fn evidence_response(&self) -> Result<EvidenceResponse> {
         self.ensure_not_recreate_pending()?;
         let db = self
             .cache()
@@ -4553,59 +4621,67 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
     /// Reauthenticate only a cached packet's selected evidence under one pin.
     /// Unrelated documents are not read; status still validates persisted capture inventory.
     pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
-        self.with_evidence(|tx| {
+        self.with_evidence(|tx| self.validate_selected_view_in(tx, view, sources))
+    }
+    fn validate_selected_view_in(
+        &self,
+        tx: &Connection,
+        view: &ViewResult,
+        sources: &[SourceFile],
+    ) -> Result<()> {
+        ensure!(
+            self.read_status(tx)?.revision == view.revision,
+            "revision conflict: cached packet pin changed"
+        );
+        let paths: BTreeSet<_> = view
+            .nodes
+            .iter()
+            .map(|n| n.path.as_str())
+            .chain(view.calls.iter().map(|c| c.path.as_str()))
+            .chain(view.regions.iter().map(|r| r.path.as_str()))
+            .chain(sources.iter().map(|f| f.path.as_str()))
+            .collect();
+        for path in paths {
+            self.attest_selected_document(tx, path)?;
+        }
+        for node in &view.nodes {
+            let actual: Option<Symbol> =
+                one(tx, "SELECT payload FROM nodes WHERE id=?1", &node.id)?;
             ensure!(
-                self.read_status(tx)?.revision == view.revision,
-                "revision conflict: cached packet pin changed"
+                actual.as_ref() == Some(node),
+                "incompatible_index: cached packet selected graph declaration changed"
             );
-            let paths: BTreeSet<_> = view
-                .nodes
-                .iter()
-                .map(|n| n.path.as_str())
-                .chain(view.calls.iter().map(|c| c.path.as_str()))
-                .chain(view.regions.iter().map(|r| r.path.as_str()))
-                .chain(sources.iter().map(|f| f.path.as_str()))
-                .collect();
-            for path in paths {
-                self.attest_selected_document(tx, path)?;
-            }
-            for node in &view.nodes {
-                let actual: Option<Symbol> =
-                    one(tx, "SELECT payload FROM nodes WHERE id=?1", &node.id)?;
-                ensure!(
-                    actual.as_ref() == Some(node),
-                    "incompatible_index: cached packet selected graph declaration changed"
-                );
-            }
-            for call in &view.calls {
-                let actual: Option<CallSite> =
-                    one(tx, "SELECT payload FROM calls WHERE id=?1", &call.id)?;
-                ensure!(
-                    actual.as_ref() == Some(call),
-                    "incompatible_index: cached packet selected graph call changed"
-                );
-            }
-            for region in &view.regions {
-                let actual: Option<ControlRegion> =
-                    one(tx, "SELECT payload FROM regions WHERE id=?1", &region.id)?;
-                ensure!(
-                    actual.as_ref() == Some(region),
-                    "incompatible_index: cached packet selected graph region changed"
-                );
-            }
-            for source in sources {
-                ensure!(
-                    self.selected_source_row(tx, &source.path)?.as_ref() == Some(source),
-                    "incompatible_index: cached packet selected source changed"
-                );
-            }
-            Ok(())
-        })
+        }
+        for call in &view.calls {
+            let actual: Option<CallSite> =
+                one(tx, "SELECT payload FROM calls WHERE id=?1", &call.id)?;
+            ensure!(
+                actual.as_ref() == Some(call),
+                "incompatible_index: cached packet selected graph call changed"
+            );
+        }
+        for region in &view.regions {
+            let actual: Option<ControlRegion> =
+                one(tx, "SELECT payload FROM regions WHERE id=?1", &region.id)?;
+            ensure!(
+                actual.as_ref() == Some(region),
+                "incompatible_index: cached packet selected graph region changed"
+            );
+        }
+        for source in sources {
+            ensure!(
+                self.selected_source_row(tx, &source.path)?.as_ref() == Some(source),
+                "incompatible_index: cached packet selected source changed"
+            );
+        }
+        Ok(())
     }
 
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
         query.validate()?;
-        self.with_evidence(|tx| {
+        self.with_evidence(|tx| self.query_view_in(tx, query))
+    }
+    fn query_view_in(&self, tx: &Connection, query: &ViewQuery) -> Result<Option<ViewResult>> {
         let revision = self.read_status(tx)?.revision;
         let selected_path: Option<String> = tx
             .query_row("SELECT path FROM nodes WHERE id=?1", [&query.seed], |r| {
@@ -4670,8 +4746,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 vec![]
             },
         }))
-            })
     }
+
     pub fn put_view(&self, view: &SavedView) -> Result<()> {
         view.validate()?;
         self.records().put_view(view)?;
