@@ -20,6 +20,25 @@ fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Comman
     c
 }
 
+fn write_optional_presentation(dir: &std::path::Path, label: &str, source_hash: &str) {
+    use protobuf::Message;
+    let mut index = scip::types::Index::new();
+    let mut document = scip::types::Document::new();
+    document.relative_path = "main.js".into();
+    let mut occurrence = scip::types::Occurrence::new();
+    occurrence.range = vec![0, 9, 10];
+    occurrence.symbol_roles = 1;
+    occurrence.symbol = label.into();
+    document.occurrences.push(occurrence);
+    index.documents.push(document);
+    fs::write(dir.join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
+    fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"main.js":source_hash})).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     let temp = TempDir::new().unwrap();
@@ -142,6 +161,397 @@ function boundary() {}
         String::from_utf8_lossy(&default.stderr).contains("unsafe or oversized input"),
         "{}",
         String::from_utf8_lossy(&default.stderr)
+    );
+}
+
+#[test]
+fn standalone_takeover_replays_original_relative_presentation_from_another_cwd() {
+    use sha2::{Digest, Sha256};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let first_cwd = temp.path().join("ingress");
+    let second_cwd = temp.path().join("takeover");
+    for dir in [&root, &first_cwd, &second_cwd] {
+        fs::create_dir(dir).unwrap();
+    }
+    let ingress_cwd = first_cwd.canonicalize().unwrap();
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    let original_label = "scip npm display 1 main.js/f().";
+    write_optional_presentation(&first_cwd, original_label, &source_hash);
+    // A cwd-rebound replay would use this same-name but wrong presentation.
+    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
+    let indexed = command(&root, &home, "index")
+        .current_dir(&first_cwd)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let initial: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    assert_eq!(initial["publishedRevision"]["indexRevision"], 1);
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let index_db = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let recorded_options = || -> Value {
+        let db = rusqlite::Connection::open(&index_db).unwrap();
+        let text: String = db
+            .query_row(
+                "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    let recorded = recorded_options();
+    assert_eq!(
+        recorded["scipPath"],
+        ingress_cwd.join("index.scip").to_str().unwrap()
+    );
+    assert_eq!(
+        recorded["manifestPath"],
+        ingress_cwd.join("manifest.json").to_str().unwrap()
+    );
+    let status = command(&root, &home, "status")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        initial["publishedRevision"]["indexGeneration"]
+    );
+    let export = command(&root, &home, "export")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let f = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "f")
+        .unwrap();
+    assert_eq!(f["displayLabel"], original_label);
+    assert_eq!(
+        recorded_options(),
+        recorded,
+        "takeovers must retain ingress identities"
+    );
+}
+
+#[test]
+fn standalone_takeover_keeps_configured_missing_presentation_absent() {
+    use sha2::{Digest, Sha256};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let first_cwd = temp.path().join("ingress");
+    let second_cwd = temp.path().join("takeover");
+    for dir in [&root, &first_cwd, &second_cwd] {
+        fs::create_dir(dir).unwrap();
+    }
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    // Inputs with these names exist only in B, never in the configured A.
+    write_optional_presentation(&second_cwd, "scip npm display 1 main.js/f().", &source_hash);
+    let indexed = command(&root, &home, "index")
+        .current_dir(&first_cwd)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(!first_cwd.join("index.scip").exists());
+    assert!(!first_cwd.join("manifest.json").exists());
+    let export = command(&root, &home, "export")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let f = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "f")
+        .unwrap();
+    assert!(
+        f["displayLabel"].is_null(),
+        "absent A inputs must not become B labels"
+    );
+}
+
+#[tokio::test]
+async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_takeover() {
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+    };
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let first_cwd = temp.path().join("ingress");
+    let second_cwd = temp.path().join("takeover");
+    for dir in [&root, &first_cwd, &second_cwd] {
+        fs::create_dir(dir).unwrap();
+    }
+    let ingress_cwd = first_cwd.canonicalize().unwrap();
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    let original_label = "scip npm display 1 main.js/f().";
+    write_optional_presentation(&first_cwd, original_label, &source_hash);
+    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let token = temp.path().join("token");
+    fs::write(&token, TOKEN).unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut child = isolated_command(&home)
+        .arg("serve")
+        .arg("--workspace")
+        .arg(&root)
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--token-file")
+        .arg(&token)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .current_dir(&first_cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let server = Server(child);
+    let startup = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut text = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    return Err(text);
+                }
+                text.push_str(&line);
+                if line.contains("Baleyg:") {
+                    return Ok(text);
+                }
+            }
+        }),
+    )
+    .await
+    .expect("daemon startup timed out")
+    .unwrap()
+    .unwrap_or_else(|text| panic!("daemon exited before binding: {text}"));
+    assert!(
+        !startup.contains("Evidence unavailable at startup"),
+        "{startup}"
+    );
+    drop(server);
+    let export = command(&root, &home, "export")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let f = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "f")
+        .unwrap();
+    assert_eq!(f["displayLabel"], original_label);
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let index_db = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    let recorded: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let recorded: Value = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(
+        recorded["scipPath"],
+        ingress_cwd.join("index.scip").to_str().unwrap()
+    );
+    assert_eq!(
+        recorded["manifestPath"],
+        ingress_cwd.join("manifest.json").to_str().unwrap()
+    );
+}
+
+#[test]
+fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
+    use sha2::{Digest, Sha256};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let first_cwd = temp.path().join("ingress");
+    let second_cwd = temp.path().join("takeover");
+    for dir in [&root, &first_cwd, &second_cwd] {
+        fs::create_dir(dir).unwrap();
+    }
+    let ingress_cwd = first_cwd.canonicalize().unwrap();
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+    write_optional_presentation(&first_cwd, "scip npm display 1 main.js/f().", &source_hash);
+    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
+    let indexed = command(&root, &home, "index")
+        .current_dir(&first_cwd)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let index_db = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db");
+    // Model one previously persisted relative record with a matching inventory;
+    // changing only reconcile_options would be rejected earlier as torn metadata.
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    let raw: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut previous: baleyg::indexer::ReconcileOptions = serde_json::from_str(&raw).unwrap();
+    previous.scip_path = Some("index.scip".into());
+    previous.manifest_path = Some("manifest.json".into());
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    db.execute(
+        "UPDATE index_metadata SET reconcile_options=?1 WHERE singleton=1",
+        [serde_json::to_string(&previous).unwrap()],
+    )
+    .unwrap();
+    for (role, name) in [("scip", "index.scip"), ("manifest", "manifest.json")] {
+        let old_key = format!("presentation-{role}:{}", ingress_cwd.join(name).display());
+        let new_key = format!("presentation-{role}:{name}");
+        assert_eq!(
+            db.execute(
+                "UPDATE capture_inputs SET input_key=?1 WHERE input_key=?2",
+                rusqlite::params![new_key, old_key],
+            )
+            .unwrap(),
+            1
+        );
+    }
+    db.execute_batch("COMMIT").unwrap();
+    drop(db);
+    let rejected = command(&root, &home, "status")
+        .current_dir(&second_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        !rejected.status.success(),
+        "legacy relative options were replayed"
+    );
+    assert!(
+        rejected.stdout.is_empty(),
+        "no cwd-rebound evidence may escape"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("run explicit baleyg index"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    let revision: i64 = db
+        .query_row(
+            "SELECT index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        revision, 1,
+        "relative legacy record cannot republish from B"
     );
 }
 
