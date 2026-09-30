@@ -132,7 +132,7 @@ async function indexThroughApi(base, token, expected) {
   while(Date.now()<deadline){
     const job=await api(base,token,"GET",`/api/jobs/${encodeURIComponent(accepted.data.id)}`);
     assert.equal(job.status,200,JSON.stringify(job.data));
-    if(job.data.finishedAt!==null){assert.equal(job.data.state,"completed",JSON.stringify(job.data));return job.data.revision;}
+    if(job.data.finishedAt!==null){assert.equal(job.data.state,"done",JSON.stringify(job.data));return job.data.revision;}
     await delay(25);
   }
   throw new Error("index job did not complete within 20 seconds");

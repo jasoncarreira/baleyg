@@ -329,17 +329,30 @@ async fn index_admission_and_publication_pair() {
         index_generation: uuid::Uuid::new_v4(),
         index_revision: pin.index_revision,
     };
-    assert_eq!(
-        call(
-            &app,
-            "POST",
-            "/api/index",
-            json!({"expectedRevision":conflict})
-        )
-        .await
-        .0,
-        409
-    );
+    let (code, stale_job) = call(
+        &app,
+        "POST",
+        "/api/index",
+        json!({"expectedRevision":conflict}),
+    )
+    .await;
+    assert_eq!(code, 202, "{stale_job}");
+    assert_eq!(stale_job["state"], "queued");
+    let stale_id = stale_job["id"].as_str().unwrap();
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (_, row) = call(&app, "GET", &format!("/api/jobs/{stale_id}"), Value::Null).await;
+            if !row["finishedAt"].is_null() {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], "revision_conflict");
+    assert_eq!(store.status().unwrap().revision, pin);
     let (code, job) = call(&app, "POST", "/api/index", json!({"expectedRevision":pin})).await;
     assert_eq!(code, 202, "{job}");
     assert!(job["revision"].is_null());
@@ -355,7 +368,7 @@ async fn index_admission_and_publication_pair() {
     })
     .await
     .unwrap();
-    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(completed["state"], "done", "{completed}");
     assert_eq!(
         completed["revision"],
         json!(store.status().unwrap().revision)

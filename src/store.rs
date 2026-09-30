@@ -1,5 +1,6 @@
 //! SQLite snapshots and durable user data. Connections are never shared between threads.
 pub mod anchors;
+pub mod requests;
 pub mod topology;
 use crate::model::*;
 use anyhow::{Context, Result, ensure};

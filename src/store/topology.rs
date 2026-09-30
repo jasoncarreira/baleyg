@@ -133,6 +133,9 @@ impl TopologyRoots {
     pub fn index_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.index_dir(identity).join("index.db")
     }
+    pub fn requests_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
+        self.index_dir(identity).join("requests.db")
+    }
     pub fn leader_lock(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.index_dir(identity).join("leader.lock")
     }

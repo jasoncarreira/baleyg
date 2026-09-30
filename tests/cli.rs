@@ -1929,7 +1929,7 @@ async fn real_index_job(
     })
     .await
     .expect("saved-item index job");
-    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(completed["state"], "done", "{completed}");
     completed["revision"].clone()
 }
 
@@ -2286,7 +2286,7 @@ def sink():
             .await
             .unwrap();
         assert_eq!(follower_http_status["revision"], post_start_pin, "{name}");
-        let refused = client
+        let follower_accepted = client
             .post(format!("{follower_url}/api/index"))
             .header("Origin", &follower_url)
             .bearer_auth(TOKEN)
@@ -2294,14 +2294,42 @@ def sink():
             .send()
             .await
             .unwrap();
-        assert_eq!(refused.status(), 409, "{name}");
-        assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
+        assert_eq!(follower_accepted.status(), 202, "{name}");
+        let follower_accepted: Value = follower_accepted.json().await.unwrap();
+        assert_eq!(follower_accepted["state"], "queued", "{name}");
+        assert!(follower_accepted["startedAt"].is_null(), "{name}");
+        let follower_id = follower_accepted["id"].as_str().unwrap();
+        let follower_done = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let job: Value = client
+                    .get(format!("{follower_url}/api/jobs/{follower_id}"))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !job["finishedAt"].is_null() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(follower_done["state"], "done", "{name}: {follower_done}");
+        let follower_pin = follower_done["revision"].clone();
+        assert_eq!(
+            follower_pin["indexRevision"],
+            post_start_pin["indexRevision"].as_u64().unwrap() + 1
+        );
         assert!(follower_server.0.try_wait().unwrap().is_none());
         let request = || {
             client
                 .post(format!("{url}/api/index"))
                 .header("Origin", &url)
-                .json(&serde_json::json!({"expectedRevision":post_start_pin.clone()}))
+                .json(&serde_json::json!({"expectedRevision":follower_pin.clone()}))
         };
         let denied = request().bearer_auth("incorrect").send().await.unwrap();
         assert_eq!(denied.status(), 401, "{name}");
@@ -2323,9 +2351,9 @@ def sink():
             .json()
             .await
             .unwrap();
-        assert!(
-            current.is_null(),
-            "{name}: rejected auth/origin must not start work"
+        assert_eq!(
+            current["id"], follower_id,
+            "{name}: rejected auth/origin must not add work"
         );
         let accepted = request().bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(accepted.status(), 202, "{name}");
@@ -2350,7 +2378,7 @@ def sink():
         })
         .await
         .unwrap();
-        assert_eq!(completed["state"], "completed", "{name}: {completed}");
+        assert_eq!(completed["state"], "done", "{name}: {completed}");
         let pin = completed["revision"].clone();
         assert_eq!(
             pin["indexGeneration"], post_start_pin["indexGeneration"],
@@ -2358,7 +2386,7 @@ def sink():
         );
         assert_eq!(
             pin["indexRevision"].as_u64().unwrap(),
-            post_start_pin["indexRevision"].as_u64().unwrap() + 1,
+            follower_pin["indexRevision"].as_u64().unwrap() + 1,
             "{name}"
         );
         let status: Value = client
@@ -3170,7 +3198,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     })
     .await
     .expect("later successful job");
-    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(completed["state"], "done", "{completed}");
     assert_eq!(
         completed["revision"]["indexGeneration"],
         pin["indexGeneration"]

@@ -115,6 +115,94 @@ pub fn reconcile_workspace(
     Ok((pin, session))
 }
 
+/// A verified leader owns the queue stream. Reclaimed running rows retain their FIFO position.
+/// Callers serialize this function with startup and other local native work.
+pub fn drain_requests(store: &Store, session: &Arc<LeaderSession>) -> Result<usize> {
+    drain_requests_observed(store, session, |_, _| {})
+}
+
+/// Progress is advisory and local. The durable request row alone controls state.
+pub fn drain_requests_observed(
+    store: &Store,
+    session: &Arc<LeaderSession>,
+    progress: impl Fn(&str, IndexProgress) + Sync,
+) -> Result<usize> {
+    store.verify_leader_session(session)?;
+    let mut completed = 0;
+    while let Some(request) = store.claim_request(session)? {
+        let outcome = (|| {
+            let options = request.options(std::path::Path::new(store.workspace_root()))?;
+            let coordinator = IndexJobCoordinator::prepare_with_session(
+                store,
+                request.expected,
+                session.clone(),
+            )?;
+            coordinator.run(
+                &options,
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                |p| progress(&request.id, p),
+            )
+        })();
+        // No unverified worker can mark a request terminal. On fencing loss leave it running
+        // for the next incarnation to reclaim after its complete root reconciliation.
+        store.finish_request(session, &request, outcome)?;
+        completed += 1;
+    }
+    Ok(completed)
+}
+
+/// One explicit CLI command commits before waiting. A free lock requires a complete
+/// takeover reconciliation before any queued request is claimed.
+pub fn enqueue_and_wait(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
+    let request = store.enqueue_request(options, None)?;
+    let mut held: Option<Arc<LeaderSession>> = None;
+    loop {
+        store.verify_root()?;
+        if let Some(row) = store.request_by_id(&request.id)? {
+            match row.state.as_str() {
+                "done" => {
+                    let session = match held.take() {
+                        Some(session) => session,
+                        None => store.follower_session()?,
+                    };
+                    session.verify()?;
+                    return Ok((row.revision.expect("done request has revision"), session));
+                }
+                "failed" => anyhow::bail!(
+                    "{}: queued indexing failed",
+                    row.error_code.unwrap_or_else(|| "index_failed".into())
+                ),
+                _ => {}
+            }
+        }
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "index wait interrupted; accepted request remains queued"
+        );
+        if held.is_none() {
+            match store.leader_session() {
+                Ok(session) => {
+                    // The takeover reconciliation is part of the same ordered native stream.
+                    let startup =
+                        IndexJobCoordinator::prepare_with_session(store, None, session.clone())?;
+                    startup.run(options, cancel, |_| {})?;
+                    held = Some(session);
+                }
+                Err(error) if format!("{error:#}").contains("storage_busy") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(session) = &held {
+            drain_requests(store, session)?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Establish one bounded serving owner. A free lock performs one complete
 /// reconciliation; contention is admitted only as a verified follower.
 pub fn establish_serving_session(

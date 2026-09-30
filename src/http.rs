@@ -44,7 +44,8 @@ pub struct IndexJob {
     pub progress: IndexProgress,
     pub revision: Option<IndexPin>,
     pub error: Option<Value>,
-    pub started_at: String,
+    pub submitted_at: String,
+    pub started_at: Option<String>,
     pub finished_at: Option<String>,
 }
 struct Jobs {
@@ -130,14 +131,14 @@ pub struct DaemonState {
     outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
-    normal_index_worker_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
-    normal_index_post_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
+    queue_tick_started: AtomicBool,
+    pending_requests: Mutex<Vec<String>>,
+    job_progress: Mutex<BTreeMap<String, IndexProgress>>,
+    native_stream: Mutex<()>,
     packets: Mutex<PacketCache>,
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
@@ -258,10 +259,6 @@ pub fn new_with_dependency_options(
         outer_fence_hook: Mutex::new(None),
         #[cfg(test)]
         preview_finish_hook: Mutex::new(None),
-        #[cfg(test)]
-        normal_index_worker_hook: Mutex::new(None),
-        #[cfg(test)]
-        normal_index_post_capture_hook: Mutex::new(None),
         dependency_options: catalog_options,
         token,
         hosts,
@@ -269,6 +266,10 @@ pub fn new_with_dependency_options(
         provider: jev,
         acp,
         packets: Mutex::new(PacketCache::default()),
+        queue_tick_started: AtomicBool::new(false),
+        pending_requests: Mutex::new(Vec::new()),
+        job_progress: Mutex::new(BTreeMap::new()),
+        native_stream: Mutex::new(()),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -277,8 +278,100 @@ pub fn new_with_dependency_options(
     }))
 }
 impl DaemonState {
-    pub fn retain_serving_session(&self, session: Arc<crate::store::topology::LeaderSession>) {
+    pub fn retain_serving_session(
+        self: &Arc<Self>,
+        session: Arc<crate::store::topology::LeaderSession>,
+    ) {
         *self.serving_session.lock().unwrap() = Some(session);
+        self.start_queue_tick();
+    }
+    /// A leader checks only the queue at idle. Follower retries require an accepted local ID.
+    fn start_queue_tick(self: &Arc<Self>) {
+        // A synchronous fixture may retain an owner without starting a daemon runtime.
+        // Do not consume the start flag until a Tokio executor can own the tick.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        if self.queue_tick_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                let worker = state.clone();
+                let result = tokio::task::spawn_blocking(move || worker.queue_tick()).await;
+                if let Err(error) = result {
+                    eprintln!("queue tick failed: {error}");
+                }
+            }
+        });
+    }
+    fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
+        let _stream = self.native_stream.lock().unwrap();
+        let mut pending = self.pending_requests.lock().unwrap();
+        pending.retain(|id| {
+            self.store
+                .request_by_id(id)
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.finished_at.is_none())
+        });
+        let pending_local = !pending.is_empty();
+        drop(pending);
+        let retained = self.serving_session.lock().unwrap().clone();
+        if let Some(ref session) = retained
+            && session.is_leader()
+            && session.verify().is_ok()
+        {
+            if crate::index_coordinator::drain_requests_observed(&self.store, session, |id, p| {
+                self.job_progress.lock().unwrap().insert(id.to_owned(), p);
+            })? > 0
+            {
+                *self.packets.lock().unwrap() = PacketCache::default();
+                self.start_dependency_index();
+            }
+            return Ok(());
+        }
+        if !pending_local {
+            return Ok(());
+        }
+        match self.store.leader_session() {
+            Ok(session) => {
+                let outcome = (|| {
+                    let coordinator =
+                        crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+                            &self.store,
+                            None,
+                            session.clone(),
+                        )?;
+                    coordinator.run(&self.options, &Arc::new(AtomicBool::new(false)), |_| {})?;
+                    let processed = crate::index_coordinator::drain_requests_observed(
+                        &self.store,
+                        &session,
+                        |id, p| {
+                            self.job_progress.lock().unwrap().insert(id.to_owned(), p);
+                        },
+                    )?;
+                    if processed > 0 {
+                        *self.packets.lock().unwrap() = PacketCache::default();
+                        self.start_dependency_index();
+                    }
+                    Ok(processed)
+                })();
+                if outcome.is_ok() {
+                    *self.serving_session.lock().unwrap() = Some(session);
+                }
+                outcome.map(|_| ())
+            }
+            Err(error) if format!("{error:#}").contains("storage_busy") => Ok(()),
+            Err(error) => Err(error),
+        }
     }
     pub fn retained_serving_session(
         &self,
@@ -417,6 +510,7 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
     )
         .into_response()
 }
+#[derive(Debug)]
 struct ApiError(StatusCode, &'static str, &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -1445,6 +1539,23 @@ fn now() -> String {
         .as_millis()
         .to_string()
 }
+impl From<crate::store::requests::Request> for IndexJob {
+    fn from(row: crate::store::requests::Request) -> Self {
+        let error = row
+            .error_code
+            .map(|code| json!({"code":code,"message":"Index job failed"}));
+        Self {
+            id: row.id,
+            state: row.state,
+            progress: IndexProgress::default(),
+            revision: row.revision,
+            error,
+            submitted_at: row.submitted_at,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+        }
+    }
+}
 async fn start_index(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -1458,131 +1569,32 @@ async fn start_index(
         }
         serde_json::from_value(value).map_err(|_| invalid())?
     };
-    let requested = request.expected_revision;
+    // Existing exceptional index-only recreation stays on its compatibility path
+    // until the following root/recovery slice integrates its quiescence barrier.
     if s.store.is_recreate_pending() {
-        if requested.is_some() {
+        if request.expected_revision.is_some() {
             return Err(ApiError::from(anyhow::anyhow!(
                 "revision conflict: exceptional recovery has no decodable prior pin"
             )));
         }
         return start_exceptional_index(s);
     }
-    {
-        let jobs = s.jobs.lock().unwrap();
-        if jobs
-            .current
-            .as_ref()
-            .and_then(|id| jobs.jobs.get(id))
-            .is_some_and(|j| j.finished_at.is_none())
-        {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "job_active",
-                "An index job is already active",
-            ));
-        }
-    }
-    let retained = s.serving_session.lock().unwrap().clone().ok_or(ApiError(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "index_not_ready",
-        "No verified daemon serving session",
-    ))?;
-    let coordinator = db(s.clone(), move |store| {
-        crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
-            store, requested, retained,
-        )
+    let options = s.options.clone();
+    let row = db(s.clone(), move |store| {
+        store.enqueue_request(&options, request.expected_revision)
     })
     .await?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let job = IndexJob {
-        id: uuid::Uuid::new_v4().to_string(),
-        state: "running".into(),
-        progress: IndexProgress::default(),
-        revision: None,
-        error: None,
-        started_at: now(),
-        finished_at: None,
-    };
-    {
-        let mut jobs = s.jobs.lock().unwrap();
-        if jobs
-            .current
-            .as_ref()
-            .and_then(|id| jobs.jobs.get(id))
-            .is_some_and(|j| j.finished_at.is_none())
-        {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "job_active",
-                "An index job is already active",
-            ));
-        }
-        // An ordinary coordinator prepared before a concurrent corruption must
-        // never reserve a stale owner after an exceptional job has taken its slot.
-        if s.store.is_recreate_pending() {
-            return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "recovery_required",
-                "Explicit index recovery now required",
-            ));
-        }
-        if jobs.jobs.len() >= 100 {
-            let old = jobs
-                .jobs
-                .iter()
-                .min_by_key(|(_, j)| &j.started_at)
-                .map(|(id, _)| id.clone());
-            if let Some(id) = old {
-                jobs.jobs.remove(&id);
-            }
-        }
-        jobs.current = Some(job.id.clone());
-        jobs.cancel = cancel.clone();
-        jobs.jobs.insert(job.id.clone(), job.clone());
-    }
-    let id = job.id.clone();
-    tokio::spawn(async move {
-        let worker = s.clone();
-        let worker_id = id.clone();
-        let worker_cancel = cancel.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            if let Some(hook) = worker.normal_index_worker_hook.lock().unwrap().clone() {
-                hook();
-            }
-            let progress = |p| {
-                if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
-                    j.progress = p;
-                }
-            };
-            #[cfg(test)]
-            let result =
-                coordinator.run_observed(&worker.options, &worker_cancel, progress, |_| {
-                    let hook = worker
-                        .normal_index_post_capture_hook
-                        .lock()
-                        .unwrap()
-                        .clone();
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                });
-            #[cfg(not(test))]
-            let result = coordinator.run(&worker.options, &worker_cancel, progress);
-            result
-        })
-        .await;
-        let outcome = match result {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("index worker failed")),
-        };
-        finish_index_job(&s, &id, outcome, &cancel);
-    });
+    let job = IndexJob::from(row);
+    // A later durable admission supersedes the legacy exceptional display slot.
+    s.jobs.lock().unwrap().current = None;
+    s.pending_requests.lock().unwrap().push(job.id.clone());
+    s.start_queue_tick();
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 // Exceptional recovery has no decodable prior pin. Reserve the only job and detach
 // any old daemon owner atomically, then drop that owner before the worker tries EX.
 // An unrelated protected reader remains in control of BUSY; no retry is implicit.
+#[allow(dead_code)]
 fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let job = IndexJob {
@@ -1591,7 +1603,8 @@ fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<Inde
         progress: IndexProgress::default(),
         revision: None,
         error: None,
-        started_at: now(),
+        submitted_at: now(),
+        started_at: Some(now()),
         finished_at: None,
     };
     let old_owner = {
@@ -1617,16 +1630,6 @@ fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<Inde
         }
         // All admission paths touching both locks use jobs -> serving_session.
         let old_owner = s.serving_session.lock().unwrap().take();
-        if jobs.jobs.len() >= 100 {
-            let old = jobs
-                .jobs
-                .iter()
-                .min_by_key(|(_, j)| &j.started_at)
-                .map(|(id, _)| id.clone());
-            if let Some(id) = old {
-                jobs.jobs.remove(&id);
-            }
-        }
         jobs.current = Some(job.id.clone());
         jobs.cancel = cancel.clone();
         jobs.jobs.insert(job.id.clone(), job.clone());
@@ -1663,6 +1666,7 @@ fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<Inde
 // A successful worker keeps its leader guard inside the returned Arc even across
 // spawn_blocking handoff. Validation and any test barrier run while that Arc lives.
 // Install it before completing the job; never publish a success without an owner.
+#[allow(dead_code)]
 fn finish_exceptional_index_job(
     s: &Arc<DaemonState>,
     id: &str,
@@ -1699,12 +1703,13 @@ fn finish_exceptional_index_job(
             // verified owner and report the committed revision as completed.
             *serving = Some(session);
             job.revision = Some(pin);
-            job.state = "completed".into();
+            job.state = "done".into();
             true
         }
         Err(error) if cancel.load(Ordering::Acquire) => {
             let _ = error;
-            job.state = "cancelled".into();
+            job.state = "failed".into();
+            job.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
             false
         }
         Err(error) => {
@@ -1727,11 +1732,13 @@ fn finish_exceptional_index_job(
     if published {
         *s.packets.lock().unwrap() = PacketCache::default();
         s.start_dependency_index();
+        s.start_queue_tick();
     }
 }
 
 // A failed publication cannot release cached packet ownership. Only a committed
 // revision transition clears packets; old barriers still block their public reads.
+#[allow(dead_code)]
 fn finish_index_job(
     s: &Arc<DaemonState>,
     id: &str,
@@ -1767,43 +1774,77 @@ fn finish_index_job(
         s.start_dependency_index();
     }
 }
-async fn current_job(State(s): State<Arc<DaemonState>>) -> Json<Option<IndexJob>> {
-    let jobs = s.jobs.lock().unwrap();
-    Json(
+// The exceptional index-only recovery worker predates requests.db. Until the
+// root/recovery slice moves it into the queue, its current ID remains readable
+// through the authenticated routes; ordinary jobs always use durable rows.
+async fn current_job(
+    State(s): State<Arc<DaemonState>>,
+) -> Result<Json<Option<IndexJob>>, ApiError> {
+    let legacy = {
+        let jobs = s.jobs.lock().unwrap();
         jobs.current
             .as_ref()
             .and_then(|id| jobs.jobs.get(id))
-            .cloned(),
-    )
+            .cloned()
+    };
+    if legacy.is_some() {
+        db(s, |store| store.verify_root()).await?;
+        return Ok(Json(legacy));
+    }
+    let row = db(s.clone(), |store| store.current_request()).await?;
+    Ok(Json(row.map(|row| {
+        let mut job = IndexJob::from(row);
+        if let Some(progress) = s.job_progress.lock().unwrap().get(&job.id) {
+            job.progress = progress.clone();
+        }
+        job
+    })))
 }
 async fn job(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
 ) -> Result<Json<IndexJob>, ApiError> {
-    Ok(Json(
-        s.jobs
-            .lock()
-            .unwrap()
-            .jobs
-            .get(&id)
-            .cloned()
-            .ok_or_else(missing)?,
-    ))
+    let legacy = s.jobs.lock().unwrap().jobs.get(&id).cloned();
+    if let Some(legacy) = legacy {
+        db(s, |store| store.verify_root()).await?;
+        return Ok(Json(legacy));
+    }
+    let row = db(s.clone(), move |store| store.request_by_id(&id))
+        .await?
+        .ok_or_else(missing)?;
+    let mut job = IndexJob::from(row);
+    if let Some(progress) = s.job_progress.lock().unwrap().get(&job.id) {
+        job.progress = progress.clone();
+    }
+    Ok(Json(job))
 }
 async fn cancel_job(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
 ) -> Result<Json<IndexJob>, ApiError> {
-    let mut jobs = s.jobs.lock().unwrap();
-    let active = jobs.current.as_ref() == Some(&id);
-    if active {
-        jobs.cancel.store(true, Ordering::Release)
+    let legacy = s.jobs.lock().unwrap().jobs.get(&id).cloned();
+    if let Some(legacy) = legacy {
+        db(s, |store| store.verify_root()).await?;
+        if legacy.finished_at.is_some() {
+            return Ok(Json(legacy));
+        }
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "request_not_cancellable",
+            "Accepted requests cannot be cancelled",
+        ));
     }
-    let j = jobs.jobs.get_mut(&id).ok_or_else(missing)?;
-    if active && j.finished_at.is_none() {
-        j.state = "cancelling".into()
+    let row = db(s, move |store| store.request_by_id(&id))
+        .await?
+        .ok_or_else(missing)?;
+    if row.finished_at.is_none() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "request_not_cancellable",
+            "Accepted requests cannot be cancelled",
+        ));
     }
-    Ok(Json(j.clone()))
+    Ok(Json(row.into()))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2915,72 +2956,57 @@ mod exceptional_recovery_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_job_racing_a_new_pending_disposition_blocks_exceptional_post() {
+    async fn multiple_posts_commit_fifo_while_other_process_holds_leader() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-        let roots = TopologyRoots::isolated_for_tests(
-            tmp.path().join("state/cache"),
-            tmp.path().join("state/data"),
-        );
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let index = roots.index_db(&identity);
         let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
-        let options = IndexOptions::new(root);
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let (_, owner) =
-            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
-                .unwrap();
+        let owner = store.leader_session().unwrap();
         let state = new(
             store.clone(),
-            options,
+            IndexOptions::new(root),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        state.retain_serving_session(owner);
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-        *state.normal_index_worker_hook.lock().unwrap() = Some(Arc::new(move || {
-            entered_tx.send(()).unwrap();
-            release_rx.lock().unwrap().recv().unwrap();
-        }));
-        let (status, normal) = start_index(State(state.clone()), Bytes::new())
+        let (first_code, first) = start_index(State(state.clone()), Bytes::new())
             .await
-            .unwrap_or_else(|error| panic!("normal admission: {} {}", error.1, error.2));
-        assert_eq!(status, StatusCode::ACCEPTED);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        std::fs::write(&index, b"bad sqlite index header").unwrap();
-        assert!(store.status().is_err());
-        assert!(store.is_recreate_pending());
-        let second = start_index(State(state.clone()), Bytes::new())
-            .await
-            .err()
             .unwrap();
-        assert_eq!(second.0, StatusCode::CONFLICT);
-        assert_eq!(second.1, "job_active");
-        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
-        release_tx.send(()).unwrap();
-        let id = normal.0.id;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (second_code, second) = start_index(State(state.clone()), Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            (first_code, second_code),
+            (StatusCode::ACCEPTED, StatusCode::ACCEPTED)
+        );
+        assert_eq!(
+            (first.0.state.as_str(), second.0.state.as_str()),
+            ("queued", "queued")
+        );
+        let a = store.request_by_id(&first.0.id).unwrap().unwrap();
+        let b = store.request_by_id(&second.0.id).unwrap().unwrap();
+        assert!(a.seq < b.seq);
+        assert_eq!(store.current_request().unwrap().unwrap().id, b.id);
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
+                if store
+                    .request_by_id(&second.0.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await
         .unwrap();
-        assert!(store.is_recreate_pending());
+        assert_eq!(store.request_by_id(&a.id).unwrap().unwrap().state, "done");
+        assert_eq!(store.request_by_id(&b.id).unwrap().unwrap().state, "done");
     }
 
     #[tokio::test]
@@ -3001,7 +3027,8 @@ mod exceptional_recovery_tests {
                     progress: IndexProgress::default(),
                     revision: None,
                     error: None,
-                    started_at: now(),
+                    submitted_at: now(),
+                    started_at: Some(now()),
                     finished_at: None,
                 },
             );
@@ -3023,7 +3050,7 @@ mod exceptional_recovery_tests {
             );
             assert_eq!(store.status().unwrap().revision, pin);
         });
-        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "completed");
+        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "done");
         assert_eq!(state.jobs.lock().unwrap().jobs[&id].revision, Some(pin));
         assert!(state.retained_serving_session().unwrap().is_leader());
         assert!(
@@ -3052,7 +3079,8 @@ mod exceptional_recovery_tests {
                     progress: IndexProgress::default(),
                     revision: None,
                     error: None,
-                    started_at: now(),
+                    submitted_at: now(),
+                    started_at: Some(now()),
                     finished_at: None,
                 },
             );
@@ -3064,7 +3092,7 @@ mod exceptional_recovery_tests {
         cancel.store(true, Ordering::Release);
         finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |_| {});
         let job = state.jobs.lock().unwrap().jobs[&id].clone();
-        assert_eq!(job.state, "completed");
+        assert_eq!(job.state, "done");
         assert_eq!(job.revision, Some(pin));
         assert!(state.retained_serving_session().unwrap().is_leader());
         assert_eq!(store.status().unwrap().revision, pin);
@@ -3094,7 +3122,8 @@ mod exceptional_recovery_tests {
                     progress: IndexProgress::default(),
                     revision: None,
                     error: None,
-                    started_at: now(),
+                    submitted_at: now(),
+                    started_at: Some(now()),
                     finished_at: None,
                 },
             );
@@ -3121,11 +3150,7 @@ mod normal_post_capture_cancellation_tests {
     use super::*;
     use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
     use rusqlite::{OpenFlags, types::Value as SqlValue};
-    use std::{
-        fs,
-        sync::{atomic::AtomicUsize, mpsc},
-        time::Duration,
-    };
+    use std::{fs, time::Duration};
     use tower::ServiceExt;
 
     #[derive(Debug, PartialEq)]
@@ -3223,42 +3248,14 @@ mod normal_post_capture_cancellation_tests {
         )
     }
 
-    // A panicking test must cancel and release its blocked spawn_blocking worker.
-    struct ReleaseOnDrop {
-        state: Arc<DaemonState>,
-        sender: Option<mpsc::Sender<()>>,
-    }
-    impl ReleaseOnDrop {
-        fn release(&mut self) {
-            self.sender.as_ref().unwrap().send(()).unwrap();
-            self.sender.take();
-        }
-    }
-    impl Drop for ReleaseOnDrop {
-        fn drop(&mut self) {
-            if let Some(sender) = self.sender.take() {
-                let jobs = self
-                    .state
-                    .jobs
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                jobs.cancel.store(true, Ordering::Release);
-                drop(jobs);
-                let _ = sender.send(());
-            }
-        }
-    }
-
     #[tokio::test]
-    async fn normal_job_cancelled_after_capture_keeps_protected_pair_and_packet() {
+    async fn accepted_job_cannot_be_cancelled_and_full_pair_changes_only_after_leader_drains() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
-        let source = root.join("one.js");
         fs::write(
-            &source,
-            "function seed() { sink(); } function sink() {}
-",
+            root.join("one.js"),
+            "function seed() { old_step(); } function old_step() {}\n",
         )
         .unwrap();
         let state_root = tmp.path().join("state");
@@ -3268,14 +3265,20 @@ mod normal_post_capture_cancellation_tests {
         let index = roots.index_db(&identity);
         let store = Store::open_for_tests(&state_root, &root).unwrap();
         let options = IndexOptions::new(root.clone());
-        let initial_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let (old_pin, serving) = crate::index_coordinator::reconcile_workspace(
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
             &store,
             &options,
-            &initial_cancel,
+            &Arc::new(AtomicBool::new(false)),
             |_| {},
         )
         .unwrap();
+        let before = pair_snapshot(&index);
+        fs::write(
+            root.join("one.js"),
+            "function seed() { fresh(); } function fresh() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("two.js"), "function extra() {}\n").unwrap();
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let state = new(
             store.clone(),
@@ -3284,242 +3287,50 @@ mod normal_post_capture_cancellation_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        state.retain_serving_session(serving);
         let app = router(state.clone());
-        let before = pair_snapshot(&index);
-        assert_eq!(before.pin, old_pin);
-        assert!(!before.rows["nodes"].is_empty());
-        assert!(!before.rows["native_documents"].is_empty());
-        let seed = store
-            .symbols_at("seed", 10)
-            .unwrap()
-            .1
-            .into_iter()
-            .find(|symbol| symbol.name == "seed")
-            .unwrap()
-            .id;
-        let (status, preview) = api(
+        let (code, accepted) = api(
             &app,
             token,
             "POST",
-            "/api/questions/preview",
-            Some(json!({"seed":seed,"question":"what happens?","expectedRevision":old_pin})),
+            "/api/index",
+            Some(json!({"expectedRevision":before.pin})),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{preview}");
-        let packet_id = preview["packet"]["packetId"].as_str().unwrap().to_owned();
-        let packet_path = format!("/api/questions/{packet_id}/jev-request");
-        let source_path = format!(
-            "/api/source?path=one.js&indexGeneration={}&indexRevision={}",
-            old_pin.index_generation, old_pin.index_revision
-        );
-        assert_eq!(
-            api(&app, token, "GET", &source_path, None).await.0,
-            StatusCode::OK
-        );
-        assert_eq!(
-            api(&app, token, "GET", &packet_path, None).await.0,
-            StatusCode::OK
-        );
-        assert!(
-            state
-                .packets
-                .lock()
-                .unwrap()
-                .packets
-                .iter()
-                .any(|(packet, _)| packet.packet_id == packet_id)
-        );
-        fs::write(
-            &source,
-            "function seed() { fresh(); } function fresh() {}
-",
-        )
-        .unwrap();
-        fs::write(
-            root.join("two.js"),
-            "function extra() {}
-",
-        )
-        .unwrap();
-
-        let (captured_tx, captured_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-        let hook_calls = Arc::new(AtomicUsize::new(0));
-        let calls = hook_calls.clone();
-        let mut release = ReleaseOnDrop {
-            state: state.clone(),
-            sender: Some(release_tx),
-        };
-        *state.normal_index_post_capture_hook.lock().unwrap() = Some(Arc::new(move || {
-            calls.fetch_add(1, Ordering::AcqRel);
-            captured_tx.send(()).unwrap();
-            release_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(30))
-                .unwrap();
-        }));
-        let (status, accepted) = start_index(
-            State(state.clone()),
-            Bytes::from(json!({"expectedRevision":old_pin}).to_string()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("normal admission: {} {}", error.1, error.2));
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let id = accepted.0.id;
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            tokio::task::spawn_blocking(move || captured_rx.recv_timeout(Duration::from_secs(12))),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-        let during = state.jobs.lock().unwrap().jobs[&id].clone();
-        assert_eq!(during.progress.phase, "complete");
-        assert_eq!((during.progress.completed, during.progress.total), (2, 2));
-        assert!(during.finished_at.is_none());
-        assert!(during.revision.is_none());
+        assert_eq!(code, StatusCode::ACCEPTED, "{accepted}");
+        assert_eq!(accepted["state"], "queued");
+        let id = accepted["id"].as_str().unwrap();
+        let (code, rejected) =
+            api(&app, token, "POST", &format!("/api/jobs/{id}/cancel"), None).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "request_not_cancellable");
         assert_eq!(pair_snapshot(&index), before);
-        let cancelling = cancel_job(State(state.clone()), Path(id.clone()))
-            .await
-            .unwrap_or_else(|error| panic!("cancel job: {} {}", error.1, error.2))
-            .0;
-        assert_eq!(cancelling.state, "cancelling");
-        release.release();
-        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let finished = {
-                    let jobs = state.jobs.lock().unwrap();
-                    let job = jobs.jobs[&id].clone();
-                    job.finished_at.is_some().then_some(job)
-                };
-                if let Some(job) = finished {
-                    break job;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(terminal.state, "cancelled");
-        assert!(terminal.revision.is_none());
-        assert_eq!(terminal.progress.phase, "complete");
-        assert_eq!(
-            (terminal.progress.completed, terminal.progress.total),
-            (2, 2)
-        );
-        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
-        assert_eq!(pair_snapshot(&index), before);
-        for path in ["/api/status", &source_path, &packet_path] {
-            let (status, response) = api(&app, token, "GET", path, None).await;
-            assert_eq!(
-                status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{path}: {response}"
-            );
-            assert_eq!(
-                response["error"]["code"], "index_not_ready",
-                "{path}: {response}"
-            );
-        }
-        assert!(
-            state
-                .packets
-                .lock()
-                .unwrap()
-                .packets
-                .iter()
-                .any(|(packet, _)| packet.packet_id == packet_id)
-        );
-        assert!(
-            state
-                .normal_index_post_capture_hook
-                .lock()
-                .unwrap()
-                .take()
-                .is_some()
-        );
-        assert!(
-            state
-                .normal_index_post_capture_hook
-                .lock()
-                .unwrap()
-                .is_none()
-        );
-
-        let (status, retry) = start_index(
-            State(state.clone()),
-            Bytes::from(json!({"expectedRevision":old_pin}).to_string()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("index retry: {} {}", error.1, error.2));
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let retry_id = retry.0.id;
+        assert_eq!(store.request_by_id(id).unwrap().unwrap().state, "queued");
+        drop(owner);
         let completed = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let finished = {
-                    let jobs = state.jobs.lock().unwrap();
-                    let job = jobs.jobs[&retry_id].clone();
-                    job.finished_at.is_some().then_some(job)
-                };
-                if let Some(job) = finished {
-                    break job;
+                let (code, row) = api(&app, token, "GET", &format!("/api/jobs/{id}"), None).await;
+                assert_eq!(code, StatusCode::OK, "{row}");
+                if !row["finishedAt"].is_null() {
+                    break row;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(completed.state, "completed");
-        let next = completed.revision.unwrap();
-        assert_eq!(next.index_generation, old_pin.index_generation);
-        assert_eq!(next.index_revision, old_pin.index_revision + 1);
-        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+        assert_eq!(completed["state"], "done", "{completed}");
         let after = pair_snapshot(&index);
-        assert_eq!(after.pin, next);
+        assert!(after.pin.index_revision > before.pin.index_revision);
         assert_ne!(after.rows["files"], before.rows["files"]);
         assert_ne!(
             after.rows["native_documents"],
             before.rows["native_documents"]
         );
         assert!(after.rows["files"].iter().any(|row| row.contains("two.js")));
-        assert!(
-            after.rows["native_documents"]
-                .iter()
-                .any(|row| row.contains("two.js"))
+        assert_eq!(
+            after.pin,
+            serde_json::from_value(completed["revision"].clone()).unwrap()
         );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if state.packets.lock().unwrap().packets.is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("successful worker must clear cached packets");
-        assert!(state.packets.lock().unwrap().packets.is_empty());
-        let (status, stale) = api(&app, token, "GET", &source_path, None).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{stale}");
-        assert_eq!(stale["error"]["code"], "revision_conflict");
-        let updated_source = format!(
-            "/api/source?path=one.js&indexGeneration={}&indexRevision={}",
-            next.index_generation, next.index_revision
-        );
-        let (status, source_response) = api(&app, token, "GET", &updated_source, None).await;
-        assert_eq!(status, StatusCode::OK, "{source_response}");
-        assert!(
-            source_response["file"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("fresh")
-        );
-        let (status, old_packet) = api(&app, token, "GET", &packet_path, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{old_packet}");
-        assert_eq!(old_packet["error"]["code"], "not_found");
     }
 }
 
@@ -4015,7 +3826,8 @@ mod rebaseline_packet_cache_tests {
                     progress: IndexProgress::default(),
                     revision: None,
                     error: None,
-                    started_at: now(),
+                    submitted_at: now(),
+                    started_at: Some(now()),
                     finished_at: None,
                 },
             )
