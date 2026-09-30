@@ -10,7 +10,7 @@ use crate::{
     planning::{
         self, FocusedView, QuestionPacket, QuestionPreview, QuestionRequest, SelectionEnvelope,
     },
-    store::{EvidenceFence, Store},
+    store::{EvidenceFence, EvidenceFencePolicy, Store},
 };
 use anyhow::Context;
 use axum::{
@@ -128,6 +128,8 @@ pub struct DaemonState {
     dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
@@ -250,6 +252,8 @@ pub fn new_with_dependency_options(
         dependency_capture_hook: Mutex::new(None),
         #[cfg(test)]
         outer_fence_hook: Mutex::new(None),
+        #[cfg(test)]
+        preview_finish_hook: Mutex::new(None),
         dependency_options: catalog_options,
         token,
         hosts,
@@ -796,12 +800,12 @@ async fn evidence_response_guard(
     if !native_response_route(request.uri().path()) {
         return next.run(request).await;
     }
-    // The snapshot is short: retain only its protected leader observation and
-    // full pin while the handler assembles/serializes the complete HTTP body.
+    // The snapshot is short: retain its protected leader observation through
+    // serialization. An ordinary same-incarnation publish does not reject an
+    // already-materialized coherent unpinned response.
     let admitted = db(state.clone(), |store| {
         let snapshot = store.evidence_response()?;
-        let pin = snapshot.status()?.revision;
-        Ok(snapshot.into_fence(pin))
+        Ok(snapshot.into_fence(EvidenceFencePolicy::T03))
     })
     .await;
     let response = next.run(request).await;
@@ -1755,8 +1759,28 @@ async fn delete_annotation(
 fn question_error(e: anyhow::Error) -> ApiError {
     let message = e.to_string();
     if message.starts_with("revision conflict")
-        || message.starts_with("index_not_ready")
-        || message.starts_with("incompatible_index")
+        || [
+            "root_changed",
+            "root_key_collision",
+            "workspace_id_changed",
+            "index_not_ready",
+            "storage_busy",
+            "incompatible_index",
+            "incompatible_record",
+            "incomplete_record",
+            "recovery_required",
+            "unsafe_index",
+        ]
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+        || e.chain().any(|cause| {
+            cause
+                .downcast_ref::<rusqlite::Error>()
+                .is_some_and(|error| {
+                    matches!(error, rusqlite::Error::SqliteFailure(info, _) if matches!(info.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+                })
+        })
     {
         e.into()
     } else if message == "question seed not found" {
@@ -1822,7 +1846,13 @@ async fn question_preview(
         s.packets
             .lock()
             .unwrap()
-            .remember_fenced(cached, bytes, || response.finish(()))?;
+            .remember_fenced(cached, bytes, || {
+                #[cfg(test)]
+                if let Some(hook) = s.preview_finish_hook.lock().unwrap().as_ref() {
+                    hook();
+                }
+                response.finish(())
+            })?;
         Ok(result)
     })
     .await
@@ -1855,7 +1885,7 @@ async fn cached_packet(
     // before exporting, displaying, or sending cached evidence to a provider.
     let witness = packet.clone();
     response.validate_selected_view(&witness.context, &witness.source_files)?;
-    let fence = response.into_fence(packet.revision);
+    let fence = response.into_fence(EvidenceFencePolicy::ExactPin(packet.revision));
     Ok((packet, fence))
 }
 // Always run the post-materialization fence, even when assembly fails. Preserve
@@ -2147,6 +2177,102 @@ mod live_tests {
         }
     }
     #[test]
+    fn question_error_keeps_typed_refusals_and_selection_errors() {
+        for (message, code) in [
+            ("root_changed: fixture", "root_changed"),
+            ("recovery_required: fixture", "recovery_required"),
+            ("unsafe_index: fixture", "unsafe_index"),
+            ("index_not_ready: fixture", "index_not_ready"),
+        ] {
+            assert_eq!(question_error(anyhow::anyhow!("{message}")).1, code);
+        }
+        assert_eq!(
+            question_error(anyhow::anyhow!("revision conflict")).1,
+            "revision_conflict"
+        );
+        assert_eq!(
+            question_error(anyhow::anyhow!("invalid selection")).1,
+            "invalid_question_selection"
+        );
+        assert_eq!(
+            question_error(anyhow::anyhow!("complete question packet exceeds 1 MiB")).1,
+            "evidence_too_large"
+        );
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert_eq!(question_error(busy.into()).1, "storage_busy");
+    }
+
+    #[tokio::test]
+    async fn preview_root_change_after_serialization_discards_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.js"), "function go() { measured(); }\n").unwrap();
+        let options = IndexOptions::new(workspace.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let seed = graph
+            .nodes
+            .iter()
+            .find(|node| node.name == "go")
+            .unwrap()
+            .id
+            .clone();
+        let session = store.leader_session().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let state = new(
+            store,
+            options,
+            "0123456789abcdef".repeat(4),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(session);
+        let root = workspace.clone();
+        *state.preview_finish_hook.lock().unwrap() = Some(Arc::new(move || {
+            std::fs::rename(&root, root.with_file_name("replaced-workspace")).unwrap();
+            std::fs::create_dir(&root).unwrap();
+        }));
+        let app = router(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/questions/preview")
+            .header("host", "127.0.0.1:7331")
+            .header(
+                "authorization",
+                "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"seed":seed,"question":"what does go do?","expectedRevision":pin})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "root_changed");
+        assert!(body.get("packet").is_none());
+        assert!(state.packets.lock().unwrap().packets.is_empty());
+    }
+
+    #[test]
     fn acp_controlled_errors_are_exact_and_sanitized() {
         for (message, code) in [
             ("ACP authentication required", "acp_auth_required"),
@@ -2166,6 +2292,11 @@ mod live_tests {
     #[tokio::test]
     async fn live_response_is_rejected_if_snapshot_changes_during_call() {
         mock_run(true, "success").await;
+    }
+
+    #[tokio::test]
+    async fn pinned_packet_conflicts_even_when_provider_fails() {
+        mock_run(true, "context_exceeded").await;
     }
 
     #[tokio::test]
@@ -2577,8 +2708,8 @@ mod dependency_lifecycle_tests {
             )
             .unwrap();
         let state = new(
-            store,
-            options,
+            store.clone(),
+            options.clone(),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             "127.0.0.1:7331".parse().unwrap(),
         )
@@ -2594,6 +2725,34 @@ mod dependency_lifecycle_tests {
         assert_eq!(valid_status, StatusCode::OK);
         assert_eq!(valid["workspaceRevision"], json!(pin));
         assert_eq!(valid["catalogId"], "matching");
+        let lock = find_lock(&temp.path().join("state")).unwrap();
+        let matching_lock = lock.clone();
+        *state.dependency_capture_hook.lock().unwrap() = Some(Arc::new(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&matching_lock)
+                .unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
+        }));
+        let (refused_status, refused) = call(&app, "/api/dependencies").await;
+        assert_eq!(refused_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused["error"]["code"], "index_not_ready");
+        assert!(refused.get("workspaceRevision").is_none());
+        assert!(refused.get("catalogId").is_none());
+        *state.dependency_capture_hook.lock().unwrap() = None;
+        let incarnation = state
+            .retained_serving_session()
+            .unwrap()
+            .leader_guard()
+            .unwrap()
+            .incarnation;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(incarnation.to_string().as_bytes()).unwrap();
+        file.sync_all().unwrap();
         let mismatched = IndexPin {
             index_revision: pin.index_revision + 1,
             ..pin
@@ -2609,10 +2768,38 @@ mod dependency_lifecycle_tests {
             failed["warnings"],
             json!(["Workspace changed; refresh the dependency catalog"])
         );
-        let lock = find_lock(&temp.path().join("state")).unwrap();
         let (browse_status, browse) = call(&app, "/api/files").await;
         assert_eq!(browse_status, StatusCode::OK);
         assert_eq!(browse["revision"], json!(pin));
+        let publishing_store = store.clone();
+        let publishing_options = options.clone();
+        let publishing_session = state.retained_serving_session().unwrap();
+        *state.outer_fence_hook.lock().unwrap() = Some(Arc::new(move || {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (graph, native, capture) = crate::indexer::index_workspace_bundle(
+                &publishing_options,
+                publishing_store.root_id(),
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
+            publishing_store
+                .publish_native(
+                    &graph,
+                    &capture,
+                    &native,
+                    publishing_session.leader_guard().unwrap(),
+                    pin,
+                    &cancel,
+                )
+                .unwrap();
+        }));
+        let (published_status, old_response) = call(&app, "/api/files").await;
+        assert_eq!(published_status, StatusCode::OK);
+        assert_eq!(old_response["revision"], json!(pin));
+        *state.outer_fence_hook.lock().unwrap() = None;
+        let current = store.status().unwrap().revision;
+        assert_eq!(current.index_revision, pin.index_revision + 1);
         let hook_lock = lock.clone();
         *state.outer_fence_hook.lock().unwrap() = Some(Arc::new(move || {
             let mut file = std::fs::OpenOptions::new()
@@ -2640,18 +2827,6 @@ mod dependency_lifecycle_tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(incarnation.to_string().as_bytes()).unwrap();
         file.sync_all().unwrap();
-        *state.dependency_capture_hook.lock().unwrap() = Some(Arc::new(move || {
-            let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
-                .unwrap();
-            file.sync_all().unwrap();
-        }));
-        let (refused_status, refused) = call(&app, "/api/dependencies").await;
-        assert_eq!(refused_status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(refused["error"]["code"], "index_not_ready");
-        assert!(refused.get("workspaceRevision").is_none());
-        assert!(refused.get("catalogId").is_none());
     }
     #[test]
     fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {

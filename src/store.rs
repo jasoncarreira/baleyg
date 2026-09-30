@@ -328,7 +328,7 @@ impl EvidenceResponse {
     }
     /// Release the SQLite snapshot before slow response assembly or provider work.
     /// The follower guard retains protected use and the snapshot's incarnation.
-    pub fn into_fence(self, revision: IndexPin) -> EvidenceFence {
+    pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
         let Self {
             store,
             db,
@@ -340,27 +340,31 @@ impl EvidenceResponse {
             store,
             follower,
             marker,
-            revision,
+            policy,
         }
     }
 }
-/// The immutable evidence pin and T03 holder survive after the read transaction closes.
+/// Unpinned responses need T03 only; cached packets also require their exact pin.
+#[derive(Clone, Copy)]
+pub enum EvidenceFencePolicy {
+    T03,
+    ExactPin(IndexPin),
+}
 pub struct EvidenceFence {
     store: Store,
     follower: topology::FollowerGuard,
     marker: uuid::Uuid,
-    revision: IndexPin,
+    policy: EvidenceFencePolicy,
 }
 impl EvidenceFence {
     pub fn finish<T>(&self, value: T) -> Result<T> {
         self.store.identity.verify()?;
         self.follower.verify(self.marker)?;
-        ensure!(
-            self.store.status()?.revision == self.revision,
-            "revision conflict"
-        );
-        self.store.identity.verify()?;
-        self.follower.verify(self.marker)?;
+        if let EvidenceFencePolicy::ExactPin(pin) = self.policy {
+            ensure!(self.store.status()?.revision == pin, "revision conflict");
+            self.store.identity.verify()?;
+            self.follower.verify(self.marker)?;
+        }
         Ok(value)
     }
 }
