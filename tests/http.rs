@@ -1270,10 +1270,17 @@ async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_
     let (ready, status) = call(&app, "GET", "/api/status", Value::Null).await;
     assert_eq!(ready, StatusCode::OK);
     assert_eq!(status["revision"], done["revision"]);
-    let (conflict, rejected) =
+    let (accepted, queued) =
         call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
-    assert_eq!(conflict, StatusCode::CONFLICT);
-    assert_eq!(rejected["error"]["code"], "revision_conflict");
+    assert_eq!(accepted, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "queued");
+    let failed = finished_index_job(&app, queued["id"].as_str().unwrap()).await;
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], "revision_conflict");
+    assert_eq!(
+        store.status().unwrap().revision,
+        serde_json::from_value(done["revision"].clone()).unwrap()
+    );
 }
 
 #[tokio::test]

@@ -3134,9 +3134,13 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     assert_eq!(terminal["state"], "failed", "{terminal}");
     assert_eq!(terminal["error"]["code"], "index_failed", "{terminal}");
     assert!(terminal["revision"].is_null(), "{terminal}");
-    assert_eq!(terminal["progress"]["phase"], "complete", "{terminal}");
-    assert_eq!(terminal["progress"]["completed"], 81, "{terminal}");
-    assert_eq!(terminal["progress"]["total"], 81, "{terminal}");
+    // Advisory progress is process-local while running; terminal rows use the
+    // stable default rather than race a late in-memory update into GET/cancel.
+    assert_eq!(
+        terminal["progress"],
+        serde_json::json!({"phase":"","completed":0,"total":0}),
+        "{terminal}"
+    );
     drop(writer); // Always rolls back the external writer lock, including on panic.
     let (generation, revision): (String, i64) = rusqlite::Connection::open(real_index_db(&home))
         .unwrap()

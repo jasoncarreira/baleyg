@@ -1794,7 +1794,9 @@ async fn current_job(
     let row = db(s.clone(), |store| store.current_request()).await?;
     Ok(Json(row.map(|row| {
         let mut job = IndexJob::from(row);
-        if let Some(progress) = s.job_progress.lock().unwrap().get(&job.id) {
+        if job.finished_at.is_none()
+            && let Some(progress) = s.job_progress.lock().unwrap().get(&job.id)
+        {
             job.progress = progress.clone();
         }
         job
@@ -1813,7 +1815,9 @@ async fn job(
         .await?
         .ok_or_else(missing)?;
     let mut job = IndexJob::from(row);
-    if let Some(progress) = s.job_progress.lock().unwrap().get(&job.id) {
+    if job.finished_at.is_none()
+        && let Some(progress) = s.job_progress.lock().unwrap().get(&job.id)
+    {
         job.progress = progress.clone();
     }
     Ok(Json(job))
@@ -1834,7 +1838,7 @@ async fn cancel_job(
             "Accepted requests cannot be cancelled",
         ));
     }
-    let row = db(s, move |store| store.request_by_id(&id))
+    let row = db(s.clone(), move |store| store.request_by_id(&id))
         .await?
         .ok_or_else(missing)?;
     if row.finished_at.is_none() {
@@ -1844,7 +1848,9 @@ async fn cancel_job(
             "Accepted requests cannot be cancelled",
         ));
     }
-    Ok(Json(row.into()))
+    // Terminal responses are immutable durable rows. Do not mix in late
+    // process-local progress when cancel is read after the initial GET.
+    Ok(Json(IndexJob::from(row)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
