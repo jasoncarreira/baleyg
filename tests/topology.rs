@@ -2475,6 +2475,87 @@ fn view_anchor_raw_bytes_survive_edits() {
 }
 
 #[test]
+fn existing_saved_writers_use_exclusive_lock_and_orphan_sidecars_refuse() {
+    use baleyg::{
+        model::{SavedView, SavedViewRecord},
+        store::topology::{DurableRecords, UseGuard},
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let records = DurableRecords::new(&roots, &identity);
+    let target = "sid:v1:0123456789abcdef0123456789abcdef";
+    let view: SavedView = serde_json::from_value(serde_json::json!({
+        "id": "exclusive-record", "title": "initial", "query": {"seed": target}
+    }))
+    .unwrap();
+    let initial = SavedViewRecord::from_base(view, None);
+    let first = records
+        .update_view_record(&initial, || Ok(test_anchor_raw(target, 'a')))
+        .unwrap();
+    let first_anchor = first.anchor.as_ref().unwrap().get().to_owned();
+    let mut edited = initial.clone();
+    edited.title = "edited".into();
+    let db = roots.record_db(&identity);
+    let before = fs::read(&db).unwrap();
+    let lock = roots.record_use_lock(&identity);
+    let guard = UseGuard::acquire_existing(&lock, true, true).unwrap();
+    let save_error = records
+        .update_view_record(&edited, || panic!("busy writer must not capture an anchor"))
+        .unwrap_err();
+    assert_eq!(save_error.to_string(), "storage_busy");
+    let delete_error = records.delete_view("exclusive-record").unwrap_err();
+    assert_eq!(delete_error.to_string(), "storage_busy");
+    assert_eq!(
+        fs::read(&db).unwrap(),
+        before,
+        "busy writers must not touch record bytes"
+    );
+    drop(guard);
+    let preserved = records.view_record("exclusive-record").unwrap().unwrap();
+    assert_eq!(preserved.anchor.unwrap().get(), first_anchor);
+
+    let updated = records
+        .update_view_record(&edited, || panic!("existing edit must keep first anchor"))
+        .unwrap();
+    assert_eq!(updated.title, "edited");
+    assert_eq!(updated.anchor.unwrap().get(), first_anchor);
+    assert!(records.delete_view("exclusive-record").unwrap());
+    assert!(records.view_record("exclusive-record").unwrap().is_none());
+    let recreated = records
+        .update_view_record(&initial, || Ok(test_anchor_raw(target, 'b')))
+        .unwrap();
+    let second_anchor = recreated.anchor.unwrap().get().to_owned();
+    assert_ne!(
+        second_anchor, first_anchor,
+        "delete followed by save must recapture"
+    );
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = db.with_file_name(format!("workspace.db{suffix}"));
+        fs::write(&sidecar, b"orphaned").unwrap();
+        let before = fs::read(&db).unwrap();
+        let save_error = records
+            .update_view_record(&edited, || panic!("orphan sidecar must not capture"))
+            .unwrap_err();
+        assert_eq!(
+            save_error.to_string(),
+            "incomplete_record: recovery required"
+        );
+        let delete_error = records.delete_view("exclusive-record").unwrap_err();
+        assert_eq!(
+            delete_error.to_string(),
+            "incomplete_record: recovery required"
+        );
+        assert_eq!(fs::read(&db).unwrap(), before);
+        assert_eq!(fs::read(&sidecar).unwrap().as_slice(), b"orphaned");
+        fs::remove_file(sidecar).unwrap();
+    }
+    let preserved = records.view_record("exclusive-record").unwrap().unwrap();
+    assert_eq!(preserved.anchor.unwrap().get(), second_anchor);
+}
+
+#[test]
 fn saved_anchor_atomic_first_save_and_delete_edit_races() {
     use baleyg::{
         model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},

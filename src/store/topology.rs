@@ -1098,6 +1098,9 @@ impl<'a> DurableRecords<'a> {
         UseGuard::acquire_existing(&self.roots.record_use_lock(self.identity), false, false)
             .context("incomplete_record: missing or unsafe use lock")
     }
+    fn lock_existing_writer(&self) -> Result<UseGuard> {
+        UseGuard::acquire_existing(&self.roots.record_use_lock(self.identity), true, true)
+    }
     fn db(&self, writable: bool) -> Result<rusqlite::Connection> {
         use rusqlite::{Connection, OpenFlags};
         let path = self.roots.record_db(self.identity);
@@ -1211,7 +1214,7 @@ impl<'a> DurableRecords<'a> {
         preserve_title: bool,
         capture: &mut impl FnMut(&str) -> Result<Option<Box<serde_json::value::RawValue>>>,
     ) -> Result<String> {
-        let guard = self.lock_existing()?;
+        let guard = self.lock_existing_writer()?;
         let mut db = self.db(true)?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let payload = Self::merge_item(&tx, table, payload, preserve_title, capture)?;
@@ -1220,6 +1223,7 @@ impl<'a> DurableRecords<'a> {
         self.identity.verify()?;
         guard.verify()?;
         tx.commit()?;
+        drop(db);
         Ok(payload)
     }
     fn merge_item(
@@ -1470,7 +1474,7 @@ impl<'a> DurableRecords<'a> {
         if !self.existing()? {
             return Ok(false);
         }
-        let guard = self.lock_existing()?;
+        let guard = self.lock_existing_writer()?;
         let mut db = self.db(true)?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let changed = if table == "views" {
@@ -1481,6 +1485,7 @@ impl<'a> DurableRecords<'a> {
         self.identity.verify()?;
         guard.verify()?;
         tx.commit()?;
+        drop(db);
         Ok(changed != 0)
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
