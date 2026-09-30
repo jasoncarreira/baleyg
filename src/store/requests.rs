@@ -5,7 +5,7 @@ use crate::{
     model::IndexPin,
     store::topology::{LeaderSession, UseGuard},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
@@ -201,10 +201,31 @@ impl Store {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.identity.verify()?;
         let id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO requests (id,root_device,root_inode,options_json,expected_generation,expected_revision,state,submitted_at) VALUES (?1,?2,?3,?4,?5,?6,'queued',?7)", params![id,self.identity.device.to_string(),self.identity.inode.to_string(),encoded,expected.map(|p|p.index_generation.to_string()),expected.map(|p|p.index_revision as i64),now()])?;
+        let submitted_at = now();
+        let root_device = self.identity.device.to_string();
+        let root_inode = self.identity.inode.to_string();
+        tx.execute("INSERT INTO requests (id,root_device,root_inode,options_json,expected_generation,expected_revision,state,submitted_at) VALUES (?1,?2,?3,?4,?5,?6,'queued',?7)", params![id,root_device,root_inode,encoded,expected.map(|p|p.index_generation.to_string()),expected.map(|p|p.index_revision as i64),submitted_at])?;
+        let seq = tx.last_insert_rowid();
         tx.commit()?;
-        self.request_by_id(&id)?
-            .context("queued request missing after commit")
+        self.identity.verify()?;
+        // Return the exact accepted row constructed under the INSERT transaction.
+        // A leader may claim immediately after COMMIT; reading it back would race
+        // and mislabel the acknowledgement as already running or terminal.
+        Ok(Request {
+            seq,
+            id,
+            state: "queued".into(),
+            root_device,
+            root_inode,
+            options_json: encoded,
+            expected,
+            claim_incarnation: None,
+            revision: None,
+            error_code: None,
+            submitted_at,
+            started_at: None,
+            finished_at: None,
+        })
     }
     pub fn request_by_id(&self, id: &str) -> Result<Option<Request>> {
         if Uuid::parse_str(id).is_err() {
