@@ -14,6 +14,94 @@ fn private_state() -> TempDir {
     }
     state
 }
+#[test]
+fn private_stage_build_is_unpublished_and_cleans_only_its_own_inode() {
+    use std::{
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        path::PathBuf,
+    };
+    let state = private_state();
+    let work = tempfile::tempdir().unwrap();
+    let mut first_stage: Option<PathBuf> = None;
+    let error = Store::open_for_tests_with_index_stage_hook(state.path(), work.path(), |path| {
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("index.db.tmp-")
+        );
+        assert_eq!(path.parent().unwrap().file_name().unwrap().len(), 64);
+        assert!(!path.with_file_name("index.db").exists());
+        let named = std::fs::symlink_metadata(path)?;
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let held = opened.metadata()?;
+        assert!(named.is_file() && !named.file_type().is_symlink());
+        assert_eq!((named.dev(), named.ino()), (held.dev(), held.ino()));
+        assert_eq!(held.mode() & 0o777, 0o600);
+        assert_eq!(held.nlink(), 1);
+        let db = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let metadata_version: i64 = db.query_row(
+            "SELECT schema_version FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!((version, metadata_version), (5, 5));
+        let classes: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='class_catalog'",
+            [],
+            |row| row.get(0),
+        )?;
+        let native: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='native_revisions'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!((classes, native), (1, 0));
+        first_stage = Some(path.to_owned());
+        anyhow::bail!("injected before-stage-publication refusal")
+    })
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected before-stage-publication refusal")
+    );
+    let first_stage = first_stage.unwrap();
+    assert!(!first_stage.exists());
+    assert!(!first_stage.with_file_name("index.db").exists());
+
+    let mut replacement_stage = None;
+    let error = Store::open_for_tests_with_index_stage_hook(state.path(), work.path(), |path| {
+        assert_ne!(path, first_stage.as_path());
+        std::fs::remove_file(path)?;
+        std::fs::write(path, b"foreign pathname")?;
+        replacement_stage = Some(path.to_owned());
+        anyhow::bail!("injected replaced-stage refusal")
+    })
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected replaced-stage refusal")
+    );
+    let replacement_stage = replacement_stage.unwrap();
+    assert_eq!(
+        std::fs::read(&replacement_stage).unwrap(),
+        b"foreign pathname"
+    );
+    std::fs::remove_file(&replacement_stage).unwrap();
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert!(!first_stage.exists());
+}
+
 fn fixture() -> (TempDir, TempDir, Store) {
     let state = private_state();
     let work = tempfile::tempdir().unwrap();

@@ -184,6 +184,31 @@ impl TopologyRoots {
         UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
             .context("incompatible_index: missing or unsafe use lock")
     }
+    /// Exceptional index replacement starts only after every protected handle closes.
+    /// Never create or upgrade a use lock while attempting exclusive admission.
+    pub fn index_use_exclusive_existing(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
+        identity.verify()?;
+        self.reject_root_overlap(identity)?;
+        for path in [
+            &self.cache,
+            &self.cache.join("indexes"),
+            &self.index_dir(identity),
+        ] {
+            private_dir(path)?;
+        }
+        UseGuard::acquire_existing(&self.index_use_lock(identity), true, true)
+    }
+    /// Retain the already-held exclusive use guard while taking the same leader inode.
+    /// A missing, replaced or unsafe leader.lock is a refusal, not a creation request.
+    pub fn leader_under_exclusive(
+        &self,
+        identity: &WorkspaceIdentity,
+        use_guard: UseGuard,
+    ) -> Result<LeaderGuard> {
+        identity.verify()?;
+        use_guard.belongs_to(&self.index_use_lock(identity), true)?;
+        self.acquire_leader(identity, use_guard, false, || Ok(()), || Ok(()), || Ok(()))
+    }
     pub fn record_use(&self, identity: &WorkspaceIdentity, exclusive: bool) -> Result<UseGuard> {
         self.prepare_records(identity)?;
         UseGuard::acquire(&self.record_use_lock(identity), exclusive, exclusive)
@@ -209,11 +234,30 @@ impl TopologyRoots {
         before_sync: impl FnOnce() -> Result<()>,
     ) -> Result<LeaderGuard> {
         let use_guard = self.index_use(identity)?;
+        self.acquire_leader(
+            identity,
+            use_guard,
+            true,
+            after_open,
+            before_write,
+            before_sync,
+        )
+    }
+    fn acquire_leader(
+        &self,
+        identity: &WorkspaceIdentity,
+        use_guard: UseGuard,
+        create: bool,
+        after_open: impl FnOnce() -> Result<()>,
+        before_write: impl FnOnce() -> Result<()>,
+        before_sync: impl FnOnce() -> Result<()>,
+    ) -> Result<LeaderGuard> {
+        identity.verify()?;
         let path = self.leader_lock(identity);
         let mut hook = Some(after_open);
         let mut file = None;
-        for _ in 0..20 {
-            let candidate = open_file(&path, true)?;
+        for _ in 0..(if create { 20 } else { 1 }) {
+            let candidate = open_file(&path, create)?;
             if let Some(after_open) = hook.take() {
                 after_open()?;
             }
@@ -226,16 +270,19 @@ impl TopologyRoots {
                 }
                 return Err(e.into());
             }
-            if private_file(&path, &candidate).is_ok() {
-                file = Some(candidate);
-                break;
+            match private_file(&path, &candidate) {
+                Ok(()) => {
+                    file = Some(candidate);
+                    break;
+                }
+                Err(error) if !create => return Err(error),
+                Err(_) => {} // Retry only normal acquisition against a replaced pathname.
             }
-            // Drop the old descriptor and lock before opening the replacement pathname.
         }
         let mut file = file.context("leader lock pathname changed repeatedly")?;
+        use_guard.verify()?;
         before_write()?;
         let incarnation = Uuid::new_v4();
-        use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::Start(0))?;
         file.set_len(0)?;
         file.write_all(incarnation.to_string().as_bytes())?;
@@ -823,6 +870,26 @@ impl UseGuard {
     pub fn verify(&self) -> Result<()> {
         private_file(&self.path, &self.file)
     }
+    fn belongs_to(&self, path: &Path, exclusive: bool) -> Result<()> {
+        ensure!(
+            self.path == path && self.exclusive == exclusive,
+            "unsafe_index: wrong index use lock path or mode"
+        );
+        self.verify()
+    }
+    fn downgrade_to_shared(&mut self) -> Result<()> {
+        ensure!(
+            self.exclusive,
+            "unsafe_index: exclusive use lock required for downgrade"
+        );
+        self.verify()?;
+        let status = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.exclusive = false;
+        self.verify()
+    }
     pub fn remove_last(self) -> Result<()> {
         ensure!(self.exclusive, "exclusive use lock required for removal");
         self.verify()?;
@@ -856,6 +923,17 @@ fn read_incarnation(file: &File) -> Result<Uuid> {
 impl LeaderGuard {
     pub fn belongs_to(&self, leader_path: &Path) -> Result<()> {
         ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
+        self.verify()
+    }
+    /// The staged publisher must use this existing EX guard, never reacquire SH.
+    pub fn verify_exclusive_use(&self, use_path: &Path) -> Result<()> {
+        self.use_guard.belongs_to(use_path, true)?;
+        self.verify()
+    }
+    /// Convert the same held use-lock descriptor after activation; keep leader flock.
+    pub fn downgrade_use_to_shared(&mut self) -> Result<()> {
+        self.verify()?;
+        self.use_guard.downgrade_to_shared()?;
         self.verify()
     }
     pub fn verify(&self) -> Result<()> {

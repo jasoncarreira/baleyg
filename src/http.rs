@@ -130,6 +130,8 @@ pub struct DaemonState {
     outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    normal_index_worker_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
@@ -254,6 +256,8 @@ pub fn new_with_dependency_options(
         outer_fence_hook: Mutex::new(None),
         #[cfg(test)]
         preview_finish_hook: Mutex::new(None),
+        #[cfg(test)]
+        normal_index_worker_hook: Mutex::new(None),
         dependency_options: catalog_options,
         token,
         hosts,
@@ -1444,6 +1448,14 @@ async fn start_index(
         serde_json::from_value(value).map_err(|_| invalid())?
     };
     let requested = request.expected_revision;
+    if s.store.is_recreate_pending() {
+        if requested.is_some() {
+            return Err(ApiError::from(anyhow::anyhow!(
+                "revision conflict: exceptional recovery has no decodable prior pin"
+            )));
+        }
+        return start_exceptional_index(s);
+    }
     {
         let jobs = s.jobs.lock().unwrap();
         if jobs
@@ -1494,6 +1506,15 @@ async fn start_index(
                 "An index job is already active",
             ));
         }
+        // An ordinary coordinator prepared before a concurrent corruption must
+        // never reserve a stale owner after an exceptional job has taken its slot.
+        if s.store.is_recreate_pending() {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recovery_required",
+                "Explicit index recovery now required",
+            ));
+        }
         if jobs.jobs.len() >= 100 {
             let old = jobs
                 .jobs
@@ -1514,6 +1535,10 @@ async fn start_index(
         let worker_id = id.clone();
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = worker.normal_index_worker_hook.lock().unwrap().clone() {
+                hook();
+            }
             coordinator.run(&worker.options, &worker_cancel, |p| {
                 if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
                     j.progress = p;
@@ -1529,6 +1554,156 @@ async fn start_index(
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
+// Exceptional recovery has no decodable prior pin. Reserve the only job and detach
+// any old daemon owner atomically, then drop that owner before the worker tries EX.
+// An unrelated protected reader remains in control of BUSY; no retry is implicit.
+fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let job = IndexJob {
+        id: uuid::Uuid::new_v4().to_string(),
+        state: "running".into(),
+        progress: IndexProgress::default(),
+        revision: None,
+        error: None,
+        started_at: now(),
+        finished_at: None,
+    };
+    let old_owner = {
+        let mut jobs = s.jobs.lock().unwrap();
+        if jobs
+            .current
+            .as_ref()
+            .and_then(|id| jobs.jobs.get(id))
+            .is_some_and(|j| j.finished_at.is_none())
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "job_active",
+                "An index job is already active",
+            ));
+        }
+        if !s.store.is_recreate_pending() {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "index_not_ready",
+                "Exceptional recovery disposition changed; retry explicit indexing",
+            ));
+        }
+        // All admission paths touching both locks use jobs -> serving_session.
+        let old_owner = s.serving_session.lock().unwrap().take();
+        if jobs.jobs.len() >= 100 {
+            let old = jobs
+                .jobs
+                .iter()
+                .min_by_key(|(_, j)| &j.started_at)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = old {
+                jobs.jobs.remove(&id);
+            }
+        }
+        jobs.current = Some(job.id.clone());
+        jobs.cancel = cancel.clone();
+        jobs.jobs.insert(job.id.clone(), job.clone());
+        old_owner
+    };
+    drop(old_owner);
+    let id = job.id.clone();
+    tokio::spawn(async move {
+        let worker = s.clone();
+        let worker_id = id.clone();
+        let worker_cancel = cancel.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::index_coordinator::reconcile_workspace(
+                &worker.store,
+                &worker.options,
+                &worker_cancel,
+                |p| {
+                    if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
+                        j.progress = p;
+                    }
+                },
+            )
+        })
+        .await;
+        let outcome = match result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("index worker failed")),
+        };
+        finish_exceptional_index_job(&s, &id, outcome, &cancel, |_| {});
+    });
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+// A successful worker keeps its leader guard inside the returned Arc even across
+// spawn_blocking handoff. Validation and any test barrier run while that Arc lives.
+// Install it before completing the job; never publish a success without an owner.
+fn finish_exceptional_index_job(
+    s: &Arc<DaemonState>,
+    id: &str,
+    result: anyhow::Result<(IndexPin, Arc<crate::store::topology::LeaderSession>)>,
+    cancel: &CancelFlag,
+    before_install: impl FnOnce(&Arc<crate::store::topology::LeaderSession>),
+) {
+    let result = result.and_then(|(pin, session)| {
+        s.store.verify_leader_session(&session)?;
+        anyhow::ensure!(
+            s.store.status()?.revision == pin,
+            "revision conflict: exceptional recovery pin changed before owner installation"
+        );
+        before_install(&session);
+        s.store.verify_leader_session(&session)?;
+        Ok((pin, session))
+    });
+    let mut abandoned = None;
+    let mut jobs = s.jobs.lock().unwrap();
+    let mut serving = s.serving_session.lock().unwrap();
+    let job = jobs
+        .jobs
+        .get_mut(id)
+        .expect("started exceptional index job");
+    let published = match result {
+        Ok((_pin, session)) if serving.is_some() => {
+            abandoned = Some(session);
+            job.state = "failed".into();
+            job.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
+            false
+        }
+        Ok((pin, session)) => {
+            // A late cancellation cannot undo durable activation. Retain the
+            // verified owner and report the committed revision as completed.
+            *serving = Some(session);
+            job.revision = Some(pin);
+            job.state = "completed".into();
+            true
+        }
+        Err(error) if cancel.load(Ordering::Acquire) => {
+            let _ = error;
+            job.state = "cancelled".into();
+            false
+        }
+        Err(error) => {
+            job.state = "failed".into();
+            let code = if error.to_string().starts_with("revision conflict") {
+                "revision_conflict"
+            } else if error.to_string().starts_with("storage_busy") {
+                "storage_busy"
+            } else {
+                "index_failed"
+            };
+            job.error = Some(json!({"code":code,"message":"Index job failed"}));
+            false
+        }
+    };
+    job.finished_at = Some(now());
+    drop(serving);
+    drop(jobs);
+    drop(abandoned);
+    if published {
+        *s.packets.lock().unwrap() = PacketCache::default();
+        s.start_dependency_index();
+    }
+}
+
 // A failed publication cannot release cached packet ownership. Only a committed
 // revision transition clears packets; old barriers still block their public reads.
 fn finish_index_job(
@@ -2636,6 +2811,272 @@ mod live_tests {
         assert_eq!(provider.budget().unwrap().reserved_cents, 10);
         assert_eq!(provider.budget().unwrap().attempts, 1);
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod exceptional_recovery_tests {
+    use super::*;
+    use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        Store,
+        Arc<DaemonState>,
+        TopologyRoots,
+        WorkspaceIdentity,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            tmp.path().join("state/cache"),
+            tmp.path().join("state/data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        drop(old);
+        std::fs::write(roots.index_db(&identity), b"bad sqlite index header").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        assert!(store.is_recreate_pending());
+        let state = new(
+            store.clone(),
+            IndexOptions::new(root),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        (tmp, store, state, roots, identity)
+    }
+
+    #[tokio::test]
+    async fn concurrent_posts_admit_one_exceptional_worker() {
+        // The current-thread executor cannot poll the spawned worker between
+        // these synchronous admissions. No timer or filesystem race is needed.
+        let (_tmp, _store, state, _roots, _identity) = fixture();
+        let (status, first) = start_exceptional_index(state.clone())
+            .unwrap_or_else(|error| panic!("unexpected admission: {} {}", error.1, error.2));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let error = start_index(State(state.clone()), Bytes::from_static(b"{}"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1, "job_active");
+        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
+        let id = first.0.id;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_job_racing_a_new_pending_disposition_blocks_exceptional_post() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            tmp.path().join("state/cache"),
+            tmp.path().join("state/data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let index = roots.index_db(&identity);
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root);
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let (_, owner) =
+            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
+                .unwrap();
+        let state = new(
+            store.clone(),
+            options,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(owner);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *state.normal_index_worker_hook.lock().unwrap() = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
+        let (status, normal) = start_index(State(state.clone()), Bytes::new())
+            .await
+            .unwrap_or_else(|error| panic!("normal admission: {} {}", error.1, error.2));
+        assert_eq!(status, StatusCode::ACCEPTED);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::write(&index, b"bad sqlite index header").unwrap();
+        assert!(store.status().is_err());
+        assert!(store.is_recreate_pending());
+        let second = start_index(State(state.clone()), Bytes::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(second.0, StatusCode::CONFLICT);
+        assert_eq!(second.1, "job_active");
+        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
+        release_tx.send(()).unwrap();
+        let id = normal.0.id;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(store.is_recreate_pending());
+    }
+
+    #[tokio::test]
+    async fn leader_remains_locked_across_worker_result_and_atomic_install() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let options = state.options.clone();
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            jobs.current = Some(id.clone());
+            jobs.cancel = cancel.clone();
+            jobs.jobs.insert(
+                id.clone(),
+                IndexJob {
+                    id: id.clone(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            );
+        }
+        let result =
+            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
+                .unwrap();
+        let pin = result.0;
+        let before = &state;
+        finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |session| {
+            assert!(session.is_leader());
+            assert!(before.retained_serving_session().is_err());
+            assert!(
+                roots
+                    .leader(&identity)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("storage_busy")
+            );
+            assert_eq!(store.status().unwrap().revision, pin);
+        });
+        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "completed");
+        assert_eq!(state.jobs.lock().unwrap().jobs[&id].revision, Some(pin));
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(
+            roots
+                .leader(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("storage_busy")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_durable_recovery_reports_completed_with_new_owner() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            jobs.current = Some(id.clone());
+            jobs.cancel = cancel.clone();
+            jobs.jobs.insert(
+                id.clone(),
+                IndexJob {
+                    id: id.clone(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            );
+        }
+        let result =
+            crate::index_coordinator::reconcile_workspace(&store, &state.options, &cancel, |_| {})
+                .unwrap();
+        let pin = result.0;
+        cancel.store(true, Ordering::Release);
+        finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |_| {});
+        let job = state.jobs.lock().unwrap().jobs[&id].clone();
+        assert_eq!(job.state, "completed");
+        assert_eq!(job.revision, Some(pin));
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert!(
+            roots
+                .leader(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("storage_busy")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_worker_never_installs_owner_or_reports_completed() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let before = std::fs::read(roots.index_db(&identity)).unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            jobs.current = Some(id.clone());
+            jobs.jobs.insert(
+                id.clone(),
+                IndexJob {
+                    id: id.clone(),
+                    state: "running".into(),
+                    progress: IndexProgress::default(),
+                    revision: None,
+                    error: None,
+                    started_at: now(),
+                    finished_at: None,
+                },
+            );
+        }
+        // The Store's own fault tests cover actual post-rename failures. Here
+        // exercise the HTTP handoff for their error result: no false success.
+        finish_exceptional_index_job(
+            &state,
+            &id,
+            Err(anyhow::anyhow!("after rename fsync failed")),
+            &cancel,
+            |_| panic!("failed worker cannot cross install barrier"),
+        );
+        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "failed");
+        assert!(state.jobs.lock().unwrap().jobs[&id].revision.is_none());
+        assert!(state.retained_serving_session().is_err());
+        assert!(store.evidence_response().is_err());
+        assert_eq!(std::fs::read(roots.index_db(&identity)).unwrap(), before);
     }
 }
 
