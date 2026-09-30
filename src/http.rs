@@ -330,7 +330,7 @@ impl DaemonState {
             if self
                 .test_pending_read_failures
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    (count > 0).then_some(count - 1)
+                    (count > 0).then(|| count - 1)
                 })
                 .is_ok()
             {

@@ -451,7 +451,7 @@ impl Store {
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
-                |count| (count > 0).then_some(count - 1),
+                |count| (count > 0).then(|| count - 1),
             )
             .is_ok()
         {
@@ -483,7 +483,7 @@ impl Store {
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
-                |count| (count > 0).then_some(count - 1),
+                |count| (count > 0).then(|| count - 1),
             )
             .is_ok()
         {
