@@ -103,6 +103,15 @@ enum ExpectedPublication {
     Pin(IndexPin),
     Recovery(Box<RecoveryBaseline>),
 }
+#[derive(Clone, Copy)]
+enum PublicationTarget<'a> {
+    Live,
+    Stage(&'a StagedIndex),
+}
+struct PublicationPlan<'a> {
+    expected: ExpectedPublication,
+    target: PublicationTarget<'a>,
+}
 #[derive(Debug)]
 struct ExceptionalIndexFormat;
 impl std::fmt::Display for ExceptionalIndexFormat {
@@ -140,6 +149,12 @@ enum PublishStage {
     BeforeTransaction,
     AfterFile,
     BeforeCommit,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ActivationStage {
+    BeforeRename,
+    AfterJournalBackupBeforeDirFsync,
+    AfterRenameBeforeDirFsync,
 }
 // Serde's compact JSON serializer writes exactly the bytes persisted by `json()`.
 // Count and abort while streaming; never build an over-limit encoded source.
@@ -286,6 +301,29 @@ impl DerefMut for IndexConnection {
         &mut self.db
     }
 }
+// Only the live variant owns a new shared-use guard. The stage variant keeps
+// the caller's verified exclusive leader guard alive across its transaction.
+enum PublicationConnection {
+    Live(IndexConnection),
+    Stage(Connection),
+}
+impl Deref for PublicationConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Live(db) => &db.db,
+            Self::Stage(db) => db,
+        }
+    }
+}
+impl DerefMut for PublicationConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self {
+            Self::Live(db) => &mut db.db,
+            Self::Stage(db) => db,
+        }
+    }
+}
 
 /// One coherent native read snapshot retained until its owned result passes T03.
 pub struct EvidenceResponse {
@@ -419,9 +457,15 @@ fn verify_index_file(path: &Path) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
-    if &header[..16] != b"SQLite format 3\0" || header[18] != 1 || header[19] != 1 {
+    if &header[..16] != b"SQLite format 3\0" {
         return Err(ExceptionalIndexFormat.into());
     }
+    // WAL (2,2) and other valid-header journaling modes are operational or
+    // incompatible state, not permission to replace this inode.
+    ensure!(
+        header[18] == 1 && header[19] == 1,
+        "incompatible_index: unsupported SQLite journaling mode"
+    );
     let _ = file.as_raw_fd();
     Ok(())
 }
@@ -434,11 +478,81 @@ fn index_path_present(path: &Path) -> Result<bool> {
     }
 }
 
+fn restore_index_journal(journal: &IndexFileWitness, backup: &Path, dir: &Path) -> Result<()> {
+    journal.verify_at(backup)?;
+    ensure!(
+        !index_path_present(&journal.path)?,
+        "unsafe_index: journal pathname reappeared"
+    );
+    std::fs::rename(backup, &journal.path)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    journal.verify()
+}
+
+// A corrupt index can be witnessed without trusting its SQLite header or payload.
+struct IndexFileWitness {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+impl IndexFileWitness {
+    fn open(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let witness = Self {
+            path: path.to_owned(),
+            file,
+        };
+        witness.verify()?;
+        Ok(witness)
+    }
+    fn verify(&self) -> Result<()> {
+        self.verify_at(&self.path)
+    }
+    fn verify_at(&self, path: &Path) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self.file.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        ensure!(
+            held.is_file()
+                && held.uid() == unsafe { libc::geteuid() }
+                && held.mode() & 0o777 == 0o600
+                && held.nlink() == 1
+                && named.is_file()
+                && !named.file_type().is_symlink()
+                && held.dev() == named.dev()
+                && held.ino() == named.ino(),
+            "unsafe_index: protected index pathname changed"
+        );
+        Ok(())
+    }
+}
 // The staged file is private to this attempt. On failure, only unlink our own inode.
 struct StagedIndex {
     path: std::path::PathBuf,
     file: std::fs::File,
     published: bool,
+}
+impl StagedIndex {
+    fn verify_path(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self.file.metadata()?;
+        let named = std::fs::symlink_metadata(&self.path)?;
+        ensure!(
+            held.is_file()
+                && held.uid() == unsafe { libc::geteuid() }
+                && held.mode() & 0o777 == 0o600
+                && held.nlink() == 1
+                && named.is_file()
+                && !named.file_type().is_symlink()
+                && held.dev() == named.dev()
+                && held.ino() == named.ino(),
+            "unsafe_index: staged pathname changed"
+        );
+        Ok(())
+    }
 }
 impl Drop for StagedIndex {
     fn drop(&mut self) {
@@ -1782,31 +1896,24 @@ impl Store {
             topology::TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
         Self::open_with_stage_hook(roots, identity, before_publish)
     }
-    fn initialize(
-        &self,
-        leader: &topology::LeaderGuard,
-        before_publish: impl FnOnce(&Path) -> Result<()>,
-    ) -> Result<()> {
+    /// Build a private schema-6 bootstrap only; the caller must validate and publish it.
+    /// The returned guard unlinks only its own stage inode if it is not published.
+    fn create_staged_index(&self, leader: &topology::LeaderGuard) -> Result<StagedIndex> {
         use rusqlite::OpenFlags;
+        use std::os::unix::fs::OpenOptionsExt;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
         let path = self.roots.index_db(&self.identity);
-        reject_sidecars(&path, true)?;
-        if index_path_present(&path)? {
-            return Ok(());
-        }
-        let use_guard = self.roots.index_use(&self.identity)?;
-        use std::os::unix::fs::OpenOptionsExt;
         let staged_path = path.with_file_name(format!("index.db.tmp-{}", uuid::Uuid::new_v4()));
-        let staged = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&staged_path)?;
-        let mut staged = StagedIndex {
+        let staged = StagedIndex {
             path: staged_path,
-            file: staged,
+            file,
             published: false,
         };
         let db = Connection::open_with_flags(
@@ -1846,6 +1953,225 @@ impl Store {
         }
         result?;
         drop(db);
+        Ok(staged)
+    }
+    fn validate_replacement_index(
+        &self,
+        path: &Path,
+        stage: &StagedIndex,
+        leader: &topology::LeaderGuard,
+        pin: IndexPin,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let named = std::fs::symlink_metadata(path)?;
+        let held = stage.file.metadata()?;
+        ensure!(
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && (named.dev(), named.ino()) == (held.dev(), held.ino()),
+            "unsafe_index: replacement inode changed"
+        );
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.identity.verify()?;
+        let db = open_index(path, false)?;
+        let status = self.decode_control_status_raw(&db)?;
+        ensure!(
+            status.revision == pin && status.evidence_format.is_some(),
+            "incompatible_index: staged pair or evidence format changed"
+        );
+        let marker: String = db.query_row(
+            "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            marker == leader.incarnation.to_string(),
+            "index_not_ready: staged leader marker changed"
+        );
+        validate_bounded_control(&db, &self.identity.record_id)?;
+        validate_paired_rows(&db)?;
+        let integrity: String = db.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        ensure!(
+            integrity == "ok",
+            "incompatible_index: staged integrity check failed"
+        );
+        drop(db);
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.identity.verify()?;
+        let named = std::fs::symlink_metadata(path)?;
+        ensure!(
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && (named.dev(), named.ino()) == (held.dev(), held.ino()),
+            "unsafe_index: replacement inode changed"
+        );
+        Ok(())
+    }
+    /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
+    pub(crate) fn recreate_index_exclusive(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        leader: &mut topology::LeaderGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.recreate_index_exclusive_with_hook(options, leader, cancel, |_| Ok(()))
+    }
+    fn recreate_index_exclusive_with_hook(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        leader: &mut topology::LeaderGuard,
+        cancel: &CancelFlag,
+        mut at: impl FnMut(ActivationStage) -> Result<()>,
+    ) -> Result<IndexPin> {
+        ensure!(
+            self.disposition() == RecoveryDisposition::RecreatePending
+                && self.recovery_required.load(Ordering::Acquire),
+            "recovery_required: exceptional recreation not classified"
+        );
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.identity.verify()?;
+        ensure!(
+            std::fs::canonicalize(&options.workspace_root)? == self.identity.root,
+            "root_changed: index options select another workspace"
+        );
+        check_cancel(cancel)?;
+        let path = self.roots.index_db(&self.identity);
+        let old = IndexFileWitness::open(&path)?;
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = path.with_file_name(format!("index.db{suffix}"));
+            ensure!(
+                !index_path_present(&sidecar)?,
+                "recovery_required: unsupported index sidecar: {}",
+                sidecar.display()
+            );
+        }
+        let journal_path = path.with_file_name("index.db-journal");
+        let journal = index_path_present(&journal_path)?
+            .then(|| IndexFileWitness::open(&journal_path))
+            .transpose()?;
+        // Reclassify after EX admission. A later repair, root mismatch, hot journal,
+        // or ordinary format/schema mismatch cannot authorize inode replacement.
+        let cause = match open_index(&path, false) {
+            Err(error) => recovery_class(&error),
+            Ok(db) => {
+                let result = self.recovery_baseline(&db);
+                drop(db);
+                match result {
+                    Err(error) => recovery_class(&error),
+                    Ok(_) => RecoveryClass::Rebuild,
+                }
+            }
+        };
+        ensure!(
+            cause == RecoveryClass::RecreatePending,
+            "recovery_required: corruption/NOTADB authority not verified"
+        );
+        old.verify()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        let mut stage = self.create_staged_index(leader)?;
+        let (graph, native, capture) =
+            crate::indexer::index_workspace_bundle(options, self.root_id(), cancel, |_| {})?;
+        let pin = self.publish_native_to_stage(
+            (&graph, &capture, &native),
+            &stage,
+            leader,
+            cancel,
+            |_, _| Ok(()),
+        )?;
+        self.validate_replacement_index(&stage.path, &stage, leader, pin)?;
+        stage.file.sync_all()?;
+        stage.verify_path()?;
+        old.verify()?;
+        if let Some(journal) = &journal {
+            journal.verify()?;
+        }
+        check_cancel(cancel)?;
+        capture.verify(cancel)?;
+        self.identity.verify()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        at(ActivationStage::BeforeRename)?;
+        old.verify()?;
+        stage.verify_path()?;
+        // The publisher's earlier validation is not enough: a failed or hot
+        // staged journal appearing at this barrier must never reach index.db.
+        reject_sidecars(&stage.path, true)?;
+        check_cancel(cancel)?;
+        capture.verify(cancel)?;
+        self.identity.verify()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        let dir = self.roots.index_dir(&self.identity);
+        let backup = if let Some(journal) = &journal {
+            let backup = dir.join(format!("index.db-journal.tmp-{}", uuid::Uuid::new_v4()));
+            ensure!(
+                !index_path_present(&backup)?,
+                "unsafe_index: journal backup exists"
+            );
+            journal.verify()?;
+            std::fs::rename(&journal.path, &backup)?;
+            if let Err(error) = journal.verify_at(&backup) {
+                restore_index_journal(journal, &backup, &dir)
+                    .context("incomplete_recovery: journal restoration failed")?;
+                return Err(error);
+            }
+            // Make the retained journal backup durable before replacing its old
+            // index. On any failure before the live rename, restore its pathname.
+            let durable_backup = at(ActivationStage::AfterJournalBackupBeforeDirFsync)
+                .and_then(|_| reject_sidecars(&stage.path, true))
+                .and_then(|_| {
+                    std::fs::File::open(&dir)?.sync_all()?;
+                    Ok(())
+                });
+            if let Err(error) = durable_backup {
+                restore_index_journal(journal, &backup, &dir)
+                    .context("incomplete_recovery: journal restoration failed")?;
+                return Err(error);
+            }
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(error) = std::fs::rename(&stage.path, &path) {
+            if let (Some(journal), Some(backup)) = (&journal, &backup) {
+                restore_index_journal(journal, backup, &dir)
+                    .context("incomplete_recovery: journal restoration failed")?;
+            }
+            return Err(error.into());
+        }
+        // The atomic rename may already be durable even if any later step fails.
+        // Never let the stage guard unlink the now-live replacement inode.
+        stage.published = true;
+        at(ActivationStage::AfterRenameBeforeDirFsync)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        if let (Some(journal), Some(backup)) = (&journal, &backup) {
+            journal.verify_at(backup)?;
+            std::fs::remove_file(backup)?;
+            std::fs::File::open(&dir)?.sync_all()?;
+        }
+        self.validate_replacement_index(&path, &stage, leader, pin)?;
+        leader.downgrade_use_to_shared()?;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        // This order means every clone still refuses while recovery_required is true.
+        self.recovery_disposition
+            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
+        self.recovery_required.store(false, Ordering::Release);
+        Ok(pin)
+    }
+    fn initialize(
+        &self,
+        leader: &topology::LeaderGuard,
+        before_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        let path = self.roots.index_db(&self.identity);
+        reject_sidecars(&path, true)?;
+        if index_path_present(&path)? {
+            return Ok(());
+        }
+        let use_guard = self.roots.index_use(&self.identity)?;
+        let mut staged = self.create_staged_index(leader)?;
         before_publish(&staged.path)?;
         verify_index_file(&staged.path)?;
         let mut checked = open_index(&staged.path, true)?;
@@ -2424,6 +2750,37 @@ impl Store {
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
     }
+    pub(crate) fn is_recreate_pending(&self) -> bool {
+        self.disposition() == RecoveryDisposition::RecreatePending
+            && self.recovery_required.load(Ordering::Acquire)
+    }
+    /// Exceptional entry owns no old protected handle before nonblocking EX.
+    /// Return the exact downgraded guard that wrote the replacement marker.
+    pub(crate) fn recreate_pending_leader_session(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        cancel: &CancelFlag,
+    ) -> Result<(IndexPin, Arc<topology::LeaderSession>)> {
+        ensure!(
+            self.is_recreate_pending(),
+            "recovery_required: exceptional recreation not classified"
+        );
+        let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
+        let mut leader = self
+            .roots
+            .leader_under_exclusive(&self.identity, exclusive)?;
+        let pin = self.recreate_index_exclusive(options, &mut leader, cancel)?;
+        let session = Arc::new(topology::LeaderSession::leader(
+            leader,
+            self.identity.clone(),
+        ));
+        self.verify_leader_session(&session)?;
+        ensure!(
+            self.status()?.revision == pin,
+            "index_not_ready: exceptional recovery pair not admitted"
+        );
+        Ok((pin, session))
+    }
     pub fn leader_session(&self) -> Result<Arc<topology::LeaderSession>> {
         Ok(Arc::new(topology::LeaderSession::leader(
             self.leader()?,
@@ -2615,6 +2972,16 @@ impl Store {
         expected: ExpectedPublication,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        self.validate_native_bundle(graph, capture, native, cancel)?;
+        self.publish_inner_expected(graph, capture, native, leader, expected, cancel)
+    }
+    fn validate_native_bundle(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
         native.validate(
             capture,
             Path::new(&self.workspace_root),
@@ -2635,8 +3002,65 @@ impl Store {
                         && counts.hashes == 1),
             "native_evidence_required: each source must open, read, and hash once"
         );
-        crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
-        self.publish_inner_expected(graph, capture, native, leader, expected, cancel)
+        crate::indexer::validate_native_graph(graph, capture, native, cancel)
+    }
+    /// Publish to an unpublished private bootstrap while the caller retains EX use.
+    /// This stages the full pair without admitting evidence from the corrupt live DB.
+    #[allow(dead_code)] // The exceptional recovery entry point is wired after this scoped seam.
+    fn publish_native_to_stage(
+        &self,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
+        stage: &StagedIndex,
+        leader: &topology::LeaderGuard,
+        cancel: &CancelFlag,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        let (graph, capture, native) = bundle;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        stage.verify_path()?;
+        self.identity.verify()?;
+        let index_dir = self.roots.index_dir(&self.identity);
+        let stage_id = stage
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("index.db.tmp-"));
+        ensure!(
+            stage.path.parent() == Some(index_dir.as_path())
+                && stage_id.is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
+            "unsafe_index: stage is outside the managed index directory"
+        );
+        let bootstrap = open_index(&stage.path, false)?;
+        let version: u32 = bootstrap.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        ensure!(
+            version == GRAPH_SCHEMA_VERSION,
+            "incompatible_index: stage is not an unpublished bootstrap"
+        );
+        let expected = self.recovery_baseline(&bootstrap)?;
+        ensure!(
+            expected.pin().is_some_and(|pin| pin.index_revision == 0) && !expected.compatible,
+            "incompatible_index: invalid private stage baseline"
+        );
+        drop(bootstrap);
+        stage.verify_path()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.validate_native_bundle(graph, capture, native, cancel)?;
+        self.publish_inner_checked_target(
+            bundle,
+            leader,
+            PublicationPlan {
+                expected: ExpectedPublication::Recovery(Box::new(expected)),
+                target: PublicationTarget::Stage(stage),
+            },
+            cancel,
+            256 * 1024 * 1024 + 16 * 1024,
+            during_tx,
+        )
     }
     fn publish_inner_expected(
         &self,
@@ -2808,9 +3232,37 @@ impl Store {
         expected: ExpectedPublication,
         cancel: &CancelFlag,
         max_graph_json_bytes: usize,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        self.publish_inner_checked_target(
+            bundle,
+            leader,
+            PublicationPlan {
+                expected,
+                target: PublicationTarget::Live,
+            },
+            cancel,
+            max_graph_json_bytes,
+            during_tx,
+        )
+    }
+    fn publish_inner_checked_target(
+        &self,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
+        leader: &topology::LeaderGuard,
+        plan: PublicationPlan<'_>,
+        cancel: &CancelFlag,
+        max_graph_json_bytes: usize,
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
-        self.ensure_not_recreate_pending()?;
+        let PublicationPlan { expected, target } = plan;
+        if let PublicationTarget::Live = target {
+            self.ensure_not_recreate_pending()?;
+        }
         let (graph, capture, native) = bundle;
         Self::enforce_selected_source_admission(graph, max_graph_json_bytes)?;
         ensure!(
@@ -2837,16 +3289,29 @@ impl Store {
         check_cancel(cancel)?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
-        let mut db = self
-            .cache_write()
-            .map_err(|error| self.report_live_read_failure(error))?;
+        let mut db = match target {
+            PublicationTarget::Live => PublicationConnection::Live(
+                self.cache_write()
+                    .map_err(|error| self.report_live_read_failure(error))?,
+            ),
+            PublicationTarget::Stage(stage) => {
+                leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+                stage.verify_path()?;
+                let db = open_index(&stage.path, true)?;
+                stage.verify_path()?;
+                PublicationConnection::Stage(db)
+            }
+        };
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         during_tx(PublishStage::BeforeTransaction, &db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let current = self
-            .recovery_baseline(&tx)
-            .map_err(|error| self.report_live_read_failure(error))?;
+        let current = match target {
+            PublicationTarget::Live => self
+                .recovery_baseline(&tx)
+                .map_err(|error| self.report_live_read_failure(error))?,
+            PublicationTarget::Stage(_) => self.recovery_baseline(&tx)?,
+        };
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
@@ -2876,11 +3341,14 @@ impl Store {
         } else {
             false
         };
-        self.ensure_not_recreate_pending()?;
+        if let PublicationTarget::Live = target {
+            self.ensure_not_recreate_pending()?;
+        }
         let rebaseline = schema != DATABASE_SCHEMA_VERSION
             || !compatible
             || !decoded
-            || self.disposition() == RecoveryDisposition::Rebuild;
+            || (matches!(target, PublicationTarget::Live)
+                && self.disposition() == RecoveryDisposition::Rebuild);
         let prior_scan = (!rebaseline)
             .then(|| compare_capture_snapshot(&tx, capture))
             .transpose()?;
@@ -3032,15 +3500,31 @@ impl Store {
         capture.verify(cancel)?;
         leader.verify()?;
         self.identity.verify()?;
+        if let PublicationTarget::Stage(stage) = target {
+            stage.verify_path()?;
+            leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        }
         during_tx(PublishStage::BeforeCommit, &tx)?;
         check_cancel(cancel)?;
         capture.verify(cancel)?;
         leader.verify()?;
         self.identity.verify()?;
+        if let PublicationTarget::Stage(stage) = target {
+            stage.verify_path()?;
+            leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        }
         storage_result(tx.commit())?;
-        self.recovery_disposition
-            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
-        self.recovery_required.store(false, Ordering::Release);
+        match target {
+            PublicationTarget::Live => {
+                self.recovery_disposition
+                    .store(RecoveryDisposition::Ready as u8, Ordering::Release);
+                self.recovery_required.store(false, Ordering::Release);
+            }
+            PublicationTarget::Stage(stage) => {
+                stage.verify_path()?;
+                leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+            }
+        }
         Ok(revision)
     }
 
@@ -4847,6 +5331,489 @@ mod rebaseline_fault_tests {
     use super::*;
     use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{fs, ptr, sync::atomic::AtomicBool};
+
+    #[test]
+    fn wal_header_without_sidecars_is_not_corruption_authority() {
+        use std::os::unix::fs::MetadataExt;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        let lock = store.roots.leader_lock(&store.identity);
+        let old_lock = fs::symlink_metadata(&lock).unwrap();
+        drop(store);
+        let db = Connection::open(&index).unwrap();
+        let mode: String = db
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let _: (i64, i64, i64) = db
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        drop(db);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!index.with_file_name(format!("index.db{suffix}")).exists());
+        }
+        let before = fs::read(&index).unwrap();
+        assert_eq!((before[18], before[19]), (2, 2));
+        let error = verify_index_file(&index).unwrap_err();
+        assert_eq!(recovery_class(&error), RecoveryClass::Hard);
+        assert!(
+            error.to_string().contains("incompatible_index"),
+            "{error:#}"
+        );
+        assert!(Store::open_for_tests(state.path(), work.path()).is_err());
+        assert_eq!(fs::read(&index).unwrap(), before);
+        let new_lock = fs::symlink_metadata(&lock).unwrap();
+        assert_eq!(
+            (old_lock.dev(), old_lock.ino()),
+            (new_lock.dev(), new_lock.ino())
+        );
+    }
+
+    #[test]
+    fn only_short_or_invalid_magic_headers_request_typed_recreation() {
+        for bytes in [
+            b"short".as_slice(),
+            b"not-a-sqlite-header-with-at-least-20".as_slice(),
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let work = tempfile::tempdir().unwrap();
+            fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+            let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+            let index = store.roots.index_db(&store.identity);
+            drop(store);
+            fs::write(&index, bytes).unwrap();
+            let error = verify_index_file(&index).unwrap_err();
+            assert!(error.is::<ExceptionalIndexFormat>());
+            assert_eq!(recovery_class(&error), RecoveryClass::RecreatePending);
+            let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+            assert_eq!(
+                recovering.disposition(),
+                RecoveryDisposition::RecreatePending
+            );
+            let exclusive = recovering
+                .roots
+                .index_use_exclusive_existing(&recovering.identity)
+                .unwrap();
+            let mut leader = recovering
+                .roots
+                .leader_under_exclusive(&recovering.identity, exclusive)
+                .unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let pin = recovering
+                .recreate_index_exclusive(
+                    &IndexOptions::new(work.path().to_owned()),
+                    &mut leader,
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(pin.index_revision, 1);
+            assert_eq!(recovering.status().unwrap().revision, pin);
+        }
+    }
+
+    #[test]
+    fn private_stage_uses_paired_writer_without_admitting_corrupt_live_evidence() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join("a.js"),
+            "function changed() { return 1; }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let owner = store.leader_session().unwrap();
+        let previous = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                owner.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(previous.index_revision, 1);
+        let live_path = store.roots.index_db(&store.identity);
+        drop(owner);
+        drop(store);
+        fs::write(&live_path, b"corrupt index, not sqlite").unwrap();
+        let original = fs::read(&live_path).unwrap();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        let clone = recovering.clone();
+        let exclusive = recovering
+            .roots
+            .index_use_exclusive_existing(&recovering.identity)
+            .unwrap();
+        let leader = recovering
+            .roots
+            .leader_under_exclusive(&recovering.identity, exclusive)
+            .unwrap();
+        let stage = recovering.create_staged_index(&leader).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, recovering.root_id(), &cancel, |_| {}).unwrap();
+        let replacement = recovering
+            .publish_native_to_stage(
+                (&graph, &capture, &native),
+                &stage,
+                &leader,
+                &cancel,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(replacement.index_revision, previous.index_revision);
+        assert_ne!(replacement.index_generation, previous.index_generation);
+        let db = open_index(&stage.path, false).unwrap();
+        let stage_status = recovering.decode_control_status_raw(&db).unwrap();
+        assert_eq!(stage_status.revision, replacement);
+        let marker: String = db
+            .query_row(
+                "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, leader.incarnation.to_string());
+        validate_paired_metadata(&db, recovering.root_id()).unwrap();
+        validate_paired_rows(&db).unwrap();
+        validate_reconcile_inventory(&db).unwrap();
+        let integrity: String = db
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        drop(db);
+        assert_eq!(fs::read(&live_path).unwrap(), original);
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        assert!(clone.recovery_required.load(Ordering::Acquire));
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery_required")
+        );
+
+        let failing = recovering.create_staged_index(&leader).unwrap();
+        let error = recovering
+            .publish_native_to_stage(
+                (&graph, &capture, &native),
+                &failing,
+                &leader,
+                &cancel,
+                |phase, _| {
+                    if phase == PublishStage::BeforeCommit {
+                        anyhow::bail!("injected stage precommit refusal");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected stage precommit refusal")
+        );
+        let unchanged = open_index(&failing.path, false).unwrap();
+        let baseline = recovering.recovery_baseline(&unchanged).unwrap();
+        assert_eq!(baseline.pin().unwrap().index_revision, 0);
+        assert_eq!(
+            unchanged
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            GRAPH_SCHEMA_VERSION
+        );
+        drop(unchanged);
+        assert_eq!(fs::read(&live_path).unwrap(), original);
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        assert!(clone.recovery_required.load(Ordering::Acquire));
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery_required")
+        );
+    }
+
+    #[test]
+    fn staged_hot_journal_after_validation_refuses_without_deleting_sidecar() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        let dir = store.roots.index_dir(&store.identity);
+        drop(store);
+        fs::write(&index, b"short").unwrap();
+        let before = fs::read(&index).unwrap();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let exclusive = recovering
+            .roots
+            .index_use_exclusive_existing(&recovering.identity)
+            .unwrap();
+        let mut leader = recovering
+            .roots
+            .leader_under_exclusive(&recovering.identity, exclusive)
+            .unwrap();
+        let mut journal = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = recovering
+            .recreate_index_exclusive_with_hook(
+                &IndexOptions::new(work.path().to_owned()),
+                &mut leader,
+                &cancel,
+                |phase| {
+                    if phase == ActivationStage::BeforeRename {
+                        let stage = fs::read_dir(&dir)?
+                            .map(|entry| entry.map(|entry| entry.path()))
+                            .collect::<std::io::Result<Vec<_>>>()?
+                            .into_iter()
+                            .find(|path| {
+                                path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .is_some_and(|name| name.starts_with("index.db.tmp-"))
+                            })
+                            .context("missing private stage at activation hook")?;
+                        let sidecar = stage.with_file_name(format!(
+                            "{}-journal",
+                            stage.file_name().unwrap().to_string_lossy()
+                        ));
+                        fs::write(&sidecar, b"hot staged journal")?;
+                        journal = Some(sidecar);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("recovery_required"), "{error:#}");
+        assert_eq!(fs::read(&index).unwrap(), before);
+        assert_eq!(fs::read(journal.unwrap()).unwrap(), b"hot staged journal");
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        leader
+            .verify_exclusive_use(&recovering.roots.index_use_lock(&recovering.identity))
+            .unwrap();
+    }
+
+    #[test]
+    fn exceptional_activation_is_atomic_and_keeps_pending_on_ambiguous_failure() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for fault in [
+            Some(ActivationStage::BeforeRename),
+            Some(ActivationStage::AfterJournalBackupBeforeDirFsync),
+            Some(ActivationStage::AfterRenameBeforeDirFsync),
+            None,
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let work = tempfile::tempdir().unwrap();
+            fs::write(work.path().join("a.js"), "function a() { return 1; }\n").unwrap();
+            let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+            let options = IndexOptions::new(work.path().to_owned());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (graph, native, capture) =
+                index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+            let original_owner = store.leader_session().unwrap();
+            let old_pin = store
+                .publish_native(
+                    &graph,
+                    &capture,
+                    &native,
+                    original_owner.leader_guard().unwrap(),
+                    store.index_baseline().unwrap(),
+                    &cancel,
+                )
+                .unwrap();
+            store
+                .put_annotation(&Annotation {
+                    id: "saved".into(),
+                    node_id: "unattached".into(),
+                    body: "keep me".into(),
+                })
+                .unwrap();
+            let index = store.roots.index_db(&store.identity);
+            let dir = store.roots.index_dir(&store.identity);
+            let leader_path = store.roots.leader_lock(&store.identity);
+            let record = store.roots.record_db(&store.identity);
+            let requests = dir.join("requests.db");
+            let facts = dir.join("facts.db");
+            let neighbor = dir.join("unrelated-record");
+            fs::write(&requests, b"retained requests").unwrap();
+            fs::write(&facts, b"retained facts").unwrap();
+            fs::write(&neighbor, b"unrelated").unwrap();
+            let durable_bytes = fs::read(&record).unwrap();
+            let old_lock = fs::symlink_metadata(&leader_path).unwrap();
+            drop(original_owner);
+            drop(store);
+            fs::write(&index, b"corrupt-index-header").unwrap();
+            let old_bytes = fs::read(&index).unwrap();
+            let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+            assert_eq!(
+                recovering.disposition(),
+                RecoveryDisposition::RecreatePending
+            );
+            let shared = recovering
+                .roots
+                .index_use_existing(&recovering.identity)
+                .unwrap();
+            assert!(
+                recovering
+                    .roots
+                    .index_use_exclusive_existing(&recovering.identity)
+                    .is_err()
+            );
+            drop(shared);
+            let exclusive = recovering
+                .roots
+                .index_use_exclusive_existing(&recovering.identity)
+                .unwrap();
+            let mut leader = recovering
+                .roots
+                .leader_under_exclusive(&recovering.identity, exclusive)
+                .unwrap();
+            if fault.is_none() || fault == Some(ActivationStage::AfterJournalBackupBeforeDirFsync) {
+                let journal = index.with_file_name("index.db-journal");
+                fs::write(&journal, b"old journal bytes").unwrap();
+                fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let result = recovering.recreate_index_exclusive_with_hook(
+                &options,
+                &mut leader,
+                &cancel,
+                |phase| {
+                    if Some(phase) == fault {
+                        anyhow::bail!("injected activation boundary");
+                    }
+                    Ok(())
+                },
+            );
+            match fault {
+                Some(ActivationStage::BeforeRename) => {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("injected activation boundary")
+                    );
+                    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+                    let staged = fs::read_dir(&dir)
+                        .unwrap()
+                        .filter_map(|entry| {
+                            let name = entry.unwrap().file_name().into_string().ok()?;
+                            name.starts_with("index.db.tmp-").then_some(name)
+                        })
+                        .count();
+                    assert_eq!(staged, 0);
+                    let wal = index.with_file_name("index.db-wal");
+                    fs::write(&wal, b"unsafe sidecar").unwrap();
+                    assert!(
+                        recovering
+                            .recreate_index_exclusive(&options, &mut leader, &cancel)
+                            .is_err()
+                    );
+                    assert_eq!(fs::read(&wal).unwrap(), b"unsafe sidecar");
+                    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+                }
+                Some(ActivationStage::AfterJournalBackupBeforeDirFsync) => {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("injected activation boundary")
+                    );
+                    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+                    assert_eq!(
+                        fs::read(index.with_file_name("index.db-journal")).unwrap(),
+                        b"old journal bytes"
+                    );
+                    assert!(!fs::read_dir(&dir).unwrap().any(|entry| {
+                        entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("index.db-journal.tmp-")
+                    }));
+                }
+                Some(ActivationStage::AfterRenameBeforeDirFsync) => {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("injected activation boundary")
+                    );
+                    assert_ne!(fs::read(&index).unwrap(), old_bytes);
+                    assert!(
+                        leader
+                            .verify_exclusive_use(
+                                &recovering.roots.index_use_lock(&recovering.identity)
+                            )
+                            .is_ok()
+                    );
+                }
+                None => {
+                    let pin = result.unwrap();
+                    assert_eq!(pin.index_revision, old_pin.index_revision);
+                    assert_ne!(pin.index_generation, old_pin.index_generation);
+                    assert_eq!(recovering.status().unwrap().revision, pin);
+                    assert!(
+                        recovering
+                            .source_at("a.js", Some(old_pin))
+                            .unwrap_err()
+                            .to_string()
+                            .contains("revision conflict")
+                    );
+                    assert!(!index.with_file_name("index.db-journal").exists());
+                    assert!(
+                        leader
+                            .verify_exclusive_use(
+                                &recovering.roots.index_use_lock(&recovering.identity)
+                            )
+                            .is_err()
+                    );
+                }
+            }
+            assert_eq!(fs::read(&requests).unwrap(), b"retained requests");
+            assert_eq!(fs::read(&facts).unwrap(), b"retained facts");
+            assert_eq!(fs::read(&neighbor).unwrap(), b"unrelated");
+            assert_eq!(fs::read(&record).unwrap(), durable_bytes);
+            let new_lock = fs::symlink_metadata(&leader_path).unwrap();
+            assert_eq!(
+                (new_lock.dev(), new_lock.ino()),
+                (old_lock.dev(), old_lock.ino())
+            );
+            if fault.is_some() {
+                assert_eq!(
+                    recovering.disposition(),
+                    RecoveryDisposition::RecreatePending
+                );
+                assert!(
+                    recovering
+                        .status()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("recovery_required")
+                );
+            }
+        }
+    }
 
     #[test]
     fn cancellation_at_before_commit_rolls_back_entire_native_class_graph_pair() {

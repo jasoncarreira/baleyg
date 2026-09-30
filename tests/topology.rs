@@ -383,6 +383,165 @@ fn persistent_short_and_malformed_markers_remain_unchanged() {
 }
 
 #[test]
+fn exclusive_recovery_reader_child() {
+    let Some(path) = std::env::var_os("TOPOLOGY_RECOVERY_READER") else {
+        return;
+    };
+    let guard = UseGuard::acquire_existing(Path::new(&path), false, true).unwrap();
+    println!("READER_READY");
+    std::io::stdout().flush().unwrap();
+    let mut byte = [0];
+    std::io::stdin().read_exact(&mut byte).unwrap();
+    guard.verify().unwrap();
+}
+
+#[test]
+fn exceptional_recovery_requires_closed_readers_and_retains_both_lock_inodes() {
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::fs::MetadataExt,
+    };
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let old = roots.leader(&identity).unwrap();
+    let leader_path = roots.leader_lock(&identity);
+    let use_path = roots.index_use_lock(&identity);
+    let old_incarnation = old.incarnation;
+    let inode_of = |path: &Path| {
+        let meta = fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    };
+    let leader_inode = inode_of(&leader_path);
+    let use_inode = inode_of(&use_path);
+    drop(old);
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("exclusive_recovery_reader_child")
+        .arg("--nocapture")
+        .env("TOPOLOGY_RECOVERY_READER", &use_path)
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line.contains("READER_READY") {
+            break;
+        }
+    }
+    let error = roots.index_use_exclusive_existing(&identity).unwrap_err();
+    assert!(error.to_string().contains("storage_busy"), "{error:#}");
+    assert_eq!(inode_of(&leader_path), leader_inode);
+    assert_eq!(inode_of(&use_path), use_inode);
+    assert_eq!(
+        fs::read(&leader_path).unwrap(),
+        old_incarnation.to_string().as_bytes()
+    );
+    child.stdin.take().unwrap().write_all(&[1]).unwrap();
+    assert!(child.wait().unwrap().success());
+
+    let unrelated = UseGuard::acquire_existing(&leader_path, true, true).unwrap();
+    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
+    let error = roots
+        .leader_under_exclusive(&identity, exclusive)
+        .unwrap_err();
+    assert!(error.to_string().contains("storage_busy"), "{error:#}");
+    assert_eq!(
+        fs::read(&leader_path).unwrap(),
+        old_incarnation.to_string().as_bytes()
+    );
+    drop(unrelated);
+
+    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
+    let mut leader = roots.leader_under_exclusive(&identity, exclusive).unwrap();
+    assert_ne!(leader.incarnation, old_incarnation);
+    assert_eq!(
+        fs::read(&leader_path).unwrap(),
+        leader.incarnation.to_string().as_bytes()
+    );
+    assert_eq!(inode_of(&leader_path), leader_inode);
+    assert_eq!(inode_of(&use_path), use_inode);
+    assert!(UseGuard::acquire_existing(&use_path, false, true).is_err());
+    leader.verify_exclusive_use(&use_path).unwrap();
+    leader.downgrade_use_to_shared().unwrap();
+    assert!(leader.verify_exclusive_use(&use_path).is_err());
+    leader.verify().unwrap();
+    let reader = UseGuard::acquire_existing(&use_path, false, true).unwrap();
+    drop(reader);
+    let mut after = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("exclusive_recovery_reader_child")
+        .arg("--nocapture")
+        .env("TOPOLOGY_RECOVERY_READER", &use_path)
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut after_reader = BufReader::new(after.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert_ne!(after_reader.read_line(&mut line).unwrap(), 0);
+        if line.contains("READER_READY") {
+            break;
+        }
+    }
+    assert!(roots.index_use_exclusive_existing(&identity).is_err());
+    assert!(
+        roots
+            .leader(&identity)
+            .unwrap_err()
+            .to_string()
+            .contains("storage_busy")
+    );
+    assert_eq!(inode_of(&leader_path), leader_inode);
+    assert_eq!(inode_of(&use_path), use_inode);
+    after.stdin.take().unwrap().write_all(&[1]).unwrap();
+    assert!(after.wait().unwrap().success());
+    drop(leader);
+    roots.leader(&identity).unwrap().verify().unwrap();
+}
+
+#[test]
+fn exceptional_leader_refuses_missing_or_unsafe_retained_path_without_creation() {
+    use std::os::unix::fs::symlink;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    roots.prepare_index(&identity).unwrap();
+    assert!(roots.index_use_exclusive_existing(&identity).is_err());
+    assert!(!roots.index_use_lock(&identity).exists());
+    let leader = roots.leader(&identity).unwrap();
+    drop(leader);
+    let shared = roots.index_use_existing(&identity).unwrap();
+    let error = roots.leader_under_exclusive(&identity, shared).unwrap_err();
+    assert!(error.to_string().contains("unsafe_index"), "{error:#}");
+    let wrong_work = temp.path().join("wrong-work");
+    fs::create_dir(&wrong_work).unwrap();
+    let wrong = WorkspaceIdentity::discover(Some(&wrong_work), &wrong_work).unwrap();
+    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
+    let error = roots.leader_under_exclusive(&wrong, exclusive).unwrap_err();
+    assert!(error.to_string().contains("unsafe_index"), "{error:#}");
+    let path = roots.leader_lock(&identity);
+    fs::remove_file(&path).unwrap();
+    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
+    assert!(roots.leader_under_exclusive(&identity, exclusive).is_err());
+    assert!(!path.exists());
+    symlink(temp.path().join("other"), &path).unwrap();
+    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
+    assert!(roots.leader_under_exclusive(&identity, exclusive).is_err());
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn multiprocess_lock_protocol() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());

@@ -146,6 +146,242 @@ function boundary() {}
 }
 
 #[test]
+fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_options() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let first = command(&root, &home, "index")
+        .arg("--max-file-bytes")
+        .arg("2097152")
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let dir = fs::read_dir(&indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let index = dir.join("index.db");
+    let leader = dir.join("leader.lock");
+    let old_inode = fs::symlink_metadata(&leader).unwrap();
+    fs::write(&index, b"invalid-sqlite-header-with-at-least-20-bytes").unwrap();
+    let corrupt = fs::read(&index).unwrap();
+    for sub in ["status", "symbols", "query", "export"] {
+        let mut cmd = command(&root, &home, sub);
+        match sub {
+            "symbols" => {
+                cmd.arg("--search").arg("a");
+            }
+            "query" => {
+                cmd.arg("--seed").arg("unknown");
+            }
+            _ => {}
+        }
+        let refused = cmd.output().unwrap();
+        assert!(!refused.status.success(), "{sub} unexpectedly succeeded");
+        assert!(
+            refused.stdout.is_empty(),
+            "{sub} emitted unverified evidence"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("explicit baleyg index"),
+            "{sub}: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(fs::read(&index).unwrap(), corrupt);
+    }
+    let recovered = command(&root, &home, "index")
+        .arg("--max-file-bytes")
+        .arg("2097152")
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let output: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(output["publishedRevision"], output["status"]["revision"]);
+    assert_eq!(output["publishedRevision"]["indexRevision"], 1);
+    assert_ne!(
+        output["publishedRevision"]["indexGeneration"],
+        first["publishedRevision"]["indexGeneration"]
+    );
+    let new_inode = fs::symlink_metadata(&leader).unwrap();
+    assert_eq!(
+        (old_inode.dev(), old_inode.ino()),
+        (new_inode.dev(), new_inode.ino())
+    );
+    let db = rusqlite::Connection::open(&index).unwrap();
+    let recorded: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&recorded).unwrap()["maxFileBytes"],
+        2_097_152
+    );
+}
+
+#[tokio::test]
+async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_when_busy() {
+    use baleyg::store::topology::UseGuard;
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+    };
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    async fn serve(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        token: &std::path::Path,
+    ) -> (Server, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut child = isolated_command(home)
+            .arg("serve")
+            .arg("--workspace")
+            .arg(root)
+            .arg("--bind")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--token-file")
+            .arg(token)
+            .arg("--max-file-bytes")
+            .arg("3145728")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let server = Server(child);
+        let boot = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::task::spawn_blocking(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut lines = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        return Err(lines);
+                    }
+                    lines.push_str(&line);
+                    if line.contains("Baleyg:") {
+                        return Ok(lines);
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("daemon startup timed out")
+        .unwrap();
+        assert!(
+            boot.is_ok(),
+            "daemon failed before binding: {:?}",
+            boot.err()
+        );
+        (server, format!("http://127.0.0.1:{port}"))
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let initial = command(&root, &home, "index").output().unwrap();
+    assert!(initial.status.success());
+    let old_pin: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    let indexes = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.odin.baleyg/indexes")
+    } else {
+        home.join(".cache/baleyg/indexes")
+    };
+    let dir = fs::read_dir(indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let index = dir.join("index.db");
+    fs::write(&index, b"broken sqlite index header").unwrap();
+    let corrupt = fs::read(&index).unwrap();
+    let token = temp.path().join("token");
+    fs::write(&token, TOKEN).unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let use_lock = dir.parent().unwrap().join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let reader = UseGuard::acquire_existing(&use_lock, false, true).unwrap();
+    let (busy_server, busy_url) = serve(&root, &home, &token).await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let busy = client
+        .get(format!("{busy_url}/api/status"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = busy.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "recovery_required");
+    assert_eq!(fs::read(&index).unwrap(), corrupt);
+    drop(busy_server);
+    drop(reader);
+    let (ready_server, url) = serve(&root, &home, &token).await;
+    let ready = client
+        .get(format!("{url}/api/status"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+    let status: Value = ready.json().await.unwrap();
+    assert_eq!(status["revision"]["indexRevision"], 1);
+    assert_ne!(
+        status["revision"]["indexGeneration"],
+        old_pin["publishedRevision"]["indexGeneration"]
+    );
+    let db = rusqlite::Connection::open(&index).unwrap();
+    let options: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&options).unwrap()["maxFileBytes"],
+        3_145_728
+    );
+    drop(ready_server);
+}
+
+#[test]
 fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");

@@ -97,6 +97,24 @@ impl IndexJobCoordinator {
     }
 }
 
+/// One explicit index command returns the owner that published its one full capture.
+/// Exceptional recovery cannot take the live-baseline path or upgrade shared use.
+pub fn reconcile_workspace(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+) -> Result<(IndexPin, Arc<LeaderSession>)> {
+    if store.is_recreate_pending() {
+        return store.recreate_pending_leader_session(options, cancel);
+    }
+    let coordinator = IndexJobCoordinator::prepare(store, None)?;
+    let session = coordinator.session();
+    let pin = coordinator.run(options, cancel, progress)?;
+    session.verify()?;
+    Ok((pin, session))
+}
+
 /// Establish one bounded serving owner. A free lock performs one complete
 /// reconciliation; contention is admitted only as a verified follower.
 pub fn establish_serving_session(
@@ -104,6 +122,16 @@ pub fn establish_serving_session(
     explicit_options: Option<&IndexOptions>,
     cancel: &CancelFlag,
 ) -> Result<Arc<LeaderSession>> {
+    if store.is_recreate_pending() {
+        let options = explicit_options.ok_or_else(|| {
+            anyhow::anyhow!(
+                "recovery_required: index options unavailable; run explicit baleyg index"
+            )
+        })?;
+        let (_, session) = store.recreate_pending_leader_session(options, cancel)?;
+        session.verify()?;
+        return Ok(session);
+    }
     match store.leader_session() {
         Ok(session) => {
             let expected = store.recovery_index_baseline()?;
@@ -158,6 +186,112 @@ mod tests {
             )
             .collect();
         (files, ops)
+    }
+
+    #[test]
+    fn explicit_reconcile_replaces_corruption_without_upgrading_a_reader() {
+        use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        let path = roots.index_db(&identity);
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(work.path().to_owned());
+        let (old, first_owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        assert_eq!(store.status().unwrap().revision, old);
+        drop(first_owner);
+        drop(store);
+        fs::write(&path, b"short").unwrap();
+        let corrupt = fs::read(&path).unwrap();
+        let pending = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert!(pending.is_recreate_pending());
+        let shared = roots.index_use_existing(&identity).unwrap();
+        let busy = reconcile_workspace(&pending, &options, &cancel, |_| {}).unwrap_err();
+        assert!(busy.to_string().contains("storage_busy"), "{busy:#}");
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert!(pending.is_recreate_pending());
+        drop(shared);
+        let mut configured = options.clone();
+        configured.max_file_bytes = 2_097_152;
+        let (new, owner) = reconcile_workspace(&pending, &configured, &cancel, |_| {}).unwrap();
+        assert_ne!(new.index_generation, old.index_generation);
+        assert_eq!(new.index_revision, 1);
+        assert_eq!(pending.status().unwrap().revision, new);
+        assert_eq!(
+            pending
+                .recorded_index_options()
+                .unwrap()
+                .unwrap()
+                .max_file_bytes,
+            2_097_152
+        );
+        assert!(
+            roots
+                .leader(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("storage_busy")
+        );
+        drop(owner);
+        roots.leader(&identity).unwrap().verify().unwrap();
+    }
+
+    #[test]
+    fn pending_read_refuses_unknown_options_and_daemon_config_does_not_fallback() {
+        use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        let path = roots.index_db(&identity);
+        let old = Store::open_for_tests(state.path(), work.path()).unwrap();
+        drop(old);
+        fs::write(&path, b"not sqlite format header").unwrap();
+        let original = fs::read(&path).unwrap();
+        let pending = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let missing = establish_serving_session(&pending, None, &cancel).unwrap_err();
+        assert!(
+            missing.to_string().contains("explicit baleyg index"),
+            "{missing:#}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let mut configured = IndexOptions::new(work.path().to_owned());
+        configured.max_file_bytes = 2_097_152;
+        let shared = roots.index_use_existing(&identity).unwrap();
+        let busy = establish_serving_session(&pending, Some(&configured), &cancel).unwrap_err();
+        assert!(busy.to_string().contains("storage_busy"), "{busy:#}");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(pending.is_recreate_pending());
+        drop(shared);
+        let owner = establish_serving_session(&pending, Some(&configured), &cancel).unwrap();
+        assert!(owner.is_leader());
+        assert_eq!(pending.status().unwrap().revision.index_revision, 1);
+        assert_eq!(
+            pending
+                .recorded_index_options()
+                .unwrap()
+                .unwrap()
+                .max_file_bytes,
+            2_097_152
+        );
+        assert!(
+            roots
+                .leader(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("storage_busy")
+        );
     }
 
     #[test]

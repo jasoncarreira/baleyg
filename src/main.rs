@@ -335,9 +335,7 @@ async fn main() -> Result<()> {
         }
         Command::Index(args) => {
             let (store, options, _) = args.resolve()?;
-            let coordinator =
-                baleyg::index_coordinator::IndexJobCoordinator::prepare(&store, None)?;
-            let session = coordinator.session();
+            let worker_store = store.clone();
             let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
             let signal = tokio::spawn(async move {
@@ -345,16 +343,21 @@ async fn main() -> Result<()> {
                 flag.store(true, Ordering::Release);
             });
             let work = tokio::task::spawn_blocking(move || {
-                coordinator.run(&options, &cancel, |p| {
-                    if p.completed == p.total {
-                        eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
-                    }
-                })
+                baleyg::index_coordinator::reconcile_workspace(
+                    &worker_store,
+                    &options,
+                    &cancel,
+                    |p| {
+                        if p.completed == p.total {
+                            eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
+                        }
+                    },
+                )
             })
             .await
             .context("index worker panicked")?;
             signal.abort();
-            let revision = work?;
+            let (revision, session) = work?;
             let output = serde_json::json!({"publishedRevision":revision,"status":store.status()?});
             write_session_json(&output, &session, std::io::stdout().lock())?;
         }
