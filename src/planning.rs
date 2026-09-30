@@ -145,12 +145,20 @@ impl QuestionPacket {
     }
 }
 pub fn prepare(store: &Store, request: QuestionRequest) -> Result<QuestionPacket> {
+    let response = store.evidence_response()?;
+    let packet = prepare_in(&response, request)?;
+    response.finish(packet)
+}
+pub fn prepare_in(
+    response: &crate::store::EvidenceResponse,
+    request: QuestionRequest,
+) -> Result<QuestionPacket> {
     request.validate()?;
     ensure!(
-        store.status()?.revision == request.expected_revision,
+        response.status()?.revision == request.expected_revision,
         "revision conflict: requested snapshot is no longer current"
     );
-    let context = store
+    let context = response
         .query_view(&ViewQuery {
             seed: request.seed.clone(),
             depth: request.evidence_depth,
@@ -186,7 +194,7 @@ pub fn prepare(store: &Store, request: QuestionRequest) -> Result<QuestionPacket
     let mut source_files = Vec::new();
     let mut bytes = 0usize;
     for path in paths {
-        let (_, file) = store
+        let (_, file) = response
             .source_at(path, Some(request.expected_revision))?
             .context("missing indexed source file")?;
         bytes = bytes.saturating_add(serde_json::to_vec(&file)?.len());
@@ -196,10 +204,6 @@ pub fn prepare(store: &Store, request: QuestionRequest) -> Result<QuestionPacket
         );
         source_files.push(file);
     }
-    ensure!(
-        store.status()?.revision == request.expected_revision,
-        "revision conflict: graph changed during question preparation"
-    );
     let mut warnings = context.warnings.clone();
     warnings.push(if noncallable {
         "Bounded source-only evidence: selected noncallable declaration, with no executable calls, target, or callback traversal. This is not a complete program or answer."

@@ -345,6 +345,9 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
     for p in &selectors {
         config.push(entry(root, p, capture.bytes(p))?);
     }
+    config.push(
+        json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
+    );
     for (p, b) in capture.admitted_inputs() {
         if p.file_name()
             .is_some_and(|n| n == ".gitignore" || n == ".ignore")
@@ -1476,12 +1479,13 @@ mod cached_executable_digest_tests {
             from_capture(&capture, &root, store.root_id(), &cancel).unwrap(),
             native
         );
+        let session = store.leader_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -1502,5 +1506,6 @@ mod cached_executable_digest_tests {
                 .iter()
                 .any(|expected| row.syntax_id == expected.syntax_id)
         }));
+        drop(session);
     }
 }

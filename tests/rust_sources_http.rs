@@ -13,7 +13,12 @@ use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-fn setup() -> (tempfile::TempDir, Store, Router) {
+fn setup() -> (
+    tempfile::TempDir,
+    Store,
+    Router,
+    Arc<baleyg::store::topology::LeaderSession>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     let source = temp.path().join("library");
@@ -34,30 +39,31 @@ fn setup() -> (tempfile::TempDir, Store, Router) {
         |_| {},
     )
     .unwrap();
+    let session = store.leader_session().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            session.leader_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
         .unwrap();
-    let app = http::router(
-        http::new_with_source_roots(
-            store.clone(),
-            IndexOptions::new(workspace.clone()),
-            TOKEN.into(),
-            "127.0.0.1:7331".parse().unwrap(),
-            None,
-            None,
-            workspace,
-            vec![("rust".into(), source)],
-        )
-        .unwrap(),
-    );
-    (temp, store, app)
+    let state = http::new_with_source_roots(
+        store.clone(),
+        IndexOptions::new(workspace.clone()),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+        None,
+        None,
+        workspace,
+        vec![("rust".into(), source)],
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    let app = http::router(state);
+    (temp, store, app, session)
 }
 async fn call(app: &Router, path: &str) -> (u16, Value) {
     let res = app
@@ -79,7 +85,7 @@ async fn call(app: &Router, path: &str) -> (u16, Value) {
 }
 #[tokio::test]
 async fn candidates_are_separate_and_ranges_match_returned_snapshot() {
-    let (temp, store, app) = setup();
+    let (temp, store, app, _session) = setup();
     let before = serde_json::to_value(store.status().unwrap()).unwrap();
     let (status, roots) = call(&app, "/api/rust-sources").await;
     assert_eq!(status, 200);
@@ -142,7 +148,7 @@ async fn candidates_are_separate_and_ranges_match_returned_snapshot() {
 }
 #[tokio::test]
 async fn invalid_paths_unknown_roots_limits_and_parse_warnings() {
-    let (temp, _, app) = setup();
+    let (temp, _, app, _session) = setup();
     for path in [
         "..",
         "%2Fetc%2Fpasswd.rs",
@@ -215,7 +221,7 @@ async fn invalid_paths_unknown_roots_limits_and_parse_warnings() {
 #[tokio::test]
 async fn symlinks_and_non_regular_files_are_never_read() {
     use std::os::unix::fs::symlink;
-    let (temp, _, app) = setup();
+    let (temp, _, app, _session) = setup();
     let root = temp.path().join("library");
     std::fs::write(temp.path().join("outside.rs"), "SECRET_MUST_NOT_LEAK").unwrap();
     symlink(temp.path().join("outside.rs"), root.join("escape.rs")).unwrap();
@@ -249,7 +255,7 @@ async fn symlinks_and_non_regular_files_are_never_read() {
 }
 #[tokio::test]
 async fn guards_apply_to_every_external_endpoint() {
-    let (_, _, app) = setup();
+    let (_, _, app, _session) = setup();
     for path in [
         "/api/rust-sources",
         "/api/rust-sources/tree?root=rust",
@@ -287,7 +293,7 @@ async fn guards_apply_to_every_external_endpoint() {
 }
 #[tokio::test]
 async fn old_constructors_have_no_roots_and_configuration_is_validated() {
-    let (temp, store, _) = setup();
+    let (temp, store, _, session) = setup();
     let workspace = temp.path().join("workspace");
     let opts = IndexOptions::new(workspace.clone());
     let state = http::new(
@@ -297,6 +303,7 @@ async fn old_constructors_have_no_roots_and_configuration_is_validated() {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
+    state.retain_serving_session(session.clone());
     assert_eq!(
         call(&http::router(state), "/api/rust-sources").await.1,
         serde_json::json!({"roots": []})
@@ -343,7 +350,7 @@ fn descriptor_is_pinned_and_exact_size_bound_is_accepted() {
 
 #[tokio::test]
 async fn extraction_budget_returns_explicit_partial_candidates() {
-    let (temp, _, app) = setup();
+    let (temp, _, app, _session) = setup();
     let text = (0..8100)
         .map(|i| format!("fn f{i}() {{}}\n"))
         .collect::<String>();

@@ -19,7 +19,15 @@ const JAVA: &str = "package demo;\nclass A {\n B first, second;\n Missing unknow
 fn cancel() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
 }
-fn setup(files: &[(&str, &str)]) -> (tempfile::TempDir, Store, Graph, Router) {
+fn setup(
+    files: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Router,
+    Arc<baleyg::store::topology::LeaderSession>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -29,11 +37,12 @@ fn setup(files: &[(&str, &str)]) -> (tempfile::TempDir, Store, Graph, Router) {
     let options = IndexOptions::new(root.clone());
     let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &root).unwrap();
+    let session = store.leader_session().unwrap();
     publish_bundle(
         &store,
         &graph,
         &root,
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         baleyg::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -50,9 +59,15 @@ fn setup(files: &[(&str, &str)]) -> (tempfile::TempDir, Store, Graph, Router) {
         )
         .unwrap(),
     );
-    (dir, store, graph, app)
+    (dir, store, graph, app, session)
 }
-fn fixture() -> (tempfile::TempDir, Store, Graph, Router) {
+fn fixture() -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Router,
+    Arc<baleyg::store::topology::LeaderSession>,
+) {
     setup(&[
         ("A.java", JAVA),
         ("B.java", "package demo; class B {}"),
@@ -128,7 +143,7 @@ fn targets(v: &Value, reason: &str) -> Vec<String> {
 }
 #[tokio::test]
 async fn exact_members_overloads_shared_fields_and_crossfile_types() {
-    let (dir, _store, graph, app) = fixture();
+    let (dir, _store, graph, app, _session) = fixture();
     for field in ["first", "second"] {
         let (status, view) = call(&app, member(&dir, id(&graph, "A"), field, 0)).await;
         assert_eq!(status, 200, "{view}");
@@ -165,7 +180,7 @@ async fn exact_members_overloads_shared_fields_and_crossfile_types() {
 }
 #[tokio::test]
 async fn cached_only_source_lines_utf8_and_measured_ranges() {
-    let (dir, store, graph, app) = setup(&[(
+    let (dir, store, graph, app, _session) = setup(&[(
         "unicode.py",
         "class Café:\n    def méthode(self):\n        # π 😀\n        return 1\n\n",
     )]);
@@ -187,7 +202,7 @@ async fn cached_only_source_lines_utf8_and_measured_ranges() {
 }
 #[tokio::test]
 async fn strict_selectors_validation_and_revision() {
-    let (dir, store, graph, app) = fixture();
+    let (dir, store, graph, app, session) = fixture();
     let good = member(&dir, id(&graph, "A"), "first", 0);
     let mut wrong_range = good.clone();
     wrong_range["startByte"] = json!(0);
@@ -214,13 +229,14 @@ async fn strict_selectors_validation_and_revision() {
         assert_eq!(status, 400, "{body}: {value}");
     }
     let old_source = source("A.java", 3, &dir);
+    let index_generation = store.status().unwrap().revision.index_generation;
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         baleyg::model::IndexPin {
-            index_generation: store.status().unwrap().revision.index_generation,
+            index_generation,
             index_revision: 1,
         },
         &cancel(),
@@ -231,7 +247,7 @@ async fn strict_selectors_validation_and_revision() {
 }
 #[tokio::test]
 async fn auth_host_origin_are_enforced() {
-    let (dir, _store, _graph, app) = fixture();
+    let (dir, _store, _graph, app, _session) = fixture();
     for (host, token, origin, expected) in [
         ("127.0.0.1:7331", "", "", 401),
         ("evil.example", TOKEN, "", 403),
@@ -261,7 +277,7 @@ async fn auth_host_origin_are_enforced() {
 }
 #[tokio::test]
 async fn ambiguity_preserves_all_cached_candidates_and_unresolved_calls_are_not_guessed() {
-    let (dir, _store, graph, app) = setup(&[
+    let (dir, _store, graph, app, _session) = setup(&[
         (
             "a.py",
             "class A:\n    value: B\nclass B: pass\nclass B: pass\n",
@@ -310,9 +326,9 @@ async fn ambiguity_preserves_all_cached_candidates_and_unresolved_calls_are_not_
 }
 #[tokio::test]
 async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
-    let refusal = |(status, body): (StatusCode, Value)| {
+    let refusal = |(status, body): (StatusCode, Value), expected: &str| {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "incompatible_index", "{body}");
+        assert_eq!(body["error"]["code"], expected, "{body}");
         assert!(
             body["targets"].is_null(),
             "no forged navigation targets: {body}"
@@ -323,7 +339,7 @@ async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
         );
     };
     // A clean native-paired document still serves bounded navigation.
-    let (dir, _store, graph, app) = fixture();
+    let (dir, _store, graph, app, _session) = fixture();
     let selector = member(&dir, id(&graph, "A"), "first", 0);
     let (status, clean) = call(&app, selector.clone()).await;
     assert_eq!(status, StatusCode::OK);
@@ -335,25 +351,29 @@ async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
         rusqlite::params![huge, id(&graph, "A")],
     )
     .unwrap();
-    refusal(call(&app, selector).await);
-    refusal(call(&app, member(&dir, id(&graph, "A"), "padding", 0)).await);
-    let (status, other) = call(&app, source("B.java", 1, &dir)).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "unaffected native document: {other}"
+    refusal(call(&app, selector).await, "incompatible_index");
+    refusal(
+        call(&app, member(&dir, id(&graph, "A"), "padding", 0)).await,
+        "incompatible_index",
+    );
+    refusal(
+        call(&app, source("B.java", 1, &dir)).await,
+        "incompatible_index",
     );
 
     // Catalog warnings are global metadata, so corruption refuses every
     // public schema-6 derived read before the huge JSON is decoded.
-    let (dir, store, graph, app) = fixture();
+    let (dir, store, graph, app, _session) = fixture();
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     db.execute(
         "UPDATE class_catalog SET warnings=?1",
         [json!(["x".repeat(2 * 1024 * 1024)]).to_string()],
     )
     .unwrap();
-    refusal(call(&app, member(&dir, id(&graph, "A"), "first", 0)).await);
+    refusal(
+        call(&app, member(&dir, id(&graph, "A"), "first", 0)).await,
+        "incompatible_index",
+    );
     assert!(
         store
             .classes_at(None, "", None, 0, 20)
@@ -362,24 +382,66 @@ async fn schema6_class_corruption_refuses_without_old_projection_guidance() {
             .contains("incompatible_index")
     );
 
+    // Under-budget malformed catalog JSON reaches class_metadata. Its first
+    // authenticated class request is typed, then the shared Store stays closed.
+    let (dir, store, _graph, app, _session) = fixture();
+    let pin = store.status().unwrap().revision;
+    let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
+    db.execute("UPDATE class_catalog SET warnings='not-json'", [])
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/classes?q=A&indexGeneration={}&indexRevision={}",
+                    pin.index_generation, pin.index_revision
+                ))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
+    refusal((status, body), "incompatible_index");
+    let closed = store.classes_at(None, "", None, 0, 20).unwrap_err();
+    assert!(
+        closed.to_string().contains("incompatible_index"),
+        "{closed:#}"
+    );
+
     // Selected class relationships are scoped by their owner and file.
-    let (dir, _store, graph, app) = fixture();
+    let (dir, _store, graph, app, _session) = fixture();
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     db.execute("UPDATE class_relations SET payload=json_set(payload,'$.candidateIds',json(?1)) WHERE owner=?2",
         rusqlite::params![json!(["x".repeat(100000)]).to_string(),id(&graph,"A")]).unwrap();
-    refusal(call(&app, member(&dir, id(&graph, "A"), "first", 0)).await);
-    let (status, other) = call(&app, source("B.java", 1, &dir)).await;
-    assert_eq!(status, StatusCode::OK, "unrelated native document: {other}");
+    refusal(
+        call(&app, member(&dir, id(&graph, "A"), "first", 0)).await,
+        "incompatible_index",
+    );
+    refusal(
+        call(&app, source("B.java", 1, &dir)).await,
+        "incompatible_index",
+    );
 
     // Deleting the live schema-6 catalog is corruption, not a truthful old4
     // private baseline or a public requireIndex fallback.
-    let (dir, store, _graph, app) = fixture();
+    let (dir, store, _graph, app, _session) = fixture();
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     db.execute_batch(
         "DELETE FROM class_relations; DELETE FROM classes; DELETE FROM class_catalog;",
     )
     .unwrap();
-    refusal(call(&app, source("A.java", 6, &dir)).await);
+    refusal(
+        call(&app, source("A.java", 6, &dir)).await,
+        "incompatible_index",
+    );
     assert!(
         store
             .classes_at(None, "", None, 0, 20)
@@ -396,7 +458,7 @@ async fn source_candidate_count_and_huge_cached_text_have_fixed_output_limits() 
     }
     text.push('\n');
     text.push_str(&" ".repeat(700_000));
-    let (dir, _store, _graph, app) = setup(&[("Many.java", &text)]);
+    let (dir, _store, _graph, app, _session) = setup(&[("Many.java", &text)]);
     let (_, view) = call(&app, source("Many.java", 1, &dir)).await;
     assert_eq!(view["truncated"], true);
     assert!(view["targets"].as_array().unwrap().len() <= 64);
@@ -407,7 +469,7 @@ async fn source_candidate_count_and_huge_cached_text_have_fixed_output_limits() 
 
 #[tokio::test]
 async fn java_field_envelope_is_exact_across_comments_lines_shared_declarations_and_utf8() {
-    let (dir, _store, graph, app) = setup(&[(
+    let (dir, _store, graph, app, _session) = setup(&[(
         "Fields.java",
         "// π 😀 before class bytes\nclass A {\n B first, second; C neighbor;\n B /* shared type */\n multiline;\n java.util.List<B> generic;\n B initialized = make(\"; C trick\");\n}\nclass B {} class C {}\n",
     )]);
@@ -431,7 +493,22 @@ async fn java_field_envelope_is_exact_across_comments_lines_shared_declarations_
 async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     let mut text = String::from("class A { B value; } class B {}\n");
     text.push_str(&" ".repeat(300_000));
-    let (dir, store, graph, app) = setup(&[("Large.java", &text)]);
+    let (dir, store, graph, app, _session) = setup(&[("Large.java", &text)]);
+    let reopen = || {
+        let root = dir.path().join("workspace");
+        let options = IndexOptions::new(root.clone());
+        let reopened = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
+        let router = http::router(
+            http::new(
+                reopened.clone(),
+                options,
+                TOKEN.into(),
+                "127.0.0.1:7331".parse().unwrap(),
+            )
+            .unwrap(),
+        );
+        (reopened, router)
+    };
     let selector = member(&dir, id(&graph, "A"), "value", 0);
     let (status, within_budget) = call(&app, selector.clone()).await;
     assert_eq!(status, 200, "{within_budget}");
@@ -451,12 +528,25 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     assert_eq!(status, 503, "{limited}");
     assert_eq!(limited["error"]["code"], "incompatible_index");
     assert!(limited.get("targets").is_none());
-    // The source selector would count forged lines in files.payload.text. Gate
-    // that read in the same pinned transaction, before any false line is admitted.
+
+    // Exercise the source selector independently against the same persisted
+    // oversized graph mutation, never as an escape from the first app's latch.
+    let (_source_store, source_app) = reopen();
+    let (status, source_refusal) = call(&source_app, source("Large.java", 2, &dir)).await;
+    assert_eq!(status, 503, "{source_refusal}");
+    assert_eq!(source_refusal["error"]["code"], "incompatible_index");
+    assert!(source_refusal.get("targets").is_none());
+    assert!(!source_refusal.to_string().contains("forged()"));
+
+    // The first selected failure closes the original app and its Store clones.
     let (status, forged_line) = call(&app, source("Large.java", 2, &dir)).await;
     assert_eq!(status, 503, "{forged_line}");
     assert_eq!(forged_line["error"]["code"], "incompatible_index");
-    assert!(store.source_at("Large.java", None).is_err());
+    let closed = store.source_at("Large.java", None).unwrap_err();
+    assert!(
+        closed.to_string().contains("incompatible_index"),
+        "{closed:#}"
+    );
     let response = app
         .clone()
         .oneshot(
@@ -473,18 +563,32 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "incompatible_index");
+
+    // Restore the first corruption before installing and independently selecting
+    // the different unproven-member graph mismatch.
+    db.execute(
+        "UPDATE files SET payload=json_set(payload,'$.text',?1)",
+        [&original_text],
+    )
+    .unwrap();
     db.execute(
         "UPDATE files SET payload=json_set(payload,'$.text','class A { C other; } class B {}')",
         [],
     )
     .unwrap();
-    let (status, unproven) = call(&app, selector.clone()).await;
+    let (unproven_store, unproven_app) = reopen();
+    let (status, unproven) = call(&unproven_app, selector.clone()).await;
     assert_eq!(status, 503, "{unproven}");
     assert_eq!(unproven["error"]["code"], "incompatible_index");
     assert!(unproven.get("targets").is_none());
-    assert!(store.source_at("Large.java", None).is_err());
-    // Restore graph JSON, then tamper the actual selected native BLOB. A pinned
-    // typed read must reject it, while unrelated member navigation stays inert.
+    let closed = unproven_store.source_at("Large.java", None).unwrap_err();
+    assert!(
+        closed.to_string().contains("incompatible_index"),
+        "{closed:#}"
+    );
+
+    // Restore graph JSON, then tamper the actual selected native BLOB. Exercise
+    // direct-native and HTTP selection independently; each handle then closes.
     db.execute(
         "UPDATE files SET payload=json_set(payload,'$.text',?1)",
         [&original_text],
@@ -508,17 +612,31 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
         language: "java".into(),
         path: "Large.java".into(),
     };
+    let (native_store, _) = reopen();
+    let native_pin = native_store.status().unwrap().revision;
+    let native_clone = native_store.clone();
+    let native_error = native_store
+        .native_source_at(native_pin, &native_key)
+        .unwrap_err();
     assert!(
-        store
-            .native_source_at(store.status().unwrap().revision, &native_key)
-            .is_err()
+        native_error.to_string().contains("incompatible_index")
+            && native_error
+                .to_string()
+                .contains("native source hash mismatch"),
+        "{native_error:#}"
     );
-    assert!(store.source_at("Large.java", None).is_err());
-    let (status, corrupted) = call(&app, selector).await;
+    let closed = native_clone.source_at("Large.java", None).unwrap_err();
+    assert!(
+        closed.to_string().contains("incompatible_index"),
+        "{closed:#}"
+    );
+
+    let (_http_store, http_app) = reopen();
+    let (status, corrupted) = call(&http_app, selector).await;
     assert_eq!(status, 503, "{corrupted}");
     assert_eq!(corrupted["error"]["code"], "incompatible_index");
     assert!(corrupted.get("targets").is_none());
-    let response = app
+    let response = http_app
         .oneshot(
             Request::builder()
                 .uri("/api/source?path=Large.java")
@@ -537,7 +655,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
 
 #[tokio::test]
 async fn unsupported_classes_never_become_class_targets_but_methods_remain_measured() {
-    let (dir, _store, _graph, app) =
+    let (dir, _store, _graph, app, _session) =
         setup(&[("app.js", "class Unsupported { run() { return 1; } }\n")]);
     let (_, view) = call(&app, source("app.js", 1, &dir)).await;
     assert!(
@@ -554,7 +672,7 @@ async fn unsupported_classes_never_become_class_targets_but_methods_remain_measu
 #[tokio::test]
 async fn java_same_class_calls_preserve_overloads_measured_nodes_and_cached_revision() {
     let text = "// π 😀 byte offsets\nclass Café {\n void flagArtifactType() {}\n void flagArtifactType(String type) {}\n void run() {\n  flagArtifactType(); // bare\n  this.flagArtifactType(\"π\"); // explicit\n }\n}\nclass Other { void flagArtifactType() {} }\n";
-    let (dir, _store, graph, app) = setup(&[("Café.java", text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("Café.java", text)]);
     let measured = graph
         .nodes
         .iter()
@@ -638,7 +756,7 @@ enum E {
  void hit() {}
 }
 "#;
-    let (dir, _store, graph, app) = setup(&[("Scopes.java", text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("Scopes.java", text)]);
     let measured = graph
         .nodes
         .iter()
@@ -679,7 +797,7 @@ enum E {
 #[tokio::test]
 async fn java_same_class_candidates_exclude_constructors_and_keep_internal_targets() {
     let text = "class A {\n A() {}\n void A() {}\n void A(int n) {}\n void run() {\n  A(); // collision\n  this.A(); // resolved\n }\n}\n";
-    let (dir, _store, graph, app) = setup(&[("A.java", text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("A.java", text)]);
     let measured = graph
         .nodes
         .iter()
@@ -720,7 +838,7 @@ async fn java_same_class_candidates_exclude_constructors_and_keep_internal_targe
 #[tokio::test]
 async fn java_same_class_proof_requires_exact_calls_callers_owners_and_target_syntax() {
     let text = "class A {\n A hit() { return this; }\n void run() {\n  hit().hit(); // chain\n }\n}\nclass B { void run() {} }\n";
-    let (dir, _store, graph, app) = setup(&[("Proof.java", text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("Proof.java", text)]);
     let measured = graph
         .nodes
         .iter()
@@ -762,7 +880,7 @@ async fn java_same_class_proof_requires_exact_calls_callers_owners_and_target_sy
 async fn java_same_class_source_and_response_budgets_fail_closed() {
     let mut text = "class A {\n void hit() {}\n void run() {\n  hit(); // call\n }\n}\n".to_owned();
     text.push_str(&" ".repeat(300_000));
-    let (dir, _store, graph, app) = setup(&[("Limits.java", &text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("Limits.java", &text)]);
     let measured = graph
         .nodes
         .iter()
@@ -815,7 +933,7 @@ class Café {
  }
 }
 "#;
-    let (dir, _store, graph, app) = setup(&[("Café.java", text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("Café.java", text)]);
     let measured = graph
         .nodes
         .iter()
@@ -858,7 +976,7 @@ async fn java_same_class_row_and_structural_work_limits_are_explicit() {
     let mut text = "class A {\n void hit() {}\n void run() {\n ".to_owned();
     text.push_str(&"hit(); ".repeat(200));
     text.push_str("// many calls\n }\n}\n");
-    let (dir, _store, graph, app) = setup(&[("ManyCalls.java", &text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("ManyCalls.java", &text)]);
     let measured = graph
         .nodes
         .iter()
@@ -912,7 +1030,7 @@ class Own extends Base {
  }
 }
 "#;
-    let (dir, _store, graph, app) = setup(&[("Inheritance.java", text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("Inheritance.java", text)]);
     let measured = graph
         .nodes
         .iter()
@@ -974,7 +1092,7 @@ fn publish_bundle(
 
 #[tokio::test]
 async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_documents() {
-    let (dir, store, _graph, app) = fixture();
+    let (dir, store, _graph, app, _session) = fixture();
     assert_eq!(
         call(&app, source("A.java", 3, &dir)).await.0,
         StatusCode::OK
@@ -990,9 +1108,67 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     let (status, result) = call(&app, source("A.java", 3, &dir)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{result}");
     assert_eq!(result["error"]["code"], "incompatible_index");
+    assert!(!result.to_string().contains("forged.java"));
+    let (status, closed) = call(&app, source("B.java", 1, &dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
+    assert_eq!(closed["error"]["code"], "incompatible_index");
+    assert!(!closed.to_string().contains("forged.java"));
+
+    // A coherent graph-only row with no selected native document is an
+    // independent typed corruption. Its first refusal closes every app path.
+    let (missing_dir, _missing_store, _graph, missing_app, _missing_session) = fixture();
+    let missing_db = rusqlite::Connection::open(index_db(&missing_dir)).unwrap();
     assert_eq!(
-        call(&app, source("B.java", 1, &dir)).await.0,
-        StatusCode::OK,
-        "unselected B.java stays usable despite A.java tamper"
+        missing_db
+            .execute(
+                "INSERT INTO files(path,hash,payload,capture_stat) SELECT 'orphan.java',hash,json_set(payload,'$.path','orphan.java'),capture_stat FROM files WHERE path='B.java'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    let fk_count: i64 = missing_db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk_count, 0);
+    let (status, missing) = call(&missing_app, source("orphan.java", 1, &missing_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{missing}");
+    assert_eq!(missing["error"]["code"], "incompatible_index");
+    assert!(missing.get("targets").is_none());
+    assert!(!missing.to_string().contains("forged.java"));
+    let (status, closed) = call(&missing_app, source("B.java", 1, &missing_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
+    assert_eq!(closed["error"]["code"], "incompatible_index");
+    assert!(!closed.to_string().contains("forged.java"));
+
+    // Member selection authenticates the exact node JSON before using its kind.
+    let (selected_dir, selected_store, selected_graph, selected_app, _selected_session) = fixture();
+    let selected_clone = selected_store.clone();
+    let class_id = id(&selected_graph, "A");
+    let selector = member(&selected_dir, class_id, "first", 0);
+    let selected_db = rusqlite::Connection::open(index_db(&selected_dir)).unwrap();
+    selected_db
+        .execute(
+            "UPDATE nodes SET payload='not-json' WHERE id=?1",
+            [&class_id],
+        )
+        .unwrap();
+    let (status, invalid) = call(&selected_app, selector).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{invalid}");
+    assert_eq!(invalid["error"]["code"], "incompatible_index");
+    assert!(invalid.get("targets").is_none());
+    assert!(!invalid.to_string().contains("not-json"));
+    let (status, closed) = call(&selected_app, source("B.java", 1, &selected_dir)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
+    assert_eq!(closed["error"]["code"], "incompatible_index");
+    assert!(closed.get("targets").is_none());
+    assert!(
+        selected_clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
     );
 }

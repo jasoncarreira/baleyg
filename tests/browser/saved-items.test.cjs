@@ -194,8 +194,13 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   const paths=fixture();let server,browser,context,page;const pageErrors=[];
   t.after(async()=>{try{await context?.close();}catch{}try{await browser?.close();}catch{}await stopDaemon(server);rmSync(paths.temp,{recursive:true,force:true});});
   const indexed=await run(binary,["index","--workspace",paths.workspace],{env:paths.env,timeout:30000});
-  const P=JSON.parse(indexed.stdout).status.revision;
+  const initialPin=JSON.parse(indexed.stdout).status.revision;
   server=await startDaemon(paths);
+  const servingStatus=await api(server.base,paths.token,"GET","/api/status");
+  assert.equal(servingStatus.status,200,JSON.stringify(servingStatus.data));
+  const P=servingStatus.data.revision;
+  assert.equal(P.indexGeneration,initialPin.indexGeneration);
+  assert.equal(P.indexRevision,initialPin.indexRevision+1);
   let wrongToken; do { wrongToken = randomBytes(32).toString("hex"); } while (wrongToken === paths.token);
   const denied = await fetch(`${server.base}/api/views`, {signal:AbortSignal.timeout(8000),
     headers:{Origin:server.base,Authorization:`Bearer ${wrongToken}`}});
@@ -278,7 +283,13 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
 
   await context.close();context=null;await stopDaemon(server);server=null;
   const legacyId=`legacy-${kind}`;insertLegacy(dbPath,kind,legacyId,seed);
-  server=await startDaemon(paths);context=await browser.newContext();page=await context.newPage();page.on("pageerror",error=>pageErrors.push(error));
+  server=await startDaemon(paths);
+  const reopenedStatus=await api(server.base,paths.token,"GET","/api/status");
+  assert.equal(reopenedStatus.status,200,JSON.stringify(reopenedStatus.data));
+  const R=reopenedStatus.data.revision;
+  assert.equal(R.indexGeneration,Q.indexGeneration);
+  assert.equal(R.indexRevision,Q.indexRevision+1);
+  context=await browser.newContext();page=await context.newPage();page.on("pageerror",error=>pageErrors.push(error));
   const legacyRequests=[];page.on("request",request=>legacyRequests.push({url:request.url(),method:request.method(),body:request.postDataJSON?.()}));
   await connect(page,server.base,paths.token);await openTools(page);
   const persistedOrphan=row(page,kind,id);await persistedOrphan.waitFor({state:"visible"});
@@ -289,7 +300,7 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   if(kind==="view")await page.locator("#view-title").fill("Legacy view edited");else {await page.locator("#note-title").fill("Legacy note");await page.locator("#note").fill("Legacy body edited");}
   const legacyPutPromise=page.waitForRequest(request=>request.method()==="PUT"&&new URL(request.url()).pathname===`${putPath}${legacyId}`);
   await page.locator(kind==="view"?"#save-view":"#save-note").click();const legacyPut=await legacyPutPromise;
-  const legacyPutResponse=await legacyPut.response();assert.ok(legacyPutResponse);assert.equal(legacyPutResponse.status(),200);assertPinnedUrl(legacyPut.url(),Q);
+  const legacyPutResponse=await legacyPut.response();assert.ok(legacyPutResponse);assert.equal(legacyPutResponse.status(),200);assertPinnedUrl(legacyPut.url(),R);
   assert.equal(kind==="view"?legacyPut.postDataJSON().query.seed:legacyPut.postDataJSON().nodeId,seed);assert.equal(Object.hasOwn(JSON.parse(readPayload(dbPath,kind,legacyId)),"anchor"),false);
   const legacyLoadAfter=row(page,kind,legacyId).getByRole("button",{name:"Load",exact:true});const legacyBox=await legacyLoadAfter.boundingBox();assert.ok(legacyBox);
   const legacyQueryBaseline=legacyRequests.filter(request=>new URL(request.url).pathname==="/api/query").length;await page.mouse.click(legacyBox.x+legacyBox.width/2,legacyBox.y+legacyBox.height/2);await delay(250);

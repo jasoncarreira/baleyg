@@ -4,6 +4,7 @@ use crate::{
     model::{CancelFlag, IndexProgress, SourceFile},
 };
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -55,6 +56,68 @@ struct Stamp {
     mtime: (i64, i64),
     #[cfg(unix)]
     ctime: (i64, i64),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CaptureStat {
+    pub version: u8,
+    pub kind: String,
+    pub size: u64,
+    pub device: Option<u64>,
+    pub inode: Option<u64>,
+    pub mtime_seconds: Option<i64>,
+    pub mtime_nanoseconds: Option<i64>,
+    pub ctime_seconds: Option<i64>,
+    pub ctime_nanoseconds: Option<i64>,
+}
+
+impl Stamp {
+    fn persisted(&self) -> CaptureStat {
+        CaptureStat {
+            version: 1,
+            kind: match self.kind {
+                1 => "directory",
+                2 => "file",
+                _ => "other",
+            }
+            .into(),
+            size: self.len,
+            #[cfg(unix)]
+            device: Some(self.dev),
+            #[cfg(not(unix))]
+            device: None,
+            #[cfg(unix)]
+            inode: Some(self.ino),
+            #[cfg(not(unix))]
+            inode: None,
+            #[cfg(unix)]
+            mtime_seconds: Some(self.mtime.0),
+            #[cfg(not(unix))]
+            mtime_seconds: None,
+            #[cfg(unix)]
+            mtime_nanoseconds: Some(self.mtime.1),
+            #[cfg(not(unix))]
+            mtime_nanoseconds: None,
+            #[cfg(unix)]
+            ctime_seconds: Some(self.ctime.0),
+            #[cfg(not(unix))]
+            ctime_seconds: None,
+            #[cfg(unix)]
+            ctime_nanoseconds: Some(self.ctime.1),
+            #[cfg(not(unix))]
+            ctime_nanoseconds: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, tag = "state", rename_all = "camelCase")]
+pub enum CaptureInputObservation {
+    Absent,
+    Present { stat: CaptureStat, hash: String },
+    Directory { stat: CaptureStat },
+    Root { stat: CaptureStat },
 }
 fn stamp(meta: &fs::Metadata) -> Stamp {
     #[cfg(unix)]
@@ -299,6 +362,7 @@ pub struct Capture {
     executable_bytes: Arc<[u8]>,
     executable_digest: String,
     input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
+    reconcile_options: crate::indexer::ReconcileOptions,
 }
 impl Capture {
     pub fn admit(
@@ -462,6 +526,7 @@ impl Capture {
             executable_bytes,
             executable_digest,
             input_bytes,
+            reconcile_options: crate::indexer::ReconcileOptions::from(options),
         };
         capture.verify(cancel)?;
         Ok(capture)
@@ -514,6 +579,87 @@ impl Capture {
         self.input_bytes
             .iter()
             .map(|(path, bytes)| (path.as_path(), bytes.as_deref()))
+    }
+    pub(crate) fn reconcile_options(&self) -> &crate::indexer::ReconcileOptions {
+        &self.reconcile_options
+    }
+    pub(crate) fn source_stat(&self, relative: &str) -> Result<CaptureStat> {
+        let path = self.root.join(relative);
+        self.inventory
+            .get(&path)
+            .map(Stamp::persisted)
+            .context("source absent from capture inventory")
+    }
+    pub(crate) fn persisted_inputs(&self) -> Result<BTreeMap<String, CaptureInputObservation>> {
+        fn relative(root: &Path, path: &Path) -> Result<String> {
+            Ok(path
+                .strip_prefix(root)?
+                .to_str()
+                .context("non-UTF8 input path")?
+                .replace('\\', "/"))
+        }
+        let mut result = BTreeMap::new();
+        result.insert(
+            "root:.".into(),
+            CaptureInputObservation::Root {
+                stat: self.root_stamp.persisted(),
+            },
+        );
+        for (path, item) in &self.inventory {
+            if item.kind == 1 {
+                result.insert(
+                    format!("directory:{}", relative(&self.root, path)?),
+                    CaptureInputObservation::Directory {
+                        stat: item.persisted(),
+                    },
+                );
+            }
+        }
+        for (path, state) in &self.inputs {
+            let mut roles = Vec::new();
+            if path == &self.executable_path {
+                roles.push(format!("executable:{}", path.to_string_lossy()));
+            }
+            if self.reconcile_options.scip_path.as_deref() == path.to_str() {
+                roles.push(format!("presentation-scip:{}", path.to_string_lossy()));
+            }
+            if self.reconcile_options.manifest_path.as_deref() == path.to_str() {
+                roles.push(format!("presentation-manifest:{}", path.to_string_lossy()));
+            }
+            if path.starts_with(&self.root) {
+                let rel = relative(&self.root, path)?;
+                if matches!(
+                    path.file_name().and_then(|v| v.to_str()),
+                    Some(".gitignore" | ".ignore")
+                ) {
+                    roles.push(format!("ignore:{rel}"));
+                } else if matches!(rel.as_str(), "rust-toolchain" | "rust-toolchain.toml") {
+                    roles.push(format!("toolchain:{rel}"));
+                } else if ROOT_INPUTS.contains(&rel.as_str()) {
+                    roles.push(format!("config:{rel}"));
+                }
+            }
+            let observation = match state {
+                None => CaptureInputObservation::Absent,
+                Some(stat) => CaptureInputObservation::Present {
+                    stat: stat.persisted(),
+                    hash: hash(
+                        self.input_bytes
+                            .get(path)
+                            .and_then(Option::as_deref)
+                            .context("present input bytes missing")?,
+                    ),
+                },
+            };
+            ensure!(!roles.is_empty(), "capture input lacks a role");
+            for role in roles {
+                ensure!(
+                    result.insert(role, observation.clone()).is_none(),
+                    "duplicate capture input role"
+                );
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -666,5 +812,75 @@ mod tests {
         capture.input_bytes.insert(exe.clone(), Some(admitted));
         assert_eq!(capture.executable_digest(&exe), Some(digest.as_str()));
         capture.verify(&cancel).unwrap();
+    }
+    #[test]
+    fn required_inputs_and_uncertain_sources_take_unconditional_hash_path() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("fake-native-bin");
+        fs::write(&exe, "native-v1").unwrap();
+        fs::write(root.path().join("one.js"), "f();").unwrap();
+        fs::write(root.path().join("package.json"), "{\"a\":1}").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(root.path().to_owned());
+        let first =
+            Capture::admit_with_executable(&options, &cancel, &|_| {}, exe.clone()).unwrap();
+        fs::write(root.path().join("one.js"), "g();").unwrap();
+        fs::write(root.path().join("package.json"), "{\"b\":2}").unwrap();
+        let second = Capture::admit_with_executable(&options, &cancel, &|_| {}, exe).unwrap();
+
+        let mut previous_inputs = first.persisted_inputs().unwrap();
+        let mut current_inputs = second.persisted_inputs().unwrap();
+        let key = "config:package.json";
+        previous_inputs.retain(|candidate, _| candidate == key);
+        current_inputs.retain(|candidate, _| candidate == key);
+        let old_stat = match &previous_inputs[key] {
+            CaptureInputObservation::Present { stat, .. } => stat.clone(),
+            other => panic!("required config was not captured: {other:?}"),
+        };
+        match current_inputs.get_mut(key).unwrap() {
+            CaptureInputObservation::Present { stat, .. } => *stat = old_stat,
+            other => panic!("required config was not recaptured: {other:?}"),
+        }
+        let input_comparison = crate::store::compare_capture_observations(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &previous_inputs,
+            &current_inputs,
+        );
+        assert_eq!(input_comparison.stat_changed, 0);
+        assert_eq!(input_comparison.hash_changed, 1);
+        assert_eq!(input_comparison.unchanged_stat_input_hash_changed, 1);
+
+        let mut uncertain = second.source_stat("one.js").unwrap();
+        uncertain.mtime_seconds = None;
+        uncertain.mtime_nanoseconds = None;
+        uncertain.ctime_seconds = None;
+        uncertain.ctime_nanoseconds = None;
+        let previous_sources = BTreeMap::from([(
+            "one.js".to_owned(),
+            (first.files[0].hash.clone(), uncertain.clone()),
+        )]);
+        let current_sources = BTreeMap::from([(
+            "one.js".to_owned(),
+            (second.files[0].hash.clone(), uncertain),
+        )]);
+        let uncertain_comparison = crate::store::compare_capture_observations(
+            &previous_sources,
+            &current_sources,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(uncertain_comparison.stat_changed, 0);
+        assert_eq!(uncertain_comparison.hash_changed, 1);
+        assert_eq!(uncertain_comparison.uncertain_timestamp_hashed, 1);
+        assert_ne!(first.files[0].text, second.files[0].text);
+        assert_eq!(
+            second.source_operations["one.js"],
+            SourceOperations {
+                opens: 1,
+                complete_reads: 1,
+                hashes: 1,
+            }
+        );
     }
 }

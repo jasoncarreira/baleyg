@@ -9,8 +9,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
     path::Path,
-    sync::Arc,
-    sync::atomic::Ordering,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,12 +21,141 @@ pub struct Store {
     roots: topology::TopologyRoots,
     identity: Arc<topology::WorkspaceIdentity>,
     workspace_root: String,
+    recovery_required: Arc<AtomicBool>,
+    recovery_disposition: Arc<AtomicU8>,
 }
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryDisposition {
+    Ready = 0,
+    Rebuild = 1,
+    RecreatePending = 2,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataColumn {
+    SchemaVersion,
+    ExtractorVersion,
+    IndexGeneration,
+    IndexRevision,
+}
+impl MetadataColumn {
+    fn sql(self) -> (&'static str, &'static str, &'static str, &'static [u8]) {
+        match self {
+            Self::SchemaVersion => (
+                "SELECT typeof(schema_version) FROM index_metadata WHERE singleton=1",
+                "SELECT schema_version FROM index_metadata WHERE singleton=1",
+                "schema_version",
+                b"schema_version",
+            ),
+            Self::ExtractorVersion => (
+                "SELECT typeof(extractor_version) FROM index_metadata WHERE singleton=1",
+                "SELECT extractor_version FROM index_metadata WHERE singleton=1",
+                "extractor_version",
+                b"extractor_version",
+            ),
+            Self::IndexGeneration => (
+                "SELECT typeof(index_generation) FROM index_metadata WHERE singleton=1",
+                "SELECT index_generation FROM index_metadata WHERE singleton=1",
+                "index_generation",
+                b"index_generation",
+            ),
+            Self::IndexRevision => (
+                "SELECT typeof(index_revision) FROM index_metadata WHERE singleton=1",
+                "SELECT index_revision FROM index_metadata WHERE singleton=1",
+                "index_revision",
+                b"index_revision",
+            ),
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MetadataAtom {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Streamed {
+        column: MetadataColumn,
+        text: bool,
+        byte_length: usize,
+        sha256: [u8; 32],
+    },
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveryWitness {
+    pragma_schema: u32,
+    schema_version: MetadataAtom,
+    extractor_version: MetadataAtom,
+    index_generation: MetadataAtom,
+    index_revision: MetadataAtom,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryBaseline {
+    witness: RecoveryWitness,
+    pin: Option<IndexPin>,
+    compatible: bool,
+}
+impl RecoveryBaseline {
+    pub(crate) fn pin(&self) -> Option<IndexPin> {
+        self.pin
+    }
+}
+#[derive(Clone, Debug)]
+enum ExpectedPublication {
+    Pin(IndexPin),
+    Recovery(Box<RecoveryBaseline>),
+}
+#[derive(Clone, Copy)]
+enum PublicationTarget<'a> {
+    Live,
+    Stage(&'a StagedIndex),
+}
+struct PublicationPlan<'a> {
+    expected: ExpectedPublication,
+    target: PublicationTarget<'a>,
+}
+#[derive(Debug)]
+struct ExceptionalIndexFormat;
+impl std::fmt::Display for ExceptionalIndexFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("exceptional index format recovery deferred")
+    }
+}
+impl std::error::Error for ExceptionalIndexFormat {}
+#[derive(Debug)]
+struct SelectedIntegrity(String);
+impl std::fmt::Display for SelectedIntegrity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for SelectedIntegrity {}
+#[derive(Debug)]
+struct ControlIntegrity(String);
+impl std::fmt::Display for ControlIntegrity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for ControlIntegrity {}
+macro_rules! control_ensure {
+    ($condition:expr, $message:expr $(,)?) => {
+        if !$condition {
+            return Err(ControlIntegrity($message.into()).into());
+        }
+    };
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublishStage {
     BeforeTransaction,
     AfterFile,
     BeforeCommit,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ActivationStage {
+    BeforeRename,
+    AfterJournalBackupBeforeDirFsync,
+    AfterRenameBeforeDirFsync,
 }
 // Serde's compact JSON serializer writes exactly the bytes persisted by `json()`.
 // Count and abort while streaming; never build an over-limit encoded source.
@@ -89,7 +220,8 @@ SELECT COALESCE(length(CAST(a.call_id AS BLOB)),0)+COALESCE(length(CAST(a.region
 UNION ALL
 SELECT COALESCE(length(CAST(c.id AS BLOB)),0)+COALESCE(length(CAST(c.owner_syntax_id AS BLOB)),0)+COALESCE(length(CAST(c.source_set_id AS BLOB)),0)+COALESCE(length(CAST(c.language AS BLOB)),0)+COALESCE(length(CAST(c.path AS BLOB)),0)+COALESCE(length(CAST(c.revision_id AS BLOB)),0)+COALESCE(length(CAST(c.kind AS BLOB)),0)+COALESCE(length(CAST(c.parent_id AS BLOB)),0)+COALESCE(length(CAST(c.arm AS BLOB)),0)+COALESCE(length(CAST(c.provenance_id AS BLOB)),0) AS row_bytes FROM native_control_regions c WHERE c.source_set_id=?2 AND c.language=?3 AND c.revision_id=?4 AND c.path=?1
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 6;
+const DATABASE_SCHEMA_VERSION: u32 = 7;
+const PREVIOUS_SCHEMA_VERSION: u32 = 6;
 const EXTRACTOR_VERSION: &str = "native-paired-v1";
 const GRAPH_SCHEMA_VERSION: u32 = 5;
 const GRAPH_EXTRACTOR_VERSION: &str = "native-no-lexical-v1";
@@ -104,7 +236,7 @@ CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES
 CREATE INDEX class_relations_owner ON class_relations(owner,id);
 CREATE INDEX class_relations_target ON class_relations(target,id);
 ";
-const CACHE_SCHEMA: &str = "
+const CACHE_SCHEMA_V6: &str = "
 CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
 CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
@@ -112,6 +244,12 @@ CREATE INDEX nodes_name ON nodes(name);
 CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
 CREATE INDEX calls_caller ON calls(caller);
 CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+";
+const CACHE_SCHEMA_V7_ADDITIONS: &str = "
+ALTER TABLE index_metadata ADD COLUMN reconciled_incarnation TEXT;
+ALTER TABLE index_metadata ADD COLUMN reconcile_options TEXT;
+ALTER TABLE files ADD COLUMN capture_stat TEXT;
+CREATE TABLE capture_inputs(input_key TEXT PRIMARY KEY, payload TEXT NOT NULL);
 ";
 
 const NATIVE_SCHEMA: &str = "
@@ -164,6 +302,112 @@ impl DerefMut for IndexConnection {
         &mut self.db
     }
 }
+// Only the live variant owns a new shared-use guard. The stage variant keeps
+// the caller's verified exclusive leader guard alive across its transaction.
+enum PublicationConnection {
+    Live(IndexConnection),
+    Stage(Connection),
+}
+impl Deref for PublicationConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Live(db) => &db.db,
+            Self::Stage(db) => db,
+        }
+    }
+}
+impl DerefMut for PublicationConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self {
+            Self::Live(db) => &mut db.db,
+            Self::Stage(db) => db,
+        }
+    }
+}
+
+/// One coherent native read snapshot retained until its owned result passes T03.
+pub struct EvidenceResponse {
+    store: Store,
+    db: IndexConnection,
+    follower: topology::FollowerGuard,
+    marker: uuid::Uuid,
+}
+impl EvidenceResponse {
+    pub fn finish<T>(&self, value: T) -> Result<T> {
+        self.store.identity.verify()?;
+        self.follower.verify(self.marker)?;
+        Ok(value)
+    }
+    pub fn status(&self) -> Result<IndexStatus> {
+        self.store.read_status(&self.db)
+    }
+    pub fn source_at(
+        &self,
+        path: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<(IndexPin, SourceFile)>> {
+        let revision = self.status()?.revision;
+        ensure!(
+            expected.is_none_or(|pin| pin == revision),
+            "revision conflict"
+        );
+        Ok(self
+            .store
+            .selected_source_row(&self.db, path)?
+            .map(|source| (revision, source)))
+    }
+    pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
+        self.store
+            .validate_selected_view_in(&self.db, view, sources)
+    }
+    pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
+        query.validate()?;
+        self.store.query_view_in(&self.db, query, None)
+    }
+    /// Release the SQLite snapshot before slow response assembly or provider work.
+    /// The follower guard retains protected use and the snapshot's incarnation.
+    pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
+        let Self {
+            store,
+            db,
+            follower,
+            marker,
+        } = self;
+        drop(db);
+        EvidenceFence {
+            store,
+            follower,
+            marker,
+            policy,
+        }
+    }
+}
+/// Unpinned responses need T03 only; cached packets also require their exact pin.
+#[derive(Clone, Copy)]
+pub enum EvidenceFencePolicy {
+    T03,
+    ExactPin(IndexPin),
+}
+pub struct EvidenceFence {
+    store: Store,
+    follower: topology::FollowerGuard,
+    marker: uuid::Uuid,
+    policy: EvidenceFencePolicy,
+}
+impl EvidenceFence {
+    pub fn finish<T>(&self, value: T) -> Result<T> {
+        self.store.identity.verify()?;
+        self.follower.verify(self.marker)?;
+        if let EvidenceFencePolicy::ExactPin(pin) = self.policy {
+            ensure!(self.store.status()?.revision == pin, "revision conflict");
+            self.store.identity.verify()?;
+            self.follower.verify(self.marker)?;
+        }
+        Ok(value)
+    }
+}
+
 fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         if suffix == "-journal" && !writable {
@@ -207,11 +451,21 @@ fn verify_index_file(path: &Path) -> Result<()> {
         path.display()
     );
     let mut header = [0u8; 20];
-    file.read_exact(&mut header)
-        .context("incompatible_index: invalid database header")?;
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(ExceptionalIndexFormat.into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(ExceptionalIndexFormat.into());
+    }
+    // WAL (2,2) and other valid-header journaling modes are operational or
+    // incompatible state, not permission to replace this inode.
     ensure!(
-        &header[..16] == b"SQLite format 3\0" && header[18] == 1 && header[19] == 1,
-        "incompatible_index: rollback header required"
+        header[18] == 1 && header[19] == 1,
+        "incompatible_index: unsupported SQLite journaling mode"
     );
     let _ = file.as_raw_fd();
     Ok(())
@@ -225,11 +479,81 @@ fn index_path_present(path: &Path) -> Result<bool> {
     }
 }
 
+fn restore_index_journal(journal: &IndexFileWitness, backup: &Path, dir: &Path) -> Result<()> {
+    journal.verify_at(backup)?;
+    ensure!(
+        !index_path_present(&journal.path)?,
+        "unsafe_index: journal pathname reappeared"
+    );
+    std::fs::rename(backup, &journal.path)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    journal.verify()
+}
+
+// A corrupt index can be witnessed without trusting its SQLite header or payload.
+struct IndexFileWitness {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+impl IndexFileWitness {
+    fn open(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let witness = Self {
+            path: path.to_owned(),
+            file,
+        };
+        witness.verify()?;
+        Ok(witness)
+    }
+    fn verify(&self) -> Result<()> {
+        self.verify_at(&self.path)
+    }
+    fn verify_at(&self, path: &Path) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self.file.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        ensure!(
+            held.is_file()
+                && held.uid() == unsafe { libc::geteuid() }
+                && held.mode() & 0o777 == 0o600
+                && held.nlink() == 1
+                && named.is_file()
+                && !named.file_type().is_symlink()
+                && held.dev() == named.dev()
+                && held.ino() == named.ino(),
+            "unsafe_index: protected index pathname changed"
+        );
+        Ok(())
+    }
+}
 // The staged file is private to this attempt. On failure, only unlink our own inode.
 struct StagedIndex {
     path: std::path::PathBuf,
     file: std::fs::File,
     published: bool,
+}
+impl StagedIndex {
+    fn verify_path(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self.file.metadata()?;
+        let named = std::fs::symlink_metadata(&self.path)?;
+        ensure!(
+            held.is_file()
+                && held.uid() == unsafe { libc::geteuid() }
+                && held.mode() & 0o777 == 0o600
+                && held.nlink() == 1
+                && named.is_file()
+                && !named.file_type().is_symlink()
+                && held.dev() == named.dev()
+                && held.ino() == named.ino(),
+            "unsafe_index: staged pathname changed"
+        );
+        Ok(())
+    }
 }
 impl Drop for StagedIndex {
     fn drop(&mut self) {
@@ -259,19 +583,33 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA)?;
-    expected.execute_batch(CLASS_SCHEMA)?;
     let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    expected.execute_batch(CACHE_SCHEMA_V6)?;
     if version == DATABASE_SCHEMA_VERSION {
+        expected.execute_batch(CACHE_SCHEMA_V7_ADDITIONS)?;
+    }
+    expected.execute_batch(CLASS_SCHEMA)?;
+    if matches!(version, PREVIOUS_SCHEMA_VERSION | DATABASE_SCHEMA_VERSION) {
         expected.execute_batch(NATIVE_SCHEMA)?;
     } else {
-        ensure!(
+        control_ensure!(
             matches!(version, LEGACY_SCHEMA_VERSION | GRAPH_SCHEMA_VERSION),
             "incompatible_index: unknown schema version"
         );
     }
-    ensure!(
-        objects(db)? == objects(&expected)?,
+    let actual = objects(db)?;
+    let exact = actual == objects(&expected)?;
+    let known_recovery_hybrid = if matches!(version, LEGACY_SCHEMA_VERSION | GRAPH_SCHEMA_VERSION) {
+        let hybrid = Connection::open_in_memory()?;
+        hybrid.execute_batch(CACHE_SCHEMA_V6)?;
+        hybrid.execute_batch(CACHE_SCHEMA_V7_ADDITIONS)?;
+        hybrid.execute_batch(CLASS_SCHEMA)?;
+        actual == objects(&hybrid)?
+    } else {
+        false
+    };
+    control_ensure!(
+        exact || known_recovery_hybrid,
         "incompatible_index: unknown cache object type, name or shape"
     );
     Ok(())
@@ -300,7 +638,10 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     ensure!(
         matches!(
             version,
-            LEGACY_SCHEMA_VERSION | GRAPH_SCHEMA_VERSION | DATABASE_SCHEMA_VERSION
+            LEGACY_SCHEMA_VERSION
+                | GRAPH_SCHEMA_VERSION
+                | PREVIOUS_SCHEMA_VERSION
+                | DATABASE_SCHEMA_VERSION
         ),
         "incompatible_index: schema version {version}"
     );
@@ -315,21 +656,57 @@ fn open_index(path: &Path, writable: bool) -> Result<Connection> {
     storage_result(db.prepare("SELECT id,name,qualified_name,path,payload FROM classes"))?;
     storage_result(db.prepare("SELECT id,owner,target,payload FROM class_relations"))?;
     validate_cache_shape(&db)?;
-    let metadata: (i64, String) = db.query_row(
-        "SELECT schema_version,extractor_version FROM index_metadata WHERE singleton=1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    ensure!(
-        (version == LEGACY_SCHEMA_VERSION && metadata == (4, LEGACY_EXTRACTOR_VERSION.into()))
-            || (version == GRAPH_SCHEMA_VERSION && metadata == (5, GRAPH_EXTRACTOR_VERSION.into()))
-            || (version == DATABASE_SCHEMA_VERSION && metadata == (6, EXTRACTOR_VERSION.into())),
-        "incompatible_index: schema and metadata mismatch"
-    );
-    let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
-    ensure!(count == 1, "incompatible_index: metadata cardinality");
     Ok(db)
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryClass {
+    Rebuild,
+    RecreatePending,
+    Hard,
+}
+fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
+    if error.downcast_ref::<ExceptionalIndexFormat>().is_some() {
+        return RecoveryClass::RecreatePending;
+    }
+    if error.downcast_ref::<SelectedIntegrity>().is_some()
+        || error.downcast_ref::<ControlIntegrity>().is_some()
+        || error.downcast_ref::<serde_json::Error>().is_some()
+        || error.downcast_ref::<std::string::FromUtf8Error>().is_some()
+    {
+        return RecoveryClass::Rebuild;
+    }
+    if let Some(sqlite) = error.downcast_ref::<rusqlite::Error>() {
+        return match sqlite {
+            rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::Utf8Error(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::QueryReturnedNoRows
+            | rusqlite::Error::QueryReturnedMoreThanOneRow => RecoveryClass::Rebuild,
+            rusqlite::Error::SqliteFailure(info, _)
+                if matches!(
+                    info.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                ) =>
+            {
+                RecoveryClass::RecreatePending
+            }
+            _ => RecoveryClass::Hard,
+        };
+    }
+    RecoveryClass::Hard
+}
+fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
+    if recovery_class(&error) != RecoveryClass::Hard
+        || error.downcast_ref::<rusqlite::Error>().is_some()
+        || error.downcast_ref::<std::io::Error>().is_some()
+    {
+        error
+    } else {
+        SelectedIntegrity(format!("{error:#}")).into()
+    }
+}
+
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     match result {
         Err(rusqlite::Error::SqliteFailure(info, _))
@@ -501,13 +878,11 @@ fn validate_graph(graph: &Graph, cancel: &CancelFlag) -> Result<IndexStats> {
 }
 
 fn class_metadata(db: &Connection) -> Result<(Vec<String>, bool)> {
-    let length: i64 = db
-        .query_row(
-            "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("incompatible_index: class catalog missing: {e}"))?;
+    let length: i64 = db.query_row(
+        "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
     ensure!(
         (0..=256 * 1024).contains(&length),
         "incompatible_index: class catalog byte budget exceeded"
@@ -535,6 +910,7 @@ fn class_metadata(db: &Connection) -> Result<(Vec<String>, bool)> {
 /// clipped in SQLite, without materializing their full strings in the API.
 /// IDs, class metadata, and source ranges remain exact; only member arrays shrink.
 fn presentation_class(
+    store: &Store,
     db: &Connection,
     id: &str,
 ) -> Result<Option<(crate::classes::ClassDefinition, usize, bool)>> {
@@ -545,20 +921,49 @@ fn presentation_class(
             [id],
             |r| r.get(0),
         )
-        .optional()?;
+        .optional()
+        .map_err(|error| store.report_selected_failure(error.into()))?;
     let Some(size) = size else {
         return Ok(None);
     };
+    let valid: bool = db
+        .query_row(
+            "SELECT json_valid(payload) FROM classes WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|error| store.report_selected_failure(error.into()))?;
+    if !valid {
+        return Err(store.report_selected_failure(
+            SelectedIntegrity("incompatible_index: selected class JSON invalid".into()).into(),
+        ));
+    }
     if size <= CLASS_BYTES as i64 {
-        let payload: String =
-            db.query_row("SELECT payload FROM classes WHERE id=?1", [id], |r| {
+        let payload: String = db
+            .query_row("SELECT payload FROM classes WHERE id=?1", [id], |r| {
                 r.get(0)
-            })?;
-        return Ok(Some((
-            serde_json::from_str(&payload)?,
-            payload.len(),
-            false,
-        )));
+            })
+            .map_err(|error| store.report_selected_failure(error.into()))?;
+        let class = serde_json::from_str(&payload)
+            .map_err(|error| store.report_selected_failure(error.into()))?;
+        return Ok(Some((class, payload.len(), false)));
+    }
+    let clip_shape: bool = db
+        .query_row(
+            "SELECT json_type(payload,'$.fields')='array'
+                AND json_type(payload,'$.methods')='array'
+                AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.fields') WHERE type!='object')
+                AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.methods') WHERE type!='object')
+             FROM classes WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|error| store.report_selected_failure(error.into()))?;
+    if !clip_shape {
+        return Err(store.report_selected_failure(
+            SelectedIntegrity("incompatible_index: selected class member JSON invalid".into())
+                .into(),
+        ));
     }
     for count in [32, 16, 8, 4, 2, 1, 0] {
         let payload: Option<String> = db.query_row("WITH clipped AS (
@@ -567,15 +972,18 @@ fn presentation_class(
                 '$.methods',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.methods') WHERE key < ?2),
                 '$.truncated',json('true')) AS payload FROM classes WHERE id=?1)
             SELECT CASE WHEN length(CAST(payload AS BLOB)) <= ?3 THEN payload ELSE NULL END FROM clipped",
-            params![id, count, CLASS_BYTES as i64], |r| r.get(0))?;
+            params![id, count, CLASS_BYTES as i64], |r| r.get(0))
+            .map_err(|error| store.report_selected_failure(error.into()))?;
         if let Some(payload) = payload {
-            return Ok(Some((serde_json::from_str(&payload)?, payload.len(), true)));
+            let class = serde_json::from_str(&payload)
+                .map_err(|error| store.report_selected_failure(error.into()))?;
+            return Ok(Some((class, payload.len(), true)));
         }
     }
     // Pathological non-member metadata cannot fit without changing identity.
     Ok(None)
 }
-fn resolve_class_id(db: &Connection, id: &str) -> Result<String> {
+fn resolve_class_id(store: &Store, db: &Connection, id: &str) -> Result<String> {
     use crate::class_diagram::InvalidRequest;
     let mut current = id.to_owned();
     let mut seen = BTreeSet::new();
@@ -591,9 +999,11 @@ fn resolve_class_id(db: &Connection, id: &str) -> Result<String> {
         )? {
             return Ok(current);
         }
-        let symbol = one::<Symbol>(db, "SELECT payload FROM nodes WHERE id=?1", &current)?.ok_or(
-            InvalidRequest("Choose an indexed Java or Python class or method."),
-        )?;
+        let symbol = one::<Symbol>(db, "SELECT payload FROM nodes WHERE id=?1", &current)
+            .map_err(|error| store.report_selected_failure(error))?
+            .ok_or(InvalidRequest(
+                "Choose an indexed Java or Python class or method.",
+            ))?;
         ensure!(
             depth > 0 || matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function),
             InvalidRequest("Choose an indexed Java or Python class or method.")
@@ -605,9 +1015,13 @@ fn resolve_class_id(db: &Connection, id: &str) -> Result<String> {
     Err(InvalidRequest("The selected symbol exceeds the class ancestry limit.").into())
 }
 
-fn resolve_class(db: &Connection, id: &str) -> Result<(crate::classes::ClassDefinition, bool)> {
-    let id = resolve_class_id(db, id)?;
-    let (class, _, clipped) = presentation_class(db, &id)?.ok_or(
+fn resolve_class(
+    store: &Store,
+    db: &Connection,
+    id: &str,
+) -> Result<(crate::classes::ClassDefinition, bool)> {
+    let id = resolve_class_id(store, db, id)?;
+    let (class, _, clipped) = presentation_class(store, db, &id)?.ok_or(
         crate::class_diagram::InvalidRequest("Class metadata exceeds the presentation byte limit."),
     )?;
     Ok((class, clipped))
@@ -906,15 +1320,15 @@ fn write_native(
 }
 
 /// Bounded readiness check for a pair installed by the verified writer. This does not
-/// attest every stored BLOB after out-of-band SQLite mutation. Opening the Store checks
-/// all rows; pinned source reads verify the selected BLOB inside their read snapshot.
+/// attest every stored BLOB after out-of-band SQLite mutation. Ordinary Store open stays
+/// bounded; pinned source reads verify the selected BLOB inside their read snapshot.
 fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
     fn one_row(db: &Connection, sql: &str) -> Result<Option<(String, String)>> {
         let mut rows = db
             .prepare(sql)?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
+        control_ensure!(
             rows.len() <= 1,
             "incompatible_index: duplicate native pair metadata"
         );
@@ -924,7 +1338,7 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
     let source = one_row(db, "SELECT id,root_id FROM native_source_sets LIMIT 2")?;
     let revision = one_row(db, "SELECT id,source_set_id FROM native_revisions LIMIT 2")?;
     let expected_source = format!("source-set:v1:{root_id}");
-    ensure!(
+    control_ensure!(
         producer
             .as_ref()
             .is_some_and(|(id, kind)| id == "baleyg.native.syntax" && kind == "native")
@@ -935,6 +1349,424 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
                 |(id, source)| id.starts_with("revision:v1:") && source == &expected_source
             ),
         "incompatible_index: missing native pair metadata"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ScanComparison {
+    pub(crate) examined: usize,
+    pub(crate) added: usize,
+    pub(crate) deleted: usize,
+    pub(crate) stat_changed: usize,
+    pub(crate) hash_changed: usize,
+    pub(crate) ctime_changed: usize,
+    pub(crate) unchanged_stat_input_hash_changed: usize,
+    pub(crate) uncertain_timestamp_hashed: usize,
+}
+impl ScanComparison {
+    fn changed(self) -> bool {
+        self.added + self.deleted + self.stat_changed + self.hash_changed > 0
+    }
+}
+
+pub(crate) type SourceObservations = BTreeMap<String, (String, crate::capture::CaptureStat)>;
+pub(crate) type InputObservations = BTreeMap<String, crate::capture::CaptureInputObservation>;
+
+pub(crate) fn compare_capture_observations(
+    previous_sources: &SourceObservations,
+    current_sources: &SourceObservations,
+    previous_inputs: &InputObservations,
+    current_inputs: &InputObservations,
+) -> ScanComparison {
+    let uncertain = |stat: &crate::capture::CaptureStat| {
+        stat.mtime_seconds.is_none()
+            || stat.mtime_nanoseconds.is_none()
+            || stat.ctime_seconds.is_none()
+            || stat.ctime_nanoseconds.is_none()
+    };
+    let mut comparison = ScanComparison::default();
+    let source_keys: BTreeSet<_> = previous_sources
+        .keys()
+        .chain(current_sources.keys())
+        .cloned()
+        .collect();
+    for key in &source_keys {
+        comparison.examined += 1;
+        match (previous_sources.get(key), current_sources.get(key)) {
+            (None, Some(_)) => comparison.added += 1,
+            (Some(_), None) => comparison.deleted += 1,
+            (Some((old_hash, old_stat)), Some((new_hash, new_stat))) => {
+                comparison.stat_changed += usize::from(old_stat != new_stat);
+                comparison.hash_changed += usize::from(old_hash != new_hash);
+                comparison.ctime_changed += usize::from(
+                    old_stat.size == new_stat.size
+                        && old_stat.device == new_stat.device
+                        && old_stat.inode == new_stat.inode
+                        && old_stat.mtime_seconds == new_stat.mtime_seconds
+                        && old_stat.mtime_nanoseconds == new_stat.mtime_nanoseconds
+                        && (old_stat.ctime_seconds != new_stat.ctime_seconds
+                            || old_stat.ctime_nanoseconds != new_stat.ctime_nanoseconds),
+                );
+                comparison.uncertain_timestamp_hashed +=
+                    usize::from(uncertain(old_stat) || uncertain(new_stat));
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    let input_keys: BTreeSet<_> = previous_inputs
+        .keys()
+        .chain(current_inputs.keys())
+        .cloned()
+        .collect();
+    for key in &input_keys {
+        comparison.examined += 1;
+        match (previous_inputs.get(key), current_inputs.get(key)) {
+            (None, Some(_)) => comparison.added += 1,
+            (Some(_), None) => comparison.deleted += 1,
+            (Some(old), Some(new)) => match (old, new) {
+                (
+                    crate::capture::CaptureInputObservation::Present {
+                        stat: old_stat,
+                        hash: old_hash,
+                    },
+                    crate::capture::CaptureInputObservation::Present {
+                        stat: new_stat,
+                        hash: new_hash,
+                    },
+                ) => {
+                    comparison.stat_changed += usize::from(old_stat != new_stat);
+                    comparison.hash_changed += usize::from(old_hash != new_hash);
+                    comparison.unchanged_stat_input_hash_changed +=
+                        usize::from(old_stat == new_stat && old_hash != new_hash);
+                    comparison.uncertain_timestamp_hashed +=
+                        usize::from(uncertain(old_stat) || uncertain(new_stat));
+                }
+                (
+                    crate::capture::CaptureInputObservation::Directory { stat: old },
+                    crate::capture::CaptureInputObservation::Directory { stat: new },
+                )
+                | (
+                    crate::capture::CaptureInputObservation::Root { stat: old },
+                    crate::capture::CaptureInputObservation::Root { stat: new },
+                ) => comparison.stat_changed += usize::from(old != new),
+                (
+                    crate::capture::CaptureInputObservation::Absent,
+                    crate::capture::CaptureInputObservation::Absent,
+                ) => {}
+                _ => comparison.stat_changed += 1,
+            },
+            (None, None) => unreachable!(),
+        }
+    }
+    comparison
+}
+
+fn compare_capture_snapshot(
+    db: &Connection,
+    capture: &crate::capture::Capture,
+) -> Result<ScanComparison> {
+    let mut previous_sources = BTreeMap::new();
+    let mut statement = db.prepare("SELECT path,hash,capture_stat FROM files ORDER BY path")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (path, hash, stat) = row?;
+        let stat: crate::capture::CaptureStat = serde_json::from_str(&stat)?;
+        ensure!(
+            previous_sources.insert(path, (hash, stat)).is_none(),
+            "incompatible_index: duplicate captured source observation"
+        );
+    }
+    let mut current_sources = BTreeMap::new();
+    for source in &capture.files {
+        current_sources.insert(
+            source.path.clone(),
+            (source.hash.clone(), capture.source_stat(&source.path)?),
+        );
+    }
+
+    let mut previous_inputs = BTreeMap::new();
+    let mut statement =
+        db.prepare("SELECT input_key,payload FROM capture_inputs ORDER BY input_key")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (key, payload) = row?;
+        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&payload)?;
+        ensure!(
+            previous_inputs.insert(key, observation).is_none(),
+            "incompatible_index: duplicate captured input observation"
+        );
+    }
+    let current_inputs = capture.persisted_inputs()?;
+    Ok(compare_capture_observations(
+        &previous_sources,
+        &current_sources,
+        &previous_inputs,
+        &current_inputs,
+    ))
+}
+
+fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str) -> Result<()> {
+    let nanos = |value: Option<i64>| value.is_some_and(|n| (0..1_000_000_000).contains(&n));
+    control_ensure!(
+        stat.version == 1
+            && stat.kind == expected_kind
+            && stat.device.is_some() == stat.inode.is_some()
+            && stat.mtime_seconds.is_some() == stat.mtime_nanoseconds.is_some()
+            && stat.ctime_seconds.is_some() == stat.ctime_nanoseconds.is_some()
+            && stat.mtime_seconds.is_some() == stat.ctime_seconds.is_some(),
+        "incompatible_index: invalid capture stat"
+    );
+    #[cfg(unix)]
+    control_ensure!(
+        stat.device.is_some_and(|n| n > 0)
+            && stat.inode.is_some_and(|n| n > 0)
+            && nanos(stat.mtime_nanoseconds)
+            && nanos(stat.ctime_nanoseconds),
+        "incompatible_index: incomplete Unix capture stat"
+    );
+    #[cfg(not(unix))]
+    control_ensure!(
+        stat.device.is_none()
+            && stat.inode.is_none()
+            && stat.mtime_seconds.is_none()
+            && stat.ctime_seconds.is_none(),
+        "incompatible_index: invalid portable capture stat"
+    );
+    Ok(())
+}
+
+fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
+    let (incarnation, options): (Option<String>, Option<String>) = db.query_row(
+        "SELECT reconciled_incarnation,reconcile_options FROM index_metadata WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let incarnation = incarnation.ok_or_else(|| {
+        ControlIntegrity("incompatible_index: missing reconciled incarnation".into())
+    })?;
+    uuid::Uuid::parse_str(&incarnation).map_err(|error| {
+        ControlIntegrity(format!(
+            "incompatible_index: invalid reconciled incarnation: {error}"
+        ))
+    })?;
+    let options = options
+        .ok_or_else(|| ControlIntegrity("incompatible_index: missing reconcile options".into()))?;
+    let decoded_options: crate::indexer::ReconcileOptions =
+        serde_json::from_str(&options).context("incompatible_index: invalid reconcile options")?;
+    control_ensure!(
+        json(&decoded_options)? == options
+            && decoded_options.version == 1
+            && decoded_options.max_file_bytes > 0
+            && decoded_options.max_file_bytes <= 256 * 1024 * 1024,
+        "incompatible_index: unsupported reconcile options"
+    );
+
+    let mut source_paths = BTreeSet::new();
+    let mut file_statement = db.prepare("SELECT path,capture_stat FROM files ORDER BY path")?;
+    let mut files = file_statement.query([])?;
+    while let Some(row) = files.next()? {
+        let path: String = row.get(0)?;
+        control_ensure!(
+            !path.is_empty()
+                && !Path::new(&path).is_absolute()
+                && !path.split('/').any(|part| part.is_empty() || part == ".."),
+            "incompatible_index: invalid captured source path"
+        );
+        control_ensure!(
+            source_paths.insert(path.clone()),
+            "incompatible_index: duplicate captured source path"
+        );
+        let payload: String = row.get(1)?;
+        let decoded: crate::capture::CaptureStat =
+            serde_json::from_str(&payload).context("incompatible_index: invalid capture stat")?;
+        validate_capture_stat(&decoded, "file")?;
+        control_ensure!(
+            json(&decoded)? == payload,
+            "incompatible_index: invalid capture stat"
+        );
+    }
+
+    let mut input_statement =
+        db.prepare("SELECT input_key,payload FROM capture_inputs ORDER BY input_key")?;
+    let mut inputs = input_statement.query([])?;
+    let mut actual = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    let mut executable = None;
+    while let Some(row) = inputs.next()? {
+        let key: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+        control_ensure!(
+            !key.is_empty() && key.len() <= 8192 && actual.insert(key.clone()),
+            "incompatible_index: invalid capture input key"
+        );
+        let observation: crate::capture::CaptureInputObservation =
+            serde_json::from_str(&payload).context("incompatible_index: invalid capture input")?;
+        control_ensure!(
+            json(&observation)? == payload,
+            "incompatible_index: noncanonical capture input"
+        );
+        match (&key[..], &observation) {
+            ("root:.", crate::capture::CaptureInputObservation::Root { stat }) => {
+                validate_capture_stat(stat, "directory")?;
+            }
+            (key, crate::capture::CaptureInputObservation::Directory { stat })
+                if key.starts_with("directory:") =>
+            {
+                validate_capture_stat(stat, "directory")?;
+                let relative = key.trim_start_matches("directory:");
+                control_ensure!(
+                    relative.is_empty()
+                        || (!Path::new(relative).is_absolute()
+                            && !relative
+                                .split('/')
+                                .any(|part| part.is_empty() || part == "..")),
+                    "incompatible_index: invalid captured directory"
+                );
+                directories.insert(relative.to_owned());
+            }
+            (key, crate::capture::CaptureInputObservation::Present { stat, hash })
+                if key.starts_with("config:")
+                    || key.starts_with("toolchain:")
+                    || key.starts_with("ignore:")
+                    || key.starts_with("presentation-scip:")
+                    || key.starts_with("presentation-manifest:")
+                    || key.starts_with("executable:") =>
+            {
+                validate_capture_stat(stat, "file")?;
+                control_ensure!(
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "incompatible_index: invalid capture input hash"
+                );
+                if key.starts_with("executable:") {
+                    control_ensure!(
+                        executable.replace(key.to_owned()).is_none(),
+                        "incompatible_index: duplicate executable input"
+                    );
+                }
+            }
+            (key, crate::capture::CaptureInputObservation::Absent)
+                if key.starts_with("config:")
+                    || key.starts_with("toolchain:")
+                    || key.starts_with("ignore:")
+                    || key.starts_with("presentation-scip:")
+                    || key.starts_with("presentation-manifest:") => {}
+            _ => {
+                return Err(ControlIntegrity(
+                    "incompatible_index: capture input role mismatch".into(),
+                )
+                .into());
+            }
+        }
+    }
+
+    control_ensure!(
+        directories.contains(""),
+        "incompatible_index: missing root directory inventory"
+    );
+    for source in &source_paths {
+        let mut parent = Path::new(source).parent();
+        while let Some(path) = parent {
+            let relative = path
+                .to_str()
+                .ok_or_else(|| {
+                    ControlIntegrity("incompatible_index: non-UTF8 source parent".into())
+                })?
+                .replace('\\', "/");
+            control_ensure!(
+                directories.contains(&relative),
+                "incompatible_index: missing source directory inventory"
+            );
+            parent = path.parent();
+        }
+    }
+    let mut expected = BTreeSet::from(["root:.".to_owned()]);
+    for name in &crate::capture::ROOT_INPUTS[..22] {
+        expected.insert(format!("config:{name}"));
+    }
+    for name in &crate::capture::ROOT_INPUTS[22..] {
+        expected.insert(format!("toolchain:{name}"));
+    }
+    for directory in &directories {
+        for name in [".gitignore", ".ignore"] {
+            expected.insert(if directory.is_empty() {
+                format!("ignore:{name}")
+            } else {
+                format!("ignore:{directory}/{name}")
+            });
+        }
+        expected.insert(format!("directory:{directory}"));
+    }
+    expected.insert(
+        executable.ok_or_else(|| {
+            ControlIntegrity("incompatible_index: missing executable input".into())
+        })?,
+    );
+    match &decoded_options.scip_path {
+        Some(path) => {
+            control_ensure!(!path.is_empty(), "incompatible_index: empty SCIP option");
+            expected.insert(format!("presentation-scip:{path}"));
+        }
+        None => control_ensure!(
+            !actual
+                .iter()
+                .any(|key| key.starts_with("presentation-scip:")),
+            "incompatible_index: unconfigured SCIP input"
+        ),
+    }
+    match &decoded_options.manifest_path {
+        Some(path) => {
+            control_ensure!(
+                !path.is_empty(),
+                "incompatible_index: empty manifest option"
+            );
+            expected.insert(format!("presentation-manifest:{path}"));
+        }
+        None => control_ensure!(
+            !actual
+                .iter()
+                .any(|key| key.starts_with("presentation-manifest:")),
+            "incompatible_index: unconfigured manifest input"
+        ),
+    }
+    control_ensure!(
+        actual == expected,
+        "incompatible_index: incomplete or unknown capture inventory"
+    );
+    Ok(())
+}
+
+fn validate_bounded_control(db: &Connection, root_id: &str) -> Result<()> {
+    let (stats, diagnostics): (String, String) = db.query_row(
+        "SELECT stats,diagnostics FROM index_metadata WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let _: IndexStats = serde_json::from_str(&stats)?;
+    let _: Vec<Diagnostic> = serde_json::from_str(&diagnostics)?;
+    validate_paired_metadata(db, root_id)?;
+    validate_reconcile_inventory(db)?;
+    let warnings_bytes: Option<i64> = db
+        .query_row(
+            "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    ensure!(
+        warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)),
+        "incompatible_index: class catalog byte budget exceeded or missing"
     );
     Ok(())
 }
@@ -955,7 +1787,7 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
             && count("native_provenance")? == count("files")?,
         "incompatible_index: incomplete native pair"
     );
-    let mut stmt=db.prepare("SELECT d.source_bytes,d.content_hash,d.byte_length,f.payload,f.hash FROM native_documents d JOIN files f ON d.path=f.path")?;
+    let mut stmt=db.prepare("SELECT d.source_bytes,d.content_hash,d.byte_length,f.payload,f.hash,f.path FROM native_documents d JOIN files f ON d.path=f.path")?;
     let mut rows = stmt.query([])?;
     let mut matched = 0;
     while let Some(row) = rows.next()? {
@@ -969,6 +1801,7 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
                 && hash == hex::encode(Sha256::digest(&bytes))
                 && file.hash == hash
                 && row.get::<_, String>(4)? == hash
+                && file.path == row.get::<_, String>(5)?
                 && file.text.as_bytes() == bytes,
             "incompatible_index: graph/native bytes mismatch"
         );
@@ -985,7 +1818,15 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
             .is_none(),
         "incompatible_index: native foreign key mismatch"
     );
+    let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if schema == DATABASE_SCHEMA_VERSION {
+        validate_reconcile_inventory(db)?;
+    }
     Ok(())
+}
+
+fn native_index_unavailable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<topology::IndexNotReady>().is_some()
 }
 impl Store {
     pub fn open(
@@ -1009,19 +1850,27 @@ impl Store {
                 .to_owned(),
             roots,
             identity: Arc::new(identity),
+            recovery_required: Arc::new(AtomicBool::new(false)),
+            recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
         };
         if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.leader(&store.identity)?;
             store.initialize(&leader, before_publish)?;
         }
-        let mut db = store.cache()?;
-        let tx = storage_result(db.transaction())?;
-        store.read_control_status(&tx)?;
-        let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if schema == DATABASE_SCHEMA_VERSION {
-            validate_paired_rows(&tx)?;
+        let admission = (|| -> Result<()> {
+            let mut db = store.cache()?;
+            let tx = storage_result(db.transaction())?;
+            let _ = store.recovery_baseline(&tx)?;
+            Ok(())
+        })();
+        match admission {
+            Ok(()) => Ok(store),
+            Err(error) if recovery_class(&error) == RecoveryClass::RecreatePending => {
+                store.mark_recovery(RecoveryDisposition::RecreatePending);
+                Ok(store)
+            }
+            Err(error) => Err(error),
         }
-        Ok(store)
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
     pub fn open_for_tests(state: &Path, workspace: &Path) -> Result<Self> {
@@ -1041,31 +1890,24 @@ impl Store {
             topology::TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
         Self::open_with_stage_hook(roots, identity, before_publish)
     }
-    fn initialize(
-        &self,
-        leader: &topology::LeaderGuard,
-        before_publish: impl FnOnce(&Path) -> Result<()>,
-    ) -> Result<()> {
+    /// Build a private schema-6 bootstrap only; the caller must validate and publish it.
+    /// The returned guard unlinks only its own stage inode if it is not published.
+    fn create_staged_index(&self, leader: &topology::LeaderGuard) -> Result<StagedIndex> {
         use rusqlite::OpenFlags;
+        use std::os::unix::fs::OpenOptionsExt;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
         let path = self.roots.index_db(&self.identity);
-        reject_sidecars(&path, true)?;
-        if index_path_present(&path)? {
-            return Ok(());
-        }
-        let use_guard = self.roots.index_use(&self.identity)?;
-        use std::os::unix::fs::OpenOptionsExt;
         let staged_path = path.with_file_name(format!("index.db.tmp-{}", uuid::Uuid::new_v4()));
-        let staged = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&staged_path)?;
-        let mut staged = StagedIndex {
+        let staged = StagedIndex {
             path: staged_path,
-            file: staged,
+            file,
             published: false,
         };
         let db = Connection::open_with_flags(
@@ -1079,7 +1921,7 @@ impl Store {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
-            db.execute_batch(CACHE_SCHEMA)?;
+            db.execute_batch(CACHE_SCHEMA_V6)?;
             db.execute_batch(CLASS_SCHEMA)?;
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
@@ -1105,11 +1947,230 @@ impl Store {
         }
         result?;
         drop(db);
+        Ok(staged)
+    }
+    fn validate_replacement_index(
+        &self,
+        path: &Path,
+        stage: &StagedIndex,
+        leader: &topology::LeaderGuard,
+        pin: IndexPin,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let named = std::fs::symlink_metadata(path)?;
+        let held = stage.file.metadata()?;
+        ensure!(
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && (named.dev(), named.ino()) == (held.dev(), held.ino()),
+            "unsafe_index: replacement inode changed"
+        );
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.identity.verify()?;
+        let db = open_index(path, false)?;
+        let status = self.decode_control_status_raw(&db)?;
+        ensure!(
+            status.revision == pin && status.evidence_format.is_some(),
+            "incompatible_index: staged pair or evidence format changed"
+        );
+        let marker: String = db.query_row(
+            "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            marker == leader.incarnation.to_string(),
+            "index_not_ready: staged leader marker changed"
+        );
+        validate_bounded_control(&db, &self.identity.record_id)?;
+        validate_paired_rows(&db)?;
+        let integrity: String = db.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        ensure!(
+            integrity == "ok",
+            "incompatible_index: staged integrity check failed"
+        );
+        drop(db);
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.identity.verify()?;
+        let named = std::fs::symlink_metadata(path)?;
+        ensure!(
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && (named.dev(), named.ino()) == (held.dev(), held.ino()),
+            "unsafe_index: replacement inode changed"
+        );
+        Ok(())
+    }
+    /// Only an already-classified corrupt index under a fresh exclusive leader may enter.
+    pub(crate) fn recreate_index_exclusive(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        leader: &mut topology::LeaderGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.recreate_index_exclusive_with_hook(options, leader, cancel, |_| Ok(()))
+    }
+    fn recreate_index_exclusive_with_hook(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        leader: &mut topology::LeaderGuard,
+        cancel: &CancelFlag,
+        mut at: impl FnMut(ActivationStage) -> Result<()>,
+    ) -> Result<IndexPin> {
+        ensure!(
+            self.disposition() == RecoveryDisposition::RecreatePending
+                && self.recovery_required.load(Ordering::Acquire),
+            "recovery_required: exceptional recreation not classified"
+        );
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.identity.verify()?;
+        ensure!(
+            std::fs::canonicalize(&options.workspace_root)? == self.identity.root,
+            "root_changed: index options select another workspace"
+        );
+        check_cancel(cancel)?;
+        let path = self.roots.index_db(&self.identity);
+        let old = IndexFileWitness::open(&path)?;
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = path.with_file_name(format!("index.db{suffix}"));
+            ensure!(
+                !index_path_present(&sidecar)?,
+                "recovery_required: unsupported index sidecar: {}",
+                sidecar.display()
+            );
+        }
+        let journal_path = path.with_file_name("index.db-journal");
+        let journal = index_path_present(&journal_path)?
+            .then(|| IndexFileWitness::open(&journal_path))
+            .transpose()?;
+        // Reclassify after EX admission. A later repair, root mismatch, hot journal,
+        // or ordinary format/schema mismatch cannot authorize inode replacement.
+        let cause = match open_index(&path, false) {
+            Err(error) => recovery_class(&error),
+            Ok(db) => {
+                let result = self.recovery_baseline(&db);
+                drop(db);
+                match result {
+                    Err(error) => recovery_class(&error),
+                    Ok(_) => RecoveryClass::Rebuild,
+                }
+            }
+        };
+        ensure!(
+            cause == RecoveryClass::RecreatePending,
+            "recovery_required: corruption/NOTADB authority not verified"
+        );
+        old.verify()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        let mut stage = self.create_staged_index(leader)?;
+        let (graph, native, capture) =
+            crate::indexer::index_workspace_bundle(options, self.root_id(), cancel, |_| {})?;
+        let pin = self.publish_native_to_stage(
+            (&graph, &capture, &native),
+            &stage,
+            leader,
+            cancel,
+            |_, _| Ok(()),
+        )?;
+        self.validate_replacement_index(&stage.path, &stage, leader, pin)?;
+        stage.file.sync_all()?;
+        stage.verify_path()?;
+        old.verify()?;
+        if let Some(journal) = &journal {
+            journal.verify()?;
+        }
+        check_cancel(cancel)?;
+        capture.verify(cancel)?;
+        self.identity.verify()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        at(ActivationStage::BeforeRename)?;
+        old.verify()?;
+        stage.verify_path()?;
+        // The publisher's earlier validation is not enough: a failed or hot
+        // staged journal appearing at this barrier must never reach index.db.
+        reject_sidecars(&stage.path, true)?;
+        check_cancel(cancel)?;
+        capture.verify(cancel)?;
+        self.identity.verify()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        let dir = self.roots.index_dir(&self.identity);
+        let backup = if let Some(journal) = &journal {
+            let backup = dir.join(format!("index.db-journal.tmp-{}", uuid::Uuid::new_v4()));
+            ensure!(
+                !index_path_present(&backup)?,
+                "unsafe_index: journal backup exists"
+            );
+            journal.verify()?;
+            std::fs::rename(&journal.path, &backup)?;
+            if let Err(error) = journal.verify_at(&backup) {
+                restore_index_journal(journal, &backup, &dir)
+                    .context("incomplete_recovery: journal restoration failed")?;
+                return Err(error);
+            }
+            // Make the retained journal backup durable before replacing its old
+            // index. On any failure before the live rename, restore its pathname.
+            let durable_backup = at(ActivationStage::AfterJournalBackupBeforeDirFsync)
+                .and_then(|_| reject_sidecars(&stage.path, true))
+                .and_then(|_| {
+                    std::fs::File::open(&dir)?.sync_all()?;
+                    Ok(())
+                });
+            if let Err(error) = durable_backup {
+                restore_index_journal(journal, &backup, &dir)
+                    .context("incomplete_recovery: journal restoration failed")?;
+                return Err(error);
+            }
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(error) = std::fs::rename(&stage.path, &path) {
+            if let (Some(journal), Some(backup)) = (&journal, &backup) {
+                restore_index_journal(journal, backup, &dir)
+                    .context("incomplete_recovery: journal restoration failed")?;
+            }
+            return Err(error.into());
+        }
+        // The atomic rename may already be durable even if any later step fails.
+        // Never let the stage guard unlink the now-live replacement inode.
+        stage.published = true;
+        at(ActivationStage::AfterRenameBeforeDirFsync)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        if let (Some(journal), Some(backup)) = (&journal, &backup) {
+            journal.verify_at(backup)?;
+            std::fs::remove_file(backup)?;
+            std::fs::File::open(&dir)?.sync_all()?;
+        }
+        self.validate_replacement_index(&path, &stage, leader, pin)?;
+        leader.downgrade_use_to_shared()?;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        // This order means every clone still refuses while recovery_required is true.
+        self.recovery_disposition
+            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
+        self.recovery_required.store(false, Ordering::Release);
+        Ok(pin)
+    }
+    fn initialize(
+        &self,
+        leader: &topology::LeaderGuard,
+        before_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        let path = self.roots.index_db(&self.identity);
+        reject_sidecars(&path, true)?;
+        if index_path_present(&path)? {
+            return Ok(());
+        }
+        let use_guard = self.roots.index_use(&self.identity)?;
+        let mut staged = self.create_staged_index(leader)?;
         before_publish(&staged.path)?;
         verify_index_file(&staged.path)?;
         let mut checked = open_index(&staged.path, true)?;
         let checked_snapshot = storage_result(checked.transaction())?;
-        self.read_control_status(&checked_snapshot)?;
+        self.decode_control_status_raw(&checked_snapshot)?;
         let integrity: String =
             storage_result(checked_snapshot.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
         ensure!(
@@ -1146,23 +2207,35 @@ impl Store {
         &self,
         before_write: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<topology::LeaderGuard> {
-        drop(self.cache()?);
+        self.ensure_not_recreate_pending()?;
+        drop(
+            self.cache()
+                .map_err(|error| self.report_live_read_failure(error))?,
+        );
         let leader = self.roots.leader(&self.identity)?;
+        // The leader incarnation is already durable. From this point every clone
+        // must remain closed unless a complete paired publication commits.
+        self.recovery_required.store(true, Ordering::Release);
         // Opening can race a second SQLite writer: repeat validation only AFTER
         // BEGIN IMMEDIATE excludes schema changes and before any metadata UPDATE.
-        let mut db = self.cache_write()?;
+        let mut db = self
+            .cache_write()
+            .map_err(|error| self.report_live_read_failure(error))?;
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         before_write(&db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let status = self.read_control_status(&tx)?;
+        let compatible = self
+            .recovery_baseline(&tx)
+            .map_err(|error| self.report_live_read_failure(error))?
+            .compatible;
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
             locked_version == admitted_version,
             "incompatible_index: cache changed after admission"
         );
-        if status.evidence_format.is_some() {
+        if compatible {
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
             storage_result(tx.execute(
@@ -1183,6 +2256,7 @@ impl Store {
         self.connect_index(true)
     }
     fn connect_index(&self, writable: bool) -> Result<IndexConnection> {
+        self.ensure_not_recreate_pending()?;
         self.identity.verify()?;
         let use_guard = self.roots.index_use_existing(&self.identity)?;
         let db = open_index(&self.roots.index_db(&self.identity), writable)?;
@@ -1196,7 +2270,330 @@ impl Store {
     fn records(&self) -> topology::DurableRecords<'_> {
         topology::DurableRecords::new(&self.roots, &self.identity)
     }
-    fn read_control_status(&self, db: &Connection) -> Result<IndexStatus> {
+    fn disposition(&self) -> RecoveryDisposition {
+        match self.recovery_disposition.load(Ordering::Acquire) {
+            0 => RecoveryDisposition::Ready,
+            1 => RecoveryDisposition::Rebuild,
+            _ => RecoveryDisposition::RecreatePending,
+        }
+    }
+    fn mark_recovery(&self, disposition: RecoveryDisposition) {
+        self.recovery_disposition
+            .fetch_max(disposition as u8, Ordering::AcqRel);
+        self.recovery_required.store(true, Ordering::Release);
+    }
+    fn ensure_not_recreate_pending(&self) -> Result<()> {
+        ensure!(
+            self.disposition() != RecoveryDisposition::RecreatePending,
+            "recovery_required: exceptional index recovery deferred"
+        );
+        Ok(())
+    }
+    fn classify_admission_error(&self, error: anyhow::Error, typed: bool) -> Result<bool> {
+        let error = if typed {
+            selected_integrity(error)
+        } else {
+            error
+        };
+        match recovery_class(&error) {
+            RecoveryClass::Rebuild => {
+                self.mark_recovery(RecoveryDisposition::Rebuild);
+                Ok(false)
+            }
+            RecoveryClass::RecreatePending => {
+                self.mark_recovery(RecoveryDisposition::RecreatePending);
+                Ok(false)
+            }
+            RecoveryClass::Hard => Err(error),
+        }
+    }
+    fn report_live_read_failure(&self, error: anyhow::Error) -> anyhow::Error {
+        match recovery_class(&error) {
+            RecoveryClass::Rebuild => {
+                self.mark_recovery(RecoveryDisposition::Rebuild);
+                anyhow::anyhow!("incompatible_index: live index decode failed: {error:#}")
+            }
+            RecoveryClass::RecreatePending => {
+                self.mark_recovery(RecoveryDisposition::RecreatePending);
+                anyhow::anyhow!("recovery_required: exceptional index recovery deferred")
+            }
+            RecoveryClass::Hard => error,
+        }
+    }
+    fn report_selected_failure(&self, error: anyhow::Error) -> anyhow::Error {
+        match recovery_class(&error) {
+            RecoveryClass::Rebuild => {
+                self.mark_recovery(RecoveryDisposition::Rebuild);
+                anyhow::anyhow!("incompatible_index: selected evidence decode failed: {error:#}")
+            }
+            RecoveryClass::RecreatePending => {
+                self.mark_recovery(RecoveryDisposition::RecreatePending);
+                anyhow::anyhow!("incompatible_index: exceptional index recovery deferred")
+            }
+            RecoveryClass::Hard => error,
+        }
+    }
+    fn validate_recovery_decode_rows(&self, db: &Connection) -> Result<()> {
+        fn json_rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<()> {
+            let mut statement = db.prepare(sql)?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for payload in rows {
+                let _: T = serde_json::from_str(&payload?)?;
+            }
+            Ok(())
+        }
+        json_rows::<SourceFile>(db, "SELECT payload FROM files ORDER BY path")?;
+        json_rows::<Symbol>(db, "SELECT payload FROM nodes ORDER BY id")?;
+        json_rows::<CallSite>(db, "SELECT payload FROM calls ORDER BY id")?;
+        json_rows::<ControlRegion>(db, "SELECT payload FROM regions ORDER BY id")?;
+        json_rows::<crate::classes::ClassDefinition>(
+            db,
+            "SELECT payload FROM classes ORDER BY id",
+        )?;
+        json_rows::<crate::classes::ClassRelation>(
+            db,
+            "SELECT payload FROM class_relations ORDER BY id",
+        )?;
+        let (stats, diagnostics, warnings): (String, String, String) = db.query_row(
+            "SELECT m.stats,m.diagnostics,c.warnings FROM index_metadata m JOIN class_catalog c ON c.singleton=m.singleton WHERE m.singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let _: IndexStats = serde_json::from_str(&stats)?;
+        let _: Vec<Diagnostic> = serde_json::from_str(&diagnostics)?;
+        let _: Vec<String> = serde_json::from_str(&warnings)?;
+
+        macro_rules! scan {
+            ($sql:expr, $( $index:literal => $kind:ty ),+ $(,)?) => {{
+                let mut statement = db.prepare($sql)?;
+                let rows = statement.query_map([], |row| {
+                    $(let _: $kind = row.get($index)?;)+
+                    Ok(())
+                })?;
+                for row in rows { row?; }
+            }};
+        }
+        scan!("SELECT ordinal FROM native_producer_languages", 0 => i64);
+        scan!("SELECT ordinal FROM native_source_set_languages", 0 => i64);
+        scan!("SELECT ordinal FROM native_source_set_dependencies", 0 => i64);
+        scan!("SELECT byte_length FROM native_documents", 0 => i64);
+        scan!("SELECT requested,selected,diagnostic FROM native_coverage", 0 => bool, 1 => bool, 2 => Option<String>);
+        scan!("SELECT ordinal FROM native_coverage_roles", 0 => i64);
+        scan!("SELECT key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_declarations",
+            0 => bool, 1 => Option<i64>, 2 => Option<bool>, 3 => i64, 4 => i64, 5 => i64, 6 => Option<i64>, 7 => Option<i64>);
+        scan!("SELECT ordinal,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_declaration_ancestors",
+            0 => i64, 1 => i64, 2 => bool, 3 => Option<i64>, 4 => Option<bool>);
+        scan!("SELECT ancestor_ordinal,ordinal FROM native_signature_parameter_types", 0 => i64, 1 => i64);
+        scan!("SELECT ordinal FROM native_header_items", 0 => i64);
+        scan!("SELECT ordinal,variadic FROM native_parameters", 0 => i64, 1 => bool);
+        scan!("SELECT ordinal,start_byte,end_byte,callee_start,callee_end FROM native_calls",
+            0 => i64, 1 => i64, 2 => i64, 3 => Option<i64>, 4 => Option<i64>);
+        scan!("SELECT ordinal FROM native_call_regions", 0 => i64);
+        scan!("SELECT ordinal,start_byte,end_byte FROM native_control_regions", 0 => i64, 1 => i64, 2 => i64);
+        Ok(())
+    }
+
+    fn verify_metadata_root(&self, db: &Connection) -> Result<()> {
+        let (count, typed): (i64, bool) = db.query_row(
+            "SELECT count(*),coalesce(min(singleton=1 AND typeof(root_spelling)='text' AND typeof(root_device)='text' AND typeof(root_inode)='text'),0) FROM index_metadata",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        ensure!(
+            count == 1 && typed,
+            "root_key_collision: index root identity is not a typed singleton"
+        );
+        let device = self.identity.device.to_string();
+        let inode = self.identity.inode.to_string();
+        for (column, expected, mismatch) in [
+            (
+                "root_spelling",
+                self.workspace_root.as_bytes(),
+                "root_key_collision: index belongs to a different spelling",
+            ),
+            (
+                "root_device",
+                device.as_bytes(),
+                "root_changed: index root identity mismatch",
+            ),
+            (
+                "root_inode",
+                inode.as_bytes(),
+                "root_changed: index root identity mismatch",
+            ),
+        ] {
+            let blob = db.blob_open(rusqlite::MAIN_DB, "index_metadata", column, 1, true)?;
+            ensure!(blob.len() == expected.len(), "{mismatch}");
+            for (offset, chunk) in expected.chunks(64 * 1024).enumerate() {
+                let offset = offset
+                    .checked_mul(64 * 1024)
+                    .context("root identity offset overflow")?;
+                let mut actual = vec![0; chunk.len()];
+                blob.read_at_exact(&mut actual, offset)?;
+                ensure!(actual == chunk, "{mismatch}");
+            }
+            blob.close()?;
+        }
+        Ok(())
+    }
+
+    fn metadata_atom(&self, db: &Connection, column: MetadataColumn) -> Result<MetadataAtom> {
+        use rusqlite::types::ValueRef;
+        use sha2::{Digest, Sha256};
+        let (type_sql, value_sql, column_name, tag) = column.sql();
+        let storage: String = db.query_row(type_sql, [], |row| row.get(0))?;
+        match storage.as_str() {
+            "null" => Ok(MetadataAtom::Null),
+            "integer" => db
+                .query_row(value_sql, [], |row| match row.get_ref(0)? {
+                    ValueRef::Integer(value) => Ok(MetadataAtom::Integer(value)),
+                    _ => Err(rusqlite::Error::InvalidQuery),
+                })
+                .map_err(Into::into),
+            "real" => db
+                .query_row(value_sql, [], |row| match row.get_ref(0)? {
+                    ValueRef::Real(value) => Ok(MetadataAtom::Real(value.to_bits())),
+                    _ => Err(rusqlite::Error::InvalidQuery),
+                })
+                .map_err(Into::into),
+            "text" | "blob" => {
+                let text = storage == "text";
+                let blob =
+                    db.blob_open(rusqlite::MAIN_DB, "index_metadata", column_name, 1, true)?;
+                let byte_length = blob.len();
+                let mut digest = Sha256::new();
+                digest.update(b"baleyg-index-metadata-witness-v1\0");
+                digest.update(tag);
+                digest.update([u8::from(text)]);
+                digest.update((byte_length as u64).to_le_bytes());
+                let mut offset = 0usize;
+                let mut buffer = vec![0; (64 * 1024).min(byte_length)];
+                while offset < byte_length {
+                    let count = buffer.len().min(byte_length - offset);
+                    blob.read_at_exact(&mut buffer[..count], offset)?;
+                    digest.update(&buffer[..count]);
+                    offset = offset
+                        .checked_add(count)
+                        .context("metadata offset overflow")?;
+                }
+                blob.close()?;
+                Ok(MetadataAtom::Streamed {
+                    column,
+                    text,
+                    byte_length,
+                    sha256: digest.finalize().into(),
+                })
+            }
+            _ => anyhow::bail!("incompatible_index: unknown SQLite metadata storage class"),
+        }
+    }
+
+    fn metadata_witness(&self, db: &Connection, schema: u32) -> Result<RecoveryWitness> {
+        Ok(RecoveryWitness {
+            pragma_schema: schema,
+            schema_version: self.metadata_atom(db, MetadataColumn::SchemaVersion)?,
+            extractor_version: self.metadata_atom(db, MetadataColumn::ExtractorVersion)?,
+            index_generation: self.metadata_atom(db, MetadataColumn::IndexGeneration)?,
+            index_revision: self.metadata_atom(db, MetadataColumn::IndexRevision)?,
+        })
+    }
+
+    fn recovery_baseline(&self, db: &Connection) -> Result<RecoveryBaseline> {
+        validate_cache_shape(db)?;
+        let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        self.verify_metadata_root(db)?;
+        let witness = self.metadata_witness(db, schema)?;
+        let bounded_text = |atom: &MetadataAtom, max: usize| matches!(atom, MetadataAtom::Streamed { text: true, byte_length, .. } if *byte_length <= max);
+        if !bounded_text(&witness.extractor_version, 256)
+            || !bounded_text(&witness.index_generation, 64)
+            || matches!(
+                witness.schema_version,
+                MetadataAtom::Streamed { .. } | MetadataAtom::Null
+            )
+            || matches!(
+                witness.index_revision,
+                MetadataAtom::Streamed { .. } | MetadataAtom::Null
+            )
+        {
+            self.mark_recovery(RecoveryDisposition::Rebuild);
+            return Ok(RecoveryBaseline {
+                witness,
+                pin: None,
+                compatible: false,
+            });
+        }
+        let decoded: rusqlite::Result<(i64, String, String, i64)> = db.query_row(
+            "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        );
+        let (metadata_schema, extractor, generation, revision) = match decoded {
+            Ok(row) => row,
+            Err(error) => {
+                let compatible = self.classify_admission_error(error.into(), false)?;
+                debug_assert!(!compatible);
+                return Ok(RecoveryBaseline {
+                    witness,
+                    pin: None,
+                    compatible: false,
+                });
+            }
+        };
+        let generation = match uuid::Uuid::parse_str(&generation) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let compatible = self.classify_admission_error(
+                    SelectedIntegrity(format!("incompatible_index: invalid generation: {error}"))
+                        .into(),
+                    false,
+                )?;
+                debug_assert!(!compatible);
+                return Ok(RecoveryBaseline {
+                    witness,
+                    pin: None,
+                    compatible: false,
+                });
+            }
+        };
+        if !(0..=9_007_199_254_740_991).contains(&revision) {
+            self.mark_recovery(RecoveryDisposition::Rebuild);
+            return Ok(RecoveryBaseline {
+                witness,
+                pin: None,
+                compatible: false,
+            });
+        }
+        let pin = IndexPin {
+            index_generation: generation,
+            index_revision: revision as u64,
+        };
+        let marker_matches = metadata_schema == i64::from(schema);
+        let recognized_legacy = marker_matches
+            && ((schema == LEGACY_SCHEMA_VERSION && extractor == LEGACY_EXTRACTOR_VERSION)
+                || (schema == GRAPH_SCHEMA_VERSION && extractor == GRAPH_EXTRACTOR_VERSION)
+                || (schema == PREVIOUS_SCHEMA_VERSION && extractor == EXTRACTOR_VERSION));
+        let compatible = if marker_matches
+            && schema == DATABASE_SCHEMA_VERSION
+            && extractor == EXTRACTOR_VERSION
+        {
+            match validate_bounded_control(db, &self.identity.record_id) {
+                Ok(()) => true,
+                Err(error) => self.classify_admission_error(error, true)?,
+            }
+        } else if recognized_legacy {
+            false
+        } else {
+            self.mark_recovery(RecoveryDisposition::Rebuild);
+            false
+        };
+        Ok(RecoveryBaseline {
+            witness,
+            pin: Some(pin),
+            compatible,
+        })
+    }
+
+    fn decode_control_status_raw(&self, db: &Connection) -> Result<IndexStatus> {
         // This check must run INSIDE the caller's read snapshot or writer lock.
         // The open_index admission check alone cannot protect against later DDL.
         validate_cache_shape(db)?;
@@ -1205,13 +2602,16 @@ impl Store {
         let row: (i64,String,String,String,String,String,i64,String,String,String) = storage_result(db.query_row(
             "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata WHERE singleton=1",
             [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))))?;
-        ensure!(
+        control_ensure!(
             (schema_version == i64::from(LEGACY_SCHEMA_VERSION)
                 && row.0 == schema_version
                 && row.1 == LEGACY_EXTRACTOR_VERSION)
                 || (schema_version == i64::from(GRAPH_SCHEMA_VERSION)
                     && row.0 == schema_version
                     && row.1 == GRAPH_EXTRACTOR_VERSION)
+                || (schema_version == i64::from(PREVIOUS_SCHEMA_VERSION)
+                    && row.0 == schema_version
+                    && row.1 == EXTRACTOR_VERSION)
                 || (schema_version == i64::from(DATABASE_SCHEMA_VERSION)
                     && row.0 == schema_version
                     && row.1 == EXTRACTOR_VERSION),
@@ -1241,39 +2641,250 @@ impl Store {
                 .then(|| EVIDENCE_FORMAT.to_owned()),
         })
     }
+    fn ensure_public_read_ready(&self) -> Result<()> {
+        if !self.recovery_required.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self.disposition() {
+            RecoveryDisposition::Ready => {
+                Err(topology::IndexNotReady::new("reconciliation required").into())
+            }
+            RecoveryDisposition::Rebuild => {
+                anyhow::bail!(
+                    "incompatible_index: reconciliation required after invalid current index"
+                )
+            }
+            RecoveryDisposition::RecreatePending => {
+                anyhow::bail!("recovery_required: exceptional index recovery deferred")
+            }
+        }
+    }
+    fn read_public_control_status(&self, db: &Connection) -> Result<IndexStatus> {
+        self.verify_metadata_root(db)
+            .map_err(|error| self.report_live_read_failure(error))?;
+        self.ensure_public_read_ready()?;
+        self.decode_control_status_raw(db)
+            .map_err(|error| self.report_live_read_failure(error))
+    }
+
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
-        let status = self.read_control_status(db)?;
+        let status = self.read_public_control_status(db)?;
         ensure!(
             status.evidence_format.is_some(),
             "index_not_ready: reindex required"
         );
-        // Every public schema-6 derived read needs the same bounded catalog
-        // singleton. Missing/oversized live metadata is corruption, never an
-        // old-index "requireIndex" fallback. This is one indexed metadata row.
-        let warnings_bytes: Option<i64> = db
-            .query_row(
-                "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        ensure!(
-            warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)),
-            "incompatible_index: class catalog byte budget exceeded or missing"
-        );
+        (|| -> Result<()> {
+            validate_reconcile_inventory(db)?;
+            // Every public schema-7 derived read needs the same bounded catalog
+            // singleton. Missing/oversized live metadata is corruption, never an
+            // old-index "requireIndex" fallback. This is one indexed metadata row.
+            let warnings_bytes: Option<i64> = db
+                .query_row(
+                    "SELECT length(CAST(warnings AS BLOB)) FROM class_catalog WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if !warnings_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)) {
+                return Err(SelectedIntegrity(
+                    "incompatible_index: class catalog byte budget exceeded or missing".into(),
+                )
+                .into());
+            }
+            Ok(())
+        })()
+        .map_err(|error| self.report_live_read_failure(error))?;
         Ok(status)
     }
+
     /// Internal control baseline, never returned by public status or evidence reads.
     pub fn index_baseline(&self) -> Result<IndexPin> {
+        self.recovery_index_baseline()?
+            .pin
+            .context("index_not_ready: prior index pin is not decodable")
+    }
+    pub(crate) fn recovery_index_baseline(&self) -> Result<RecoveryBaseline> {
+        self.ensure_not_recreate_pending()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        Ok(self.read_control_status(&tx)?.revision)
+        self.recovery_baseline(&tx)
     }
     pub fn root_id(&self) -> &str {
         &self.identity.record_id
     }
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace_root
+    }
+    pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
+        let db = self.cache()?;
+        let schema: u32 =
+            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+        if schema != DATABASE_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        let payload: Option<String> = storage_result(db.query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        ))?;
+        let payload = payload.context("incompatible_index: missing reconcile options")?;
+        let options: crate::indexer::ReconcileOptions = serde_json::from_str(&payload)
+            .context("incompatible_index: invalid reconcile options")?;
+        ensure!(
+            json(&options)? == payload && options.version == 1,
+            "incompatible_index: unsupported reconcile options"
+        );
+        options.require_absolute_optional_inputs().context(
+            "recovery_required: recorded relative index input; run explicit baleyg index",
+        )?;
+        let mut result =
+            crate::indexer::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
+        result.max_file_bytes = options.max_file_bytes;
+        result.scip_path = options.scip_path.map(Into::into);
+        result.manifest_path = options.manifest_path.map(Into::into);
+        Ok(Some(result))
+    }
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
+    }
+    pub(crate) fn is_recreate_pending(&self) -> bool {
+        self.disposition() == RecoveryDisposition::RecreatePending
+            && self.recovery_required.load(Ordering::Acquire)
+    }
+    /// Exceptional entry owns no old protected handle before nonblocking EX.
+    /// Return the exact downgraded guard that wrote the replacement marker.
+    pub(crate) fn recreate_pending_leader_session(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        cancel: &CancelFlag,
+    ) -> Result<(IndexPin, Arc<topology::LeaderSession>)> {
+        ensure!(
+            self.is_recreate_pending(),
+            "recovery_required: exceptional recreation not classified"
+        );
+        let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
+        let mut leader = self
+            .roots
+            .leader_under_exclusive(&self.identity, exclusive)?;
+        let pin = self.recreate_index_exclusive(options, &mut leader, cancel)?;
+        let session = Arc::new(topology::LeaderSession::leader(
+            leader,
+            self.identity.clone(),
+        ));
+        self.verify_leader_session(&session)?;
+        ensure!(
+            self.status()?.revision == pin,
+            "index_not_ready: exceptional recovery pair not admitted"
+        );
+        Ok((pin, session))
+    }
+    pub fn leader_session(&self) -> Result<Arc<topology::LeaderSession>> {
+        Ok(Arc::new(topology::LeaderSession::leader(
+            self.leader()?,
+            self.identity.clone(),
+        )))
+    }
+    pub(crate) fn verify_leader_session(&self, session: &topology::LeaderSession) -> Result<()> {
+        session.belongs_to(&self.identity, &self.roots.leader_lock(&self.identity))
+    }
+    pub(crate) fn begin_leader_publication(&self, session: &topology::LeaderSession) -> Result<()> {
+        self.verify_leader_session(session)?;
+        self.recovery_required.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub fn follower_session(&self) -> Result<Arc<topology::LeaderSession>> {
+        let db = self
+            .cache()
+            .map_err(|error| self.report_live_read_failure(error))?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        let (_, marker) = self.admit_evidence_control(&db)?;
+        let follower = self.roots.follower(self.identity.clone())?;
+        self.verify_follower_marker(&follower, marker)?;
+        drop(db);
+        Ok(Arc::new(topology::LeaderSession::follower(follower)))
+    }
+    fn admit_evidence_control(&self, db: &Connection) -> Result<(IndexStatus, uuid::Uuid)> {
+        self.verify_metadata_root(db)
+            .map_err(|error| self.report_live_read_failure(error))?;
+        self.ensure_public_read_ready()?;
+        let schema: u32 =
+            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+        if schema != DATABASE_SCHEMA_VERSION {
+            return Err(topology::IndexNotReady::new("reconciliation required").into());
+        }
+        let status = self.read_status(db)?;
+        let marker: Option<String> = db
+            .query_row(
+                "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| self.report_live_read_failure(selected_integrity(error.into())))?;
+        let marker = marker
+            .context("incompatible_index: missing reconciled incarnation")
+            .and_then(|value| {
+                uuid::Uuid::parse_str(&value)
+                    .context("incompatible_index: invalid reconciled incarnation")
+            })
+            .map_err(|error| self.report_live_read_failure(selected_integrity(error)))?;
+        Ok((status, marker))
+    }
+    fn verify_follower_marker(
+        &self,
+        follower: &topology::FollowerGuard,
+        marker: uuid::Uuid,
+    ) -> Result<()> {
+        if follower.incarnation != marker {
+            return Err(topology::IndexNotReady::new("reconciled leader mismatch").into());
+        }
+        self.identity.verify()?;
+        follower.verify(marker)
+    }
+    pub fn evidence_response(&self) -> Result<EvidenceResponse> {
+        self.ensure_not_recreate_pending()?;
+        let db = self
+            .cache()
+            .map_err(|error| self.report_live_read_failure(error))?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        let (_, marker) = self.admit_evidence_control(&db)?;
+        let follower = self.roots.follower(self.identity.clone())?;
+        self.verify_follower_marker(&follower, marker)?;
+        Ok(EvidenceResponse {
+            store: self.clone(),
+            db,
+            follower,
+            marker,
+        })
+    }
+    fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.with_evidence_hook(read, || Ok(()))
+    }
+    fn with_evidence_hook<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+        before_finish: impl FnOnce() -> Result<()>,
+    ) -> Result<T> {
+        self.with_evidence_observed(read, before_finish, |_| {})
+    }
+    fn with_evidence_observed<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+        before_finish: impl FnOnce() -> Result<()>,
+        observe_finish: impl FnOnce(&Result<()>),
+    ) -> Result<T> {
+        let response = self.evidence_response()?;
+        let value = read(&response.db);
+        let hook = before_finish();
+        let fence = response.finish(());
+        observe_finish(&fence);
+        match value {
+            Err(error) => Err(error),
+            Ok(value) => {
+                hook?;
+                fence?;
+                Ok(value)
+            }
+        }
     }
     pub fn status(&self) -> Result<IndexStatus> {
         self.status_with_open_hook(|_| Ok(()))
@@ -1284,10 +2895,13 @@ impl Store {
         &self,
         before_snapshot: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<IndexStatus> {
-        let mut db = self.cache()?;
+        self.ensure_not_recreate_pending()?;
+        let db = self
+            .cache()
+            .map_err(|error| self.report_live_read_failure(error))?;
         before_snapshot(&db)?;
-        let tx = storage_result(db.transaction())?;
-        self.read_status(&tx)
+        drop(db);
+        self.with_evidence(|db| self.read_status(db))
     }
     pub fn publish(
         &self,
@@ -1319,6 +2933,52 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        self.publish_native_expected(
+            graph,
+            capture,
+            native,
+            leader,
+            ExpectedPublication::Pin(expected_revision),
+            cancel,
+        )
+    }
+    pub(crate) fn publish_native_recovery(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        leader: &topology::LeaderGuard,
+        expected: RecoveryBaseline,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_native_expected(
+            graph,
+            capture,
+            native,
+            leader,
+            ExpectedPublication::Recovery(Box::new(expected)),
+            cancel,
+        )
+    }
+    fn publish_native_expected(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        leader: &topology::LeaderGuard,
+        expected: ExpectedPublication,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.validate_native_bundle(graph, capture, native, cancel)?;
+        self.publish_inner_expected(graph, capture, native, leader, expected, cancel)
+    }
+    fn validate_native_bundle(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
         native.validate(
             capture,
             Path::new(&self.workspace_root),
@@ -1340,22 +3000,85 @@ impl Store {
             "native_evidence_required: each source must open, read, and hash once"
         );
         crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
-        self.publish_inner(graph, capture, native, leader, expected_revision, cancel)
+        // A capture from a direct library caller must not persist cwd-relative
+        // presentation identities even if it bypassed the explicit CLI ingress.
+        capture
+            .reconcile_options()
+            .require_absolute_optional_inputs()
     }
-    fn publish_inner(
+    /// Publish to an unpublished private bootstrap while the caller retains EX use.
+    /// This stages the full pair without admitting evidence from the corrupt live DB.
+    #[allow(dead_code)] // The exceptional recovery entry point is wired after this scoped seam.
+    fn publish_native_to_stage(
+        &self,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
+        stage: &StagedIndex,
+        leader: &topology::LeaderGuard,
+        cancel: &CancelFlag,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        let (graph, capture, native) = bundle;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        stage.verify_path()?;
+        self.identity.verify()?;
+        let index_dir = self.roots.index_dir(&self.identity);
+        let stage_id = stage
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("index.db.tmp-"));
+        ensure!(
+            stage.path.parent() == Some(index_dir.as_path())
+                && stage_id.is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
+            "unsafe_index: stage is outside the managed index directory"
+        );
+        let bootstrap = open_index(&stage.path, false)?;
+        let version: u32 = bootstrap.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        ensure!(
+            version == GRAPH_SCHEMA_VERSION,
+            "incompatible_index: stage is not an unpublished bootstrap"
+        );
+        let expected = self.recovery_baseline(&bootstrap)?;
+        ensure!(
+            expected.pin().is_some_and(|pin| pin.index_revision == 0) && !expected.compatible,
+            "incompatible_index: invalid private stage baseline"
+        );
+        drop(bootstrap);
+        stage.verify_path()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.validate_native_bundle(graph, capture, native, cancel)?;
+        self.publish_inner_checked_target(
+            bundle,
+            leader,
+            PublicationPlan {
+                expected: ExpectedPublication::Recovery(Box::new(expected)),
+                target: PublicationTarget::Stage(stage),
+            },
+            cancel,
+            256 * 1024 * 1024 + 16 * 1024,
+            during_tx,
+        )
+    }
+    fn publish_inner_expected(
         &self,
         graph: &Graph,
         capture: &crate::capture::Capture,
         native: &crate::native_evidence::Artifact,
         leader: &topology::LeaderGuard,
-        expected_revision: IndexPin,
+        expected: ExpectedPublication,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
-        self.publish_inner_checked(
+        self.publish_inner_checked_expected(
             (graph, capture, native),
             leader,
-            expected_revision,
+            expected,
             cancel,
+            256 * 1024 * 1024 + 16 * 1024,
             |_, _| Ok(()),
         )
     }
@@ -1453,6 +3176,7 @@ impl Store {
     }
     // Private transaction seam used by the in-module rollback tests. Normal callers
     // always pass a no-op; no SQL-fault control is exposed to API or CLI clients.
+    #[cfg(test)]
     fn publish_inner_checked(
         &self,
         bundle: (
@@ -1476,6 +3200,7 @@ impl Store {
     }
     // This test-only injection exercises the production admission path with a
     // small graph-JSON cap, without creating a 256MiB escaped source fixture.
+    #[cfg(test)]
     fn publish_inner_checked_with_source_cap(
         &self,
         bundle: (
@@ -1487,8 +3212,59 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
         max_graph_json_bytes: usize,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        self.publish_inner_checked_expected(
+            bundle,
+            leader,
+            ExpectedPublication::Pin(expected_revision),
+            cancel,
+            max_graph_json_bytes,
+            during_tx,
+        )
+    }
+    fn publish_inner_checked_expected(
+        &self,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
+        leader: &topology::LeaderGuard,
+        expected: ExpectedPublication,
+        cancel: &CancelFlag,
+        max_graph_json_bytes: usize,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        self.publish_inner_checked_target(
+            bundle,
+            leader,
+            PublicationPlan {
+                expected,
+                target: PublicationTarget::Live,
+            },
+            cancel,
+            max_graph_json_bytes,
+            during_tx,
+        )
+    }
+    fn publish_inner_checked_target(
+        &self,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
+        leader: &topology::LeaderGuard,
+        plan: PublicationPlan<'_>,
+        cancel: &CancelFlag,
+        max_graph_json_bytes: usize,
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
+        let PublicationPlan { expected, target } = plan;
+        if let PublicationTarget::Live = target {
+            self.ensure_not_recreate_pending()?;
+        }
         let (graph, capture, native) = bundle;
         Self::enforce_selected_source_admission(graph, max_graph_json_bytes)?;
         ensure!(
@@ -1515,25 +3291,76 @@ impl Store {
         check_cancel(cancel)?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
-        let mut db = self.cache_write()?;
+        let mut db = match target {
+            PublicationTarget::Live => PublicationConnection::Live(
+                self.cache_write()
+                    .map_err(|error| self.report_live_read_failure(error))?,
+            ),
+            PublicationTarget::Stage(stage) => {
+                leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+                stage.verify_path()?;
+                let db = open_index(&stage.path, true)?;
+                stage.verify_path()?;
+                PublicationConnection::Stage(db)
+            }
+        };
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         during_tx(PublishStage::BeforeTransaction, &db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let baseline = self.read_control_status(&tx)?;
+        let current = match target {
+            PublicationTarget::Live => self
+                .recovery_baseline(&tx)
+                .map_err(|error| self.report_live_read_failure(error))?,
+            PublicationTarget::Stage(_) => self.recovery_baseline(&tx)?,
+        };
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
             locked_version == admitted_version,
             "incompatible_index: cache changed after admission"
         );
-        let old = baseline.revision;
-        ensure!(
-            expected_revision == old,
-            "revision conflict: expected {expected_revision:?}, found {old:?}"
-        );
+        match &expected {
+            ExpectedPublication::Pin(expected_pin) => ensure!(
+                current.pin == Some(*expected_pin),
+                "revision conflict: expected {expected_pin:?}, found {:?}",
+                current.pin
+            ),
+            ExpectedPublication::Recovery(expected_baseline) => ensure!(
+                current.witness == expected_baseline.witness
+                    && current.pin == expected_baseline.pin,
+                "revision conflict: private recovery baseline changed"
+            ),
+        }
+        let compatible = current.compatible;
+        let old_pin = current.pin;
         let schema: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        let rebaseline = schema != DATABASE_SCHEMA_VERSION;
+        let decoded = if compatible {
+            match self.validate_recovery_decode_rows(&tx) {
+                Ok(()) => true,
+                Err(error) => self.classify_admission_error(error, true)?,
+            }
+        } else {
+            false
+        };
+        if let PublicationTarget::Live = target {
+            self.ensure_not_recreate_pending()?;
+        }
+        let rebaseline = schema != DATABASE_SCHEMA_VERSION
+            || !compatible
+            || !decoded
+            || (matches!(target, PublicationTarget::Live)
+                && self.disposition() == RecoveryDisposition::Rebuild);
+        let prior_scan = (!rebaseline)
+            .then(|| compare_capture_snapshot(&tx, capture))
+            .transpose()?;
+        if let Some(comparison) = prior_scan {
+            ensure!(
+                comparison.examined > 0,
+                "incompatible_index: empty prior scan comparison"
+            );
+            let _changed = comparison.changed();
+        }
         ensure!(
             graph.files.len() == native.revision.documents.len(),
             "graph/native document cardinality mismatch"
@@ -1556,26 +3383,49 @@ impl Store {
             index_generation: if rebaseline {
                 uuid::Uuid::new_v4()
             } else {
-                old.index_generation
+                old_pin
+                    .context("index_not_ready: prior index pin is not decodable")?
+                    .index_generation
             },
-            index_revision: old
-                .index_revision
-                .checked_add(1)
-                .filter(|n| *n <= 9_007_199_254_740_991)
-                .context("revision overflow")?,
+            index_revision: if rebaseline {
+                1
+            } else {
+                old_pin
+                    .context("index_not_ready: prior index pin is not decodable")?
+                    .index_revision
+                    .checked_add(1)
+                    .filter(|n| *n <= 9_007_199_254_740_991)
+                    .context("revision overflow")?
+            },
         };
-        if rebaseline {
-            tx.execute_batch(NATIVE_SCHEMA)?;
+        if rebaseline && schema != DATABASE_SCHEMA_VERSION {
+            let has_inventory: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='capture_inputs')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_inventory {
+                tx.execute_batch(CACHE_SCHEMA_V7_ADDITIONS)?;
+            }
+            if schema != PREVIOUS_SCHEMA_VERSION {
+                tx.execute_batch(NATIVE_SCHEMA)?;
+            }
         }
         tx.execute_batch(
             "DELETE FROM class_relations; DELETE FROM classes; DELETE FROM class_catalog;
-             DELETE FROM calls; DELETE FROM regions; DELETE FROM nodes; DELETE FROM files;",
+             DELETE FROM calls; DELETE FROM regions; DELETE FROM nodes; DELETE FROM files;
+             DELETE FROM capture_inputs;",
         )?;
         for f in &graph.files {
             check_cancel(cancel)?;
             tx.execute(
-                "INSERT INTO files VALUES(?1,?2,?3)",
-                params![f.path, f.hash, json(f)?],
+                "INSERT INTO files(path,hash,payload,capture_stat) VALUES(?1,?2,?3,?4)",
+                params![
+                    f.path,
+                    f.hash,
+                    json(f)?,
+                    json(&capture.source_stat(&f.path)?)?
+                ],
             )?;
             during_tx(PublishStage::AfterFile, &tx)?;
         }
@@ -1626,6 +3476,13 @@ impl Store {
             )?;
         }
         write_native(&tx, native, capture, cancel)?;
+        for (key, observation) in capture.persisted_inputs()? {
+            check_cancel(cancel)?;
+            tx.execute(
+                "INSERT INTO capture_inputs(input_key,payload) VALUES(?1,?2)",
+                params![key, json(&observation)?],
+            )?;
+        }
         tx.execute(
             "INSERT INTO class_catalog VALUES(1,?1,?2)",
             params![json(&classes.warnings)?, classes.truncated],
@@ -1634,8 +3491,8 @@ impl Store {
             .duration_since(UNIX_EPOCH)?
             .as_millis()
             .to_string();
-        tx.execute("UPDATE index_metadata SET schema_version=6,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6 WHERE singleton=1",
-            params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?])?;
+        tx.execute("UPDATE index_metadata SET schema_version=7,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconciled_incarnation=?7,reconcile_options=?8 WHERE singleton=1",
+            params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,leader.incarnation.to_string(),json(capture.reconcile_options())?])?;
         if rebaseline {
             tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
         }
@@ -1645,12 +3502,31 @@ impl Store {
         capture.verify(cancel)?;
         leader.verify()?;
         self.identity.verify()?;
+        if let PublicationTarget::Stage(stage) = target {
+            stage.verify_path()?;
+            leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        }
         during_tx(PublishStage::BeforeCommit, &tx)?;
         check_cancel(cancel)?;
         capture.verify(cancel)?;
         leader.verify()?;
         self.identity.verify()?;
+        if let PublicationTarget::Stage(stage) = target {
+            stage.verify_path()?;
+            leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        }
         storage_result(tx.commit())?;
+        match target {
+            PublicationTarget::Live => {
+                self.recovery_disposition
+                    .store(RecoveryDisposition::Ready as u8, Ordering::Release);
+                self.recovery_required.store(false, Ordering::Release);
+            }
+            PublicationTarget::Stage(stage) => {
+                stage.verify_path()?;
+                leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+            }
+        }
         Ok(revision)
     }
 
@@ -1659,13 +3535,13 @@ impl Store {
         pin: IndexPin,
         read: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        ensure!(
-            self.read_status(&tx)?.revision == pin,
-            "revision conflict: stale native pin"
-        );
-        read(&tx)
+        self.with_evidence(|db| {
+            ensure!(
+                self.read_status(db)?.revision == pin,
+                "revision conflict: stale native pin"
+            );
+            read(db).map_err(|error| self.report_selected_failure(error))
+        })
     }
 
     /// Reparse exactly one selected, paired source in this SQLite snapshot.
@@ -1688,7 +3564,7 @@ impl Store {
             source_set_id == format!("source-set:v1:{}", self.root_id()),
             "incompatible_index: selected source set mismatch"
         );
-        let file = Self::selected_source_row(db, path)?
+        let file = Self::selected_source_row_bounded(db, path, 256 * 1024 * 1024)?
             .context("incompatible_index: selected graph source absent")?;
         let mut producer:Producer=db.query_row(
             "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",[],
@@ -1748,16 +3624,18 @@ impl Store {
         language: &str,
         revision_id: &str,
     ) -> Result<(i64, i64)> {
-        db.query_row(
+        Ok(db.query_row(
             SELECTED_ANCILLARY_BYTE_SQL,
             params![path, source_set_id, language, revision_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|e| {
-            anyhow::anyhow!("incompatible_index: selected evidence byte budget exceeded: {e}")
-        })
+        )?)
     }
     fn attest_selected_document(&self, db: &Connection, path: &str) -> Result<()> {
+        self.attest_selected_document_inner(db, path)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))
+    }
+    fn attest_selected_document_inner(&self, db: &Connection, path: &str) -> Result<()> {
         // SQLite lengths and bounded row counts precede BLOB/JSON allocation and
         // selected tree-sitter extraction. All predicates stay on this source set,
         // revision, language and path; no workspace-wide payload scan.
@@ -1876,11 +3754,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.caller AS B
 UNION ALL
 SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BLOB)),0)+COALESCE(length(CAST(g.path AS BLOB)),0)+COALESCE(length(CAST(g.payload AS BLOB)),0) AS row_bytes FROM regions g WHERE g.path=?1
 )"#;
-        let (graph_row, graph_total): (i64, i64) = db
-            .query_row(graph_sql, [path], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(|e| {
-                anyhow::anyhow!("incompatible_index: selected graph row byte budget exceeded: {e}")
-            })?;
+        let (graph_row, graph_total): (i64, i64) =
+            db.query_row(graph_sql, [path], |r| Ok((r.get(0)?, r.get(1)?)))?;
         // JSON may escape one source byte into six; the absolute row ceiling
         // is an explicit fail-closed selected API limit if capture exceeds it.
         let graph_row_limit = native_bytes
@@ -1898,7 +3773,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 && graph_total <= graph_total_limit,
             "incompatible_index: selected graph row byte budget exceeded"
         );
-        let file = Self::selected_source_row(db, path)?
+        let file = Self::selected_source_row_bounded(db, path, 256 * 1024 * 1024)?
             .context("incompatible_index: selected graph/native source missing")?;
         let witness = self.selected_native_witness(db, path)?;
         let mut stored:Vec<(String,Option<String>)>=db.prepare(
@@ -2061,18 +3936,14 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             &witness,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "incompatible_index: selected graph evidence differs from source: {e:#}"
-            )
-        })
     }
 
     /// Class DTOs are selected presentation projections; compare only this
     /// document's rows with a bounded in-memory class build from attested bytes.
     fn attest_selected_class(&self, db: &Connection, path: &str) -> Result<()> {
         self.attest_selected_document(db, path)?;
-        let file = Self::selected_source_row(db, path)?
+        let file = self
+            .selected_source_row(db, path)?
             .context("incompatible_index: selected class source missing")?;
         if !matches!(file.language.as_str(), "java" | "python") {
             return Ok(());
@@ -2401,9 +4272,12 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 params![key.source_set_id,key.language,key.path],|r|Ok([
                     r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?]),
             ).optional()?;
-            ensure!(sizes.is_none_or(|bytes|bytes[0]>=0 && bytes[0]<=256*1024*1024
-                && bytes[1..].iter().all(|length|*length>=0 && *length<=16*1024)),
-                "incompatible_index: selected native source byte budget exceeded");
+            if !sizes.is_none_or(|bytes|bytes[0]>=0 && bytes[0]<=256*1024*1024
+                && bytes[1..].iter().all(|length|*length>=0 && *length<=16*1024)) {
+                return Err(SelectedIntegrity(
+                    "incompatible_index: selected native source byte budget exceeded".into(),
+                ).into());
+            }
             type NativeSourceRow=(String,String,i64,Vec<u8>);
             let row:Option<Result<NativeSourceRow>>=db.query_row(
                 "SELECT revision_id,content_hash,byte_length,source_bytes FROM native_documents WHERE source_set_id=?1 AND language=?2 AND path=?3",
@@ -2412,25 +4286,45 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                     let revision_id:String=r.get(0)?;
                     let hash:String=r.get(1)?;
                     let length:i64=r.get(2)?;
-                    let raw=r.get_ref(3)?.as_blob()?;
-                    ensure!(length==raw.len() as i64 && hash==hex::encode(Sha256::digest(raw)),
-                        "incompatible_index: native source hash mismatch");
+                    let raw=r.get_ref(3)?;
+                    let raw=raw.as_blob().map_err(|error| selected_integrity(error.into()))?;
+                    if length!=raw.len() as i64 || hash!=hex::encode(Sha256::digest(raw)) {
+                        return Err(SelectedIntegrity(
+                            "incompatible_index: native source hash mismatch".into(),
+                        ).into());
+                    }
                     Ok((revision_id,hash,length,r.get(3)?))
                 })()),
             ).optional()?;
             let row=row.transpose()?.map(|(revision_id,content_hash,byte_length,bytes)|->Result<_>{
-                let graph=Self::selected_source_row(db,&key.path)?
-                    .context("incompatible_index: paired graph source missing")?;
-                ensure!(graph.path==key.path && graph.language==key.language
-                    && graph.hash==content_hash && graph.text.as_bytes()==bytes,
-                    "incompatible_index: native source differs from paired graph");
-                Ok((Document {key:key.clone(),revision_id,content_hash,byte_length:usize::try_from(byte_length)?},bytes))
+                let graph=match self.selected_source_row(db,&key.path)? {
+                    Some(graph)=>graph,
+                    None=>return Err(SelectedIntegrity(
+                        "incompatible_index: paired graph source missing".into(),
+                    ).into()),
+                };
+                if graph.path!=key.path || graph.language!=key.language
+                    || graph.hash!=content_hash || graph.text.as_bytes()!=bytes {
+                    return Err(SelectedIntegrity(
+                        "incompatible_index: native source differs from paired graph".into(),
+                    ).into());
+                }
+                let byte_length=usize::try_from(byte_length).map_err(|error| -> anyhow::Error {
+                    SelectedIntegrity(format!(
+                        "incompatible_index: selected native byte length conversion failed: {error}"
+                    )).into()
+                })?;
+                Ok((Document {key:key.clone(),revision_id,content_hash,byte_length},bytes))
             }).transpose()?;
             if row.is_none() {
                 let graph_file:bool=db.query_row(
                     "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",[&key.path],|r|r.get(0),
                 )?;
-                ensure!(!graph_file,"incompatible_index: selected native source absent");
+                if graph_file {
+                    return Err(SelectedIntegrity(
+                        "incompatible_index: selected native source absent".into(),
+                    ).into());
+                }
             }
             Ok(row)
         })
@@ -2675,9 +4569,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         request: &crate::navigation::NavigationRequest,
     ) -> Result<crate::navigation::NavigationResult> {
         request.validate()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(request.expected_revision() == revision, "revision conflict");
         // Navigation's source selector counts lines in the graph JSON, and its
         // member selector reads graph class/node rows. Before either consumes a
@@ -2685,10 +4578,28 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         // in this same read transaction. Never scan the entire workspace here.
         let selected_path: Option<String> = match request {
             crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
-            crate::navigation::NavigationRequest::Member(s) => tx.query_row(
-                "SELECT path FROM nodes WHERE id=?1 AND json_extract(payload,'$.kind')='class' LIMIT 1",
-                [&s.class_id], |row| row.get(0),
-            ).optional()?,
+            crate::navigation::NavigationRequest::Member(s) => {
+                let selected: Option<(String, bool, Option<String>)> = tx
+                    .query_row(
+                        "SELECT path,json_valid(payload),CASE WHEN json_valid(payload) THEN json_extract(payload,'$.kind') ELSE NULL END FROM nodes WHERE id=?1 LIMIT 1",
+                        [&s.class_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|error| self.report_selected_failure(error.into()))?;
+                match selected {
+                    Some((_path, false, _)) => {
+                        return Err(self.report_selected_failure(
+                            SelectedIntegrity(
+                                "incompatible_index: selected navigation node JSON invalid".into(),
+                            )
+                            .into(),
+                        ));
+                    }
+                    Some((path, true, Some(kind))) if kind == "class" => Some(path),
+                    _ => None,
+                }
+            }
         };
         if let Some(path) = selected_path {
             // Gate allocation of the selected JSON/BLOB before decoding either.
@@ -2698,24 +4609,33 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 [&path], |row| Ok((row.get(0)?, row.get(1)?)),
             ).optional()?;
             if let Some((graph_len, native_len)) = sizes {
-                ensure!(
-                    graph_len <= 2 * 1024 * 1024 && native_len <= 2 * 1024 * 1024,
-                    "incompatible_index: selected navigation source exceeds budget"
-                );
-                self.attest_selected_document(&tx, &path)?;
+                if graph_len > 2 * 1024 * 1024 || native_len > 2 * 1024 * 1024 {
+                    return Err(self.report_selected_failure(
+                        SelectedIntegrity(
+                            "incompatible_index: selected navigation source exceeds budget".into(),
+                        )
+                        .into(),
+                    ));
+                }
+                self.attest_selected_document(tx, &path)?;
             } else {
                 let graph_file: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",
                     [&path],
                     |row| row.get(0),
                 )?;
-                ensure!(
-                    !graph_file,
-                    "incompatible_index: selected native document missing"
-                );
+                if graph_file {
+                    return Err(self.report_selected_failure(
+                        SelectedIntegrity(
+                            "incompatible_index: selected native document missing".into(),
+                        )
+                        .into(),
+                    ));
+                }
             }
         }
-        crate::navigation::navigate(&tx, request, revision)
+        crate::navigation::navigate(tx, request, revision)
+            })
     }
 
     pub fn classes_at(
@@ -2746,11 +4666,11 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 InvalidRequest("Choose a workspace-relative class source path.")
             );
         }
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
-        let (mut warnings, truncated) = class_metadata(&tx)?;
+        let (mut warnings, truncated) = class_metadata(tx)
+            .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
         let pattern = format!(
             "%{}%",
             query
@@ -2766,13 +4686,14 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
                 params![path, pattern, query, (limit + 1) as i64, offset as i64],
                 |r| r.get::<_, String>(0),
             )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.report_selected_failure(error.into()))?;
         let mut items = Vec::new();
         let mut consumed = 0;
         let mut bytes = 0;
         let mut byte_limited = false;
         for id in ids.iter().take(limit) {
-            let Some((class, size, clipped)) = presentation_class(&tx, id)? else {
+            let Some((class, size, clipped)) = presentation_class(self, tx, id)? else {
                 // Consume an individually oversized row so pagination always progresses.
                 consumed += 1;
                 byte_limited = true;
@@ -2804,7 +4725,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .map(|class| class.symbol.path.as_str())
             .collect();
         for path in paths {
-            self.attest_selected_class(&tx, path)?;
+            self.attest_selected_class(tx, path)?;
         }
         Ok(ClassPage {
             revision,
@@ -2814,6 +4735,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             warnings,
             require_index: false,
         })
+            })
     }
     /// Bounded one-hop relation reads and seed resolution share a revision-pinned
     /// read transaction. No filesystem access or graph/provider augmentation.
@@ -2823,57 +4745,57 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
     ) -> Result<crate::class_diagram::ClassDiagram> {
         use crate::class_diagram::{self, InvalidRequest};
         request.validate()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
-        ensure!(revision == request.expected_revision, "revision conflict");
-        let (warnings, truncated) = class_metadata(&tx)?;
-        let (seed, clipped) = resolve_class(&tx, &request.seed)?;
-        // Explicitly selected measured declarations are independent roots, never
-        // connected by lexical type-name matches or candidate relationships.
-        let mut seeds = vec![seed.symbol.id.clone()];
-        let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
-        for expanded in &request.expanded {
-            let (class, _) = resolve_class(&tx, expanded)?;
-            if !classes.contains_key(&class.symbol.id) {
-                ensure!(
-                    classes.len() < class_diagram::MAX_NODES,
-                    InvalidRequest("Too many selected classes.")
-                );
-                seeds.push(class.symbol.id.clone());
-                classes.insert(class.symbol.id.clone(), class);
+        self.with_evidence(|tx| {
+            let revision = self.read_status(tx)?.revision;
+            ensure!(revision == request.expected_revision, "revision conflict");
+            let (warnings, truncated) = class_metadata(tx)
+                .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
+            let (seed, clipped) = resolve_class(self, tx, &request.seed)?;
+            // Explicitly selected measured declarations are independent roots, never
+            // connected by lexical type-name matches or candidate relationships.
+            let mut seeds = vec![seed.symbol.id.clone()];
+            let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
+            for expanded in &request.expanded {
+                let (class, _) = resolve_class(self, tx, expanded)?;
+                if !classes.contains_key(&class.symbol.id) {
+                    ensure!(
+                        classes.len() < class_diagram::MAX_NODES,
+                        InvalidRequest("Too many selected classes.")
+                    );
+                    seeds.push(class.symbol.id.clone());
+                    classes.insert(class.symbol.id.clone(), class);
+                }
             }
-        }
-        let paths: BTreeSet<_> = classes
-            .values()
-            .map(|class| class.symbol.path.as_str())
-            .collect();
-        for path in paths {
-            self.attest_selected_class(&tx, path)?;
-        }
-        class_diagram::project(
-            revision,
-            &seeds,
-            &classes,
-            vec![],
-            vec![],
-            warnings,
-            truncated || clipped,
-        )
+            let paths: BTreeSet<_> = classes
+                .values()
+                .map(|class| class.symbol.path.as_str())
+                .collect();
+            for path in paths {
+                self.attest_selected_class(tx, path)?;
+            }
+            class_diagram::project(
+                revision,
+                &seeds,
+                &classes,
+                vec![],
+                vec![],
+                warnings,
+                truncated || clipped,
+            )
+        })
     }
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
         Ok(self.symbols_at(query, limit)?.1)
     }
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         ensure!(query.len() <= 8192, "search query too long");
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         let selected_paths: BTreeSet<String> = tx.prepare("SELECT path FROM nodes WHERE instr(lower(name),lower(?1)) > 0 OR instr(lower(id),lower(?1)) > 0 ORDER BY CASE WHEN lower(name)=lower(?1) THEN 0 WHEN instr(lower(name),lower(?1))=1 THEN 1 ELSE 2 END,name,id LIMIT ?2")?
             .query_map(params![query,limit.min(150) as i64],|r|r.get::<_,String>(0))?
             .collect::<rusqlite::Result<_>>()?;
         for path in selected_paths {
-            self.attest_selected_document(&tx, &path)?;
+            self.attest_selected_document(tx, &path)?;
         }
         let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE instr(lower(name),lower(?1)) > 0 OR instr(lower(id),lower(?1)) > 0 ORDER BY CASE WHEN lower(name)=lower(?1) THEN 0 WHEN instr(lower(name),lower(?1))=1 THEN 1 ELSE 2 END,name,id LIMIT ?2")?;
         let values = stmt.query_map(params![query, limit.min(150) as i64], |r| {
@@ -2884,9 +4806,10 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .collect::<Result<Vec<Symbol>>>()?;
         let paths: BTreeSet<_> = values.iter().map(|node| node.path.as_str()).collect();
         for path in paths {
-            self.attest_selected_document(&tx, path)?;
+            self.attest_selected_document(tx, path)?;
         }
         Ok((revision, values))
+            })
     }
     pub fn symbol(&self, id: &str) -> Result<Option<Symbol>> {
         Ok(self.symbol_at(id, None)?.map(|(_, v)| v))
@@ -2899,24 +4822,26 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         id: &str,
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, Symbol)>> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
-        ensure!(
-            expected_revision.is_none_or(|pin| pin == revision),
-            "revision conflict"
-        );
-        let selected_path: Option<String> = tx
-            .query_row("SELECT path FROM nodes WHERE id=?1", [id], |r| r.get(0))
-            .optional()?;
-        if let Some(path) = selected_path {
-            self.attest_selected_document(&tx, &path)?;
-        }
-        let node: Option<Symbol> = one(&tx, "SELECT payload FROM nodes WHERE id=?1", id)?;
-        Ok(node.map(|node| (revision, node)))
+        self.with_evidence(|tx| {
+            let revision = self.read_status(tx)?.revision;
+            ensure!(
+                expected_revision.is_none_or(|pin| pin == revision),
+                "revision conflict"
+            );
+            let selected_path: Option<String> = tx
+                .query_row("SELECT path FROM nodes WHERE id=?1", [id], |r| r.get(0))
+                .optional()?;
+            if let Some(path) = selected_path {
+                self.attest_selected_document(tx, &path)?;
+            }
+            let node: Option<Symbol> = one(tx, "SELECT payload FROM nodes WHERE id=?1", id)?;
+            Ok(node.map(|node| (revision, node)))
+        })
     }
-    fn selected_source_row(db: &Connection, path: &str) -> Result<Option<SourceFile>> {
+    fn selected_source_row(&self, db: &Connection, path: &str) -> Result<Option<SourceFile>> {
         Self::selected_source_row_bounded(db, path, 256 * 1024 * 1024)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))
     }
     fn selected_source_row_bounded(
         db: &Connection,
@@ -2987,14 +4912,16 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         path: &str,
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, SourceFile)>> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
-        ensure!(
-            expected_revision.is_none_or(|pin| pin == revision),
-            "revision conflict"
-        );
-        Ok(Self::selected_source_row(&tx, path)?.map(|file| (revision, file)))
+        self.with_evidence(|tx| {
+            let revision = self.read_status(tx)?.revision;
+            ensure!(
+                expected_revision.is_none_or(|pin| pin == revision),
+                "revision conflict"
+            );
+            Ok(self
+                .selected_source_row(tx, path)?
+                .map(|file| (revision, file)))
+        })
     }
     /// Catalog reads pin revision and rows to one SQLite read transaction.
     /// Enrich only the visible tree page from one cached index snapshot.
@@ -3003,26 +4930,50 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         root: &Path,
         items: &mut [crate::file_tree::Entry],
     ) -> Result<(IndexPin, String)> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
-        let workspace = Path::new(&self.workspace_root);
-        let mut stmt = tx.prepare("SELECT (SELECT count(*) FROM nodes n WHERE n.path=f.path AND json_extract(n.payload,'$.kind') IN ('function','method')) FROM files f WHERE f.path=?1")?;
-        for item in items.iter_mut().filter(|e| e.kind == "file") {
-            let absolute = root.join(&item.path);
-            let Ok(relative) = absolute.strip_prefix(workspace) else {
-                continue;
-            };
-            let Some(relative) = relative.to_str() else {
-                continue;
-            };
-            let count: Option<i64> = stmt.query_row([relative], |r| r.get(0)).optional()?;
-            if let Some(count) = count {
-                item.indexed_path = Some(relative.into());
-                item.method_count = Some(usize::try_from(count)?);
+        self.tree_metadata_with_finish_hook(root, items, || Ok(()))
+    }
+    fn tree_metadata_with_finish_hook(
+        &self,
+        root: &Path,
+        items: &mut [crate::file_tree::Entry],
+        before_finish: impl FnOnce() -> Result<()>,
+    ) -> Result<(IndexPin, String)> {
+        let (revision, workspace_root, overlays) = self.with_evidence_hook(|tx| {
+            let revision = self.read_status(tx)?.revision;
+            let workspace = Path::new(&self.workspace_root);
+            let mut valid_stmt = tx.prepare(
+                "SELECT NOT EXISTS(SELECT 1 FROM nodes n WHERE n.path=f.path AND json_valid(n.payload)=0) FROM files f WHERE f.path=?1",
+            )?;
+            let mut count_stmt = tx.prepare(
+                "SELECT (SELECT count(*) FROM nodes n WHERE n.path=f.path AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM files f WHERE f.path=?1",
+            )?;
+            let mut overlays = Vec::new();
+            for (index, item) in items.iter().enumerate().filter(|(_, entry)| entry.kind == "file") {
+                let absolute = root.join(&item.path);
+                let Ok(relative) = absolute.strip_prefix(workspace) else { continue };
+                let Some(relative) = relative.to_str() else { continue };
+                let valid: Option<bool> = valid_stmt
+                    .query_row([relative], |row| row.get(0))
+                    .optional()
+                    .map_err(|error| self.report_selected_failure(error.into()))?;
+                let Some(valid) = valid else { continue };
+                if !valid {
+                    return Err(self.report_selected_failure(
+                        SelectedIntegrity("incompatible_index: selected tree node JSON invalid".into()).into(),
+                    ));
+                }
+                let count: i64 = count_stmt
+                    .query_row([relative], |row| row.get(0))
+                    .map_err(|error| self.report_selected_failure(error.into()))?;
+                overlays.push((index, relative.to_owned(), usize::try_from(count)?));
             }
+            Ok((revision, self.workspace_root.clone(), overlays))
+        }, before_finish)?;
+        for (index, path, count) in overlays {
+            items[index].indexed_path = Some(path);
+            items[index].method_count = Some(count);
         }
-        Ok((revision, self.workspace_root.clone()))
+        Ok((revision, workspace_root))
     }
     pub fn files_at(
         &self,
@@ -3034,26 +4985,48 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             (1..=200).contains(&limit) && offset <= i64::MAX as usize,
             "invalid catalog pagination"
         );
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
-        let mut stmt = tx.prepare("SELECT f.path,json_extract(f.payload,'$.language'),(SELECT count(*) FROM nodes n WHERE n.path=f.path AND json_extract(n.payload,'$.kind') IN ('function','method')) FROM files f ORDER BY f.path LIMIT ?1 OFFSET ?2")?;
-        let mut items = stmt.query_map(params![(limit + 1) as i64, offset as i64], |r| {
-            Ok(serde_json::json!({"path":r.get::<_,String>(0)?,"language":r.get::<_,String>(1)?,"methodCount":r.get::<_,i64>(2)?}))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let selected_valid: bool = tx
+            .query_row(
+                "WITH selected AS (SELECT path,payload FROM files ORDER BY path LIMIT ?1 OFFSET ?2)
+                 SELECT NOT EXISTS(
+                    SELECT 1 FROM selected WHERE json_valid(payload)=0
+                    UNION ALL
+                    SELECT 1 FROM nodes n JOIN selected f ON f.path=n.path WHERE json_valid(n.payload)=0
+                 )",
+                params![(limit + 1) as i64, offset as i64],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.report_selected_failure(error.into()))?;
+        if !selected_valid {
+            return Err(self.report_selected_failure(
+                SelectedIntegrity("incompatible_index: selected file page JSON invalid".into())
+                    .into(),
+            ));
+        }
+        let mut stmt = tx.prepare("SELECT f.path,CASE WHEN json_valid(f.payload) THEN json_extract(f.payload,'$.language') ELSE NULL END,(SELECT count(*) FROM nodes n WHERE n.path=f.path AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM files f ORDER BY f.path LIMIT ?1 OFFSET ?2")?;
+        let values = stmt
+            .query_map(params![(limit + 1) as i64, offset as i64], |r| {
+                Ok(serde_json::json!({"path":r.get::<_,String>(0)?,"language":r.get::<_,String>(1)?,"methodCount":r.get::<_,i64>(2)?}))
+            })
+            .map_err(|error| self.report_selected_failure(error.into()))?;
+        let mut items = values
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.report_selected_failure(error.into()))?;
         let next = (items.len() > limit).then_some(offset + limit);
         items.truncate(limit);
         Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
+            })
     }
     pub fn methods_at(
         &self,
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
         if !tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",
@@ -3062,11 +5035,27 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         )? {
             return Ok(None);
         }
-        let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE path=?1 AND json_extract(payload,'$.kind') IN ('function','method') ORDER BY json_extract(payload,'$.range.startByte'),id LIMIT 1001")?;
-        let values = stmt.query_map([path], |r| r.get::<_, String>(0))?;
+        let selected_valid: bool = tx
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE path=?1 AND json_valid(payload)=0)",
+                [path],
+                |r| r.get(0),
+            )
+            .map_err(|error| self.report_selected_failure(error.into()))?;
+        if !selected_valid {
+            return Err(self.report_selected_failure(
+                SelectedIntegrity("incompatible_index: selected method JSON invalid".into()).into(),
+            ));
+        }
+        let mut stmt = tx.prepare("SELECT payload FROM nodes WHERE path=?1 AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.kind') IN ('function','method') ELSE 0 END ORDER BY CASE WHEN json_valid(payload) THEN json_extract(payload,'$.range.startByte') ELSE NULL END,id LIMIT 1001")?;
+        let values = stmt
+            .query_map([path], |r| r.get::<_, String>(0))
+            .map_err(|error| self.report_selected_failure(error.into()))?;
         let mut items = Vec::new();
         for value in values {
-            let symbol: Symbol = serde_json::from_str(&value?)?;
+            let value = value.map_err(|error| self.report_selected_failure(error.into()))?;
+            let symbol: Symbol = serde_json::from_str(&value)
+                .map_err(|error| self.report_selected_failure(error.into()))?;
             // Accessor syntax alone does not prove a body is trivial. Without
             // semantic proof retain it, including zero-call validations/checks.
             items.push(serde_json::json!({"symbol":symbol,"consequential":true,"reason":"Conservative heuristic: retained; triviality is not proven"}));
@@ -3076,6 +5065,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         Ok(Some(
             serde_json::json!({"revision":revision,"items":items,"truncated":truncated}),
         ))
+            })
     }
     /// Only cached source and measured calls from the same snapshot are used.
     pub fn sequence_at(
@@ -3084,17 +5074,16 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| {
+        let revision = self.read_status(tx)?.revision;
         ensure!(revision == expected, "revision conflict");
         let selected_path: Option<String> = tx
             .query_row("SELECT path FROM nodes WHERE id=?1", [seed], |r| r.get(0))
             .optional()?;
         if let Some(path) = selected_path {
-            self.attest_selected_document(&tx, &path)?;
+            self.attest_selected_document(tx, &path)?;
         }
-        let Some(symbol) = one::<Symbol>(&tx, "SELECT payload FROM nodes WHERE id=?1", seed)?
+        let Some(symbol) = one::<Symbol>(tx, "SELECT payload FROM nodes WHERE id=?1", seed)?
         else {
             return Ok(None);
         };
@@ -3102,8 +5091,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
             "invalid sequence symbol kind"
         );
-        self.attest_selected_document(&tx, &symbol.path)?;
-        let file = one::<SourceFile>(&tx, "SELECT payload FROM files WHERE path=?1", &symbol.path)?
+        self.attest_selected_document(tx, &symbol.path)?;
+        let file = one::<SourceFile>(tx, "SELECT payload FROM files WHERE path=?1", &symbol.path)?
             .context("sequence source missing")?;
         let mut stmt = tx.prepare("SELECT payload FROM calls WHERE path=?1 ORDER BY json_extract(payload,'$.range.startByte'),id")?;
         let values = stmt.query_map([&symbol.path], |r| r.get::<_, String>(0))?;
@@ -3111,6 +5100,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .map(|v| Ok(serde_json::from_str::<CallSite>(&v?)?))
             .collect::<Result<Vec<_>>>()?;
         crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
+            })
     }
     fn read_graph(&self, db: &Connection) -> Result<Graph> {
         let status = self.read_status(db)?;
@@ -3128,19 +5118,24 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         })
     }
     pub fn graph(&self) -> Result<Graph> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let graph = self.read_graph(&tx)?;
-        storage_result(tx.commit())?;
-        Ok(graph)
+        self.with_evidence(|tx| {
+            let graph = self.read_graph(tx)?;
+            Ok(graph)
+        })
     }
     /// Reauthenticate only a cached packet's selected evidence under one pin.
-    /// Unrelated documents are not read, so bounded status stays metadata-only.
+    /// Unrelated documents are not read; status still validates persisted capture inventory.
     pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
+        self.with_evidence(|tx| self.validate_selected_view_in(tx, view, sources))
+    }
+    fn validate_selected_view_in(
+        &self,
+        tx: &Connection,
+        view: &ViewResult,
+        sources: &[SourceFile],
+    ) -> Result<()> {
         ensure!(
-            self.read_status(&tx)?.revision == view.revision,
+            self.read_status(tx)?.revision == view.revision,
             "revision conflict: cached packet pin changed"
         );
         let paths: BTreeSet<_> = view
@@ -3152,11 +5147,11 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .chain(sources.iter().map(|f| f.path.as_str()))
             .collect();
         for path in paths {
-            self.attest_selected_document(&tx, path)?;
+            self.attest_selected_document(tx, path)?;
         }
         for node in &view.nodes {
             let actual: Option<Symbol> =
-                one(&tx, "SELECT payload FROM nodes WHERE id=?1", &node.id)?;
+                one(tx, "SELECT payload FROM nodes WHERE id=?1", &node.id)?;
             ensure!(
                 actual.as_ref() == Some(node),
                 "incompatible_index: cached packet selected graph declaration changed"
@@ -3164,7 +5159,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         }
         for call in &view.calls {
             let actual: Option<CallSite> =
-                one(&tx, "SELECT payload FROM calls WHERE id=?1", &call.id)?;
+                one(tx, "SELECT payload FROM calls WHERE id=?1", &call.id)?;
             ensure!(
                 actual.as_ref() == Some(call),
                 "incompatible_index: cached packet selected graph call changed"
@@ -3172,7 +5167,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         }
         for region in &view.regions {
             let actual: Option<ControlRegion> =
-                one(&tx, "SELECT payload FROM regions WHERE id=?1", &region.id)?;
+                one(tx, "SELECT payload FROM regions WHERE id=?1", &region.id)?;
             ensure!(
                 actual.as_ref() == Some(region),
                 "incompatible_index: cached packet selected graph region changed"
@@ -3180,7 +5175,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         }
         for source in sources {
             ensure!(
-                Self::selected_source_row(&tx, &source.path)?.as_ref() == Some(source),
+                self.selected_source_row(tx, &source.path)?.as_ref() == Some(source),
                 "incompatible_index: cached packet selected source changed"
             );
         }
@@ -3197,9 +5192,15 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         expected_pin: Option<&IndexPin>,
     ) -> Result<Option<ViewResult>> {
         query.validate()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let revision = self.read_status(&tx)?.revision;
+        self.with_evidence(|tx| self.query_view_in(tx, query, expected_pin))
+    }
+    fn query_view_in(
+        &self,
+        tx: &Connection,
+        query: &ViewQuery,
+        expected_pin: Option<&IndexPin>,
+    ) -> Result<Option<ViewResult>> {
+        let revision = self.read_status(tx)?.revision;
         ensure!(
             expected_pin.is_none_or(|expected| *expected == revision),
             "revision conflict: stale native pin"
@@ -3210,9 +5211,9 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             })
             .optional()?;
         if let Some(path) = selected_path {
-            self.attest_selected_document(&tx, &path)?;
+            self.attest_selected_document(tx, &path)?;
         }
-        let seed: Option<Symbol> = one(&tx, "SELECT payload FROM nodes WHERE id=?1", &query.seed)?;
+        let seed: Option<Symbol> = one(tx, "SELECT payload FROM nodes WHERE id=?1", &query.seed)?;
         let Some(seed) = seed else { return Ok(None) };
         let mut calls = Vec::new();
         let mut region_ids = BTreeSet::new();
@@ -3238,7 +5239,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         let mut regions = BTreeMap::new();
         while let Some(id) = region_ids.pop_first() {
             let region: Option<ControlRegion> =
-                one(&tx, "SELECT payload FROM regions WHERE id=?1", &id)?;
+                one(tx, "SELECT payload FROM regions WHERE id=?1", &id)?;
             if let Some(region) = region {
                 if let Some(parent) = &region.parent {
                     region_ids.insert(parent.clone());
@@ -3251,9 +5252,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             .chain(regions.values().map(|r| r.path.as_str()))
             .collect();
         for path in paths {
-            self.attest_selected_document(&tx, path)?;
+            self.attest_selected_document(tx, path)?;
         }
-        storage_result(tx.commit())?;
         Ok(Some(ViewResult {
             revision,
             query: query.clone(),
@@ -3269,6 +5269,7 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             },
         }))
     }
+
     pub fn put_view(&self, view: &SavedView) -> Result<()> {
         view.validate()?;
         self.records().put_view(view)?;
@@ -3383,6 +5384,21 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             attachment,
         })
     }
+    // Durable records are not index evidence. Admit even an empty result before returning it.
+    fn saved_pin(response: &EvidenceResponse, expected_pin: Option<IndexPin>) -> Result<IndexPin> {
+        let pin = response.status()?.revision;
+        ensure!(
+            expected_pin.is_none_or(|expected| expected == pin),
+            "revision conflict: stale native pin"
+        );
+        Ok(pin)
+    }
+
+    fn finish_saved<T>(&self, response: &EvidenceResponse, value: T) -> Result<T> {
+        // A publication in flight must not turn an old attachment into a Ready response.
+        self.ensure_public_read_ready()?;
+        response.finish(value)
+    }
 
     fn unavailable_view(view: SavedViewRecord) -> SavedViewState {
         let orphaned_ids = std::iter::once(view.query.seed.clone())
@@ -3403,28 +5419,19 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
 
     pub fn saved_views_at(&self, expected_pin: Option<IndexPin>) -> Result<Vec<SavedViewState>> {
         let views = self.records().view_records()?;
-        if views.is_empty() && expected_pin.is_none() {
-            return Ok(vec![]);
-        }
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let control = self.read_control_status(&tx)?;
-        if control.evidence_format.is_none() {
-            ensure!(
-                expected_pin.is_none(),
-                "revision conflict: native evidence unavailable"
-            );
-            return Ok(views.into_iter().map(Self::unavailable_view).collect());
-        }
-        let pin = self.read_status(&tx)?.revision;
-        ensure!(
-            expected_pin.is_none_or(|expected| expected == pin),
-            "revision conflict: stale native pin"
-        );
-        views
+        let response = match self.evidence_response() {
+            Ok(response) => response,
+            Err(error) if expected_pin.is_none() && native_index_unavailable(&error) => {
+                return Ok(views.into_iter().map(Self::unavailable_view).collect());
+            }
+            Err(error) => return Err(error),
+        };
+        let pin = Self::saved_pin(&response, expected_pin)?;
+        let states = views
             .into_iter()
-            .map(|view| Self::resolve_view(&tx, self, view, Some(pin)))
-            .collect()
+            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin)))
+            .collect::<Result<Vec<_>>>()?;
+        self.finish_saved(&response, states)
     }
     pub fn views(&self) -> Result<Vec<SavedViewState>> {
         self.saved_views_at(None)
@@ -3436,39 +5443,18 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         expected_pin: Option<IndexPin>,
     ) -> Result<Option<SavedViewState>> {
         let view = self.records().view_record(id)?;
-        let Some(view) = view else {
-            if let Some(expected) = expected_pin {
-                let mut db = self.cache()?;
-                let tx = storage_result(db.transaction())?;
-                let status = self.read_control_status(&tx)?;
-                ensure!(
-                    status.evidence_format.is_some(),
-                    "revision conflict: native evidence unavailable"
-                );
-                ensure!(
-                    status.revision == expected,
-                    "revision conflict: stale native pin"
-                );
-                self.read_status(&tx)?;
+        let response = match self.evidence_response() {
+            Ok(response) => response,
+            Err(error) if expected_pin.is_none() && native_index_unavailable(&error) => {
+                return Ok(view.map(Self::unavailable_view));
             }
-            return Ok(None);
+            Err(error) => return Err(error),
         };
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let control = self.read_control_status(&tx)?;
-        if control.evidence_format.is_none() {
-            ensure!(
-                expected_pin.is_none(),
-                "revision conflict: native evidence unavailable"
-            );
-            return Ok(Some(Self::unavailable_view(view)));
-        }
-        let pin = self.read_status(&tx)?.revision;
-        ensure!(
-            expected_pin.is_none_or(|expected| expected == pin),
-            "revision conflict: stale native pin"
-        );
-        Ok(Some(Self::resolve_view(&tx, self, view, Some(pin))?))
+        let pin = Self::saved_pin(&response, expected_pin)?;
+        let state = view
+            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin)))
+            .transpose()?;
+        self.finish_saved(&response, state)
     }
     pub fn view(&self, id: &str) -> Result<Option<SavedViewState>> {
         self.saved_view_at(id, None)
@@ -3476,30 +5462,21 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
 
     pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
         view.validate()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let status = self.read_control_status(&tx)?;
-        ensure!(
-            status.evidence_format.is_some(),
-            "revision conflict: native evidence unavailable"
-        );
-        ensure!(
-            status.revision == pin,
-            "revision conflict: stale native pin"
-        );
-        self.read_status(&tx)?;
+        let response = self.evidence_response()?;
+        Self::saved_pin(&response, Some(pin))?;
         let record = self.records().update_view_record(
             &SavedViewRecord::from_base(view.clone(), None),
             || {
                 serde_json::value::to_raw_value(&Self::selected_anchor_in(
-                    &tx,
+                    &response.db,
                     self,
                     &view.query.seed,
                 )?)
                 .map_err(Into::into)
             },
         )?;
-        Self::resolve_view(&tx, self, record, Some(pin))
+        let state = Self::resolve_view(&response.db, self, record, Some(pin))?;
+        self.finish_saved(&response, state)
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
         self.records().delete_view(id)
@@ -3510,7 +5487,6 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         self.records().put_annotation(annotation)?;
         Ok(())
     }
-
     fn resolve_annotation(
         db: &Connection,
         store: &Self,
@@ -3547,31 +5523,22 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         expected_pin: Option<IndexPin>,
     ) -> Result<Vec<AnnotationState>> {
         let annotations = self.records().annotation_records()?;
-        if annotations.is_empty() && expected_pin.is_none() {
-            return Ok(vec![]);
-        }
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let control = self.read_control_status(&tx)?;
-        if control.evidence_format.is_none() {
-            ensure!(
-                expected_pin.is_none(),
-                "revision conflict: native evidence unavailable"
-            );
-            return Ok(annotations
-                .into_iter()
-                .map(Self::unavailable_annotation)
-                .collect());
-        }
-        let pin = self.read_status(&tx)?.revision;
-        ensure!(
-            expected_pin.is_none_or(|expected| expected == pin),
-            "revision conflict: stale native pin"
-        );
-        annotations
+        let response = match self.evidence_response() {
+            Ok(response) => response,
+            Err(error) if expected_pin.is_none() && native_index_unavailable(&error) => {
+                return Ok(annotations
+                    .into_iter()
+                    .map(Self::unavailable_annotation)
+                    .collect());
+            }
+            Err(error) => return Err(error),
+        };
+        let pin = Self::saved_pin(&response, expected_pin)?;
+        let states = annotations
             .into_iter()
-            .map(|item| Self::resolve_annotation(&tx, self, item, Some(pin)))
-            .collect()
+            .map(|item| Self::resolve_annotation(&response.db, self, item, Some(pin)))
+            .collect::<Result<Vec<_>>>()?;
+        self.finish_saved(&response, states)
     }
     pub fn annotations(&self) -> Result<Vec<AnnotationState>> {
         self.saved_annotations_at(None)
@@ -3583,18 +5550,8 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
         request: &AnnotationRequest,
     ) -> Result<AnnotationState> {
         request.validate()?;
-        let mut db = self.cache()?;
-        let tx = storage_result(db.transaction())?;
-        let status = self.read_control_status(&tx)?;
-        ensure!(
-            status.evidence_format.is_some(),
-            "revision conflict: native evidence unavailable"
-        );
-        ensure!(
-            status.revision == pin,
-            "revision conflict: stale native pin"
-        );
-        self.read_status(&tx)?;
+        let response = self.evidence_response()?;
+        Self::saved_pin(&response, Some(pin))?;
         let title = request
             .title
             .as_ref()
@@ -3606,14 +5563,15 @@ SELECT COALESCE(length(CAST(g.id AS BLOB)),0)+COALESCE(length(CAST(g.owner AS BL
             request.title.is_none(),
             || {
                 serde_json::value::to_raw_value(&Self::selected_anchor_in(
-                    &tx,
+                    &response.db,
                     self,
                     &request.node_id,
                 )?)
                 .map_err(Into::into)
             },
         )?;
-        Self::resolve_annotation(&tx, self, record, Some(pin))
+        let state = Self::resolve_annotation(&response.db, self, record, Some(pin))?;
+        self.finish_saved(&response, state)
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
         self.records().delete_annotation(id)
@@ -3625,6 +5583,489 @@ mod rebaseline_fault_tests {
     use super::*;
     use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{fs, ptr, sync::atomic::AtomicBool};
+
+    #[test]
+    fn wal_header_without_sidecars_is_not_corruption_authority() {
+        use std::os::unix::fs::MetadataExt;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        let lock = store.roots.leader_lock(&store.identity);
+        let old_lock = fs::symlink_metadata(&lock).unwrap();
+        drop(store);
+        let db = Connection::open(&index).unwrap();
+        let mode: String = db
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let _: (i64, i64, i64) = db
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        drop(db);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!index.with_file_name(format!("index.db{suffix}")).exists());
+        }
+        let before = fs::read(&index).unwrap();
+        assert_eq!((before[18], before[19]), (2, 2));
+        let error = verify_index_file(&index).unwrap_err();
+        assert_eq!(recovery_class(&error), RecoveryClass::Hard);
+        assert!(
+            error.to_string().contains("incompatible_index"),
+            "{error:#}"
+        );
+        assert!(Store::open_for_tests(state.path(), work.path()).is_err());
+        assert_eq!(fs::read(&index).unwrap(), before);
+        let new_lock = fs::symlink_metadata(&lock).unwrap();
+        assert_eq!(
+            (old_lock.dev(), old_lock.ino()),
+            (new_lock.dev(), new_lock.ino())
+        );
+    }
+
+    #[test]
+    fn only_short_or_invalid_magic_headers_request_typed_recreation() {
+        for bytes in [
+            b"short".as_slice(),
+            b"not-a-sqlite-header-with-at-least-20".as_slice(),
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let work = tempfile::tempdir().unwrap();
+            fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+            let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+            let index = store.roots.index_db(&store.identity);
+            drop(store);
+            fs::write(&index, bytes).unwrap();
+            let error = verify_index_file(&index).unwrap_err();
+            assert!(error.is::<ExceptionalIndexFormat>());
+            assert_eq!(recovery_class(&error), RecoveryClass::RecreatePending);
+            let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+            assert_eq!(
+                recovering.disposition(),
+                RecoveryDisposition::RecreatePending
+            );
+            let exclusive = recovering
+                .roots
+                .index_use_exclusive_existing(&recovering.identity)
+                .unwrap();
+            let mut leader = recovering
+                .roots
+                .leader_under_exclusive(&recovering.identity, exclusive)
+                .unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let pin = recovering
+                .recreate_index_exclusive(
+                    &IndexOptions::new(work.path().to_owned()),
+                    &mut leader,
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(pin.index_revision, 1);
+            assert_eq!(recovering.status().unwrap().revision, pin);
+        }
+    }
+
+    #[test]
+    fn private_stage_uses_paired_writer_without_admitting_corrupt_live_evidence() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join("a.js"),
+            "function changed() { return 1; }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let owner = store.leader_session().unwrap();
+        let previous = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                owner.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(previous.index_revision, 1);
+        let live_path = store.roots.index_db(&store.identity);
+        drop(owner);
+        drop(store);
+        fs::write(&live_path, b"corrupt index, not sqlite").unwrap();
+        let original = fs::read(&live_path).unwrap();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        let clone = recovering.clone();
+        let exclusive = recovering
+            .roots
+            .index_use_exclusive_existing(&recovering.identity)
+            .unwrap();
+        let leader = recovering
+            .roots
+            .leader_under_exclusive(&recovering.identity, exclusive)
+            .unwrap();
+        let stage = recovering.create_staged_index(&leader).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, recovering.root_id(), &cancel, |_| {}).unwrap();
+        let replacement = recovering
+            .publish_native_to_stage(
+                (&graph, &capture, &native),
+                &stage,
+                &leader,
+                &cancel,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(replacement.index_revision, previous.index_revision);
+        assert_ne!(replacement.index_generation, previous.index_generation);
+        let db = open_index(&stage.path, false).unwrap();
+        let stage_status = recovering.decode_control_status_raw(&db).unwrap();
+        assert_eq!(stage_status.revision, replacement);
+        let marker: String = db
+            .query_row(
+                "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, leader.incarnation.to_string());
+        validate_paired_metadata(&db, recovering.root_id()).unwrap();
+        validate_paired_rows(&db).unwrap();
+        validate_reconcile_inventory(&db).unwrap();
+        let integrity: String = db
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        drop(db);
+        assert_eq!(fs::read(&live_path).unwrap(), original);
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        assert!(clone.recovery_required.load(Ordering::Acquire));
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery_required")
+        );
+
+        let failing = recovering.create_staged_index(&leader).unwrap();
+        let error = recovering
+            .publish_native_to_stage(
+                (&graph, &capture, &native),
+                &failing,
+                &leader,
+                &cancel,
+                |phase, _| {
+                    if phase == PublishStage::BeforeCommit {
+                        anyhow::bail!("injected stage precommit refusal");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected stage precommit refusal")
+        );
+        let unchanged = open_index(&failing.path, false).unwrap();
+        let baseline = recovering.recovery_baseline(&unchanged).unwrap();
+        assert_eq!(baseline.pin().unwrap().index_revision, 0);
+        assert_eq!(
+            unchanged
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            GRAPH_SCHEMA_VERSION
+        );
+        drop(unchanged);
+        assert_eq!(fs::read(&live_path).unwrap(), original);
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        assert!(clone.recovery_required.load(Ordering::Acquire));
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery_required")
+        );
+    }
+
+    #[test]
+    fn staged_hot_journal_after_validation_refuses_without_deleting_sidecar() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        let dir = store.roots.index_dir(&store.identity);
+        drop(store);
+        fs::write(&index, b"short").unwrap();
+        let before = fs::read(&index).unwrap();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let exclusive = recovering
+            .roots
+            .index_use_exclusive_existing(&recovering.identity)
+            .unwrap();
+        let mut leader = recovering
+            .roots
+            .leader_under_exclusive(&recovering.identity, exclusive)
+            .unwrap();
+        let mut journal = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = recovering
+            .recreate_index_exclusive_with_hook(
+                &IndexOptions::new(work.path().to_owned()),
+                &mut leader,
+                &cancel,
+                |phase| {
+                    if phase == ActivationStage::BeforeRename {
+                        let stage = fs::read_dir(&dir)?
+                            .map(|entry| entry.map(|entry| entry.path()))
+                            .collect::<std::io::Result<Vec<_>>>()?
+                            .into_iter()
+                            .find(|path| {
+                                path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .is_some_and(|name| name.starts_with("index.db.tmp-"))
+                            })
+                            .context("missing private stage at activation hook")?;
+                        let sidecar = stage.with_file_name(format!(
+                            "{}-journal",
+                            stage.file_name().unwrap().to_string_lossy()
+                        ));
+                        fs::write(&sidecar, b"hot staged journal")?;
+                        journal = Some(sidecar);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("recovery_required"), "{error:#}");
+        assert_eq!(fs::read(&index).unwrap(), before);
+        assert_eq!(fs::read(journal.unwrap()).unwrap(), b"hot staged journal");
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        leader
+            .verify_exclusive_use(&recovering.roots.index_use_lock(&recovering.identity))
+            .unwrap();
+    }
+
+    #[test]
+    fn exceptional_activation_is_atomic_and_keeps_pending_on_ambiguous_failure() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for fault in [
+            Some(ActivationStage::BeforeRename),
+            Some(ActivationStage::AfterJournalBackupBeforeDirFsync),
+            Some(ActivationStage::AfterRenameBeforeDirFsync),
+            None,
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let work = tempfile::tempdir().unwrap();
+            fs::write(work.path().join("a.js"), "function a() { return 1; }\n").unwrap();
+            let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+            let options = IndexOptions::new(work.path().to_owned());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (graph, native, capture) =
+                index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+            let original_owner = store.leader_session().unwrap();
+            let old_pin = store
+                .publish_native(
+                    &graph,
+                    &capture,
+                    &native,
+                    original_owner.leader_guard().unwrap(),
+                    store.index_baseline().unwrap(),
+                    &cancel,
+                )
+                .unwrap();
+            store
+                .put_annotation(&Annotation {
+                    id: "saved".into(),
+                    node_id: "unattached".into(),
+                    body: "keep me".into(),
+                })
+                .unwrap();
+            let index = store.roots.index_db(&store.identity);
+            let dir = store.roots.index_dir(&store.identity);
+            let leader_path = store.roots.leader_lock(&store.identity);
+            let record = store.roots.record_db(&store.identity);
+            let requests = dir.join("requests.db");
+            let facts = dir.join("facts.db");
+            let neighbor = dir.join("unrelated-record");
+            fs::write(&requests, b"retained requests").unwrap();
+            fs::write(&facts, b"retained facts").unwrap();
+            fs::write(&neighbor, b"unrelated").unwrap();
+            let durable_bytes = fs::read(&record).unwrap();
+            let old_lock = fs::symlink_metadata(&leader_path).unwrap();
+            drop(original_owner);
+            drop(store);
+            fs::write(&index, b"corrupt-index-header").unwrap();
+            let old_bytes = fs::read(&index).unwrap();
+            let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+            assert_eq!(
+                recovering.disposition(),
+                RecoveryDisposition::RecreatePending
+            );
+            let shared = recovering
+                .roots
+                .index_use_existing(&recovering.identity)
+                .unwrap();
+            assert!(
+                recovering
+                    .roots
+                    .index_use_exclusive_existing(&recovering.identity)
+                    .is_err()
+            );
+            drop(shared);
+            let exclusive = recovering
+                .roots
+                .index_use_exclusive_existing(&recovering.identity)
+                .unwrap();
+            let mut leader = recovering
+                .roots
+                .leader_under_exclusive(&recovering.identity, exclusive)
+                .unwrap();
+            if fault.is_none() || fault == Some(ActivationStage::AfterJournalBackupBeforeDirFsync) {
+                let journal = index.with_file_name("index.db-journal");
+                fs::write(&journal, b"old journal bytes").unwrap();
+                fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let result = recovering.recreate_index_exclusive_with_hook(
+                &options,
+                &mut leader,
+                &cancel,
+                |phase| {
+                    if Some(phase) == fault {
+                        anyhow::bail!("injected activation boundary");
+                    }
+                    Ok(())
+                },
+            );
+            match fault {
+                Some(ActivationStage::BeforeRename) => {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("injected activation boundary")
+                    );
+                    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+                    let staged = fs::read_dir(&dir)
+                        .unwrap()
+                        .filter_map(|entry| {
+                            let name = entry.unwrap().file_name().into_string().ok()?;
+                            name.starts_with("index.db.tmp-").then_some(name)
+                        })
+                        .count();
+                    assert_eq!(staged, 0);
+                    let wal = index.with_file_name("index.db-wal");
+                    fs::write(&wal, b"unsafe sidecar").unwrap();
+                    assert!(
+                        recovering
+                            .recreate_index_exclusive(&options, &mut leader, &cancel)
+                            .is_err()
+                    );
+                    assert_eq!(fs::read(&wal).unwrap(), b"unsafe sidecar");
+                    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+                }
+                Some(ActivationStage::AfterJournalBackupBeforeDirFsync) => {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("injected activation boundary")
+                    );
+                    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+                    assert_eq!(
+                        fs::read(index.with_file_name("index.db-journal")).unwrap(),
+                        b"old journal bytes"
+                    );
+                    assert!(!fs::read_dir(&dir).unwrap().any(|entry| {
+                        entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("index.db-journal.tmp-")
+                    }));
+                }
+                Some(ActivationStage::AfterRenameBeforeDirFsync) => {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("injected activation boundary")
+                    );
+                    assert_ne!(fs::read(&index).unwrap(), old_bytes);
+                    assert!(
+                        leader
+                            .verify_exclusive_use(
+                                &recovering.roots.index_use_lock(&recovering.identity)
+                            )
+                            .is_ok()
+                    );
+                }
+                None => {
+                    let pin = result.unwrap();
+                    assert_eq!(pin.index_revision, old_pin.index_revision);
+                    assert_ne!(pin.index_generation, old_pin.index_generation);
+                    assert_eq!(recovering.status().unwrap().revision, pin);
+                    assert!(
+                        recovering
+                            .source_at("a.js", Some(old_pin))
+                            .unwrap_err()
+                            .to_string()
+                            .contains("revision conflict")
+                    );
+                    assert!(!index.with_file_name("index.db-journal").exists());
+                    assert!(
+                        leader
+                            .verify_exclusive_use(
+                                &recovering.roots.index_use_lock(&recovering.identity)
+                            )
+                            .is_err()
+                    );
+                }
+            }
+            assert_eq!(fs::read(&requests).unwrap(), b"retained requests");
+            assert_eq!(fs::read(&facts).unwrap(), b"retained facts");
+            assert_eq!(fs::read(&neighbor).unwrap(), b"unrelated");
+            assert_eq!(fs::read(&record).unwrap(), durable_bytes);
+            let new_lock = fs::symlink_metadata(&leader_path).unwrap();
+            assert_eq!(
+                (new_lock.dev(), new_lock.ino()),
+                (old_lock.dev(), old_lock.ino())
+            );
+            if fault.is_some() {
+                assert_eq!(
+                    recovering.disposition(),
+                    RecoveryDisposition::RecreatePending
+                );
+                assert!(
+                    recovering
+                        .status()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("recovery_required")
+                );
+            }
+        }
+    }
 
     #[test]
     fn cancellation_at_before_commit_rolls_back_entire_native_class_graph_pair() {
@@ -3678,13 +6119,13 @@ mod rebaseline_fault_tests {
         let initial_cancel = Arc::new(AtomicBool::new(false));
         let (graph, native, capture) =
             index_workspace_bundle(&options, store.root_id(), &initial_cancel, |_| {}).unwrap();
-        let leader = store.leader().unwrap();
+        let session = store.leader_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &leader,
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &initial_cancel,
             )
@@ -3768,10 +6209,11 @@ mod rebaseline_fault_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_store = store.clone();
+        let worker_session = session.clone();
         let worker = std::thread::spawn(move || {
             worker_store.publish_inner_checked(
                 (&next, &next_capture, &next_native),
-                &leader,
+                worker_session.leader_guard().unwrap(),
                 pin,
                 &worker_cancel,
                 |stage, tx| {
@@ -3928,13 +6370,13 @@ mod rebaseline_fault_tests {
         let initial_cancel = Arc::new(AtomicBool::new(false));
         let (graph, native, capture) =
             index_workspace_bundle(&options, store.root_id(), &initial_cancel, |_| {}).unwrap();
-        let leader = store.leader().unwrap();
+        let session = store.leader_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &leader,
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &initial_cancel,
             )
@@ -4025,9 +6467,10 @@ mod rebaseline_fault_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_store = store.clone();
+        let worker_session = session.clone();
         let worker = std::thread::spawn(move || {
             worker_store.publish_inner_checked(
-                (&next,&next_capture,&next_native),&leader,pin,&worker_cancel,
+                (&next,&next_capture,&next_native),worker_session.leader_guard().unwrap(),pin,&worker_cancel,
                 |stage,tx|{
                     if stage!=PublishStage::BeforeCommit {return Ok(());}
                     // All graph/native/class inserts and paired checks precede
@@ -4387,7 +6830,7 @@ mod rebaseline_fault_tests {
                                 PublishStage::AfterFile => {
                                     // Real SQLite UNIQUE error after DELETEs and one inserted file.
                                     tx.execute(
-                                        "INSERT INTO files VALUES(?1,'duplicate','{}')",
+                                        "INSERT INTO files(path,hash,payload,capture_stat) VALUES(?1,'duplicate','{}','{}')",
                                         [&graph.files[0].path],
                                     )?;
                                 }
@@ -4474,6 +6917,7 @@ mod sqlite_schema_race_tests {
         crate::native_evidence::Artifact,
         IndexPin,
         CancelFlag,
+        Arc<topology::LeaderSession>,
     ) {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
@@ -4487,26 +6931,573 @@ mod sqlite_schema_race_tests {
         let options = IndexOptions::new(work.path().to_owned());
         let (graph, native, capture) =
             index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let session = store.leader_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                session.leader_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
             .unwrap();
-        (state, work, store, graph, capture, native, pin, cancel)
+        (
+            state, work, store, graph, capture, native, pin, cancel, session,
+        )
+    }
+
+    #[test]
+    fn response_post_fence_discards_none_and_empty_results() {
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let none = store.with_evidence_hook(
+            |_db| Ok(None::<IndexStatus>),
+            || {
+                std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                Ok(())
+            },
+        );
+        assert!(none.is_err(), "post-fence failure must discard None");
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let empty = store.with_evidence_hook(
+            |_db| Ok(Vec::<Symbol>::new()),
+            || {
+                std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                Ok(())
+            },
+        );
+        assert!(
+            empty.is_err(),
+            "post-fence failure must discard an empty collection"
+        );
+    }
+
+    #[test]
+    fn direct_response_pre_fence_rejects_root_lock_and_incarnation_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let original = work.path().to_owned();
+        let moved = original.with_extension("moved-before-read");
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let root_error = store.status().unwrap_err();
+        assert!(
+            root_error.to_string().contains("root_changed"),
+            "{root_error:#}"
+        );
+        std::fs::remove_dir(&original).unwrap();
+        std::fs::rename(&moved, &original).unwrap();
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        std::fs::remove_file(&leader_path).unwrap();
+        std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string()).unwrap();
+        std::fs::set_permissions(&leader_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let lock_error = store.symbol_at("missing", None).unwrap_err();
+        assert!(
+            lock_error.to_string().contains("managed file")
+                || lock_error.to_string().contains("incarnation")
+                || lock_error.to_string().contains("leader lock is not held"),
+            "{lock_error:#}"
+        );
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string()).unwrap();
+        let incarnation_error = store.symbols_at("never", 10).unwrap_err();
+        assert!(
+            incarnation_error.to_string().contains("incarnation")
+                || incarnation_error.to_string().contains("mismatch"),
+            "{incarnation_error:#}"
+        );
+    }
+
+    #[test]
+    fn response_fences_root_lock_and_error_results_before_release() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let original = work.path().to_owned();
+        let moved = original.with_extension("moved-for-fence");
+        let root_error = store
+            .with_evidence_hook(
+                |_db| Ok(Some("owned".to_owned())),
+                || {
+                    std::fs::rename(&original, &moved)?;
+                    std::fs::create_dir(&original)?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            root_error.to_string().contains("root_changed"),
+            "{root_error:#}"
+        );
+        std::fs::remove_dir(&original).unwrap();
+        std::fs::rename(&moved, &original).unwrap();
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let lock_error = store
+            .with_evidence_hook(
+                |_db| Ok(Vec::<Symbol>::new()),
+                || {
+                    std::fs::remove_file(&leader_path)?;
+                    std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                    std::fs::set_permissions(&leader_path, std::fs::Permissions::from_mode(0o600))?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            lock_error.to_string().contains("managed file")
+                || lock_error.to_string().contains("incarnation"),
+            "{lock_error:#}"
+        );
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let finish_observed = std::cell::Cell::new(false);
+        let error = store
+            .with_evidence_observed::<()>(
+                |_db| anyhow::bail!("materialization sentinel"),
+                || {
+                    std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                    Ok(())
+                },
+                |fence| {
+                    finish_observed.set(true);
+                    assert!(
+                        fence.is_err(),
+                        "concurrent incarnation change must fail the final fence"
+                    );
+                },
+            )
+            .unwrap_err();
+        assert!(finish_observed.get(), "final fence was not attempted");
+        assert!(
+            error.to_string().contains("materialization sentinel"),
+            "original materialization error must win: {error:#}"
+        );
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let finish_observed = std::cell::Cell::new(false);
+        let io_error = store
+            .with_evidence_observed::<()>(
+                |_db| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+                || {
+                    std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                    Ok(())
+                },
+                |fence| {
+                    finish_observed.set(true);
+                    assert!(fence.is_err());
+                },
+            )
+            .unwrap_err();
+        assert!(finish_observed.get());
+        assert!(
+            io_error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(!native_index_unavailable(&io_error));
+    }
+
+    #[test]
+    fn tree_metadata_applies_no_overlay_before_post_fence() {
+        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let mut entries = vec![crate::file_tree::Entry {
+            name: "flow.js".into(),
+            path: "flow.js".into(),
+            kind: "file",
+            indexed_path: None,
+            method_count: None,
+            unindexed_reason: None,
+        }];
+        let leader_path = store.roots.leader_lock(&store.identity);
+        let error = store
+            .tree_metadata_with_finish_hook(work.path(), &mut entries, || {
+                std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("incarnation"), "{error:#}");
+        assert!(entries[0].indexed_path.is_none());
+        assert!(entries[0].method_count.is_none());
+    }
+
+    #[test]
+    fn durable_fallback_classifier_excludes_operational_and_current_corruption_errors() {
+        let operational: anyhow::Error =
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
+        assert!(!native_index_unavailable(&operational));
+        let sqlite: anyhow::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            None,
+        )
+        .into();
+        assert!(!native_index_unavailable(&sqlite));
+        let corruption: anyhow::Error =
+            ControlIntegrity("incompatible_index: current marker".into()).into();
+        assert!(!native_index_unavailable(&corruption));
+        let safe: anyhow::Error = topology::IndexNotReady::new("reconciliation required").into();
+        assert!(native_index_unavailable(&safe));
+    }
+
+    #[test]
+    fn recovery_classifier_separates_corruption_from_operational_storage_errors() {
+        let classify = |extended_code| {
+            let error: anyhow::Error =
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(extended_code), None)
+                    .into();
+            recovery_class(&error)
+        };
+        assert_eq!(
+            classify(rusqlite::ffi::SQLITE_CORRUPT),
+            RecoveryClass::RecreatePending
+        );
+        assert_eq!(
+            classify(rusqlite::ffi::SQLITE_NOTADB),
+            RecoveryClass::RecreatePending
+        );
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_READONLY,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_NOMEM,
+            rusqlite::ffi::SQLITE_ERROR,
+        ] {
+            assert_eq!(classify(code), RecoveryClass::Hard);
+        }
+    }
+
+    #[test]
+    fn live_read_reporter_separates_root_storage_corruption_from_operational_errors() {
+        let sqlite = |code| -> anyhow::Error {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into()
+        };
+        for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB] {
+            let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) =
+                ready();
+            let clone = store.clone();
+            let error = store.report_live_read_failure(sqlite(code));
+            assert!(
+                error.to_string().starts_with("recovery_required:"),
+                "{error:#}"
+            );
+            assert_eq!(store.disposition(), RecoveryDisposition::RecreatePending);
+            assert!(
+                clone
+                    .status()
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("recovery_required:")
+            );
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_ERROR,
+        ] {
+            let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
+            let error = store.report_live_read_failure(sqlite(code));
+            assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+            assert_eq!(store.status().unwrap().revision, pin);
+        }
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let clone = store.clone();
+        let error = store.report_live_read_failure(
+            rusqlite::Error::InvalidColumnType(
+                0,
+                "root_spelling".into(),
+                rusqlite::types::Type::Real,
+            )
+            .into(),
+        );
+        assert!(error.to_string().starts_with("incompatible_index:"));
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible_index")
+        );
+
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let clone = store.clone();
+        let error = store.report_live_read_failure(
+            ControlIntegrity("incompatible_index: existing structural check".into()).into(),
+        );
+        assert!(error.to_string().starts_with("incompatible_index:"));
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible_index")
+        );
+
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
+        let error = store.report_live_read_failure(anyhow::anyhow!(
+            "root_key_collision: index belongs to a different spelling"
+        ));
+        assert!(error.to_string().starts_with("root_key_collision:"));
+        assert_eq!(store.status().unwrap().revision, pin);
+    }
+
+    #[test]
+    fn selected_operational_errors_do_not_latch_but_integrity_failure_closes_clones() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_READONLY,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_NOMEM,
+            rusqlite::ffi::SQLITE_ERROR,
+        ] {
+            let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
+            let clone = store.clone();
+            let operational: anyhow::Error =
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into();
+            let returned = store.report_selected_failure(operational);
+            assert!(returned.downcast_ref::<rusqlite::Error>().is_some());
+            assert_eq!(store.status().unwrap().revision, pin);
+            assert_eq!(clone.status().unwrap().revision, pin);
+        }
+
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
+        let clone = store.clone();
+        let io: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected").into();
+        let returned = store.report_selected_failure(io);
+        assert!(returned.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(clone.status().unwrap().revision, pin);
+
+        let integrity: anyhow::Error = SelectedIntegrity("selected mismatch".into()).into();
+        let returned = store.report_selected_failure(integrity);
+        assert!(returned.to_string().contains("incompatible_index"));
+        assert!(store.status().is_err());
+        assert!(clone.status().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_scan_classifies_same_size_preserved_mtime_edit_by_ctime() {
+        use std::ffi::CString;
+        use std::os::unix::fs::MetadataExt;
+
+        let (_state, work, store, _graph, _capture, _native, _pin, cancel, _session) = ready();
+        let path = work.path().join("flow.js");
+        let before_meta = fs::metadata(&path).unwrap();
+        let before_stat: crate::capture::CaptureStat = {
+            let db = store.cache().unwrap();
+            let payload: String = db
+                .query_row(
+                    "SELECT capture_stat FROM files WHERE path='flow.js'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&payload).unwrap()
+        };
+        fs::write(&path, "function go() { observed(); }\n").unwrap();
+        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: before_meta.atime(),
+                tv_nsec: before_meta.atime_nsec(),
+            },
+            libc::timespec {
+                tv_sec: before_meta.mtime(),
+                tv_nsec: before_meta.mtime_nsec(),
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+        let options = IndexOptions::new(work.path().to_owned());
+        let (_next, _native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let after_stat = capture.source_stat("flow.js").unwrap();
+        assert_eq!(before_stat.size, after_stat.size);
+        assert_eq!(before_stat.device, after_stat.device);
+        assert_eq!(before_stat.inode, after_stat.inode);
+        assert_eq!(before_stat.mtime_seconds, after_stat.mtime_seconds);
+        assert_eq!(before_stat.mtime_nanoseconds, after_stat.mtime_nanoseconds);
+        assert_ne!(
+            (before_stat.ctime_seconds, before_stat.ctime_nanoseconds),
+            (after_stat.ctime_seconds, after_stat.ctime_nanoseconds)
+        );
+        let db = store.cache().unwrap();
+        let comparison = compare_capture_snapshot(&db, &capture).unwrap();
+        assert_eq!(comparison.ctime_changed, 1);
+        assert_eq!(comparison.hash_changed, 1);
+        assert!(comparison.changed());
+        assert_eq!(capture.files[0].text, "function go() { observed(); }\n");
+        assert_eq!(
+            capture.source_operations["flow.js"],
+            crate::capture::SourceOperations {
+                opens: 1,
+                complete_reads: 1,
+                hashes: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn real_revision_private_recovery_before_commit_error_rolls_back_same_inode() {
+        use rusqlite::types::ValueRef;
+        use std::os::unix::fs::MetadataExt;
+
+        let (_state, _work, store, graph, capture, native, _old, cancel, session) = ready();
+        let clone = store.clone();
+        let path = store.roots.index_db(&store.identity);
+        let inode = fs::metadata(&path).unwrap().ino();
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let logical = || {
+            let db = Connection::open(&path).unwrap();
+            let (schema, extractor, generation, files, nodes, documents, revisions, classes):
+                (i64, String, String, i64, i64, i64, i64, i64) = db
+                .query_row(
+                    "SELECT schema_version,extractor_version,index_generation,(SELECT count(*) FROM files),(SELECT count(*) FROM nodes),(SELECT count(*) FROM native_documents),(SELECT count(*) FROM native_revisions),(SELECT count(*) FROM class_catalog) FROM index_metadata",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                )
+                .unwrap();
+            let revision_bits = db
+                .query_row(
+                    "SELECT index_revision FROM index_metadata",
+                    [],
+                    |row| match row.get_ref(0)? {
+                        ValueRef::Real(value) => Ok(value.to_bits()),
+                        _ => Err(rusqlite::Error::InvalidQuery),
+                    },
+                )
+                .unwrap();
+            assert!(files > 0, "rollback fixture must contain a file row");
+            assert!(
+                documents > 0,
+                "rollback fixture must contain a native document row"
+            );
+            let selected_file: (String, String) = db
+                .query_row(
+                    "SELECT hash,payload FROM files ORDER BY path LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let selected_native: (String, Vec<u8>) = db
+                .query_row(
+                    "SELECT content_hash,source_bytes FROM native_documents ORDER BY revision_id,language,path LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            (
+                schema,
+                extractor,
+                generation,
+                revision_bits,
+                files,
+                nodes,
+                documents,
+                revisions,
+                classes,
+                selected_file,
+                selected_native,
+            )
+        };
+        let before = logical();
+        let baseline = {
+            let mut db = store.cache().unwrap();
+            let tx = db.transaction().unwrap();
+            store.recovery_baseline(&tx).unwrap()
+        };
+        assert!(baseline.pin().is_none());
+        let error = store
+            .publish_inner_checked_expected(
+                (&graph, &capture, &native),
+                session.leader_guard().unwrap(),
+                ExpectedPublication::Recovery(Box::new(baseline)),
+                &cancel,
+                256 * 1024 * 1024 + 16 * 1024,
+                |stage, _tx| {
+                    if stage == PublishStage::BeforeCommit {
+                        anyhow::bail!("injected private metadata recovery failure");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected private metadata recovery failure"),
+            "{error:#}"
+        );
+        assert_eq!(logical(), before, "failed recovery changed logical pair");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert!(
+            store
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible_index")
+        );
+        assert!(
+            clone
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible_index")
+        );
+    }
+
+    #[test]
+    fn failed_takeover_before_writer_transaction_closes_every_clone() {
+        let (state, work, store, _graph, _capture, _native, pin, _cancel, session) = ready();
+        let clone = store.clone();
+        drop(session);
+        let error = store
+            .leader_with_open_hook(|_| anyhow::bail!("injected pre-transaction takeover failure"))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "injected pre-transaction takeover failure"
+        );
+        assert!(store.status().is_err());
+        assert!(clone.status().is_err());
+        let separately_opened = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(separately_opened.index_baseline().unwrap(), pin);
+        assert!(!separately_opened.recovery_required.load(Ordering::Acquire));
     }
 
     #[test]
     fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
-        let (_state, _work, store, graph, capture, native, old, cancel) = ready();
+        let (_state, _work, store, graph, capture, native, old, cancel, session) = ready();
+        let clone = store.clone();
         let path = store.roots.index_db(&store.identity);
-        let leader = store.leader().unwrap();
         let after_external = RefCell::new(None);
-        let error = store.publish_inner_checked((&graph, &capture, &native), &leader, old, &cancel,
+        let error = store.publish_inner_checked((&graph, &capture, &native), session.leader_guard().unwrap(), old, &cancel,
             |stage, _checked_connection| {
                 if stage == PublishStage::BeforeTransaction {
                     // The Store connection has passed open_index's exact object check,
@@ -4537,7 +7528,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                6,
+                7,
                 "native-paired-v1",
                 old.index_generation.to_string(),
                 old.index_revision as i64
@@ -4546,7 +7537,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         let forged: i64 = db
             .query_row(
@@ -4563,13 +7554,23 @@ mod sqlite_schema_race_tests {
                 .to_string()
                 .contains("incompatible_index")
         );
+        db.execute_batch("DROP TRIGGER forged_after_admission")
+            .unwrap();
+        drop(db);
+        for closed in [store.status().unwrap_err(), clone.status().unwrap_err()] {
+            assert_eq!(
+                closed.to_string(),
+                "incompatible_index: reconciliation required after invalid current index"
+            );
+        }
     }
 
     #[test]
     fn changed_metadata_between_admission_and_leader_lock_refuses_before_update() {
-        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, session) = ready();
         let path = store.roots.index_db(&store.identity);
         let after_external = RefCell::new(None);
+        drop(session);
         let error = store
             .leader_with_open_hook(|_checked| {
                 let attacker = Connection::open(&path)?;
@@ -4592,12 +7593,15 @@ mod sqlite_schema_race_tests {
             fs::read(&path).unwrap(),
             after_external.into_inner().unwrap()
         );
-        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(store.index_baseline().unwrap(), pin);
+        let closed = store.status().unwrap_err();
+        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
     }
 
     #[test]
     fn second_connection_adds_view_after_admission_before_status_and_leader_snapshot() {
-        let (_state, _work, store, _graph, _capture, _native, pin, _cancel) = ready();
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let status_clone = store.clone();
         let path = store.roots.index_db(&store.identity);
         let after_status_ddl = RefCell::new(None);
         let status_error = store
@@ -4623,15 +7627,37 @@ mod sqlite_schema_race_tests {
             .execute_batch("DROP VIEW status_after_admission")
             .unwrap();
         drop(attacker);
-        assert_eq!(store.status().unwrap().revision, pin);
+        for closed in [
+            store.status().unwrap_err(),
+            status_clone.status().unwrap_err(),
+        ] {
+            assert_eq!(
+                closed.to_string(),
+                "incompatible_index: reconciliation required after invalid current index"
+            );
+        }
 
+        let (
+            _leader_state,
+            _leader_work,
+            leader_store,
+            _leader_graph,
+            _leader_capture,
+            _leader_native,
+            leader_pin,
+            _leader_cancel,
+            leader_session,
+        ) = ready();
+        let leader_clone = leader_store.clone();
+        let leader_path = leader_store.roots.index_db(&leader_store.identity);
         let after_leader_ddl = RefCell::new(None);
-        let leader_error = store
+        drop(leader_session);
+        let leader_error = leader_store
             .leader_with_open_hook(|_checked| {
-                let attacker = Connection::open(&path)?;
+                let attacker = Connection::open(&leader_path)?;
                 attacker.execute_batch("CREATE VIEW leader_after_admission AS SELECT 1")?;
                 drop(attacker);
-                *after_leader_ddl.borrow_mut() = Some(fs::read(&path)?);
+                *after_leader_ddl.borrow_mut() = Some(fs::read(&leader_path)?);
                 Ok(())
             })
             .unwrap_err();
@@ -4641,30 +7667,43 @@ mod sqlite_schema_race_tests {
                 .contains("incompatible_index: unknown cache object")
         );
         assert_eq!(
-            fs::read(&path).unwrap(),
+            fs::read(&leader_path).unwrap(),
             after_leader_ddl.into_inner().unwrap(),
             "leader metadata update must not write after external DDL"
         );
-        let attacker = Connection::open(&path).unwrap();
+        let attacker = Connection::open(&leader_path).unwrap();
         let (schema, marker, generation, revision): (i64,String,String,i64) = attacker.query_row(
             "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata", [],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                6,
+                7,
                 "native-paired-v1",
-                pin.index_generation.to_string(),
-                pin.index_revision as i64
+                leader_pin.index_generation.to_string(),
+                leader_pin.index_revision as i64
             )
         );
         assert!(
-            store
+            leader_store
                 .status()
                 .unwrap_err()
                 .to_string()
-                .contains("incompatible_index")
+                .contains("incompatible_index: unknown cache object type, name or shape")
         );
+        attacker
+            .execute_batch("DROP VIEW leader_after_admission")
+            .unwrap();
+        drop(attacker);
+        for closed in [
+            leader_store.status().unwrap_err(),
+            leader_clone.status().unwrap_err(),
+        ] {
+            assert_eq!(
+                closed.to_string(),
+                "incompatible_index: reconciliation required after invalid current index"
+            );
+        }
     }
 }
 

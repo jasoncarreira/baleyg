@@ -11,7 +11,16 @@ use std::{
 };
 use tempfile::TempDir;
 const CODE: &str = "function leaf() {}\nfunction helper() { leaf(); }\nfunction seed(flag) { if (flag) { helper(); helper(); } console.log(flag); }\n";
-fn fixture(code: &str) -> (TempDir, TempDir, Store, Graph, QuestionRequest) {
+fn fixture(
+    code: &str,
+) -> (
+    TempDir,
+    TempDir,
+    Store,
+    Graph,
+    QuestionRequest,
+    Arc<baleyg::store::topology::LeaderSession>,
+) {
     let work = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     #[cfg(unix)]
@@ -24,11 +33,12 @@ fn fixture(code: &str) -> (TempDir, TempDir, Store, Graph, QuestionRequest) {
     let graph = index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
     // Native measured calls cannot acquire lexical targets from matching names.
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
+    let session = store.leader_session().unwrap();
     let revision = publish_bundle(
         &store,
         &graph,
         work.path(),
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         baleyg::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -37,7 +47,7 @@ fn fixture(code: &str) -> (TempDir, TempDir, Store, Graph, QuestionRequest) {
     )
     .unwrap();
     let request = serde_json::from_value(serde_json::json!({"seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id, "question":"Where is helper called?", "expectedRevision":revision})).unwrap();
-    (work, state, store, graph, request)
+    (work, state, store, graph, request, session)
 }
 fn all(packet: &QuestionPacket, relevance: Relevance) -> SelectionEnvelope {
     SelectionEnvelope {
@@ -56,7 +66,7 @@ fn all(packet: &QuestionPacket, relevance: Relevance) -> SelectionEnvelope {
 }
 #[test]
 fn packet_snapshot_unique_candidates_complete_source_and_stable_hash() {
-    let (work, _state, store, _graph, request) = fixture(CODE);
+    let (work, _state, store, _graph, request, _session) = fixture(CODE);
     let packet = prepare(&store, request.clone()).unwrap();
     assert_eq!(packet, prepare(&store, request.clone()).unwrap());
     assert_eq!(packet.packet_id.len(), 64);
@@ -89,7 +99,7 @@ fn packet_snapshot_unique_candidates_complete_source_and_stable_hash() {
 }
 #[test]
 fn strict_requests_and_limits() {
-    let (_, _, _, _, request) = fixture(CODE);
+    let (_, _, _, _, request, _session) = fixture(CODE);
     assert_eq!(request.evidence_depth, 2);
     assert_eq!(request.max_visible, 5);
     assert!(!request.allow_deeper_display);
@@ -108,7 +118,7 @@ fn strict_requests_and_limits() {
 }
 #[test]
 fn exact_coverage_rejects_unknown_duplicate_missing_and_wrong_packet() {
-    let (_w, _s, store, _, request) = fixture(CODE);
+    let (_w, _s, store, _, request, _session) = fixture(CODE);
     let p = prepare(&store, request).unwrap();
     let valid = all(&p, Relevance::Essential);
     let mut bad = valid.clone();
@@ -126,7 +136,7 @@ fn exact_coverage_rejects_unknown_duplicate_missing_and_wrong_packet() {
 }
 #[test]
 fn direct_default_source_order_budget_and_actual_regions() {
-    let (_w, _s, store, graph, mut request) = fixture(CODE);
+    let (_w, _s, store, graph, mut request, _session) = fixture(CODE);
     let p = prepare(&store, request.clone()).unwrap();
     let v = assemble(&p, &all(&p, Relevance::Essential), "manual").unwrap();
     assert_eq!(v.calls.len(), 3);
@@ -164,7 +174,7 @@ fn direct_default_source_order_budget_and_actual_regions() {
 }
 #[test]
 fn local_literal_only_uncertainty_and_no_budget_filling() {
-    let (_w, _s, store, _, mut request) = fixture(CODE);
+    let (_w, _s, store, _, mut request, _session) = fixture(CODE);
     request.focus_terms = vec!["leaf".into()];
     let p = prepare(&store, request.clone()).unwrap();
     let s = preview(&p).unwrap();
@@ -200,13 +210,13 @@ fn local_literal_only_uncertainty_and_no_budget_filling() {
 }
 #[test]
 fn revision_drift_rejected_snapshot_remains_immutable() {
-    let (_w, _s, store, graph, request) = fixture(CODE);
+    let (_w, _s, store, graph, request, session) = fixture(CODE);
     let p = prepare(&store, request.clone()).unwrap();
     publish_bundle(
         &store,
         &graph,
         _w.path(),
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         request.expected_revision,
         &Arc::new(AtomicBool::new(false)),
     )
@@ -224,7 +234,7 @@ fn revision_drift_rejected_snapshot_remains_immutable() {
 #[test]
 fn complete_source_packet_size_limit_errors_without_truncating() {
     let code = format!("{CODE}\n/*{}*/", "x".repeat(1024 * 1024));
-    let (_w, _s, store, _, request) = fixture(&code);
+    let (_w, _s, store, _, request, _session) = fixture(&code);
     assert!(
         prepare(&store, request)
             .unwrap_err()
@@ -235,7 +245,7 @@ fn complete_source_packet_size_limit_errors_without_truncating() {
 #[test]
 fn candidate_limit_reports_incomplete_evidence() {
     let code = format!("function seed() {{ {} }}", "console.log();".repeat(301));
-    let (_w, _s, store, _, request) = fixture(&code);
+    let (_w, _s, store, _, request, _session) = fixture(&code);
     let p = prepare(&store, request).unwrap();
     assert_eq!(p.context.calls.len(), 300);
     assert!(p.context.truncated);
@@ -246,7 +256,7 @@ fn candidate_limit_reports_incomplete_evidence() {
 #[test]
 fn assembly_preserves_boundaries_and_never_expands_callbacks() {
     let code = "class Runner {}\nfunction cb() { console.log('callback'); }\nfunction seed(flag) { if (flag) { while (flag) { new Runner(); external(cb); } } }";
-    let (_w, _s, store, graph, mut request) = fixture(code);
+    let (_w, _s, store, graph, mut request, session) = fixture(code);
     let class_id = graph
         .nodes
         .iter()
@@ -265,7 +275,7 @@ fn assembly_preserves_boundaries_and_never_expands_callbacks() {
         &store,
         &graph,
         _w.path(),
-        &store.leader().unwrap(),
+        session.leader_guard().unwrap(),
         request.expected_revision,
         &Arc::new(AtomicBool::new(false)),
     )
@@ -292,7 +302,7 @@ fn assembly_preserves_boundaries_and_never_expands_callbacks() {
 
 #[test]
 fn display_scores_rank_membership_but_output_stays_in_source_order() {
-    let (_w, _s, store, _, mut request) =
+    let (_w, _s, store, _, mut request, _session) =
         fixture("function seed() { resolve(); open(); rename(); }");
     request.max_visible = 2;
     let p = prepare(&store, request).unwrap();
@@ -360,7 +370,7 @@ fn display_scores_rank_membership_but_output_stays_in_source_order() {
 }
 #[test]
 fn display_scores_reject_nonfinite_and_out_of_range_values() {
-    let (_w, _s, store, _, request) = fixture(CODE);
+    let (_w, _s, store, _, request, _session) = fixture(CODE);
     let p = prepare(&store, request).unwrap();
     for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 1.01] {
         let mut s = all(&p, Relevance::Uncertain);
@@ -387,7 +397,7 @@ fn display_scores_reject_nonfinite_and_out_of_range_values() {
 }
 #[test]
 fn scores_never_promote_lower_labels_or_override_direct_display_policy() {
-    let (_w, _s, store, _, mut request) = fixture(CODE);
+    let (_w, _s, store, _, mut request, _session) = fixture(CODE);
     request.max_visible = 1;
     for allow in [false, true] {
         request.allow_deeper_display = allow;
@@ -437,7 +447,7 @@ fn scores_never_promote_lower_labels_or_override_direct_display_policy() {
 #[test]
 fn variable_question_packet_is_source_only_not_an_executable_seed() {
     let source = "function seed(arg) { const value = arg; return value; }\n";
-    let (_work, _state, store, graph, mut request) = fixture(source);
+    let (_work, _state, store, graph, mut request, _session) = fixture(source);
     let variable = graph.nodes.iter().find(|n| n.name == "value").unwrap();
     assert_eq!(variable.kind, SymbolKind::Variable);
     request.seed = variable.id.clone();
