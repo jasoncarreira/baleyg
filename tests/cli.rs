@@ -2,6 +2,145 @@ use serde_json::Value;
 use std::{fs, process::Command};
 use tempfile::TempDir;
 
+/// Only fixed startup markers are retained. Never copy arbitrary daemon stderr,
+/// filesystem paths, source text or the bearer into a failure artifact.
+fn readiness_stderr_category(sample: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(sample);
+    if text.contains("bind daemon listener") {
+        "listener_bind_error"
+    } else if text.contains("Error:") {
+        "other_startup_error"
+    } else if text.contains("Evidence unavailable at startup:") {
+        "index_startup_unavailable"
+    } else if text.contains("Baleyg: http://") {
+        "server_banner_present"
+    } else {
+        "no_allowlisted_marker"
+    }
+}
+
+/// Opt-in failure-only report, outside the tracked worktree. Every value written
+/// here is a fixed category or bounded number, not untrusted process output.
+fn write_private_readiness_diagnostic(
+    dir: &std::path::Path,
+    child: &mut std::process::Child,
+    stderr_path: &std::path::Path,
+    address: std::net::SocketAddr,
+    healthz: &str,
+) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let meta = fs::symlink_metadata(dir)?;
+    if !dir.is_absolute()
+        || !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o777 != 0o700
+        || dir
+            .canonicalize()?
+            .starts_with(std::env::current_dir()?.canonicalize()?)
+    {
+        return Err(std::io::Error::other(
+            "unsafe readiness diagnostic directory",
+        ));
+    }
+    let child_state = match child.try_wait()? {
+        Some(status) => match status.code() {
+            Some(code) => format!("exited_code_{code}"),
+            None => {
+                use std::os::unix::process::ExitStatusExt;
+                format!("exited_signal_{}", status.signal().unwrap_or_default())
+            }
+        },
+        None => "alive_at_deadline".to_owned(),
+    };
+    let listener =
+        match std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(150))
+        {
+            Ok(_) => "tcp_accepts",
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => "tcp_refused",
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => "tcp_timeout",
+            Err(_) => "tcp_other_error",
+        };
+    let mut sample = Vec::new();
+    fs::File::open(stderr_path)?
+        .take(16_384)
+        .read_to_end(&mut sample)?;
+    let category = readiness_stderr_category(&sample);
+    let output = dir.join(format!(
+        "queue-api-readiness-{}-{}.log",
+        std::process::id(),
+        child.id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(output)?;
+    // The caller supplies `healthz` from a closed set of literals or HTTP status
+    // numbers. Do not accept arbitrary reqwest error text here.
+    writeln!(
+        file,
+        "child={child_state} healthz={healthz} listener={listener} stderr_category={category}"
+    )?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[test]
+fn readiness_stderr_category_never_copies_secret_or_temp_path() {
+    let poisoned = b"Error: bind daemon listener /private/tmp/secret Bearer 0123456789abcdef\n";
+    let category = readiness_stderr_category(poisoned);
+    assert_eq!(category, "listener_bind_error");
+    assert!(!category.contains("Bearer"));
+    assert!(!category.contains("/private"));
+    assert!(!category.contains("0123456789abcdef"));
+    let mixed = b"Baleyg: http://127.0.0.1:7331/\nEvidence unavailable at startup: /private/tmp/secret\nError: failed after banner; Bearer 0123456789abcdef\n";
+    let fatal = readiness_stderr_category(mixed);
+    assert_eq!(fatal, "other_startup_error");
+    assert!(!fatal.contains("Bearer"));
+    assert!(!fatal.contains("/private"));
+    assert!(!fatal.contains("0123456789abcdef"));
+}
+
+#[test]
+fn private_readiness_report_is_mode_600_bounded_and_never_copies_raw_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("private");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr_path = tmp.path().join("daemon-stderr");
+    let secret = "Bearer 0123456789abcdef /private/tmp/user-workspace source-data";
+    fs::write(
+        &stderr_path,
+        format!("Error: bind daemon listener {secret}\n"),
+    )
+    .unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    write_private_readiness_diagnostic(
+        &dir,
+        &mut child,
+        &stderr_path,
+        "127.0.0.1:9".parse().unwrap(),
+        "connect_error",
+    )
+    .unwrap();
+    let _ = child.wait();
+    let path = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let report = fs::read_to_string(&path).unwrap();
+    assert!(report.len() < 256);
+    assert!(report.contains("stderr_category=listener_bind_error"));
+    assert!(!report.contains(secret));
+    assert!(!report.contains("Bearer"));
+    assert!(!report.contains("/private/tmp"));
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 fn isolated_command(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
@@ -1929,7 +2068,7 @@ async fn real_index_job(
     })
     .await
     .expect("saved-item index job");
-    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(completed["state"], "done", "{completed}");
     completed["revision"].clone()
 }
 
@@ -2286,7 +2425,7 @@ def sink():
             .await
             .unwrap();
         assert_eq!(follower_http_status["revision"], post_start_pin, "{name}");
-        let refused = client
+        let follower_accepted = client
             .post(format!("{follower_url}/api/index"))
             .header("Origin", &follower_url)
             .bearer_auth(TOKEN)
@@ -2294,14 +2433,42 @@ def sink():
             .send()
             .await
             .unwrap();
-        assert_eq!(refused.status(), 409, "{name}");
-        assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
+        assert_eq!(follower_accepted.status(), 202, "{name}");
+        let follower_accepted: Value = follower_accepted.json().await.unwrap();
+        assert_eq!(follower_accepted["state"], "queued", "{name}");
+        assert!(follower_accepted["startedAt"].is_null(), "{name}");
+        let follower_id = follower_accepted["id"].as_str().unwrap();
+        let follower_done = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let job: Value = client
+                    .get(format!("{follower_url}/api/jobs/{follower_id}"))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !job["finishedAt"].is_null() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(follower_done["state"], "done", "{name}: {follower_done}");
+        let follower_pin = follower_done["revision"].clone();
+        assert_eq!(
+            follower_pin["indexRevision"],
+            post_start_pin["indexRevision"].as_u64().unwrap() + 1
+        );
         assert!(follower_server.0.try_wait().unwrap().is_none());
         let request = || {
             client
                 .post(format!("{url}/api/index"))
                 .header("Origin", &url)
-                .json(&serde_json::json!({"expectedRevision":post_start_pin.clone()}))
+                .json(&serde_json::json!({"expectedRevision":follower_pin.clone()}))
         };
         let denied = request().bearer_auth("incorrect").send().await.unwrap();
         assert_eq!(denied.status(), 401, "{name}");
@@ -2323,9 +2490,9 @@ def sink():
             .json()
             .await
             .unwrap();
-        assert!(
-            current.is_null(),
-            "{name}: rejected auth/origin must not start work"
+        assert_eq!(
+            current["id"], follower_id,
+            "{name}: rejected auth/origin must not add work"
         );
         let accepted = request().bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(accepted.status(), 202, "{name}");
@@ -2350,7 +2517,7 @@ def sink():
         })
         .await
         .unwrap();
-        assert_eq!(completed["state"], "completed", "{name}: {completed}");
+        assert_eq!(completed["state"], "done", "{name}: {completed}");
         let pin = completed["revision"].clone();
         assert_eq!(
             pin["indexGeneration"], post_start_pin["indexGeneration"],
@@ -2358,7 +2525,7 @@ def sink():
         );
         assert_eq!(
             pin["indexRevision"].as_u64().unwrap(),
-            post_start_pin["indexRevision"].as_u64().unwrap() + 1,
+            follower_pin["indexRevision"].as_u64().unwrap() + 1,
             "{name}"
         );
         let status: Value = client
@@ -2883,9 +3050,36 @@ def sink():
         let stale = request().bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(
             stale.status(),
-            409,
-            "{name}: stale entire pair refused before work"
+            202,
+            "{name}: stale request durably accepted"
         );
+        let stale: Value = stale.json().await.unwrap();
+        assert_eq!(
+            stale["state"], "queued",
+            "{name}: accepted before claim-time CAS"
+        );
+        let stale_id = stale["id"].as_str().unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let row: Value = client
+                    .get(format!("{url}/api/jobs/{stale_id}"))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !row["finishedAt"].is_null() {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(failed["state"], "failed", "{name}: {failed}");
+        assert_eq!(failed["error"]["code"], "revision_conflict", "{name}");
         assert_eq!(real_native_snapshot(&home), native_before, "{name}");
         drop(server);
     }
@@ -2927,7 +3121,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let server = Server(
+    let stderr_path = tmp.path().join("daemon-stderr");
+    let mut server = Server(
         isolated_command(&home)
             .arg("serve")
             .arg("--workspace")
@@ -2938,7 +3133,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
             .arg(&token_file)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(
-                fs::File::create(tmp.path().join("daemon-stderr")).unwrap(),
+                fs::File::create(&stderr_path).unwrap(),
             ))
             .spawn()
             .unwrap(),
@@ -2948,21 +3143,43 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let mut last_healthz = "not_observed".to_owned();
+    let readiness = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if client
-                .get(format!("{url}/healthz"))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
-                break;
+            last_healthz = "request_in_flight".to_owned();
+            match client.get(format!("{url}/healthz")).send().await {
+                Ok(response) if response.status().is_success() => break,
+                Ok(response) => {
+                    last_healthz = format!("http_status_{}", response.status().as_u16())
+                }
+                Err(error) if error.is_timeout() => last_healthz = "request_timeout".to_owned(),
+                Err(error) if error.is_connect() => last_healthz = "connect_error".to_owned(),
+                Err(_) => last_healthz = "request_other_error".to_owned(),
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("real daemon readiness");
+    .await;
+    if readiness.is_err()
+        && let Some(dir) = std::env::var_os("BALEYG_PRIVATE_DIAGNOSTICS_DIR")
+    {
+        let diagnostic = write_private_readiness_diagnostic(
+            std::path::Path::new(&dir),
+            &mut server.0,
+            &stderr_path,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            &last_healthz,
+        );
+        eprintln!(
+            "private readiness diagnostic {}",
+            if diagnostic.is_ok() {
+                "recorded"
+            } else {
+                "unavailable"
+            }
+        );
+    }
+    readiness.expect("real daemon readiness");
     let (code, status) = real_api(
         &client,
         &url,
@@ -3079,9 +3296,13 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     assert_eq!(terminal["state"], "failed", "{terminal}");
     assert_eq!(terminal["error"]["code"], "index_failed", "{terminal}");
     assert!(terminal["revision"].is_null(), "{terminal}");
-    assert_eq!(terminal["progress"]["phase"], "complete", "{terminal}");
-    assert_eq!(terminal["progress"]["completed"], 81, "{terminal}");
-    assert_eq!(terminal["progress"]["total"], 81, "{terminal}");
+    // Advisory progress is process-local while running; terminal rows use the
+    // stable default rather than race a late in-memory update into GET/cancel.
+    assert_eq!(
+        terminal["progress"],
+        serde_json::json!({"phase":"","completed":0,"total":0}),
+        "{terminal}"
+    );
     drop(writer); // Always rolls back the external writer lock, including on panic.
     let (generation, revision): (String, i64) = rusqlite::Connection::open(real_index_db(&home))
         .unwrap()
@@ -3170,7 +3391,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     })
     .await
     .expect("later successful job");
-    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(completed["state"], "done", "{completed}");
     assert_eq!(
         completed["revision"]["indexGeneration"],
         pin["indexGeneration"]

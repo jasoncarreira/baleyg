@@ -151,17 +151,29 @@ async fn validation_and_limit() {
         index_generation: _store.index_baseline().unwrap().index_generation,
         index_revision: 9,
     };
-    assert_eq!(
-        call(
-            &app,
-            "POST",
-            "/api/index",
-            json!({"expectedRevision":stale})
-        )
-        .await
-        .0,
-        409
-    );
+    let (code, accepted) = call(
+        &app,
+        "POST",
+        "/api/index",
+        json!({"expectedRevision":stale}),
+    )
+    .await;
+    assert_eq!(code, 202, "{accepted}");
+    assert_eq!(accepted["state"], "queued");
+    let stale_id = accepted["id"].as_str().unwrap();
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, row) = call(&app, "GET", &format!("/api/jobs/{stale_id}"), Value::Null).await;
+            if !row["finishedAt"].is_null() {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], "revision_conflict");
     let req = Request::builder()
         .method("POST")
         .uri("/api/index")
@@ -281,13 +293,74 @@ async fn jobs_publish_and_cancel() {
     })
     .await
     .unwrap();
-    assert_eq!(completed["state"], "completed");
+    assert_eq!(completed["state"], "done");
     assert_eq!(store.status().unwrap().revision.index_revision, 1);
     let (_, cancelled) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
-    assert_eq!(cancelled["state"], "completed");
+    assert_eq!(cancelled["state"], "done");
     assert_eq!(store.status().unwrap().revision.index_revision, 1);
     state.cancel_active();
 }
+#[tokio::test]
+async fn queued_request_is_durable_and_non_cancellable_during_lock_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("one.js"), "function one() {}\n").unwrap();
+    let store = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
+    let held = store.leader_session().unwrap();
+    let state = http::new(
+        store.clone(),
+        IndexOptions::new(root),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = http::router(state.clone());
+    let (code, accepted) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{accepted}");
+    assert_eq!(accepted["state"], "queued");
+    assert!(accepted["submittedAt"].is_string());
+    assert!(accepted["startedAt"].is_null());
+    assert!(accepted["finishedAt"].is_null());
+    let id = accepted["id"].as_str().unwrap();
+    let (code, current) = call(&app, "GET", "/api/jobs/current", Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(current["id"], id);
+    let (code, rejected) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(rejected["error"]["code"], "request_not_cancellable");
+    assert_eq!(store.request_by_id(id).unwrap().unwrap().state, "queued");
+    drop(held);
+    let done = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (code, row) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            assert_eq!(code, StatusCode::OK, "{row}");
+            if !row["finishedAt"].is_null() {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(done["startedAt"].is_string());
+    assert_eq!(
+        store.status().unwrap().revision,
+        serde_json::from_value(done["revision"].clone()).unwrap()
+    );
+    let (code, again) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(again, done);
+    drop(state);
+    let reopened = Store::open_for_tests(
+        &dir.path().join("state"),
+        std::path::Path::new(store.workspace_root()),
+    )
+    .unwrap();
+    assert_eq!(reopened.request_by_id(id).unwrap().unwrap().state, "done");
+}
+
 #[test]
 fn token_security() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -340,7 +413,7 @@ async fn active_job_cancellation_does_not_publish() {
     assert_eq!(code, 202);
     let id = j["id"].as_str().unwrap();
     let (code, _) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
-    assert_eq!(code, 200);
+    assert_eq!(code, 409);
     let terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let (_, j) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
@@ -352,8 +425,8 @@ async fn active_job_cancellation_does_not_publish() {
     })
     .await
     .unwrap();
-    assert_eq!(terminal["state"], "cancelled");
-    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert_eq!(terminal["state"], "done");
+    assert_eq!(store.index_baseline().unwrap().index_revision, 1);
 }
 
 #[tokio::test]
@@ -716,7 +789,7 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
     })
     .await
     .unwrap();
-    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["state"], "done", "{done}");
     let (status, ready) = call(&app, "GET", "/api/status", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ready["evidenceFormat"], "terminal-native-graph-v1");
@@ -1176,7 +1249,7 @@ async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_
     let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
     let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
-    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["state"], "done", "{done}");
     assert_eq!(done["revision"]["indexRevision"], 1);
     assert_ne!(
         done["revision"]["indexGeneration"],
@@ -1197,10 +1270,17 @@ async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_
     let (ready, status) = call(&app, "GET", "/api/status", Value::Null).await;
     assert_eq!(ready, StatusCode::OK);
     assert_eq!(status["revision"], done["revision"]);
-    let (conflict, rejected) =
+    let (accepted, queued) =
         call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
-    assert_eq!(conflict, StatusCode::CONFLICT);
-    assert_eq!(rejected["error"]["code"], "revision_conflict");
+    assert_eq!(accepted, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "queued");
+    let failed = finished_index_job(&app, queued["id"].as_str().unwrap()).await;
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], "revision_conflict");
+    assert_eq!(
+        store.status().unwrap().revision,
+        serde_json::from_value(done["revision"].clone()).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -1226,7 +1306,7 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
     let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
     let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
-    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["state"], "done", "{done}");
     assert_ne!(
         done["revision"]["indexGeneration"],
         json!(old)["indexGeneration"]
@@ -1242,7 +1322,7 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
 }
 
 #[tokio::test]
-async fn index_request_without_startup_session_does_not_reacquire_leadership() {
+async fn index_request_without_startup_session_takes_over_after_ack() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -1254,13 +1334,16 @@ async fn index_request_without_startup_session_does_not_reacquire_leadership() {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    let app = http::router(state);
-    let (status, body) = call(&app, "POST", "/api/index", json!({})).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"]["code"], "index_not_ready");
-    let session = store.leader_session().unwrap();
-    assert!(
-        session.is_leader(),
-        "HTTP request must not have retained or reacquired the lock"
+    let app = http::router(state.clone());
+    let (status, accepted) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert_eq!(accepted["state"], "queued");
+    assert!(accepted["startedAt"].is_null());
+    let done = finished_index_job(&app, accepted["id"].as_str().unwrap()).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(
+        store.status().unwrap().revision,
+        serde_json::from_value(done["revision"].clone()).unwrap()
     );
+    assert!(state.retained_serving_session().unwrap().is_leader());
 }

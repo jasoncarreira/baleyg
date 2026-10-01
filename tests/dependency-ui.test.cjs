@@ -186,7 +186,7 @@ test("connect and completed workspace index automatically refresh metadata, neve
  if(url==="/api/views"||url==="/api/annotations")return response([]);
  if(url==="/api/jev/status"||url==="/api/acp/status")return response({enabled:false});
  if(url==="/api/index")return response({id:"job",state:"running"});
- if(url==="/api/jobs/job"){revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2};return response({id:"job",state:"completed"});}
+ if(url==="/api/jobs/job"){revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2};return response({id:"job",state:"done"});}
  throw Error(url);};
  h.get("token").value="synthetic";h.get("connect-form").listeners.submit({preventDefault(){}});await new Promise(setImmediate);
  assert.equal(h.get("workspace").hidden,false);assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,1);
@@ -265,4 +265,19 @@ test("late external-source catalog response cannot paint after same-number new-g
  assert.equal(h.run('status.revision.indexGeneration'),next.indexGeneration);
  assert.equal(h.run('externalSnapshot'),null);
  assert.equal(h.get('external-source').children.length,0);
+});
+
+test("queued indexing can stop local waiting without cancelling the durable request",async()=>{
+ const h=harness(),requests=[];
+ h.context.fetch=async(url,options)=>{requests.push([url,options.method]);
+  if(url==="/api/index")return response({id:"accepted",state:"queued",submittedAt:"1",startedAt:null,finishedAt:null});
+  throw Error(`unexpected ${url}`);};
+ await h.get("index").listeners.click();
+ assert.equal(h.get("cancel").hidden,false);assert.equal(h.get("index").disabled,true);
+ assert.match(h.get("job").textContent,/queued · accepted/);
+ h.get("cancel").listeners.click();
+ assert.equal(h.get("cancel").hidden,true);assert.equal(h.get("index").disabled,false);
+ assert.match(h.get("job").textContent,/no longer waiting here/);
+ assert.deepEqual(requests,[["/api/index","POST"]]);
+ assert.equal([...h.timers.values()].filter(t=>t.delay===700).length,0);
 });

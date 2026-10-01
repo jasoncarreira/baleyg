@@ -4,7 +4,7 @@ let token = "", epoch = 0, querySerial = 0, sourceSerial = 0, searchSerial = 0;
 let status = null, result = null, seed = null, views = [], annotations = [], editingView = null, editingNote = null;
 let statusSerial = 0, savedSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
-let job = null, pollTimer = null;
+let job = null, pollTimer = null, waitingForJob = false;
 let packet = null, focused = null, questionSerial = 0;
 let jevStatus = null, jevStatusSerial = 0, jevRunning = false;
 let acpStatus = null, acpStatusSerial = 0, acpRunning = false, answerSerial = 0;
@@ -311,6 +311,8 @@ form("connect-form", async () => {
   tokenFileSerial++; token = supplied; $("token").value = "";
   try {
     await refreshStatus(); await loadSaved(); await refreshJevStatus(); await refreshAcpStatus();
+    job = await api("/api/jobs/current").catch(() => null); waitingForJob = !!job && activeJob(job);
+    if (job) { showJob(); schedulePoll(); }
     $("error").hidden = true; $("error").textContent = "";
     $("workspace").hidden = false; $("connect-form").hidden = true; $("logout").hidden = false;
     window.BaleygShell?.setConnected(true);
@@ -330,7 +332,7 @@ form("connect-form", async () => {
 $("logout").addEventListener("click", () => {
   window.BaleygShell?.setConnected(false);
   tokenFileSerial++; const forgotten = forgetStoredToken(); $("remember-token").checked = false; $("token-file").value = "";
-  clearDependencyCatalog(); clearExternalSources(); clearBrowse(); statusSerial++; epoch++; querySerial++; searchSerial++; clearTimeout(pollTimer); token = ""; status = null; result = null; seed = null; job = null;
+  clearDependencyCatalog(); clearExternalSources(); clearBrowse(); statusSerial++; epoch++; querySerial++; searchSerial++; clearTimeout(pollTimer); token = ""; status = null; result = null; seed = null; job = null; waitingForJob = false;
   acpStatusSerial++; acpStatus = null; acpRunning = false; $("acp-status").textContent = "ACP status unavailable.";
   jevStatusSerial++; jevStatus = null; jevRunning = false; $("jev-status").textContent = "Live Jev status unavailable.";
   invalidateFocus(); views = []; annotations = []; sourceCache.clear(); clearSource(); resetView(); resetNote();
@@ -639,29 +641,31 @@ form("annotation-form", async () => {
   await api(`/api/annotations/${encodeURIComponent(id)}?${IndexPin.query(pin)}`, "PUT", dto);
   resetNote(); await loadSaved();
 });
-function activeJob(value) { return ["queued", "running", "cancelling", "canceling", "pending"].includes(value.state); }
+function activeJob(value) { return ["queued", "running"].includes(value.state); }
 function showJob() {
-  $("job").textContent = `Index ${job.state} · ${job.progress?.phase || ""} · ${job.progress?.completed ?? 0}/${job.progress?.total ?? "?"}${job.error ? ` · ${describe(job.error)}` : ""}`;
-  $("cancel").hidden = !activeJob(job); $("index").disabled = activeJob(job);
+  if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; return; }
+  $("job").textContent = `Index ${job.state}${job.state === "queued" ? " · accepted" : ""}${activeJob(job) && !waitingForJob ? " · no longer waiting here" : ""} · ${job.progress?.phase || ""} · ${job.progress?.completed ?? 0}/${job.progress?.total ?? "?"}${job.error ? ` · ${describe(job.error)}` : ""}`;
+  $("cancel").hidden = !waitingForJob || !activeJob(job);
+  $("index").disabled = waitingForJob && activeJob(job);
 }
 function schedulePoll() {
   clearTimeout(pollTimer);
-  if (!job || !activeJob(job) || !token) return;
+  if (!waitingForJob || !job || !activeJob(job) || !token) return;
   pollTimer = setTimeout(() => perform(async () => {
     job = await api(`/api/jobs/${encodeURIComponent(job.id)}`); showJob();
     if (activeJob(job)) schedulePoll();
-    else { await refreshStatus(); await loadSaved(); }
+    else { waitingForJob = false; showJob(); await refreshStatus(); await loadSaved(); }
   }), 700);
 }
 $("index").addEventListener("click", () => perform(async () => {
   window.BaleygClasses?.reset();
   diagramSerial++; window.BaleygShell?.resetInspector(); clearSource();
-  job = await api("/api/index", "POST", {}); showJob(); schedulePoll();
+  job = await api("/api/index", "POST", {}); waitingForJob = true; showJob(); schedulePoll();
 }, $("index")).then(() => { if (job) showJob(); }));
-$("cancel").addEventListener("click", () => perform(async () => {
-  if (!job) return;
-  job = await api(`/api/jobs/${encodeURIComponent(job.id)}/cancel`, "POST", {}); showJob(); schedulePoll();
-}, $("cancel")));
+$("cancel").addEventListener("click", () => {
+  // Stopping this page's polling never cancels a durably accepted request.
+  clearTimeout(pollTimer); waitingForJob = false; showJob();
+});
 
 async function refreshJevStatus() {
   const serial = ++jevStatusSerial;

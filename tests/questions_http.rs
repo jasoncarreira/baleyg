@@ -598,7 +598,7 @@ async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_termina
     })
     .await
     .unwrap();
-    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["state"], "done", "{done}");
     let (status, ready) = call(&app, "GET", "/api/status", Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{ready}");
     assert_eq!(ready["evidenceFormat"], "terminal-native-graph-v1");

@@ -1,5 +1,6 @@
 //! SQLite snapshots and durable user data. Connections are never shared between threads.
 pub mod anchors;
+pub mod requests;
 pub mod topology;
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
@@ -10,7 +11,7 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -23,6 +24,11 @@ pub struct Store {
     workspace_root: String,
     recovery_required: Arc<AtomicBool>,
     recovery_disposition: Arc<AtomicU8>,
+    pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
+    #[cfg(test)]
+    test_queue_finish_failures: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    test_queue_post_commit_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1852,6 +1858,11 @@ impl Store {
             identity: Arc::new(identity),
             recovery_required: Arc::new(AtomicBool::new(false)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
+            pending_request_completion: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_queue_post_commit_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.leader(&store.identity)?;

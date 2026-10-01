@@ -344,16 +344,7 @@ async fn main() -> Result<()> {
                 flag.store(true, Ordering::Release);
             });
             let work = tokio::task::spawn_blocking(move || {
-                baleyg::index_coordinator::reconcile_workspace(
-                    &worker_store,
-                    &options,
-                    &cancel,
-                    |p| {
-                        if p.completed == p.total {
-                            eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
-                        }
-                    },
-                )
+                baleyg::index_coordinator::enqueue_and_wait(&worker_store, &options, &cancel)
             })
             .await
             .context("index worker panicked")?;
