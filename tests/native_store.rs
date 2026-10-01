@@ -603,7 +603,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
     let version: String = db
         .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, "native-v3");
+    assert_eq!(version, "native-v4");
     let calls: Vec<String> = db
         .prepare("SELECT id FROM native_calls")
         .unwrap()
