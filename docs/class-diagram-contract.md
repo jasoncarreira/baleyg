@@ -27,7 +27,9 @@ field/parameter/returns; matchKind syntaxCandidate/unmatched/ambiguous. Unique *
 Java package/import/lexical context; Python explicit module/relative import/lexical context. No global bare
 name guessing. Generic type parameters and shadowing must not falsely match workspace classes. Cap per-file
 AST visits/depth, declarations/members/references and global text/records; cancellation checks. Limits/recovery
-explicit. No function-body traversal for class relationship discovery. Preserve nested lexical classes safely.
+explicit. Two-step build ([Decision 0004](semantic-evidence/decisions/0004-compositional-class-catalog.md)):
+per-file extraction uses only per-file limits; global caps, warnings and truncation are applied when composing
+per-file results in path order. Catalog::build is that composition over every file. No function-body traversal for class relationship discovery. Preserve nested lexical classes safely.
 
 Store/HTTP owner: src/store.rs, src/http.rs, src/class_diagram.rs, tests/class_diagram_http.rs.
 Persist Catalog projection atomically with existing index publication, building before transaction. Graph,
