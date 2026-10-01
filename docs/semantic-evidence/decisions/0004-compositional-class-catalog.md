@@ -25,27 +25,53 @@ It also shares the catalog-wide `warnings` list (deduplicated, at most 100) and 
 
 ## Decision
 
-The catalog is built in two steps.
+The catalog is built in two steps. Every limit is read from one `Limits` value. Production uses the constants above, and the fixture tests below use small limits. The warning strings below are shown with production values; their numbers are formatted from the active `Limits`.
 
-1. **Per-file extraction.**
-   - A file's class extraction is a function of only:
-     - the file's bytes, path and language;
-     - that file's measured `Symbol`s;
-     - the **per-file** limits: `FILE_BYTES` (2 MiB), `FILE_CLASSES` (1,000), `FILE_REFS` (8,192), `MEMBERS` (256 per class), `VISITS`, `DEPTH`, `TEXT` (2,048 bytes per string), and the per-declaration type-parameter limits.
-   - It reads no workspace-wide budget.
-   - Its result is the file's ordered classes, each with its members and relations, its own warnings, and the byte, record and text sizes that the global caps charge.
-   - The result is stored with the file's **graph projection**, not just its document version, because the measured `Symbol`s carry captured SCIP display labels from outside the file. It is reused for as long as that projection is.
-2. **Per-revision composition.**
-   - Composition walks the revision's per-file results in path order, with classes in `(path, start_byte, id)` order.
-   - It applies the workspace-wide caps to those **complete** results, one class at a time:
-     - **Input limit.** A revision over 100,000 files or 1,000,000 symbols gives an empty, incomplete catalog, as today.
-     - **Registry caps** (`TOTAL_BYTES`, `CLASSES`, `REGISTRY_TEXT`). A file whose source would exceed `TOTAL_BYTES` is excluded, along with every later file. Classes past `CLASSES` or `REGISTRY_TEXT` are excluded. Either way, the registry is marked incomplete.
-     - **Detail caps** (`RECORDS`, `OUTPUT_TEXT`). Once a class would exceed one, that class and every later admitted class keep their declaration but lose the members and relations past the cap, and are marked `truncated`. Discovery of declarations continues.
-     - **Warnings.** Each admitted file's warnings and each cap's warning are added in walk order, deduplicated, keeping the first 100. The two closing warnings ("Declared types are terminal source text…" and "Incomplete class declaration registry…") follow under today's conditions. `truncated` is set when any cap or per-file limit truncated output.
-   - Composition reads only stored per-file results. It never re-parses, and it runs in memory, bounded by the caps.
-   - Its output is one **class projection per owning path**, plus the revision's catalog `warnings` and `truncated`.
+### 1. Per-file extraction
 
-`Catalog::build(files, nodes, cancel)` remains the full-build reference. It is defined as composition over per-file extraction of every file, and it is what #67's independent full-native snapshot uses. #67's full-snapshot parity for classes is measured against this definition, not against the current one-pass output.
+- **Inputs.** A file's extraction is a function of only:
+  - the file's bytes, path and language;
+  - the file's measured `Symbol`s, including their captured SCIP display labels;
+  - the **per-file** limits: `FILE_BYTES` (2 MiB), `FILE_CLASSES` (1,000), `FILE_REFS` (8,192), `MEMBERS` (256 per class), `VISITS` and detail visits (100,000), `DEPTH` (64), `TEXT` (2,048 bytes per string), and the type-parameter limits (256 per declaration and per scope).
+- **No workspace budget.** It reads no workspace-wide budget and is never cut by one. `tick`, `details`, `reserve_text` and `reserve_detail_text` keep only their per-file checks. The registry and detail charges are **counted**, not refused.
+- **Per-file messages are unchanged,** including `"{path}: class declaration limit reached (1000/file, 20000/catalog)"` when `FILE_CLASSES` is hit. That keeps below-cap output identical.
+- **Result `F`.** Extraction produces:
+  - `F.source_bytes`: the file's byte length. A file skipped by `FILE_BYTES` still has one, as today.
+  - `F.registry_bytes`: the sum of every registry-text charge the extraction made. That is binding name plus value, class `id + name + path + qualified name`, and type-parameter scope text ×2. A file that declares **no** class still charges its bindings.
+  - `F.warnings`: the file's own limit warnings, in emission order.
+  - `F.truncated`: whether any per-file limit truncated output.
+  - `F.registry_incomplete`: whether a per-file limit that today calls `registry_limit` fired (for example, no unique measured class symbol, an over-long qualified name, a type-parameter limit, or the work limit).
+  - `F.classes`: the file's classes in `(start_byte, id)` order. Each class carries its declaration and its **detail items** (fields, methods, relations and detail type-parameter text) in extraction order. Each item has `records`: 1 for a member or relation, 0 for type-parameter text, and `text`: the bytes that `reserve_detail_text` charges.
+- **Reuse.** `F` is stored with the document's **graph projection**, whose identity covers the document version and the file's measured `Symbol`s. `F` is reused exactly while that graph projection is reused, and recomputed whenever it changes. This includes an unchanged source file whose captured SCIP labels change.
+
+### 2. Per-revision composition
+
+- **Input limit.** If the revision has more than 100,000 files or 1,000,000 symbols, the catalog is empty, `truncated = true`, and `warnings` holds only the input-limit message, with no closing warnings. This is today's behaviour.
+- **Otherwise,** walk the Java/Python files in ascending byte order of path. Start with counters `S` (source), `T` (registry text), `N` (classes), `R` (records) and `X` (detail text) at 0, and latches `registry_open` and `detail_open` set to true.
+- **For each file `F`:**
+  1. If `registry_open` is false, skip `F`. It contributes no classes and no warnings.
+  2. **Registry caps.**
+     - If `S + F.source_bytes > TOTAL_BYTES`, emit `"Class catalog source limit exceeded (256 MiB)"`. Otherwise, if `T + F.registry_bytes > REGISTRY_TEXT`, emit `"Class declaration registry text limit reached (32 MiB)"`. In either case, set `registry_open` false, mark the registry incomplete, and skip `F` and every later file.
+     - Equality is admitted.
+     - An excluded file's own warnings never enter the list.
+  3. **Admit the file.** Add `F.source_bytes` to `S` and `F.registry_bytes` to `T`. Append `F.warnings` in order. If `F.truncated`, set the catalog's `truncated`.
+  4. **For each class `c` of `F`, in order:**
+     - If `N = CLASSES`, emit `"Class catalog declaration limit reached (20000)"`, set `registry_open` false, mark the registry incomplete, and stop. The rest of `F` and every later file are excluded; `F`'s warnings from step 3 stay.
+     - Otherwise, admit `c`'s declaration and add 1 to `N`.
+     - For each item `i` of `c`: admit it only if `detail_open`, `R + i.records ≤ RECORDS` and `X + i.text ≤ OUTPUT_TEXT`; then add `i.records` to `R` and `i.text` to `X`.
+     - At the first item that fails, set `detail_open` false and emit one detail warning. If `R + i.records > RECORDS`, it is the record warning `"Class detail limit reached (250000 records / 64 MiB text / 100000 visits per file); declaration discovery continues"`. Otherwise it is the text warning `"Class detail text limit reached (64 MiB); declaration discovery continues"`. That item and every later item, in this class and every later class, are dropped. A class that loses at least one item is `truncated`.
+     - Declarations keep being admitted after `detail_open` closes.
+- **Warnings list.** Warnings are added in walk order and deduplicated by exact string. The first 100 distinct entries are kept and later ones are dropped silently.
+- **Closing warnings.** After the walk, these follow, outside the 100-entry limit and in this order:
+  1. `"Declared types are terminal source text…"`, if any class was admitted;
+  2. `"Incomplete class declaration registry: some declarations may be absent."`, if the registry is incomplete. That is either a registry cap above, or an admitted file with `F.registry_incomplete` set.
+- **Catalog `truncated`** is set when any cap above fires, or when an admitted file's `F.truncated` is set.
+- **Output.**
+  - Classes come out in `(path, start_byte, id)` order, and relations in `(path, start_byte, id)` order, deduplicated by `id`, as today.
+  - Composition yields one **class projection per document** (its admitted classes and relations) plus the revision's catalog `warnings` and `truncated`.
+  - Composition reads only the `F` values. It never re-parses.
+
+`Catalog::build(files, nodes, cancel)` is defined as `compose(extract_file(f) for every file)` with production limits. #67's full-snapshot parity for classes is measured against that definition, not against the current one-pass output.
 
 ## Alternatives rejected
 
@@ -54,32 +80,42 @@ The catalog is built in two steps.
 
 ## Consequences
 
-- **Exact parity by construction.** Delta publication and the full rebuild run the same two functions over the same inputs.
-- **Delta writes.** An edit re-extracts only the changed files. Composition then rewrites only the per-path projections whose content changed: normally just the edited file's. Another path's projection changes only when a cap boundary moves across it.
+- **Defined parity.** Delta publication and the full rebuild apply the same normative rules. The tests below check them against an independent build and against frozen expected outputs, not just against each other.
+- **Delta writes.** A publication re-extracts only files whose graph projection changed: an edited file, or an unchanged file whose captured SCIP labels changed. Composition then rewrites only the class projections whose content changed: normally just those files'. Another document's projection changes only when a cap boundary moves across it.
 - **Storage.** Per-file results live on the graph projection and per-document class projections are shared across revisions, so an unchanged file's class rows are stored once.
-- **Future cross-file resolution** (binding relation targets across files) would belong in composition, and a target change would rewrite the dependent path's projection. Adding it is a separate decision.
+- **No resolution is added.** Every relation stays `unmatched`, as today. Binding relation targets across files would be a separate semantic decision.
 
 ## Behaviour change
 
-Below every workspace-wide cap, output is identical to the current build. At a cap, the cut can fall differently. Today a detail budget can be exhausted partway through extracting a class, and a later file's extraction sees budget already used. Under this decision, the caps are applied after extraction, at class granularity, in a fixed order. Nothing depends on the old cut points.
+Below every workspace-wide cap, output is identical to the current build. Frozen fixtures check this (see the tests below). At a cap, the rules above replace today's. Today:
+
+- An overflowing registry-text charge drops one binding or class, and then every later node in the file and every later file stops, with a per-file "work limit" warning.
+- Detail budgets are consumed in traversal order, interleaving nested classes.
+
+Under this decision, registry caps exclude whole files, `CLASSES` cuts between classes, and detail caps cut at the first failing item, in class order. Nothing depends on the old cut points.
 
 ## Required tests (#67)
 
-- Composition over per-file extraction equals `Catalog::build` on the #72 cohorts and the existing class fixtures.
-- At each workspace-wide cap (`TOTAL_BYTES`, `CLASSES`, `RECORDS`, `OUTPUT_TEXT`, `REGISTRY_TEXT`, the input limit), cover:
-  - the cut;
-  - `truncated`;
-  - the warnings;
-  - that growing an earlier file moves the cut in a later, unchanged file, and delta publication rewrites exactly that file's projection.
-- A per-file result is independent of the other files in the workspace: the same bytes give the same result in any workspace.
-- The warnings keep their order, deduplication and 100-entry limit.
+1. **Frozen below-cap outputs.** Before `classes.rs` changes, record the current one-pass `Catalog::build` output, byte-for-byte JSON, for the existing class fixtures and a below-cap sample of the #72 cohorts, and check it in. The new implementation must reproduce it exactly.
+2. **Normative cap fixtures** with small `Limits` and checked-in expected outputs, written from the rules above and not generated by the implementation under test. For each of `TOTAL_BYTES`, `REGISTRY_TEXT`, `CLASSES`, `RECORDS`, `OUTPUT_TEXT` and the input limit:
+   - **Boundary:** exactly at the limit (admitted) and one unit over (cut).
+   - **Registry text without classes:** a file with no class whose bindings cross `REGISTRY_TEXT`.
+   - **Detail cut inside a class:** a class whose items cross `RECORDS` and, separately, `OUTPUT_TEXT`. It keeps its declaration and its earlier items, is `truncated`, and later classes keep declarations without items.
+   - **Excluded file's warnings:** they are absent from the list.
+   - **Warning limit:** deduplication and the 100-entry limit, with the closing warnings after it in order.
+   - **Moving cut:** growing an earlier file moves the cut in a later, unchanged file, and delta publication rewrites exactly that file's class projection.
+3. **Independent oracle.**
+   - #67's full-snapshot oracle builds the catalog in a fresh, isolated build. It re-extracts every file from the authenticated captured source and the revision's measured graph, and reads **no** stored `F`, graph projection or class projection.
+   - It compares every pinned per-document class row, the order, the catalog `warnings` and `truncated`, byte-for-byte, with delta output after each #67 parity scenario.
+4. **Cache invalidation.** An unchanged source file whose captured SCIP label changes gets a new graph projection, a recomputed `F` and the class projection that follows from it at the new revision, while an older retained pin still reads its exact previous rows.
+5. **Workspace independence.** The same per-file inputs (bytes, path, language, measured `Symbol`s) give the same `F` in any workspace.
 
 ## Implementation impact
 
-- **`src/classes.rs`.** Split into a per-file extraction (`extract_file`) and composition (`compose`). `Catalog::build` becomes `compose` over `extract_file`. Global counters move out of extraction and into composition.
+- **`src/classes.rs`.** Split into a per-file extraction (`extract_file`) and composition (`compose`), both taking `Limits`. `Catalog::build` becomes `compose` over `extract_file`. The global counters and refusals move out of extraction and into composition.
 - **`src/store.rs` (#67 v8).**
-  - The per-file result is stored on the document's graph projection.
-  - Per-path class projections (`class_projections`, `classes`, `class_relations`) are named by each revision's manifest.
+  - `F` is stored on the document's graph projection and reused or recomputed with it.
+  - Per-document class projections (`class_projections`, `classes`, `class_relations`) are named by each revision's manifest.
   - The catalog `warnings` and `truncated` move to the revision header.
   - Composition runs before the publication transaction, and the transaction writes only new projections.
 - **`docs/class-diagram-contract.md`.** Its cap rule now points here.
