@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { canonicalBytes } from "./json.mjs";
 import { validate } from "./formats.mjs";
+import { inventoryMismatch } from "./native-inventory.mjs";
 
 const domains = Object.freeze({
   syntax: "baleyg.syntax.v1\0",
@@ -69,20 +70,23 @@ function checkComponents(components) {
       );
   }
 }
-export const extractionContext = (input) =>
-  digest("extractionContext", input);
+export const extractionContext = (input) => digest("extractionContext", input);
 const contextHashFields = Object.freeze({
   config: "configHash",
   dependency: "dependencyHash",
   toolchain: "toolchainHash",
 });
 // The native producer's declared inventory is authenticated before any
-// occurrence ID is minted: every declared component must resolve to the
-// revision's captured digest of that kind, backed by an authenticated capture.
+// occurrence ID is minted: it must equal the trusted inventory of the admitted
+// producer version for the document's language, and every component must
+// resolve to the revision's captured digest of that kind, backed by an
+// authenticated capture.
 // An undeclared, unknown, unsorted, duplicate or unbacked component fails closed.
 export function nativeOccurrenceContext(fixture, native, revision, document) {
   const fail = (message) => {
-    const e = new Error(`IDENTITY.EXTRACTION_CONTEXT extractionInputs: ${message}`);
+    const e = new Error(
+      `IDENTITY.EXTRACTION_CONTEXT extractionInputs: ${message}`,
+    );
     Object.assign(e, {
       assertion: "IDENTITY.EXTRACTION_CONTEXT",
       code: "invalidRecord",
@@ -96,6 +100,13 @@ export function nativeOccurrenceContext(fixture, native, revision, document) {
     (x) => x.id === native.producerId && x.kind === "native",
   );
   if (!producer) fail("native producer descriptor not admitted");
+  const mismatch = inventoryMismatch(
+    producer.id,
+    producer.version,
+    document.key.language,
+    inputs,
+  );
+  if (mismatch) fail(mismatch);
   const components = inputs.map((name, i) => {
     if (!Object.hasOwn(contextHashFields, name))
       fail(`undeclared component ${name}`);

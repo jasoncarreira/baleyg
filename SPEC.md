@@ -301,8 +301,12 @@ exact measured name, Java overload signature or same-key sibling ordinal). Range
 hash remain separate fields, so a body-only edit changes no IDs. Readable path/key strings are
 separate presentation-only `displayKey` values, never identity, accepted input, or hashed. SCIP
 symbols remain in a separate binding layer, never as node IDs. Call sites and control regions use
-revision-local `occ:v1:` IDs: the first 128 bits of the digest over revision, shortened owner syntax
-ID, occurrence kind and ordinal. Backward compatibility is not required for this change.
+per-document `occ:v2:` IDs ([Decision 0003](docs/semantic-evidence/decisions/0003-per-document-occurrence-ids.md)):
+the first 128 bits of the domain-separated digest over the document's content hash, its
+authenticated extraction context, the native producer ID and version, the owner syntax ID,
+occurrence kind and ordinal. No revision is hashed, so an unchanged document keeps its occurrence
+IDs across revisions. The withdrawn revision-bound `occ:v1:` form is not accepted; backward
+compatibility is not required.
 
 Identity and location are separate fields. Renames and moves of a declaration change its ID;
 annotations on a removed declaration remain visible orphans. Durable anchors also store a hash of the
@@ -314,8 +318,9 @@ Illustrative only: node IDs are stable syntax IDs; the SCIP symbol is a separate
 call site keeps its own identity, separate from its declared target and dispatch kind. These example
 hashes assume logical source set `core`, Java, the displayed paths, `type` declaration keys for
 classes, zero-based declaration ordinals, ordinary Java method signatures (empty except
-`rateFor(Region)`), and revision `rev-148` for occurrence IDs. `displayKey` is a readable result
-label, never an identity or request selector; this is not a complete v1 DTO schema.
+`rateFor(Region)`). Occurrence IDs are shown as placeholders, since their digests depend on the
+document's content hash and extraction context, which this example does not fix. `displayKey` is a
+readable result label, never an identity or request selector; this is not a complete v1 DTO schema.
 
 ```json
 {
@@ -336,16 +341,16 @@ label, never an identity or request selector; this is not a complete v1 DTO sche
     "provenance": { "source": "scip", "evidenceKind": "declarationBinding", "indexRev": 148 }
   }],
   "callSites": [{
-    "id": "occ:v1:c5fb440e061729989aca50c29a8f0b5c",
+    "id": "occ:v2:<call-site digest>",
     "displayKey": "...Invoice.java#class:Invoice/method:total()@call:3",
     "caller": "sid:v1:f2ff8bd933db88969122e5d61d873746",
     "range": [1312, 1340],
     "ordinal": 3,
-    "regions": ["occ:v1:e7bdfb1616a2481d2ea152a56d2c5698"],
+    "regions": ["occ:v2:<region digest>"],
     "provenance": { "source": "treesitter", "evidenceKind": "measuredSyntax", "indexRev": 148 }
   }],
   "callBindings": [{
-    "callSite": "occ:v1:c5fb440e061729989aca50c29a8f0b5c",
+    "callSite": "occ:v2:<call-site digest>",
     "declaredTarget": "sid:v1:7bfe74998e06c7d1c080fe6f60acf8f3",
     "dispatch": "virtual",
     "disposition": "resolved",

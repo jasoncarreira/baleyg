@@ -3,6 +3,7 @@ import { canonicalBytes } from "../json.mjs";
 import { validate } from "../formats.mjs";
 import { toByteRange } from "../coordinates.mjs";
 import { lookupKey } from "../lookup.mjs";
+import { inventoryMismatch } from "../native-inventory.mjs";
 
 const bytes = (value) => canonicalBytes(value);
 const hex = (value) => bytes(value).toString("hex");
@@ -228,8 +229,10 @@ export function checkMeasurement(
     reject("MEASUREMENT.OWNER", "producerId", "native producer not admitted");
   const encoding = producer.positionEncoding;
   // Independently authenticate the declared extraction-input inventory before
-  // any occurrence ID is re-derived. No inventory, an unknown/unsorted/duplicate
-  // component, or one without an authenticated capture fails closed.
+  // any occurrence ID is re-derived. No inventory, one that differs from the
+  // trusted inventory of the admitted producer version and row language, an
+  // unknown/unsorted/duplicate component, or one without an authenticated
+  // capture fails closed.
   const contextFields = {
     config: "configHash",
     dependency: "dependencyHash",
@@ -237,7 +240,10 @@ export function checkMeasurement(
   };
   const inventory = native.extractionInputs;
   inventory.forEach((name, i) => {
-    if (!Object.hasOwn(contextFields, name) || (i && ascii(inventory[i - 1], name) >= 0))
+    if (
+      !Object.hasOwn(contextFields, name) ||
+      (i && ascii(inventory[i - 1], name) >= 0)
+    )
       reject(
         "IDENTITY.EXTRACTION_CONTEXT",
         "extractionInputs",
@@ -249,10 +255,20 @@ export function checkMeasurement(
       JSON.stringify([row.document.sourceSetId, row.revisionId]),
     );
     const { document } = sourceFor(loaded, row);
+    const mismatch = inventoryMismatch(
+      producer.id,
+      producer.version,
+      row.document.language,
+      inventory,
+    );
+    if (mismatch)
+      reject("IDENTITY.EXTRACTION_CONTEXT", "extractionInputs", mismatch);
     const components = inventory.map((name) => {
       const value = revision[contextFields[name]];
       if (
-        !loaded.fixture.captures.some((x) => x.kind === name && x.hash === value)
+        !loaded.fixture.captures.some(
+          (x) => x.kind === name && x.hash === value,
+        )
       )
         reject(
           "IDENTITY.EXTRACTION_CONTEXT",

@@ -99,7 +99,8 @@ test("example source bytes, immutable IDs and per-document occurrences", () => {
   const unchangedCall = (revisionId) =>
     records.calls.find(
       (row) =>
-        row.revisionId === revisionId && row.document.path === "src/unchanged.js",
+        row.revisionId === revisionId &&
+        row.document.path === "src/unchanged.js",
     );
   assert.equal(
     unchangedCall("r2").id,
@@ -134,8 +135,9 @@ test("example source bytes, immutable IDs and per-document occurrences", () => {
 
 // Decision 0003 fail-closed precondition: no occ:v2 ID is minted (by the
 // normalizer) or re-derived (by the independent checker) unless the native
-// producer's declared inventory is explicit, known, sorted, unique, and each
-// component resolves to an authenticated capture of the pinned revision.
+// producer's declared inventory is explicit, known, sorted, unique, equal to the
+// trusted inventory of the admitted producer version, and each component
+// resolves to an authenticated capture of the pinned revision.
 test("undeclared, unknown, duplicate or unauthenticated extraction inventory fails closed", () => {
   const variant = (mutate) => {
     const loaded = { ...fixture, native: structuredClone(fixture.native) };
@@ -148,7 +150,11 @@ test("undeclared, unknown, duplicate or unauthenticated extraction inventory fai
       () => run(omitted),
       (e) => e.assertion === "FORMAT.SHAPE" && /extractionInputs/.test(e.field),
     );
-  for (const inputs of [["source"], ["config", "config"], ["toolchain", "config"]]) {
+  for (const inputs of [
+    ["source"],
+    ["config", "config"],
+    ["toolchain", "config"],
+  ]) {
     const bad = variant((x) => (x.native.extractionInputs = inputs));
     if (inputs[0] === "source")
       assert.throws(() => normalizeFixture(bad), /FORMAT/);
@@ -162,23 +168,70 @@ test("undeclared, unknown, duplicate or unauthenticated extraction inventory fai
           inputs.join(),
         );
   }
-  const unauthenticated = variant((x) => {
-    x.native.extractionInputs = ["config"];
-    x.fixture = {
+  // The artifact's inventory is a claim checked against the trusted inventory
+  // of the admitted producer version, never the authority.
+  const withVersion = (x, version) =>
+    (x.fixture = {
       ...x.fixture,
-      captures: x.fixture.captures.filter((c) => c.kind !== "config"),
-    };
-  });
-  for (const run of [normalizeFixture, (x) => checkMeasurement(x, records)])
-    assert.throws(
-      () => run(unauthenticated),
-      (e) =>
-        e.assertion === "IDENTITY.EXTRACTION_CONTEXT" &&
-        e.field === "extractionInputs",
-    );
-  // A declared, authenticated config component is a different context, so it
+      producers: x.fixture.producers.map((p) =>
+        p.id === x.native.producerId && p.kind === "native"
+          ? { ...p, version }
+          : p,
+      ),
+    });
+  const rejected = (loaded, reason, message) => {
+    for (const run of [normalizeFixture, (x) => checkMeasurement(x, records)])
+      assert.throws(
+        () => run(loaded),
+        (e) =>
+          e.assertion === "IDENTITY.EXTRACTION_CONTEXT" &&
+          e.field === "extractionInputs" &&
+          reason.test(e.message),
+        message,
+      );
+  };
+  // Same producer version re-declaring its inventory ([] -> [config]).
+  rejected(
+    variant((x) => (x.native.extractionInputs = ["config"])),
+    /differs from the trusted inventory of native@1 /,
+    "same-version [] -> [config]",
+  );
+  // A config-reading producer version that omits config from its declaration,
+  // so a changed config would not re-identify its occurrences.
+  rejected(
+    variant((x) => {
+      withVersion(x, "1+config");
+      x.fixture.captures = x.fixture.captures.map((c) =>
+        c.kind === "config" ? { ...c, hash: "0".repeat(64) } : c,
+      );
+    }),
+    /differs from the trusted inventory of native@1\+config /,
+    "changed config with omitted input",
+  );
+  // A producer version with no trusted inventory.
+  rejected(
+    variant((x) => withVersion(x, "2")),
+    /no trusted inventory for native producer native@2 /,
+    "unknown producer version",
+  );
+  // The trusted inventory matches, but its component has no authenticated capture.
+  rejected(
+    variant((x) => {
+      withVersion(x, "1+config");
+      x.native.extractionInputs = ["config"];
+      x.fixture.captures = x.fixture.captures.filter(
+        (c) => c.kind !== "config",
+      );
+    }),
+    /component config lacks an authenticated capture/,
+    "unauthenticated capture",
+  );
+  // A legitimate config-reading producer version is a different context, so it
   // re-identifies every occurrence; the published [] records then fail.
-  const config = variant((x) => (x.native.extractionInputs = ["config"]));
+  const config = variant((x) => {
+    withVersion(x, "1+config");
+    x.native.extractionInputs = ["config"];
+  });
   const reidentified = normalizeFixture(config).records;
   assert.equal(reidentified.calls.length, records.calls.length);
   for (const [i, row] of reidentified.calls.entries())
@@ -197,7 +250,8 @@ test("withdrawn occ:v1 rows and v1-derived values are rejected by the occ:v2 che
   const v1 = "56fac677947ade31ace83067fd89c569";
   const call = (rows) =>
     rows.calls.find(
-      (row) => row.revisionId === "r2" && row.document.path === "src/unchanged.js",
+      (row) =>
+        row.revisionId === "r2" && row.document.path === "src/unchanged.js",
     );
   assert.equal(validate("Call", call(records)), undefined);
   for (const [id, wrongSpelling] of [
