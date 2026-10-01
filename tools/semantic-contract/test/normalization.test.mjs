@@ -59,6 +59,7 @@ async function specimen() {
   put("captures/native.json", {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [],
     calls: [],
     controls: [],
@@ -166,6 +167,7 @@ function setNative(s, rows) {
   s.files["captures/native.json"] = JSON.stringify({
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: rows,
     calls: [],
     controls: [],
@@ -205,6 +207,7 @@ test("NORMALIZE.OCCURRENCE source-derived call/reference ordinals and exact tupl
   const native = {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [row(s)],
     calls: [
       {
@@ -243,7 +246,7 @@ test("NORMALIZE.OCCURRENCE source-derived call/reference ordinals and exact tupl
   const loaded = await loadFixture(s.root);
   const result = normalize(loaded);
   assert.equal(result.records.calls.length, 1);
-  assert.match(result.records.calls[0].id, /^occ:v1:/);
+  assert.match(result.records.calls[0].id, /^occ:v2:/);
   assert.equal(result.records.references.length, 0);
   assert.equal(result.identityMap.has("reference"), true);
 });
@@ -267,6 +270,7 @@ test("NORMALIZE.CALLEE does not guess a range from the separate spelling witness
   const native = {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [row(s)],
     calls: [call],
     controls: [],
@@ -324,6 +328,7 @@ test("NORMALIZE.REFERENCE_JOIN non-exact diagnostics do not fabricate reference 
   const native = {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [row(s)],
     calls: [],
     controls: [],
@@ -443,11 +448,11 @@ test("NORMALIZE.JOIN counts distinct measured candidate IDs and exact tuple", as
   };
   const one = {
       ref: "one",
-      id: "occ:v1:" + "1".repeat(32),
+      id: "occ:v2:" + "1".repeat(32),
       anchor: measured,
       ownerRef: "decl",
     },
-    two = { ...one, ref: "two", id: "occ:v1:" + "2".repeat(32) };
+    two = { ...one, ref: "two", id: "occ:v2:" + "2".repeat(32) };
   let join = joinAnchor(anchor, buildAnchorIndex([one, one]), loaded);
   assert.equal(join.status, "exact");
   join = joinAnchor(anchor, buildAnchorIndex([one, two]), loaded);
@@ -466,6 +471,7 @@ function measured(s) {
   return {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [row(s)],
     calls: [
       {
@@ -721,6 +727,7 @@ async function invocationFixture(t) {
   const native = {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [
       declaration("main", "main", 0, 29, 9),
       declaration("target", "target", 30, 50, 39),
@@ -1146,7 +1153,7 @@ test("join matching does not cross owner, family, bytes, revision or producer su
   };
   const hit = {
     ref: "reference",
-    id: "occ:v1:" + "1".repeat(32),
+    id: "occ:v2:" + "1".repeat(32),
     ownerRef: "decl",
     anchor: measuredAnchor,
   };
@@ -1451,10 +1458,17 @@ test("isolated r1/r2 comparison keeps historical provenance and never rebinds r1
       result.records.callBindings[0].callId,
       result.identityMap.get("call"),
     );
-    assert.notEqual(
+    // Decision 0003: identical r2 bytes share r1's occ:v2 call ID, changed
+    // bytes do not; either way the single binding stays r1-scoped and is
+    // never carried onto the r2 call record.
+    (label === "same" ? assert.equal : assert.notEqual)(
       result.records.callBindings[0].callId,
       result.identityMap.get("call-r2"),
+      label,
     );
+    assert.equal(result.records.callBindings[0].join.anchor.revisionId, "r1");
+    assert.equal(result.recordMap.get("call-r2").revisionId, "r2");
+    assert.equal(result.recordMap.get("call").revisionId, "r1");
     // v1: evaluated at the binding's own revision (#52), so never stale.
     assert.equal(result.records.callBindings[0].staleTarget, false);
     assert.equal(

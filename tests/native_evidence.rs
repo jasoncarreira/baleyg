@@ -2,35 +2,49 @@ use baleyg::native_ids::{IdentityRegistry, canonical};
 use serde_json::json;
 
 #[test]
-fn identity_excludes_body_and_revision_but_occurrence_is_revision_local() {
+fn identity_excludes_body_and_revision_and_occurrence_is_document_version_local() {
     let descriptor = json!({"sourceSet":"core", "path":"src/A.java", "language":"java", "ancestors":[],
         "declaration":{"kind":"method", "name":"run", "signature":{"parameterTypes":[],"typeParameterCount":0,"variadic":false},"ordinal":0}});
     let mut registry = IdentityRegistry::default();
     let syntax = registry.stable(&descriptor).unwrap();
     assert_eq!(syntax, "sid:v1:42d51f619d3e03c37a1629b6a01af34a");
+    let context = baleyg::native_ids::extraction_context("java", &[]).unwrap();
+    let occurrence = |content: &str, context: &str, version: &str, kind: &str| {
+        json!({"contentHash":content,"extractionContext":context,"nativeProducerId":"baleyg.native.syntax",
+            "nativeProducerVersion":version,"ownerSyntaxId":syntax,"kind":kind,"ordinal":0})
+    };
+    let bytes = "a".repeat(64);
     let first = registry
-        .occurrence(&json!({"revisionId":"r1","ownerSyntaxId":syntax,"kind":"call","ordinal":0}))
+        .occurrence(&occurrence(&bytes, &context, "native-v3", "call"))
         .unwrap();
-    let second = registry
-        .occurrence(&json!({"revisionId":"r2","ownerSyntaxId":syntax,"kind":"call","ordinal":0}))
-        .unwrap();
-    assert_ne!(first, second);
+    assert!(first.starts_with("occ:v2:") && first.len() == 39);
+    // The containing revision is not an input: an identical document version, producer and
+    // context keep one ID in every revision.
     assert_eq!(
         first,
         registry
-            .occurrence(
-                &json!({"revisionId":"r1","ownerSyntaxId":syntax,"kind":"call","ordinal":0})
-            )
+            .occurrence(&occurrence(&bytes, &context, "native-v3", "call"))
             .unwrap()
     );
-    assert_ne!(
-        first,
-        registry
-            .occurrence(
-                &json!({"revisionId":"r1","ownerSyntaxId":syntax,"kind":"control","ordinal":0})
-            )
-            .unwrap()
-    );
+    for changed in [
+        occurrence(&"b".repeat(64), &context, "native-v3", "call"),
+        occurrence(&bytes, &"c".repeat(64), "native-v3", "call"),
+        occurrence(&bytes, &context, "native-v4", "call"),
+        occurrence(&bytes, &context, "native-v3", "control"),
+    ] {
+        assert_ne!(first, registry.occurrence(&changed).unwrap());
+    }
+    // The withdrawn revision-bound v1 input is rejected, never minted.
+    for withdrawn in [
+        json!({"revisionId":"r1","ownerSyntaxId":syntax,"kind":"call","ordinal":0}),
+        {
+            let mut v = occurrence(&bytes, &context, "native-v3", "call");
+            v["revisionId"] = json!("r1");
+            v
+        },
+    ] {
+        assert!(registry.occurrence(&withdrawn).is_err());
+    }
     let changed = json!({"sourceSet":"core", "path":"src/A.java", "language":"java", "ancestors":[],
         "declaration":{"kind":"method", "name":"changed", "signature":{"parameterTypes":[],"typeParameterCount":0,"variadic":false},"ordinal":0}});
     assert_ne!(syntax, registry.stable(&changed).unwrap());
@@ -132,7 +146,7 @@ fn unicode_lookup_normalizes_without_changing_exact_identity_bytes() {
 fn closed_records_reject_unknown_fields_and_fabricated_semantics() {
     use baleyg::native_evidence::{Call, Coverage, Provenance};
     use serde_json::json;
-    assert!(serde_json::from_value::<Call>(json!({"id":"occ:v1:dead","ownerSyntaxId":"sid:v1:dead","ordinal":0,"document":{"sourceSetId":"s","language":"rust","path":"a.rs"},"revisionId":"r","range":{"start":0,"end":1},"calleeRange":null,"spelling":null,"regionIds":[],"provenanceId":"p","target":"guessed"})).is_err());
+    assert!(serde_json::from_value::<Call>(json!({"id":"occ:v2:dead","ownerSyntaxId":"sid:v1:dead","ordinal":0,"document":{"sourceSetId":"s","language":"rust","path":"a.rs"},"revisionId":"r","range":{"start":0,"end":1},"calleeRange":null,"spelling":null,"regionIds":[],"provenanceId":"p","target":"guessed"})).is_err());
     assert!(serde_json::from_value::<Provenance>(json!({"id":"p","producerId":"n","document":{"sourceSetId":"s","language":"rust","path":"a.rs"},"revisionId":"r","contentHash":"h","evidenceKind":"measuredSyntax","basis":null,"freshness":"fresh","derivedFrom":null,"receiver":"guessed"})).is_err());
     assert!(serde_json::from_value::<Coverage>(json!({"producerId":"n","language":"rust","sourceSetId":"s","documentPath":"a.rs","revisionId":"r","requested":true,"selected":true,"state":"complete","supportedRoles":["definition","call"],"observedRoles":[],"diagnostic":null,"reference":"inferred"})).is_err());
 }
@@ -182,6 +196,63 @@ fn source_body_only_changes_revision_not_stable_declaration() {
         before.revision.documents[0].content_hash,
         after.revision.documents[0].content_hash
     );
+}
+
+#[test]
+fn editing_one_document_reidentifies_only_its_own_occurrences() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        .unwrap();
+    fs::write(
+        root.path().join("a.js"),
+        "function f() { g(); if (x) { h(); } }\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("b.js"), "function g() { k(); }\n").unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let index = || {
+        index_workspace_with_native(
+            &IndexOptions::new(root.path().into()),
+            &id.record_id,
+            &cancel,
+            |_| {},
+        )
+        .unwrap()
+        .1
+    };
+    let before = index();
+    fs::write(root.path().join("b.js"), "function g() { k(); k(); }\n").unwrap();
+    let after = index();
+    assert_ne!(before.revision.id, after.revision.id);
+    let ids = |a: &baleyg::native_evidence::Artifact, path: &str| {
+        let calls = a.calls.iter().filter(|c| c.document.path == path);
+        let regions = a.control_regions.iter().filter(|r| r.document.path == path);
+        calls
+            .map(|c| c.id.clone())
+            .chain(regions.map(|r| r.id.clone()))
+            .collect::<Vec<_>>()
+    };
+    // a.js is byte-identical under the same producer and context: same occ:v2 IDs, now
+    // carried by records of the new containing revision.
+    assert_eq!(ids(&before, "a.js").len(), 3);
+    assert_eq!(ids(&before, "a.js"), ids(&after, "a.js"));
+    assert!(
+        after
+            .calls
+            .iter()
+            .all(|c| c.revision_id == after.revision.id)
+    );
+    // Only the edited document is re-identified.
+    let (old_b, new_b) = (ids(&before, "b.js"), ids(&after, "b.js"));
+    assert!(old_b.iter().all(|id| !new_b.contains(id)));
 }
 
 #[test]

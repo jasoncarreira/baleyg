@@ -35,7 +35,7 @@ const canonical = (value) => {
 };
 const hash = (domain, value) =>
   createHash("sha256")
-    .update(`baleyg.${domain}.v1\0`)
+    .update(`baleyg.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
     .update(canonical(value))
     .digest("hex");
 const orderSyntax = (a, b) =>
@@ -50,8 +50,24 @@ const orderId = (a, b) =>
   Buffer.compare(Buffer.from(canonical(a)), Buffer.from(canonical(b)));
 const sha = (value) => createHash("sha256").update(value).digest("hex");
 const syntax = (value) => `sid:v1:${hash("syntax", value).slice(0, 32)}`;
-const occurrence = (value) =>
-  `occ:v1:${hash("occurrence", value).slice(0, 32)}`;
+// Decision 0003: an occurrence binds its document bytes, the language's
+// extraction context (the native producer declares an empty inventory) and the
+// native producer descriptor; it never binds a revision.
+const extractionContext = (language) =>
+  sha(
+    "baleyg.extraction-context.v1\0" + canonical({ language, components: [] }),
+  );
+const occurrence = (
+  value,
+  { text = source, language = "javascript", version = "1" } = {},
+) =>
+  `occ:v2:${hash("occurrence", {
+    contentHash: sha(text),
+    extractionContext: extractionContext(language),
+    nativeProducerId: "native",
+    nativeProducerVersion: version,
+    ...value,
+  }).slice(0, 32)}`;
 const span = (start, end, encoding = "utf8") => ({ start, end, encoding });
 const source = "function main() { target(); }\nfunction target() {}\n";
 const doc = {
@@ -89,6 +105,50 @@ const nativeDeclaration = (ref, name, start, end, nameStart) => ({
     witness("header.name", nameStart, nameStart + name.length, name),
   ],
 });
+// Decision 0003: occurrence IDs bind the containing document's bytes. After a
+// test changes a sample's admitted source bytes or document, recompute each
+// expected call/control ID independently from its own (revision, document)
+// bytes, owner, kind and ordinal, and rewrite the references to it.
+function reidentify(s) {
+  const renamed = new Map(),
+    key = (revisionId, id) => JSON.stringify([revisionId, id]);
+  for (const [kind, rows] of [
+    ["call", s.records.calls],
+    ["control", s.records.controlRegions],
+  ])
+    for (const row of rows) {
+      const text = s.loaded.sources.get(
+        JSON.stringify([
+          row.document.sourceSetId,
+          row.revisionId,
+          row.document.path,
+        ]),
+      );
+      renamed.set(
+        key(row.revisionId, row.id),
+        occurrence(
+          { ownerSyntaxId: row.ownerSyntaxId, kind, ordinal: row.ordinal },
+          { text, language: row.document.language },
+        ),
+      );
+    }
+  const next = (revisionId, id) => renamed.get(key(revisionId, id)) ?? id;
+  for (const row of [...s.records.calls, ...s.records.controlRegions]) {
+    const old = row.id;
+    row.id = next(row.revisionId, old);
+    if (row.provenanceId === `native:${row.revisionId}:${old}`)
+      row.provenanceId = `native:${row.revisionId}:${row.id}`;
+    if (row.regionIds)
+      row.regionIds = row.regionIds.map((id) => next(row.revisionId, id));
+    if (row.parentId) row.parentId = next(row.revisionId, row.parentId);
+  }
+  if (s.ids)
+    for (const name of Object.keys(s.ids))
+      s.ids[name] = next("r1", s.ids[name]);
+  s.records.calls.sort(orderId);
+  s.records.controlRegions.sort(orderId);
+  return s;
+}
 function sample() {
   const declarations = [
     nativeDeclaration("main", "main", 0, 29, 9),
@@ -131,12 +191,13 @@ function sample() {
   const native = {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations,
     calls: [call],
     controls: [control],
     references: [reference],
   };
-  const producer = { id: "native", kind: "native", positionEncoding: "utf8" };
+  const producer = { id: "native", version: "1", kind: "native", positionEncoding: "utf8" };
   const sourceBytes = Buffer.from(source),
     contentHash = sha(sourceBytes);
   const loaded = {
@@ -179,13 +240,11 @@ function sample() {
     decl("target", 30, 50, 39, target),
   ].sort(orderSyntax);
   const callId = occurrence({
-      revisionId: "r1",
       ownerSyntaxId: main,
       kind: "call",
       ordinal: 0,
     }),
     controlId = occurrence({
-      revisionId: "r1",
       ownerSyntaxId: main,
       kind: "control",
       ordinal: 0,
@@ -233,7 +292,6 @@ test("independent measured source baseline, ownership, candidates, and native pr
   assert.equal(
     result.identityByRef.get("reference"),
     occurrence({
-      revisionId: "r1",
       ownerSyntaxId: s.ids.main,
       kind: "reference",
       ordinal: 0,
@@ -265,13 +323,11 @@ test("measured Java ordinary functions reject even with independent byte witness
       declaration: { kind: "function", name, signature: null, ordinal: 0 },
     });
   const call = occurrence({
-    revisionId: "r1",
     ownerSyntaxId: id("main"),
     kind: "call",
     ordinal: 0,
   });
   const control = occurrence({
-    revisionId: "r1",
     ownerSyntaxId: id("main"),
     kind: "control",
     ordinal: 0,
@@ -551,7 +607,7 @@ const controls = registerControls(
     {
       id: "RECORDS.MEMBERSHIP.id",
       mutate: (s) => {
-        s.records.calls[0].id = "occ:v1:" + "0".repeat(32);
+        s.records.calls[0].id = "occ:v2:" + "0".repeat(32);
         return s;
       },
       expectedAssertion: "RECORDS.MEMBERSHIP",
@@ -735,7 +791,7 @@ function shifted(encoding) {
   s.loaded.revisions.get(
     JSON.stringify(["main", "r1"]),
   ).documents[0].contentHash = sha(Buffer.from(text));
-  return s;
+  return reidentify(s);
 }
 test("UTF-8, UTF-16 and scalar positions convert independently from actual source bytes", async () => {
   for (const encoding of ["utf8", "utf16", "unicodeScalar"]) {
@@ -836,13 +892,14 @@ function lexical(language, spelling, expected) {
       native: {
         formatVersion: 1,
         producerId: "native",
+        extractionInputs: [],
         declarations: [declaration],
         calls: [],
         controls: [],
         references: [reference],
       },
       fixture: {
-        producers: [{ id: "native", kind: "native", positionEncoding: "utf8" }],
+        producers: [{ id: "native", version: "1", kind: "native", positionEncoding: "utf8" }],
       },
       sources: new Map([[JSON.stringify(["main", "r1", key.path]), data]]),
       revisions: new Map([
@@ -1043,23 +1100,22 @@ function nested() {
     header: row.header,
     provenanceId: `native:r1:${id}`,
   });
-  const cid = occurrence({
-    revisionId: "r1",
-    ownerSyntaxId: innerId,
-    kind: "call",
-    ordinal: 0,
-  });
+  const cid = occurrence(
+    { ownerSyntaxId: innerId, kind: "call", ordinal: 0 },
+    { text: data },
+  );
   const loaded = {
     native: {
       formatVersion: 1,
       producerId: "native",
+      extractionInputs: [],
       declarations: [outer, inner],
       calls: [call],
       controls: [],
       references: [],
     },
     fixture: {
-      producers: [{ id: "native", kind: "native", positionEncoding: "utf8" }],
+      producers: [{ id: "native", version: "1", kind: "native", positionEncoding: "utf8" }],
     },
     sources: new Map([[JSON.stringify(["main", "r1", key.path]), data]]),
     revisions: new Map([
@@ -1142,7 +1198,6 @@ test("control containment, parent order and region membership are source-derived
   s.loaded.native.controls.push(inner);
   s.loaded.native.calls[0].regionRefs = ["block", "inner"];
   const innerId = occurrence({
-    revisionId: "r1",
     ownerSyntaxId: s.ids.main,
     kind: "control",
     ordinal: 1,
@@ -1242,13 +1297,14 @@ test("declared sibling ordinal comes from numeric source order, never adapter or
     native: {
       formatVersion: 1,
       producerId: "native",
+      extractionInputs: [],
       declarations: rows,
       calls: [],
       controls: [],
       references: [],
     },
     fixture: {
-      producers: [{ id: "native", kind: "native", positionEncoding: "utf8" }],
+      producers: [{ id: "native", version: "1", kind: "native", positionEncoding: "utf8" }],
     },
     sources: new Map([[JSON.stringify(["main", "r1", key.path]), data]]),
     revisions: new Map([
@@ -1282,7 +1338,7 @@ test("declared sibling ordinal comes from numeric source order, never adapter or
     (e) => e.assertion === "RECORDS.ORDER" && e.field === "declarations",
   );
 });
-test("same syntax ID across revisions, but revision-local call/control/reference IDs and proof freshness", () => {
+test("identical bytes keep syntax and occurrence IDs across revisions; records and proof freshness stay revision-scoped", () => {
   const s = sample(),
     old = checkMeasurement(s.loaded, s.records),
     revised = structuredClone(s);
@@ -1306,7 +1362,7 @@ test("same syntax ID across revisions, but revision-local call/control/reference
     ],
   ]);
   const nextId = (kind, ordinal = 0) =>
-    occurrence({ revisionId: "r2", ownerSyntaxId: s.ids.main, kind, ordinal });
+    occurrence({ ownerSyntaxId: s.ids.main, kind, ordinal });
   for (const d of revised.records.declarations) {
     d.revisionId = "r2";
     d.provenanceId = `native:r2:${d.syntaxId}`;
@@ -1329,9 +1385,15 @@ test("same syntax ID across revisions, but revision-local call/control/reference
     measured.identityByRef.get("main"),
     old.identityByRef.get("main"),
   );
-  assert.notEqual(
+  // Decision 0003: same bytes, producer and context give the same occ:v2 ID;
+  // the r2 record and its proof remain r2-scoped.
+  assert.equal(
     measured.identityByRef.get("call"),
     old.identityByRef.get("call"),
+  );
+  assert.equal(
+    measured.recordByNativeRef.get("call").revisionId,
+    "r2",
   );
   assert.equal(measured.nativeProofRows[0].freshness, "possiblyStale");
 });
@@ -1380,18 +1442,14 @@ test("admitted body-only revision preserves syntax IDs and changes occurrence ID
   }
   s.records.declarations.push(...secondDeclarations);
   s.records.declarations.sort(orderSyntax);
-  const nextCallId = occurrence({
-      revisionId: "r2",
-      ownerSyntaxId: s.ids.main,
-      kind: "call",
-      ordinal: 0,
-    }),
-    nextControlId = occurrence({
-      revisionId: "r2",
-      ownerSyntaxId: s.ids.main,
-      kind: "control",
-      ordinal: 0,
-    });
+  const nextCallId = occurrence(
+      { ownerSyntaxId: s.ids.main, kind: "call", ordinal: 0 },
+      { text: next },
+    ),
+    nextControlId = occurrence(
+      { ownerSyntaxId: s.ids.main, kind: "control", ordinal: 0 },
+      { text: next },
+    );
   s.records.calls.push({
     ...s.records.calls[0],
     id: nextCallId,
@@ -1470,23 +1528,22 @@ test("document module owns top-level measured calls; only empty module may have 
       ancestors: [],
       declaration: { kind: "module", name: null, signature: null, ordinal: 0 },
     }),
-    cid = occurrence({
-      revisionId: "r1",
-      ownerSyntaxId: id,
-      kind: "call",
-      ordinal: 0,
-    });
+    cid = occurrence(
+      { ownerSyntaxId: id, kind: "call", ordinal: 0 },
+      { text: bytes },
+    );
   const loaded = {
     native: {
       formatVersion: 1,
       producerId: "native",
+      extractionInputs: [],
       declarations: [module],
       calls: [call],
       controls: [],
       references: [],
     },
     fixture: {
-      producers: [{ id: "native", kind: "native", positionEncoding: "utf8" }],
+      producers: [{ id: "native", version: "1", kind: "native", positionEncoding: "utf8" }],
     },
     sources: new Map([[JSON.stringify(["main", "r1", doc.path]), bytes]]),
     revisions: new Map([
@@ -1660,13 +1717,14 @@ function javaSignatures() {
     native: {
       formatVersion: 1,
       producerId: "native",
+      extractionInputs: [],
       declarations: [method[0], ctor[0]],
       calls: [],
       controls: [],
       references: [],
     },
     fixture: {
-      producers: [{ id: "native", kind: "native", positionEncoding: "utf8" }],
+      producers: [{ id: "native", version: "1", kind: "native", positionEncoding: "utf8" }],
     },
     sources: new Map([[JSON.stringify(["main", "r1", key.path]), data]]),
     revisions: new Map([
@@ -2002,7 +2060,6 @@ function secondCallAndControl() {
   };
   s.loaded.native.calls.push(second);
   const secondId = occurrence({
-    revisionId: "r1",
     ownerSyntaxId: s.ids.main,
     kind: "call",
     ordinal: 1,
@@ -2030,7 +2087,6 @@ function secondCallAndControl() {
   s.loaded.native.controls.push(inner);
   s.loaded.native.calls[0].regionRefs.push("inner");
   const innerId = occurrence({
-    revisionId: "r1",
     ownerSyntaxId: s.ids.main,
     kind: "control",
     ordinal: 1,
@@ -2049,7 +2105,7 @@ function secondCallAndControl() {
   });
   s.records.controlRegions.sort(orderId);
   s.records.calls.find((x) => x.ordinal === 0).regionIds.push(innerId);
-  return s;
+  return reidentify(s);
 }
 test("two source calls and two controls use independent ASCII-id storage order", async () => {
   const s = secondCallAndControl(),
@@ -2165,12 +2221,10 @@ function relocatedInner(place) {
       provenanceId: `native:r1:${id}`,
     };
   });
-  const callId = occurrence({
-    revisionId: "r1",
-    ownerSyntaxId: ids.inner,
-    kind: "call",
-    ordinal: 0,
-  });
+  const callId = occurrence(
+    { ownerSyntaxId: ids.inner, kind: "call", ordinal: 0 },
+    { text: data },
+  );
   const records = {
     declarations: rows.sort(orderSyntax),
     calls: [
@@ -2194,13 +2248,14 @@ function relocatedInner(place) {
       native: {
         formatVersion: 1,
         producerId: "native",
+        extractionInputs: [],
         declarations: [a, b, inner],
         calls: [call],
         controls: [],
         references: [],
       },
       fixture: {
-        producers: [{ id: "native", kind: "native", positionEncoding: "utf8" }],
+        producers: [{ id: "native", version: "1", kind: "native", positionEncoding: "utf8" }],
       },
       sources: new Map([[JSON.stringify(["main", "r1", doc.path]), data]]),
       revisions: new Map([
@@ -2286,18 +2341,14 @@ function insertedSibling(inserted) {
       at = start + 2;
     from = end;
     const region = `${ref}-block`,
-      controlId = occurrence({
-        revisionId: "r1",
-        ownerSyntaxId: mainId,
-        kind: "control",
-        ordinal,
-      }),
-      callId = occurrence({
-        revisionId: "r1",
-        ownerSyntaxId: mainId,
-        kind: "call",
-        ordinal,
-      });
+      controlId = occurrence(
+        { ownerSyntaxId: mainId, kind: "control", ordinal },
+        { text: data },
+      ),
+      callId = occurrence(
+        { ownerSyntaxId: mainId, kind: "call", ordinal },
+        { text: data },
+      );
     controls.push({
       ref: region,
       nativeId: null,
@@ -2366,13 +2417,14 @@ function insertedSibling(inserted) {
       native: {
         formatVersion: 1,
         producerId: "native",
+        extractionInputs: [],
         declarations: [main],
         calls,
         controls,
         references: [],
       },
       fixture: {
-        producers: [{ id: "native", kind: "native", positionEncoding: "utf8" }],
+        producers: [{ id: "native", version: "1", kind: "native", positionEncoding: "utf8" }],
       },
       sources: new Map([[JSON.stringify(["main", "r1", doc.path]), data]]),
       revisions: new Map([
@@ -2487,12 +2539,10 @@ test("source rename, document path, container, and ordinal shifts cannot retain 
   for (const kind of ["call", "control"]) {
     const key = kind === "call" ? "calls" : "controlRegions",
       record = renamed.records[key][0],
-      id = occurrence({
-        revisionId: "r1",
-        ownerSyntaxId: renamedId,
-        kind,
-        ordinal: 0,
-      });
+      id = occurrence(
+        { ownerSyntaxId: renamedId, kind, ordinal: 0 },
+        { text: data },
+      );
     record.ownerSyntaxId = renamedId;
     record.id = id;
     record.provenanceId = `native:r1:${id}`;
@@ -2543,7 +2593,6 @@ test("source rename, document path, container, and ordinal shifts cannot retain 
   for (const kind of ["call", "control"]) {
     const v = path.records[kind === "call" ? "calls" : "controlRegions"][0],
       id = occurrence({
-        revisionId: "r1",
         ownerSyntaxId: pathMain,
         kind,
         ordinal: 0,
@@ -2921,7 +2970,6 @@ function crossSnapshotOwner(axis) {
   };
   s.loaded.native.controls.push(foreignControl);
   const controlId = occurrence({
-    revisionId: foreignRevision,
     ownerSyntaxId: foreignId,
     kind: "control",
     ordinal: 0,
@@ -3045,7 +3093,6 @@ function crossRevisionOwner() {
   };
   s.loaded.native.controls.push(control);
   const id = occurrence({
-    revisionId: "r2",
     ownerSyntaxId: s.ids.main,
     kind: "control",
     ordinal: 0,
@@ -3171,7 +3218,6 @@ function foreignOwnerControl() {
   };
   s.loaded.native.controls.push(foreign);
   const id = occurrence({
-    revisionId: "r1",
     ownerSyntaxId: moduleId,
     kind: "control",
     ordinal: 0,

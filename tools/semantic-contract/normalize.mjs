@@ -6,6 +6,7 @@ import {
   assignOccurrenceOrdinals,
   headerHash,
   siblingGroupHash,
+  nativeOccurrenceContext,
 } from "./identity.mjs";
 import {
   toByteRange,
@@ -554,8 +555,14 @@ export function normalizeOccurrences(loaded, keys) {
   const ordinals = assignOccurrenceOrdinals(rows);
   for (const item of rows) {
     item.ordinal = ordinals.get(item);
+    const revision = loaded.revisions.get(
+      tuple(item.row.document.sourceSetId, item.revisionId),
+    );
+    const document = revision.documents.find(
+      (d) => encode(d.key) === encode(item.row.document),
+    );
     item.id = keys.registry.register("occurrence", {
-      revisionId: item.revisionId,
+      ...nativeOccurrenceContext(loaded.fixture, native, revision, document),
       ownerSyntaxId: item.ownerSyntaxId,
       kind: item.kind,
       ordinal: item.ordinal,
@@ -816,8 +823,14 @@ export function normalizeFixture(loaded) {
           x.revisionId === row.revisionId &&
           same(x.document, row.document),
       ) ??
-      records.calls.find((x) => x.id === occ.ids.get(row.ref)) ??
-      records.controlRegions.find((x) => x.id === occ.ids.get(row.ref));
+      records.calls.find(
+        (x) =>
+          x.id === occ.ids.get(row.ref) && x.revisionId === row.revisionId,
+      ) ??
+      records.controlRegions.find(
+        (x) =>
+          x.id === occ.ids.get(row.ref) && x.revisionId === row.revisionId,
+      );
     if (output) insert(recordMap, row.ref, output);
     const proof = nativeProof(
       row,
@@ -1084,7 +1097,9 @@ export function normalizeFixture(loaded) {
         continue;
       }
       const native = occ.referenceRows.find(
-        (x) => x.id === join.candidateIds[0],
+        (x) =>
+          x.id === join.candidateIds[0] &&
+          x.revisionId === join.anchor.revisionId,
       );
       if (!native)
         fail("NORMALIZE.REFERENCE", "anchor", "reference measurement missing");
@@ -1123,7 +1138,11 @@ export function normalizeFixture(loaded) {
       });
       resolution(value.declaredTarget, value.candidates, value.resolution);
       validate("Reference", value);
-      const referenceKey = encode([proof.producerId, value.id]);
+      const referenceKey = encode([
+        proof.producerId,
+        value.revisionId,
+        value.id,
+      ]);
       if (!referenceGroups.has(referenceKey))
         referenceGroups.set(referenceKey, []);
       referenceGroups.get(referenceKey).push({ fact, value });

@@ -23,7 +23,7 @@ function sample(spec, trail = []) {
       hash: "a".repeat(64),
       path: "src/a.js",
       syntaxId: "sid:v1:" + "a".repeat(32),
-      occurrenceId: "occ:v1:" + "a".repeat(32),
+      occurrenceId: "occ:v2:" + "a".repeat(32),
     }[spec];
   if (spec.nullable) return null;
   if (spec.either) return sample(spec.either[0], trail);

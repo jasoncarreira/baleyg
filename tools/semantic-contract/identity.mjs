@@ -1,16 +1,19 @@
 import { createHash } from "node:crypto";
 import { canonicalBytes } from "./json.mjs";
 import { validate } from "./formats.mjs";
+import { inventoryMismatch } from "./native-inventory.mjs";
 
 const domains = Object.freeze({
   syntax: "baleyg.syntax.v1\0",
-  occurrence: "baleyg.occurrence.v1\0",
+  occurrence: "baleyg.occurrence.v2\0",
+  extractionContext: "baleyg.extraction-context.v1\0",
   header: "baleyg.header.v1\0",
   siblingGroup: "baleyg.sibling-group.v1\0",
 });
 const shapes = Object.freeze({
   syntax: "SyntaxDigestInput",
   occurrence: "OccurrenceDigestInput",
+  extractionContext: "ExtractionContextInput",
   header: "HeaderDigestInput",
   siblingGroup: "SiblingGroupInput",
 });
@@ -18,6 +21,7 @@ export function digest(kind, input) {
   if (!Object.hasOwn(domains, kind))
     throw new TypeError(`IDENTITY.DOMAIN unknown ${kind}`);
   validate(shapes[kind], input);
+  if (kind === "extractionContext") checkComponents(input.components);
   return createHash("sha256")
     .update(domains[kind])
     .update(canonicalBytes(input))
@@ -51,7 +55,78 @@ export function sourceManifestHash(rows) {
 export const syntaxId = (input) =>
   `sid:v1:${digest("syntax", input).slice(0, 32)}`;
 export const occurrenceId = (input) =>
-  `occ:v1:${digest("occurrence", input).slice(0, 32)}`;
+  `occ:v2:${digest("occurrence", input).slice(0, 32)}`;
+// Decision 0003: components sort by name then hash (byte order) and are unique.
+function checkComponents(components) {
+  for (let i = 1; i < components.length; i++) {
+    const a = components[i - 1],
+      b = components[i];
+    const order =
+      Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)) ||
+      Buffer.compare(Buffer.from(a.hash), Buffer.from(b.hash));
+    if (order >= 0)
+      throw new Error(
+        "IDENTITY.EXTRACTION_CONTEXT components unsorted or duplicate",
+      );
+  }
+}
+export const extractionContext = (input) => digest("extractionContext", input);
+const contextHashFields = Object.freeze({
+  config: "configHash",
+  dependency: "dependencyHash",
+  toolchain: "toolchainHash",
+});
+// The native producer's declared inventory is authenticated before any
+// occurrence ID is minted: it must equal the trusted inventory of the admitted
+// producer version for the document's language, and every component must
+// resolve to the revision's captured digest of that kind, backed by an
+// authenticated capture.
+// An undeclared, unknown, unsorted, duplicate or unbacked component fails closed.
+export function nativeOccurrenceContext(fixture, native, revision, document) {
+  const fail = (message) => {
+    const e = new Error(
+      `IDENTITY.EXTRACTION_CONTEXT extractionInputs: ${message}`,
+    );
+    Object.assign(e, {
+      assertion: "IDENTITY.EXTRACTION_CONTEXT",
+      code: "invalidRecord",
+      field: "extractionInputs",
+    });
+    throw e;
+  };
+  const inputs = native?.extractionInputs;
+  if (!Array.isArray(inputs)) fail("native inventory not declared");
+  const producer = fixture.producers.find(
+    (x) => x.id === native.producerId && x.kind === "native",
+  );
+  if (!producer) fail("native producer descriptor not admitted");
+  const mismatch = inventoryMismatch(
+    producer.id,
+    producer.version,
+    document.key.language,
+    inputs,
+  );
+  if (mismatch) fail(mismatch);
+  const components = inputs.map((name, i) => {
+    if (!Object.hasOwn(contextHashFields, name))
+      fail(`undeclared component ${name}`);
+    if (i && Buffer.compare(Buffer.from(inputs[i - 1]), Buffer.from(name)) >= 0)
+      fail("components unsorted or duplicate");
+    const hash = revision?.[contextHashFields[name]];
+    if (!fixture.captures.some((x) => x.kind === name && x.hash === hash))
+      fail(`component ${name} lacks an authenticated capture`);
+    return { name, hash };
+  });
+  return {
+    contentHash: document.contentHash,
+    extractionContext: extractionContext({
+      language: document.key.language,
+      components,
+    }),
+    nativeProducerId: producer.id,
+    nativeProducerVersion: producer.version,
+  };
+}
 export const headerHash = (header) => digest("header", header);
 export const siblingGroupHash = (headers) =>
   digest("siblingGroup", { headers });
@@ -65,7 +140,7 @@ export function identityRegistry(hash = digest) {
     const value = hash(kind, input);
     if (!/^[0-9a-f]{64}$/.test(value))
       throw new TypeError("IDENTITY.HASH expected full lowercase SHA-256");
-    const id = `${kind === "syntax" ? "sid" : "occ"}:v1:${value.slice(0, 32)}`;
+    const id = `${kind === "syntax" ? "sid:v1" : "occ:v2"}:${value.slice(0, 32)}`;
     const canonical = canonicalBytes(input).toString("hex");
     const old = seen.get(id);
     if (old !== undefined && old !== canonical)

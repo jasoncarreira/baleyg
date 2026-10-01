@@ -5,7 +5,7 @@ import { validate } from "../formats.mjs";
 import { registerControls, runControl } from "./mutations.mjs";
 
 const sid = `sid:v1:${"a".repeat(32)}`;
-const oid = `occ:v1:${"b".repeat(32)}`;
+const oid = `occ:v2:${"b".repeat(32)}`;
 const hash = "a".repeat(64);
 const document = {
   sourceSetId: "main",

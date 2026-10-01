@@ -278,6 +278,7 @@ async function specimen(
   put("captures/native.json", {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [],
     calls: [],
     controls: [],

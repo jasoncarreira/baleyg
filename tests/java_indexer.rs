@@ -80,7 +80,7 @@ class Café {
     assert_ne!(call("use").caller, lambda.id);
     assert!(g.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
     for c in g.calls.iter().filter(|c| c.path.ends_with(".java")) {
-        assert!(c.id.starts_with("occ:v1:"));
+        assert!(c.id.starts_with("occ:v2:"));
         assert!(g.nodes.iter().any(|n| n.id == c.caller));
         assert_eq!(c.provenance.semantic, SemanticState::Unavailable);
         assert!(

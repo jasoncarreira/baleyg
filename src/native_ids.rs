@@ -1,4 +1,5 @@
-//! Canonical native syntax identity. Digest inputs never include revision or source body.
+//! Canonical native syntax and occurrence identity. Digest inputs never include revision or
+//! source body; occurrence identity binds the document's content hash instead (Decision 0003).
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::Value;
@@ -96,8 +97,14 @@ struct StableSignature {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OccurrenceInput {
-    #[serde(rename = "revisionId")]
-    revision_id: String,
+    #[serde(rename = "contentHash")]
+    content_hash: String,
+    #[serde(rename = "extractionContext")]
+    extraction_context: String,
+    #[serde(rename = "nativeProducerId")]
+    native_producer_id: String,
+    #[serde(rename = "nativeProducerVersion")]
+    native_producer_version: String,
     #[serde(rename = "ownerSyntaxId")]
     owner_syntax_id: String,
     kind: String,
@@ -209,10 +216,33 @@ fn validate_stable(value: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn check_hash(s: &str) -> Result<()> {
+    ensure!(
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid native identity hash"
+    );
+    Ok(())
+}
 fn validate_occurrence(value: &Value) -> Result<()> {
-    exact_keys(value, &["revisionId", "ownerSyntaxId", "kind", "ordinal"])?;
+    exact_keys(
+        value,
+        &[
+            "contentHash",
+            "extractionContext",
+            "nativeProducerId",
+            "nativeProducerVersion",
+            "ownerSyntaxId",
+            "kind",
+            "ordinal",
+        ],
+    )?;
     let input: OccurrenceInput = serde_json::from_value(value.clone())?;
-    check_text(&input.revision_id)?;
+    check_hash(&input.content_hash)?;
+    check_hash(&input.extraction_context)?;
+    check_text(&input.native_producer_id)?;
+    check_text(&input.native_producer_version)?;
     ensure!(
         input.owner_syntax_id.len() == 39
             && input.owner_syntax_id.starts_with("sid:v1:")
@@ -254,6 +284,34 @@ impl IdentityRegistry {
     }
     pub fn occurrence(&mut self, input: &Value) -> Result<String> {
         validate_occurrence(input)?;
-        self.register(b"baleyg.occurrence.v1\0", input, "occ:v1:")
+        self.register(b"baleyg.occurrence.v2\0", input, "occ:v2:")
     }
+}
+
+/// Decision 0003 extraction context: the full SHA-256 over
+/// `baleyg.extraction-context.v1\0` and canonical `{language,components}`.
+/// Components must already be sorted by name then hash and unique.
+pub fn extraction_context(language: &str, components: &[(String, String)]) -> Result<String> {
+    ensure!(
+        matches!(language, "java" | "rust" | "python" | "javascript"),
+        "invalid extraction-context language"
+    );
+    for (name, hash) in components {
+        check_text(name)?;
+        check_hash(hash)?;
+    }
+    ensure!(
+        components.windows(2).all(|w| {
+            (w[0].0.as_bytes(), w[0].1.as_bytes()) < (w[1].0.as_bytes(), w[1].1.as_bytes())
+        }),
+        "unsorted or duplicate extraction-context components"
+    );
+    let components: Vec<Value> = components
+        .iter()
+        .map(|(name, hash)| serde_json::json!({"name":name,"hash":hash}))
+        .collect();
+    Ok(digest(
+        b"baleyg.extraction-context.v1\0",
+        &canonical(&serde_json::json!({"language":language,"components":components})),
+    ))
 }

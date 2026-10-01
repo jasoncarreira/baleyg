@@ -115,7 +115,7 @@ fn configured() { opaque!(not_a_call()); let c = || separate(); after(); }
         .unwrap();
     assert_ne!(separate.caller, after.caller);
     assert!(g.calls.iter().filter(|c| c.path == "lib.rs").all(
-        |c| c.id.starts_with("occ:v1:") && c.provenance.semantic == SemanticState::Unavailable
+        |c| c.id.starts_with("occ:v2:") && c.provenance.semantic == SemanticState::Unavailable
     ));
     assert!(g.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
 }
@@ -187,7 +187,9 @@ fn cargo_hash_inputs_and_fresh_scip_do_not_resolve_rust() {
     let stale = run(&o);
     assert_eq!(stale.stats.semantic_state, SemanticState::Unavailable);
     assert_eq!(stale.calls.len(), g.calls.len());
-    assert_ne!(stale.calls[0].id, g.calls[0].id);
+    // Cargo inputs change the revision, not the native extraction context (Decision 0003),
+    // so unchanged documents keep their occ:v2 IDs.
+    assert_eq!(stale.calls[0].id, g.calls[0].id);
 }
 
 #[test]

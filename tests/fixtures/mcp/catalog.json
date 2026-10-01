@@ -2173,7 +2173,7 @@
         },
         "OccurrenceId": {
           "type": "string",
-          "pattern": "^occ:v1:[0-9a-f]{32}$"
+          "pattern": "^occ:v2:[0-9a-f]{32}$"
         },
         "Parameter": {
           "type": "object",

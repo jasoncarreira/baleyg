@@ -119,6 +119,7 @@ async function writeJavaCorpus(
   const native = {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: decls,
     calls,
     controls: [],

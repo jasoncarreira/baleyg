@@ -462,7 +462,7 @@ export function checkJoins(loaded, records, coverage, measurement) {
     roles(value, row.document.language, callee, declarationSite);
     resolution(value);
     validate("Reference", value);
-    const group = key([proof.producerId, value.id]);
+    const group = key([proof.producerId, value.revisionId, value.id]);
     if (!referenceClaims.has(group)) referenceClaims.set(group, []);
     referenceClaims.get(group).push({ factRef: fact.ref, value });
   }
