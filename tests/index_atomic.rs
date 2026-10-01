@@ -1162,8 +1162,8 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(mutation).unwrap();
         assert!(
-            db.changes() > 0,
-            "inventory mutation touched no rows: {mutation}"
+            db.changes() == 1,
+            "inventory mutation must touch exactly one row: {mutation}"
         );
         drop(db);
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
