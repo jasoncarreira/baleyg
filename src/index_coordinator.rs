@@ -221,8 +221,9 @@ pub(crate) fn finish_reconciled_head(
     let Ok(selected) = head.options(std::path::Path::new(store.workspace_root())) else {
         return Ok(());
     };
+    // The request root was verified by device/inode on enqueue and again on
+    // read/claim; only the persisted option fields need exact equality here.
     if head.expected.is_some()
-        || selected.workspace_root != options.workspace_root
         || selected.scip_path != options.scip_path
         || selected.manifest_path != options.manifest_path
         || selected.max_file_bytes != options.max_file_bytes
