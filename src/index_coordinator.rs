@@ -154,14 +154,20 @@ pub fn drain_requests_observed(
 }
 
 fn retryable_cli_completion_error(error: &anyhow::Error) -> bool {
-    if error.to_string().starts_with("storage_busy") {
+    // Never treat invariant failures such as "storage_busy: cached claim changed"
+    // as retryable merely because their text shares a prefix with lock contention.
+    #[cfg(test)]
+    if error.to_string() == "storage_busy: injected terminal write failure" {
         return true;
     }
     error.chain().any(|cause| {
-        matches!(cause.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::SqliteFailure(info, _))
-                if matches!(info.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+        cause
+            .downcast_ref::<crate::store::topology::StorageBusy>()
+            .is_some()
+            || matches!(cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(info, _))
+                    if matches!(info.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
     })
 }
 
@@ -742,5 +748,42 @@ mod queue_completion_retry_tests {
         );
         assert_eq!(returned.index_revision, baseline.index_revision + 4);
         assert_eq!(store.status().unwrap().revision, returned);
+    }
+    #[test]
+    fn cli_cached_claim_mismatch_fails_closed_instead_of_retrying_forever() {
+        let (_tmp, store, options, baseline, session) = fixture();
+        let q1 = store.enqueue_request(&options, None).unwrap();
+        let q2 = store.enqueue_request(&options, None).unwrap();
+        store.inject_queue_finish_failure(false);
+        let initial = drain_requests(&store, &session).unwrap_err();
+        assert!(
+            initial
+                .to_string()
+                .contains("injected terminal write failure")
+        );
+        let published = store.status().unwrap().revision;
+        assert_eq!(published.index_revision, baseline.index_revision + 1);
+        let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+        db.execute(
+            "UPDATE requests SET claim_incarnation='changed-incarnation' WHERE id=?1",
+            [&q1.id],
+        )
+        .unwrap();
+        drop(db);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = retry_cli_recorded_completion(&store, &session, &cancel, initial).unwrap_err();
+        assert!(
+            error.to_string().contains("cached claim changed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.request_by_id(&q1.id).unwrap().unwrap().state,
+            "running"
+        );
+        assert_eq!(
+            store.request_by_id(&q2.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(store.status().unwrap().revision, published);
     }
 }

@@ -785,7 +785,7 @@ fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Re
     }
 }
 #[derive(Debug)]
-struct StorageBusy;
+pub(crate) struct StorageBusy;
 impl std::fmt::Display for StorageBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("storage_busy")
