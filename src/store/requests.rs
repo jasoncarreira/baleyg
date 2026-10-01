@@ -615,7 +615,7 @@ impl Store {
         #[cfg(test)]
         if self
             .test_queue_finish_failures
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |count| (count > 0).then(|| count - 1),
@@ -647,7 +647,7 @@ impl Store {
         #[cfg(test)]
         if self
             .test_queue_post_commit_failures
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |count| (count > 0).then(|| count - 1),

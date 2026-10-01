@@ -341,7 +341,7 @@ impl DaemonState {
             #[cfg(test)]
             if self
                 .test_pending_read_failures
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                     (count > 0).then(|| count - 1)
                 })
                 .is_ok()
