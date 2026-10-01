@@ -2795,6 +2795,9 @@ impl Store {
     pub(crate) fn is_root_replaced(&self) -> bool {
         self.disposition() == RecoveryDisposition::RootReplaced
     }
+    pub(crate) fn is_ready_disposition(&self) -> bool {
+        self.disposition() == RecoveryDisposition::Ready
+    }
     pub(crate) fn is_recreate_pending(&self) -> bool {
         matches!(
             self.disposition(),

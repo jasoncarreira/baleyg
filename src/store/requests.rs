@@ -376,7 +376,7 @@ impl Store {
             self.verify_leader_session(session)?;
             // Before the first durable request, a fresh Ready index has no queue.
             // RootReplaced must never use this exception: its old ACKs may exist.
-            if !self.is_root_replaced() {
+            if self.is_ready_disposition() {
                 match fs::symlink_metadata(self.request_db_path()) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         ensure!(
@@ -705,5 +705,35 @@ mod root_failure_tests {
             .unwrap();
         assert_eq!(code, "root_changed");
         assert!(store.enqueue_request(&options, None).is_err());
+    }
+
+    #[test]
+    fn ready_leader_without_accepted_queue_skips_without_creating_db() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        assert!(!store.request_db_path().exists());
+        let owner = store.leader_session().unwrap();
+        // Acquiring the leader sets the publication fence; Ready disposition
+        // still distinguishes this fresh start from exceptional recovery.
+        assert!(store.is_ready_disposition());
+        assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 0);
+        assert!(!store.request_db_path().exists());
+    }
+
+    #[test]
+    fn exceptional_dispositions_cannot_treat_missing_queue_as_empty() {
+        for disposition in [
+            super::super::RecoveryDisposition::Rebuild,
+            super::super::RecoveryDisposition::RecreatePending,
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+            let owner = store.leader_session().unwrap();
+            store.mark_recovery(disposition);
+            assert!(store.fail_changed_root_requests(&owner).is_err());
+            assert!(!store.request_db_path().exists());
+        }
     }
 }
