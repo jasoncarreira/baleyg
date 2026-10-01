@@ -365,6 +365,12 @@ impl DaemonState {
         drop(pending);
         #[cfg(test)]
         self.test_queue_after_pending_snapshot.run();
+        if self.store.is_recreate_pending() && !pending_local && !self.store.is_root_replaced() {
+            // Admission can follow an empty snapshot before an old-leader drain.
+            // A corrupt-index request must wait for the next exceptional tick;
+            // RootReplaced still has to fail old-root durable requests below.
+            return Ok(());
+        }
         if self.store.is_recreate_pending() && pending_local {
             // The native stream excludes the tick while the old owner is removed.
             // No retained SH guard may enter the nonblocking EX attempt.
