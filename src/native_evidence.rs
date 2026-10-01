@@ -27,7 +27,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 const PRODUCER: &str = "baleyg.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v3";
+pub(crate) const NATIVE_VERSION: &str = "native-v4";
 /// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
 /// descriptor `(id, version)` and language. `extract` measures one document from only its own
 /// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
@@ -60,29 +60,48 @@ fn native_extraction_context(
         .and_then(|(_, _, languages)| languages.iter().find(|(l, _)| *l == language))
         .map(|(_, inventory)| *inventory)
         .context("undeclared native extraction-input inventory")?;
-    authenticated_extraction_context(language, inventory, revision)
+    // The v4 parser reads no external component: all grammars and normalization tables are
+    // fixed in this executable. Other captured inputs affect revision admission, not syntax.
+    authenticated_extraction_context(language, inventory, &[], revision)
 }
 fn authenticated_extraction_context(
     language: &str,
     inventory: &[&str],
+    observed: &[(&str, Option<&[u8]>)],
     revision: &Revision,
 ) -> Result<String> {
-    let mut components = inventory
-        .iter()
-        .map(|name| {
-            let hash = match *name {
-                "toolchain" => &revision.toolchain_hash,
-                "config" => &revision.config_hash,
-                "dependency" => &revision.dependency_hash,
-                _ => anyhow::bail!("undeclared native extraction component: {name}"),
-            };
-            ensure!(
-                valid_hash(hash),
-                "unauthenticated native extraction component: {name}"
-            );
-            Ok(((*name).to_owned(), hash.clone()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut declared = BTreeSet::new();
+    for name in inventory {
+        ensure!(
+            matches!(*name, "toolchain" | "config" | "dependency") && declared.insert(*name),
+            "unsupported or duplicate native extraction component: {name}"
+        );
+    }
+    let mut captured = BTreeMap::new();
+    for (name, bytes) in observed {
+        ensure!(
+            declared.contains(name) && captured.insert(*name, *bytes).is_none(),
+            "undeclared or duplicate captured native extraction component: {name}"
+        );
+    }
+    let mut components = Vec::with_capacity(inventory.len());
+    for name in inventory {
+        let bytes = captured
+            .get(name)
+            .context("absent native extraction component capture")?
+            .context("absent native extraction component bytes")?;
+        let expected = match *name {
+            "toolchain" => &revision.toolchain_hash,
+            "config" => &revision.config_hash,
+            "dependency" => &revision.dependency_hash,
+            _ => unreachable!(),
+        };
+        ensure!(
+            valid_hash(expected) && hash(bytes) == *expected,
+            "mismatched native extraction component: {name}"
+        );
+        components.push(((*name).to_owned(), expected.clone()));
+    }
     components.sort();
     extraction_context(language, &components)
 }
@@ -804,6 +823,10 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
     // Occurrence identity binds this captured document version. Authenticate its content hash
     // and extraction context against the captured revision before measuring, so a failed
     // precondition mints no occ:v2 record at all.
+    ensure!(
+        f.hash == hash(f.text.as_bytes()),
+        "native captured source hash mismatch"
+    );
     ensure!(
         a.revision
             .documents
@@ -1634,19 +1657,58 @@ mod occurrence_identity_tests {
         }
         // An undeclared producer version (e.g. the withdrawn occ:v1 producer) or language has
         // no authenticated inventory, so it fails closed.
-        for version in ["native-v2", "native-v4"] {
+        for version in ["native-v2", "native-v3"] {
             assert!(native_extraction_context(&producer(version), "rust", &revision).is_err());
         }
         assert!(native_extraction_context(&producer(NATIVE_VERSION), "go", &revision).is_err());
-        // A declared component resolves only to its captured revision digest.
+        let mut captured = revision.clone();
+        captured.config_hash = hash(b"captured config");
         assert_eq!(
-            authenticated_extraction_context("rust", &["config"], &revision).unwrap(),
-            extraction_context("rust", &[("config".into(), revision.config_hash.clone())]).unwrap()
+            authenticated_extraction_context(
+                "rust",
+                &["config"],
+                &[("config", Some(b"captured config"))],
+                &captured,
+            )
+            .unwrap(),
+            extraction_context("rust", &[("config".into(), captured.config_hash.clone())]).unwrap()
         );
-        assert!(authenticated_extraction_context("rust", &["settings"], &revision).is_err());
-        let mut unauthenticated = revision.clone();
-        unauthenticated.config_hash = "not-a-captured-digest".into();
-        assert!(authenticated_extraction_context("rust", &["config"], &unauthenticated).is_err());
+        for (inventory, observed) in [
+            (vec!["config"], vec![]),
+            (vec!["config"], vec![("config", None)]),
+            (
+                vec!["config"],
+                vec![("config", Some(b"stale config".as_slice()))],
+            ),
+            (
+                vec![],
+                vec![("config", Some(b"captured config".as_slice()))],
+            ),
+            (
+                vec!["settings"],
+                vec![("settings", Some(b"captured config".as_slice()))],
+            ),
+            (
+                vec!["config", "config"],
+                vec![("config", Some(b"captured config".as_slice()))],
+            ),
+        ] {
+            assert!(
+                authenticated_extraction_context("rust", &inventory, &observed, &captured).is_err(),
+                "{inventory:?} {observed:?}"
+            );
+        }
+        let mut forged_digest = captured.clone();
+        forged_digest.config_hash = "not-a-captured-digest".into();
+        assert!(
+            authenticated_extraction_context(
+                "rust",
+                &["config"],
+                &[("config", Some(b"captured config"))],
+                &forged_digest,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1658,6 +1720,9 @@ mod occurrence_identity_tests {
         let mut artifact = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
         artifact.calls.clear();
         artifact.control_regions.clear();
+        assert!(extract(&mut artifact, &forged, &mut IdentityRegistry::default()).is_err());
+        forged = source.clone();
+        forged.text.push_str(" // changed after admission");
         assert!(extract(&mut artifact, &forged, &mut IdentityRegistry::default()).is_err());
         assert!(artifact.calls.is_empty() && artifact.control_regions.is_empty());
     }
