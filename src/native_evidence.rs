@@ -2,7 +2,7 @@
 use crate::{
     capture::Capture,
     model::{CancelFlag, SourceFile},
-    native_ids::{IdentityRegistry, canonical, digest},
+    native_ids::{IdentityRegistry, canonical, digest, extraction_context},
 };
 use anyhow::{Context, Result, ensure};
 use icu_normalizer::ComposingNormalizerBorrowed;
@@ -25,6 +25,67 @@ where
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 const PRODUCER: &str = "baleyg.native.syntax";
+/// Native producer descriptor version. Any change that can alter a native measured field or
+/// projection, or that starts reading another input, must change it (Decision 0003).
+pub(crate) const NATIVE_VERSION: &str = "native-v3";
+/// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
+/// descriptor `(id, version)` and language. `extract` measures one document from only its own
+/// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
+/// are compiled into the executable and fixed by `NATIVE_VERSION`. It reads no configuration,
+/// toolchain or dependency capture, and no other source document, so every language declares
+/// the explicit empty inventory. An unlisted descriptor or language has no declaration.
+type LanguageInventory = (&'static str, &'static [&'static str]);
+const EXTRACTION_INPUTS: &[(&str, &str, &[LanguageInventory])] = &[(
+    PRODUCER,
+    NATIVE_VERSION,
+    &[
+        ("java", &[]),
+        ("rust", &[]),
+        ("python", &[]),
+        ("javascript", &[]),
+    ],
+)];
+/// Authenticate the declared inventory of `producer` for `language` against the captured
+/// revision and derive the document's extraction context. This is the fail-closed
+/// precondition for minting any `occ:v2` ID: an undeclared descriptor/language or a declared
+/// component without a valid captured revision digest refuses, and nothing is minted.
+fn native_extraction_context(
+    producer: &Producer,
+    language: &str,
+    revision: &Revision,
+) -> Result<String> {
+    let inventory = EXTRACTION_INPUTS
+        .iter()
+        .find(|(id, version, _)| *id == producer.id && *version == producer.version)
+        .and_then(|(_, _, languages)| languages.iter().find(|(l, _)| *l == language))
+        .map(|(_, inventory)| *inventory)
+        .context("undeclared native extraction-input inventory")?;
+    authenticated_extraction_context(language, inventory, revision)
+}
+fn authenticated_extraction_context(
+    language: &str,
+    inventory: &[&str],
+    revision: &Revision,
+) -> Result<String> {
+    let mut components = inventory
+        .iter()
+        .map(|name| {
+            let hash = match *name {
+                "toolchain" => &revision.toolchain_hash,
+                "config" => &revision.config_hash,
+                "dependency" => &revision.dependency_hash,
+                _ => anyhow::bail!("undeclared native extraction component: {name}"),
+            };
+            ensure!(
+                valid_hash(hash),
+                "unauthenticated native extraction component: {name}"
+            );
+            Ok(((*name).to_owned(), hash.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    components.sort();
+    extraction_context(language, &components)
+}
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -317,7 +378,7 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
         .to_owned();
     let producer = Producer {
         id: PRODUCER.into(),
-        version: "native-v2".into(),
+        version: NATIVE_VERSION.into(),
         executable_hash: executable_hash.clone(),
         kind: "native".into(),
         languages: LANGUAGES.map(str::to_owned).into(),
@@ -735,9 +796,26 @@ pub(crate) fn selected_source_witness(
     Ok(artifact)
 }
 
+/// Measure exactly one document. Under `occ:v2` this is strictly document-local: it reads only
+/// `f` and the producer/source-set/revision descriptors, never another source document.
 fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Result<()> {
     language_order(&f.language)?;
     safe_path(&f.path)?;
+    // Occurrence identity binds this captured document version. Authenticate its content hash
+    // and extraction context against the captured revision before measuring, so a failed
+    // precondition mints no occ:v2 record at all.
+    ensure!(
+        a.revision
+            .documents
+            .iter()
+            .any(|d| d.key.source_set_id == a.source_set.id
+                && d.key.language == f.language
+                && d.key.path == f.path
+                && d.content_hash == f.hash
+                && d.byte_length == f.text.len()),
+        "native document not in captured revision"
+    );
+    let extraction_context = native_extraction_context(&a.producer, &f.language, &a.revision)?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&match f.language.as_str() {
         "java" => tree_sitter_java::LANGUAGE.into(),
@@ -806,6 +884,7 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         ids,
         document: key,
         proof_id,
+        extraction_context,
         seen: BTreeSet::new(),
         visits: 0,
         opaque_rust: false,
@@ -858,17 +937,40 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
     });
     Ok(())
 }
+/// Decision 0003 `occ:v2` input: document version, extraction context and native producer
+/// descriptor, never the containing revision.
+fn occurrence_input(
+    content_hash: &str,
+    extraction_context: &str,
+    producer: &Producer,
+    owner: &str,
+    kind: &str,
+    ordinal: usize,
+) -> Value {
+    json!({"contentHash":content_hash,"extractionContext":extraction_context,"nativeProducerId":producer.id,"nativeProducerVersion":producer.version,"ownerSyntaxId":owner,"kind":kind,"ordinal":ordinal})
+}
 struct ParserState<'a> {
     artifact: &'a mut Artifact,
     file: &'a SourceFile,
     ids: &'a mut IdentityRegistry,
     document: DocumentKey,
     proof_id: String,
+    extraction_context: String,
     seen: BTreeSet<(String, String, usize, usize)>,
     visits: usize,
     opaque_rust: bool,
 }
 impl ParserState<'_> {
+    fn occurrence_input(&self, owner: &str, kind: &str, ordinal: usize) -> Value {
+        occurrence_input(
+            &self.file.hash,
+            &self.extraction_context,
+            &self.artifact.producer,
+            owner,
+            kind,
+            ordinal,
+        )
+    }
     fn finish_occurrences(&mut self) -> Result<()> {
         let mut replacements = BTreeMap::new();
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -886,8 +988,13 @@ impl ParserState<'_> {
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
+                let input = self.occurrence_input(
+                    &self.artifact.control_regions[*i].owner_syntax_id,
+                    "control",
+                    ordinal,
+                );
+                let id = self.ids.occurrence(&input)?;
                 let region = &mut self.artifact.control_regions[*i];
-                let id=self.ids.occurrence(&json!({"revisionId":region.revision_id,"ownerSyntaxId":region.owner_syntax_id,"kind":"control","ordinal":ordinal}))?;
                 replacements.insert(std::mem::replace(&mut region.id, id.clone()), id);
                 region.ordinal = ordinal;
             }
@@ -917,9 +1024,15 @@ impl ParserState<'_> {
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
+                let input = self.occurrence_input(
+                    &self.artifact.calls[*i].owner_syntax_id,
+                    "call",
+                    ordinal,
+                );
+                let id = self.ids.occurrence(&input)?;
                 let call = &mut self.artifact.calls[*i];
                 call.ordinal = ordinal;
-                call.id=self.ids.occurrence(&json!({"revisionId":call.revision_id,"ownerSyntaxId":call.owner_syntax_id,"kind":"call","ordinal":ordinal}))?;
+                call.id = id;
                 for region in &mut call.region_ids {
                     *region = replacements
                         .get(region)
@@ -1110,7 +1223,7 @@ impl Artifact {
         ensure!(
             self.producer.id == PRODUCER
                 && self.producer.kind == "native"
-                && self.producer.version == "native-v2"
+                && self.producer.version == NATIVE_VERSION
                 && self.producer.position_encoding == "utf8"
                 && valid_hash(&self.producer.executable_hash),
             "invalid native producer"
@@ -1379,7 +1492,19 @@ impl Artifact {
             if let Some(s) = &c.spelling {
                 text(s)?;
             }
-            ensure!(c.id==occurrence.occurrence(&json!({"revisionId":self.revision.id,"ownerSyntaxId":c.owner_syntax_id,"kind":"call","ordinal":c.ordinal}))?,"native call occurrence mismatch");
+            let context =
+                native_extraction_context(&self.producer, &c.document.language, &self.revision)?;
+            ensure!(
+                c.id == occurrence.occurrence(&occurrence_input(
+                    &file.hash,
+                    &context,
+                    &self.producer,
+                    &c.owner_syntax_id,
+                    "call",
+                    c.ordinal
+                ))?,
+                "native call occurrence mismatch"
+            );
         }
         let mut regions = BTreeMap::new();
         for region in &self.control_regions {
@@ -1396,7 +1521,24 @@ impl Artifact {
                 "native control ownership"
             );
             span(&file.text, &region.range, false)?;
-            ensure!(region.id==occurrence.occurrence(&json!({"revisionId":self.revision.id,"ownerSyntaxId":region.owner_syntax_id,"kind":"control","ordinal":region.ordinal}))? && regions.insert(region.id.clone(),region).is_none(),"native control occurrence mismatch");
+            let context = native_extraction_context(
+                &self.producer,
+                &region.document.language,
+                &self.revision,
+            )?;
+            ensure!(
+                region.id
+                    == occurrence.occurrence(&occurrence_input(
+                        &file.hash,
+                        &context,
+                        &self.producer,
+                        &region.owner_syntax_id,
+                        "control",
+                        region.ordinal
+                    ))?
+                    && regions.insert(region.id.clone(), region).is_none(),
+                "native control occurrence mismatch"
+            );
         }
         for region in &self.control_regions {
             if let Some(parent) = &region.parent_id {
@@ -1426,6 +1568,131 @@ impl Artifact {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod occurrence_identity_tests {
+    use super::*;
+
+    fn producer(version: &str) -> Producer {
+        Producer {
+            id: PRODUCER.into(),
+            version: version.into(),
+            executable_hash: "e".repeat(64),
+            kind: "native".into(),
+            languages: LANGUAGES.map(str::to_owned).into(),
+            position_encoding: "utf8".into(),
+        }
+    }
+    fn selected(file: &SourceFile, revision_id: &str, version: &str) -> Result<Artifact> {
+        let source_set = SourceSet {
+            id: "source-set:v1:root".into(),
+            root_id: "root".into(),
+            languages: LANGUAGES.map(str::to_owned).into(),
+            dependencies: vec![],
+        };
+        let key = DocumentKey {
+            source_set_id: source_set.id.clone(),
+            language: file.language.clone(),
+            path: file.path.clone(),
+        };
+        let revision = Revision {
+            id: revision_id.into(),
+            source_set_id: source_set.id.clone(),
+            documents: vec![Document {
+                key,
+                revision_id: revision_id.into(),
+                content_hash: file.hash.clone(),
+                byte_length: file.text.len(),
+            }],
+            toolchain_hash: "1".repeat(64),
+            config_hash: hash(revision_id.as_bytes()),
+            dependency_hash: "3".repeat(64),
+        };
+        selected_source_witness(file, producer(version), source_set, revision)
+    }
+    fn file(text: &str) -> SourceFile {
+        SourceFile {
+            path: "a.js".into(),
+            hash: hash(text.as_bytes()),
+            language: "javascript".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn native_producer_declares_and_authenticates_an_explicit_empty_inventory() {
+        let revision = selected(&file("f();"), "revision:v1:r1", NATIVE_VERSION)
+            .unwrap()
+            .revision;
+        for language in LANGUAGES {
+            assert_eq!(
+                native_extraction_context(&producer(NATIVE_VERSION), language, &revision).unwrap(),
+                extraction_context(language, &[]).unwrap()
+            );
+        }
+        // An undeclared producer version (e.g. the withdrawn occ:v1 producer) or language has
+        // no authenticated inventory, so it fails closed.
+        for version in ["native-v2", "native-v4"] {
+            assert!(native_extraction_context(&producer(version), "rust", &revision).is_err());
+        }
+        assert!(native_extraction_context(&producer(NATIVE_VERSION), "go", &revision).is_err());
+        // A declared component resolves only to its captured revision digest.
+        assert_eq!(
+            authenticated_extraction_context("rust", &["config"], &revision).unwrap(),
+            extraction_context("rust", &[("config".into(), revision.config_hash.clone())]).unwrap()
+        );
+        assert!(authenticated_extraction_context("rust", &["settings"], &revision).is_err());
+        let mut unauthenticated = revision.clone();
+        unauthenticated.config_hash = "not-a-captured-digest".into();
+        assert!(authenticated_extraction_context("rust", &["config"], &unauthenticated).is_err());
+    }
+
+    #[test]
+    fn failed_precondition_mints_no_occurrence() {
+        let source = file("function f() { g(); if (x) { h(); } }");
+        assert!(selected(&source, "revision:v1:r1", "native-v2").is_err());
+        let mut forged = source.clone();
+        forged.hash = "0".repeat(64);
+        let mut artifact = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
+        artifact.calls.clear();
+        artifact.control_regions.clear();
+        assert!(extract(&mut artifact, &forged, &mut IdentityRegistry::default()).is_err());
+        assert!(artifact.calls.is_empty() && artifact.control_regions.is_empty());
+    }
+
+    #[test]
+    fn document_version_keeps_occurrence_ids_across_revisions() {
+        let source = file("function f() { g(); if (x) { h(); } }");
+        let r1 = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
+        let r2 = selected(&source, "revision:v1:r2", NATIVE_VERSION).unwrap();
+        assert_eq!(r1.calls.len(), 2);
+        assert_eq!(r1.control_regions.len(), 1);
+        for (a, b) in r1.calls.iter().zip(&r2.calls) {
+            assert!(a.id.starts_with("occ:v2:"));
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.region_ids, b.region_ids);
+            assert_eq!(
+                (a.revision_id.as_str(), b.revision_id.as_str()),
+                ("revision:v1:r1", "revision:v1:r2")
+            );
+        }
+        assert_eq!(r1.control_regions[0].id, r2.control_regions[0].id);
+        assert_ne!(r1.provenance[0].id, r2.provenance[0].id);
+        let edited = selected(
+            &file("function f() { g(); if (x) { h(); } } "),
+            "revision:v1:r2",
+            NATIVE_VERSION,
+        )
+        .unwrap();
+        assert!(
+            r1.calls
+                .iter()
+                .zip(&edited.calls)
+                .all(|(a, b)| a.id != b.id)
+        );
+        assert_ne!(r1.control_regions[0].id, edited.control_regions[0].id);
     }
 }
 

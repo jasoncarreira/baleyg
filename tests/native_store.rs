@@ -559,6 +559,61 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
     assert!(store.native_source_at(pin, &key).is_err());
 }
 
+#[test]
+fn index_from_another_native_producer_version_is_rebuilt_not_served() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let first = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    drop(leader);
+    drop(store);
+    // An index persisted by the withdrawn occ:v1 producer: its occurrence IDs cannot be
+    // reproduced by this binary's occ:v2 derivation.
+    let path = published_db(state.path(), root.path());
+    let db = Connection::open(&path).unwrap();
+    db.execute("UPDATE native_producers SET version='native-v2'", [])
+        .unwrap();
+    drop(db);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(store.index_baseline().unwrap(), first);
+    let leader = store.leader().unwrap();
+    for error in [
+        store.status().map(|_| ()).unwrap_err(),
+        store.graph().map(|_| ()).unwrap_err(),
+        store
+            .native_declarations_at(first, "javascript", "hello")
+            .map(|_| ())
+            .unwrap_err(),
+    ] {
+        assert!(
+            error.to_string().contains("incompatible_index"),
+            "{error:#}"
+        );
+    }
+    let pin = publish(&store, root.path(), &cancel, first, &leader).unwrap();
+    assert_ne!(pin.index_generation, first.index_generation);
+    assert_eq!(store.status().unwrap().revision, pin);
+    let db = Connection::open(&path).unwrap();
+    let version: String = db
+        .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, "native-v3");
+    let calls: Vec<String> = db
+        .prepare("SELECT id FROM native_calls")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(!calls.is_empty() && calls.iter().all(|id| id.starts_with("occ:v2:")));
+}
+
 fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::PathBuf {
     state
         .join("cache/indexes")

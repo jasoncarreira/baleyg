@@ -117,3 +117,117 @@ fn every_normative_stable_id_vector() {
         ])
     );
 }
+
+/// Backticked cells of each table row in the Decision 0003 `occ:v2` vector section.
+type ContextRow = (String, String);
+type OccurrenceRow = (String, String, String);
+fn occurrence_v2_rows() -> (Vec<ContextRow>, Vec<OccurrenceRow>) {
+    let doc = include_str!("../docs/semantic-evidence/publication-rejoin-vectors-v1.md");
+    let section = &doc[doc
+        .find(r#"<a id="occurrence-identity-v2-decision-0003"></a>"#)
+        .unwrap()..];
+    let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+    let (mut contexts, mut occurrences) = (vec![], vec![]);
+    for line in section.lines().filter(|l| l.starts_with("| ")) {
+        // Labels may hold backticked text too; the vector cells start at the canonical input.
+        let ticks: Vec<&str> = line
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .skip_while(|t| !t.starts_with('{'))
+            .collect();
+        match ticks.as_slice() {
+            [input, full] if input.starts_with("{\"components\"") => {
+                contexts.push((input.to_string(), full.to_string()))
+            }
+            [input, full, id] if input.starts_with("{\"contentHash\"") => {
+                occurrences.push((input.to_string(), full.to_string(), id.to_string()))
+            }
+            _ => {}
+        }
+    }
+    (contexts, occurrences)
+}
+
+#[test]
+fn every_decision_0003_extraction_context_and_occurrence_vector() {
+    let (contexts, occurrences) = occurrence_v2_rows();
+    assert_eq!((contexts.len(), occurrences.len()), (2, 4));
+    // The authenticated config capture and the hypothetical control capture.
+    let config = [
+        hex::encode(Sha256::digest(b"config-v1")),
+        hex::encode(Sha256::digest(b"config-v2")),
+    ];
+    assert_eq!(
+        config[0],
+        "e3155b20e134632816c8611c4e9ee5cbd0e00689f7c4c955ee9f896580d02fdb"
+    );
+    for ((text, full), capture) in contexts.iter().zip(&config) {
+        let input: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(input["components"][0]["hash"], json!(capture));
+        let bytes = encode(&input);
+        assert_eq!(bytes, text.as_bytes(), "canonical context bytes");
+        assert_eq!(baleyg::native_ids::canonical(&input), bytes);
+        let digest = Sha256::digest(
+            [
+                b"baleyg.extraction-context.v1\0".as_slice(),
+                bytes.as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(&hex::encode(digest), full);
+        let components = vec![("config".to_owned(), capture.clone())];
+        assert_eq!(
+            &baleyg::native_ids::extraction_context("javascript", &components).unwrap(),
+            full
+        );
+    }
+    let mut production = baleyg::native_ids::IdentityRegistry::default();
+    let mut ids = vec![];
+    for (text, full, id) in &occurrences {
+        let input: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            contexts
+                .iter()
+                .any(|(_, c)| input["extractionContext"] == json!(c))
+        );
+        let bytes = encode(&input);
+        assert_eq!(bytes, text.as_bytes(), "canonical occurrence bytes");
+        assert_eq!(baleyg::native_ids::canonical(&input), bytes);
+        let digest = hex::encode(Sha256::digest(
+            [b"baleyg.occurrence.v2\0".as_slice(), bytes.as_slice()].concat(),
+        ));
+        assert_eq!(&digest, full);
+        assert_eq!(id, &format!("occ:v2:{}", &digest[..32]));
+        assert_eq!(&production.occurrence(&input).unwrap(), id);
+        ids.push(id.clone());
+        // The withdrawn revision-bound v1 form of the same owner/kind/ordinal is refused by
+        // production, and its v1 digest never equals any v2 digest or ID.
+        for revision in ["r1", "r2"] {
+            let v1 = json!({"revisionId":revision,"ownerSyntaxId":input["ownerSyntaxId"],
+                "kind":input["kind"],"ordinal":input["ordinal"]});
+            assert!(production.occurrence(&v1).is_err());
+            let v1_digest = hex::encode(Sha256::digest(
+                [b"baleyg.occurrence.v1\0".as_slice(), encode(&v1).as_slice()].concat(),
+            ));
+            assert!(
+                occurrences
+                    .iter()
+                    .all(|(_, f, v2)| f != &v1_digest && v2[7..] != v1_digest[..32])
+            );
+        }
+    }
+    // Equal-ID rows differ only by kind; both controls change the call ID.
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 4);
+    // The decision's reproduction check of the withdrawn v1 r1/call digest.
+    let v1_call = json!({"revisionId":"r1","ownerSyntaxId":"sid:v1:6cce6099437ddb2256f7ae368d29c0b5","kind":"call","ordinal":0});
+    let v1_digest = hex::encode(Sha256::digest(
+        [
+            b"baleyg.occurrence.v1\0".as_slice(),
+            encode(&v1_call).as_slice(),
+        ]
+        .concat(),
+    ));
+    assert!(v1_digest.starts_with("ccc4d599"), "{v1_digest}");
+}
