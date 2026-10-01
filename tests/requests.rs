@@ -203,3 +203,84 @@ fn hot_journal_rolls_back_before_queue_identity_and_ack() {
     assert_eq!(original.options_json, accepted.options_json);
     assert_eq!(original.state, "queued");
 }
+
+#[test]
+fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let options = IndexOptions::new(root.clone());
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let owner = store.leader_session().unwrap();
+    assert_eq!(store.claim_request(&owner).unwrap().unwrap().id, first.id);
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 2);
+    assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 0);
+    let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+    for id in [first.id, second.id] {
+        let (state, code, finished): (String, String, String) = db
+            .query_row(
+                "SELECT state,error_code,finished_at FROM requests WHERE id=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((state.as_str(), code.as_str()), ("failed", "root_changed"));
+        assert!(!finished.is_empty());
+    }
+    assert!(store.claim_request(&owner).is_err());
+}
+
+#[test]
+fn replacement_root_can_accept_while_old_holder_is_live_then_recover_index_only() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function oldName() {}\n").unwrap();
+    let old = Store::open_for_tests(state.path(), &root).unwrap();
+    let first = old
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    let old_owner = old.leader_session().unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function newName() {}\n").unwrap();
+    let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+    assert!(replacement.status().is_err());
+    let options = IndexOptions::new(root.clone());
+    let second = replacement.enqueue_request(&options, None).unwrap();
+    assert_ne!(first.root_inode, second.root_inode);
+    assert!(
+        replacement.leader_session().is_err(),
+        "old holder still fences new work"
+    );
+    assert_eq!(old.fail_changed_root_requests(&old_owner).unwrap(), 1);
+    drop(old_owner);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (pin, session) =
+        baleyg::index_coordinator::enqueue_and_wait(&replacement, &options, &cancel).unwrap();
+    assert!(session.is_leader());
+    assert_eq!(
+        replacement
+            .request_by_id(&second.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "done"
+    );
+    assert_eq!(replacement.status().unwrap().revision, pin);
+    let db = rusqlite::Connection::open(replacement.request_db_path()).unwrap();
+    let code: String = db
+        .query_row(
+            "SELECT error_code FROM requests WHERE id=?1",
+            [&first.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(code, "root_changed");
+}

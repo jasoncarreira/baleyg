@@ -347,7 +347,32 @@ impl DaemonState {
         });
         let pending_local = !pending.is_empty();
         drop(pending);
+        if self.store.is_recreate_pending() && pending_local {
+            // The native stream excludes the tick while the old owner is removed.
+            // No retained SH guard may enter the nonblocking EX attempt.
+            drop(self.serving_session.lock().unwrap().take());
+            match self
+                .store
+                .recreate_pending_leader_session(&self.options, &Arc::new(AtomicBool::new(false)))
+            {
+                Ok((_, session)) => {
+                    self.store.fail_changed_root_requests(&session)?;
+                    *self.serving_session.lock().unwrap() = Some(session);
+                }
+                Err(error) if format!("{error:#}").contains("storage_busy") => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
         let retained = self.serving_session.lock().unwrap().clone();
+        if self.store.verify_root().is_err() {
+            if let Some(ref session) = retained
+                && session.is_leader()
+            {
+                self.store.fail_changed_root_requests(session)?;
+            }
+            *self.serving_session.lock().unwrap() = None;
+            return Ok(());
+        }
         if let Some(ref session) = retained
             && session.is_leader()
             && session.verify().is_ok()
@@ -377,6 +402,7 @@ impl DaemonState {
         match self.store.leader_session() {
             Ok(session) => {
                 let outcome = (|| {
+                    self.store.fail_changed_root_requests(&session)?;
                     let coordinator =
                         crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
                             &self.store,
@@ -1602,15 +1628,10 @@ async fn start_index(
         }
         serde_json::from_value(value).map_err(|_| invalid())?
     };
-    // Existing exceptional index-only recreation stays on its compatibility path
-    // until the following root/recovery slice integrates its quiescence barrier.
-    if s.store.is_recreate_pending() {
-        if request.expected_revision.is_some() {
-            return Err(ApiError::from(anyhow::anyhow!(
-                "revision conflict: exceptional recovery has no decodable prior pin"
-            )));
-        }
-        return start_exceptional_index(s);
+    if s.store.is_recreate_pending() && request.expected_revision.is_some() {
+        return Err(ApiError::from(anyhow::anyhow!(
+            "revision conflict: exceptional recovery has no decodable prior pin"
+        )));
     }
     let options = s.options.clone();
     let row = db(s.clone(), move |store| {

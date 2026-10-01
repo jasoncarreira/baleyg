@@ -36,6 +36,7 @@ enum RecoveryDisposition {
     Ready = 0,
     Rebuild = 1,
     RecreatePending = 2,
+    RootReplaced = 3,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetadataColumn {
@@ -1880,6 +1881,10 @@ impl Store {
                 store.mark_recovery(RecoveryDisposition::RecreatePending);
                 Ok(store)
             }
+            Err(error) if error.to_string() == "root_changed: index root identity mismatch" => {
+                store.mark_recovery(RecoveryDisposition::RootReplaced);
+                Ok(store)
+            }
             Err(error) => Err(error),
         }
     }
@@ -2029,8 +2034,10 @@ impl Store {
         mut at: impl FnMut(ActivationStage) -> Result<()>,
     ) -> Result<IndexPin> {
         ensure!(
-            self.disposition() == RecoveryDisposition::RecreatePending
-                && self.recovery_required.load(Ordering::Acquire),
+            matches!(
+                self.disposition(),
+                RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
+            ) && self.recovery_required.load(Ordering::Acquire),
             "recovery_required: exceptional recreation not classified"
         );
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
@@ -2068,10 +2075,25 @@ impl Store {
                 }
             }
         };
-        ensure!(
-            cause == RecoveryClass::RecreatePending,
-            "recovery_required: corruption/NOTADB authority not verified"
-        );
+        if self.disposition() == RecoveryDisposition::RootReplaced {
+            // A new inode at the same canonical spelling is a root transition, not
+            // corruption. Recheck the old derived index under EX before replacing it.
+            let db = open_index(&path, false)?;
+            let mismatch = self.recovery_baseline(&db).unwrap_err();
+            ensure!(
+                mismatch.to_string() == "root_changed: index root identity mismatch",
+                "root_changed: replacement authority changed"
+            );
+            ensure!(
+                journal.is_none(),
+                "recovery_required: root replacement has hot journal"
+            );
+        } else {
+            ensure!(
+                cause == RecoveryClass::RecreatePending,
+                "recovery_required: corruption/NOTADB authority not verified"
+            );
+        }
         old.verify()?;
         leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
         let mut stage = self.create_staged_index(leader)?;
@@ -2285,7 +2307,8 @@ impl Store {
         match self.recovery_disposition.load(Ordering::Acquire) {
             0 => RecoveryDisposition::Ready,
             1 => RecoveryDisposition::Rebuild,
-            _ => RecoveryDisposition::RecreatePending,
+            2 => RecoveryDisposition::RecreatePending,
+            _ => RecoveryDisposition::RootReplaced,
         }
     }
     fn mark_recovery(&self, disposition: RecoveryDisposition) {
@@ -2295,7 +2318,10 @@ impl Store {
     }
     fn ensure_not_recreate_pending(&self) -> Result<()> {
         ensure!(
-            self.disposition() != RecoveryDisposition::RecreatePending,
+            !matches!(
+                self.disposition(),
+                RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
+            ),
             "recovery_required: exceptional index recovery deferred"
         );
         Ok(())
@@ -2759,8 +2785,10 @@ impl Store {
         self.identity.verify()
     }
     pub(crate) fn is_recreate_pending(&self) -> bool {
-        self.disposition() == RecoveryDisposition::RecreatePending
-            && self.recovery_required.load(Ordering::Acquire)
+        matches!(
+            self.disposition(),
+            RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
+        ) && self.recovery_required.load(Ordering::Acquire)
     }
     /// Exceptional entry owns no old protected handle before nonblocking EX.
     /// Return the exact downgraded guard that wrote the replacement marker.

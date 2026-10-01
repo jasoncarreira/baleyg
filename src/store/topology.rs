@@ -187,6 +187,21 @@ impl TopologyRoots {
         UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
             .context("incompatible_index: missing or unsafe use lock")
     }
+    /// Root-loss queue transitions still require the existing protected index directory.
+    /// They cannot use the root pathname, which now names a different inode or is absent.
+    pub(crate) fn index_use_existing_without_root(
+        &self,
+        identity: &WorkspaceIdentity,
+    ) -> Result<UseGuard> {
+        for path in [
+            &self.cache,
+            &self.cache.join("indexes"),
+            &self.index_dir(identity),
+        ] {
+            private_dir(path)?;
+        }
+        UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
+    }
     /// Exceptional index replacement starts only after every protected handle closes.
     /// Never create or upgrade a use lock while attempting exclusive admission.
     pub fn index_use_exclusive_existing(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
@@ -924,6 +939,15 @@ fn read_incarnation(file: &File) -> Result<Uuid> {
 }
 
 impl LeaderGuard {
+    pub(crate) fn belongs_to_after_root_loss(
+        &self,
+        leader_path: &Path,
+        use_path: &Path,
+    ) -> Result<()> {
+        ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
+        self.use_guard.belongs_to(use_path, false)?;
+        self.verify()
+    }
     pub fn belongs_to(&self, leader_path: &Path) -> Result<()> {
         ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
         self.verify()
@@ -1019,6 +1043,32 @@ impl LeaderSession {
             }
             Self::Follower(guard) => guard.verify(guard.incarnation),
         }
+    }
+    pub(crate) fn verify_after_root_loss(
+        &self,
+        identity: &WorkspaceIdentity,
+        leader_path: &Path,
+        use_path: &Path,
+    ) -> Result<()> {
+        let Self::Leader {
+            guard,
+            identity: held,
+        } = self
+        else {
+            bail!("storage_busy: follower cannot fail old-root requests");
+        };
+        ensure!(
+            held.root == identity.root
+                && held.root_key == identity.root_key
+                && held.device == identity.device
+                && held.inode == identity.inode,
+            "storage_busy: leader belongs to another root"
+        );
+        ensure!(
+            identity.verify().is_err(),
+            "root_changed: old-root transition requires root loss"
+        );
+        guard.belongs_to_after_root_loss(leader_path, use_path)
     }
     pub fn belongs_to(&self, identity: &WorkspaceIdentity, leader_path: &Path) -> Result<()> {
         let Self::Leader {

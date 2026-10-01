@@ -106,7 +106,9 @@ pub fn reconcile_workspace(
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(IndexPin, Arc<LeaderSession>)> {
     if store.is_recreate_pending() {
-        return store.recreate_pending_leader_session(options, cancel);
+        let (pin, session) = store.recreate_pending_leader_session(options, cancel)?;
+        store.fail_changed_root_requests(&session)?;
+        return Ok((pin, session));
     }
     let coordinator = IndexJobCoordinator::prepare(store, None)?;
     let session = coordinator.session();
@@ -127,7 +129,12 @@ pub fn drain_requests_observed(
     session: &Arc<LeaderSession>,
     progress: impl Fn(&str, IndexProgress) + Sync,
 ) -> Result<usize> {
+    if store.verify_root().is_err() {
+        store.fail_changed_root_requests(session)?;
+        anyhow::bail!("root_changed: old leader stopped after queue failure transition");
+    }
     store.verify_leader_session(session)?;
+    store.fail_changed_root_requests(session)?;
     // A prior attempt may have published but failed its queue terminal write. Resolve
     // that exact cached result before any new claim or native publication.
     let mut completed = usize::from(store.retry_recorded_completion(session)?);
@@ -207,15 +214,15 @@ pub fn enqueue_and_wait(
     options: &IndexOptions,
     cancel: &CancelFlag,
 ) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
-    // Preserve the existing exceptional index-only recovery entry until the next
-    // slice introduces queue quiescence and handle-drop barriers for this path.
-    if store.is_recreate_pending() {
-        return reconcile_workspace(store, options, cancel, |_| {});
-    }
     let request = store.enqueue_request(options, None)?;
     let mut held: Option<Arc<LeaderSession>> = None;
     loop {
-        store.verify_root()?;
+        if let Err(error) = store.verify_root() {
+            if let Some(session) = &held {
+                store.fail_changed_root_requests(session)?;
+            }
+            return Err(error);
+        }
         if let Some(row) = store.request_by_id(&request.id)? {
             match row.state.as_str() {
                 "done" => {
@@ -237,12 +244,23 @@ pub fn enqueue_and_wait(
             !cancel.load(Ordering::Acquire),
             "index wait interrupted; accepted request remains queued"
         );
+        if held.is_none() && store.is_recreate_pending() {
+            match store.recreate_pending_leader_session(options, cancel) {
+                Ok((_, session)) => {
+                    store.fail_changed_root_requests(&session)?;
+                    held = Some(session);
+                }
+                Err(error) if format!("{error:#}").contains("storage_busy") => {}
+                Err(error) => return Err(error),
+            }
+        }
         if held.is_none() {
             match store.leader_session() {
                 Ok(session) => {
                     // The takeover reconciliation precedes claims and may itself satisfy
                     // the FIFO head: it captured after acceptance using that request's
                     // exact options. Claim only after the full root-checked publication.
+                    store.fail_changed_root_requests(&session)?;
                     let earliest = store.earliest_unfinished_request()?;
                     let reconcile_options = earliest
                         .as_ref()
@@ -304,11 +322,13 @@ pub fn establish_serving_session(
             )
         })?;
         let (_, session) = store.recreate_pending_leader_session(options, cancel)?;
+        store.fail_changed_root_requests(&session)?;
         session.verify()?;
         return Ok(session);
     }
     match store.leader_session() {
         Ok(session) => {
+            store.fail_changed_root_requests(&session)?;
             let expected = store.recovery_index_baseline()?;
             let options = match explicit_options {
                 Some(options) => options.clone(),

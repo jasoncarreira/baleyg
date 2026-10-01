@@ -152,8 +152,17 @@ impl Store {
         self.roots.requests_db(&self.identity)
     }
     fn request_connection(&self) -> Result<(UseGuard, Connection)> {
-        self.identity.verify()?;
-        let guard = self.roots.index_use(&self.identity)?;
+        self.request_connection_for_root_loss(false)
+    }
+    fn request_connection_for_root_loss(&self, old_root: bool) -> Result<(UseGuard, Connection)> {
+        if !old_root {
+            self.identity.verify()?;
+        }
+        let guard = if old_root {
+            self.roots.index_use_existing_without_root(&self.identity)?
+        } else {
+            self.roots.index_use(&self.identity)?
+        };
         let path = self.request_db_path();
         // The protected directory and file must remain private, regular and tied to the pathname.
         let file = OpenOptions::new()
@@ -216,7 +225,9 @@ impl Store {
         );
         let check: String = db.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
         ensure!(check == "ok", "incompatible_queue: integrity check failed");
-        self.identity.verify()?;
+        if !old_root {
+            self.identity.verify()?;
+        }
         guard.verify()?;
         Ok((guard, db))
     }
@@ -319,6 +330,46 @@ impl Store {
             );
         }
         Ok(())
+    }
+    /// Mark old-root rows before replacement work, or fail this holder's rows after root loss.
+    pub fn fail_changed_root_requests(&self, session: &LeaderSession) -> Result<usize> {
+        let old_root = self.identity.verify().is_err();
+        if old_root {
+            self.verify_old_root_queue_leader(session)?;
+        } else {
+            self.verify_leader_session(session)?;
+        }
+        let (_guard, mut db) = self.request_connection_for_root_loss(old_root)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if old_root {
+            self.verify_old_root_queue_leader(session)?;
+        } else {
+            self.verify_leader_session(session)?;
+        }
+        let predicate = if old_root {
+            "root_device=?3 AND root_inode=?4"
+        } else {
+            "(root_device<>?3 OR root_inode<>?4)"
+        };
+        let changed = tx.execute(&format!("UPDATE requests SET state='failed',claim_incarnation=?1,started_at=COALESCE(started_at,?2),finished_at=?2,error_code='root_changed' WHERE state IN ('queued','running') AND {predicate}"),
+            params![session.incarnation().to_string(),now(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
+        tx.commit()?;
+        Ok(changed)
+    }
+    fn verify_old_root_queue_leader(&self, session: &LeaderSession) -> Result<()> {
+        let root = std::fs::symlink_metadata(&self.identity.root);
+        ensure!(
+            root.as_ref().is_err_or(|m| m.dev() != self.identity.device
+                || m.ino() != self.identity.inode
+                || !m.is_dir()
+                || m.file_type().is_symlink()),
+            "root_changed: pathname still names captured root"
+        );
+        session.verify_after_root_loss(
+            &self.identity,
+            &self.roots.leader_lock(&self.identity),
+            &self.roots.index_use_lock(&self.identity),
+        )
     }
     pub fn claim_request(&self, session: &LeaderSession) -> Result<Option<Request>> {
         self.verify_leader_session(session)?;
