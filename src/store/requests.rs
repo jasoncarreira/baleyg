@@ -148,6 +148,14 @@ fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
 }
 const COLUMNS: &str = "seq,id,root_device,root_inode,options_json,expected_generation,expected_revision,state,claim_incarnation,result_generation,result_revision,error_code,submitted_at,started_at,finished_at";
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn set_queue_select_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        self.test_queue_select_hook.set(hook);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_exclusive_recovery_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        self.test_exclusive_recovery_hook.set(hook);
+    }
     pub fn request_db_path(&self) -> std::path::PathBuf {
         self.roots.requests_db(&self.identity)
     }
@@ -324,6 +332,8 @@ impl Store {
             return Ok(None);
         }
         let (_guard, db) = self.request_connection()?;
+        #[cfg(test)]
+        self.test_queue_select_hook.run();
         let row = db
             .query_row(
                 &format!("SELECT {COLUMNS} FROM requests WHERE id=?1"),

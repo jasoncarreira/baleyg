@@ -17,6 +17,28 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestOneShotHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+#[cfg(test)]
+impl std::fmt::Debug for TestOneShotHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TestOneShotHook")
+    }
+}
+#[cfg(test)]
+impl TestOneShotHook {
+    pub(crate) fn set(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.0.lock().unwrap() = Some(Box::new(hook));
+    }
+    pub(crate) fn run(&self) {
+        let hook = self.0.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -26,6 +48,10 @@ pub struct Store {
     recovery_disposition: Arc<AtomicU8>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
     request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
+    #[cfg(test)]
+    test_queue_select_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    test_exclusive_recovery_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_finish_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -1863,6 +1889,10 @@ impl Store {
             pending_request_completion: Arc::new(Mutex::new(None)),
             request_file_witness: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            test_queue_select_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
             test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             test_queue_post_commit_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2845,6 +2875,8 @@ impl Store {
         let mut leader = self
             .roots
             .leader_under_exclusive(&self.identity, exclusive)?;
+        #[cfg(test)]
+        self.test_exclusive_recovery_hook.run();
         let pin = self.recreate_index_exclusive(options, &mut leader, cancel)?;
         let session = Arc::new(topology::LeaderSession::leader(
             leader,
