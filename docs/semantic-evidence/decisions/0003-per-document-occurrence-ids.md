@@ -1,8 +1,8 @@
 # Decision 0003: per-document occurrence identity, revision-scoped semantic validity
 
-- **Status:** proposed amendment for owner ratification. It changes normative text in `../contract-v1.md` (#22) and `../publication-rejoin-vectors-v1.md` (#11A). It changes no deployed schema by itself; implementation follows in separate reviewed work (see [Implementation impact](#implementation-impact)).
-- **Scope:** occurrence identity (`OccurrenceId`) and the rules that relied on occurrence IDs being revision-bound. Syntax identity (`SyntaxId`), canonical bytes, `Revision.id`, coverage, freshness, warnings-v1, and the 11A raw envelope and proof rules are unchanged.
-- **Compatibility:** pre-release, no backward compatibility required. Legacy #26 `SemanticCapture` `formatVersion:1` bytes and their published example hashes stay immutable (Decision 0002). They keep the v1 occurrence derivation as historical identity.
+- **Status:** proposed amendment for owner ratification. It changes normative text in `../contract-v1.md` (#22), `0002-publication-rejoin.md` and `../publication-rejoin-vectors-v1.md` (#11A). It changes no deployed schema by itself; implementation follows in separate reviewed work (see [Implementation impact](#implementation-impact)).
+- **Scope:** occurrence identity (`OccurrenceId`), the extraction-context digest it depends on, and the rules that relied on occurrence IDs being revision-bound. Syntax identity (`SyntaxId`), canonical bytes, `Revision.id`, coverage, freshness, warnings-v1, and the 11A raw envelope and proof rules are unchanged.
+- **Compatibility: none.** Pre-release, the owner requires no backward compatibility. There is **one** occurrence identity, `occ:v2`. The revision-bound `occ:v1` derivation is withdrawn everywhere. This supersedes Decision 0002's clause keeping legacy #26 `formatVersion:1` example bytes immutable, as far as those bytes carry occurrence IDs: the frozen normalized `formatVersion:1` fixture records and the #57 v1 vector rows are regenerated under `occ:v2`.
 
 ## Problem
 
@@ -12,51 +12,60 @@ A store that materializes native evidence must rewrite O(workspace) rows on each
 
 ## What revision binding was protecting
 
-The v1 rule "occurrence-keyed evidence never crosses revisions" protects **semantic validity**, not syntax. A document can be byte-identical across revisions while a fact *about* one of its occurrences becomes wrong: an unchanged call to `g()` whose target `g` changed in another document. Revision-bound occurrence IDs enforced this by making every binding expire at every revision. The same guarantee can be stated directly on semantic records, where the staleness actually lives.
+The v1 rule "occurrence-keyed evidence never crosses revisions" protects **semantic validity**, not syntax. A document can be byte-identical across revisions while a fact *about* one of its occurrences becomes wrong: an unchanged call to `g()` whose target `g` changed in another document. Revision-bound occurrence IDs enforced this by making every binding expire at every revision. The same guarantee is now stated directly on semantic records, where the staleness actually lives.
 
 ## Decision
 
-1. **Occurrence identity is per document version.** The occurrence input is exactly
+1. **Extraction context.** For each document, `extractionContext` is the full SHA-256 over domain `baleyg.extraction-context.v1\0` and the #22 canonical bytes of `{language:Language, components:[{name:Text, hash:Hash}]}`.
+   - `components` lists **every** non-source input that the native producer reads for that document's language and that can affect any native measured field or projection: configuration, toolchain and dependency captures, each by its captured component digest. They are sorted by `name`, then `hash`, and unique.
+   - A producer that reads no such input has `components: []`.
+   - The native producer declares which components it reads. Starting to read another input is a native producer version change (item 3).
+   - #71's path-neutral extraction cache keys on this **same** digest; it must not define a different one.
+2. **Occurrence identity is per document version and context.** The occurrence input is exactly
 
    ```text
-   {contentHash:Hash, nativeProducerId:Text, nativeProducerVersion:Text, ownerSyntaxId:SyntaxId, kind:call|reference|control, ordinal:UInt}
+   {contentHash:Hash, extractionContext:Hash, nativeProducerId:Text, nativeProducerVersion:Text, ownerSyntaxId:SyntaxId, kind:call|reference|control, ordinal:UInt}
    ```
 
    - The domain is `baleyg.occurrence.v2\0`, and the emitted form is `occ:v2:` followed by the first 32 lowercase hex characters (16 bytes) of the full SHA-256.
    - `contentHash` is the containing document's exact content digest.
    - `nativeProducerId`/`nativeProducerVersion` are the native producer descriptor's `id` and `version`.
-   - `ownerSyntaxId` is the emitted 128-bit owner ID, which already binds source set, path and language.
-   - Ordering, ordinal namespaces, duplicate rejection and collision handling are unchanged from v1.
-2. **Consequence.** A byte-identical document measured by the same native producer version keeps identical occurrence IDs across revisions. Any byte change to a document changes **all** of that document's occurrence IDs and no other document's. A change of native producer version changes all occurrence IDs.
-3. **Native producer versioning.** Any change to the native extractor that can change a measured occurrence's owner, kind, ordinal, range or spelling **must** change `nativeProducerVersion`. This is the same rule #71's fact cache depends on. The executable hash stays in `Producer.executableHash`, provenance and `Revision.id`, but is not occurrence identity, so a rebuild of the same extractor version doesn't churn IDs.
-4. **Occurrence records keep their shape.** `Call`, `ControlRegion` and `Reference` still carry `.revisionId`, now defined as the **containing revision** in which the record is published or answered, supplied by the revision's document manifest. It is not part of occurrence identity. `.ordinal` is document-version-local.
-5. **Semantic validity stays revision-scoped.** This restates the old guarantee directly:
-   - Every semantic record, binding and join keyed by an occurrence ID (`CallBinding`, `Reference` resolution and targets, `Join` with occurrence candidates) is valid **only at the revision of its provenance**.
-   - That revision is the captured revision for captured evidence, and the destination revision for publication-rejoined evidence.
-   - An occurrence ID shared by two revisions never carries a binding, resolution, target, join or provenance from one revision to the other.
+   - `ownerSyntaxId` is the emitted 128-bit owner ID, which binds the source set, path and language.
+   - Ordering, ordinal namespaces, duplicate rejection and collision handling are unchanged.
+3. **Native producer versioning.** Any extractor change that can alter **any** native measured field or projection of any occurrence or declaration **must** change `nativeProducerVersion`. That covers owner, kind, ordinal, range, callee range, spelling, lookup key, region membership, parent and arm, and coverage. #71 relies on the same rule. The executable hash stays in `Producer.executableHash`, provenance and `Revision.id`, but is not occurrence identity.
+4. **When IDs are equal.** Two revisions share an occurrence ID exactly when the document has identical bytes (`contentHash`) at the same `DocumentKey` (through the owner ID), under the same native producer ID and version and the same `extractionContext`, with the same owner, kind and ordinal. Under items 1 and 3, those inputs determine identical native measured output. Any change to bytes, context or producer version re-identifies all of that document's occurrences, and no other document's.
+5. **Semantic validity stays revision-scoped.**
+   - Every semantic record, binding and join keyed by an occurrence ID (`CallBinding`, `Reference` resolution and targets, `Join` with occurrence candidates) is valid **only at the revision of its provenance**. That is the captured revision for captured evidence, and the destination revision for publication-rejoined evidence.
+   - A shared occurrence ID never carries a binding, resolution, target, join or provenance from one revision to another.
    - After a failed or omitted r2 refresh, r2 occurrences have no selected-producer binding even when their IDs equal r1's.
    - Freshness rule 2 (`possiblyStale`), `staleTarget=false` and the no-expansion rules are unchanged.
-6. **11A rejoin.** For an unchanged-byte document under the same native producer version, the r2 native occurrence ID **equals** the r1 ID.
-   - Rejoin still mints **new r2 provenance** (with the verified `derivedFrom`) and r2-scoped associations. All 11A validity checks are unchanged: identical authenticated bytes and key, exactly one distinct compatible r2 native candidate at the converted span and kind, the same-`SyntaxId` target rule, and the A-`failed` / B-`partial` dispositions.
-   - ID equality is a join convenience, never a validity proof.
-   - "No r1 call ID is attached to r2" becomes: **no r1 provenance or binding is attached to r2**.
-7. **Cross-revision links.** Stable syntax IDs, and occurrence IDs of byte-identical documents under the same native producer version, are the only cross-revision identity links. Neither carries semantic validity across revisions. The #47 historical-evidence scope is unchanged: no old call binding is applied.
-8. **Legacy v1 identity.** `occ:v1` with domain `baleyg.occurrence.v1\0` and the revision-bound input remains defined **only** as the identity of immutable legacy #26 `SemanticCapture` `formatVersion:1` artifacts and the existing #57 v1 vector rows. A checker validates each artifact under its own format's occurrence version. New native evidence and new `CapturedScipFactV1`-derived publications use `occ:v2`, and v1 and v2 IDs are never compared or mixed in one revision.
+6. **Pinned projection (acceptance condition).** A pinned read of revision r2 projects every native record of a reused (unchanged) document version **as r2 evidence**:
+   - its `.revisionId` is r2;
+   - its native measured-syntax provenance and coverage are r2's;
+   - no r1 provenance, reference resolution, target or join becomes r2-valid because an occurrence ID matches.
+
+   The physical layout (item 9) is informative, but this projection is required of any implementation.
+7. **11A rejoin.** For an unchanged-byte document under the same producer and context, the r2 native occurrence ID **equals** the r1 ID.
+   - Rejoin still requires a **separately verified** r2 native candidate at the converted span and kind. It mints **new r2 provenance** with the verified `derivedFrom`, and r2-scoped associations with the r2 internal target revision.
+   - All 11A checks are unchanged: identical authenticated bytes and key, exactly one distinct compatible r2 candidate, the same-`SyntaxId` target rule, the A-`failed` / B-`partial` dispositions, freshness and no-expansion.
+   - ID equality is never a validity proof. No r1 provenance or binding is carried into r2.
+8. **Cross-revision links.** Stable syntax IDs, and occurrence IDs under item 4's conditions, are the only cross-revision identity links. Neither carries semantic validity across revisions. The #47 historical-evidence scope is unchanged: no old call binding is applied.
 
 ## Storage consequence (informative)
 
-Publication can write only the changed documents' native rows plus a revision → document-version manifest. Pinned reads of an older revision resolve through that revision's manifest, and document versions that no retained revision references can be garbage-collected. This is the model #67's native-correctness work should implement. No read-time ID derivation or occurrence-ID resolution index is needed.
+9. Publication can write only the changed document versions' native rows plus a revision → document-version manifest. Pinned reads resolve through that revision's manifest and project item 6's r2 fields, and document versions that no retained revision references can be garbage-collected. This is the model #67's native-correctness work should implement. No read-time ID derivation or occurrence-ID resolution index is needed.
 
 ## Vectors
 
-[`../publication-rejoin-vectors-v1.md`](../publication-rejoin-vectors-v1.md#occurrence-identity-v2-decision-0003) gives the exact v2 rows for the #57 fixture's A.js call and reference. They were computed from #22 canonical bytes with `tools/semantic-contract/json.mjs::canonicalBytes` and independently with Python `hashlib`. The same method reproduces the existing v1 row `r1/call` (`ccc4d599…`).
+[`../publication-rejoin-vectors-v1.md`](../publication-rejoin-vectors-v1.md#occurrence-identity-v2-decision-0003) gives the exact `extractionContext` and `occ:v2` rows for the #57 fixture's A.js call and reference. They include controls for a changed native producer version and a changed extraction context, and they replace the withdrawn v1 rows. They were computed from #22 canonical bytes with `tools/semantic-contract/json.mjs::canonicalBytes` and independently re-canonicalized and hashed with Python `hashlib`. The same method reproduces the withdrawn v1 `r1/call` digest (`ccc4d599…`).
 
 ## Implementation impact
 
 None of this is done by this docs change:
 
-- **`src/native_ids.rs`:** occurrence registration switches to domain `baleyg.occurrence.v2\0`, prefix `occ:v2:` and the new input. `src/native_evidence.rs`: bump the native producer version.
+- **`src/native_ids.rs`:** occurrence registration switches to domain `baleyg.occurrence.v2\0`, prefix `occ:v2:` and the new input. `src/native_evidence.rs`: compute and declare `extractionContext`, and bump the native producer version.
 - **`src/mcp/catalog.rs`, `src/mcp/tools.rs`:** the `occ:v1:` ID patterns become `occ:v2:`.
-- **`tools/semantic-contract/identity.mjs`** and the semantic-contract tests and fixtures that compute occurrence IDs (`formats`, `identity`, `normalization`, `record-*`, `graph*`, `answers`, `counts`, `example-fixture`): v2 for new-format fixtures, v1 retained only for legacy `formatVersion:1` bytes.
+- **`tools/semantic-contract/identity.mjs`** and every semantic-contract test and fixture that computes or pins occurrence IDs (`formats`, `identity`, `normalization`, `record-*`, `graph*`, `answers`, `counts`, `example-fixture`). That includes the frozen normalized `formatVersion:1` records (`tools/semantic-contract/schema.mjs` normalized record shapes), regenerated under `occ:v2` with their published hashes updated.
 - **Native tests** (e.g. `tests/python_indexer.rs`) that pin occurrence IDs.
-- **#67:** the native-correctness slice is re-scoped to per-document storage plus a revision manifest. **#87–#90:** wording that assumes r2-minted occurrence IDs (#89 rejoin and #90 in-transaction rejoin) is updated to "same IDs for unchanged documents; new r2 provenance and associations".
+- **#71:** key on item 1's `extractionContext`.
+- **#67:** the native-correctness slice is re-scoped to per-document storage, a revision manifest and item 6's projection. **#87–#90:** wording that assumes r2-minted occurrence IDs (#89 rejoin and #90 in-transaction rejoin) is updated to "same IDs for unchanged documents; new r2 provenance and associations".
