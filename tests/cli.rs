@@ -2,6 +2,139 @@ use serde_json::Value;
 use std::{fs, process::Command};
 use tempfile::TempDir;
 
+/// Only fixed startup markers are retained. Never copy arbitrary daemon stderr,
+/// filesystem paths, source text or the bearer into a failure artifact.
+fn readiness_stderr_category(sample: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(sample);
+    if text.contains("bind daemon listener") {
+        "listener_bind_error"
+    } else if text.contains("Evidence unavailable at startup:") {
+        "index_startup_unavailable"
+    } else if text.contains("Baleyg: http://") {
+        "server_banner_present"
+    } else if text.contains("Error:") {
+        "other_startup_error"
+    } else {
+        "no_allowlisted_marker"
+    }
+}
+
+/// Opt-in failure-only report, outside the tracked worktree. Every value written
+/// here is a fixed category or bounded number, not untrusted process output.
+fn write_private_readiness_diagnostic(
+    dir: &std::path::Path,
+    child: &mut std::process::Child,
+    stderr_path: &std::path::Path,
+    address: std::net::SocketAddr,
+    healthz: &str,
+) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let meta = fs::symlink_metadata(dir)?;
+    if !dir.is_absolute()
+        || !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o777 != 0o700
+        || dir
+            .canonicalize()?
+            .starts_with(std::env::current_dir()?.canonicalize()?)
+    {
+        return Err(std::io::Error::other(
+            "unsafe readiness diagnostic directory",
+        ));
+    }
+    let child_state = match child.try_wait()? {
+        Some(status) => match status.code() {
+            Some(code) => format!("exited_code_{code}"),
+            None => {
+                use std::os::unix::process::ExitStatusExt;
+                format!("exited_signal_{}", status.signal().unwrap_or_default())
+            }
+        },
+        None => "alive_at_deadline".to_owned(),
+    };
+    let listener =
+        match std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(150))
+        {
+            Ok(_) => "tcp_accepts",
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => "tcp_refused",
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => "tcp_timeout",
+            Err(_) => "tcp_other_error",
+        };
+    let mut sample = Vec::new();
+    fs::File::open(stderr_path)?
+        .take(16_384)
+        .read_to_end(&mut sample)?;
+    let category = readiness_stderr_category(&sample);
+    let output = dir.join(format!(
+        "queue-api-readiness-{}-{}.log",
+        std::process::id(),
+        child.id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(output)?;
+    // The caller supplies `healthz` from a closed set of literals or HTTP status
+    // numbers. Do not accept arbitrary reqwest error text here.
+    writeln!(
+        file,
+        "child={child_state} healthz={healthz} listener={listener} stderr_category={category}"
+    )?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[test]
+fn readiness_stderr_category_never_copies_secret_or_temp_path() {
+    let poisoned = b"Error: bind daemon listener /private/tmp/secret Bearer 0123456789abcdef\n";
+    let category = readiness_stderr_category(poisoned);
+    assert_eq!(category, "listener_bind_error");
+    assert!(!category.contains("Bearer"));
+    assert!(!category.contains("/private"));
+    assert!(!category.contains("0123456789abcdef"));
+}
+
+#[test]
+fn private_readiness_report_is_mode_600_bounded_and_never_copies_raw_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("private");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr_path = tmp.path().join("daemon-stderr");
+    let secret = "Bearer 0123456789abcdef /private/tmp/user-workspace source-data";
+    fs::write(
+        &stderr_path,
+        format!("Error: bind daemon listener {secret}\n"),
+    )
+    .unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    write_private_readiness_diagnostic(
+        &dir,
+        &mut child,
+        &stderr_path,
+        "127.0.0.1:9".parse().unwrap(),
+        "connect_error",
+    )
+    .unwrap();
+    let _ = child.wait();
+    let path = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let report = fs::read_to_string(&path).unwrap();
+    assert!(report.len() < 256);
+    assert!(report.contains("stderr_category=listener_bind_error"));
+    assert!(!report.contains(secret));
+    assert!(!report.contains("Bearer"));
+    assert!(!report.contains("/private/tmp"));
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 fn isolated_command(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
@@ -2982,7 +3115,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let server = Server(
+    let stderr_path = tmp.path().join("daemon-stderr");
+    let mut server = Server(
         isolated_command(&home)
             .arg("serve")
             .arg("--workspace")
@@ -2993,7 +3127,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
             .arg(&token_file)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(
-                fs::File::create(tmp.path().join("daemon-stderr")).unwrap(),
+                fs::File::create(&stderr_path).unwrap(),
             ))
             .spawn()
             .unwrap(),
@@ -3003,21 +3137,43 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let mut last_healthz = "not_observed".to_owned();
+    let readiness = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if client
-                .get(format!("{url}/healthz"))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
-                break;
+            last_healthz = "request_in_flight".to_owned();
+            match client.get(format!("{url}/healthz")).send().await {
+                Ok(response) if response.status().is_success() => break,
+                Ok(response) => {
+                    last_healthz = format!("http_status_{}", response.status().as_u16())
+                }
+                Err(error) if error.is_timeout() => last_healthz = "request_timeout".to_owned(),
+                Err(error) if error.is_connect() => last_healthz = "connect_error".to_owned(),
+                Err(_) => last_healthz = "request_other_error".to_owned(),
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("real daemon readiness");
+    .await;
+    if readiness.is_err()
+        && let Some(dir) = std::env::var_os("BALEYG_PRIVATE_DIAGNOSTICS_DIR")
+    {
+        let diagnostic = write_private_readiness_diagnostic(
+            std::path::Path::new(&dir),
+            &mut server.0,
+            &stderr_path,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            &last_healthz,
+        );
+        eprintln!(
+            "private readiness diagnostic {}",
+            if diagnostic.is_ok() {
+                "recorded"
+            } else {
+                "unavailable"
+            }
+        );
+    }
+    readiness.expect("real daemon readiness");
     let (code, status) = real_api(
         &client,
         &url,
