@@ -414,13 +414,15 @@ async fn active_job_cancellation_does_not_publish() {
     let id = j["id"].as_str().unwrap();
     let (code, _) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
     assert_eq!(code, 409);
-    let terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // The 15k-function index runs beside other verifier lanes in CI. This is a
+    // bounded completion guard, not an index-latency requirement.
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
             let (_, j) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !j["finishedAt"].is_null() {
                 break j;
             }
-            tokio::task::yield_now().await
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
@@ -1235,13 +1237,14 @@ fn corrupt_recovery_fixture(
 }
 
 async fn finished_index_job(app: &Router, id: &str) -> Value {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // Keep a finite CI progress guard without hot-polling the queue worker.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let (_, job) = call(app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !job["finishedAt"].is_null() {
                 break job;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
@@ -1317,9 +1320,10 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
     let id = admitted["id"].as_str().unwrap();
     let queue = store.request_db_path();
     let accepted_bytes = std::fs::read(&queue).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    // Poll at the queue tick cadence; CI may schedule its blocking worker late.
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
         while state.retained_serving_session().is_ok() {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
