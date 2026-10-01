@@ -3124,31 +3124,96 @@ mod exceptional_recovery_tests {
     }
 
     #[tokio::test]
-    async fn concurrent_posts_admit_one_exceptional_worker() {
-        // The current-thread executor cannot poll the spawned worker between
-        // these synchronous admissions. No timer or filesystem race is needed.
-        let (_tmp, _store, state, _roots, _identity) = fixture();
-        let (status, first) = start_exceptional_index(state.clone())
-            .unwrap_or_else(|error| panic!("unexpected admission: {} {}", error.1, error.2));
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let error = start_index(State(state.clone()), Bytes::from_static(b"{}"))
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        assert_eq!(error.1, "job_active");
-        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
-        let id = first.0.id;
+    async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
+        use tower::ServiceExt;
+        let (_tmp, store, state, roots, identity) = fixture();
+        let app = router(state.clone());
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/index")
+                .header("host", "127.0.0.1:7331")
+                .header("origin", "http://127.0.0.1:7331")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let ack: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(ack["state"], "queued");
+            assert!(ack["startedAt"].is_null());
+            ids.push(ack["id"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(ids[0], ids[1]);
+        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert!(first.seq < second.seq);
+        assert!(
+            state.jobs.lock().unwrap().jobs.is_empty(),
+            "legacy job map must not own queued work"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
+                if store
+                    .request_by_id(&ids[0])
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                    && store
+                        .request_by_id(&ids[1])
+                        .unwrap()
+                        .unwrap()
+                        .finished_at
+                        .is_some()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .unwrap();
+        .expect("durable FIFO requests did not finish");
+        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert_eq!(
+            (first.state.as_str(), second.state.as_str()),
+            ("done", "done")
+        );
+        let first_pin = first.revision.unwrap();
+        let second_pin = second.revision.unwrap();
+        assert_eq!(
+            first_pin.index_revision, 1,
+            "recovery full reconcile satisfies first head"
+        );
+        assert_eq!(
+            second_pin.index_revision, 2,
+            "second request publishes in FIFO order"
+        );
+        assert_eq!(
+            first_pin.index_generation, second_pin.index_generation,
+            "no second exceptional index replacement"
+        );
+        assert_eq!(store.status().unwrap().revision, second_pin);
+        let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let owner = state.retained_serving_session().unwrap();
+        store.verify_leader_session(&owner).unwrap();
+        assert!(
+            roots.leader(&identity).is_err(),
+            "one held leader fences both terminal writes"
+        );
+        assert!(state.jobs.lock().unwrap().jobs.is_empty());
     }
 
     #[tokio::test]
