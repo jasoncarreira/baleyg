@@ -8,12 +8,12 @@ fn readiness_stderr_category(sample: &[u8]) -> &'static str {
     let text = String::from_utf8_lossy(sample);
     if text.contains("bind daemon listener") {
         "listener_bind_error"
+    } else if text.contains("Error:") {
+        "other_startup_error"
     } else if text.contains("Evidence unavailable at startup:") {
         "index_startup_unavailable"
     } else if text.contains("Baleyg: http://") {
         "server_banner_present"
-    } else if text.contains("Error:") {
-        "other_startup_error"
     } else {
         "no_allowlisted_marker"
     }
@@ -96,6 +96,12 @@ fn readiness_stderr_category_never_copies_secret_or_temp_path() {
     assert!(!category.contains("Bearer"));
     assert!(!category.contains("/private"));
     assert!(!category.contains("0123456789abcdef"));
+    let mixed = b"Baleyg: http://127.0.0.1:7331/\nEvidence unavailable at startup: /private/tmp/secret\nError: failed after banner; Bearer 0123456789abcdef\n";
+    let fatal = readiness_stderr_category(mixed);
+    assert_eq!(fatal, "other_startup_error");
+    assert!(!fatal.contains("Bearer"));
+    assert!(!fatal.contains("/private"));
+    assert!(!fatal.contains("0123456789abcdef"));
 }
 
 #[test]
