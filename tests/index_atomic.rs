@@ -1136,10 +1136,15 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         "DELETE FROM capture_inputs WHERE input_key='config:package.json'",
         "INSERT INTO capture_inputs(input_key,payload) VALUES('unknown:slot','{\"state\":\"absent\"}')",
         "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',2)",
-        "UPDATE capture_inputs SET payload=json_set(payload,'$.hash',lower(hex(randomblob(32)))) WHERE input_key LIKE 'presentation-scip:%'",
+        "UPDATE capture_inputs SET payload=json_set(payload,'$.hash',lower(hex(randomblob(32)))) WHERE input_key='config:package.json'",
     ] {
         let (state, workspace) = fixture();
         fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
+        fs::write(
+            workspace.path().join("package.json"),
+            b"{\"name\":\"capture-fixture\"}",
+        )
+        .unwrap();
         let scip = workspace.path().join("labels.scip");
         let manifest = workspace.path().join("labels.json");
         fs::write(&scip, b"captured presentation bytes").unwrap();
@@ -1156,6 +1161,10 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         drop(store);
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(mutation).unwrap();
+        assert!(
+            db.changes() > 0,
+            "inventory mutation touched no rows: {mutation}"
+        );
         drop(db);
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
         assert!(
