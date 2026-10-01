@@ -2,7 +2,7 @@
 
 - **Status:** prospective docs-only #11A amendment; no deployed importer, checker, schema, or migration
 - **Scope:** `../contract-v1.md` and `../publication-rejoin-vectors-v1.md`
-- **Amended by:** [Decision 0003](0003-per-document-occurrence-ids.md) (proposed). Occurrence IDs become per document version and extraction context (`occ:v2`), so an unchanged-byte document's r2 occurrence IDs equal its r1 IDs. Rejoin still requires a separately verified r2 native candidate, mints new r2 provenance and associations, and carries no r1 provenance or binding into r2.
+- **Amended by:** [Decision 0003](0003-per-document-occurrence-ids.md) (proposed). Occurrence IDs become per document version and extraction context (`occ:v2`), so a byte-identical document at the same `DocumentKey`, under the same native producer ID, version and extraction context has equal r1 and r2 occurrence IDs; a context or producer change makes them differ. Rejoin still requires a separately verified r2 native candidate, mints new r2 provenance and associations, and carries no r1 provenance or binding into r2.
 - **Compatibility:** #22 canonical bytes, #38 native records, #47 declaration history, #52 revision/warnings. Legacy #26 `SemanticCapture` `formatVersion:1` bytes stay immutable **except** where Decision 0003 regenerates occurrence IDs in its frozen normalized records (pre-release, no backward compatibility).
 
 ## Owner decisions and the narrow boundary

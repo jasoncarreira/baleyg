@@ -21,6 +21,8 @@ The v1 rule "occurrence-keyed evidence never crosses revisions" protects **seman
    - A producer that reads no such input has `components: []`.
    - The native producer declares which components it reads. Starting to read another input is a native producer version change (item 3).
    - #71's path-neutral extraction cache keys on this **same** digest; it must not define a different one.
+   - **Authentication, fail-closed.** Before an `extractionContext` (or an occurrence ID derived from it) is treated as identity or cache evidence, the producer's declared component inventory and every component digest must be verified against the authenticated revision capture and the native producer descriptor. An undeclared, missing, stale or mismatched component, or an unproven `[]` from a producer that has not declared its inventory, means the document version is **not** reusable and is not a cache hit, so it is measured again. The v2 hash proves its inputs match, not that they were authentic.
+   - **Document locality.** Native measurement of a document depends only on its own bytes and its extraction context. A native producer must not read another source document to measure a document. If it ever needs to, each such document's `contentHash` must be listed as an authenticated component named `source:<language>:<path>`, and so enters #71's cache key too.
 2. **Occurrence identity is per document version and context.** The occurrence input is exactly
 
    ```text
@@ -33,7 +35,10 @@ The v1 rule "occurrence-keyed evidence never crosses revisions" protects **seman
    - `ownerSyntaxId` is the emitted 128-bit owner ID, which binds the source set, path and language.
    - Ordering, ordinal namespaces, duplicate rejection and collision handling are unchanged.
 3. **Native producer versioning.** Any extractor change that can alter **any** native measured field or projection of any occurrence or declaration **must** change `nativeProducerVersion`. That covers owner, kind, ordinal, range, callee range, spelling, lookup key, region membership, parent and arm, and coverage. #71 relies on the same rule. The executable hash stays in `Producer.executableHash`, provenance and `Revision.id`, but is not occurrence identity.
-4. **When IDs are equal.** Two revisions share an occurrence ID exactly when the document has identical bytes (`contentHash`) at the same `DocumentKey` (through the owner ID), under the same native producer ID and version and the same `extractionContext`, with the same owner, kind and ordinal. Under items 1 and 3, those inputs determine identical native measured output. Any change to bytes, context or producer version re-identifies all of that document's occurrences, and no other document's.
+4. **When IDs are equal.** Two revisions share an occurrence ID exactly when the document has identical bytes (`contentHash`) at the same `DocumentKey` (through the owner ID), under the same native producer ID and version and the same authenticated `extractionContext`, with the same owner, kind and ordinal. Under items 1 and 3, those inputs determine identical native measured output. What a change re-identifies:
+   - a byte change to one document re-identifies all of **that** document's occurrences and no other document's;
+   - a change to a shared context component re-identifies every document whose context includes that component;
+   - a native producer ID or version change re-identifies every document that producer measures.
 5. **Semantic validity stays revision-scoped.**
    - Every semantic record, binding and join keyed by an occurrence ID (`CallBinding`, `Reference` resolution and targets, `Join` with occurrence candidates) is valid **only at the revision of its provenance**. That is the captured revision for captured evidence, and the destination revision for publication-rejoined evidence.
    - A shared occurrence ID never carries a binding, resolution, target, join or provenance from one revision to another.
@@ -45,7 +50,7 @@ The v1 rule "occurrence-keyed evidence never crosses revisions" protects **seman
    - no r1 provenance, reference resolution, target or join becomes r2-valid because an occurrence ID matches.
 
    The physical layout (item 9) is informative, but this projection is required of any implementation.
-7. **11A rejoin.** For an unchanged-byte document under the same producer and context, the r2 native occurrence ID **equals** the r1 ID.
+7. **11A rejoin.** For a byte-identical document at the same `DocumentKey`, under the same native producer ID, version and extraction context, the r2 native occurrence ID **equals** the r1 ID; otherwise it differs.
    - Rejoin still requires a **separately verified** r2 native candidate at the converted span and kind. It mints **new r2 provenance** with the verified `derivedFrom`, and r2-scoped associations with the r2 internal target revision.
    - All 11A checks are unchanged: identical authenticated bytes and key, exactly one distinct compatible r2 candidate, the same-`SyntaxId` target rule, the A-`failed` / B-`partial` dispositions, freshness and no-expansion.
    - ID equality is never a validity proof. No r1 provenance or binding is carried into r2.
