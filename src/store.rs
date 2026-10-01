@@ -2792,6 +2792,9 @@ impl Store {
     pub(crate) fn root_path_replaced(&self) -> Result<bool> {
         self.identity.root_path_replaced()
     }
+    pub(crate) fn is_root_replaced(&self) -> bool {
+        self.disposition() == RecoveryDisposition::RootReplaced
+    }
     pub(crate) fn is_recreate_pending(&self) -> bool {
         matches!(
             self.disposition(),

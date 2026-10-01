@@ -587,3 +587,45 @@ fn live_old_holder_rejects_replaced_same_key_queue_inode() {
     assert!(error.to_string().contains("inode replaced"), "{error:#}");
     assert_eq!(fs::read(&index).unwrap(), before);
 }
+
+#[test]
+fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let old = Store::open_for_tests(state.path(), &root).unwrap();
+    old.enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    let owner = old.leader_session().unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+    let queue = replacement.request_db_path();
+    let index = queue.with_file_name("index.db");
+    let index_before = fs::read(&index).unwrap();
+    fs::remove_file(&queue).unwrap();
+    assert!(
+        replacement
+            .enqueue_request(&IndexOptions::new(root.clone()), None)
+            .is_err()
+    );
+    assert!(
+        !queue.exists(),
+        "replacement ACK must not create an empty queue"
+    );
+    assert_eq!(fs::read(&index).unwrap(), index_before);
+    drop(owner);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        baleyg::index_coordinator::reconcile_workspace(
+            &replacement,
+            &IndexOptions::new(root),
+            &cancel,
+            |_| {}
+        )
+        .is_err()
+    );
+    assert!(!queue.exists());
+    assert_eq!(fs::read(&index).unwrap(), index_before);
+}

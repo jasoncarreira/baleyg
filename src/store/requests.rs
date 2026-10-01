@@ -152,7 +152,9 @@ impl Store {
         self.roots.requests_db(&self.identity)
     }
     fn request_connection(&self) -> Result<(UseGuard, Connection)> {
-        self.request_connection_for_root_loss(false, false)
+        // A replacement-root follower may accept before it owns the leader lock,
+        // but it must never recreate a missing queue containing old-root ACKs.
+        self.request_connection_for_root_loss(false, self.is_root_replaced())
     }
     fn request_connection_for_root_loss(
         &self,
