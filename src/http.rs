@@ -3251,39 +3251,50 @@ mod exceptional_recovery_tests {
         let queue_bytes = std::fs::read(&queue_path).unwrap();
         let corrupt_index = std::fs::read(&fixture.index_path).unwrap();
         let lock_path = fixture.roots.index_use_lock(&fixture.identity);
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "http::exceptional_recovery_tests::independent_shared_reader_process",
-                "--nocapture",
-            ])
-            .env("BALEYG_TEST_INDEX_USE_SH", &lock_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let ready = tokio::task::spawn_blocking(move || {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "http::exceptional_recovery_tests::independent_shared_reader_process",
+                    "--nocapture",
+                ])
+                .env("BALEYG_TEST_INDEX_USE_SH", &lock_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let drain = tokio::task::spawn_blocking(move || {
             let mut reader = std::io::BufReader::new(stdout);
+            let mut ready = Some(ready_tx);
             loop {
                 let mut line = String::new();
-                assert_ne!(
-                    reader.read_line(&mut line).unwrap(),
-                    0,
-                    "reader exited before SH_READY"
-                );
-                if line.contains("SH_READY") {
+                if reader.read_line(&mut line).unwrap() == 0 {
                     break;
                 }
+                if line.contains("SH_READY")
+                    && let Some(sender) = ready.take()
+                {
+                    let _ = sender.send(());
+                }
             }
+            assert!(ready.is_none(), "reader exited before SH_READY");
         });
-        if tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
             .await
-            .is_err()
-        {
-            child.kill().unwrap();
-            panic!("independent SH reader did not start");
-        }
+            .expect("independent SH reader did not start")
+            .unwrap();
         let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
         let (release_select_tx, release_select_rx) = std::sync::mpsc::channel();
         fixture.store.set_queue_select_hook(move || {
@@ -3345,8 +3356,25 @@ mod exceptional_recovery_tests {
             assert!(finished.is_none());
         }
         drop(db);
-        child.stdin.take().unwrap().write_all(b"x").unwrap();
-        assert!(child.wait().unwrap().success());
+        child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+        let child_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independent SH reader did not exit after release");
+        assert!(
+            child_status.success(),
+            "independent SH reader exited unsuccessfully"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("child output drain did not finish")
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if fixture
