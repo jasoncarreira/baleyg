@@ -149,6 +149,8 @@ pub struct DaemonState {
     test_queue_before_stream: crate::store::TestOneShotHook,
     #[cfg(test)]
     test_queue_after_stream: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_after_pending_snapshot: crate::store::TestOneShotHook,
     packets: Mutex<PacketCache>,
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
@@ -288,6 +290,8 @@ pub fn new_with_dependency_options(
         test_queue_before_stream: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_after_stream: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_after_pending_snapshot: crate::store::TestOneShotHook::default(),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -359,6 +363,8 @@ impl DaemonState {
         });
         let pending_local = !pending.is_empty();
         drop(pending);
+        #[cfg(test)]
+        self.test_queue_after_pending_snapshot.run();
         if self.store.is_recreate_pending() && pending_local {
             // The native stream excludes the tick while the old owner is removed.
             // No retained SH guard may enter the nonblocking EX attempt.
@@ -3237,6 +3243,106 @@ mod exceptional_recovery_tests {
         let mut signal = [0];
         std::io::stdin().read_exact(&mut signal).unwrap();
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn idle_tick_cannot_drain_request_admitted_after_empty_pending_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            tmp.path().join("state/cache"),
+            tmp.path().join("state/data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let index_path = roots.index_db(&identity);
+        let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let (prior, old_owner) = crate::index_coordinator::reconcile_workspace(
+            &old,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        std::fs::write(&index_path, b"bad sqlite index header").unwrap();
+        let corrupt_bytes = std::fs::read(&index_path).unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        assert!(store.is_recreate_pending());
+        let state = new(
+            store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        // Own the old serving SH without starting the periodic timer. Drive the
+        // exact empty-snapshot race with one explicitly paused tick instead.
+        *state.serving_session.lock().unwrap() = Some(old_owner);
+        let reader = roots.index_use_existing(&identity).unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        state.test_queue_after_pending_snapshot.set(move || {
+            let _ = entered_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        let worker = state.clone();
+        let idle_tick = tokio::task::spawn_blocking(move || worker.queue_tick());
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .expect("idle tick did not snapshot empty pending list")
+            .unwrap();
+        let request = store.enqueue_request(&options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(request.id.clone());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), idle_tick)
+            .await
+            .expect("idle tick did not leave the snapshot barrier")
+            .unwrap()
+            .unwrap();
+        let admitted = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(
+            admitted.state, "queued",
+            "old leader drained a recovery request"
+        );
+        assert!(admitted.finished_at.is_none());
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        let worker = state.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || worker.queue_tick()),
+        )
+        .await
+        .expect("recovery tick did not attempt protected EX")
+        .unwrap()
+        .unwrap();
+        assert!(state.retained_serving_session().is_err());
+        assert_eq!(std::fs::read(&index_path).unwrap(), corrupt_bytes);
+        let blocked = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(blocked.state, "queued");
+        assert!(blocked.finished_at.is_none());
+        drop(reader);
+        let worker = state.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || worker.queue_tick()),
+        )
+        .await
+        .expect("accepted request did not retry after foreign reader release")
+        .unwrap()
+        .unwrap();
+        let done = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        assert_eq!(done.revision.unwrap().index_revision, 1);
+        assert_ne!(
+            done.revision.unwrap().index_generation,
+            prior.index_generation
+        );
     }
 
     #[tokio::test]
