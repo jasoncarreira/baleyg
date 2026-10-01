@@ -106,7 +106,9 @@ pub fn reconcile_workspace(
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(IndexPin, Arc<LeaderSession>)> {
     if store.is_recreate_pending() {
-        return store.recreate_pending_leader_session(options, cancel);
+        let (pin, session) = store.recreate_pending_leader_session(options, cancel)?;
+        store.fail_changed_root_requests(&session)?;
+        return Ok((pin, session));
     }
     let coordinator = IndexJobCoordinator::prepare(store, None)?;
     let session = coordinator.session();
@@ -127,7 +129,12 @@ pub fn drain_requests_observed(
     session: &Arc<LeaderSession>,
     progress: impl Fn(&str, IndexProgress) + Sync,
 ) -> Result<usize> {
+    if store.root_path_replaced()? {
+        store.fail_changed_root_requests(session)?;
+        anyhow::bail!("root_changed: old leader stopped after queue failure transition");
+    }
     store.verify_leader_session(session)?;
+    store.fail_changed_root_requests(session)?;
     // A prior attempt may have published but failed its queue terminal write. Resolve
     // that exact cached result before any new claim or native publication.
     let mut completed = usize::from(store.retry_recorded_completion(session)?);
@@ -200,6 +207,39 @@ fn retry_cli_recorded_completion(
     }
 }
 
+/// A recovery full capture can satisfy the FIFO head when it used exactly that
+/// unpinned request's options. Never publish the same capture a second time.
+pub(crate) fn finish_reconciled_head(
+    store: &Store,
+    session: &Arc<LeaderSession>,
+    options: &IndexOptions,
+    pin: IndexPin,
+) -> Result<()> {
+    let Some(head) = store.earliest_unfinished_request()? else {
+        return Ok(());
+    };
+    let Ok(selected) = head.options(std::path::Path::new(store.workspace_root())) else {
+        return Ok(());
+    };
+    // The request root was verified by device/inode on enqueue and again on
+    // read/claim; only the persisted option fields need exact equality here.
+    if head.expected.is_some()
+        || selected.scip_path != options.scip_path
+        || selected.manifest_path != options.manifest_path
+        || selected.max_file_bytes != options.max_file_bytes
+    {
+        return Ok(());
+    }
+    if let Some(claimed) = store.claim_request(session)? {
+        ensure!(
+            claimed.id == head.id,
+            "storage_busy: FIFO head changed during recovery"
+        );
+        store.record_and_finish_request(session, &claimed, Ok(pin))?;
+    }
+    Ok(())
+}
+
 /// One explicit CLI command commits before waiting. A free lock requires a complete
 /// takeover reconciliation before any queued request is claimed.
 pub fn enqueue_and_wait(
@@ -207,14 +247,15 @@ pub fn enqueue_and_wait(
     options: &IndexOptions,
     cancel: &CancelFlag,
 ) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
-    // Preserve the existing exceptional index-only recovery entry until the next
-    // slice introduces queue quiescence and handle-drop barriers for this path.
-    if store.is_recreate_pending() {
-        return reconcile_workspace(store, options, cancel, |_| {});
-    }
     let request = store.enqueue_request(options, None)?;
     let mut held: Option<Arc<LeaderSession>> = None;
     loop {
+        if store.root_path_replaced()? {
+            if let Some(session) = &held {
+                store.fail_changed_root_requests(session)?;
+            }
+            anyhow::bail!("root_changed: captured workspace pathname changed");
+        }
         store.verify_root()?;
         if let Some(row) = store.request_by_id(&request.id)? {
             match row.state.as_str() {
@@ -237,12 +278,31 @@ pub fn enqueue_and_wait(
             !cancel.load(Ordering::Acquire),
             "index wait interrupted; accepted request remains queued"
         );
+        if held.is_none() && store.is_recreate_pending() {
+            match store.recreate_pending_leader_session(options, cancel) {
+                Ok((pin, session)) => {
+                    store.fail_changed_root_requests(&session)?;
+                    held = Some(session.clone());
+                    if let Err(error) = finish_reconciled_head(store, &session, options, pin) {
+                        retry_cli_recorded_completion(store, &session, cancel, error)?;
+                    }
+                }
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::store::topology::StorageBusy>()
+                            .is_some()
+                    }) => {}
+                Err(error) => return Err(error),
+            }
+        }
         if held.is_none() {
             match store.leader_session() {
                 Ok(session) => {
                     // The takeover reconciliation precedes claims and may itself satisfy
                     // the FIFO head: it captured after acceptance using that request's
                     // exact options. Claim only after the full root-checked publication.
+                    store.fail_changed_root_requests(&session)?;
                     let earliest = store.earliest_unfinished_request()?;
                     let reconcile_options = earliest
                         .as_ref()
@@ -304,11 +364,13 @@ pub fn establish_serving_session(
             )
         })?;
         let (_, session) = store.recreate_pending_leader_session(options, cancel)?;
+        store.fail_changed_root_requests(&session)?;
         session.verify()?;
         return Ok(session);
     }
     match store.leader_session() {
         Ok(session) => {
+            store.fail_changed_root_requests(&session)?;
             let expected = store.recovery_index_baseline()?;
             let options = match explicit_options {
                 Some(options) => options.clone(),
@@ -386,10 +448,17 @@ mod tests {
         let corrupt = fs::read(&path).unwrap();
         let pending = Store::open_for_tests(state.path(), work.path()).unwrap();
         assert!(pending.is_recreate_pending());
+        let queued = pending.enqueue_request(&options, None).unwrap();
+        let queue_before = fs::read(pending.request_db_path()).unwrap();
         let shared = roots.index_use_existing(&identity).unwrap();
         let busy = reconcile_workspace(&pending, &options, &cancel, |_| {}).unwrap_err();
         assert!(busy.to_string().contains("storage_busy"), "{busy:#}");
         assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert_eq!(fs::read(pending.request_db_path()).unwrap(), queue_before);
+        assert_eq!(
+            pending.request_by_id(&queued.id).unwrap().unwrap().state,
+            "queued"
+        );
         assert!(pending.is_recreate_pending());
         drop(shared);
         let mut configured = options.clone();

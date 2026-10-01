@@ -145,6 +145,10 @@ pub struct DaemonState {
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
     native_stream: Mutex<()>,
+    #[cfg(test)]
+    test_queue_before_stream: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_after_stream: crate::store::TestOneShotHook,
     packets: Mutex<PacketCache>,
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
@@ -280,6 +284,10 @@ pub fn new_with_dependency_options(
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
         native_stream: Mutex::new(()),
+        #[cfg(test)]
+        test_queue_before_stream: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_after_stream: crate::store::TestOneShotHook::default(),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -323,7 +331,11 @@ impl DaemonState {
         });
     }
     fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.test_queue_before_stream.run();
         let _stream = self.native_stream.lock().unwrap();
+        #[cfg(test)]
+        self.test_queue_after_stream.run();
         let mut pending = self.pending_requests.lock().unwrap();
         pending.retain(|id| {
             #[cfg(test)]
@@ -347,7 +359,46 @@ impl DaemonState {
         });
         let pending_local = !pending.is_empty();
         drop(pending);
+        if self.store.is_recreate_pending() && pending_local {
+            // The native stream excludes the tick while the old owner is removed.
+            // No retained SH guard may enter the nonblocking EX attempt.
+            drop(self.serving_session.lock().unwrap().take());
+            match self
+                .store
+                .recreate_pending_leader_session(&self.options, &Arc::new(AtomicBool::new(false)))
+            {
+                Ok((pin, session)) => {
+                    self.store.fail_changed_root_requests(&session)?;
+                    *self.serving_session.lock().unwrap() = Some(session.clone());
+                    crate::index_coordinator::finish_reconciled_head(
+                        &self.store,
+                        &session,
+                        &self.options,
+                        pin,
+                    )?;
+                }
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::store::topology::StorageBusy>()
+                            .is_some()
+                    }) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let retained = self.serving_session.lock().unwrap().clone();
+        if self.store.root_path_replaced()? {
+            if let Some(ref session) = retained
+                && session.is_leader()
+            {
+                self.store.fail_changed_root_requests(session)?;
+            }
+            *self.serving_session.lock().unwrap() = None;
+            return Ok(());
+        }
         if let Some(ref session) = retained
             && session.is_leader()
             && session.verify().is_ok()
@@ -377,6 +428,7 @@ impl DaemonState {
         match self.store.leader_session() {
             Ok(session) => {
                 let outcome = (|| {
+                    self.store.fail_changed_root_requests(&session)?;
                     let coordinator =
                         crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
                             &self.store,
@@ -1602,15 +1654,10 @@ async fn start_index(
         }
         serde_json::from_value(value).map_err(|_| invalid())?
     };
-    // Existing exceptional index-only recreation stays on its compatibility path
-    // until the following root/recovery slice integrates its quiescence barrier.
-    if s.store.is_recreate_pending() {
-        if request.expected_revision.is_some() {
-            return Err(ApiError::from(anyhow::anyhow!(
-                "revision conflict: exceptional recovery has no decodable prior pin"
-            )));
-        }
-        return start_exceptional_index(s);
+    if s.store.is_recreate_pending() && request.expected_revision.is_some() {
+        return Err(ApiError::from(anyhow::anyhow!(
+            "revision conflict: exceptional recovery has no decodable prior pin"
+        )));
     }
     let options = s.options.clone();
     let row = db(s.clone(), move |store| {
@@ -3088,32 +3135,467 @@ mod exceptional_recovery_tests {
         (tmp, store, state, roots, identity)
     }
 
+    struct PausedRecoveryFixture {
+        _tmp: tempfile::TempDir,
+        store: Store,
+        state: Arc<DaemonState>,
+        roots: TopologyRoots,
+        identity: WorkspaceIdentity,
+        old_owner: Option<Arc<crate::store::topology::LeaderSession>>,
+        q2: crate::store::requests::Request,
+        q1: crate::store::requests::Request,
+        old_generation: uuid::Uuid,
+        index_path: std::path::PathBuf,
+    }
+
+    fn paused_recovery_fixture() -> PausedRecoveryFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            tmp.path().join("state/cache"),
+            tmp.path().join("state/data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let index_path = roots.index_db(&identity);
+        let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (pin, old_owner) =
+            crate::index_coordinator::reconcile_workspace(&old, &options, &cancel, |_| {}).unwrap();
+        let q2 = old.enqueue_request(&options, None).unwrap();
+        assert_eq!(old.claim_request(&old_owner).unwrap().unwrap().id, q2.id);
+        let q1 = old.enqueue_request(&options, None).unwrap();
+        assert!(q2.seq < q1.seq);
+        std::fs::write(&index_path, b"bad sqlite index header").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        assert!(store.is_recreate_pending());
+        let state = new(
+            store.clone(),
+            options,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        PausedRecoveryFixture {
+            _tmp: tmp,
+            store,
+            state,
+            roots,
+            identity,
+            old_owner: Some(old_owner),
+            q2,
+            q1,
+            old_generation: pin.index_generation,
+            index_path,
+        }
+    }
+
+    fn assert_reclaimed_fifo(
+        f: &PausedRecoveryFixture,
+        old_incarnation: uuid::Uuid,
+        queue_inode: u64,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        let q2 = f.store.request_by_id(&f.q2.id).unwrap().unwrap();
+        let q1 = f.store.request_by_id(&f.q1.id).unwrap().unwrap();
+        assert_eq!((q2.state.as_str(), q1.state.as_str()), ("done", "done"));
+        assert_eq!(q2.revision.unwrap().index_revision, 1);
+        assert_eq!(q1.revision.unwrap().index_revision, 2);
+        assert_eq!(
+            q2.revision.unwrap().index_generation,
+            q1.revision.unwrap().index_generation
+        );
+        assert_ne!(q1.revision.unwrap().index_generation, f.old_generation);
+        assert_eq!(f.store.status().unwrap().revision, q1.revision.unwrap());
+        assert_eq!(
+            std::fs::metadata(f.store.request_db_path()).unwrap().ino(),
+            queue_inode,
+            "index-only recreation must not replace requests.db"
+        );
+        let session = f.state.retained_serving_session().unwrap();
+        f.store.verify_leader_session(&session).unwrap();
+        assert_ne!(session.incarnation(), old_incarnation);
+        assert!(f.roots.leader(&f.identity).is_err());
+    }
+
+    #[test]
+    fn independent_shared_reader_process() {
+        use std::io::{Read, Write};
+        let Some(path) = std::env::var_os("BALEYG_TEST_INDEX_USE_SH") else {
+            return;
+        };
+        let guard = crate::store::topology::UseGuard::acquire_existing(
+            std::path::Path::new(&path),
+            false,
+            false,
+        )
+        .unwrap();
+        println!("SH_READY");
+        std::io::stdout().flush().unwrap();
+        let mut signal = [0];
+        std::io::stdin().read_exact(&mut signal).unwrap();
+        drop(guard);
+    }
+
     #[tokio::test]
-    async fn concurrent_posts_admit_one_exceptional_worker() {
-        // The current-thread executor cannot poll the spawned worker between
-        // these synchronous admissions. No timer or filesystem race is needed.
-        let (_tmp, _store, state, _roots, _identity) = fixture();
-        let (status, first) = start_exceptional_index(state.clone())
-            .unwrap_or_else(|error| panic!("unexpected admission: {} {}", error.1, error.2));
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let error = start_index(State(state.clone()), Bytes::from_static(b"{}"))
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        assert_eq!(error.1, "job_active");
-        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
-        let id = first.0.id;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    async fn timer_tick_with_independent_shared_reader_defers_without_changing_both_dbs() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::fs::MetadataExt;
+        use std::process::{Command, Stdio};
+        let mut fixture = paused_recovery_fixture();
+        let old_incarnation = fixture.old_owner.as_ref().unwrap().incarnation();
+        let queue_path = fixture.store.request_db_path();
+        let queue_inode = std::fs::metadata(&queue_path).unwrap().ino();
+        let queue_bytes = std::fs::read(&queue_path).unwrap();
+        let corrupt_index = std::fs::read(&fixture.index_path).unwrap();
+        let lock_path = fixture.roots.index_use_lock(&fixture.identity);
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "http::exceptional_recovery_tests::independent_shared_reader_process",
+                    "--nocapture",
+                ])
+                .env("BALEYG_TEST_INDEX_USE_SH", &lock_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let drain = tokio::task::spawn_blocking(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut ready = Some(ready_tx);
             loop {
-                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if line.contains("SH_READY")
+                    && let Some(sender) = ready.take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+            assert!(ready.is_none(), "reader exited before SH_READY");
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+            .await
+            .expect("independent SH reader did not start")
+            .unwrap();
+        let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+        let (release_select_tx, release_select_rx) = std::sync::mpsc::channel();
+        fixture.store.set_queue_select_hook(move || {
+            let _ = selected_tx.send(());
+            let _ = release_select_rx.recv();
+        });
+        fixture
+            .state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(fixture.q1.id.clone());
+        fixture
+            .state
+            .retain_serving_session(fixture.old_owner.take().unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(5), selected_rx)
+            .await
+            .expect("20-ms timer did not pause in protected SELECT")
+            .unwrap();
+        assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        release_select_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if fixture.state.retained_serving_session().is_err()
+                    && fixture.state.native_stream.try_lock().is_ok()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .unwrap();
+        .expect("tick did not defer after external SH prevented EX");
+        assert_eq!(
+            std::fs::read(&queue_path).unwrap(),
+            queue_bytes,
+            "corruption-only EX BUSY must not change queued/running rows"
+        );
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        assert!(
+            fixture
+                .state
+                .pending_requests
+                .lock()
+                .unwrap()
+                .contains(&fixture.q1.id)
+        );
+        let db = rusqlite::Connection::open(&queue_path).unwrap();
+        for (id, expected) in [(&fixture.q2.id, "running"), (&fixture.q1.id, "queued")] {
+            let (state, finished): (String, Option<String>) = db
+                .query_row(
+                    "SELECT state,finished_at FROM requests WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, expected);
+            assert!(finished.is_none());
+        }
+        drop(db);
+        child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+        let child_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independent SH reader did not exit after release");
+        assert!(
+            child_status.success(),
+            "independent SH reader exited unsuccessfully"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("child output drain did not finish")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if fixture
+                    .store
+                    .request_by_id(&fixture.q1.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same accepted Q1 ID did not retry after external SH release");
+        assert_reclaimed_fifo(&fixture, old_incarnation, queue_inode);
+    }
+
+    #[tokio::test]
+    async fn timer_tick_quiesces_protected_select_before_ex_and_fences_injected_tick() {
+        use std::os::unix::fs::MetadataExt;
+        let mut fixture = paused_recovery_fixture();
+        let old_incarnation = fixture.old_owner.as_ref().unwrap().incarnation();
+        let queue_path = fixture.store.request_db_path();
+        let queue_inode = std::fs::metadata(&queue_path).unwrap().ino();
+        let queue_bytes = std::fs::read(&queue_path).unwrap();
+        let corrupt_index = std::fs::read(&fixture.index_path).unwrap();
+        let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+        let (release_select_tx, release_select_rx) = std::sync::mpsc::channel();
+        fixture.store.set_queue_select_hook(move || {
+            let _ = selected_tx.send(());
+            let _ = release_select_rx.recv();
+        });
+        let (exclusive_tx, exclusive_rx) = tokio::sync::oneshot::channel();
+        let (release_ex_tx, release_ex_rx) = std::sync::mpsc::channel();
+        fixture.store.set_exclusive_recovery_hook(move || {
+            let _ = exclusive_tx.send(());
+            let _ = release_ex_rx.recv();
+        });
+        fixture
+            .state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(fixture.q1.id.clone());
+        fixture
+            .state
+            .retain_serving_session(fixture.old_owner.take().unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(5), selected_rx)
+            .await
+            .expect("20-ms timer did not reach protected SELECT")
+            .unwrap();
+        // This is the genuine daemon timer spawn_blocking worker, paused while
+        // its short-lived request connection and shared use guard are both open.
+        assert!(fixture.state.native_stream.try_lock().is_err());
+        assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        release_select_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), exclusive_rx)
+            .await
+            .expect("timer recovery did not acquire fresh EX")
+            .unwrap();
+        assert!(
+            fixture.state.retained_serving_session().is_err(),
+            "old Arc must be dropped before EX"
+        );
+        assert!(
+            fixture.state.native_stream.try_lock().is_err(),
+            "EX stays inside native stream"
+        );
+        assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        let (before_tx, before_rx) = tokio::sync::oneshot::channel();
+        let (after_tx, mut after_rx) = tokio::sync::oneshot::channel();
+        fixture.state.test_queue_before_stream.set(move || {
+            let _ = before_tx.send(());
+        });
+        fixture.state.test_queue_after_stream.set(move || {
+            let _ = after_tx.send(());
+        });
+        // The production 20-ms timer awaits its first worker; this SECOND call
+        // is deliberately injected on the SAME daemon to test the stream gate.
+        let state = fixture.state.clone();
+        let injected = tokio::task::spawn_blocking(move || state.queue_tick());
+        tokio::time::timeout(std::time::Duration::from_secs(5), before_rx)
+            .await
+            .expect("injected same-daemon tick did not reach stream")
+            .unwrap();
+        assert!(fixture.state.native_stream.try_lock().is_err());
+        assert!(
+            matches!(
+                after_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "injected tick must not open a queue handle while EX is held"
+        );
+        assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        release_ex_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), after_rx)
+            .await
+            .expect("injected tick never passed stream after EX")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), injected)
+            .await
+            .expect("injected same-daemon tick did not finish")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if fixture
+                    .store
+                    .request_by_id(&fixture.q1.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same queued ID never finished after EX");
+        assert_reclaimed_fifo(&fixture, old_incarnation, queue_inode);
+    }
+
+    #[tokio::test]
+    async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
+        use tower::ServiceExt;
+        let (_tmp, store, state, roots, identity) = fixture();
+        let app = router(state.clone());
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/index")
+                .header("host", "127.0.0.1:7331")
+                .header("origin", "http://127.0.0.1:7331")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let ack: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(ack["state"], "queued");
+            assert!(ack["startedAt"].is_null());
+            ids.push(ack["id"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(ids[0], ids[1]);
+        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert!(first.seq < second.seq);
+        assert!(
+            state.jobs.lock().unwrap().jobs.is_empty(),
+            "legacy job map must not own queued work"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if store
+                    .request_by_id(&ids[0])
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                    && store
+                        .request_by_id(&ids[1])
+                        .unwrap()
+                        .unwrap()
+                        .finished_at
+                        .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable FIFO requests did not finish");
+        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert_eq!(
+            (first.state.as_str(), second.state.as_str()),
+            ("done", "done")
+        );
+        let first_pin = first.revision.unwrap();
+        let second_pin = second.revision.unwrap();
+        assert_eq!(
+            first_pin.index_revision, 1,
+            "recovery full reconcile satisfies first head"
+        );
+        assert_eq!(
+            second_pin.index_revision, 2,
+            "second request publishes in FIFO order"
+        );
+        assert_eq!(
+            first_pin.index_generation, second_pin.index_generation,
+            "no second exceptional index replacement"
+        );
+        assert_eq!(store.status().unwrap().revision, second_pin);
+        let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let owner = state.retained_serving_session().unwrap();
+        store.verify_leader_session(&owner).unwrap();
+        assert!(
+            roots.leader(&identity).is_err(),
+            "one held leader fences both terminal writes"
+        );
+        assert!(state.jobs.lock().unwrap().jobs.is_empty());
     }
 
     #[tokio::test]

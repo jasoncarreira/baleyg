@@ -1174,6 +1174,7 @@ async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
 
 fn corrupt_recovery_fixture(
     retain_old: bool,
+    alias_options: bool,
 ) -> (
     tempfile::TempDir,
     Store,
@@ -1204,6 +1205,21 @@ fn corrupt_recovery_fixture(
             .unwrap();
     std::fs::write(&index, b"bad sqlite index header").unwrap();
     let pending = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
+    if alias_options {
+        // The final workspace component is a real directory; only its parent
+        // spelling differs. The queue pins the same captured root inode.
+        let alias = dir.path().join("root-alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        options.workspace_root = alias.join("workspace");
+        assert_ne!(
+            options.workspace_root,
+            std::fs::canonicalize(&root).unwrap()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&options.workspace_root).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
+    }
     let state = http::new(
         pending.clone(),
         options,
@@ -1234,7 +1250,8 @@ async fn finished_index_job(app: &Router, id: &str) -> Value {
 
 #[tokio::test]
 async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_new_leader() {
-    let (_dir, store, state, app, index, roots, identity, old) = corrupt_recovery_fixture(false);
+    let (_dir, store, state, app, index, roots, identity, old) =
+        corrupt_recovery_fixture(false, true);
     assert!(state.retained_serving_session().is_err());
     let bytes = std::fs::read(&index).unwrap();
     let (conflict, rejected) =
@@ -1285,7 +1302,8 @@ async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_
 
 #[tokio::test]
 async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_foreign_reader() {
-    let (_dir, store, state, app, index, roots, identity, old) = corrupt_recovery_fixture(true);
+    let (_dir, store, state, app, index, roots, identity, old) =
+        corrupt_recovery_fixture(true, false);
     let bytes = std::fs::read(&index).unwrap();
     let (conflict, rejected) =
         call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
@@ -1296,17 +1314,30 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
     let reader = roots.index_use_existing(&identity).unwrap();
     let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
-    let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
-    assert_eq!(done["state"], "failed", "{done}");
-    assert_eq!(done["error"]["code"], "storage_busy", "{done}");
-    assert!(state.retained_serving_session().is_err());
+    let id = admitted["id"].as_str().unwrap();
+    let queue = store.request_db_path();
+    let accepted_bytes = std::fs::read(&queue).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.retained_serving_session().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery tick did not release daemon old owner");
+    let (_, blocked) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+    assert_eq!(blocked["id"], id);
+    assert_eq!(blocked["state"], "queued", "{blocked}");
+    assert!(blocked["finishedAt"].is_null());
     assert_eq!(std::fs::read(&index).unwrap(), bytes);
+    assert_eq!(std::fs::read(&queue).unwrap(), accepted_bytes);
     assert!(store.status().is_err());
     drop(reader);
-    let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
-    let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
+    let done = finished_index_job(&app, id).await;
     assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(
+        done["revision"]["indexRevision"], 1,
+        "no duplicate publication"
+    );
     assert_ne!(
         done["revision"]["indexGeneration"],
         json!(old)["indexGeneration"]

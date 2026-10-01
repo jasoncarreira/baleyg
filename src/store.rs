@@ -17,6 +17,28 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestOneShotHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+#[cfg(test)]
+impl std::fmt::Debug for TestOneShotHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TestOneShotHook")
+    }
+}
+#[cfg(test)]
+impl TestOneShotHook {
+    pub(crate) fn set(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.0.lock().unwrap() = Some(Box::new(hook));
+    }
+    pub(crate) fn run(&self) {
+        let hook = self.0.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -25,6 +47,11 @@ pub struct Store {
     recovery_required: Arc<AtomicBool>,
     recovery_disposition: Arc<AtomicU8>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
+    request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
+    #[cfg(test)]
+    test_queue_select_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    test_exclusive_recovery_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_finish_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -36,6 +63,7 @@ enum RecoveryDisposition {
     Ready = 0,
     Rebuild = 1,
     RecreatePending = 2,
+    RootReplaced = 3,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetadataColumn {
@@ -1859,6 +1887,11 @@ impl Store {
             recovery_required: Arc::new(AtomicBool::new(false)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             pending_request_completion: Arc::new(Mutex::new(None)),
+            request_file_witness: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_queue_select_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1878,6 +1911,10 @@ impl Store {
             Ok(()) => Ok(store),
             Err(error) if recovery_class(&error) == RecoveryClass::RecreatePending => {
                 store.mark_recovery(RecoveryDisposition::RecreatePending);
+                Ok(store)
+            }
+            Err(error) if error.to_string() == "root_changed: index root identity mismatch" => {
+                store.mark_recovery(RecoveryDisposition::RootReplaced);
                 Ok(store)
             }
             Err(error) => Err(error),
@@ -2029,8 +2066,10 @@ impl Store {
         mut at: impl FnMut(ActivationStage) -> Result<()>,
     ) -> Result<IndexPin> {
         ensure!(
-            self.disposition() == RecoveryDisposition::RecreatePending
-                && self.recovery_required.load(Ordering::Acquire),
+            matches!(
+                self.disposition(),
+                RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
+            ) && self.recovery_required.load(Ordering::Acquire),
             "recovery_required: exceptional recreation not classified"
         );
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
@@ -2068,10 +2107,25 @@ impl Store {
                 }
             }
         };
-        ensure!(
-            cause == RecoveryClass::RecreatePending,
-            "recovery_required: corruption/NOTADB authority not verified"
-        );
+        if self.disposition() == RecoveryDisposition::RootReplaced {
+            // A new inode at the same canonical spelling is a root transition, not
+            // corruption. Recheck the old derived index under EX before replacing it.
+            let db = open_index(&path, false)?;
+            match self.recovery_baseline(&db) {
+                Err(error) if error.to_string() == "root_changed: index root identity mismatch" => {
+                }
+                _ => anyhow::bail!("root_changed: replacement authority changed"),
+            }
+            ensure!(
+                journal.is_none(),
+                "recovery_required: root replacement has hot journal"
+            );
+        } else {
+            ensure!(
+                cause == RecoveryClass::RecreatePending,
+                "recovery_required: corruption/NOTADB authority not verified"
+            );
+        }
         old.verify()?;
         leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
         let mut stage = self.create_staged_index(leader)?;
@@ -2285,7 +2339,8 @@ impl Store {
         match self.recovery_disposition.load(Ordering::Acquire) {
             0 => RecoveryDisposition::Ready,
             1 => RecoveryDisposition::Rebuild,
-            _ => RecoveryDisposition::RecreatePending,
+            2 => RecoveryDisposition::RecreatePending,
+            _ => RecoveryDisposition::RootReplaced,
         }
     }
     fn mark_recovery(&self, disposition: RecoveryDisposition) {
@@ -2295,7 +2350,10 @@ impl Store {
     }
     fn ensure_not_recreate_pending(&self) -> Result<()> {
         ensure!(
-            self.disposition() != RecoveryDisposition::RecreatePending,
+            !matches!(
+                self.disposition(),
+                RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
+            ),
             "recovery_required: exceptional index recovery deferred"
         );
         Ok(())
@@ -2668,6 +2726,9 @@ impl Store {
             RecoveryDisposition::RecreatePending => {
                 anyhow::bail!("recovery_required: exceptional index recovery deferred")
             }
+            RecoveryDisposition::RootReplaced => {
+                anyhow::bail!("recovery_required: replacement-root index recovery deferred")
+            }
         }
     }
     fn read_public_control_status(&self, db: &Connection) -> Result<IndexStatus> {
@@ -2758,9 +2819,20 @@ impl Store {
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
     }
+    pub(crate) fn root_path_replaced(&self) -> Result<bool> {
+        self.identity.root_path_replaced()
+    }
+    pub(crate) fn is_root_replaced(&self) -> bool {
+        self.disposition() == RecoveryDisposition::RootReplaced
+    }
+    pub(crate) fn is_ready_disposition(&self) -> bool {
+        self.disposition() == RecoveryDisposition::Ready
+    }
     pub(crate) fn is_recreate_pending(&self) -> bool {
-        self.disposition() == RecoveryDisposition::RecreatePending
-            && self.recovery_required.load(Ordering::Acquire)
+        matches!(
+            self.disposition(),
+            RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
+        ) && self.recovery_required.load(Ordering::Acquire)
     }
     /// Exceptional entry owns no old protected handle before nonblocking EX.
     /// Return the exact downgraded guard that wrote the replacement marker.
@@ -2773,10 +2845,38 @@ impl Store {
             self.is_recreate_pending(),
             "recovery_required: exceptional recreation not classified"
         );
+        if self.disposition() == RecoveryDisposition::RootReplaced {
+            // The old index is still fenced by the verified leader under SH. Resolve
+            // foreign-root queue rows durably BEFORE attempting index replacement.
+            // Dropping this entire scope releases every local SH and SQLite handle.
+            {
+                let leader = Arc::new(topology::LeaderSession::leader(
+                    self.roots.leader(&self.identity)?,
+                    self.identity.clone(),
+                ));
+                self.verify_leader_session(&leader)?;
+                let index_path = self.roots.index_db(&self.identity);
+                ensure!(
+                    !index_path_present(&index_path.with_file_name("index.db-journal"))?,
+                    "recovery_required: root replacement has hot journal"
+                );
+                let db = open_index(&index_path, false)?;
+                let mismatch = self.recovery_baseline(&db);
+                drop(db);
+                ensure!(
+                    matches!(mismatch, Err(ref error)
+                    if error.to_string() == "root_changed: index root identity mismatch"),
+                    "root_changed: replacement authority changed"
+                );
+                self.fail_changed_root_requests(&leader)?;
+            }
+        }
         let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
         let mut leader = self
             .roots
             .leader_under_exclusive(&self.identity, exclusive)?;
+        #[cfg(test)]
+        self.test_exclusive_recovery_hook.run();
         let pin = self.recreate_index_exclusive(options, &mut leader, cancel)?;
         let session = Arc::new(topology::LeaderSession::leader(
             leader,

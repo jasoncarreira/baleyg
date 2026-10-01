@@ -187,6 +187,21 @@ impl TopologyRoots {
         UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
             .context("incompatible_index: missing or unsafe use lock")
     }
+    /// Root-loss queue transitions still require the existing protected index directory.
+    /// They cannot use the root pathname, which now names a different inode or is absent.
+    pub(crate) fn index_use_existing_without_root(
+        &self,
+        identity: &WorkspaceIdentity,
+    ) -> Result<UseGuard> {
+        for path in [
+            &self.cache,
+            &self.cache.join("indexes"),
+            &self.index_dir(identity),
+        ] {
+            private_dir(path)?;
+        }
+        UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
+    }
     /// Exceptional index replacement starts only after every protected handle closes.
     /// Never create or upgrade a use lock while attempting exclusive admission.
     pub fn index_use_exclusive_existing(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
@@ -532,6 +547,25 @@ impl WorkspaceIdentity {
         }
         self.verify()?;
         Ok(self)
+    }
+    /// Only a proven pathname loss authorizes old-root queue failure. A changed
+    /// workspace marker or an unreadable pathname is not proof of replacement.
+    pub(crate) fn root_path_replaced(&self) -> Result<bool> {
+        let held = self.root_handle.metadata()?;
+        ensure!(
+            (held.dev(), held.ino()) == (self.device, self.inode),
+            "root_changed: captured handle identity changed"
+        );
+        self.root_path_replaced_from(fs::symlink_metadata(&self.root))
+    }
+    fn root_path_replaced_from(&self, named: std::io::Result<fs::Metadata>) -> Result<bool> {
+        match named {
+            Ok(m) => Ok(!m.is_dir()
+                || m.file_type().is_symlink()
+                || (m.dev(), m.ino()) != (self.device, self.inode)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
+        }
     }
     pub fn verify(&self) -> Result<()> {
         let m = fs::symlink_metadata(&self.root).context("root_changed")?;
@@ -924,6 +958,15 @@ fn read_incarnation(file: &File) -> Result<Uuid> {
 }
 
 impl LeaderGuard {
+    pub(crate) fn belongs_to_after_root_loss(
+        &self,
+        leader_path: &Path,
+        use_path: &Path,
+    ) -> Result<()> {
+        ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
+        self.use_guard.belongs_to(use_path, false)?;
+        self.verify()
+    }
     pub fn belongs_to(&self, leader_path: &Path) -> Result<()> {
         ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
         self.verify()
@@ -1019,6 +1062,32 @@ impl LeaderSession {
             }
             Self::Follower(guard) => guard.verify(guard.incarnation),
         }
+    }
+    pub(crate) fn verify_after_root_loss(
+        &self,
+        identity: &WorkspaceIdentity,
+        leader_path: &Path,
+        use_path: &Path,
+    ) -> Result<()> {
+        let Self::Leader {
+            guard,
+            identity: held,
+        } = self
+        else {
+            bail!("storage_busy: follower cannot fail old-root requests");
+        };
+        ensure!(
+            held.root == identity.root
+                && held.root_key == identity.root_key
+                && held.device == identity.device
+                && held.inode == identity.inode,
+            "storage_busy: leader belongs to another root"
+        );
+        ensure!(
+            identity.verify().is_err(),
+            "root_changed: old-root transition requires root loss"
+        );
+        guard.belongs_to_after_root_loss(leader_path, use_path)
     }
     pub fn belongs_to(&self, identity: &WorkspaceIdentity, leader_path: &Path) -> Result<()> {
         let Self::Leader {
@@ -2088,6 +2157,23 @@ mod gc_schema_race_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("incompatible_index")
+        );
+    }
+
+    #[test]
+    fn root_loss_requires_proven_pathname_change_not_arbitrary_io_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap();
+        assert!(!identity.root_path_replaced().unwrap());
+        let denied = identity.root_path_replaced_from(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected metadata refusal",
+        )));
+        assert_eq!(denied.unwrap_err().to_string(), "injected metadata refusal");
+        assert!(
+            identity
+                .root_path_replaced_from(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
+                .unwrap()
         );
     }
 }

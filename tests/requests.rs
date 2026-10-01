@@ -203,3 +203,429 @@ fn hot_journal_rolls_back_before_queue_identity_and_ack() {
     assert_eq!(original.options_json, accepted.options_json);
     assert_eq!(original.state, "queued");
 }
+
+#[test]
+fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let options = IndexOptions::new(root.clone());
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let owner = store.leader_session().unwrap();
+    assert_eq!(store.claim_request(&owner).unwrap().unwrap().id, first.id);
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 2);
+    assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 0);
+    let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+    for id in [first.id, second.id] {
+        let (state, code, finished): (String, String, String) = db
+            .query_row(
+                "SELECT state,error_code,finished_at FROM requests WHERE id=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((state.as_str(), code.as_str()), ("failed", "root_changed"));
+        assert!(!finished.is_empty());
+    }
+    assert!(store.claim_request(&owner).is_err());
+}
+
+#[test]
+fn replacement_root_can_accept_while_old_holder_is_live_then_recover_index_only() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function oldName() {}\n").unwrap();
+    let old = Store::open_for_tests(state.path(), &root).unwrap();
+    let first = old
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    let old_owner = old.leader_session().unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function newName() {}\n").unwrap();
+    let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+    assert!(replacement.status().is_err());
+    let options = IndexOptions::new(root.clone());
+    let second = replacement.enqueue_request(&options, None).unwrap();
+    assert_ne!(first.root_inode, second.root_inode);
+    assert!(
+        replacement.leader_session().is_err(),
+        "old holder still fences new work"
+    );
+    drop(old_owner);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let lock = state
+        .path()
+        .join("cache/indexes")
+        .join(format!("{}.lock", identity.root_key));
+    let independent_reader =
+        baleyg::store::topology::UseGuard::acquire(&lock, false, false).unwrap();
+    let index_path = replacement.request_db_path().with_file_name("index.db");
+    let index_before = fs::read(&index_path).unwrap();
+    let requests_before = fs::read(replacement.request_db_path()).unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error =
+        baleyg::index_coordinator::reconcile_workspace(&replacement, &options, &cancel, |_| {})
+            .unwrap_err();
+    assert!(error.to_string().contains("storage_busy"), "{error:#}");
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    assert_ne!(
+        fs::read(replacement.request_db_path()).unwrap(),
+        requests_before,
+        "root-loss-only failure was durable before EX BUSY"
+    );
+    let db = rusqlite::Connection::open(replacement.request_db_path()).unwrap();
+    let old_code: String = db
+        .query_row(
+            "SELECT error_code FROM requests WHERE id=?1",
+            [&first.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_code, "root_changed");
+    drop(db);
+    drop(independent_reader);
+    let (pin, session) =
+        baleyg::index_coordinator::enqueue_and_wait(&replacement, &options, &cancel).unwrap();
+    assert!(session.is_leader());
+    assert_eq!(
+        replacement
+            .request_by_id(&second.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "done"
+    );
+    assert_eq!(replacement.status().unwrap().revision, pin);
+    let db = rusqlite::Connection::open(replacement.request_db_path()).unwrap();
+    let code: String = db
+        .query_row(
+            "SELECT error_code FROM requests WHERE id=?1",
+            [&first.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(code, "root_changed");
+}
+
+#[test]
+fn unchanged_root_with_changed_workspace_marker_cannot_fail_queue_rows() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let row = store
+        .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
+        .unwrap();
+    let owner = store.leader_session().unwrap();
+    fs::write(
+        root.path().join(".git/baleyg/workspace-id"),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    assert!(store.fail_changed_root_requests(&owner).is_err());
+    let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+    let state: String = db
+        .query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "queued");
+}
+
+#[test]
+fn replacement_rechecks_old_index_under_ex_before_any_rename() {
+    use std::os::unix::fs::MetadataExt;
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let old = Store::open_for_tests(state.path(), &root).unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+    let index = replacement.request_db_path().with_file_name("index.db");
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET root_inode=?1",
+        [fs::metadata(&root).unwrap().ino().to_string()],
+    )
+    .unwrap();
+    drop(db);
+    let before = fs::read(&index).unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error = baleyg::index_coordinator::reconcile_workspace(
+        &replacement,
+        &IndexOptions::new(root),
+        &cancel,
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("replacement authority changed"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(&index).unwrap(), before);
+    drop(old);
+}
+
+#[test]
+fn replacement_queue_write_refusal_preserves_old_index_before_ex() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let old = Store::open_for_tests(state.path(), &root).unwrap();
+    let old_request = old
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+    let index = replacement.request_db_path().with_file_name("index.db");
+    let db = rusqlite::Connection::open(replacement.request_db_path()).unwrap();
+    db.execute_batch("CREATE TRIGGER refuse_root_failure BEFORE UPDATE ON requests WHEN NEW.error_code='root_changed' BEGIN SELECT RAISE(ABORT,'injected queue write failure'); END;").unwrap();
+    drop(db);
+    let index_before = fs::read(&index).unwrap();
+    let queue_before = fs::read(replacement.request_db_path()).unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        baleyg::index_coordinator::reconcile_workspace(
+            &replacement,
+            &IndexOptions::new(root),
+            &cancel,
+            |_| {}
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&index).unwrap(), index_before);
+    assert_eq!(
+        fs::read(replacement.request_db_path()).unwrap(),
+        queue_before
+    );
+    let db = rusqlite::Connection::open(replacement.request_db_path()).unwrap();
+    let state: String = db
+        .query_row(
+            "SELECT state FROM requests WHERE id=?1",
+            [&old_request.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "queued");
+}
+
+#[test]
+fn replacement_refuses_foreign_index_marker_and_sidecars_without_queue_transition() {
+    for foreign in ["marker", "wal", "journal"] {
+        let state = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let old = Store::open_for_tests(state.path(), &root).unwrap();
+        old.enqueue_request(&IndexOptions::new(root.clone()), None)
+            .unwrap();
+        fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+        let index = replacement.request_db_path().with_file_name("index.db");
+        match foreign {
+            "marker" => {
+                let db = rusqlite::Connection::open(&index).unwrap();
+                db.execute("UPDATE index_metadata SET root_spelling='foreign'", [])
+                    .unwrap();
+            }
+            "wal" => fs::write(index.with_file_name("index.db-wal"), b"foreign").unwrap(),
+            _ => fs::write(index.with_file_name("index.db-journal"), b"foreign").unwrap(),
+        }
+        let index_before = fs::read(&index).unwrap();
+        let queue_before = fs::read(replacement.request_db_path()).unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            baleyg::index_coordinator::reconcile_workspace(
+                &replacement,
+                &IndexOptions::new(root),
+                &cancel,
+                |_| {}
+            )
+            .is_err(),
+            "{foreign}"
+        );
+        assert_eq!(fs::read(&index).unwrap(), index_before, "{foreign}");
+        assert_eq!(
+            fs::read(replacement.request_db_path()).unwrap(),
+            queue_before,
+            "{foreign}"
+        );
+        drop(old);
+    }
+}
+
+#[test]
+fn replacement_refuses_missing_or_foreign_queue_without_swapping_index() {
+    for fault in ["missing", "foreign", "incompatible", "empty"] {
+        let state = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let old = Store::open_for_tests(state.path(), &root).unwrap();
+        old.enqueue_request(&IndexOptions::new(root.clone()), None)
+            .unwrap();
+        fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+        let queue = replacement.request_db_path();
+        let index = queue.with_file_name("index.db");
+        match fault {
+            "missing" => fs::remove_file(&queue).unwrap(),
+            "empty" => {
+                fs::remove_file(&queue).unwrap();
+                fs::write(&queue, b"").unwrap();
+            }
+            _ => {
+                let db = rusqlite::Connection::open(&queue).unwrap();
+                if fault == "foreign" {
+                    db.execute("UPDATE queue_identity SET root_key='foreign'", [])
+                        .unwrap();
+                } else {
+                    db.pragma_update(None, "user_version", 2).unwrap();
+                }
+            }
+        }
+        let before_index = fs::read(&index).unwrap();
+        let before_queue = if queue.exists() {
+            Some(fs::read(&queue).unwrap())
+        } else {
+            None
+        };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            baleyg::index_coordinator::reconcile_workspace(
+                &replacement,
+                &IndexOptions::new(root),
+                &cancel,
+                |_| {}
+            )
+            .is_err(),
+            "{fault}"
+        );
+        assert_eq!(fs::read(&index).unwrap(), before_index, "{fault}");
+        assert_eq!(queue.exists(), before_queue.is_some(), "{fault}");
+        if let Some(bytes) = before_queue {
+            assert_eq!(fs::read(&queue).unwrap(), bytes, "{fault}");
+        }
+        drop(old);
+    }
+}
+
+#[test]
+fn root_failure_commit_error_never_authorizes_index_swap() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let old = Store::open_for_tests(state.path(), &root).unwrap();
+    let row = old
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+    let queue = replacement.request_db_path();
+    let index = queue.with_file_name("index.db");
+    let db = rusqlite::Connection::open(&queue).unwrap();
+    db.execute_batch("CREATE TABLE commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE commit_failure(id INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_commit AFTER UPDATE ON requests WHEN NEW.error_code='root_changed' BEGIN INSERT INTO commit_failure(id) VALUES (1); END;").unwrap();
+    drop(db);
+    let before_index = fs::read(&index).unwrap();
+    let before_queue = fs::read(&queue).unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error = baleyg::index_coordinator::reconcile_workspace(
+        &replacement,
+        &IndexOptions::new(root),
+        &cancel,
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("FOREIGN KEY"), "{error:#}");
+    assert_eq!(fs::read(&index).unwrap(), before_index);
+    assert_eq!(fs::read(&queue).unwrap(), before_queue);
+    let db = rusqlite::Connection::open(&queue).unwrap();
+    let state: String = db
+        .query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "queued");
+}
+
+#[test]
+fn live_old_holder_rejects_replaced_same_key_queue_inode() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    store
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    let owner = store.leader_session().unwrap();
+    let queue = store.request_db_path();
+    let copy = queue.with_file_name("requests.db.tmp-copy");
+    fs::copy(&queue, &copy).unwrap();
+    fs::rename(&copy, &queue).unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    let index = queue.with_file_name("index.db");
+    let before = fs::read(&index).unwrap();
+    let error = store.fail_changed_root_requests(&owner).unwrap_err();
+    assert!(error.to_string().contains("inode replaced"), "{error:#}");
+    assert_eq!(fs::read(&index).unwrap(), before);
+}
+
+#[test]
+fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let old = Store::open_for_tests(state.path(), &root).unwrap();
+    old.enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    let owner = old.leader_session().unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+    let queue = replacement.request_db_path();
+    let index = queue.with_file_name("index.db");
+    let index_before = fs::read(&index).unwrap();
+    fs::remove_file(&queue).unwrap();
+    assert!(
+        replacement
+            .enqueue_request(&IndexOptions::new(root.clone()), None)
+            .is_err()
+    );
+    assert!(
+        !queue.exists(),
+        "replacement ACK must not create an empty queue"
+    );
+    assert_eq!(fs::read(&index).unwrap(), index_before);
+    drop(owner);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        baleyg::index_coordinator::reconcile_workspace(
+            &replacement,
+            &IndexOptions::new(root),
+            &cancel,
+            |_| {}
+        )
+        .is_err()
+    );
+    assert!(!queue.exists());
+    assert_eq!(fs::read(&index).unwrap(), index_before);
+}
