@@ -153,6 +153,47 @@ pub fn drain_requests_observed(
     Ok(completed)
 }
 
+fn retryable_cli_completion_error(error: &anyhow::Error) -> bool {
+    if error.to_string().starts_with("storage_busy") {
+        return true;
+    }
+    error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(info, _))
+                if matches!(info.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+    })
+}
+
+/// The CLI is its own sole queue driver. A transient completion failure must be
+/// resolved while this verified leader is still held, not handed to a nonexistent
+/// daemon or a future command. Never repeat the native publication for that head.
+fn retry_cli_recorded_completion(
+    store: &Store,
+    session: &LeaderSession,
+    cancel: &CancelFlag,
+    initial: anyhow::Error,
+) -> Result<()> {
+    if !store.has_recorded_completion(session) || !retryable_cli_completion_error(&initial) {
+        return Err(initial);
+    }
+    loop {
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "index wait interrupted; accepted request remains queued"
+        );
+        store.verify_leader_session(session)?;
+        match store.retry_recorded_completion(session) {
+            Ok(true) => return Ok(()),
+            Ok(false) => anyhow::bail!("storage_busy: cached completion disappeared"),
+            Err(error) if retryable_cli_completion_error(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// One explicit CLI command commits before waiting. A free lock requires a complete
 /// takeover reconciliation before any queued request is claimed.
 pub fn enqueue_and_wait(
@@ -207,6 +248,8 @@ pub fn enqueue_and_wait(
                     let startup =
                         IndexJobCoordinator::prepare_with_session(store, None, session.clone())?;
                     let takeover_pin = startup.run(&reconcile_options, cancel, |_| {})?;
+                    // Retain the verified owner before any terminal write can fail.
+                    held = Some(session.clone());
                     if let Some(head) = earliest
                         && head.expected.is_none()
                         && head
@@ -218,16 +261,24 @@ pub fn enqueue_and_wait(
                             claimed.id == head.id,
                             "storage_busy: FIFO head changed during takeover"
                         );
-                        store.record_and_finish_request(&session, &claimed, Ok(takeover_pin))?;
+                        if let Err(error) =
+                            store.record_and_finish_request(&session, &claimed, Ok(takeover_pin))
+                        {
+                            retry_cli_recorded_completion(store, &session, cancel, error)?;
+                        }
                     }
-                    held = Some(session);
                 }
                 Err(error) if format!("{error:#}").contains("storage_busy") => {}
                 Err(error) => return Err(error),
             }
         }
         if let Some(session) = &held {
-            drain_requests(store, session)?;
+            loop {
+                match drain_requests(store, session) {
+                    Ok(_) => break,
+                    Err(error) => retry_cli_recorded_completion(store, session, cancel, error)?,
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -626,5 +677,70 @@ mod queue_completion_retry_tests {
             q2.revision.unwrap().index_revision,
             baseline.index_revision + 2
         );
+    }
+    #[test]
+    fn cli_takeover_fast_path_retries_cached_first_completion_before_next_head() {
+        let (_tmp, store, options, baseline, owner) = fixture();
+        drop(owner);
+        let q1 = store.enqueue_request(&options, None).unwrap();
+        let q2 = store.enqueue_request(&options, None).unwrap();
+        store.inject_queue_finish_failure(false);
+        // The one CLI caller accepts Q3 and must also drain Q1/Q2. There is no
+        // daemon, restart, extra waiter or manual second drain.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (returned, held) = enqueue_and_wait(&store, &options, &cancel).unwrap();
+        assert!(held.is_leader());
+        let first = store.request_by_id(&q1.id).unwrap().unwrap();
+        let second = store.request_by_id(&q2.id).unwrap().unwrap();
+        assert_eq!(
+            (first.state.as_str(), second.state.as_str()),
+            ("done", "done")
+        );
+        assert!(q1.seq < q2.seq);
+        assert_eq!(
+            first.revision.unwrap().index_revision,
+            baseline.index_revision + 1
+        );
+        assert_eq!(
+            second.revision.unwrap().index_revision,
+            baseline.index_revision + 2
+        );
+        assert_eq!(returned.index_revision, baseline.index_revision + 3);
+        assert_eq!(store.status().unwrap().revision, returned);
+    }
+
+    #[test]
+    fn cli_ordinary_drain_retries_cached_completion_without_republishing() {
+        let (_tmp, store, options, baseline, owner) = fixture();
+        drop(owner);
+        // Pin Q1 to the pair the mandatory takeover capture will produce, so
+        // the unpinned-head fast path is skipped and ordinary drain executes Q1.
+        let takeover_pin = IndexPin {
+            index_generation: baseline.index_generation,
+            index_revision: baseline.index_revision + 1,
+        };
+        let q1 = store.enqueue_request(&options, Some(takeover_pin)).unwrap();
+        let q2 = store.enqueue_request(&options, None).unwrap();
+        store.inject_queue_finish_failure(false);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (returned, held) = enqueue_and_wait(&store, &options, &cancel).unwrap();
+        assert!(held.is_leader());
+        let first = store.request_by_id(&q1.id).unwrap().unwrap();
+        let second = store.request_by_id(&q2.id).unwrap().unwrap();
+        assert_eq!(
+            (first.state.as_str(), second.state.as_str()),
+            ("done", "done")
+        );
+        assert!(q1.seq < q2.seq);
+        assert_eq!(
+            first.revision.unwrap().index_revision,
+            baseline.index_revision + 2
+        );
+        assert_eq!(
+            second.revision.unwrap().index_revision,
+            baseline.index_revision + 3
+        );
+        assert_eq!(returned.index_revision, baseline.index_revision + 4);
+        assert_eq!(store.status().unwrap().revision, returned);
     }
 }

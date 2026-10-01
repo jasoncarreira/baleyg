@@ -365,6 +365,16 @@ impl Store {
         Ok(())
     }
 
+    /// A CLI may retry only its own cached completion while holding that same leader.
+    /// Do not convert an ordinary claim/read/publish error into an unbounded retry.
+    pub(crate) fn has_recorded_completion(&self, session: &LeaderSession) -> bool {
+        self.pending_request_completion
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|pending| pending.incarnation == session.incarnation().to_string())
+    }
+
     /// Resolve the one in-flight FIFO head before claiming any newer row. A terminal
     /// reread handles an ambiguous SQLite COMMIT; it must match our cached result.
     pub(crate) fn retry_recorded_completion(&self, session: &LeaderSession) -> Result<bool> {
