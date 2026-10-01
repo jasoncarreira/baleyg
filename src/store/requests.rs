@@ -374,6 +374,21 @@ impl Store {
             self.verify_old_root_queue_leader(session)?;
         } else {
             self.verify_leader_session(session)?;
+            // Before the first durable request, a fresh Ready index has no queue.
+            // RootReplaced must never use this exception: its old ACKs may exist.
+            if !self.is_root_replaced() {
+                match fs::symlink_metadata(self.request_db_path()) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ensure!(
+                            self.request_file_witness.lock().unwrap().is_none(),
+                            "incompatible_queue: accepted requests.db disappeared"
+                        );
+                        return Ok(0);
+                    }
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {}
+                }
+            }
         }
         let (_guard, mut db) = self.request_connection_for_root_loss(old_root, true)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;

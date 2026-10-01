@@ -207,6 +207,38 @@ fn retry_cli_recorded_completion(
     }
 }
 
+/// A recovery full capture can satisfy the FIFO head when it used exactly that
+/// unpinned request's options. Never publish the same capture a second time.
+pub(crate) fn finish_reconciled_head(
+    store: &Store,
+    session: &Arc<LeaderSession>,
+    options: &IndexOptions,
+    pin: IndexPin,
+) -> Result<()> {
+    let Some(head) = store.earliest_unfinished_request()? else {
+        return Ok(());
+    };
+    let Ok(selected) = head.options(std::path::Path::new(store.workspace_root())) else {
+        return Ok(());
+    };
+    if head.expected.is_some()
+        || selected.workspace_root != options.workspace_root
+        || selected.scip_path != options.scip_path
+        || selected.manifest_path != options.manifest_path
+        || selected.max_file_bytes != options.max_file_bytes
+    {
+        return Ok(());
+    }
+    if let Some(claimed) = store.claim_request(session)? {
+        ensure!(
+            claimed.id == head.id,
+            "storage_busy: FIFO head changed during recovery"
+        );
+        store.record_and_finish_request(session, &claimed, Ok(pin))?;
+    }
+    Ok(())
+}
+
 /// One explicit CLI command commits before waiting. A free lock requires a complete
 /// takeover reconciliation before any queued request is claimed.
 pub fn enqueue_and_wait(
@@ -247,9 +279,12 @@ pub fn enqueue_and_wait(
         );
         if held.is_none() && store.is_recreate_pending() {
             match store.recreate_pending_leader_session(options, cancel) {
-                Ok((_, session)) => {
+                Ok((pin, session)) => {
                     store.fail_changed_root_requests(&session)?;
-                    held = Some(session);
+                    held = Some(session.clone());
+                    if let Err(error) = finish_reconciled_head(store, &session, options, pin) {
+                        retry_cli_recorded_completion(store, &session, cancel, error)?;
+                    }
                 }
                 Err(error)
                     if error.chain().any(|cause| {

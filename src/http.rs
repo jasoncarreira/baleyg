@@ -355,9 +355,15 @@ impl DaemonState {
                 .store
                 .recreate_pending_leader_session(&self.options, &Arc::new(AtomicBool::new(false)))
             {
-                Ok((_, session)) => {
+                Ok((pin, session)) => {
                     self.store.fail_changed_root_requests(&session)?;
-                    *self.serving_session.lock().unwrap() = Some(session);
+                    *self.serving_session.lock().unwrap() = Some(session.clone());
+                    crate::index_coordinator::finish_reconciled_head(
+                        &self.store,
+                        &session,
+                        &self.options,
+                        pin,
+                    )?;
                 }
                 Err(error)
                     if error.chain().any(|cause| {
