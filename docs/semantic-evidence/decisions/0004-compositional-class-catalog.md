@@ -34,7 +34,7 @@ The catalog is built in two steps.
      - the **per-file** limits: `FILE_BYTES` (2 MiB), `FILE_CLASSES` (1,000), `FILE_REFS` (8,192), `MEMBERS` (256 per class), `VISITS`, `DEPTH`, `TEXT` (2,048 bytes per string), and the per-declaration type-parameter limits.
    - It reads no workspace-wide budget.
    - Its result is the file's ordered classes, each with its members and relations, its own warnings, and the byte, record and text sizes that the global caps charge.
-   - The result is stored with the file's document version and reused for as long as that version is.
+   - The result is stored with the file's **graph projection**, not just its document version, because the measured `Symbol`s carry captured SCIP display labels from outside the file. It is reused for as long as that projection is.
 2. **Per-revision composition.**
    - Composition walks the revision's per-file results in path order, with classes in `(path, start_byte, id)` order.
    - It applies the workspace-wide caps to those **complete** results, one class at a time:
@@ -45,13 +45,18 @@ The catalog is built in two steps.
    - Composition reads only stored per-file results. It never re-parses, and it runs in memory, bounded by the caps.
    - Its output is one **class projection per owning path**, plus the revision's catalog `warnings` and `truncated`.
 
-`Catalog::build(files, nodes, cancel)` remains the full-build reference. It is defined as composition over per-file extraction of every file, and it is what #67's independent full-native snapshot uses.
+`Catalog::build(files, nodes, cancel)` remains the full-build reference. It is defined as composition over per-file extraction of every file, and it is what #67's independent full-native snapshot uses. #67's full-snapshot parity for classes is measured against this definition, not against the current one-pass output.
+
+## Alternatives rejected
+
+- **Keep the one-pass output exactly, and replay or re-parse to reproduce it.** Reproducing today's mid-class budget cutoffs and warning order on a delta needs every earlier file's extraction state. In practice that means re-parsing every Java/Python file, or replaying stored per-file extraction traces, on every publication. That is O(workspace) work per edit, against a p95 that includes class projection.
+- **Exclude classes from parity or from the p95, or let class rows lag behind.** That contradicts #67's acceptance criteria.
 
 ## Consequences
 
 - **Exact parity by construction.** Delta publication and the full rebuild run the same two functions over the same inputs.
 - **Delta writes.** An edit re-extracts only the changed files. Composition then rewrites only the per-path projections whose content changed: normally just the edited file's. Another path's projection changes only when a cap boundary moves across it.
-- **Storage.** Per-file results live on the document version and per-path projections are shared across revisions, so an unchanged file's class rows are stored once.
+- **Storage.** Per-file results live on the graph projection and per-document class projections are shared across revisions, so an unchanged file's class rows are stored once.
 - **Future cross-file resolution** (binding relation targets across files) would belong in composition, and a target change would rewrite the dependent path's projection. Adding it is a separate decision.
 
 ## Behaviour change
@@ -73,7 +78,7 @@ Below every workspace-wide cap, output is identical to the current build. At a c
 
 - **`src/classes.rs`.** Split into a per-file extraction (`extract_file`) and composition (`compose`). `Catalog::build` becomes `compose` over `extract_file`. Global counters move out of extraction and into composition.
 - **`src/store.rs` (#67 v8).**
-  - The per-file result is stored on the document version.
+  - The per-file result is stored on the document's graph projection.
   - Per-path class projections (`class_projections`, `classes`, `class_relations`) are named by each revision's manifest.
   - The catalog `warnings` and `truncated` move to the revision header.
   - Composition runs before the publication transaction, and the transaction writes only new projections.
