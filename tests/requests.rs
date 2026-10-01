@@ -467,3 +467,123 @@ fn replacement_refuses_foreign_index_marker_and_sidecars_without_queue_transitio
         drop(old);
     }
 }
+
+#[test]
+fn replacement_refuses_missing_or_foreign_queue_without_swapping_index() {
+    for fault in ["missing", "foreign", "incompatible", "empty"] {
+        let state = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let old = Store::open_for_tests(state.path(), &root).unwrap();
+        old.enqueue_request(&IndexOptions::new(root.clone()), None)
+            .unwrap();
+        fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+        let queue = replacement.request_db_path();
+        let index = queue.with_file_name("index.db");
+        match fault {
+            "missing" => fs::remove_file(&queue).unwrap(),
+            "empty" => {
+                fs::remove_file(&queue).unwrap();
+                fs::write(&queue, b"").unwrap();
+            }
+            _ => {
+                let db = rusqlite::Connection::open(&queue).unwrap();
+                if fault == "foreign" {
+                    db.execute("UPDATE queue_identity SET root_key='foreign'", [])
+                        .unwrap();
+                } else {
+                    db.pragma_update(None, "user_version", 2).unwrap();
+                }
+            }
+        }
+        let before_index = fs::read(&index).unwrap();
+        let before_queue = if queue.exists() {
+            Some(fs::read(&queue).unwrap())
+        } else {
+            None
+        };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            baleyg::index_coordinator::reconcile_workspace(
+                &replacement,
+                &IndexOptions::new(root),
+                &cancel,
+                |_| {}
+            )
+            .is_err(),
+            "{fault}"
+        );
+        assert_eq!(fs::read(&index).unwrap(), before_index, "{fault}");
+        assert_eq!(queue.exists(), before_queue.is_some(), "{fault}");
+        if let Some(bytes) = before_queue {
+            assert_eq!(fs::read(&queue).unwrap(), bytes, "{fault}");
+        }
+        drop(old);
+    }
+}
+
+#[test]
+fn root_failure_commit_error_never_authorizes_index_swap() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let old = Store::open_for_tests(state.path(), &root).unwrap();
+    let row = old
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let replacement = Store::open_for_tests(state.path(), &root).unwrap();
+    let queue = replacement.request_db_path();
+    let index = queue.with_file_name("index.db");
+    let db = rusqlite::Connection::open(&queue).unwrap();
+    db.execute_batch("CREATE TABLE commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE commit_failure(id INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_commit AFTER UPDATE ON requests WHEN NEW.error_code='root_changed' BEGIN INSERT INTO commit_failure(id) VALUES (1); END;").unwrap();
+    drop(db);
+    let before_index = fs::read(&index).unwrap();
+    let before_queue = fs::read(&queue).unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error = baleyg::index_coordinator::reconcile_workspace(
+        &replacement,
+        &IndexOptions::new(root),
+        &cancel,
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("FOREIGN KEY"), "{error:#}");
+    assert_eq!(fs::read(&index).unwrap(), before_index);
+    assert_eq!(fs::read(&queue).unwrap(), before_queue);
+    let db = rusqlite::Connection::open(&queue).unwrap();
+    let state: String = db
+        .query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "queued");
+}
+
+#[test]
+fn live_old_holder_rejects_replaced_same_key_queue_inode() {
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    store
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    let owner = store.leader_session().unwrap();
+    let queue = store.request_db_path();
+    let copy = queue.with_file_name("requests.db.tmp-copy");
+    fs::copy(&queue, &copy).unwrap();
+    fs::rename(&copy, &queue).unwrap();
+    fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+    let index = queue.with_file_name("index.db");
+    let before = fs::read(&index).unwrap();
+    let error = store.fail_changed_root_requests(&owner).unwrap_err();
+    assert!(error.to_string().contains("inode replaced"), "{error:#}");
+    assert_eq!(fs::read(&index).unwrap(), before);
+}

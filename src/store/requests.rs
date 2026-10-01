@@ -152,9 +152,13 @@ impl Store {
         self.roots.requests_db(&self.identity)
     }
     fn request_connection(&self) -> Result<(UseGuard, Connection)> {
-        self.request_connection_for_root_loss(false)
+        self.request_connection_for_root_loss(false, false)
     }
-    fn request_connection_for_root_loss(&self, old_root: bool) -> Result<(UseGuard, Connection)> {
+    fn request_connection_for_root_loss(
+        &self,
+        old_root: bool,
+        existing_only: bool,
+    ) -> Result<(UseGuard, Connection)> {
         if !old_root {
             self.identity.verify()?;
         }
@@ -168,7 +172,7 @@ impl Store {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(!existing_only)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)?;
@@ -197,6 +201,10 @@ impl Store {
         // root singleton and quick_check before interpreting any row.
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
+            ensure!(
+                !existing_only,
+                "incompatible_queue: missing initialized queue schema"
+            );
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let locked_version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
             if locked_version == 0 {
@@ -225,6 +233,23 @@ impl Store {
         );
         let check: String = db.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
         ensure!(check == "ok", "incompatible_queue: integrity check failed");
+        // Retain an in-process inode witness across all Store clones. A fresh
+        // process relies on the durable queue singleton, not a guessed inode.
+        let current = fs::symlink_metadata(&path)?;
+        ensure!(
+            current.is_file()
+                && !current.file_type().is_symlink()
+                && (current.dev(), current.ino()) == (metadata.dev(), metadata.ino()),
+            "unsafe requests.db changed during open"
+        );
+        let mut witness = self.request_file_witness.lock().unwrap();
+        let current_inode = (current.dev(), current.ino());
+        ensure!(
+            witness.is_none_or(|prior| prior == current_inode),
+            "incompatible_queue: requests.db inode replaced"
+        );
+        *witness = Some(current_inode);
+        drop(witness);
         if !old_root {
             self.identity.verify()?;
         }
@@ -348,7 +373,7 @@ impl Store {
         } else {
             self.verify_leader_session(session)?;
         }
-        let (_guard, mut db) = self.request_connection_for_root_loss(old_root)?;
+        let (_guard, mut db) = self.request_connection_for_root_loss(old_root, true)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if old_root {
             self.verify_old_root_queue_leader(session)?;
@@ -383,12 +408,9 @@ impl Store {
         } else {
             self.verify_leader_session(session)?;
         }
-        if let Err(error) = tx.commit() {
-            // A failed COMMIT can be ambiguous. Never proceed to EX unless every
-            // selected row is durably terminal under this exact incarnation.
-            self.attest_changed_root_rows(&db, &affected, session)?;
-            let _ = error;
-        }
+        // A failed COMMIT is ambiguous even if this Connection can reread its
+        // writes. Never advance to EX on a result without a successful COMMIT.
+        tx.commit()?;
         self.attest_changed_root_rows(&db, &affected, session)?;
         Ok(changed)
     }

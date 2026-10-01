@@ -25,6 +25,7 @@ pub struct Store {
     recovery_required: Arc<AtomicBool>,
     recovery_disposition: Arc<AtomicU8>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
+    request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
     #[cfg(test)]
     test_queue_finish_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -1860,6 +1861,7 @@ impl Store {
             recovery_required: Arc::new(AtomicBool::new(false)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             pending_request_completion: Arc::new(Mutex::new(None)),
+            request_file_witness: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
