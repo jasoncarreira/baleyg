@@ -19,6 +19,7 @@ import {
   orderedEnvelope,
 } from "../record-check/measurement.mjs";
 import { registerControls, runControl } from "./mutations.mjs";
+import { validate } from "../formats.mjs";
 
 const root = fileURLToPath(
   new URL(
@@ -79,7 +80,10 @@ test("example anchor snapshots parse as native JavaScript scripts; duplicate exp
 
 // Expected IDs and bytes are independently pinned from the literal source and
 // #22 domain-separated canonical digest, not copied from a checker result.
-test("example source bytes, immutable IDs and captured revision-local occurrences", () => {
+// The occ:v2 call ID was independently recomputed with Python hashlib from
+// unchanged.js bytes (9acebf74...), the empty-inventory JavaScript extraction
+// context (6c408070...), native producer `native`/`1` and owner `same`.
+test("example source bytes, immutable IDs and per-document occurrences", () => {
   assert.equal(
     records.declarations.find(
       (row) => row.revisionId === "r2" && row.name === "same",
@@ -92,14 +96,23 @@ test("example source bytes, immutable IDs and captured revision-local occurrence
     ).syntaxId,
     "sid:v1:f2b6e998da22cfa687148e62362a00e4",
   );
+  const unchangedCall = (revisionId) =>
+    records.calls.find(
+      (row) =>
+        row.revisionId === revisionId && row.document.path === "src/unchanged.js",
+    );
   assert.equal(
-    records.calls.find((row) => row.revisionId === "r2").id,
-    "occ:v1:56fac677947ade31ace83067fd89c569",
+    unchangedCall("r2").id,
+    "occ:v2:fc90c768b3c1881e75447f9a9837f921",
   );
+  // Decision 0003: byte-identical unchanged.js keeps its occurrence ID across
+  // revisions, while each record and its proof remain revision-scoped.
+  assert.equal(unchangedCall("r1").id, unchangedCall("r2").id);
   assert.notEqual(
-    records.calls.find((row) => row.revisionId === "r1").id,
-    records.calls.find((row) => row.revisionId === "r2").id,
+    unchangedCall("r1").provenanceId,
+    unchangedCall("r2").provenanceId,
   );
+  assert.ok(records.calls.every((row) => !row.id.startsWith("occ:v1:")));
   assert.equal(
     fixture.revisions
       .get(JSON.stringify(["main", "r1"]))
@@ -117,6 +130,95 @@ test("example source bytes, immutable IDs and captured revision-local occurrence
     fixture.revisionChronology.get("main").map((row) => row.id),
     ["r0", "r1", "r2"],
   );
+});
+
+// Decision 0003 fail-closed precondition: no occ:v2 ID is minted (by the
+// normalizer) or re-derived (by the independent checker) unless the native
+// producer's declared inventory is explicit, known, sorted, unique, and each
+// component resolves to an authenticated capture of the pinned revision.
+test("undeclared, unknown, duplicate or unauthenticated extraction inventory fails closed", () => {
+  const variant = (mutate) => {
+    const loaded = { ...fixture, native: structuredClone(fixture.native) };
+    mutate(loaded);
+    return loaded;
+  };
+  const omitted = variant((x) => delete x.native.extractionInputs);
+  for (const run of [normalizeFixture, (x) => checkMeasurement(x, records)])
+    assert.throws(
+      () => run(omitted),
+      (e) => e.assertion === "FORMAT.SHAPE" && /extractionInputs/.test(e.field),
+    );
+  for (const inputs of [["source"], ["config", "config"], ["toolchain", "config"]]) {
+    const bad = variant((x) => (x.native.extractionInputs = inputs));
+    if (inputs[0] === "source")
+      assert.throws(() => normalizeFixture(bad), /FORMAT/);
+    else
+      for (const run of [normalizeFixture, (x) => checkMeasurement(x, records)])
+        assert.throws(
+          () => run(bad),
+          (e) =>
+            e.assertion === "IDENTITY.EXTRACTION_CONTEXT" &&
+            e.field === "extractionInputs",
+          inputs.join(),
+        );
+  }
+  const unauthenticated = variant((x) => {
+    x.native.extractionInputs = ["config"];
+    x.fixture = {
+      ...x.fixture,
+      captures: x.fixture.captures.filter((c) => c.kind !== "config"),
+    };
+  });
+  for (const run of [normalizeFixture, (x) => checkMeasurement(x, records)])
+    assert.throws(
+      () => run(unauthenticated),
+      (e) =>
+        e.assertion === "IDENTITY.EXTRACTION_CONTEXT" &&
+        e.field === "extractionInputs",
+    );
+  // A declared, authenticated config component is a different context, so it
+  // re-identifies every occurrence; the published [] records then fail.
+  const config = variant((x) => (x.native.extractionInputs = ["config"]));
+  const reidentified = normalizeFixture(config).records;
+  assert.equal(reidentified.calls.length, records.calls.length);
+  for (const [i, row] of reidentified.calls.entries())
+    assert.notEqual(row.id, records.calls[i].id);
+  assert.throws(
+    () => checkMeasurement(config, records),
+    (e) => e.assertion === "RECORDS.MEMBERSHIP",
+  );
+});
+
+// Owner ruling on Decision 0003: rows published under the withdrawn
+// revision-bound occ:v1 identity must not pass the occ:v2 checker, neither with
+// their literal v1 spelling nor with the v1 digest re-labelled as occ:v2.
+test("withdrawn occ:v1 rows and v1-derived values are rejected by the occ:v2 checker", () => {
+  // Formerly published r2 unchanged.js call (v1 bundle 676d58ad...).
+  const v1 = "56fac677947ade31ace83067fd89c569";
+  const call = (rows) =>
+    rows.calls.find(
+      (row) => row.revisionId === "r2" && row.document.path === "src/unchanged.js",
+    );
+  assert.equal(validate("Call", call(records)), undefined);
+  for (const [id, wrongSpelling] of [
+    [`occ:v1:${v1}`, true],
+    [`occ:v2:${v1}`, false],
+  ]) {
+    const mutated = structuredClone(records);
+    Object.assign(call(mutated), { id, provenanceId: `native:r2:${id}` });
+    mutated.calls = orderedEnvelope("calls", mutated.calls);
+    if (wrongSpelling)
+      assert.throws(
+        () => validate("Call", call(mutated)),
+        (e) => e.assertion === "FORMAT.SHAPE" && e.field === "Call.id",
+      );
+    else validate("Call", call(mutated));
+    assert.throws(
+      () => checkMeasurement(fixture, mutated),
+      (e) => e.assertion === "RECORDS.MEMBERSHIP" && e.field === "calls",
+      id,
+    );
+  }
 });
 
 test("authored graph answers select latest declaration proofs, never old occurrences", () => {

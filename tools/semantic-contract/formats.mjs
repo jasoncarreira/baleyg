@@ -68,7 +68,7 @@ function walk(spec, value, path) {
     if (
       spec === "occurrenceId" &&
       typeof value === "string" &&
-      /^occ:v1:[a-f0-9]{32}$/.test(value)
+      /^occ:v2:[a-f0-9]{32}$/.test(value)
     )
       return;
     if (

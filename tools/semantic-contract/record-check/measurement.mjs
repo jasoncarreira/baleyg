@@ -115,9 +115,10 @@ function witnesses(row, source, within, encoding) {
     if (!seen.has(leaf.field))
       reject("MEASUREMENT.WITNESS", leaf.field, "missing source witness");
 }
+// Decision 0003: occurrence identity is v2; every other domain stays v1.
 function hash(domain, input) {
   return createHash("sha256")
-    .update(`baleyg.${domain}.v1\0`)
+    .update(`baleyg.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
     .update(bytes(input))
     .digest("hex");
 }
@@ -210,7 +211,7 @@ export function checkMeasurement(
     const value = handleDigest(domain, input);
     if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value))
       reject("ID.SOURCE", "id", "digest must be a full lowercase SHA-256 hash");
-    const id = `${domain === "syntax" ? "sid" : "occ"}:v1:${value.slice(0, 32)}`;
+    const id = `${domain === "syntax" ? "sid:v1" : "occ:v2"}:${value.slice(0, 32)}`;
     const descriptor = hex(input),
       prior = handles.get(id);
     if (prior !== undefined && prior !== descriptor)
@@ -226,6 +227,50 @@ export function checkMeasurement(
   if (!producer)
     reject("MEASUREMENT.OWNER", "producerId", "native producer not admitted");
   const encoding = producer.positionEncoding;
+  // Independently authenticate the declared extraction-input inventory before
+  // any occurrence ID is re-derived. No inventory, an unknown/unsorted/duplicate
+  // component, or one without an authenticated capture fails closed.
+  const contextFields = {
+    config: "configHash",
+    dependency: "dependencyHash",
+    toolchain: "toolchainHash",
+  };
+  const inventory = native.extractionInputs;
+  inventory.forEach((name, i) => {
+    if (!Object.hasOwn(contextFields, name) || (i && ascii(inventory[i - 1], name) >= 0))
+      reject(
+        "IDENTITY.EXTRACTION_CONTEXT",
+        "extractionInputs",
+        "undeclared, unsorted or duplicate extraction component",
+      );
+  });
+  function occurrenceContext(row) {
+    const revision = loaded.revisions.get(
+      JSON.stringify([row.document.sourceSetId, row.revisionId]),
+    );
+    const { document } = sourceFor(loaded, row);
+    const components = inventory.map((name) => {
+      const value = revision[contextFields[name]];
+      if (
+        !loaded.fixture.captures.some((x) => x.kind === name && x.hash === value)
+      )
+        reject(
+          "IDENTITY.EXTRACTION_CONTEXT",
+          "extractionInputs",
+          `component ${name} lacks an authenticated capture`,
+        );
+      return { name, hash: value };
+    });
+    return {
+      contentHash: document.contentHash,
+      extractionContext: createHash("sha256")
+        .update("baleyg.extraction-context.v1\0")
+        .update(bytes({ language: row.document.language, components }))
+        .digest("hex"),
+      nativeProducerId: producer.id,
+      nativeProducerVersion: producer.version,
+    };
+  }
   const all = [
     ...native.declarations,
     ...native.calls,
@@ -568,7 +613,7 @@ export function checkMeasurement(
     group.forEach((x, i) => {
       x.ordinal = i;
       x.id = handle("occurrence", {
-        revisionId: x.row.revisionId,
+        ...occurrenceContext(x.row),
         ownerSyntaxId: x.ownerSyntaxId,
         kind: x.kind,
         ordinal: i,

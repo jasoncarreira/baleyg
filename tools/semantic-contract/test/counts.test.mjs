@@ -57,8 +57,25 @@ const header = (name) => ({
 });
 const syntax = (name) =>
   `sid:v1:${domain("syntax", { sourceSet: "main", path: document.path, language: "javascript", ancestors: [], declaration: { kind: "function", name, signature: null, ordinal: 0 } })}`;
-const occurrence = (owner, kind, ordinal) =>
-  `occ:v1:${domain("occurrence", { revisionId: "r1", ownerSyntaxId: owner, kind, ordinal })}`;
+// Decision 0003: occ:v2 binds document bytes, extraction context and native
+// producer descriptor; the declared native inventory is explicitly empty.
+const extractionContext = sha(
+  "baleyg.extraction-context.v1\0" +
+    canonical({ language: "javascript", components: [] }),
+);
+const occurrence = (owner, kind, ordinal, text = source) =>
+  sha(
+    "baleyg.occurrence.v2\0" +
+      canonical({
+        contentHash: sha(text),
+        extractionContext,
+        nativeProducerId: "native",
+        nativeProducerVersion: "1",
+        ownerSyntaxId: owner,
+        kind,
+        ordinal,
+      }),
+  ).replace(/^(.{32}).*$/, "occ:v2:$1");
 const mainId = syntax("main"),
   targetId = syntax("target");
 const callId = occurrence(mainId, "call", 0),
@@ -84,6 +101,7 @@ const declaration = (ref, name, start, end, nameStart) => ({
 const native = {
   formatVersion: 1,
   producerId: "native",
+  extractionInputs: [],
   declarations: [
     declaration("main", "main", 0, 39, 9),
     declaration("target", "target", 40, 60, 49),
@@ -295,6 +313,10 @@ async function specimen(
       ? "😀\n" + (sourceOverride ?? source)
       : (sourceOverride ?? source),
     sourceHash = sha(sourceText);
+  // Occurrence IDs bind this specimen's admitted main.js bytes (Decision 0003).
+  const callId = occurrence(mainId, "call", 0, sourceText),
+    refId = occurrence(mainId, "reference", 0, sourceText),
+    callbackId = occurrence(mainId, "reference", 1, sourceText);
   const alternateText = (kind) => `${sourceText}// admitted ${kind} snapshot\n`;
   const measuredNative = structuredClone(native);
   if (shifted)
@@ -817,12 +839,12 @@ async function specimen(
       range: range(18 + offset, 26 + offset),
       calleeRange: range(18 + offset, 24 + offset),
       spelling: "target",
-      regionIds: control ? [occurrence(mainId, "control", 0)] : [],
+      regionIds: control ? [occurrence(mainId, "control", 0, sourceText)] : [],
       provenanceId: `native:r1:${callId}`,
     },
   ];
   if (control) {
-    const id = occurrence(mainId, "control", 0);
+    const id = occurrence(mainId, "control", 0, sourceText);
     records.controlRegions = [
       {
         id,
@@ -856,7 +878,7 @@ async function specimen(
         : declarationSite &&
             fact.anchor.kind === "reference" &&
             bytes[0] === 49 + offset
-          ? occurrence(targetId, "reference", 0)
+          ? occurrence(targetId, "reference", 0, sourceText)
           : {
               declarationName: targetId,
               callee: callId,
@@ -900,7 +922,7 @@ async function specimen(
         const resolution = fact.record.resolution;
         records.references.push({
           id: atDeclaration
-            ? occurrence(targetId, "reference", 0)
+            ? occurrence(targetId, "reference", 0, sourceText)
             : callback
               ? callbackId
               : refId,
@@ -1127,7 +1149,7 @@ test("draft language corpus skips only count floors; example and draft stay in t
       id: "COUNT.profile.draft-still-checks-invariants",
       baseline: () => s.records,
       mutate: (records) => {
-        records.references[0].id = `occ:v1:${"b".repeat(32)}`;
+        records.references[0].id = `occ:v2:${"b".repeat(32)}`;
         return records;
       },
       check: (records) =>
@@ -1156,7 +1178,7 @@ test("exact mutation controls on source-backed native membership and captured di
       id: "COUNT.calls.forged-owner-span-provenance",
       baseline: () => sample.records,
       mutate: (records) => {
-        const forged = `occ:v1:${"a".repeat(32)}`;
+        const forged = `occ:v2:${"a".repeat(32)}`;
         records.calls[0] = {
           ...records.calls[0],
           id: forged,
@@ -1189,7 +1211,7 @@ test("exact mutation controls on source-backed native membership and captured di
       id: "COUNT.reference.native-id",
       baseline: () => sample.records,
       mutate: (records) => {
-        records.references[0].id = `occ:v1:${"b".repeat(32)}`;
+        records.references[0].id = `occ:v2:${"b".repeat(32)}`;
         return records;
       },
       check: (records) => result(sample.loaded, records),

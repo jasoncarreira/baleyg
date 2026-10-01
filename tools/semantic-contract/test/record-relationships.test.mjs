@@ -30,7 +30,7 @@ const canon = (value) =>
           .join(",")}}`;
 const digest = (domain, value) =>
   createHash("sha256")
-    .update(`baleyg.${domain}.v1\0`)
+    .update(`baleyg.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
     .update(canon(value))
     .digest("hex")
     .slice(0, 32);
@@ -415,6 +415,7 @@ async function specimen(t, change = {}) {
   put("captures/native.json", {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [...nativeRows, ...nextRows],
     calls: [],
     controls: [],
@@ -723,7 +724,20 @@ async function specimen(t, change = {}) {
     anchorResults: [],
   };
   if (baseReference) {
-    const id = `occ:v1:${digest("occurrence", { revisionId: "r1", ownerSyntaxId: idFor("Child"), kind: "reference", ordinal: 0 })}`;
+    // Decision 0003: document bytes, empty-inventory extraction context and the
+// native producer descriptor, not the revision, identify the occurrence.
+    const id = `occ:v2:${digest("occurrence", {
+      contentHash: sha(text),
+      extractionContext: sha(
+        "baleyg.extraction-context.v1\0" +
+          canon({ language: "java", components: [] }),
+      ),
+      nativeProducerId: "native",
+      nativeProducerVersion: "1",
+      ownerSyntaxId: idFor("Child"),
+      kind: "reference",
+      ordinal: 0,
+    })}`;
     const target =
       change.externalReference.kind === "external"
         ? change.externalReference
@@ -1717,6 +1731,7 @@ impl${variant === "generic" ? "<T>" : ""} ${variant === "inherent" ? "" : "Face 
   put("captures/native.json", {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: rows,
     calls: [],
     controls: [],

@@ -374,8 +374,16 @@ export const types = Object.freeze({
     ancestors: array("Key"),
     declaration: "Key",
   }),
+  ExtractionContextComponent: object({ name: "Text", hash: "Hash" }),
+  ExtractionContextInput: object({
+    language: "Language",
+    components: array("ExtractionContextComponent"),
+  }),
   OccurrenceDigestInput: object({
-    revisionId: "Text",
+    contentHash: "Hash",
+    extractionContext: "Hash",
+    nativeProducerId: "Text",
+    nativeProducerVersion: "Text",
     ownerSyntaxId: "SyntaxId",
     kind: enumOf("call", "reference", "control"),
     ordinal: "UInt",
@@ -509,6 +517,7 @@ export const types = Object.freeze({
   NativeArtifact: object({
     formatVersion: literal(1),
     producerId: "Text",
+    extractionInputs: array(enumOf("config", "dependency", "toolchain")),
     declarations: array("NativeDeclaration"),
     calls: array("NativeCall"),
     controls: array("NativeControl"),

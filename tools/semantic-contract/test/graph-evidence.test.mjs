@@ -92,7 +92,7 @@ function specimen({
     provenanceId: "native:r2:declaration",
   };
   const call = {
-    id: "occ:v1:11111111111111111111111111111111",
+    id: "occ:v2:11111111111111111111111111111111",
     document: D,
     revisionId: "r2",
     provenanceId: "native:r2:call",
@@ -629,6 +629,7 @@ async function admitted(
   put("captures/native.json", {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations,
     calls: [oldCall, call],
     controls: [],
@@ -937,8 +938,21 @@ test("admitted failed/omitted refresh selects source-backed declaration proofs, 
         ordinal: 0,
       },
     });
-    const expectedCall = occurrenceId({
-      revisionId: "r2",
+    // Decision 0003: r2's call ID binds r2's go.js bytes, the empty-inventory
+    // JavaScript extraction context and native producer `native`/`1`.
+    const r2Text =
+      "export function go() { go(); }\n" +
+      (options.changed ? "// changed bytes\n" : "");
+    const extractionContext = contentHash(
+      Buffer.from(
+        'baleyg.extraction-context.v1\0{"components":[],"language":"javascript"}',
+      ),
+    );
+const expectedCall = occurrenceId({
+      contentHash: contentHash(Buffer.from(r2Text)),
+      extractionContext,
+      nativeProducerId: "native",
+      nativeProducerVersion: "1",
       ownerSyntaxId: expectedSyntax,
       kind: "call",
       ordinal: 0,
