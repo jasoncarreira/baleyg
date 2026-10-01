@@ -129,7 +129,7 @@ pub fn drain_requests_observed(
     session: &Arc<LeaderSession>,
     progress: impl Fn(&str, IndexProgress) + Sync,
 ) -> Result<usize> {
-    if store.verify_root().is_err() {
+    if store.root_path_replaced()? {
         store.fail_changed_root_requests(session)?;
         anyhow::bail!("root_changed: old leader stopped after queue failure transition");
     }
@@ -217,12 +217,13 @@ pub fn enqueue_and_wait(
     let request = store.enqueue_request(options, None)?;
     let mut held: Option<Arc<LeaderSession>> = None;
     loop {
-        if let Err(error) = store.verify_root() {
+        if store.root_path_replaced()? {
             if let Some(session) = &held {
                 store.fail_changed_root_requests(session)?;
             }
-            return Err(error);
+            anyhow::bail!("root_changed: captured workspace pathname changed");
         }
+        store.verify_root()?;
         if let Some(row) = store.request_by_id(&request.id)? {
             match row.state.as_str() {
                 "done" => {
@@ -250,7 +251,12 @@ pub fn enqueue_and_wait(
                     store.fail_changed_root_requests(&session)?;
                     held = Some(session);
                 }
-                Err(error) if format!("{error:#}").contains("storage_busy") => {}
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::store::topology::StorageBusy>()
+                            .is_some()
+                    }) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -406,10 +412,17 @@ mod tests {
         let corrupt = fs::read(&path).unwrap();
         let pending = Store::open_for_tests(state.path(), work.path()).unwrap();
         assert!(pending.is_recreate_pending());
+        let queued = pending.enqueue_request(&options, None).unwrap();
+        let queue_before = fs::read(pending.request_db_path()).unwrap();
         let shared = roots.index_use_existing(&identity).unwrap();
         let busy = reconcile_workspace(&pending, &options, &cancel, |_| {}).unwrap_err();
         assert!(busy.to_string().contains("storage_busy"), "{busy:#}");
         assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert_eq!(fs::read(pending.request_db_path()).unwrap(), queue_before);
+        assert_eq!(
+            pending.request_by_id(&queued.id).unwrap().unwrap().state,
+            "queued"
+        );
         assert!(pending.is_recreate_pending());
         drop(shared);
         let mut configured = options.clone();

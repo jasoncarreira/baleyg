@@ -359,12 +359,20 @@ impl DaemonState {
                     self.store.fail_changed_root_requests(&session)?;
                     *self.serving_session.lock().unwrap() = Some(session);
                 }
-                Err(error) if format!("{error:#}").contains("storage_busy") => return Ok(()),
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::store::topology::StorageBusy>()
+                            .is_some()
+                    }) =>
+                {
+                    return Ok(());
+                }
                 Err(error) => return Err(error),
             }
         }
         let retained = self.serving_session.lock().unwrap().clone();
-        if self.store.verify_root().is_err() {
+        if self.store.root_path_replaced()? {
             if let Some(ref session) = retained
                 && session.is_leader()
             {

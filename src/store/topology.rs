@@ -548,6 +548,25 @@ impl WorkspaceIdentity {
         self.verify()?;
         Ok(self)
     }
+    /// Only a proven pathname loss authorizes old-root queue failure. A changed
+    /// workspace marker or an unreadable pathname is not proof of replacement.
+    pub(crate) fn root_path_replaced(&self) -> Result<bool> {
+        let held = self.root_handle.metadata()?;
+        ensure!(
+            (held.dev(), held.ino()) == (self.device, self.inode),
+            "root_changed: captured handle identity changed"
+        );
+        self.root_path_replaced_from(fs::symlink_metadata(&self.root))
+    }
+    fn root_path_replaced_from(&self, named: std::io::Result<fs::Metadata>) -> Result<bool> {
+        match named {
+            Ok(m) => Ok(!m.is_dir()
+                || m.file_type().is_symlink()
+                || (m.dev(), m.ino()) != (self.device, self.inode)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
     pub fn verify(&self) -> Result<()> {
         let m = fs::symlink_metadata(&self.root).context("root_changed")?;
         let handle = self.root_handle.metadata()?;
@@ -2138,6 +2157,23 @@ mod gc_schema_race_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("incompatible_index")
+        );
+    }
+
+    #[test]
+    fn root_loss_requires_proven_pathname_change_not_arbitrary_io_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap();
+        assert!(!identity.root_path_replaced().unwrap());
+        let denied = identity.root_path_replaced_from(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected metadata refusal",
+        )));
+        assert_eq!(denied.unwrap_err().to_string(), "injected metadata refusal");
+        assert!(
+            identity
+                .root_path_replaced_from(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
+                .unwrap()
         );
     }
 }

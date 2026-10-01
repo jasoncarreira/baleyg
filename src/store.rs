@@ -2079,11 +2079,11 @@ impl Store {
             // A new inode at the same canonical spelling is a root transition, not
             // corruption. Recheck the old derived index under EX before replacing it.
             let db = open_index(&path, false)?;
-            let mismatch = self.recovery_baseline(&db).unwrap_err();
-            ensure!(
-                mismatch.to_string() == "root_changed: index root identity mismatch",
-                "root_changed: replacement authority changed"
-            );
+            match self.recovery_baseline(&db) {
+                Err(error) if error.to_string() == "root_changed: index root identity mismatch" => {
+                }
+                _ => anyhow::bail!("root_changed: replacement authority changed"),
+            }
             ensure!(
                 journal.is_none(),
                 "recovery_required: root replacement has hot journal"
@@ -2694,6 +2694,9 @@ impl Store {
             RecoveryDisposition::RecreatePending => {
                 anyhow::bail!("recovery_required: exceptional index recovery deferred")
             }
+            RecoveryDisposition::RootReplaced => {
+                anyhow::bail!("recovery_required: replacement-root index recovery deferred")
+            }
         }
     }
     fn read_public_control_status(&self, db: &Connection) -> Result<IndexStatus> {
@@ -2784,6 +2787,9 @@ impl Store {
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
     }
+    pub(crate) fn root_path_replaced(&self) -> Result<bool> {
+        self.identity.root_path_replaced()
+    }
     pub(crate) fn is_recreate_pending(&self) -> bool {
         matches!(
             self.disposition(),
@@ -2801,6 +2807,32 @@ impl Store {
             self.is_recreate_pending(),
             "recovery_required: exceptional recreation not classified"
         );
+        if self.disposition() == RecoveryDisposition::RootReplaced {
+            // The old index is still fenced by the verified leader under SH. Resolve
+            // foreign-root queue rows durably BEFORE attempting index replacement.
+            // Dropping this entire scope releases every local SH and SQLite handle.
+            {
+                let leader = Arc::new(topology::LeaderSession::leader(
+                    self.roots.leader(&self.identity)?,
+                    self.identity.clone(),
+                ));
+                self.verify_leader_session(&leader)?;
+                let index_path = self.roots.index_db(&self.identity);
+                ensure!(
+                    !index_path_present(&index_path.with_file_name("index.db-journal"))?,
+                    "recovery_required: root replacement has hot journal"
+                );
+                let db = open_index(&index_path, false)?;
+                let mismatch = self.recovery_baseline(&db);
+                drop(db);
+                ensure!(
+                    matches!(mismatch, Err(ref error)
+                    if error.to_string() == "root_changed: index root identity mismatch"),
+                    "root_changed: replacement authority changed"
+                );
+                self.fail_changed_root_requests(&leader)?;
+            }
+        }
         let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
         let mut leader = self
             .roots

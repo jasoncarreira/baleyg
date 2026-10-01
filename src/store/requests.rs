@@ -236,6 +236,14 @@ impl Store {
         options: &IndexOptions,
         expected: Option<IndexPin>,
     ) -> Result<Request> {
+        self.enqueue_request_with_hook(options, expected, || {})
+    }
+    fn enqueue_request_with_hook(
+        &self,
+        options: &IndexOptions,
+        expected: Option<IndexPin>,
+        after_write_lock: impl FnOnce(),
+    ) -> Result<Request> {
         self.identity.verify()?;
         let selected = std::fs::symlink_metadata(&options.workspace_root)?;
         ensure!(
@@ -255,6 +263,7 @@ impl Store {
         ensure!(encoded.len() <= 4096, "invalid request options length");
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        after_write_lock();
         self.identity.verify()?;
         let id = Uuid::new_v4().to_string();
         let submitted_at = now();
@@ -333,7 +342,7 @@ impl Store {
     }
     /// Mark old-root rows before replacement work, or fail this holder's rows after root loss.
     pub fn fail_changed_root_requests(&self, session: &LeaderSession) -> Result<usize> {
-        let old_root = self.identity.verify().is_err();
+        let old_root = self.identity.root_path_replaced()?;
         if old_root {
             self.verify_old_root_queue_leader(session)?;
         } else {
@@ -351,18 +360,66 @@ impl Store {
         } else {
             "(root_device<>?3 OR root_inode<>?4)"
         };
+        let affected: Vec<Request> = {
+            let read_predicate = predicate.replace("?3", "?1").replace("?4", "?2");
+            let mut statement = tx.prepare(&format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND {read_predicate} ORDER BY seq"))?;
+            let rows = statement.query_map(
+                params![
+                    self.identity.device.to_string(),
+                    self.identity.inode.to_string()
+                ],
+                read,
+            )?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
         let changed = tx.execute(&format!("UPDATE requests SET state='failed',claim_incarnation=?1,started_at=COALESCE(started_at,?2),finished_at=?2,error_code='root_changed' WHERE state IN ('queued','running') AND {predicate}"),
             params![session.incarnation().to_string(),now(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
-        tx.commit()?;
+        ensure!(
+            changed == affected.len(),
+            "storage_busy: root failure set changed"
+        );
+        if old_root {
+            self.verify_old_root_queue_leader(session)?;
+        } else {
+            self.verify_leader_session(session)?;
+        }
+        if let Err(error) = tx.commit() {
+            // A failed COMMIT can be ambiguous. Never proceed to EX unless every
+            // selected row is durably terminal under this exact incarnation.
+            self.attest_changed_root_rows(&db, &affected, session)?;
+            let _ = error;
+        }
+        self.attest_changed_root_rows(&db, &affected, session)?;
         Ok(changed)
     }
+    fn attest_changed_root_rows(
+        &self,
+        db: &Connection,
+        affected: &[Request],
+        session: &LeaderSession,
+    ) -> Result<()> {
+        for prior in affected {
+            let row = db.query_row(
+                &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),
+                [prior.seq],
+                read,
+            )?;
+            ensure!(
+                row.id == prior.id
+                    && row.root_device == prior.root_device
+                    && row.root_inode == prior.root_inode
+                    && row.state == "failed"
+                    && row.error_code.as_deref() == Some("root_changed")
+                    && row.claim_incarnation.as_deref()
+                        == Some(session.incarnation().to_string().as_str()),
+                "storage_busy: root failure commit not confirmed"
+            );
+        }
+        Ok(())
+    }
     fn verify_old_root_queue_leader(&self, session: &LeaderSession) -> Result<()> {
-        let root = std::fs::symlink_metadata(&self.identity.root);
         ensure!(
-            root.as_ref().is_err_or(|m| m.dev() != self.identity.device
-                || m.ino() != self.identity.inode
-                || !m.is_dir()
-                || m.file_type().is_symlink()),
+            self.identity.root_path_replaced()?,
             "root_changed: pathname still names captured root"
         );
         session.verify_after_root_loss(
@@ -560,5 +617,54 @@ impl Store {
             &self.test_queue_finish_failures
         };
         counter.store(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod root_failure_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn root_loss_serializes_prior_accept_and_refuses_late_insert_under_writer_lock() {
+        let state = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let store = Store::open_for_tests(state.path(), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        let owner = store.leader_session().unwrap();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker_store = store.clone();
+        let worker_options = options.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store.enqueue_request_with_hook(&worker_options, None, || {
+                locked_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            })
+        });
+        // The late request already holds SQLite's writer lock. Move the root
+        // before allowing its *in-transaction* identity check to run.
+        locked_rx.recv().unwrap();
+        fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 1);
+        let db = Connection::open(store.request_db_path()).unwrap();
+        let rows: i64 = db
+            .query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "no late accepted row escaped the transition");
+        let code: String = db
+            .query_row(
+                "SELECT error_code FROM requests WHERE id=?1",
+                [&accepted.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(code, "root_changed");
+        assert!(store.enqueue_request(&options, None).is_err());
     }
 }
