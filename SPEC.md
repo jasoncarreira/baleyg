@@ -304,8 +304,10 @@ symbols remain in a separate binding layer, never as node IDs. Call sites and co
 per-document `occ:v2:` IDs ([Decision 0003](docs/semantic-evidence/decisions/0003-per-document-occurrence-ids.md)):
 the first 128 bits of the domain-separated digest over the document's content hash, its
 authenticated extraction context, the native producer ID and version, the owner syntax ID,
-occurrence kind and ordinal. No revision is hashed, so an unchanged document keeps its occurrence
-IDs across revisions. The withdrawn revision-bound `occ:v1:` form is not accepted; backward
+occurrence kind and ordinal. No revision is hashed: two revisions share an occurrence ID exactly when
+the document has identical bytes at the same `DocumentKey`, under the same native producer ID and
+version and the same authenticated extraction context, with the same owner, kind and ordinal. A
+producer-version or extraction-context change re-identifies even an unchanged file. The withdrawn revision-bound `occ:v1:` form is not accepted; backward
 compatibility is not required.
 
 Identity and location are separate fields. Renames and moves of a declaration change its ID;
