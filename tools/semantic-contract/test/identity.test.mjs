@@ -14,7 +14,9 @@ import {
   identityRegistry,
   assignOrdinals,
   assignOccurrenceOrdinals,
+  extractionContext,
 } from "../identity.mjs";
+import { validate } from "../formats.mjs";
 import { canonicalBytes } from "../json.mjs";
 const vectors = JSON.parse(
   readFileSync(
@@ -95,50 +97,175 @@ test("IDENTITY.VECTORS all 64 full digests, domains and canonical inputs from de
     );
   }
 });
-test("IDENTITY.OCCURRENCE independent canonical, domain, full hash and emitted vectors", () => {
-  const ownerSyntaxId = vectors.cases[0].expected.stableId;
-  // These fixtures were computed from the documented byte input, not digest().
-  const expected = [
-    [
-      "r1",
-      "call",
-      0,
-      "5a3261565d80529699c7a66174cf9c038cbcc4d01874ae15512921ed51d0fdea",
-    ],
-    [
-      "r2",
-      "call",
-      0,
-      "661ef37d50792c7983348d12c2e3dc05a4dfbe035bebb656431e7e9f5e228d3f",
-    ],
-    [
-      "r1",
-      "reference",
-      0,
-      "f9c4ea01eac566e46182df0c7d2637f4fb68c4c55d3aa52ea5833d83028398b6",
-    ],
-    [
-      "r1",
-      "call",
-      1,
-      "fbcb1a9e5c48eab2080c5214c9d7728ba354bc919e753249c6da073d2bc36dbe",
-    ],
-  ];
+// Decision 0003 vectors, copied byte for byte from
+// docs/semantic-evidence/publication-rejoin-vectors-v1.md#occurrence-identity-v2-decision-0003.
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const v2 = Object.freeze({
+  contentHash:
+    "8026dced2c17cbbfb8563d8a7f07e250a141be61cd497e6ba88caeb52a6de8f2",
+  owner: "sid:v1:6cce6099437ddb2256f7ae368d29c0b5",
+  config1: "e3155b20e134632816c8611c4e9ee5cbd0e00689f7c4c955ee9f896580d02fdb",
+  config2: "3e8214adf35212b25f8d669f6bb1416d39e07bacc3d82acfc287218cabbe0712",
+  context1: "f107be5e05433157fa89fe8ad71823d92ed9773210f89cb41c22afbdabb513bc",
+  context2: "c5e91e3fcdb5abd319c3ad99debad41167bed38170ba4512785a49e1ad4c6be6",
+});
+const v2Input = (kind, version, context) => ({
+  contentHash: v2.contentHash,
+  extractionContext: context,
+  nativeProducerId: "native-test",
+  nativeProducerVersion: version,
+  ownerSyntaxId: v2.owner,
+  kind,
+  ordinal: 0,
+});
+const v2Occurrences = [
+  [
+    v2Input("call", "native-test-1", v2.context1),
+    `{"contentHash":"${v2.contentHash}","extractionContext":"${v2.context1}","kind":"call","nativeProducerId":"native-test","nativeProducerVersion":"native-test-1","ordinal":0,"ownerSyntaxId":"${v2.owner}"}`,
+    "de9121457466b75595443402b6e39755043af4b499b85881be1329aff7c8cdc9",
+    "occ:v2:de9121457466b75595443402b6e39755",
+  ],
+  [
+    v2Input("reference", "native-test-1", v2.context1),
+    `{"contentHash":"${v2.contentHash}","extractionContext":"${v2.context1}","kind":"reference","nativeProducerId":"native-test","nativeProducerVersion":"native-test-1","ordinal":0,"ownerSyntaxId":"${v2.owner}"}`,
+    "e77cc56a31d81733d7de8f42e13f4db1afa22a311c641e3d05494287ef085afb",
+    "occ:v2:e77cc56a31d81733d7de8f42e13f4db1",
+  ],
+  [
+    v2Input("call", "native-test-2", v2.context1),
+    `{"contentHash":"${v2.contentHash}","extractionContext":"${v2.context1}","kind":"call","nativeProducerId":"native-test","nativeProducerVersion":"native-test-2","ordinal":0,"ownerSyntaxId":"${v2.owner}"}`,
+    "09446fd4270ebdae22d2791d1e8f946c41ed7c86ed603c751ed7beef62e5baac",
+    "occ:v2:09446fd4270ebdae22d2791d1e8f946c",
+  ],
+  [
+    v2Input("call", "native-test-1", v2.context2),
+    `{"contentHash":"${v2.contentHash}","extractionContext":"${v2.context2}","kind":"call","nativeProducerId":"native-test","nativeProducerVersion":"native-test-1","ordinal":0,"ownerSyntaxId":"${v2.owner}"}`,
+    "c35ed01ea1015ebaecb6080e7b40e48d2f2c97914fd6a8623039e70d83540742",
+    "occ:v2:c35ed01ea1015ebaecb6080e7b40e48d",
+  ],
+];
+test("IDENTITY.EXTRACTION_CONTEXT Decision 0003 vectors: capture digests, canonical bytes and SHA-256", () => {
+  assert.equal(sha256("config-v1"), v2.config1);
+  assert.equal(sha256("config-v2"), v2.config2);
   assert.equal(
-    Buffer.from("baleyg.occurrence.v1\0").toString("hex"),
-    "62616c6579672e6f6363757272656e63652e763100",
+    Buffer.from("baleyg.extraction-context.v1\0").toString("hex"),
+    "62616c6579672e65787472616374696f6e2d636f6e746578742e763100",
   );
-  for (const [revisionId, kind, ordinal, full] of expected) {
-    const input = { revisionId, ownerSyntaxId, kind, ordinal };
-    const literal = `{"kind":"${kind}","ordinal":${ordinal},"ownerSyntaxId":"${ownerSyntaxId}","revisionId":"${revisionId}"}`;
-    assert.equal(
-      canonicalBytes(input).toString("hex"),
-      Buffer.from(literal).toString("hex"),
-    );
-    assert.equal(digest("occurrence", input), full);
-    assert.equal(occurrenceId(input), `occ:v1:${full.slice(0, 32)}`);
+  for (const [hash, literal, full] of [
+    [
+      v2.config1,
+      `{"components":[{"hash":"${v2.config1}","name":"config"}],"language":"javascript"}`,
+      v2.context1,
+    ],
+    [
+      v2.config2,
+      `{"components":[{"hash":"${v2.config2}","name":"config"}],"language":"javascript"}`,
+      v2.context2,
+    ],
+  ]) {
+    const input = {
+      language: "javascript",
+      components: [{ name: "config", hash }],
+    };
+    assert.equal(canonicalBytes(input).toString("utf8"), literal);
+    assert.equal(extractionContext(input), full);
+    assert.equal(digest("extractionContext", input), full);
   }
-  assert.equal(new Set(expected.map((row) => row[3].slice(0, 32))).size, 4);
+});
+test("IDENTITY.OCCURRENCE Decision 0003 occ:v2 vectors byte for byte", () => {
+  assert.equal(
+    Buffer.from("baleyg.occurrence.v2\0").toString("hex"),
+    "62616c6579672e6f6363757272656e63652e763200",
+  );
+  for (const [input, literal, full, id] of v2Occurrences) {
+    assert.equal(canonicalBytes(input).toString("utf8"), literal);
+    assert.equal(digest("occurrence", input), full);
+    assert.equal(occurrenceId(input), id);
+    assert.equal(identityRegistry().register("occurrence", input), id);
+  }
+  // r1 ID = r2 ID: neither revision is an input. The two controls differ.
+  const [call, reference, version, config] = v2Occurrences.map((x) => x[3]);
+  assert.equal(new Set([call, reference, version, config]).size, 4);
+});
+test("IDENTITY.OCCURRENCE withdrawn revision-bound occ:v1 input and values are rejected", () => {
+  // The withdrawn v1 r1/call row: domain baleyg.occurrence.v1\0 over
+  // {kind,ordinal,ownerSyntaxId,revisionId}, recomputed here independently.
+  const v1Input = {
+    revisionId: "r1",
+    ownerSyntaxId: v2.owner,
+    kind: "call",
+    ordinal: 0,
+  };
+  const v1Full = sha256(
+    Buffer.concat([
+      Buffer.from("baleyg.occurrence.v1\0"),
+      canonicalBytes(v1Input),
+    ]),
+  );
+  assert.ok(v1Full.startsWith("ccc4d599"));
+  for (const bad of [
+    v1Input,
+    { ...v2Occurrences[0][0], revisionId: "r1" },
+    (({ contentHash, ...rest }) => rest)(v2Occurrences[0][0]),
+  ]) {
+    assert.throws(() => digest("occurrence", bad), /FORMAT|field/);
+    assert.throws(() => occurrenceId(bad), /FORMAT|field/);
+    assert.throws(
+      () => identityRegistry().register("occurrence", bad),
+      /FORMAT|field/,
+    );
+  }
+  const v1Id = `occ:v1:${v1Full.slice(0, 32)}`;
+  for (const [, , full, id] of v2Occurrences) {
+    assert.notEqual(full, v1Full);
+    assert.notEqual(id, v1Id);
+    assert.notEqual(id.slice(7), v1Id.slice(7));
+  }
+  assert.throws(() => validate("OccurrenceId", v1Id), /expected occurrenceId/);
+  validate("OccurrenceId", v2Occurrences[0][3]);
+});
+test("IDENTITY.OCCURRENCE same document, producer and context share an ID; any input change re-identifies", () => {
+  const base = v2Occurrences[0][0],
+    id = occurrenceId(base);
+  // Revisions r1 and r2 with identical bytes/producer/context: same ID.
+  const registry = identityRegistry();
+  assert.equal(registry.register("occurrence", structuredClone(base)), id);
+  assert.equal(registry.register("occurrence", structuredClone(base)), id);
+  for (const changed of [
+    { ...base, contentHash: sha256("changed bytes") },
+    { ...base, extractionContext: v2.context2 },
+    { ...base, nativeProducerVersion: "native-test-2" },
+    { ...base, nativeProducerId: "other-native" },
+    { ...base, ordinal: 1 },
+    { ...base, kind: "control" },
+  ])
+    assert.notEqual(occurrenceId(changed), id);
+  const empty = extractionContext({ language: "javascript", components: [] });
+  assert.equal(
+    empty,
+    sha256(
+      Buffer.concat([
+        Buffer.from("baleyg.extraction-context.v1\0"),
+        Buffer.from('{"components":[],"language":"javascript"}'),
+      ]),
+    ),
+  );
+  assert.notEqual(
+    empty,
+    extractionContext({ language: "python", components: [] }),
+  );
+  const a = { name: "config", hash: v2.config1 },
+    b = { name: "dependency", hash: v2.config2 };
+  extractionContext({ language: "javascript", components: [a, b] });
+  for (const components of [
+    [b, a],
+    [a, a],
+    [a, { name: "config", hash: v2.config2 }],
+  ])
+    assert.throws(
+      () => extractionContext({ language: "javascript", components }),
+      /IDENTITY.EXTRACTION_CONTEXT/,
+    );
 });
 test("IDENTITY.COLLISION retained revisions and distinct full hashes sharing a prefix", () => {
   const input = {
@@ -160,19 +287,31 @@ test("IDENTITY.COLLISION retained revisions and distinct full hashes sharing a p
     () => registry.register("syntax", { ...input, path: "src/B.java" }),
     /IDENTITY.COLLISION/,
   );
-  const occurrences = identityRegistry(
-    (_, row) => prefix + (row.revisionId === "r2" ? "b" : "c").repeat(32),
-  );
   const item = {
-    revisionId: "r1",
+    contentHash: "1".repeat(64),
+    extractionContext: "2".repeat(64),
+    nativeProducerId: "native",
+    nativeProducerVersion: "1",
     ownerSyntaxId: syntaxId(input),
     kind: "call",
     ordinal: 0,
   };
-  assert.throws(() => {
-    occurrences.register("occurrence", item);
-    occurrences.register("occurrence", { ...item, revisionId: "r2" });
-  }, /IDENTITY.COLLISION/);
+  const occurrences = identityRegistry(
+    (_, row) =>
+      prefix + (row.contentHash === item.contentHash ? "c" : "b").repeat(32),
+  );
+  assert.equal(
+    occurrences.register("occurrence", item),
+    occurrences.register("occurrence", structuredClone(item)),
+  );
+  assert.throws(
+    () =>
+      occurrences.register("occurrence", {
+        ...item,
+        contentHash: "3".repeat(64),
+      }),
+    /IDENTITY.COLLISION/,
+  );
   assert.throws(
     () => syntaxId({ ...input, nativeId: "ignored" }),
     /unknown field/,

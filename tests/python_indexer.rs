@@ -51,7 +51,7 @@ fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
     }));
     for call in graph.calls.iter().filter(|c| c.path == "sample.py") {
         assert_eq!(call.provenance.semantic, SemanticState::Unavailable);
-        assert!(call.id.starts_with("occ:v1:"));
+        assert!(call.id.starts_with("occ:v2:"));
         assert!(graph.nodes.iter().any(|n| n.id == call.caller));
         assert!(
             source.is_char_boundary(call.range.start_byte)

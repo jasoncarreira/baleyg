@@ -22,7 +22,7 @@ import { canonicalBytes } from "../json.mjs";
 import { registerControls, runControl } from "./mutations.mjs";
 
 const sid = (n) => `sid:v1:${String(n).padStart(32, "0")}`;
-const oid = (n) => `occ:v1:${String(n).padStart(32, "0")}`;
+const oid = (n) => `occ:v2:${String(n).padStart(32, "0")}`;
 const D = { sourceSetId: "main", language: "javascript", path: "src/go.js" };
 const coverage = (p, r, state) => ({
   producerId: p,
@@ -893,6 +893,7 @@ async function admittedGraph(
   put("captures/native.json", {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations,
     calls: [oldCall, call],
     controls: [],
@@ -1234,8 +1235,21 @@ test("captured failed and omitted refresh answers pass the complete graph checke
         ordinal: 0,
       },
     });
-    const callId = occurrenceId({
-      revisionId: "r2",
+    // Decision 0003: r2's call ID binds r2's go.js bytes, the empty-inventory
+    // JavaScript extraction context and native producer `native`/`1`.
+    const r2Text =
+      "export function go() { go(); }\n" +
+      (options.changed ? "// changed bytes\n" : "");
+    const extractionContext = contentHash(
+      Buffer.from(
+        'baleyg.extraction-context.v1\0{"components":[],"language":"javascript"}',
+      ),
+    );
+const callId = occurrenceId({
+      contentHash: contentHash(Buffer.from(r2Text)),
+      extractionContext,
+      nativeProducerId: "native",
+      nativeProducerVersion: "1",
       ownerSyntaxId: rootId,
       kind: "call",
       ordinal: 0,
@@ -1243,7 +1257,9 @@ test("captured failed and omitted refresh answers pass the complete graph checke
     const declaration = records.declarations.find(
       (d) => d.revisionId === "r2" && d.syntaxId === rootId,
     );
-    const call = records.calls.find((c) => c.id === callId);
+    const call = records.calls.find(
+      (c) => c.id === callId && c.revisionId === "r2",
+    );
     assert.ok(declaration);
     assert.ok(call);
     assert.equal(

@@ -58,8 +58,27 @@ const witness = (field, start, end, text) => ({
 const names = ["main", "target", "other", "third"];
 const syntax = (name, doc = document) =>
   `sid:v1:${digest("syntax", { sourceSet: doc.sourceSetId, path: doc.path, language: "javascript", ancestors: [], declaration: { kind: "function", name, signature: null, ordinal: 0 } })}`;
-const callId = (rev) =>
-  `occ:v1:${digest("occurrence", { revisionId: rev, ownerSyntaxId: syntax("main"), kind: "call", ordinal: 0 })}`;
+// Decision 0003: the call ID binds the main document's bytes, its extraction
+// context (empty declared native inventory) and the native producer, not a revision.
+const callId = (text = source) =>
+  createHash("sha256")
+    .update("baleyg.occurrence.v2\0")
+    .update(
+      canon({
+        contentHash: sha(text),
+        extractionContext: sha(
+          "baleyg.extraction-context.v1\0" +
+            canon({ language: "javascript", components: [] }),
+        ),
+        nativeProducerId: "native",
+        nativeProducerVersion: "1",
+        ownerSyntaxId: syntax("main"),
+        kind: "call",
+        ordinal: 0,
+      }),
+    )
+    .digest("hex")
+    .replace(/^(.{32}).*$/, "occ:v2:$1");
 const internal = (name, rev = "r1", doc = document) => ({
   kind: "internal",
   syntaxId: syntax(name, doc),
@@ -234,6 +253,7 @@ async function specimen(
   put("captures/native.json", {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: allDeclarations,
     calls: allCalls,
     controls: [],
@@ -621,7 +641,7 @@ async function specimen(
     );
   records.calls = allCalls
     .map((d) => ({
-      id: callId(d.revisionId),
+      id: callId(texts[d.revisionId]),
       ownerSyntaxId: syntax("main"),
       ordinal: 0,
       document,
@@ -630,13 +650,13 @@ async function specimen(
       calleeRange: range(d.calleeRange.start, d.calleeRange.end),
       spelling: "target",
       regionIds: [],
-      provenanceId: `native:${d.revisionId}:${callId(d.revisionId)}`,
+      provenanceId: `native:${d.revisionId}:${callId(texts[d.revisionId])}`,
     }))
     .sort((a, b) => Buffer.compare(Buffer.from(a.id), Buffer.from(b.id)));
   records.provenance = [
     ...proofs,
     ...[...allDeclarations, ...allCalls].map((d) => ({
-      id: `native:${d.revisionId}:${d.kind === "function" ? syntax(d.name, d.document) : callId(d.revisionId)}`,
+      id: `native:${d.revisionId}:${d.kind === "function" ? syntax(d.name, d.document) : callId(texts[d.revisionId])}`,
       producerId: "native",
       document: d.document,
       revisionId: d.revisionId,
@@ -668,7 +688,7 @@ async function specimen(
       kind: "callee",
     },
     status,
-    candidateIds: status === "exact" ? [callId(fact.anchor.revisionId)] : [],
+    candidateIds: status === "exact" ? [callId(texts[fact.anchor.revisionId])] : [],
     diagnostic: status === "exact" ? null : status,
   });
   const contradiction =
@@ -691,7 +711,7 @@ async function specimen(
         ? false // v1: evaluated at the binding's own revision (#52)
         : null;
     return {
-      callId: status === "exact" ? callId(rev) : null,
+      callId: status === "exact" ? callId(texts[rev]) : null,
       join,
       resolution: contradiction ? "ambiguous" : resolution,
       declaredTarget: contradiction ? null : declaredTarget,
@@ -743,12 +763,12 @@ function expectedMembers(names, { possibleDispatch = [] } = {}) {
       kind: "callee",
     },
     status: "exact",
-    candidateIds: [callId("r1")],
+    candidateIds: [callId()],
     diagnostic: null,
   };
   return order(
     names.map((name, i) => ({
-      callId: callId("r1"),
+      callId: callId(),
       join,
       resolution: contradictory ? "ambiguous" : "resolved",
       declaredTarget: contradictory ? null : internal(name),
@@ -902,7 +922,7 @@ test("historical proof remains linked to r1; a changed r2 target never marks the
     const s = await specimen(t, { history: true, changedSource }),
       B = check(s),
       member = B.callBindings[0];
-    assert.equal(member.callId, callId("r1"));
+    assert.equal(member.callId, callId());
     // v1: staleTarget is evaluated at the binding's own revision (#52).
     assert.equal(member.staleTarget, false);
     assert.equal(B.groups.size, 1);
@@ -964,12 +984,12 @@ test("two measured revisions close each call, fact, proof and historical group i
         kind: "callee",
       },
       status: "exact",
-      candidateIds: [callId(revision)],
+      candidateIds: [callId(text)],
       diagnostic: null,
     };
     const members = order(
       names.map((_, i) => ({
-        callId: callId(revision),
+        callId: callId(text),
         join,
         resolution: "ambiguous",
         declaredTarget: null,
@@ -986,7 +1006,7 @@ test("two measured revisions close each call, fact, proof and historical group i
       (g) =>
         g.producerId === "semantic" &&
         g.revisionId === revision &&
-        g.callId === callId(revision),
+        g.callId === callId(text),
     );
     assert.equal(groups.length, 1);
     const group = groups[0];
@@ -1138,7 +1158,7 @@ test("two producers keep full separate proof inventories; reassignment merges on
     canon(
       order(
         ["target", "other"].map((name, i) => ({
-          callId: callId("r1"),
+          callId: callId(),
           join: s.expectedJoin(s.facts[i].fact),
           resolution: "resolved",
           declaredTarget: internal(name),
@@ -1164,7 +1184,7 @@ test("two producers keep full separate proof inventories; reassignment merges on
       factRef = `binding-${i}`,
       proofId = `proof-${i}`;
     const member = {
-      callId: callId("r1"),
+      callId: callId(),
       join: s.expectedJoin(s.facts[i].fact),
       resolution: "resolved",
       declaredTarget: internal(name),
@@ -1180,7 +1200,7 @@ test("two producers keep full separate proof inventories; reassignment merges on
       canon(member),
     );
     assert.equal(group.revisionId, "r1");
-    assert.equal(group.callId, callId("r1"));
+    assert.equal(group.callId, callId());
     assert.deepEqual(group.factRefs, [factRef]);
     assert.deepEqual(group.provenanceIds, [proofId]);
     assert.equal(canon(group.members), canon([member]));
@@ -1382,7 +1402,7 @@ test("finite loaded binding controls run valid baseline before each one-property
       id: "BINDING.JOIN.nonexact-call",
       options: { status: "unmatched" },
       output: (r) => {
-        r[0].callId = callId("r1");
+        r[0].callId = callId();
       },
       assertion: "BINDING.JOIN",
       field: "join",
@@ -1391,7 +1411,7 @@ test("finite loaded binding controls run valid baseline before each one-property
       id: "BINDING.JOIN.unsupported-call",
       options: { status: "unsupported" },
       output: (r) => {
-        r[0].callId = callId("r1");
+        r[0].callId = callId();
       },
       assertion: "BINDING.JOIN",
       field: "join",
@@ -1697,7 +1717,7 @@ test("internal and external exact claims resolve to ambiguous Target[] with both
     B = check(s);
   const expected = order(
     ["proof-0", "proof-1"].map((provenanceId) => ({
-      callId: callId("r1"),
+      callId: callId(),
       join: s.expectedJoin(s.facts[0].fact),
       resolution: "ambiguous",
       declaredTarget: null,

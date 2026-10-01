@@ -1369,6 +1369,16 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
         Ok(rows.pop())
     }
     let producer = one_row(db, "SELECT id,kind FROM native_producers LIMIT 2")?;
+    // Occurrence IDs bind the native producer version (Decision 0003). An index persisted by
+    // another native producer version holds IDs this binary cannot reproduce, so it is never
+    // served; the integrity failure forces an in-place rebaseline from fresh measurement.
+    let producer_version = one_row(db, "SELECT id,version FROM native_producers LIMIT 2")?;
+    control_ensure!(
+        producer_version
+            .as_ref()
+            .is_none_or(|(_, version)| version == crate::native_evidence::NATIVE_VERSION),
+        "incompatible_index: native producer version mismatch"
+    );
     let source = one_row(db, "SELECT id,root_id FROM native_source_sets LIMIT 2")?;
     let revision = one_row(db, "SELECT id,source_set_id FROM native_revisions LIMIT 2")?;
     let expected_source = format!("source-set:v1:{root_id}");

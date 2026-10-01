@@ -55,6 +55,7 @@ async function specimen() {
   put("captures/native.json", {
     formatVersion: 1,
     producerId: "native",
+    extractionInputs: [],
     declarations: [],
     calls: [],
     controls: [],
@@ -633,6 +634,7 @@ async function relationshipSpecimen(
     s.files["captures/native.json"] = JSON.stringify({
       formatVersion: 1,
       producerId: "native",
+      extractionInputs: [],
       declarations: [value.declaration],
       calls: [],
       controls: [],

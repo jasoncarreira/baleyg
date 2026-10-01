@@ -173,7 +173,7 @@ fn invalid_cross_revision_witness_is_rejected() {
 fn generated_semantic_contract_anchors_are_the_rust_golden() {
     use baleyg::{model::DurableAnchor, native_evidence::Declaration};
     let records: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/semantic-evidence/v1/example/generated/bundles/676d58ad7a57fcd810e7fdd579b6a4349cd26f1ae8fa91ec5753d076362b0964/records.json"
+        "fixtures/semantic-evidence/v1/example/generated/bundles/8381c629d0225ac5173515bf353b1cf73d7f39fe9fed599741059236cd55d396/records.json"
     )).unwrap();
     let declarations: Vec<Declaration> =
         serde_json::from_value(records["declarations"].clone()).unwrap();
@@ -207,7 +207,7 @@ fn authored_semantic_contract_cases_execute_through_production_audit() {
     ))
     .unwrap();
     let records: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/semantic-evidence/v1/example/generated/bundles/676d58ad7a57fcd810e7fdd579b6a4349cd26f1ae8fa91ec5753d076362b0964/records.json"
+        "fixtures/semantic-evidence/v1/example/generated/bundles/8381c629d0225ac5173515bf353b1cf73d7f39fe9fed599741059236cd55d396/records.json"
     )).unwrap();
     let declarations: Vec<Declaration> =
         serde_json::from_value(records["declarations"].clone()).unwrap();

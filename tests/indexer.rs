@@ -30,8 +30,8 @@ fn pure_fixture_and_determinism() {
     assert_eq!(graph, run(&options));
     assert_eq!(graph.stats.semantic_state, SemanticState::Unavailable);
     assert!(graph.nodes.iter().all(|n| n.id.starts_with("sid:v1:")));
-    assert!(graph.calls.iter().all(|c| c.id.starts_with("occ:v1:")));
-    assert!(graph.regions.iter().all(|r| r.id.starts_with("occ:v1:")));
+    assert!(graph.calls.iter().all(|c| c.id.starts_with("occ:v2:")));
+    assert!(graph.regions.iter().all(|r| r.id.starts_with("occ:v2:")));
     assert!(
         graph
             .calls
@@ -273,7 +273,7 @@ fn scip_label_requires_exact_captured_hash_and_name_token_and_never_supplies_ide
 }
 
 #[test]
-fn root_dependency_drift_changes_native_revision_not_stable_declaration_ids() {
+fn root_dependency_drift_changes_native_revision_not_stable_or_occurrence_ids() {
     use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "main.js", "function same() { foo(); }");
@@ -292,7 +292,12 @@ fn root_dependency_drift_changes_native_revision_not_stable_declaration_ids() {
         index_workspace_with_native(&options, &root_id, &cancel(), |_| {}).unwrap();
     assert_ne!(first.revision.id, second.revision.id);
     assert_eq!(before.nodes, after.nodes);
-    assert_ne!(before.calls[0].id, after.calls[0].id);
+    // Decision 0003: the native producer declares no dependency input, so an unchanged
+    // document keeps its occ:v2 IDs while its records move to the new containing revision.
+    assert_eq!(before.calls[0].id, after.calls[0].id);
+    assert_eq!(first.calls[0].id, second.calls[0].id);
+    assert_eq!(first.calls[0].revision_id, first.revision.id);
+    assert_eq!(second.calls[0].revision_id, second.revision.id);
     assert_eq!(before.files, after.files);
     assert!(
         after

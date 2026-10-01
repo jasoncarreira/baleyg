@@ -378,6 +378,7 @@ mod tests {
             "sid:v1:ABCDEF0123456789abcdef0123456789",
             "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag",
+            "occ:v2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "occ:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             let mut v = good(n);

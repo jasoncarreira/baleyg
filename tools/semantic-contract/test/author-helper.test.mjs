@@ -19,6 +19,7 @@ import {
   siblingGroupHash,
   syntaxId,
   occurrenceId,
+  extractionContext,
 } from "../identity.mjs";
 import { parseJson, canonicalBytes } from "../json.mjs";
 
@@ -103,6 +104,43 @@ test("AUTHOR.IDS computes native declaration, header and occurrence identities w
       row.ref,
     );
   }
+  // Decision 0003 inputs: the row document's bytes in its revision, the
+  // extraction context of the native artifact's declared inventory, and the
+  // native producer descriptor. The revision itself is not an input.
+  const native = parseJson(await readFile(join(root, fixture.nativeArtifact)));
+  const producer = fixture.producers.find(
+    (x) => x.id === native.producerId && x.kind === "native",
+  );
+  const field = {
+    config: "configHash",
+    dependency: "dependencyHash",
+    toolchain: "toolchainHash",
+  };
+  const occurrenceInput = async ({ ownerRef, revisionId }) => {
+    const row = {
+      revisionId,
+      document: ids.declarations.find((x) => x.ref === ownerRef).document,
+    };
+    const revision = fixture.revisions.find(
+      (x) =>
+        x.id === row.revisionId && x.sourceSetId === row.document.sourceSetId,
+    );
+    const document = revision.documents.find((x) =>
+      same(x.key, row.document),
+    );
+    return {
+      contentHash: contentHash(await readFile(join(root, document.sourceFile))),
+      extractionContext: extractionContext({
+        language: row.document.language,
+        components: native.extractionInputs.map((name) => ({
+          name,
+          hash: revision[field[name]],
+        })),
+      }),
+      nativeProducerId: producer.id,
+      nativeProducerVersion: producer.version,
+    };
+  };
   for (const [kind, recordsKey] of [
     ["calls", "calls"],
     ["controls", "controlRegions"],
@@ -112,7 +150,7 @@ test("AUTHOR.IDS computes native declaration, header and occurrence identities w
       assert.equal(
         row.occurrenceId,
         occurrenceId({
-          revisionId: row.revisionId,
+          ...(await occurrenceInput(row)),
           ownerSyntaxId: ids.declarations.find((x) => x.ref === row.ownerRef)
             .syntaxId,
           kind:
@@ -126,7 +164,9 @@ test("AUTHOR.IDS computes native declaration, header and occurrence identities w
       );
       if (kind !== "references")
         assert.ok(
-          records[recordsKey].some((x) => x.id === row.occurrenceId),
+          records[recordsKey].some(
+            (x) => x.id === row.occurrenceId && x.revisionId === row.revisionId,
+          ),
           row.ref,
         );
     }
