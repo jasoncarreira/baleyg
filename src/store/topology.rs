@@ -1728,8 +1728,8 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(matches!(version, 4..=7), "incompatible index schema");
-    // GC may classify only the two exact cache formats this binary knows.
+    ensure!(matches!(version, 4..=8), "incompatible index schema");
+    // GC classifies only exact known historical or current cache formats.
     // The same structural and extractor-marker check applies before it can
     // declare an index eligible for deletion or report it as recently opened.
     super::validate_cache_shape(db)?;
@@ -2120,7 +2120,8 @@ mod gc_schema_race_tests {
         assert!(
             refused
                 .to_string()
-                .contains("incompatible_index: unknown cache object")
+                .contains("incompatible_index: unknown cache object"),
+            "{refused:#}"
         );
         let ddl_bytes = after_external.into_inner().unwrap();
         assert_eq!(

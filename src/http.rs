@@ -2837,7 +2837,7 @@ mod live_tests {
             let db = rusqlite::Connection::open(db_path).unwrap();
             let mut bytes: Vec<u8> = db
                 .query_row(
-                    "SELECT source_bytes FROM native_documents WHERE path='a.js'",
+                    "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js'",
                     [],
                     |row| row.get(0),
                 )
@@ -2845,7 +2845,7 @@ mod live_tests {
             bytes[0] ^= 1;
             assert_eq!(
                 db.execute(
-                    "UPDATE native_documents SET source_bytes=?1 WHERE path='a.js'",
+                    "UPDATE document_versions SET source_bytes=?1 WHERE id=(SELECT m.document_version_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js')",
                     [bytes],
                 )
                 .unwrap(),
@@ -3930,27 +3930,30 @@ mod normal_post_capture_cancellation_tests {
             index_generation: uuid::Uuid::parse_str(&generation).unwrap(),
             index_revision: u64::try_from(revision).unwrap(),
         };
-        let mut tables = vec![
-            "files".to_owned(),
-            "nodes".to_owned(),
-            "calls".to_owned(),
-            "regions".to_owned(),
-            "class_catalog".to_owned(),
-            "classes".to_owned(),
-            "class_relations".to_owned(),
-        ];
-        let mut names = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'native_*' ORDER BY name")
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        tables.extend(
-            names
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap(),
+        assert_eq!(
+            tables.len(),
+            28,
+            "compare the complete v8 evidence inventory"
         );
-        drop(names);
-        assert!(tables.iter().any(|table| table == "native_documents"));
+        for required in [
+            "document_versions",
+            "revision_documents",
+            "graph_nodes",
+            "native_version_declarations",
+            "class_projections",
+        ] {
+            assert!(
+                tables.iter().any(|table| table == required),
+                "missing {required}"
+            );
+        }
         let mut rows = BTreeMap::new();
         for table in tables {
             assert!(
@@ -4069,12 +4072,19 @@ mod normal_post_capture_cancellation_tests {
         assert_eq!(completed["state"], "done", "{completed}");
         let after = pair_snapshot(&index);
         assert!(after.pin.index_revision > before.pin.index_revision);
-        assert_ne!(after.rows["files"], before.rows["files"]);
         assert_ne!(
-            after.rows["native_documents"],
-            before.rows["native_documents"]
+            after.rows["revision_documents"],
+            before.rows["revision_documents"]
         );
-        assert!(after.rows["files"].iter().any(|row| row.contains("two.js")));
+        assert_ne!(
+            after.rows["document_versions"],
+            before.rows["document_versions"]
+        );
+        assert!(
+            after.rows["document_versions"]
+                .iter()
+                .any(|row| row.contains("two.js"))
+        );
         assert_eq!(
             after.pin,
             serde_json::from_value(completed["revision"].clone()).unwrap()
@@ -4378,6 +4388,97 @@ mod rebaseline_packet_cache_tests {
     use crate::indexer::index_workspace_bundle;
     use std::{fs, sync::atomic::AtomicBool};
 
+    // Exact frozen v4 SQLite objects and graph/class rows. Never spoof a v8 marker.
+    const HTTP_TEST_LEGACY_V4_SCHEMA: &str = r#"
+    CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+    CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+    CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+    CREATE INDEX nodes_name ON nodes(name);
+    CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+    CREATE INDEX calls_caller ON calls(caller);
+    CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+
+
+    CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
+    CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
+    CREATE INDEX classes_path ON classes(path,id);
+    CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+    CREATE INDEX class_relations_owner ON class_relations(owner,id);
+    CREATE INDEX class_relations_target ON class_relations(target,id);
+    "#;
+    fn downgrade_to_physical_legacy4(db: &rusqlite::Connection) {
+        db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")
+            .unwrap();
+        // Preserve the exact committed pin and selected graph/class DTOs on the SAME inode.
+        // The bootstrap (no published revision) also becomes an empty physical old4 cache.
+        db.execute_batch(r#"
+            CREATE TEMP TABLE old_metadata AS SELECT singleton,4 AS schema_version,
+                'native-v1' AS extractor_version,root_spelling,root_device,root_inode,
+                index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics
+                FROM index_metadata;
+            CREATE TEMP TABLE old_files AS SELECT d.path,d.content_hash AS hash,
+                json_object('path',d.path,'hash',d.content_hash,'language',d.language,
+                    'text',CAST(d.source_bytes AS TEXT)) AS payload
+                FROM revision_documents rd JOIN document_versions d ON d.id=rd.document_version_id;
+            CREATE TEMP TABLE old_nodes AS SELECT n.id,n.name,n.path,n.payload
+                FROM graph_nodes n JOIN revision_documents rd ON rd.graph_projection_id=n.projection_id;
+            CREATE TEMP TABLE old_calls AS SELECT c.id,c.caller,c.target,c.path,c.payload
+                FROM graph_calls c JOIN revision_documents rd ON rd.graph_projection_id=c.projection_id;
+            CREATE TEMP TABLE old_regions AS SELECT r.id,r.owner,r.path,r.payload
+                FROM graph_regions r JOIN revision_documents rd ON rd.graph_projection_id=r.projection_id;
+            CREATE TEMP TABLE old_classes AS SELECT c.id,c.name,c.qualified_name,c.path,c.payload
+                FROM classes c JOIN revision_documents rd ON rd.class_projection_id=c.projection_id;
+            CREATE TEMP TABLE old_class_relations AS SELECT c.id,c.owner,c.target,c.payload
+                FROM class_relations c JOIN revision_documents rd ON rd.class_projection_id=c.projection_id;
+            CREATE TEMP TABLE old_class_catalog AS SELECT 1 AS singleton,
+                COALESCE((SELECT class_warnings FROM native_revisions LIMIT 1),'[]') AS warnings,
+                COALESCE((SELECT class_truncated FROM native_revisions LIMIT 1),0) AS truncated;
+        "#).unwrap();
+        let names = db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for name in names {
+            assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            db.execute_batch(&format!("DROP TABLE \"{name}\";"))
+                .unwrap();
+        }
+        db.execute_batch(HTTP_TEST_LEGACY_V4_SCHEMA).unwrap();
+        db.execute_batch(
+            r#"
+            INSERT INTO index_metadata SELECT * FROM old_metadata;
+            INSERT INTO files SELECT * FROM old_files;
+            INSERT INTO nodes SELECT * FROM old_nodes;
+            INSERT INTO calls SELECT * FROM old_calls;
+            INSERT INTO regions SELECT * FROM old_regions;
+            INSERT INTO class_catalog SELECT * FROM old_class_catalog;
+            INSERT INTO classes SELECT * FROM old_classes;
+            INSERT INTO class_relations SELECT * FROM old_class_relations;
+            PRAGMA user_version=4;
+            COMMIT;
+            PRAGMA foreign_keys=ON;
+        "#,
+        )
+        .unwrap();
+        let leftovers: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN
+            ('document_versions','revision_documents','native_revisions','graph_projections')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leftovers, 0,
+            "legacy fixture must be physical old4, never marker-only"
+        );
+    }
+
     #[test]
     fn preview_fence_failure_restores_evicted_and_same_id_packets() {
         let revision = IndexPin {
@@ -4492,30 +4593,7 @@ mod rebaseline_packet_cache_tests {
             .unwrap()
             .join("index.db");
         let db = rusqlite::Connection::open(&db_path).unwrap();
-        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        let tables = {
-            let mut stmt = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'",
-                )
-                .unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        for table in tables {
-            db.execute(&format!("DROP TABLE \"{table}\""), []).unwrap();
-        }
-        for index in ["nodes_path", "calls_path", "regions_path"] {
-            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-        }
-        db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-            [],
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
+        downgrade_to_physical_legacy4(&db);
         drop(db);
         let old_bytes = fs::read(&db_path).unwrap();
         let state = new(

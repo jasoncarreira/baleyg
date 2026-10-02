@@ -6279,11 +6279,16 @@ mod rebaseline_fault_tests {
         let unchanged = open_index(&failing.path, false).unwrap();
         let baseline = recovering.recovery_baseline(&unchanged).unwrap();
         assert_eq!(baseline.pin().unwrap().index_revision, 0);
+        assert!(
+            baseline.compatible,
+            "private stage remains an empty v8 bootstrap"
+        );
+        validate_v8_bootstrap(&unchanged).unwrap();
         assert_eq!(
             unchanged
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            GRAPH_SCHEMA_VERSION
+            DATABASE_SCHEMA_VERSION
         );
         drop(unchanged);
         assert_eq!(fs::read(&live_path).unwrap(), original);
