@@ -4891,15 +4891,6 @@ impl Store {
             }
         })
     }
-    fn read_native_calls(
-        db: &Connection,
-        owner: &str,
-    ) -> Result<Vec<crate::native_evidence::Call>> {
-        v8_owner_scope(db, owner)?
-            .map(|scope| read_native_calls_v8(db, &scope, owner))
-            .transpose()
-            .map(|calls| calls.unwrap_or_default())
-    }
     pub fn native_control_regions_at(
         &self,
         pin: IndexPin,
@@ -4918,15 +4909,6 @@ impl Store {
                 Ok(vec![])
             }
         })
-    }
-    fn read_native_control_regions(
-        db: &Connection,
-        owner: &str,
-    ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
-        v8_owner_scope(db, owner)?
-            .map(|scope| read_native_control_regions_v8(db, &scope, owner))
-            .transpose()
-            .map(|regions| regions.unwrap_or_default())
     }
     /// Search only the persisted projection. Wildcards are literal user text.
     /// One read snapshot and revision guard; no source reads or catalog rebuilds.

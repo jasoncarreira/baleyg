@@ -976,7 +976,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
 
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=x'FF' WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
         [],
     )
     .unwrap();
@@ -1312,7 +1312,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=x'FF' WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
     )
     .unwrap();
@@ -1465,7 +1465,7 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
     let inode = fs::metadata(&path).unwrap().ino();
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=x'FF' WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
     )
     .unwrap();
