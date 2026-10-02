@@ -4471,3 +4471,112 @@ async fn saved_items_real_index_matrix() {
     assert!(raw_anchor(&stored_payload(&record_db, "annotations", "legacy-note")).is_none());
     drop(server);
 }
+
+#[test]
+fn optional_captured_scip_changes_presentation_without_native_identity_or_full_rewrite_breakage() {
+    use sha2::{Digest, Sha256};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let ingress = temp.path().join("ingress");
+    let other = temp.path().join("other");
+    for dir in [&root, &ingress, &other] {
+        fs::create_dir(dir).unwrap();
+    }
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let first = command(&root, &home, "index")
+        .current_dir(&ingress)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_pin: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_pin["publishedRevision"]["indexRevision"], 1);
+    let original = command(&root, &home, "export")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(original.status.success());
+    let original: Value = serde_json::from_slice(&original.stdout).unwrap();
+    let first_symbol = original["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "f")
+        .unwrap();
+    let first_id = first_symbol["id"].clone();
+    assert!(first_symbol["displayLabel"].is_null());
+    let hash = hex::encode(Sha256::digest(source.as_bytes()));
+    write_optional_presentation(&ingress, "scip npm display 1 main.js/f().", &hash);
+    // An unrelated cwd never becomes the base of the recorded optional inputs.
+    write_optional_presentation(&other, "scip npm display 1 other().", "stale");
+    let changed = command(&root, &home, "export")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
+    let next = changed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "f")
+        .unwrap();
+    assert_eq!(next["id"], first_id);
+    assert_eq!(next["displayLabel"], "scip npm display 1 main.js/f().");
+    assert_eq!(
+        changed["files"][0]["text"].as_str().unwrap().as_bytes(),
+        source.as_bytes()
+    );
+    let status = command(&root, &home, "status")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    // Full-rewrite staging publishes per CLI command: index r1, original export r2,
+    // changed export r3, this status r4, stale export r5, latest status r6.
+    assert_eq!(status["revision"]["indexRevision"], 4);
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        first_pin["publishedRevision"]["indexGeneration"]
+    );
+    write_optional_presentation(&ingress, "scip npm display 1 main.js/f().", "bad-hash");
+    let stale = command(&root, &home, "export")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(
+        stale.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    let symbol = stale["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "f")
+        .unwrap();
+    assert_eq!(symbol["id"], first_id);
+    assert!(symbol["displayLabel"].is_null());
+    let latest = command(&root, &home, "status")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(latest.status.success());
+    let latest: Value = serde_json::from_slice(&latest.stdout).unwrap();
+    assert_eq!(latest["revision"]["indexRevision"], 6);
+}

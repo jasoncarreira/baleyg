@@ -4,6 +4,7 @@ use crate::{capture::Capture, model::*, native_evidence};
 use anyhow::{Context, Result, ensure};
 use protobuf::Message;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -350,6 +351,383 @@ fn scip_coordinate(text: &str, byte: usize, encoding: i32) -> Option<(i32, i32)>
         _ => return None,
     };
     Some((line, i32::try_from(column).ok()?))
+}
+
+/// Decision made before a delta writer may reuse any prior native or graph rows.
+/// The old capture is an immutable *admitted* snapshot, not a live filesystem read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapturedChange {
+    Unchanged,
+    DocumentLocal { path: String },
+    FullNative { reason: &'static str },
+}
+
+/// An intentionally narrow proof: only a literal in a return expression or a comment
+/// inside a function body may change. Every other edit takes the full-native path.
+/// This reads only the changed document's source bytes and never queries lookup owners.
+fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
+    if old.path != new.path || old.language != new.language || old.text == new.text {
+        return false;
+    }
+    let language = match old.language.as_str() {
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        _ => return false,
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return false;
+    }
+    let (Some(before), Some(after)) =
+        (parser.parse(&old.text, None), parser.parse(&new.text, None))
+    else {
+        return false;
+    };
+    if before.root_node().has_error() || after.root_node().has_error() {
+        return false;
+    }
+    let a = old.text.as_bytes();
+    let b = new.text.as_bytes();
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (a_end, b_end) = (a.len() - suffix, b.len() - suffix);
+    // An insertion/deletion, or a boundary-crossing token edit, is not proved local.
+    if prefix == a_end || prefix == b_end {
+        return false;
+    }
+    fn changed_leaf<'a>(root: Node<'a>, start: usize, end: usize) -> Option<Node<'a>> {
+        let mut node = root.descendant_for_byte_range(start, end)?;
+        while node.child_count() > 0 {
+            let child = (0..node.child_count())
+                .filter_map(|i| node.child(i))
+                .find(|n| n.start_byte() <= start && n.end_byte() >= end)?;
+            node = child;
+        }
+        (node.start_byte() <= start && node.end_byte() >= end).then_some(node)
+    }
+    let Some(left) = changed_leaf(before.root_node(), prefix, a_end) else {
+        return false;
+    };
+    let Some(right) = changed_leaf(after.root_node(), prefix, b_end) else {
+        return false;
+    };
+    if left.kind() != right.kind() || !left.is_named() {
+        return false;
+    }
+    let comment = left.kind() == "comment";
+    let literal = matches!(
+        left.kind(),
+        "number"
+            | "integer"
+            | "integer_literal"
+            | "decimal_integer_literal"
+            | "string"
+            | "string_literal"
+            | "string_fragment"
+            | "raw_string_literal"
+    );
+    if !comment && !literal {
+        return false;
+    }
+    fn safe_ancestry(mut node: Node<'_>, comment: bool) -> bool {
+        let mut body = false;
+        let mut function = false;
+        let mut returned = false;
+        while let Some(parent) = node.parent() {
+            let kind = parent.kind();
+            if kind.contains("import")
+                || kind.contains("export")
+                || (kind.contains("class") && !matches!(kind, "class_body" | "class_declaration"))
+                || kind.contains("super")
+                || kind.contains("call")
+                || kind.contains("invocation")
+                || (kind.contains("declaration")
+                    && !kind.contains("function")
+                    && !kind.contains("method"))
+                || kind.contains("parameter")
+                || kind.contains("assignment")
+                || kind.contains("attribute")
+                || kind.contains("decorator")
+                || kind.contains("type_annotation")
+                || kind == "ERROR"
+            {
+                return false;
+            }
+            body |= matches!(kind, "statement_block" | "block");
+            function |= kind.contains("function") || kind.contains("method");
+            returned |= matches!(kind, "return_statement" | "return_expression");
+            node = parent;
+        }
+        body && function && (comment || returned)
+    }
+    if !safe_ancestry(left, comment) || !safe_ancestry(right, comment) {
+        return false;
+    }
+    // Identical tree shape is necessary, not sufficient: the exact bytes outside the
+    // one measured leaf must also be unchanged, including the enclosing header/scope.
+    fn shape(node: Node<'_>, result: &mut Vec<&'static str>) {
+        result.push(node.kind());
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                shape(child, result);
+            }
+        }
+        result.push("/");
+    }
+    let mut old_shape = vec![];
+    let mut new_shape = vec![];
+    shape(before.root_node(), &mut old_shape);
+    shape(after.root_node(), &mut new_shape);
+    old_shape == new_shape
+        && a[..left.start_byte()] == b[..right.start_byte()]
+        && a[left.end_byte()..] == b[right.end_byte()..]
+}
+
+/// The only scan outside the changed document compares path/language/capture hashes.
+/// A prior failed or ambiguous lookup in an unchanged file is deliberately not read.
+/// The caller supplies two captures admitted with the same root; admission/config and
+/// producer equality must be checked separately by the reuse fingerprint below.
+pub fn measure_captured_change(previous: &Capture, current: &Capture) -> CapturedChange {
+    measure_captured_change_observed(previous, current, |_| {})
+}
+
+/// Classifier candidate callback only. This is NOT a native extraction witness;
+/// the separate selected native stage observes only after successful assembly.
+pub fn measure_captured_change_observed(
+    previous: &Capture,
+    current: &Capture,
+    mut visit: impl FnMut(&str),
+) -> CapturedChange {
+    let old_options = previous.reconcile_options();
+    let new_options = current.reconcile_options();
+    if old_options != new_options {
+        return CapturedChange::FullNative {
+            reason: "capture admission changed",
+        };
+    }
+    let (Ok(previous_native), Ok(current_native)) = (
+        previous.native_input_fingerprints(),
+        current.native_input_fingerprints(),
+    ) else {
+        return CapturedChange::FullNative {
+            reason: "native input authentication unavailable",
+        };
+    };
+    if previous_native != current_native {
+        return CapturedChange::FullNative {
+            reason: "captured native input changed",
+        };
+    }
+    let before: BTreeMap<_, _> = previous
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f))
+        .collect();
+    let after: BTreeMap<_, _> = current.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    if before.keys().ne(after.keys()) {
+        return CapturedChange::FullNative {
+            reason: "source inventory changed (add/delete/rename)",
+        };
+    }
+    let mut changed = None;
+    for (path, old) in before {
+        let new = after[path];
+        if old.language != new.language {
+            return CapturedChange::FullNative {
+                reason: "source language changed",
+            };
+        }
+        if old.hash == new.hash {
+            continue;
+        }
+        if changed.is_some() {
+            return CapturedChange::FullNative {
+                reason: "multiple source documents changed",
+            };
+        }
+        changed = Some((path, old, new));
+    }
+    match changed {
+        None => CapturedChange::Unchanged,
+        Some((path, old, new)) => {
+            visit(path);
+            if proved_body_only(old, new) {
+                CapturedChange::DocumentLocal {
+                    path: path.to_owned(),
+                }
+            } else {
+                CapturedChange::FullNative {
+                    reason: "cross-file effect not proved local",
+                }
+            }
+        }
+    }
+}
+
+/// Actual selected-document native measurement for a proved local change. The
+/// unchanged full publication path remains separate and still assembles all files.
+#[derive(Debug)]
+pub struct StagedNativeMeasurement {
+    pub decision: CapturedChange,
+    pub selected: Option<native_evidence::SelectedDocument>,
+}
+
+pub fn measure_captured_native_change(
+    previous: &Capture,
+    current: &Capture,
+    root: &Path,
+    root_id: &str,
+    cancel: &CancelFlag,
+    on_extract: impl FnMut(&native_evidence::DocumentKey),
+) -> Result<StagedNativeMeasurement> {
+    let decision = measure_captured_change(previous, current);
+    let selected = match &decision {
+        CapturedChange::DocumentLocal { path } => Some(native_evidence::measure_captured_document(
+            current, root, root_id, path, cancel, on_extract,
+        )?),
+        _ => None,
+    };
+    Ok(StagedNativeMeasurement { decision, selected })
+}
+
+/// Fingerprints are internal reuse *conditions*, not a new public source of authority.
+/// The native fingerprint excludes revision-scoped IDs only; it includes authenticated
+/// bytes, admission/config/toolchain, producer, coverage roles and measured owners.
+/// A display-label change can preserve native identity but must change projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentFingerprint {
+    pub native: String,
+    pub projection: String,
+}
+impl DocumentFingerprint {
+    pub fn reusable_native(&self, other: &Self) -> bool {
+        self.native == other.native
+    }
+    pub fn reusable_projection(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+/// Called only with the artifact and graph from one validated captured bundle; a later
+/// writer must also attest any stored candidate before comparing these fingerprints.
+pub fn measure_document_fingerprint(
+    capture: &Capture,
+    native: &native_evidence::Artifact,
+    graph: &Graph,
+    path: &str,
+    options: &IndexOptions,
+) -> Result<DocumentFingerprint> {
+    let file = capture
+        .files
+        .iter()
+        .find(|f| f.path == path)
+        .context("missing captured document")?;
+    ensure!(
+        hex::encode(Sha256::digest(file.text.as_bytes())) == file.hash
+            && capture.hashes.get(path) == Some(&file.hash),
+        "captured document hash mismatch"
+    );
+    let document = native
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key.path == path)
+        .context("missing measured native document")?;
+    ensure!(
+        document.key.language == file.language
+            && document.key.source_set_id == native.source_set.id
+            && document.content_hash == file.hash
+            && document.byte_length == file.text.len()
+            && document.revision_id == native.revision.id,
+        "native document is not the captured bytes"
+    );
+    let coverage: Vec<_> = native
+        .coverage
+        .iter()
+        .filter(|v| v.document_path == path)
+        .collect();
+    ensure!(coverage.len() == 1, "missing or duplicate native coverage");
+    let coverage = coverage[0];
+    ensure!(
+        coverage.language == file.language
+            && coverage.source_set_id == native.source_set.id
+            && coverage.producer_id == native.producer.id
+            && coverage.revision_id == native.revision.id,
+        "native coverage ownership mismatch"
+    );
+    // Do not carry occurrence revision/proof IDs into a reusable version's identity.
+    // Every other field, including owner/key/roles and all distinct source facts, stays.
+    fn stable_fact<T: Serialize>(fact: &T) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(fact)?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("revisionId");
+            obj.remove("provenanceId");
+        }
+        Ok(value)
+    }
+    let declarations = native
+        .declarations
+        .iter()
+        .filter(|d| d.document == document.key)
+        .map(stable_fact)
+        .collect::<Result<Vec<_>>>()?;
+    let calls = native
+        .calls
+        .iter()
+        .filter(|c| c.document == document.key)
+        .map(stable_fact)
+        .collect::<Result<Vec<_>>>()?;
+    let regions = native
+        .control_regions
+        .iter()
+        .filter(|r| r.document == document.key)
+        .map(stable_fact)
+        .collect::<Result<Vec<_>>>()?;
+    let context = crate::native_ids::extraction_context(&file.language, &[])?;
+    let native_value = serde_json::json!({
+        "sourceSetId":native.source_set.id,"language":file.language,"path":file.path,
+        "contentHash":file.hash,"byteLength":file.text.len(),"extractionContext":context,
+        "producer":native.producer,"toolchainHash":native.revision.toolchain_hash,
+        "configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash,
+        "coverage":stable_fact(coverage)?,"declarations":declarations,"calls":calls,"regions":regions,
+    });
+    let native_hash = crate::native_ids::digest(
+        b"baleyg.local-native-fingerprint.v1\0",
+        &crate::native_ids::canonical(&native_value),
+    );
+    let labels = measured_display_labels(options, capture, native);
+    let nodes: Vec<_> = graph.nodes.iter().filter(|n| n.path == path).collect();
+    let graph_calls: Vec<_> = graph.calls.iter().filter(|c| c.path == path).collect();
+    let graph_regions: Vec<_> = graph.regions.iter().filter(|r| r.path == path).collect();
+    let scip_over_cutoff = matches!(file.language.as_str(), "javascript" | "java" | "python")
+        && options
+            .scip_path
+            .as_ref()
+            .and_then(|p| capture.bytes(p))
+            .and_then(|bytes| scip::types::Index::parse_from_bytes(bytes).ok())
+            .is_some_and(|index| index.documents.len() > 1_000);
+    let selected_labels: BTreeMap<_, _> = labels
+        .into_iter()
+        .filter(|(id, _)| nodes.iter().any(|node| &node.id == id))
+        .collect();
+    let projection_value = serde_json::json!({
+        "nativeFingerprint":&native_hash,"nodes":nodes,"calls":graph_calls,"regions":graph_regions,
+        "displayLabels":selected_labels,"scipOverCutoff":scip_over_cutoff,
+    });
+    Ok(DocumentFingerprint {
+        native: native_hash,
+        projection: crate::native_ids::digest(
+            b"baleyg.local-graph-fingerprint.v1\0",
+            &crate::native_ids::canonical(&projection_value),
+        ),
+    })
 }
 
 fn project_native(
