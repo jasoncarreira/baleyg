@@ -908,3 +908,102 @@ fn production_class_limits_are_fixed_at_decision_0004_values() {
     assert_eq!(limits.files, 100_000);
     assert_eq!(limits.symbols, 1_000_000);
 }
+
+#[test]
+fn tiny_limits_control_measured_names_import_bindings_and_type_parameter_details() {
+    use baleyg::classes::{DetailValue, FileExtraction, Limits};
+    let extract = |path: &str, source: &str, limits: Limits| {
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join(path), source).unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let graph =
+            index_workspace(&IndexOptions::new(work.path().to_owned()), &cancel, |_| {}).unwrap();
+        FileExtraction::extract_file(&graph.files[0], &graph.nodes, &cancel, limits).unwrap()
+    };
+    let default = Limits::default();
+    let long_name = "class LongerName {}";
+    assert_eq!(extract("A.java", long_name, default).classes.len(), 1);
+    let short_text = Limits { text: 2, ..default };
+    let clipped = extract("A.java", long_name, short_text);
+    assert!(clipped.registry_incomplete);
+    assert!(clipped.classes.is_empty());
+    assert_eq!(clipped.warnings, ["A."]);
+
+    let import = "import verylongpackage.B; class A { B field; }";
+    assert!(!extract("A.java", import, default).registry_incomplete);
+    let clipped = extract("A.java", import, Limits { text: 5, ..default });
+    assert!(clipped.registry_incomplete);
+    assert_eq!(clipped.classes.len(), 1);
+    assert_eq!(clipped.classes[0].symbol.name, "A");
+    assert_eq!(clipped.warnings, ["Class"]);
+
+    let class_parameters = "class A<T,U> {}";
+    assert_eq!(
+        extract("A.java", class_parameters, default).classes.len(),
+        1
+    );
+    let clipped = extract(
+        "A.java",
+        class_parameters,
+        Limits {
+            members: 1,
+            ..default
+        },
+    );
+    assert!(clipped.registry_incomplete);
+    assert!(clipped.classes.is_empty());
+    assert!(
+        clipped
+            .warnings
+            .iter()
+            .any(|w| w.contains("Class type parameter limit reached (1/declaration)"))
+    );
+
+    let inherited = "class A[T]:\n    class B[U]: pass\n";
+    assert_eq!(extract("a.py", inherited, default).classes.len(), 2);
+    let clipped = extract(
+        "a.py",
+        inherited,
+        Limits {
+            members: 1,
+            ..default
+        },
+    );
+    assert!(clipped.registry_incomplete);
+    assert_eq!(clipped.classes.len(), 1);
+    assert!(
+        clipped
+            .warnings
+            .iter()
+            .any(|w| w.contains("Class inherited type parameter limit reached (1/scope)"))
+    );
+
+    let method = "class A { <T,U> A method(A value) { return value; } A field; class Nested {} }";
+    let ordinary = extract("A.java", method, default);
+    assert!(ordinary.items.iter().any(|item| matches!(&item.value,
+        DetailValue::Relation(relation) if relation.kind == "returns")));
+    let clipped = extract(
+        "A.java",
+        method,
+        Limits {
+            members: 1,
+            ..default
+        },
+    );
+    assert!(
+        clipped
+            .classes
+            .iter()
+            .any(|c| c.qualified_name == "A.Nested")
+    );
+    assert!(
+        clipped
+            .warnings
+            .iter()
+            .any(|w| w.contains("Method type parameter detail limit reached (1)"))
+    );
+    assert!(!clipped.items.iter().any(|item| matches!(&item.value,
+        DetailValue::Relation(relation) if relation.kind == "returns" || relation.kind == "parameter")));
+    assert!(clipped.items.iter().any(|item| matches!(&item.value,
+        DetailValue::Relation(relation) if relation.kind == "field")));
+}

@@ -505,7 +505,7 @@ impl Builder<'_> {
             .iter()
             .filter(|s| s.kind == kind && s.range == range(n));
         let s = matches.next()?;
-        if matches.next().is_some() || s.id.len() > 8192 || s.name.len() > TEXT {
+        if matches.next().is_some() || s.id.len() > 8192 || s.name.len() > self.limits.text {
             None
         } else {
             Some((*s).clone())
@@ -516,8 +516,8 @@ impl Builder<'_> {
         true
     }
     fn bind(&mut self, scope: usize, name: String, value: Option<String>) {
-        if name.len() > TEXT
-            || value.as_ref().is_some_and(|s| s.len() > TEXT)
+        if name.len() > self.limits.text
+            || value.as_ref().is_some_and(|s| s.len() > self.limits.text)
             || !self.reserve_text(name.len() + value.as_ref().map_or(0, String::len))
         {
             self.scopes[scope].wildcard = true;
@@ -828,14 +828,16 @@ impl Extractor<'_, '_> {
                 return Ok(None);
             };
             for p in parameters {
-                if names.len() >= 256 {
+                if names.len() >= self.b.limits.members {
                     if let Some(index) = detail {
                         self.b.catalog.classes[index].truncated = true;
-                        self.b.limit("Method type parameter detail limit reached (256); method references omitted");
+                        self.b.limit(&format!("Method type parameter detail limit reached ({}); method references omitted", self.b.limits.members));
                     } else {
                         self.exhausted = true;
-                        self.b
-                            .registry_limit("Class type parameter limit reached (256/declaration)");
+                        self.b.registry_limit(&format!(
+                            "Class type parameter limit reached ({}/declaration)",
+                            self.b.limits.members
+                        ));
                     }
                     return Ok(None);
                 }
@@ -923,14 +925,16 @@ impl Extractor<'_, '_> {
                 lexical_parent = next;
             }
         }
-        if blocked.len() > 256
+        if blocked.len() > self.b.limits.members
             || !self
                 .b
                 .reserve_text(blocked.iter().map(String::len).sum::<usize>() * 2)
         {
             self.exhausted = true;
-            self.b
-                .registry_limit("Class inherited type parameter limit reached (256/scope)");
+            self.b.registry_limit(&format!(
+                "Class inherited type parameter limit reached ({}/scope)",
+                self.b.limits.members
+            ));
             return Ok(());
         }
         let base_scope = self.b.scopes.len();
