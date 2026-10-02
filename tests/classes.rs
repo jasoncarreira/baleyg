@@ -4,12 +4,40 @@ use baleyg::{
     model::{CancelFlag, Graph},
 };
 use std::{
+    cell::Cell,
     fs,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
+thread_local! { static GOLDEN_ORDINAL: Cell<usize> = const { Cell::new(0) }; }
+fn golden(catalog: &Catalog) {
+    if catalog.truncated {
+        return;
+    }
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_owned();
+    let ordinal = GOLDEN_ORDINAL.with(|counter| {
+        let n = counter.get();
+        counter.set(n + 1);
+        n
+    });
+    let path = format!("tests/fixtures/classes/below-cap/{name}-{ordinal}.json");
+    let bytes = serde_json::to_vec(catalog).unwrap();
+    if std::env::var_os("BALEYG_CAPTURE_CLASS_GOLDENS").is_some() {
+        fs::create_dir_all("tests/fixtures/classes/below-cap").unwrap();
+        fs::write(path, bytes).unwrap();
+    } else if std::path::Path::new(&path).exists() {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes,
+            "frozen pre-edit class JSON differs"
+        );
+    }
+}
 fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
     let temp = tempfile::tempdir().unwrap();
     for (path, text) in files {
@@ -20,6 +48,7 @@ fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
     let cancel = Arc::new(AtomicBool::new(false));
     let graph = index_workspace(&IndexOptions::new(temp.path().into()), &cancel, |_| {}).unwrap();
     let catalog = Catalog::build(&graph.files, &graph.nodes, &cancel).unwrap();
+    golden(&catalog);
     (graph, catalog)
 }
 fn class<'a>(c: &'a Catalog, name: &str) -> &'a baleyg::classes::ClassDefinition {
@@ -535,4 +564,20 @@ fn method_generic_detail_limit_does_not_stop_declarations_or_leak_partial_blocke
     );
     linked(&c, "p.Owner", "T256", "field", "p.T256");
     linked(&c, "p.Later", "Owner.Nested", "field", "p.Owner.Nested");
+}
+
+#[test]
+fn cohort72_small_java_python_templates_below_cap() {
+    let (_, catalog) = fixture(&[
+        (
+            "small/java/Csmall0000.java",
+            include_str!("../tools/synthetic-cohorts/templates/small/java.java"),
+        ),
+        (
+            "small/python/Csmall0000.py",
+            include_str!("../tools/synthetic-cohorts/templates/small/python.py"),
+        ),
+    ]);
+    assert!(!catalog.truncated, "{catalog:#?}");
+    assert!(!catalog.classes.is_empty());
 }
