@@ -1448,11 +1448,32 @@ mod budget_tests {
             .module(tree.root_node(), 0)
             .unwrap();
             assert!(b.registry_complete);
-            assert!(
-                b.pending.is_empty(),
-                "incomplete method blockers must not emit references"
-            );
-            assert!(b.catalog.truncated);
+            if detail_visits >= VISITS - 3 {
+                assert!(
+                    b.pending.is_empty(),
+                    "incomplete method blockers must not emit references"
+                );
+                assert!(b.catalog.truncated);
+            } else {
+                let owner = b.catalog.classes[1].symbol.id.as_str();
+                assert_eq!(
+                    b.pending
+                        .iter()
+                        .map(|p| (
+                            p.relation.kind.as_str(),
+                            p.relation.type_name.as_str(),
+                            p.relation.owner.as_str()
+                        ))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        ("returns", "Target", owner),
+                        ("parameter", "Target", owner),
+                        ("field", "Target", owner)
+                    ],
+                    "complete method and field references must remain measured"
+                );
+                assert!(!b.catalog.truncated);
+            }
             assert_eq!(b.catalog.classes.len(), 4);
             assert!(
                 b.catalog
@@ -1475,7 +1496,8 @@ mod budget_tests {
                 },
             });
             b.resolve().unwrap();
-            let relation = &b.catalog.relations[0];
+            let relation = b.catalog.relations.last().unwrap();
+            assert_eq!(relation.id, "measured-before-cap");
             assert_eq!(relation.match_kind, "unmatched");
             assert!(relation.candidate_ids.is_empty());
             assert!(relation.target.is_none());

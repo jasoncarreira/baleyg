@@ -2148,7 +2148,7 @@ mod gc_schema_race_tests {
             (schema, marker.as_str(), generation, revision),
             (
                 8,
-                "native-v4",
+                "native-v4-class-compose-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
             )

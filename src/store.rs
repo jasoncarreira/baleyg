@@ -8543,7 +8543,7 @@ mod sqlite_schema_race_tests {
             (schema, marker.as_str(), generation, revision),
             (
                 8,
-                "native-v4",
+                "native-v4-class-compose-v1",
                 old.index_generation.to_string(),
                 old.index_revision as i64
             )
@@ -8693,7 +8693,7 @@ mod sqlite_schema_race_tests {
             (schema, marker.as_str(), generation, revision),
             (
                 8,
-                "native-v4",
+                "native-v4-class-compose-v1",
                 leader_pin.index_generation.to_string(),
                 leader_pin.index_revision as i64
             )
