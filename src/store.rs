@@ -7054,6 +7054,8 @@ mod rebaseline_fault_tests {
         crate::indexer::validate_native_graph(&next, &next_capture, &next_native, &initial_cancel)
             .unwrap();
 
+        // The leader was acquired before r1; snapshot after all leader activity.
+        let baseline_db = fs::read(store.roots.index_db(&store.identity)).unwrap();
         let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -7081,15 +7083,16 @@ mod rebaseline_fault_tests {
                         new_revision == i64::try_from(pin.index_revision + 1)?,
                         "new revision not staged inside writer transaction"
                     );
+                    let staged_pin = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision + 1);
                     let added: i64 = tx.query_row(
-                        "SELECT count(*) FROM classes WHERE path='Types.java' AND name='Added'",
-                        [],
+                        "SELECT count(*) FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 AND c.path='Types.java' AND c.name='Added'",
+                        [&staged_pin],
                         |row| row.get(0),
                     )?;
                     ensure!(added == 1, "new class projection not staged");
                     let raw: Vec<u8> = tx.query_row(
-                        "SELECT source_bytes FROM document_versions WHERE path='Types.java'",
-                        [],
+                        "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='Types.java' AND v.path='Types.java'",
+                        [&staged_pin],
                         |row| row.get(0),
                     )?;
                     ensure!(raw == changed.as_bytes(), "new native source not staged");
@@ -7141,6 +7144,11 @@ mod rebaseline_fault_tests {
                 worker_outcome(other)
             ),
         }
+        assert_eq!(
+            fs::read(store.roots.index_db(&store.identity)).unwrap(),
+            baseline_db,
+            "cancelled staged r2 must leave every retained r1 SQLite byte unchanged"
+        );
         assert_eq!(store.status().unwrap().revision, pin);
         assert_eq!(store.graph().unwrap(), old_graph);
         assert_eq!(
@@ -7312,6 +7320,8 @@ mod rebaseline_fault_tests {
         crate::indexer::validate_native_graph(&next, &next_capture, &next_native, &initial_cancel)
             .unwrap();
 
+        // The baseline is captured after the sole leader acquisition and r1 commit.
+        let baseline_db = fs::read(store.roots.index_db(&store.identity)).unwrap();
         let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -7329,18 +7339,19 @@ mod rebaseline_fault_tests {
                         "SELECT index_revision FROM index_metadata WHERE singleton=1",[],|r|r.get(0))?;
                     ensure!(revision==i64::try_from(pin.index_revision+1)?,
                         "new revision not staged in publisher transaction");
+                    let staged_pin = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision + 1);
                     let graph_functions:i64=tx.query_row(
-                        "SELECT count(*) FROM graph_nodes WHERE path='a.js' AND json_extract(payload,'$.kind')='function'",[],|r|r.get(0))?;
+                        "SELECT count(*) FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path='a.js' AND n.path='a.js' AND json_extract(n.payload,'$.kind')='function'",[&staged_pin],|r|r.get(0))?;
                     let native_functions:i64=tx.query_row(
-                        "SELECT count(*) FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id WHERE v.path='a.js' AND d.kind='function'",[],|r|r.get(0))?;
+                        "SELECT count(*) FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js' AND d.kind='function'",[&staged_pin],|r|r.get(0))?;
                     let graph_calls:i64=tx.query_row(
-                        "SELECT count(*) FROM graph_calls WHERE path='a.js'",[],|r|r.get(0))?;
+                        "SELECT count(*) FROM graph_calls c JOIN revision_documents m ON m.graph_projection_id=c.projection_id WHERE m.revision_id=?1 AND m.path='a.js' AND c.path='a.js'",[&staged_pin],|r|r.get(0))?;
                     let native_calls:i64=tx.query_row(
-                        "SELECT count(*) FROM native_version_calls c JOIN document_versions v ON v.id=c.version_id WHERE v.path='a.js'",[],|r|r.get(0))?;
+                        "SELECT count(*) FROM native_version_calls c JOIN document_versions v ON v.id=c.version_id JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
                     ensure!((graph_functions,native_functions,graph_calls,native_calls)==(5_000,5_000,5_000,5_000),
-                        "5,000 measured graph/native function and call rows not staged: graph={graph_functions}/{graph_calls} native={native_functions}/{native_calls}");
+                        "5,000 measured graph/native function and call rows not staged for active pin: graph={graph_functions}/{graph_calls} native={native_functions}/{native_calls}");
                     let source_bytes:Vec<u8>=tx.query_row(
-                        "SELECT source_bytes FROM document_versions WHERE path='a.js'",[],|r|r.get(0))?;
+                        "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
                     ensure!(source_bytes==large_source.as_bytes(),
                         "new captured native source bytes not staged");
                     validate_paired_metadata(tx,worker_store.root_id())?;
@@ -7387,6 +7398,11 @@ mod rebaseline_fault_tests {
                 outcome(other)
             ),
         }
+        assert_eq!(
+            fs::read(store.roots.index_db(&store.identity)).unwrap(),
+            baseline_db,
+            "cancelled staged 5,000-row r2 must leave every retained r1 SQLite byte unchanged"
+        );
         assert_eq!(store.status().unwrap().revision, pin);
         assert_eq!(store.graph().unwrap(), old_graph);
         assert_eq!(
