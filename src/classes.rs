@@ -230,8 +230,10 @@ impl Catalog {
     ) -> Result<Self> {
         check(cancel)?;
         if files.len() > limits.files || nodes.len() > limits.symbols {
-            let mut catalog = Self::default();
-            catalog.truncated = true;
+            let mut catalog = Self {
+                truncated: true,
+                ..Self::default()
+            };
             catalog.warnings.push(format!(
                 "Class catalog input limit exceeded ({} files / {} symbols)",
                 limits.files, limits.symbols
