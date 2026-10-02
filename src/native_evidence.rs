@@ -532,30 +532,56 @@ pub(crate) fn measure_captured_document(
     capture.verify(cancel)?;
     let (mut artifact, files) = build_native_header(capture, root, root_id)?;
     let selected: Vec<_> = files.into_iter().filter(|file| file.path == path).collect();
-    ensure!(selected.len() == 1, "selected native source must be unique and admitted");
+    ensure!(
+        selected.len() == 1,
+        "selected native source must be unique and admitted"
+    );
     let file = selected[0];
-    ensure!(capture.hashes.get(path) == Some(&file.hash)
-        && file.hash == hash(file.text.as_bytes()),
-        "selected native source bytes/hash mismatch");
-    let documents: Vec<_> = artifact.revision.documents.iter()
-        .filter(|document| document.key.path == path).cloned().collect();
-    ensure!(documents.len() == 1, "selected native revision document must be unique");
+    ensure!(
+        capture.hashes.get(path) == Some(&file.hash) && file.hash == hash(file.text.as_bytes()),
+        "selected native source bytes/hash mismatch"
+    );
+    let documents: Vec<_> = artifact
+        .revision
+        .documents
+        .iter()
+        .filter(|document| document.key.path == path)
+        .cloned()
+        .collect();
+    ensure!(
+        documents.len() == 1,
+        "selected native revision document must be unique"
+    );
     let document = documents[0].clone();
-    ensure!(document.key.source_set_id == artifact.source_set.id
-        && document.key.language == file.language
-        && document.content_hash == file.hash
-        && document.byte_length == file.text.len()
-        && document.revision_id == artifact.revision.id,
-        "selected native document not bound to full capture");
+    ensure!(
+        document.key.source_set_id == artifact.source_set.id
+            && document.key.language == file.language
+            && document.content_hash == file.hash
+            && document.byte_length == file.text.len()
+            && document.revision_id == artifact.revision.id,
+        "selected native document not bound to full capture"
+    );
     let mut ids = IdentityRegistry::default();
     extract(&mut artifact, file, &mut ids)?;
-    ensure!(artifact.coverage.len() == 1 && artifact.provenance.len() == 1
-        && artifact.coverage[0].document_path == path
-        && artifact.provenance[0].document == document.key
-        && artifact.declarations.iter().all(|row| row.document == document.key)
-        && artifact.calls.iter().all(|row| row.document == document.key)
-        && artifact.control_regions.iter().all(|row| row.document == document.key),
-        "selected native facts escaped the admitted document");
+    ensure!(
+        artifact.coverage.len() == 1
+            && artifact.provenance.len() == 1
+            && artifact.coverage[0].document_path == path
+            && artifact.provenance[0].document == document.key
+            && artifact
+                .declarations
+                .iter()
+                .all(|row| row.document == document.key)
+            && artifact
+                .calls
+                .iter()
+                .all(|row| row.document == document.key)
+            && artifact
+                .control_regions
+                .iter()
+                .all(|row| row.document == document.key),
+        "selected native facts escaped the admitted document"
+    );
     capture.verify(cancel)?;
     on_extract(&document.key);
     Ok(SelectedDocument {

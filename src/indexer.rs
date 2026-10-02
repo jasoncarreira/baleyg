@@ -589,11 +589,9 @@ pub fn measure_captured_native_change(
 ) -> Result<StagedNativeMeasurement> {
     let decision = measure_captured_change(previous, current);
     let selected = match &decision {
-        CapturedChange::DocumentLocal { path } => Some(
-            native_evidence::measure_captured_document(
-                current, root, root_id, path, cancel, on_extract,
-            )?,
-        ),
+        CapturedChange::DocumentLocal { path } => Some(native_evidence::measure_captured_document(
+            current, root, root_id, path, cancel, on_extract,
+        )?),
         _ => None,
     };
     Ok(StagedNativeMeasurement { decision, selected })

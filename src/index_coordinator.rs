@@ -80,7 +80,9 @@ impl IndexJobCoordinator {
         cancel: &CancelFlag,
         on_extract: impl FnMut(&crate::native_evidence::DocumentKey),
     ) -> Result<indexer::StagedNativeMeasurement> {
-        indexer::measure_captured_native_change(previous, current, root, root_id, cancel, on_extract)
+        indexer::measure_captured_native_change(
+            previous, current, root, root_id, cancel, on_extract,
+        )
     }
 
     /// Projection uses the admitted bytes; publication checks drift, cancellation and the

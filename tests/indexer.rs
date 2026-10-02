@@ -1125,7 +1125,11 @@ fn admitted_body_edit_measures_only_changed_document_not_unrelated_lookup_owners
         store::topology::WorkspaceIdentity,
     };
     let d = tempfile::tempdir().unwrap();
-    write(d.path(), "a.js", "function f(){ if (ready()) { return 10; } return 0; }\n");
+    write(
+        d.path(),
+        "a.js",
+        "function f(){ if (ready()) { return 10; } return 0; }\n",
+    );
     // An unrelated pre-existing unresolved/ambiguous lookup cannot force fallback.
     write(
         d.path(),
@@ -1134,18 +1138,35 @@ fn admitted_body_edit_measures_only_changed_document_not_unrelated_lookup_owners
     );
     let options = IndexOptions::new(d.path().to_owned());
     let first = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    write(d.path(), "a.js", "function f(){ if (ready()) { return 20; } return 0; }\n");
+    write(
+        d.path(),
+        "a.js",
+        "function f(){ if (ready()) { return 20; } return 0; }\n",
+    );
     let second = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert_eq!(first.files[0].text.as_bytes(), b"function f(){ if (ready()) { return 10; } return 0; }\n");
-    assert_eq!(second.files[0].text.as_bytes(), b"function f(){ if (ready()) { return 20; } return 0; }\n");
+    assert_eq!(
+        first.files[0].text.as_bytes(),
+        b"function f(){ if (ready()) { return 10; } return 0; }\n"
+    );
+    assert_eq!(
+        second.files[0].text.as_bytes(),
+        b"function f(){ if (ready()) { return 20; } return 0; }\n"
+    );
     let choice = measure_captured_change(&first, &second);
     let root = d.path().canonicalize().unwrap();
-    let root_id = WorkspaceIdentity::discover(Some(&root), &root).unwrap().record_id;
+    let root_id = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .record_id;
     let mut measured = vec![];
     let stage = IndexJobCoordinator::staged_capture_measurement(
-        &first, &second, &root, &root_id, &cancel(),
+        &first,
+        &second,
+        &root,
+        &root_id,
+        &cancel(),
         |key| measured.push(key.path.clone()),
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(stage.decision, choice);
     let selected = stage.selected.unwrap();
     assert_eq!(
@@ -1156,45 +1177,145 @@ fn admitted_body_edit_measures_only_changed_document_not_unrelated_lookup_owners
     );
     assert_eq!(measured, ["a.js"]); // callback ran only AFTER real native extract succeeded
     let mut rejected = vec![];
-    assert!(IndexJobCoordinator::staged_capture_measurement(
-        &first, &second, &root, "incorrect-root-id", &cancel(),
-        |key| rejected.push(key.path.clone()),
-    ).is_err());
-    assert!(rejected.is_empty(), "failed native authentication cannot report assembly");
+    assert!(
+        IndexJobCoordinator::staged_capture_measurement(
+            &first,
+            &second,
+            &root,
+            "incorrect-root-id",
+            &cancel(),
+            |key| rejected.push(key.path.clone()),
+        )
+        .is_err()
+    );
+    assert!(
+        rejected.is_empty(),
+        "failed native authentication cannot report assembly"
+    );
     assert_eq!(first.files[1], second.files[1]);
-    assert!(selected.declarations.iter().any(|row| row.name.as_deref() == Some("f")));
+    assert!(
+        selected
+            .declarations
+            .iter()
+            .any(|row| row.name.as_deref() == Some("f"))
+    );
     assert!(!selected.calls.is_empty());
     assert!(!selected.control_regions.is_empty());
     assert!(selected.calls.iter().all(|row| row.document.path == "a.js"));
-    assert!(selected.calls.iter().all(|row| selected.declarations.iter()
-        .any(|owner| owner.syntax_id == row.owner_syntax_id)));
-    assert!(selected.declarations.iter().all(|row| row.document.path == "a.js"));
+    assert!(selected.calls.iter().all(|row| {
+        selected
+            .declarations
+            .iter()
+            .any(|owner| owner.syntax_id == row.owner_syntax_id)
+    }));
+    assert!(
+        selected
+            .declarations
+            .iter()
+            .all(|row| row.document.path == "a.js")
+    );
     let (_graph, full, _separate_capture) =
         index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
     assert_eq!(selected.producer, full.producer);
     assert_eq!(selected.source_set, full.source_set);
     assert_eq!(selected.revision, full.revision);
-    assert_eq!(selected.document, *full.revision.documents.iter().find(|row| row.key.path == "a.js").unwrap());
-    assert_eq!(selected.coverage, *full.coverage.iter().find(|row| row.document_path == "a.js").unwrap());
-    assert_eq!(selected.provenance, *full.provenance.iter().find(|row| row.document.path == "a.js").unwrap());
-    assert_eq!(selected.declarations, full.declarations.iter().filter(|row| row.document.path == "a.js").cloned().collect::<Vec<_>>());
-    assert_eq!(selected.calls, full.calls.iter().filter(|row| row.document.path == "a.js").cloned().collect::<Vec<_>>());
-    assert_eq!(selected.control_regions, full.control_regions.iter().filter(|row| row.document.path == "a.js").cloned().collect::<Vec<_>>());
+    assert_eq!(
+        selected.document,
+        *full
+            .revision
+            .documents
+            .iter()
+            .find(|row| row.key.path == "a.js")
+            .unwrap()
+    );
+    assert_eq!(
+        selected.coverage,
+        *full
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "a.js")
+            .unwrap()
+    );
+    assert_eq!(
+        selected.provenance,
+        *full
+            .provenance
+            .iter()
+            .find(|row| row.document.path == "a.js")
+            .unwrap()
+    );
+    assert_eq!(
+        selected.declarations,
+        full.declarations
+            .iter()
+            .filter(|row| row.document.path == "a.js")
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        selected.calls,
+        full.calls
+            .iter()
+            .filter(|row| row.document.path == "a.js")
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        selected.control_regions,
+        full.control_regions
+            .iter()
+            .filter(|row| row.document.path == "a.js")
+            .cloned()
+            .collect::<Vec<_>>()
+    );
     let selected_bytes = serde_json::to_vec(&(
-        &selected.revision, &selected.document, &selected.coverage, &selected.provenance,
-        &selected.declarations, &selected.calls, &selected.control_regions,
-    )).unwrap();
+        &selected.revision,
+        &selected.document,
+        &selected.coverage,
+        &selected.provenance,
+        &selected.declarations,
+        &selected.calls,
+        &selected.control_regions,
+    ))
+    .unwrap();
     let oracle_bytes = serde_json::to_vec(&(
         &full.revision,
-        full.revision.documents.iter().find(|row| row.key.path == "a.js").unwrap(),
-        full.coverage.iter().find(|row| row.document_path == "a.js").unwrap(),
-        full.provenance.iter().find(|row| row.document.path == "a.js").unwrap(),
-        full.declarations.iter().filter(|row| row.document.path == "a.js").collect::<Vec<_>>(),
-        full.calls.iter().filter(|row| row.document.path == "a.js").collect::<Vec<_>>(),
-        full.control_regions.iter().filter(|row| row.document.path == "a.js").collect::<Vec<_>>(),
-    )).unwrap();
-    assert_eq!(selected_bytes, oracle_bytes, "selected native bytes differ from the full captured oracle");
-    assert_eq!(measured, ["a.js"], "the separate full oracle is not a stage observation");
+        full.revision
+            .documents
+            .iter()
+            .find(|row| row.key.path == "a.js")
+            .unwrap(),
+        full.coverage
+            .iter()
+            .find(|row| row.document_path == "a.js")
+            .unwrap(),
+        full.provenance
+            .iter()
+            .find(|row| row.document.path == "a.js")
+            .unwrap(),
+        full.declarations
+            .iter()
+            .filter(|row| row.document.path == "a.js")
+            .collect::<Vec<_>>(),
+        full.calls
+            .iter()
+            .filter(|row| row.document.path == "a.js")
+            .collect::<Vec<_>>(),
+        full.control_regions
+            .iter()
+            .filter(|row| row.document.path == "a.js")
+            .collect::<Vec<_>>(),
+    ))
+    .unwrap();
+    assert_eq!(
+        selected_bytes, oracle_bytes,
+        "selected native bytes differ from the full captured oracle"
+    );
+    assert_eq!(
+        measured,
+        ["a.js"],
+        "the separate full oracle is not a stage observation"
+    );
 }
 
 #[test]
@@ -1517,7 +1638,11 @@ fn optional_native_input_aliases_force_full_native_fallback() {
         store::topology::WorkspaceIdentity,
     };
     for (relative, old_input, new_input) in [
-        ("Cargo.toml", "[package]\nname='one'\n", "[package]\nname='two'\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname='one'\n",
+            "[package]\nname='two'\n",
+        ),
         ("nested/.ignore", "# old ignore\n", "# changed ignore\n"),
     ] {
         let d = tempfile::tempdir().unwrap();
@@ -1532,25 +1657,46 @@ fn optional_native_input_aliases_force_full_native_fallback() {
         write(d.path(), relative, new_input);
         write(d.path(), "a.js", "function f(){ return 20; }\n");
         let after = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-        assert_eq!(before.files[0].text.as_bytes(), b"function f(){ return 10; }\n");
-        assert_eq!(after.files[0].text.as_bytes(), b"function f(){ return 20; }\n");
-        assert_eq!(measure_captured_change(&before, &after), CapturedChange::FullNative {
-            reason: "captured native input changed",
-        }, "{relative}");
+        assert_eq!(
+            before.files[0].text.as_bytes(),
+            b"function f(){ return 10; }\n"
+        );
+        assert_eq!(
+            after.files[0].text.as_bytes(),
+            b"function f(){ return 20; }\n"
+        );
+        assert_eq!(
+            measure_captured_change(&before, &after),
+            CapturedChange::FullNative {
+                reason: "captured native input changed",
+            },
+            "{relative}"
+        );
         let root = d.path().canonicalize().unwrap();
-        let root_id = WorkspaceIdentity::discover(Some(&root), &root).unwrap().record_id;
+        let root_id = WorkspaceIdentity::discover(Some(&root), &root)
+            .unwrap()
+            .record_id;
         let mut observed = vec![];
-        let staged = measure_captured_native_change(&before, &after, &root, &root_id,
-            &cancel(), |key| observed.push(key.path.clone())).unwrap();
+        let staged =
+            measure_captured_native_change(&before, &after, &root, &root_id, &cancel(), |key| {
+                observed.push(key.path.clone())
+            })
+            .unwrap();
         assert!(matches!(staged.decision, CapturedChange::FullNative { .. }));
         assert!(staged.selected.is_none());
-        assert!(observed.is_empty(), "fallback has no selected-only native measurement");
+        assert!(
+            observed.is_empty(),
+            "fallback has no selected-only native measurement"
+        );
     }
 }
 
 #[test]
 fn optional_executable_alias_keeps_authenticated_native_role_without_editing_binary() {
-    use baleyg::{capture::Capture, indexer::{CapturedChange, measure_captured_change}};
+    use baleyg::{
+        capture::Capture,
+        indexer::{CapturedChange, measure_captured_change},
+    };
     let executable = std::env::current_exe().unwrap();
     if fs::metadata(&executable).unwrap().len() > 256 * 1024 * 1024 {
         // The optional SCIP capture itself has a 256 MiB admission ceiling.
@@ -1563,6 +1709,10 @@ fn optional_executable_alias_keeps_authenticated_native_role_without_editing_bin
     let before = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
     write(d.path(), "a.js", "function f(){ return 20; }\n");
     let after = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert_eq!(measure_captured_change(&before, &after),
-        CapturedChange::DocumentLocal { path: "a.js".into() });
+    assert_eq!(
+        measure_captured_change(&before, &after),
+        CapturedChange::DocumentLocal {
+            path: "a.js".into()
+        }
+    );
 }

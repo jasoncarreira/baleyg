@@ -592,7 +592,10 @@ impl Capture {
                     .to_str()
                     .context("non-UTF8 native input path")?
                     .replace('\\', "/");
-                if matches!(path.file_name().and_then(|name| name.to_str()), Some(".gitignore" | ".ignore")) {
+                if matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(".gitignore" | ".ignore")
+                ) {
                     roles.push(format!("ignore:{relative}"));
                 } else if matches!(relative.as_str(), "rust-toolchain" | "rust-toolchain.toml") {
                     roles.push(format!("toolchain:{relative}"));
@@ -603,12 +606,17 @@ impl Capture {
             if roles.is_empty() {
                 continue;
             }
-            let bytes = self.input_bytes.get(path).context("missing admitted native input")?;
+            let bytes = self
+                .input_bytes
+                .get(path)
+                .context("missing admitted native input")?;
             let digest = match (expected, bytes) {
                 (None, None) => None,
                 (Some(stat), Some(bytes)) => {
-                    ensure!(stat.kind == 2 && stat.len == bytes.len() as u64,
-                        "malformed admitted native input");
+                    ensure!(
+                        stat.kind == 2 && stat.len == bytes.len() as u64,
+                        "malformed admitted native input"
+                    );
                     Some(if path == &self.executable_path {
                         self.executable_digest(path)
                             .context("native executable Arc identity mismatch")?
@@ -620,16 +628,29 @@ impl Capture {
                 _ => anyhow::bail!("native input bytes/stamp mismatch"),
             };
             for role in roles {
-                ensure!(result.insert(role, digest.clone()).is_none(),
-                    "duplicate admitted native input role");
+                ensure!(
+                    result.insert(role, digest.clone()).is_none(),
+                    "duplicate admitted native input role"
+                );
             }
         }
-        ensure!(result.keys().any(|key| key.starts_with("executable:")),
-            "missing admitted native executable role");
-        ensure!(ROOT_INPUTS.iter().all(|name| {
-            result.contains_key(&format!("{}:{name}",
-                if matches!(*name, "rust-toolchain" | "rust-toolchain.toml") { "toolchain" } else { "config" }))
-        }), "missing admitted native config/toolchain role");
+        ensure!(
+            result.keys().any(|key| key.starts_with("executable:")),
+            "missing admitted native executable role"
+        );
+        ensure!(
+            ROOT_INPUTS.iter().all(|name| {
+                result.contains_key(&format!(
+                    "{}:{name}",
+                    if matches!(*name, "rust-toolchain" | "rust-toolchain.toml") {
+                        "toolchain"
+                    } else {
+                        "config"
+                    }
+                ))
+            }),
+            "missing admitted native config/toolchain role"
+        );
         Ok(result)
     }
 
