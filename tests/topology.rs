@@ -1547,7 +1547,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        8
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -2211,8 +2211,68 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
     );
 }
 
+// Frozen v4 objects match Store's exact closed-world legacy recognition.
+// This is a physical old-format fixture, not a marker downgrade of a v8 DB.
+const FROZEN_LEGACY4_GRAPH_SQL: &str = "
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX nodes_name ON nodes(name);
+CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX calls_caller ON calls(caller);
+CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+";
+const FROZEN_LEGACY4_CLASS_SQL: &str = "
+CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
+CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX classes_path ON classes(path,id);
+CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX class_relations_owner ON class_relations(owner,id);
+CREATE INDEX class_relations_target ON class_relations(target,id);
+";
+fn rewrite_as_physical_v4(db: &rusqlite::Connection) {
+    let metadata: (String,String,String,String,i64,i64,String,String,String) = db.query_row(
+        "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
+        [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+    ).unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let names: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for name in names {
+        db.execute_batch(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")))
+            .unwrap();
+    }
+    db.execute_batch(FROZEN_LEGACY4_GRAPH_SQL).unwrap();
+    db.execute_batch(FROZEN_LEGACY4_CLASS_SQL).unwrap();
+    db.execute(
+        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        rusqlite::params![
+            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
+            metadata.7, metadata.8
+        ],
+    )
+    .unwrap();
+    db.execute("INSERT INTO class_catalog VALUES(1,'[]',0)", [])
+        .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
 #[test]
-fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes() {
+fn gc_classifies_safe_schema8_and_physical_legacy4_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2233,17 +2293,15 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
         (entry.status, entry.reason)
     };
     assert_eq!(inspect(), ("unknown", "recent_open"));
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='native-v1'",
-        [],
-    )
-    .unwrap();
-    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='native-no-lexical-v1'",
-        [],
-    )
-    .unwrap();
+    // v8's CHECK forbids spoofing an old extractor on the current layout.
+    assert!(
+        db.execute(
+            "UPDATE index_metadata SET extractor_version='native-v1'",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute_batch("CREATE TABLE unsupported(id INTEGER)")
         .unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
@@ -2252,16 +2310,25 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
         .unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
     db.execute_batch("DROP VIEW unapproved_view").unwrap();
-    db.pragma_update(None, "user_version", 6).unwrap();
+    db.pragma_update(None, "user_version", 7).unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
-    db.pragma_update(None, "user_version", 5).unwrap();
+    db.pragma_update(None, "user_version", 8).unwrap();
+    assert_eq!(inspect(), ("unknown", "recent_open"));
+    // A real frozen old4 physical layout is safe for GC classification, but
+    // remains unreadable to public v8 evidence routes until explicit reindex.
+    rewrite_as_physical_v4(&db);
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute(
-        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+        "UPDATE index_metadata SET extractor_version='wrong-old-extractor'",
         [],
     )
     .unwrap();
-    db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.execute(
+        "UPDATE index_metadata SET extractor_version='native-v1'",
+        [],
+    )
+    .unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute_batch("CREATE TRIGGER unapproved_trigger AFTER INSERT ON calls BEGIN SELECT RAISE(FAIL,'FORGED'); END;").unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));

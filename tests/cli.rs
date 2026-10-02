@@ -654,7 +654,7 @@ fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
         let new_key = format!("presentation-{role}:{name}");
         assert_eq!(
             db.execute(
-                "UPDATE capture_inputs SET input_key=?1 WHERE input_key=?2",
+                "UPDATE revision_capture_inputs SET input_key=?1 WHERE input_key=?2",
                 rusqlite::params![new_key, old_key],
             )
             .unwrap(),
@@ -1675,34 +1675,18 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         .join("index.db");
     {
         let db = rusqlite::Connection::open(&path).unwrap();
-        db.pragma_update(None, "foreign_keys", false).unwrap();
-        let native_tables = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        for table in native_tables {
-            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
-        }
-        for index in ["nodes_path", "calls_path", "regions_path"] {
-            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-        }
-        db.execute_batch(
-            "DROP TABLE capture_inputs;
-             ALTER TABLE files DROP COLUMN capture_stat;
-             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
-             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
-        )
-        .unwrap();
+        rewrite_as_physical_v4(&db);
         db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            "INSERT INTO files(path,hash,payload) VALUES('a.js','legacy-hash','{}')",
             [],
         )
         .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
-        db.execute("UPDATE calls SET payload=json_set(payload,'$.target','lexical-guess','$.resolution','internal')",[]).unwrap();
+        db.execute(
+            "INSERT INTO nodes(id,name,path,payload) VALUES('legacy-go','go','a.js','{}')",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO calls(id,caller,target,path,payload) VALUES('legacy-forged','legacy-go','legacy-go','a.js','{\"target\":\"lexical-guess\",\"resolution\":\"internal\"}')",[]).unwrap();
     }
     let mut rebuilt_generation = None;
     for (ordinal, sub) in ["status", "symbols", "query", "export"]
@@ -1752,13 +1736,13 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
             );
         }
     }
-    // Real CLI exploit regression: an exact legacy4 DB with an extra trigger
-    // cannot rebaseline into a forged schema5 publication or write anything.
+    // An extra trigger on the rebuilt current v8 index must never run during
+    // exceptional rebaseline or forge a published graph call.
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch(
-        "CREATE TRIGGER forged_call AFTER INSERT ON calls BEGIN
-        UPDATE calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
-        WHERE id=NEW.id; END;",
+        "CREATE TRIGGER forged_call AFTER INSERT ON graph_calls BEGIN
+        UPDATE graph_calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
+        WHERE projection_id=NEW.projection_id AND id=NEW.id; END;",
     )
     .unwrap();
     drop(db);
@@ -1774,7 +1758,7 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
     let db = rusqlite::Connection::open(&path).unwrap();
     let forged: i64 = db
         .query_row(
-            "SELECT count(*) FROM calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
+            "SELECT count(*) FROM graph_calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
             [],
             |r| r.get(0),
         )
@@ -1860,6 +1844,66 @@ fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
     }
     find(home).expect("published native database")
 }
+// Frozen v4 objects match Store's exact closed-world legacy recognition.
+// This is a physical old-format fixture, not a marker downgrade of a v8 DB.
+const FROZEN_LEGACY4_GRAPH_SQL: &str = "
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX nodes_name ON nodes(name);
+CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX calls_caller ON calls(caller);
+CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+";
+const FROZEN_LEGACY4_CLASS_SQL: &str = "
+CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
+CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX classes_path ON classes(path,id);
+CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX class_relations_owner ON class_relations(owner,id);
+CREATE INDEX class_relations_target ON class_relations(target,id);
+";
+fn rewrite_as_physical_v4(db: &rusqlite::Connection) {
+    let metadata: (String,String,String,String,i64,i64,String,String,String) = db.query_row(
+        "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
+        [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+    ).unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let names: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for name in names {
+        db.execute_batch(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")))
+            .unwrap();
+    }
+    db.execute_batch(FROZEN_LEGACY4_GRAPH_SQL).unwrap();
+    db.execute_batch(FROZEN_LEGACY4_CLASS_SQL).unwrap();
+    db.execute(
+        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        rusqlite::params![
+            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
+            metadata.7, metadata.8
+        ],
+    )
+    .unwrap();
+    db.execute("INSERT INTO class_catalog VALUES(1,'[]',0)", [])
+        .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
 fn real_native_snapshot(home: &std::path::Path) -> Value {
     use rusqlite::types::ValueRef;
     let db = rusqlite::Connection::open(real_index_db(home)).unwrap();
@@ -1874,7 +1918,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     ).unwrap();
     let mut documents = Vec::new();
     let mut stmt = db.prepare(
-        "SELECT source_set_id,language,path,revision_id,content_hash,byte_length,source_bytes FROM native_documents ORDER BY path"
+        "SELECT v.source_set_id,v.language,m.path,m.revision_id,v.content_hash,v.byte_length,v.source_bytes FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id ORDER BY m.path"
     ).unwrap();
     let rows = stmt
         .query_map([], |r| {
@@ -1895,7 +1939,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             "revisionId":revision,"contentHash":hash,"byteLength":length,"bytesHex":hex::encode(bytes)}));
     }
     let mut all_rows = serde_json::Map::new();
-    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%' ORDER BY name").unwrap();
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
     for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
         let name = name.unwrap();
         let mut table = db

@@ -9,6 +9,36 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
+// Pin every SQL tamper to the admitted revision. Historical versions and
+// projections can retain the same source path or measured symbol ID.
+fn live_revision(db: &Connection) -> String {
+    db.query_row(
+        "SELECT r.id FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision",
+        [],
+        |row| row.get(0),
+    ).unwrap()
+}
+fn live_document_version(db: &Connection, path: &str) -> String {
+    db.query_row(
+        "SELECT d.document_version_id FROM revision_documents d WHERE d.revision_id=?1 AND d.path=?2",
+        rusqlite::params![live_revision(db), path],
+        |row| row.get(0),
+    ).unwrap()
+}
+fn live_graph_projection(db: &Connection, path: &str) -> String {
+    db.query_row(
+        "SELECT d.graph_projection_id FROM revision_documents d WHERE d.revision_id=?1 AND d.path=?2",
+        rusqlite::params![live_revision(db), path],
+        |row| row.get(0),
+    ).unwrap()
+}
+fn live_class_projection(db: &Connection, path: &str) -> String {
+    db.query_row(
+        "SELECT d.class_projection_id FROM revision_documents d WHERE d.revision_id=?1 AND d.path=?2",
+        rusqlite::params![live_revision(db), path],
+        |row| row.get(0),
+    ).unwrap()
+}
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, CancelFlag) {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -184,7 +214,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     let count: i64 = db
         .query_row(
@@ -197,8 +227,8 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     for node in &graph.nodes {
         let parent: Option<String> = db
             .query_row(
-                "SELECT owner_syntax_id FROM native_declarations WHERE syntax_id=?1",
-                [&node.id],
+                "SELECT owner_syntax_id FROM native_version_declarations WHERE version_id=?1 AND syntax_id=?2",
+                rusqlite::params![live_document_version(&db, &node.path), node.id],
                 |r| r.get(0),
             )
             .unwrap();
@@ -322,11 +352,15 @@ fn empty_workspace_has_native_pair_without_document_rows() {
     )
     .unwrap();
     for table in [
-        "native_documents",
-        "native_coverage",
-        "native_provenance",
-        "native_calls",
-        "native_declarations",
+        "document_versions",
+        "revision_documents",
+        "graph_projections",
+        "graph_nodes",
+        "graph_calls",
+        "graph_regions",
+        "class_projections",
+        "native_version_calls",
+        "native_version_declarations",
     ] {
         let count: i64 = db
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -355,12 +389,86 @@ fn known_old_schema_four_remains_unready_until_full_native_reindex() {
         )
         .join("index.db");
     let db = Connection::open(&path).unwrap();
+    // Build a genuine old4 physical index, not a counterfeit metadata marker:
+    // v8's metadata CHECK forbids a schema_version=4 update in place.
+    let metadata: (String, String, String, String, i64, i64, String, String, String) = db
+        .query_row(
+            "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+        )
+        .unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for table in tables {
+        db.execute_batch(&format!("DROP TABLE \"{}\"", table.replace('"', "\"\"")))
+            .unwrap();
+    }
+    // validate_cache_shape compares sqlite_master SQL exactly, including SQL text
+    // and object order. These are verbatim CACHE_SCHEMA_V6 + CLASS_SCHEMA.
+    db.execute_batch(r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX nodes_name ON nodes(name);
+CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX calls_caller ON calls(caller);
+CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+
+CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
+CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX classes_path ON classes(path,id);
+CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX class_relations_owner ON class_relations(owner,id);
+CREATE INDEX class_relations_target ON class_relations(target,id);
+"#).unwrap();
     db.execute(
-        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+        "INSERT INTO class_catalog(singleton,warnings,truncated) VALUES(1,'[]',0)",
         [],
     )
     .unwrap();
+    db.execute(
+        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        rusqlite::params![
+            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
+            metadata.7, metadata.8
+        ],
+    )
+    .unwrap();
     db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='files'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='class_catalog'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
     drop(db);
     assert_eq!(store.index_baseline().unwrap(), original);
     assert!(
@@ -456,15 +564,15 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
 
     let mut bytes: Vec<u8> = db
         .query_row(
-            "SELECT source_bytes FROM native_documents WHERE path='flow.rs'",
-            [],
+            "SELECT source_bytes FROM document_versions WHERE id=?1",
+            [live_document_version(&db, "flow.rs")],
             |r| r.get(0),
         )
         .unwrap();
     bytes[0] ^= 1;
     db.execute(
-        "UPDATE native_documents SET source_bytes=?1 WHERE path='flow.rs'",
-        [bytes],
+        "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+        rusqlite::params![bytes, live_document_version(&db, "flow.rs")],
     )
     .unwrap();
     drop(db);
@@ -536,15 +644,15 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
     let db = Connection::open(db_path).unwrap();
     let mut bytes: Vec<u8> = db
         .query_row(
-            "SELECT source_bytes FROM native_documents WHERE path='source63.js'",
-            [],
+            "SELECT source_bytes FROM document_versions WHERE id=?1",
+            [live_document_version(&db, "source63.js")],
             |r| r.get(0),
         )
         .unwrap();
     bytes[0] ^= 1;
     db.execute(
-        "UPDATE native_documents SET source_bytes=?1 WHERE path='source63.js'",
-        [bytes],
+        "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+        rusqlite::params![bytes, live_document_version(&db, "source63.js")],
     )
     .unwrap();
     drop(db);
@@ -605,7 +713,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
             .unwrap();
         assert_eq!(version, "native-v4");
         let calls: Vec<String> = db
-            .prepare("SELECT id FROM native_calls")
+            .prepare("SELECT id FROM native_version_calls")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -658,8 +766,8 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
     };
     let owner: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='hello'",
+            [live_document_version(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
@@ -678,36 +786,72 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
     );
     assert!(store.native_coverage_at(pin, &key).unwrap().is_some());
     // Every edit preserves row identity, pin, ordinals, ranges and FK constraints.
+    let version = live_document_version(&db, "flow.js");
+    let revision = live_revision(&db);
     let cases = [
         (
-            "native_headers",
+            "native_version_headers",
             "result_type",
-            "UPDATE native_headers SET result_type='Fabricated' WHERE syntax_id=(SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello')",
+            "syntax_id=?3",
+            owner.as_str(),
+            "Fabricated",
+            "selected native declarations differ",
         ),
         (
-            "native_calls",
+            "native_version_calls",
             "spelling",
-            "UPDATE native_calls SET spelling='fabricated' WHERE path='flow.js'",
+            "owner_syntax_id=?3",
+            owner.as_str(),
+            "fabricated",
+            "selected native calls differ",
         ),
         (
-            "native_control_regions",
+            "native_version_control_regions",
             "arm",
-            "UPDATE native_control_regions SET arm='fabricated' WHERE path='flow.js'",
+            "owner_syntax_id=?3",
+            owner.as_str(),
+            "fabricated",
+            "selected native regions differ",
         ),
+        // Coverage selection belongs to the admitted revision manifest, not to the immutable native version.
         (
-            "native_coverage",
-            "selected",
-            "UPDATE native_coverage SET selected=0 WHERE document_path='flow.js'",
+            "revision_documents",
+            "coverage_selected",
+            "path=?3",
+            "flow.js",
+            "0",
+            "selected native coverage differs",
         ),
     ];
-    for (table, column, sql) in cases {
-        let old: rusqlite::types::Value = db.query_row(
-            &format!("SELECT {column} FROM {table} WHERE {} LIMIT 1", if table == "native_headers" {
-                "syntax_id=(SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello')"
-            } else if table == "native_coverage" { "document_path='flow.js'" } else { "path='flow.js'" }),
-            [], |r| r.get(0),
-        ).unwrap();
-        assert!(db.execute(sql, []).unwrap() > 0, "{table} fixture row");
+    for (table, column, predicate, row_key, forged, expected) in cases {
+        let key_column = if table == "revision_documents" {
+            "revision_id"
+        } else {
+            "version_id"
+        };
+        let parent = if table == "revision_documents" {
+            &revision
+        } else {
+            &version
+        };
+        let select_predicate = predicate.replace("?3", "?2");
+        let where_clause = format!("{key_column}=?1 AND {select_predicate}");
+        let old: rusqlite::types::Value = db
+            .query_row(
+                &format!("SELECT {column} FROM {table} WHERE {where_clause} LIMIT 1"),
+                rusqlite::params![parent, row_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            db.execute(
+                &format!("UPDATE {table} SET {column}=?1 WHERE {key_column}=?2 AND {predicate}"),
+                rusqlite::params![forged, parent, row_key],
+            )
+            .unwrap()
+                > 0,
+            "{table} fixture row"
+        );
         let selected_store = Store::open_for_tests(state.path(), root.path()).unwrap();
         assert_eq!(
             selected_store.status().unwrap().revision,
@@ -716,22 +860,16 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
         );
         let selected_clone = selected_store.clone();
         let error = match table {
-            "native_headers" => selected_store
+            "native_version_headers" => selected_store
                 .native_declarations_at(pin, "javascript", "hello")
                 .map(|_| ()),
-            "native_calls" => selected_store.native_calls_at(pin, &owner).map(|_| ()),
-            "native_control_regions" => selected_store
+            "native_version_calls" => selected_store.native_calls_at(pin, &owner).map(|_| ()),
+            "native_version_control_regions" => selected_store
                 .native_control_regions_at(pin, &owner)
                 .map(|_| ()),
             _ => selected_store.native_coverage_at(pin, &key).map(|_| ()),
         }
         .unwrap_err();
-        let expected = match table {
-            "native_headers" => "selected native declarations differ",
-            "native_calls" => "selected native calls differ",
-            "native_control_regions" => "selected native regions differ",
-            _ => "selected native coverage differs",
-        };
         assert!(
             error.to_string().contains("incompatible_index")
                 && error.to_string().contains(expected),
@@ -744,16 +882,9 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
         };
         let closed = selected_clone.native_source_at(pin, &java).unwrap_err();
         assert_current_corruption(closed);
-        let predicate = if table == "native_headers" {
-            "syntax_id=(SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello')"
-        } else if table == "native_coverage" {
-            "document_path='flow.js'"
-        } else {
-            "path='flow.js'"
-        };
         db.execute(
-            &format!("UPDATE {table} SET {column}=?1 WHERE {predicate}"),
-            [old],
+            &format!("UPDATE {table} SET {column}=?1 WHERE {key_column}=?2 AND {predicate}"),
+            rusqlite::params![old, parent, row_key],
         )
         .unwrap();
     }
@@ -785,22 +916,19 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
     let forged_hash = hex::encode(Sha256::digest(&forged));
     db.execute_batch("BEGIN").unwrap();
     db.execute(
-        "UPDATE native_documents SET source_bytes=?1, content_hash=?2 WHERE path='flow.js'",
-        rusqlite::params![forged, forged_hash],
+        "UPDATE document_versions SET source_bytes=?1, content_hash=?2 WHERE id=?3",
+        rusqlite::params![forged, forged_hash, live_document_version(&db, "flow.js")],
     )
     .unwrap();
-    db.execute(
-        "UPDATE native_provenance SET content_hash=?1 WHERE path='flow.js'",
-        [&forged_hash],
-    )
-    .unwrap();
+    // Revision-scoped provenance is derived from the manifest and revision header.
+    // Do not update a nonexistent native_provenance table.
     db.execute_batch("COMMIT").unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
     let native_clone = store.clone();
     let native_error = store.native_source_at(pin, &key).unwrap_err();
     assert!(
         native_error.to_string().contains("incompatible_index")
-            && native_error.to_string().contains("source hash mismatch"),
+            && native_error.to_string().contains("selected native"),
         "{native_error:#}"
     );
     let closed = native_clone.source_at("flow.java", Some(pin)).unwrap_err();
@@ -812,7 +940,7 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
     let graph_error = graph_store.source_at("flow.js", Some(pin)).unwrap_err();
     assert!(
         graph_error.to_string().contains("incompatible_index")
-            && graph_error.to_string().contains("source hash mismatch"),
+            && graph_error.to_string().contains("selected native"),
         "{graph_error:#}"
     );
     let closed = graph_clone.source_at("flow.java", Some(pin)).unwrap_err();
@@ -820,35 +948,30 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
 
     db.execute_batch("BEGIN").unwrap();
     db.execute(
-        "UPDATE native_documents SET source_bytes=?1, content_hash=?2 WHERE path='flow.js'",
-        rusqlite::params![bytes, original.content_hash],
+        "UPDATE document_versions SET source_bytes=?1, content_hash=?2 WHERE id=?3",
+        rusqlite::params![
+            bytes,
+            original.content_hash,
+            live_document_version(&db, "flow.js")
+        ],
     )
     .unwrap();
-    db.execute(
-        "UPDATE native_provenance SET content_hash=?1 WHERE path='flow.js'",
-        [&original.content_hash],
-    )
-    .unwrap();
+    // The admitted manifest still names the same immutable document version.
     db.execute_batch("COMMIT").unwrap();
-    let original_payload: String = db
-        .query_row("SELECT payload FROM files WHERE path='flow.js'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    let mut altered: serde_json::Value = serde_json::from_str(&original_payload).unwrap();
-    altered["path"] = serde_json::json!("forged.js");
-    db.execute(
-        "UPDATE files SET payload=?1 WHERE path='flow.js'",
-        [altered.to_string()],
-    )
-    .unwrap();
+    // v8 has no duplicated files.payload. Forge the selected graph row's
+    // serialized path without changing its projection, document version or pin.
+    let projection = live_graph_projection(&db, "flow.js");
+    assert_eq!(db.execute(
+        "UPDATE graph_nodes SET payload=json_set(payload,'$.path','forged.js') WHERE projection_id=?1 AND path='flow.js' AND id=(SELECT id FROM graph_nodes WHERE projection_id=?1 AND path='flow.js' ORDER BY id LIMIT 1)",
+        [&projection],
+    ).unwrap(), 1);
     let payload_store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(payload_store.status().unwrap().revision, pin);
     let payload_clone = payload_store.clone();
     let payload_error = payload_store.source_at("flow.js", Some(pin)).unwrap_err();
     assert!(
         payload_error.to_string().contains("incompatible_index")
-            && payload_error.to_string().contains("source bytes mismatch"),
+            && !payload_error.to_string().contains("forged.js"),
         "{payload_error:#}"
     );
     let closed = payload_clone.source_at("flow.java", Some(pin)).unwrap_err();
@@ -870,8 +993,8 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     let owner: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='hello'",
+            [live_document_version(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
@@ -882,14 +1005,14 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
     };
     let original_end: i64 = db
         .query_row(
-            "SELECT end_byte FROM native_declarations WHERE syntax_id=?1",
-            [&owner],
+            "SELECT end_byte FROM native_version_declarations WHERE version_id=?1 AND syntax_id=?2",
+            rusqlite::params![live_document_version(&db, "flow.js"), owner],
             |r| r.get(0),
         )
         .unwrap();
     db.execute(
-        "UPDATE native_declarations SET end_byte=end_byte+1 WHERE syntax_id=?1",
-        [&owner],
+        "UPDATE native_version_declarations SET end_byte=end_byte+1 WHERE version_id=?1 AND syntax_id=?2",
+        rusqlite::params![live_document_version(&db, "flow.js"), owner],
     )
     .unwrap();
     let declarations_clone = store.clone();
@@ -905,20 +1028,20 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
     );
     assert_current_corruption(declarations_clone.status().unwrap_err());
     db.execute(
-        "UPDATE native_declarations SET end_byte=?1 WHERE syntax_id=?2",
-        rusqlite::params![original_end, owner],
+        "UPDATE native_version_declarations SET end_byte=?1 WHERE version_id=?2 AND syntax_id=?3",
+        rusqlite::params![original_end, live_document_version(&db, "flow.js"), owner],
     )
     .unwrap();
     let original_kind: String = db
         .query_row(
-            "SELECT kind FROM native_control_regions WHERE path='flow.js' LIMIT 1",
-            [],
+            "SELECT kind FROM native_version_control_regions WHERE version_id=?1 ORDER BY id LIMIT 1",
+            [live_document_version(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
     db.execute(
-        "UPDATE native_control_regions SET kind='while_statement' WHERE path='flow.js'",
-        [],
+        "UPDATE native_version_control_regions SET kind='while_statement' WHERE version_id=?1",
+        [live_document_version(&db, "flow.js")],
     )
     .unwrap();
     let regions_store = Store::open_for_tests(state.path(), root.path()).unwrap();
@@ -934,18 +1057,18 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
     );
     assert_current_corruption(regions_clone.status().unwrap_err());
     db.execute(
-        "UPDATE native_control_regions SET kind=?1 WHERE path='flow.js'",
-        [&original_kind],
+        "UPDATE native_version_control_regions SET kind=?1 WHERE version_id=?2",
+        rusqlite::params![original_kind, live_document_version(&db, "flow.js")],
     )
     .unwrap();
     let original: (String, Option<String>) = db
         .query_row(
-            "SELECT state,diagnostic FROM native_coverage WHERE document_path='flow.js'",
-            [],
+            "SELECT coverage_state,coverage_diagnostic FROM revision_documents WHERE revision_id=?1 AND path='flow.js'",
+            [live_revision(&db)],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    db.execute("UPDATE native_coverage SET state='partial',diagnostic='fabricated' WHERE document_path='flow.js'", []).unwrap();
+    db.execute("UPDATE revision_documents SET coverage_state='partial',coverage_diagnostic='fabricated' WHERE revision_id=?1 AND path='flow.js'", [live_revision(&db)]).unwrap();
     let coverage_store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(coverage_store.status().unwrap().revision, pin);
     let coverage_clone = coverage_store.clone();
@@ -969,8 +1092,8 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
         .unwrap_err();
     assert_current_corruption(closed);
     db.execute(
-        "UPDATE native_coverage SET state=?1,diagnostic=?2 WHERE document_path='flow.js'",
-        rusqlite::params![original.0, original.1],
+        "UPDATE revision_documents SET coverage_state=?1,coverage_diagnostic=?2 WHERE revision_id=?3 AND path='flow.js'",
+        rusqlite::params![original.0, original.1, live_revision(&db)],
     )
     .unwrap();
 }
@@ -990,8 +1113,8 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     let owner: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='hello'",
+            [live_document_version(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
@@ -1001,15 +1124,17 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
     assert!(store.sequence_at(&owner, pin, true).unwrap().is_some());
     let call_id: String = db
         .query_row(
-            "SELECT id FROM calls WHERE path='flow.js' LIMIT 1",
-            [],
+            "SELECT id FROM graph_calls WHERE projection_id=?1 ORDER BY id LIMIT 1",
+            [live_graph_projection(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
     let original: String = db
-        .query_row("SELECT payload FROM calls WHERE id=?1", [&call_id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT payload FROM graph_calls WHERE projection_id=?1 AND id=?2",
+            rusqlite::params![live_graph_projection(&db, "flow.js"), call_id],
+            |r| r.get(0),
+        )
         .unwrap();
     let original_value: serde_json::Value = serde_json::from_str(&original).unwrap();
     assert!(
@@ -1019,8 +1144,12 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
     let mut forged = original_value.clone();
     forged["calleeText"] = serde_json::json!("fabricatedCallee");
     db.execute(
-        "UPDATE calls SET payload=?1 WHERE id=?2",
-        rusqlite::params![forged.to_string(), call_id],
+        "UPDATE graph_calls SET payload=?1 WHERE projection_id=?2 AND id=?3",
+        rusqlite::params![
+            forged.to_string(),
+            live_graph_projection(&db, "flow.js"),
+            call_id
+        ],
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
@@ -1050,8 +1179,8 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
     );
     let java: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.java' AND name='go'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='go'",
+            [live_document_version(&db, "flow.java")],
             |r| r.get(0),
         )
         .unwrap();
@@ -1081,20 +1210,21 @@ fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_wi
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     let original: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='hello'",
+            [live_document_version(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
     let fake = "sid:v1:ffffffffffffffffffffffffffffffff";
-    db.execute("INSERT INTO native_declarations(syntax_id,source_set_id,language,path,revision_id,owner_syntax_id,kind,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end,provenance_id)
-        SELECT ?1,source_set_id,language,path,revision_id,owner_syntax_id,kind,'phantom','phantom',key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end,provenance_id
-        FROM native_declarations WHERE syntax_id=?2",
-        rusqlite::params![fake,original]).unwrap();
+    let version = live_document_version(&db, "flow.js");
+    db.execute("INSERT INTO native_version_declarations(version_id,syntax_id,owner_syntax_id,kind,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end)
+        SELECT version_id,?1,owner_syntax_id,kind,'phantom','phantom',key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end
+        FROM native_version_declarations WHERE version_id=?2 AND syntax_id=?3",
+        rusqlite::params![fake,version,original]).unwrap();
     db.execute(
-        "INSERT INTO native_headers(syntax_id,kind,name,result_type)
-        SELECT ?1,kind,'phantom',result_type FROM native_headers WHERE syntax_id=?2",
-        rusqlite::params![fake, original],
+        "INSERT INTO native_version_headers(version_id,syntax_id,kind,name,result_type)
+        SELECT version_id,?1,kind,'phantom',result_type FROM native_version_headers WHERE version_id=?2 AND syntax_id=?3",
+        rusqlite::params![fake, version, original],
     )
     .unwrap();
     let fk_count: i64 = db
@@ -1137,16 +1267,16 @@ fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     let owner: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='hello'",
+            [live_document_version(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
     db.execute(
         "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<1500)
-        INSERT INTO native_signature_parameter_types(syntax_id,ancestor_ordinal,ordinal,type_name)
-        SELECT ?1,10000+v,0,'amplified' FROM n",
-        [&owner],
+        INSERT INTO native_version_header_items(version_id,syntax_id,item_kind,ordinal,value)
+        SELECT ?1,?2,'modifier',10000+v,'amplified' FROM n",
+        rusqlite::params![live_document_version(&db, "flow.js"), owner],
     )
     .unwrap();
     let fk_count: i64 = db
@@ -1188,13 +1318,13 @@ fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() 
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     let owner: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='hello'",
+            [live_document_version(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
-    db.execute("INSERT INTO native_signature_parameter_types(syntax_id,ancestor_ordinal,ordinal,type_name) VALUES(?1,10000,0,?2)",
-        rusqlite::params![owner,"X".repeat(64*1024)]).unwrap();
+    db.execute("INSERT INTO native_version_header_items(version_id,syntax_id,item_kind,ordinal,value) VALUES(?1,?2,'modifier',10000,?3)",
+        rusqlite::params![live_document_version(&db, "flow.js"),owner,"X".repeat(64*1024)]).unwrap();
     let fk_count: i64 = db
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get(0)
@@ -1233,14 +1363,18 @@ fn selected_class_payload_oversize_refuses_before_json_decode() {
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     let id: String = db
         .query_row(
-            "SELECT id FROM classes WHERE path='flow.java' LIMIT 1",
-            [],
+            "SELECT id FROM classes WHERE projection_id=?1 ORDER BY id LIMIT 1",
+            [live_class_projection(&db, "flow.java")],
             |r| r.get(0),
         )
         .unwrap();
     db.execute(
-        "UPDATE classes SET payload=?1 WHERE id=?2",
-        rusqlite::params!["not-valid-class-json".repeat(8000), id],
+        "UPDATE classes SET payload=?1 WHERE projection_id=?2 AND id=?3",
+        rusqlite::params![
+            "not-valid-class-json".repeat(8000),
+            live_class_projection(&db, "flow.java"),
+            id
+        ],
     )
     .unwrap();
     let selected_clone = store.clone();
@@ -1253,8 +1387,8 @@ fn selected_class_payload_oversize_refuses_before_json_decode() {
     );
     let rust_id: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.rs' AND name='main'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='main'",
+            [live_document_version(&db, "flow.rs")],
             |r| r.get(0),
         )
         .unwrap();
@@ -1278,16 +1412,20 @@ fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     let owner: String = db
         .query_row(
-            "SELECT syntax_id FROM native_declarations WHERE path='flow.js' AND name='hello'",
-            [],
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='hello'",
+            [live_document_version(&db, "flow.js")],
             |r| r.get(0),
         )
         .unwrap();
     db.execute(
         "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<40)
-        INSERT INTO native_signature_parameter_types(syntax_id,ancestor_ordinal,ordinal,type_name)
-        SELECT ?1,30000+v,0,?2 FROM n",
-        rusqlite::params![owner, "Y".repeat(8 * 1024)],
+        INSERT INTO native_version_header_items(version_id,syntax_id,item_kind,ordinal,value)
+        SELECT ?1,?2,'modifier',30000+v,?3 FROM n",
+        rusqlite::params![
+            live_document_version(&db, "flow.js"),
+            owner,
+            "Y".repeat(8 * 1024)
+        ],
     )
     .unwrap();
     let fk_count: i64 = db
@@ -1326,15 +1464,17 @@ fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
-    for table in ["nodes", "calls", "regions"] {
+    for table in ["graph_nodes", "graph_calls", "graph_regions"] {
         // These three fixed SQL identifiers are the selected graph row families.
-        let query = format!("SELECT id,payload FROM {table} WHERE path='flow.js' LIMIT 1");
+        let projection = live_graph_projection(&db, "flow.js");
+        let query =
+            format!("SELECT id,payload FROM {table} WHERE projection_id=?1 ORDER BY id LIMIT 1");
         let (id, original): (String, String) = db
-            .query_row(&query, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(&query, [&projection], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         db.execute(
-            &format!("UPDATE {table} SET payload=?1 WHERE id=?2"),
-            rusqlite::params!["invalid-json".repeat(8000), id],
+            &format!("UPDATE {table} SET payload=?1 WHERE projection_id=?2 AND id=?3"),
+            rusqlite::params!["invalid-json".repeat(8000), projection, id],
         )
         .unwrap();
         let selected_store = Store::open_for_tests(state.path(), root.path()).unwrap();
@@ -1354,8 +1494,8 @@ fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
             .unwrap_err();
         assert_current_corruption(closed);
         db.execute(
-            &format!("UPDATE {table} SET payload=?1 WHERE id=?2"),
-            rusqlite::params![original, id],
+            &format!("UPDATE {table} SET payload=?1 WHERE projection_id=?2 AND id=?3"),
+            rusqlite::params![original, projection, id],
         )
         .unwrap();
     }
@@ -1377,9 +1517,12 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     db.execute(
         "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<40)
-        INSERT INTO nodes(id,name,path,payload)
-        SELECT printf('forged-graph-%d',v),'forged','flow.js',?1 FROM n",
-        ["invalid-json".repeat(800)],
+        INSERT INTO graph_nodes(projection_id,id,name,path,payload)
+        SELECT ?1,printf('forged-graph-%d',v),'forged','flow.js',?2 FROM n",
+        rusqlite::params![
+            live_graph_projection(&db, "flow.js"),
+            "invalid-json".repeat(800)
+        ],
     )
     .unwrap();
     let fk_count: i64 = db

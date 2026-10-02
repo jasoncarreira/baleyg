@@ -418,10 +418,11 @@ impl EvidenceResponse {
             expected.is_none_or(|pin| pin == revision),
             "revision conflict"
         );
-        Ok(self
-            .store
-            .selected_source_row(&self.db, path)?
-            .map(|source| (revision, source)))
+        let source = self.store.selected_source_row(&self.db, path)?;
+        if source.is_some() {
+            self.store.attest_selected_document(&self.db, path)?;
+        }
+        Ok(source.map(|source| (revision, source)))
     }
     pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
         self.store
@@ -815,7 +816,7 @@ fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
         other => Ok(other?),
     }
 }
-fn json<T: Serialize>(value: &T) -> Result<String> {
+fn json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 fn rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<Vec<T>> {
@@ -2513,7 +2514,7 @@ impl Store {
             topology::TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
         Self::open_with_stage_hook(roots, identity, before_publish)
     }
-    /// Build a private schema-6 bootstrap only; the caller must validate and publish it.
+    /// Build a private schema-8 bootstrap only; the caller must validate and publish it.
     /// The returned guard unlinks only its own stage inode if it is not published.
     fn create_staged_index(&self, leader: &topology::LeaderGuard) -> Result<StagedIndex> {
         use rusqlite::OpenFlags;
@@ -3358,7 +3359,7 @@ impl Store {
         );
         (|| -> Result<()> {
             validate_reconcile_inventory(db)?;
-            // Every public schema-7 derived read needs the same bounded catalog
+            // Every public v8 derived read needs the same bounded catalog
             // singleton. Missing/oversized live metadata is corruption, never an
             // old-index "requireIndex" fallback. This is one indexed metadata row.
             let warnings_bytes: Option<i64> = db
@@ -5289,9 +5290,11 @@ impl Store {
                 expected_revision.is_none_or(|pin| pin == revision),
                 "revision conflict"
             );
-            Ok(self
-                .selected_source_row(tx, path)?
-                .map(|file| (revision, file)))
+            let source = self.selected_source_row(tx, path)?;
+            if source.is_some() {
+                self.attest_selected_document(tx, path)?;
+            }
+            Ok(source.map(|file| (revision, file)))
         })
     }
     /// Catalog reads pin revision and rows to one SQLite read transaction.
@@ -5474,6 +5477,9 @@ impl Store {
             )?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        for path in &paths {
+            self.attest_selected_document(db, path)?;
+        }
         let files = paths
             .iter()
             .map(|path| {
@@ -5977,6 +5983,40 @@ mod rebaseline_fault_tests {
     use super::*;
     use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{fs, ptr, sync::atomic::AtomicBool};
+
+    fn physical_old_v4(db: &Connection) {
+        let meta: (String,String,String,String,i64,i64,String,String,String) = db.query_row(
+            "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
+            [],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+        ).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        let names: Vec<String> = db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for name in names {
+            db.execute_batch(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")))
+                .unwrap();
+        }
+        db.execute_batch(CACHE_SCHEMA_V6).unwrap();
+        db.execute_batch(CLASS_SCHEMA).unwrap();
+        db.execute(
+            "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                meta.0, meta.1, meta.2, meta.3, meta.4, meta.5, meta.6, meta.7, meta.8
+            ],
+        )
+        .unwrap();
+        db.execute("INSERT INTO class_catalog VALUES(1,'[]',0)", [])
+            .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='document_versions'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
 
     #[test]
     fn wal_header_without_sidecars_is_not_corruption_authority() {
@@ -6632,7 +6672,7 @@ mod rebaseline_fault_tests {
                     )?;
                     ensure!(added == 1, "new class projection not staged");
                     let raw: Vec<u8> = tx.query_row(
-                        "SELECT source_bytes FROM native_documents WHERE path='Types.java'",
+                        "SELECT source_bytes FROM document_versions WHERE path='Types.java'",
                         [],
                         |row| row.get(0),
                     )?;
@@ -6874,17 +6914,17 @@ mod rebaseline_fault_tests {
                     ensure!(revision==i64::try_from(pin.index_revision+1)?,
                         "new revision not staged in publisher transaction");
                     let graph_functions:i64=tx.query_row(
-                        "SELECT count(*) FROM nodes WHERE path='a.js' AND json_extract(payload,'$.kind')='function'",[],|r|r.get(0))?;
+                        "SELECT count(*) FROM graph_nodes WHERE path='a.js' AND json_extract(payload,'$.kind')='function'",[],|r|r.get(0))?;
                     let native_functions:i64=tx.query_row(
-                        "SELECT count(*) FROM native_declarations WHERE path='a.js' AND kind='function'",[],|r|r.get(0))?;
+                        "SELECT count(*) FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id WHERE v.path='a.js' AND d.kind='function'",[],|r|r.get(0))?;
                     let graph_calls:i64=tx.query_row(
-                        "SELECT count(*) FROM calls WHERE path='a.js'",[],|r|r.get(0))?;
+                        "SELECT count(*) FROM graph_calls WHERE path='a.js'",[],|r|r.get(0))?;
                     let native_calls:i64=tx.query_row(
-                        "SELECT count(*) FROM native_calls WHERE path='a.js'",[],|r|r.get(0))?;
+                        "SELECT count(*) FROM native_version_calls c JOIN document_versions v ON v.id=c.version_id WHERE v.path='a.js'",[],|r|r.get(0))?;
                     ensure!((graph_functions,native_functions,graph_calls,native_calls)==(5_000,5_000,5_000,5_000),
                         "5,000 measured graph/native function and call rows not staged: graph={graph_functions}/{graph_calls} native={native_functions}/{native_calls}");
                     let source_bytes:Vec<u8>=tx.query_row(
-                        "SELECT source_bytes FROM native_documents WHERE path='a.js'",[],|r|r.get(0))?;
+                        "SELECT source_bytes FROM document_versions WHERE path='a.js'",[],|r|r.get(0))?;
                     ensure!(source_bytes==large_source.as_bytes(),
                         "new captured native source bytes not staged");
                     validate_paired_metadata(tx,worker_store.root_id())?;
@@ -6984,7 +7024,7 @@ mod rebaseline_fault_tests {
         let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
         let call_bytes: i64 = db
             .query_row(
-                "SELECT max(length(CAST(payload AS BLOB))) FROM calls WHERE path='flow.js'",
+                "SELECT max(length(CAST(payload AS BLOB))) FROM graph_calls WHERE path='flow.js'",
                 [],
                 |r| r.get(0),
             )
@@ -7102,14 +7142,14 @@ mod rebaseline_fault_tests {
         let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
         let json_bytes: i64 = db
             .query_row(
-                "SELECT length(CAST(payload AS BLOB)) FROM files WHERE path='flow.js'",
+                "SELECT length(source_bytes) FROM document_versions WHERE path='flow.js'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         assert!(
-            json_bytes > source.len() as i64 * 5,
-            "JSON source must exercise near-sixfold control-byte expansion"
+            json_bytes == source.len() as i64,
+            "v8 source bytes must be stored without JSON expansion"
         );
         assert_eq!(
             store
@@ -7145,20 +7185,14 @@ mod rebaseline_fault_tests {
             )
             .unwrap();
         let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
-        let (source_set_id,language,revision_id):(String,String,String)=db.query_row(
-            "SELECT source_set_id,language,revision_id FROM native_documents WHERE path='flow.js'",[],
-            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-        let (max_ancillary, total_ancillary) = Store::selected_ancillary_byte_usage(
-            &db,
-            "flow.js",
-            &source_set_id,
-            &language,
-            &revision_id,
-        )
-        .unwrap();
+        let (version_id,class_id):(String,String)=db.query_row(
+            "SELECT document_version_id,class_projection_id FROM revision_documents WHERE path='flow.js'",[],
+            |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let (max_ancillary, total_ancillary) =
+            Store::selected_ancillary_byte_usage(&db, &version_id, &class_id).unwrap();
         let source_json_bytes: i64 = db
             .query_row(
-                "SELECT length(CAST(payload AS BLOB)) FROM files WHERE path='flow.js'",
+                "SELECT length(source_bytes) FROM document_versions WHERE path='flow.js'",
                 [],
                 |r| r.get(0),
             )
@@ -7202,12 +7236,7 @@ mod rebaseline_fault_tests {
         let original = store.index_baseline().unwrap();
         let path = store.roots.index_db(&store.identity);
         let db = Connection::open(&path).unwrap();
-        db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-            [],
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
+        physical_old_v4(&db);
         drop(db);
         let before = fs::read(&path).unwrap();
         let leader = store.leader().unwrap();
@@ -7222,10 +7251,10 @@ mod rebaseline_fault_tests {
                         if stage == mode {
                             match mode {
                                 PublishStage::AfterFile => {
-                                    // Real SQLite UNIQUE error after DELETEs and one inserted file.
+                                    // Real SQLite UNIQUE error after one inserted v8 document version.
                                     tx.execute(
-                                        "INSERT INTO files(path,hash,payload,capture_stat) VALUES(?1,'duplicate','{}','{}')",
-                                        [&graph.files[0].path],
+                                        "INSERT INTO document_versions SELECT * FROM document_versions LIMIT 1",
+                                        [],
                                     )?;
                                 }
                                 PublishStage::BeforeCommit => {
@@ -7698,7 +7727,7 @@ mod sqlite_schema_race_tests {
             let db = store.cache().unwrap();
             let payload: String = db
                 .query_row(
-                    "SELECT capture_stat FROM files WHERE path='flow.js'",
+                    "SELECT capture_stat FROM revision_documents WHERE path='flow.js'",
                     [],
                     |row| row.get(0),
                 )
@@ -7772,7 +7801,7 @@ mod sqlite_schema_race_tests {
             let (schema, extractor, generation, files, nodes, documents, revisions, classes):
                 (i64, String, String, i64, i64, i64, i64, i64) = db
                 .query_row(
-                    "SELECT schema_version,extractor_version,index_generation,(SELECT count(*) FROM files),(SELECT count(*) FROM nodes),(SELECT count(*) FROM native_documents),(SELECT count(*) FROM native_revisions),(SELECT count(*) FROM class_catalog) FROM index_metadata",
+                    "SELECT schema_version,extractor_version,index_generation,(SELECT count(*) FROM revision_documents),(SELECT count(*) FROM graph_nodes),(SELECT count(*) FROM document_versions),(SELECT count(*) FROM native_revisions),(SELECT count(*) FROM class_projections) FROM index_metadata",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
                 )
@@ -7794,14 +7823,14 @@ mod sqlite_schema_race_tests {
             );
             let selected_file: (String, String) = db
                 .query_row(
-                    "SELECT hash,payload FROM files ORDER BY path LIMIT 1",
+                    "SELECT content_hash,path FROM document_versions ORDER BY path LIMIT 1",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
             let selected_native: (String, Vec<u8>) = db
                 .query_row(
-                    "SELECT content_hash,source_bytes FROM native_documents ORDER BY revision_id,language,path LIMIT 1",
+                    "SELECT content_hash,source_bytes FROM document_versions ORDER BY language,path LIMIT 1",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -7897,8 +7926,8 @@ mod sqlite_schema_race_tests {
                     // The Store connection has passed open_index's exact object check,
                     // but has NOT acquired the SQLite writer lock yet.
                     let attacker = Connection::open(&path)?;
-                    attacker.execute_batch("CREATE TRIGGER forged_after_admission AFTER INSERT ON calls BEGIN
-                        UPDATE calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED') WHERE id=NEW.id; END;")?;
+                    attacker.execute_batch("CREATE TRIGGER forged_after_admission AFTER INSERT ON graph_calls BEGIN
+                        UPDATE graph_calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED') WHERE projection_id=NEW.projection_id AND id=NEW.id; END;")?;
                     drop(attacker);
                     *after_external.borrow_mut() = Some(fs::read(&path)?);
                 }
@@ -7922,8 +7951,8 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                7,
-                "native-paired-v1",
+                8,
+                "native-v4",
                 old.index_generation.to_string(),
                 old.index_revision as i64
             )
@@ -7931,11 +7960,11 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
         let forged: i64 = db
             .query_row(
-                "SELECT count(*) FROM calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
+                "SELECT count(*) FROM graph_calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
                 [],
                 |r| r.get(0),
             )
@@ -8072,8 +8101,8 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                7,
-                "native-paired-v1",
+                8,
+                "native-v4",
                 leader_pin.index_generation.to_string(),
                 leader_pin.index_revision as i64
             )
@@ -8133,13 +8162,13 @@ mod selected_source_budget_tests {
         let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
         let (node_id, original): (String, String) = db
             .query_row(
-                "SELECT id,payload FROM nodes WHERE path='one.js' LIMIT 1",
+                "SELECT id,payload FROM graph_nodes WHERE path='one.js' LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         db.execute(
-            "UPDATE nodes SET payload=?1 WHERE id=?2",
+            "UPDATE graph_nodes SET payload=?1 WHERE id=?2 AND projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='one.js')",
             params!["not-valid-graph-json".repeat(2000), node_id],
         )
         .unwrap();
@@ -8151,7 +8180,7 @@ mod selected_source_budget_tests {
                 .contains("graph row byte budget exceeded")
         );
         db.execute(
-            "UPDATE nodes SET payload=?1 WHERE id=?2",
+            "UPDATE graph_nodes SET payload=?1 WHERE id=?2 AND projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='one.js')",
             params![original, node_id],
         )
         .unwrap();
@@ -8163,7 +8192,7 @@ mod selected_source_budget_tests {
                 .contains("byte budget exceeded")
         );
         db.execute(
-            "UPDATE files SET payload=?1 WHERE path='one.js'",
+            "UPDATE document_versions SET source_bytes=?1,byte_length=length(?1) WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
             ["not-valid-json".repeat(2000)],
         )
         .unwrap();
@@ -8174,7 +8203,7 @@ mod selected_source_budget_tests {
                 .contains("byte budget exceeded")
         );
         db.execute(
-            "UPDATE files SET payload='not-json' WHERE path='one.js'",
+            "UPDATE document_versions SET source_bytes=x'ff',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
             [],
         )
         .unwrap();

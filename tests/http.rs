@@ -9,6 +9,66 @@ use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+// Frozen v4 objects match Store's exact closed-world legacy recognition.
+// This is a physical old-format fixture, not a marker downgrade of a v8 DB.
+const FROZEN_LEGACY4_GRAPH_SQL: &str = "
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX nodes_name ON nodes(name);
+CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX calls_caller ON calls(caller);
+CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+";
+const FROZEN_LEGACY4_CLASS_SQL: &str = "
+CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
+CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX classes_path ON classes(path,id);
+CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX class_relations_owner ON class_relations(owner,id);
+CREATE INDEX class_relations_target ON class_relations(target,id);
+";
+fn rewrite_as_physical_v4(db: &rusqlite::Connection) {
+    let metadata: (String,String,String,String,i64,i64,String,String,String) = db.query_row(
+        "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
+        [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+    ).unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let names: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for name in names {
+        db.execute_batch(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")))
+            .unwrap();
+    }
+    db.execute_batch(FROZEN_LEGACY4_GRAPH_SQL).unwrap();
+    db.execute_batch(FROZEN_LEGACY4_CLASS_SQL).unwrap();
+    db.execute(
+        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        rusqlite::params![
+            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
+            metadata.7, metadata.8
+        ],
+    )
+    .unwrap();
+    db.execute("INSERT INTO class_catalog VALUES(1,'[]',0)", [])
+        .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
 fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -562,27 +622,16 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
         .join("index.db");
     {
         let db = rusqlite::Connection::open(&index).unwrap();
-        db.pragma_update(None, "foreign_keys", false).unwrap();
-        let native_tables = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        for table in native_tables {
-            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
-        }
-        for index in ["nodes_path", "calls_path", "regions_path"] {
-            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-        }
-        db.execute_batch(
-            "DROP TABLE capture_inputs;
-             ALTER TABLE files DROP COLUMN capture_stat;
-             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
-             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+        rewrite_as_physical_v4(&db);
+        db.execute(
+            "INSERT INTO files(path,hash,payload) VALUES('a.js','legacy-hash','{}')",
+            [],
         )
         .unwrap();
+        db.execute("INSERT INTO nodes(id,name,path,payload) VALUES('legacy-base','Base','a.js','{}'),('legacy-go','go','a.js','{}')",[]).unwrap();
+        db.execute("INSERT INTO classes(id,name,qualified_name,path,payload) VALUES('legacy-base','Base','Base','a.js','{}')",[]).unwrap();
+        db.execute("INSERT INTO class_relations(id,owner,target,payload) VALUES('legacy-edge','legacy-base','legacy-base','{}')",[]).unwrap();
+        db.execute("INSERT INTO calls(id,caller,target,path,payload) VALUES('legacy-call','legacy-go','legacy-base','a.js','{}')",[]).unwrap();
         // An old index holds lexical class adjacency and lexical call targets.
         let base: String = db
             .query_row("SELECT id FROM classes WHERE name='Base'", [], |row| {
@@ -603,12 +652,6 @@ async fn legacy_index_refuses_derived_routes_and_cached_packet_before_pin_compar
             )
             .unwrap();
         assert!(lexical_calls > 0, "fixture needs a lexical call target");
-        db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-            [],
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
     }
     let same_old_pair = json!(pin).to_string();
     let unauthenticated = Request::builder()
@@ -1146,7 +1189,7 @@ async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
             }
             "input-classes" => {
                 db.execute(
-                    "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
+                    "UPDATE revision_capture_inputs SET payload='not-json' WHERE input_key='root:.'",
                     [],
                 )
                 .unwrap();

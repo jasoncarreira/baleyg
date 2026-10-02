@@ -432,8 +432,8 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            7,
-            "native-paired-v1",
+            8,
+            "native-v4",
             prior.index_generation.to_string(),
             prior.index_revision as i64
         )
@@ -441,7 +441,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     assert!(
         store
@@ -981,7 +981,7 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     // No ID, path, index pin, or FK changes: only selected graph JSON is forged.
     db.execute(
-        "UPDATE nodes SET payload=json_set(payload,'$.name','Fabricated') WHERE id=?1",
+        "UPDATE graph_nodes SET payload=json_set(payload,'$.name','Fabricated') WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1",
         [&seed],
     )
     .unwrap();
@@ -1028,19 +1028,19 @@ class B {}
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     let id: String = db
         .query_row(
-            "SELECT id FROM calls WHERE path='Types.java' LIMIT 1",
+            "SELECT id FROM graph_calls WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') LIMIT 1",
             [],
             |r| r.get(0),
         )
         .unwrap();
     let payload: String = db
-        .query_row("SELECT payload FROM calls WHERE id=?1", [&id], |r| r.get(0))
+        .query_row("SELECT payload FROM graph_calls WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1", [&id], |r| r.get(0))
         .unwrap();
     let mut forged: Value = serde_json::from_str(&payload).unwrap();
     assert!(forged["calleeText"].is_string());
     forged["calleeText"] = json!("fabricatedCall");
     db.execute(
-        "UPDATE calls SET payload=?1 WHERE id=?2",
+        "UPDATE graph_calls SET payload=?1 WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?2",
         rusqlite::params![forged.to_string(), id],
     )
     .unwrap();
@@ -1136,7 +1136,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     let method_id = id(&graph, "run");
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute(
-        "UPDATE nodes SET payload='not-json' WHERE id=?1",
+        "UPDATE graph_nodes SET payload='not-json' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1",
         [&method_id],
     )
     .unwrap();
