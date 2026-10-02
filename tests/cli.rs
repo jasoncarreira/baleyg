@@ -4546,7 +4546,9 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["revision"]["indexRevision"], 2);
+    // Full-rewrite staging publishes per CLI command: index r1, original export r2,
+    // changed export r3, this status r4, stale export r5, latest status r6.
+    assert_eq!(status["revision"]["indexRevision"], 4);
     assert_eq!(
         status["revision"]["indexGeneration"],
         first_pin["publishedRevision"]["indexGeneration"]
@@ -4576,5 +4578,5 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(latest.status.success());
     let latest: Value = serde_json::from_slice(&latest.stdout).unwrap();
-    assert_eq!(latest["revision"]["indexRevision"], 3);
+    assert_eq!(latest["revision"]["indexRevision"], 6);
 }
