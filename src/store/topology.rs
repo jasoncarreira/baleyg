@@ -1743,7 +1743,7 @@ fn inspect_index_with_open_hook(
             || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1")
             || (version == 6 && schema == 6 && extractor == "native-paired-v1")
             || (version == 7 && schema == 7 && extractor == "native-paired-v1")
-            || (version == 8 && schema == 8 && extractor == "native-v4"))
+            || (version == 8 && schema == 8 && extractor == super::EXTRACTOR_VERSION))
             && Path::new(&spelling).is_absolute()
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"
