@@ -13,9 +13,6 @@ use std::{
 };
 thread_local! { static GOLDEN_ORDINAL: Cell<usize> = const { Cell::new(0) }; }
 fn golden(catalog: &Catalog) {
-    if catalog.truncated {
-        return;
-    }
     let name = std::thread::current()
         .name()
         .unwrap_or("unnamed")
@@ -567,7 +564,7 @@ fn method_generic_detail_limit_does_not_stop_declarations_or_leak_partial_blocke
 }
 
 #[test]
-fn cohort72_small_java_python_templates_below_cap() {
+fn cohort72_small_java_python_generated_below_cap() {
     let (_, catalog) = fixture(&[
         (
             "small/java/Csmall0000.java",
