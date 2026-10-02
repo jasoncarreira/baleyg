@@ -1020,3 +1020,124 @@ fn class_registry_import_charge_one_file_pilot() {
         );
     }
 }
+
+#[test]
+#[ignore = "1000 Java class resource pilot; requires explicit grant"]
+fn class_declaration_limit_one_file_pilot() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        store::topology::WorkspaceIdentity,
+    };
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path();
+    eprintln!(
+        "{}",
+        serde_json::json!({"pilot":"class-declarations-one-file",
+        "stage":"allocated","workspace":workspace.display().to_string()})
+    );
+    std::io::Write::flush(&mut std::io::stderr()).unwrap();
+    let selected = "class Selected {}\n";
+    fs::write(workspace.join("z.java"), selected).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(selected.as_bytes())),
+        "ed4b90f6df47e5727ff3c68e3a3d95cae670daa9dc621b4b464d814599e104cf"
+    );
+    let identity = WorkspaceIdentity::discover(Some(workspace), workspace).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let mut z_id = None;
+    for count in [999, 1000] {
+        let source = (0..count)
+            .map(|index| format!("class A19_{index:04} {{}}\n"))
+            .collect::<String>();
+        fs::write(workspace.join("a19.java"), &source).unwrap();
+        assert_eq!((source.len(), source.lines().count()), (count * 18, count));
+        let expected_sha = if count == 999 {
+            "a3cbd864da62cfdf40bce0af99bc1fb49c8fcc1f1d4cdb22a2f18634ef893677"
+        } else {
+            "d27d1fd273c8a8a9ed644eeccd1303ec3702fb777dcf429b8c252f69ad48a191"
+        };
+        assert_eq!(hex::encode(Sha256::digest(source.as_bytes())), expected_sha);
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(workspace.to_owned()),
+            &identity.record_id,
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(graph.files.len(), 2);
+        assert_eq!(native.revision.documents.len(), 2);
+        assert_eq!(native.coverage.len(), 2);
+        assert!(native.coverage.iter().all(|c| c.state == "complete"));
+        assert_eq!(native.declarations.len(), count + 3);
+        assert_eq!(graph.nodes.len(), count + 3);
+        let selected_node: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|s| {
+                s.path == "z.java"
+                    && s.name == "Selected"
+                    && s.kind == baleyg::model::SymbolKind::Class
+            })
+            .collect();
+        assert_eq!(selected_node.len(), 1);
+        if let Some(id) = &z_id {
+            assert_eq!(id, &selected_node[0].id);
+        }
+        z_id = Some(selected_node[0].id.clone());
+        let mut witness = Vec::new();
+        for file in &graph.files {
+            let (size, registry, classes) = if file.path == "a19.java" {
+                (count * 18, count * 79, count)
+            } else {
+                (18, 77, 1)
+            };
+            let raw = fs::read(workspace.join(&file.path)).unwrap();
+            let digest = hex::encode(Sha256::digest(&raw));
+            assert_eq!(raw.len(), size);
+            assert_eq!(file.hash, digest);
+            let captured = capture.files.iter().find(|f| f.path == file.path).unwrap();
+            assert_eq!(
+                (captured.hash.as_str(), captured.text.as_bytes()),
+                (digest.as_str(), raw.as_slice())
+            );
+            let doc = native
+                .revision
+                .documents
+                .iter()
+                .find(|d| d.key.path == file.path)
+                .unwrap();
+            assert_eq!(
+                (doc.content_hash.as_str(), doc.byte_length),
+                (digest.as_str(), size)
+            );
+            let f = baleyg::classes::FileExtraction::extract_file(
+                file,
+                &graph.nodes,
+                &cancel,
+                baleyg::classes::Limits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                (f.source_bytes, f.registry_bytes, f.classes.len()),
+                (size, registry, classes)
+            );
+            assert!(
+                !f.truncated && !f.registry_incomplete && f.warnings.is_empty(),
+                "{}: {f:#?}",
+                file.path
+            );
+            witness.push(
+                serde_json::json!({"path":file.path,"sourceBytes":size,"sha256":digest,
+                "registryBytes":registry,"classes":classes}),
+            );
+        }
+        println!(
+            "{}",
+            serde_json::json!({"pilot":"class-declarations-one-file","count":count,
+            "workspace":workspace.display().to_string(),"files":witness,
+            "nativeDocuments":native.revision.documents.len(),"nativeDeclarations":native.declarations.len(),
+            "graphNodes":graph.nodes.len(),"zSymbolId":selected_node[0].id})
+        );
+    }
+}
