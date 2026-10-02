@@ -778,6 +778,12 @@ fn class_registry_import_charge_tiny_native_pilot() {
     use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path();
+    eprintln!(
+        "{}",
+        serde_json::json!({"pilot":"class-registry-tiny","stage":"allocated",
+        "workspace":workspace.display().to_string()})
+    );
+    std::io::Write::flush(&mut std::io::stderr()).unwrap();
     let long = format!("import {}.{};\n", "p".repeat(1023), "c".repeat(1024));
     let short = |prefix| format!("import {}.{};\n", "p".repeat(prefix), "c".repeat(60));
     let selected = "class Selected {}\n";
