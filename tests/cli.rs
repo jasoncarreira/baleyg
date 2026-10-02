@@ -1912,6 +1912,32 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap();
+    let (generation, revision_number, incarnation): (String, i64, String) = db
+        .query_row(
+            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(&generation).is_ok());
+    assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
+    let pin_id = format!("pin:v1:{generation}:{revision_number}");
+    let (header_pin, header_incarnation, header_revision): (String, String, i64) = db
+        .query_row(
+            "SELECT id,reconciled_incarnation,published_index_revision FROM native_revisions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(header_pin, pin_id);
+    assert_eq!(header_incarnation, incarnation);
+    assert_eq!(header_revision, revision_number);
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
     let revision: (String, String, String, String, String) = db.query_row(
         "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions", [],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
@@ -1966,10 +1992,54 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             .unwrap();
         all_rows.insert(name, serde_json::json!(records));
     }
+    assert_eq!(
+        all_rows.len(),
+        28,
+        "retain every v8 evidence table in raw snapshot"
+    );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
             "configHash":revision.3,"dependencyHash":revision.4},
         "documents":documents,"allRows":all_rows})
+}
+
+// Only successful same-byte reindex may ignore per-publication pin cells.
+// All failed/no-op comparisons must keep real_native_snapshot entirely raw.
+fn same_bytes_evidence(snapshot: &Value) -> Value {
+    let pin = snapshot["revision"]["id"].as_str().unwrap().to_owned();
+    let header = snapshot["allRows"]["native_revisions"].as_array().unwrap();
+    assert_eq!(header.len(), 1);
+    let header = header[0].as_array().unwrap();
+    assert_eq!(header[0], pin);
+    assert!(uuid::Uuid::parse_str(header[8].as_str().unwrap()).is_ok());
+    assert!(header[12].as_i64().is_some_and(|revision| revision > 0));
+    for table in ["revision_capture_inputs", "revision_documents"] {
+        for row in snapshot["allRows"][table].as_array().unwrap() {
+            assert_eq!(row[0], pin, "{table} must reference the admitted pin");
+        }
+    }
+    for doc in snapshot["documents"].as_array().unwrap() {
+        assert_eq!(doc["revisionId"], pin);
+    }
+    let mut evidence = snapshot.clone();
+    evidence["revision"]["id"] = serde_json::json!("<current-pin>");
+    for doc in evidence["documents"].as_array_mut().unwrap() {
+        doc["revisionId"] = serde_json::json!("<current-pin>");
+    }
+    let header = evidence["allRows"]["native_revisions"]
+        .as_array_mut()
+        .unwrap()[0]
+        .as_array_mut()
+        .unwrap();
+    header[0] = serde_json::json!("<current-pin>");
+    header[8] = serde_json::json!("<leader-incarnation>");
+    header[12] = serde_json::json!("<current-revision>");
+    for table in ["revision_capture_inputs", "revision_documents"] {
+        for row in evidence["allRows"][table].as_array_mut().unwrap() {
+            row[0] = serde_json::json!("<current-pin>");
+        }
+    }
+    evidence
 }
 
 fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
@@ -2590,9 +2660,39 @@ def sink():
         use sha2::{Digest, Sha256};
         let native_after = real_native_snapshot(&home);
         let graph_after = real_export(&root, &home);
+        let before_header = &native_before["allRows"]["native_revisions"][0];
+        let leader_header = &native_as_leader["allRows"]["native_revisions"][0];
+        let after_header = &native_after["allRows"]["native_revisions"][0];
+        assert_ne!(
+            before_header[0], after_header[0],
+            "{name}: publication pin rotates"
+        );
+        assert_ne!(
+            before_header[8], after_header[8],
+            "{name}: daemon takeover rotates leader"
+        );
         assert_eq!(
-            native_after, native_before,
-            "{name}: complete normalized native rows must be stable"
+            leader_header[8], after_header[8],
+            "{name}: active leader remains stable"
+        );
+        assert_ne!(
+            before_header[12], after_header[12],
+            "{name}: revision advances"
+        );
+        assert_eq!(after_header[12], pin["indexRevision"], "{name}");
+        assert_eq!(
+            after_header[0],
+            format!(
+                "pin:v1:{}:{}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            ),
+            "{name}: header pin must match public status"
+        );
+        assert_eq!(
+            same_bytes_evidence(&native_after),
+            same_bytes_evidence(&native_before),
+            "{name}: all 28 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,

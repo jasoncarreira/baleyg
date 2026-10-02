@@ -685,8 +685,37 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         // Both withdrawn v2 and immediate v3 predecessor must be refused; v3 used occ:v2 IDs.
         let path = published_db(state.path(), root.path());
         let db = Connection::open(&path).unwrap();
-        db.execute("UPDATE native_producers SET version=?1", [old_version])
+        // Rewrite every producer-version FK in one deferred transaction. This
+        // models a coherent index from a withdrawn producer, not a broken FK.
+        db.pragma_update(None, "foreign_keys", "ON").unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            db.execute("UPDATE native_producers SET version=?1", [old_version])
+                .unwrap(),
+            1
+        );
+        db.execute(
+            "UPDATE native_producer_languages SET producer_version=?1",
+            [old_version],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE native_producer_inputs SET producer_version=?1",
+            [old_version],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE document_versions SET producer_version=?1",
+            [old_version],
+        )
+        .unwrap();
+        db.execute_batch("COMMIT").unwrap();
+        let violations: i64 = db
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
             .unwrap();
+        assert_eq!(violations, 0, "fixture must preserve producer FKs");
         drop(db);
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
         assert_eq!(store.index_baseline().unwrap(), first);
