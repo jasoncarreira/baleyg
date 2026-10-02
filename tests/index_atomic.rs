@@ -625,16 +625,22 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
         8
     );
     let files = db
-        .prepare("SELECT path FROM revision_documents ORDER BY path")
+        .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
         .unwrap()
-        .query_map([], |r| r.get::<_, String>(0))
+        .query_map(
+            [format!(
+                "pin:v1:{}:{}",
+                second.index_generation, second.index_revision
+            )],
+            |r| r.get::<_, String>(0),
+        )
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(files, vec!["two.js"]);
     let capture_stat: String = db
         .query_row(
-            "SELECT capture_stat FROM revision_documents WHERE path='two.js'",
+            "SELECT capture_stat FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path='two.js'",
             [],
             |r| r.get(0),
         )
@@ -645,7 +651,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
     let package: String = db
         .query_row(
-            "SELECT payload FROM revision_capture_inputs WHERE input_key='config:package.json'",
+            "SELECT payload FROM revision_capture_inputs WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND input_key='config:package.json'",
             [],
             |r| r.get(0),
         )
@@ -656,7 +662,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
     let absent: i64 = db
         .query_row(
-            "SELECT count(*) FROM revision_capture_inputs WHERE payload='{\"state\":\"absent\"}'",
+            "SELECT count(*) FROM revision_capture_inputs WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND payload='{\"state\":\"absent\"}'",
             [],
             |r| r.get(0),
         )
@@ -776,7 +782,11 @@ fn physical_schema_four_rebuild_is_same_file_with_fresh_generation_and_revision_
     assert_eq!(store.status().unwrap().revision, rebuilt);
 }
 
-fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
+fn sqlite_snapshot(
+    path: &Path,
+    pin: baleyg::model::IndexPin,
+    normalize_current_publication: bool,
+) -> Vec<(String, Vec<Vec<String>>)> {
     use rusqlite::types::Value;
     let db = rusqlite::Connection::open(path).unwrap();
     let (generation, published_revision, incarnation): (String, i64, String) = db
@@ -788,23 +798,28 @@ fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
         .unwrap();
     assert!(uuid::Uuid::parse_str(&generation).is_ok());
     assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
-    let revision_id = format!("pin:v1:{generation}:{published_revision}");
-    let (header_id, header_incarnation, header_revision): (String, String, i64) = db
+    assert_eq!(pin.index_generation.to_string(), generation);
+    if normalize_current_publication {
+        assert_eq!(pin.index_revision as i64, published_revision);
+    }
+    let revision_id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+    let (header_incarnation, header_revision): (String, i64) = db
         .query_row(
-            "SELECT id,reconciled_incarnation,published_index_revision FROM native_revisions",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            "SELECT reconciled_incarnation,published_index_revision FROM native_revisions WHERE id=?1",
+            [&revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(header_id, revision_id);
-    assert_eq!(header_incarnation, incarnation);
-    assert_eq!(header_revision, published_revision);
+    assert_eq!(header_revision, pin.index_revision as i64);
+    if normalize_current_publication {
+        assert_eq!(header_incarnation, incarnation);
+    }
     let violations: i64 = db
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(violations, 0, "revision pin FKs must remain valid");
+    assert_eq!(violations, 0, "all retained revision FKs must remain valid");
     let tables: Vec<String> = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
         .unwrap()
@@ -816,11 +831,39 @@ fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
     tables
         .into_iter()
         .map(|table| {
-            let escaped = table.replace('"', "\"\"");
-            let mut statement = db.prepare(&format!("SELECT * FROM \"{escaped}\"")).unwrap();
+            // Select the complete revision projection, not all archived rows.
+            // Every table remains in the independent cold-source comparison.
+            let (where_clause, alias) = match table.as_str() {
+                "native_revisions" => ("id=?1", ""),
+                "revision_capture_inputs" | "revision_documents" => ("revision_id=?1", ""),
+                "native_source_sets" => ("id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
+                "native_source_set_languages" | "native_source_set_dependencies" =>
+                    ("source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
+                "native_producers" | "native_producer_languages" | "native_producer_inputs" =>
+                    ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)", "producer"),
+                "document_versions" => ("id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "graph_projections" => ("id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "graph_nodes" | "graph_calls" | "graph_regions" =>
+                    ("projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "class_projections" => ("id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "classes" | "class_relations" =>
+                    ("projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                name if name.starts_with("native_version_") =>
+                    ("version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
+                _ => panic!("unhandled v8 evidence table: {table}"),
+            };
+            // Producer descriptor columns differ: only the parent table uses id/version.
+            let where_clause = if table == "native_producers" {
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)"
+            } else {
+                where_clause
+            };
+            let alias = if alias.is_empty() { "" } else { " selected" };
+            let sql = format!("SELECT * FROM \"{table}\"{alias} WHERE {where_clause}");
+            let mut statement = db.prepare(&sql).unwrap();
             let columns = statement.column_count();
             let mut rows = statement
-                .query_map([], |row| {
+                .query_map([&revision_id], |row| {
                     (0..columns)
                         .map(|column| match row.get::<_, Value>(column)? {
                             Value::Null => Ok("null".to_owned()),
@@ -834,24 +877,22 @@ fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
-            // These three header cells identify this particular publication,
-            // not its source/evidence. Validate them against live metadata and
-            // every dependent revision FK before normalizing for a cold oracle.
             if table == "native_revisions" {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], format!("t:{revision_id}"));
-                assert_eq!(rows[0][8], format!("t:{incarnation}"));
-                assert_eq!(rows[0][12], format!("i:{published_revision}"));
-                rows[0][0] = "t:<current-pin>".into();
-                rows[0][8] = "t:<leader-incarnation>".into();
-                rows[0][12] = "i:<current-revision>".into();
-            } else if matches!(
-                table.as_str(),
-                "revision_capture_inputs" | "revision_documents"
-            ) {
+                assert_eq!(rows[0][8], format!("t:{header_incarnation}"));
+                assert_eq!(rows[0][12], format!("i:{}", pin.index_revision));
+                if normalize_current_publication {
+                    rows[0][0] = "t:<current-pin>".into();
+                    rows[0][8] = "t:<leader-incarnation>".into();
+                    rows[0][12] = "i:<current-revision>".into();
+                }
+            } else if matches!(table.as_str(), "revision_capture_inputs" | "revision_documents") {
                 for row in &mut rows {
                     assert_eq!(row[0], format!("t:{revision_id}"));
-                    row[0] = "t:<current-pin>".into();
+                    if normalize_current_publication {
+                        row[0] = "t:<current-pin>".into();
+                    }
                 }
             }
             rows.sort();
@@ -872,6 +913,10 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         ("delete.js", "function deleted() {}\n"),
         ("rename-old.js", "function renamed() {}\n"),
         ("ignored.js", "function admittedAfterRuleChange() {}\n"),
+        (
+            "Witness.java",
+            "class Witness { void retained() { measured(); } }\n",
+        ),
     ] {
         fs::write(workspace.path().join(name), source).unwrap();
     }
@@ -888,6 +933,27 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
+    let reconciled_path = index_dir(state.path()).join("index.db");
+    let retained_first = sqlite_snapshot(&reconciled_path, first, false);
+    for table in [
+        "document_versions",
+        "graph_projections",
+        "class_projections",
+        "native_version_declarations",
+        "graph_nodes",
+        "classes",
+    ] {
+        assert!(
+            retained_first
+                .iter()
+                .find(|(name, _)| name == table)
+                .unwrap()
+                .1
+                .len()
+                > 0,
+            "{table} fixture must be nonempty"
+        );
+    }
 
     fs::write(
         workspace.path().join("keep.js"),
@@ -907,23 +973,73 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         "{\"name\":\"after!\"}\n",
     )
     .unwrap();
-    IndexJobCoordinator::prepare(&store, Some(first))
+    let second = IndexJobCoordinator::prepare(&store, Some(first))
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
+    assert_eq!(second.index_generation, first.index_generation);
+    assert_eq!(second.index_revision, first.index_revision + 1);
+    assert_eq!(store.status().unwrap().revision, second);
+    assert_eq!(
+        sqlite_snapshot(&reconciled_path, first, false),
+        retained_first,
+        "r1 full evidence must remain immutable after r2"
+    );
+    let r2 = sqlite_snapshot(&reconciled_path, second, true);
+    let paths = |snapshot: &Vec<(String, Vec<Vec<String>>)>| -> std::collections::BTreeSet<String> {
+        snapshot
+            .iter()
+            .find(|(table, _)| table == "revision_documents")
+            .unwrap()
+            .1
+            .iter()
+            .map(|row| row[3].clone())
+            .collect()
+    };
+    let first_paths = paths(&retained_first);
+    let second_paths = paths(&r2);
+    assert!(first_paths.contains("t:delete.js") && first_paths.contains("t:rename-old.js"));
+    assert!(
+        second_paths.contains("t:added.rs")
+            && second_paths.contains("t:rename-new.js")
+            && second_paths.contains("t:ignored.js")
+            && !second_paths.contains("t:delete.js")
+            && !second_paths.contains("t:rename-old.js")
+    );
+    let db = rusqlite::Connection::open(&reconciled_path).unwrap();
+    let headers: i64 = db
+        .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(headers, 2, "r1 and r2 headers survive");
+    for pin in [first, second] {
+        let id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        for table in ["revision_documents", "revision_capture_inputs"] {
+            let count: i64 = db
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE revision_id=?1"),
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(count > 0, "{table}: complete {id} evidence must remain");
+        }
+    }
+    let stale = store.source_at("keep.js", Some(first)).unwrap_err();
+    assert!(stale.to_string().contains("revision conflict"), "{stale:#}");
+    drop(db);
 
     let fresh_state = tempfile::tempdir().unwrap();
     fs::set_permissions(fresh_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let fresh = Store::open_for_tests(fresh_state.path(), workspace.path()).unwrap();
-    IndexJobCoordinator::prepare(&fresh, None)
+    let cold_pin = IndexJobCoordinator::prepare(&fresh, None)
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
-    let reconciled_path = index_dir(state.path()).join("index.db");
     let fresh_path = index_dir(fresh_state.path()).join("index.db");
     assert_eq!(
-        sqlite_snapshot(&reconciled_path),
-        sqlite_snapshot(&fresh_path)
+        r2,
+        sqlite_snapshot(&fresh_path, cold_pin, true),
+        "current r2 must equal a full independent cold build, including every selected v8 table"
     );
     let metadata = |path: &Path| {
         let db = rusqlite::Connection::open(path).unwrap();
@@ -967,7 +1083,7 @@ fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
         let db = rusqlite::Connection::open(&path).unwrap();
         let payload: String = db
             .query_row(
-                "SELECT capture_stat FROM revision_documents WHERE path='same.js'",
+                "SELECT capture_stat FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path='same.js'",
                 [],
                 |row| row.get(0),
             )

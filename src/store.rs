@@ -970,7 +970,7 @@ fn validate_graph(graph: &Graph, cancel: &CancelFlag) -> Result<IndexStats> {
 
 fn class_metadata(db: &Connection) -> Result<(Vec<String>, bool)> {
     let length: i64 = db.query_row(
-        "SELECT length(CAST(r.class_warnings AS BLOB)) FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision",
+        "SELECT length(CAST(r.class_warnings AS BLOB)) FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision",
         [],
         |r| r.get(0),
     )?;
@@ -979,7 +979,7 @@ fn class_metadata(db: &Connection) -> Result<(Vec<String>, bool)> {
         "incompatible_index: class catalog byte budget exceeded"
     );
     let (warnings, mut truncated): (String, bool) = db.query_row(
-        "SELECT r.class_warnings,r.class_truncated FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision",
+        "SELECT r.class_warnings,r.class_truncated FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -1008,7 +1008,7 @@ fn presentation_class(
     use crate::class_diagram::CLASS_BYTES;
     let size: Option<i64> = db
         .query_row(
-            "SELECT length(CAST(payload AS BLOB)) FROM classes JOIN revision_documents m ON m.class_projection_id=classes.projection_id WHERE classes.id=?1",
+            "SELECT length(CAST(payload AS BLOB)) FROM classes JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.class_projection_id=classes.projection_id WHERE classes.id=?1",
             [id],
             |r| r.get(0),
         )
@@ -1019,7 +1019,7 @@ fn presentation_class(
     };
     let valid: bool = db
         .query_row(
-            "SELECT json_valid(payload) FROM classes JOIN revision_documents m ON m.class_projection_id=classes.projection_id WHERE classes.id=?1",
+            "SELECT json_valid(payload) FROM classes JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.class_projection_id=classes.projection_id WHERE classes.id=?1",
             [id],
             |r| r.get(0),
         )
@@ -1031,7 +1031,7 @@ fn presentation_class(
     }
     if size <= CLASS_BYTES as i64 {
         let payload: String = db
-            .query_row("SELECT payload FROM classes JOIN revision_documents m ON m.class_projection_id=classes.projection_id WHERE classes.id=?1", [id], |r| {
+            .query_row("SELECT payload FROM classes JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.class_projection_id=classes.projection_id WHERE classes.id=?1", [id], |r| {
                 r.get(0)
             })
             .map_err(|error| store.report_selected_failure(error.into()))?;
@@ -1045,7 +1045,7 @@ fn presentation_class(
                 AND json_type(payload,'$.methods')='array'
                 AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.fields') WHERE type!='object')
                 AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.methods') WHERE type!='object')
-             FROM classes JOIN revision_documents m ON m.class_projection_id=classes.projection_id WHERE classes.id=?1",
+             FROM classes JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.class_projection_id=classes.projection_id WHERE classes.id=?1",
             [id],
             |r| r.get(0),
         )
@@ -1061,7 +1061,7 @@ fn presentation_class(
             SELECT json_set(payload,
                 '$.fields',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.fields') WHERE key < ?2),
                 '$.methods',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.methods') WHERE key < ?2),
-                '$.truncated',json('true')) AS payload FROM classes JOIN revision_documents m ON m.class_projection_id=classes.projection_id WHERE classes.id=?1)
+                '$.truncated',json('true')) AS payload FROM classes JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.class_projection_id=classes.projection_id WHERE classes.id=?1)
             SELECT CASE WHEN length(CAST(payload AS BLOB)) <= ?3 THEN payload ELSE NULL END FROM clipped",
             params![id, count, CLASS_BYTES as i64], |r| r.get(0))
             .map_err(|error| store.report_selected_failure(error.into()))?;
@@ -1084,13 +1084,13 @@ fn resolve_class_id(store: &Store, db: &Connection, id: &str) -> Result<String> 
             InvalidRequest("The selected symbol has a cyclic class ancestry.")
         );
         if db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE c.id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.class_projection_id=c.projection_id WHERE c.id=?1)",
             [&current],
             |r| r.get::<_, bool>(0),
         )? {
             return Ok(current);
         }
-        let symbol = one::<Symbol>(db, "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE n.id=?1", &current)
+        let symbol = one::<Symbol>(db, "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE n.id=?1", &current)
             .map_err(|error| store.report_selected_failure(error))?
             .ok_or(InvalidRequest(
                 "Choose an indexed Java or Python class or method.",
@@ -1212,6 +1212,267 @@ fn v8_document_projection(
     })
 }
 
+// A full rewrite still retains canonical version/projection IDs. Reusing one
+// means checking every old immutable row against this new captured publication;
+// silently ignoring a collision would bless corrupted or incomplete evidence.
+#[derive(Default)]
+struct ImmutableAppend {
+    schema: BTreeMap<String, (Vec<String>, Vec<usize>)>,
+    reused: BTreeMap<String, BTreeSet<String>>,
+    expected: BTreeMap<(String, String), i64>,
+}
+impl ImmutableAppend {
+    fn table(sql: &str) -> Result<&str> {
+        let table = sql
+            .split_whitespace()
+            .nth(2)
+            .context("missing immutable table")?;
+        ensure!(
+            matches!(
+                table,
+                "native_producers"
+                    | "native_producer_languages"
+                    | "native_source_sets"
+                    | "native_source_set_languages"
+                    | "native_source_set_dependencies"
+                    | "document_versions"
+                    | "graph_projections"
+                    | "class_projections"
+                    | "graph_nodes"
+                    | "graph_calls"
+                    | "graph_regions"
+                    | "classes"
+                    | "class_relations"
+                    | "native_version_coverage_roles"
+                    | "native_version_declarations"
+                    | "native_version_declaration_ancestors"
+                    | "native_version_own_signature_types"
+                    | "native_version_ancestor_signature_types"
+                    | "native_version_headers"
+                    | "native_version_header_items"
+                    | "native_version_parameters"
+                    | "native_version_calls"
+                    | "native_version_control_regions"
+                    | "native_version_call_regions"
+            ),
+            "incompatible_index: unrecognized immutable table"
+        );
+        Ok(table)
+    }
+    fn key(db: &Connection, values: &[&dyn rusqlite::ToSql], i: usize) -> Result<String> {
+        Ok(db.query_row("SELECT CAST(?1 AS TEXT)", [values[i]], |row| row.get(0))?)
+    }
+    fn group(
+        table: &str,
+        db: &Connection,
+        values: &[&dyn rusqlite::ToSql],
+    ) -> Result<Option<String>> {
+        let key = match table {
+            "native_producer_languages" => Some(format!(
+                "{}\u{1f}{}",
+                Self::key(db, values, 0)?,
+                Self::key(db, values, 1)?
+            )),
+            "native_source_set_languages"
+            | "native_source_set_dependencies"
+            | "graph_nodes"
+            | "graph_calls"
+            | "graph_regions"
+            | "classes"
+            | "class_relations"
+            | "native_version_coverage_roles"
+            | "native_version_declarations"
+            | "native_version_declaration_ancestors"
+            | "native_version_own_signature_types"
+            | "native_version_ancestor_signature_types"
+            | "native_version_headers"
+            | "native_version_header_items"
+            | "native_version_parameters"
+            | "native_version_calls"
+            | "native_version_control_regions"
+            | "native_version_call_regions" => Some(Self::key(db, values, 0)?),
+            _ => None,
+        };
+        Ok(key)
+    }
+    fn insert(
+        &mut self,
+        db: &Connection,
+        sql: &str,
+        values: &[&dyn rusqlite::ToSql],
+    ) -> Result<usize> {
+        let table = Self::table(sql)?;
+        if !self.schema.contains_key(table) {
+            let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut columns = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let keys = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, order))| *order > 0)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            ensure!(
+                !keys.is_empty(),
+                "incompatible_index: immutable table has no key"
+            );
+            let names = columns.drain(..).map(|(name, _)| name).collect::<Vec<_>>();
+            self.schema.insert(table.to_owned(), (names, keys));
+        }
+        let (columns, keys) = &self.schema[table];
+        ensure!(
+            columns.len() == values.len(),
+            "incompatible_index: immutable column count"
+        );
+        let predicate = |indices: &[usize]| {
+            indices
+                .iter()
+                .map(|i| format!("{} IS ?{}", columns[*i], i + 1))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let key_predicate = keys
+            .iter()
+            .enumerate()
+            .map(|(parameter, i)| format!("{} IS ?{}", columns[*i], parameter + 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let key_values = keys.iter().map(|i| values[*i]).collect::<Vec<_>>();
+        let exists: i64 = db.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {key_predicate})"),
+            key_values.as_slice(),
+            |row| row.get(0),
+        )?;
+        let inserted = if exists != 0 {
+            let all = (0..columns.len()).collect::<Vec<_>>();
+            let exact: i64 = db.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {})",
+                    predicate(&all)
+                ),
+                values,
+                |row| row.get(0),
+            )?;
+            control_ensure!(
+                exact == 1,
+                format!("incompatible_index: immutable {table} differs from captured evidence")
+            );
+            0
+        } else {
+            db.execute(sql, values)?
+        };
+        let parent = match table {
+            "native_producers" => Some(format!(
+                "{}\u{1f}{}",
+                Self::key(db, values, 0)?,
+                Self::key(db, values, 1)?
+            )),
+            "native_source_sets" | "document_versions" | "graph_projections"
+            | "class_projections" => Some(Self::key(db, values, 0)?),
+            _ => None,
+        };
+        if exists != 0
+            && let Some(parent) = parent
+        {
+            self.reused
+                .entry(table.to_owned())
+                .or_default()
+                .insert(parent);
+        }
+        if let Some(parent) = Self::group(table, db, values)? {
+            *self.expected.entry((table.to_owned(), parent)).or_default() += 1;
+        }
+        Ok(inserted)
+    }
+    fn finish(&self, db: &Connection) -> Result<()> {
+        const FAMILIES: &[(&str, &[(&str, &str)])] = &[
+            (
+                "native_producers",
+                &[
+                    ("native_producer_languages", "producer"),
+                    ("native_producer_inputs", "producer"),
+                ],
+            ),
+            (
+                "native_source_sets",
+                &[
+                    ("native_source_set_languages", "source_set_id"),
+                    ("native_source_set_dependencies", "source_set_id"),
+                ],
+            ),
+            (
+                "document_versions",
+                &[
+                    ("native_version_coverage_roles", "version_id"),
+                    ("native_version_declarations", "version_id"),
+                    ("native_version_declaration_ancestors", "version_id"),
+                    ("native_version_own_signature_types", "version_id"),
+                    ("native_version_ancestor_signature_types", "version_id"),
+                    ("native_version_headers", "version_id"),
+                    ("native_version_header_items", "version_id"),
+                    ("native_version_parameters", "version_id"),
+                    ("native_version_calls", "version_id"),
+                    ("native_version_control_regions", "version_id"),
+                    ("native_version_call_regions", "version_id"),
+                ],
+            ),
+            (
+                "graph_projections",
+                &[
+                    ("graph_nodes", "projection_id"),
+                    ("graph_calls", "projection_id"),
+                    ("graph_regions", "projection_id"),
+                ],
+            ),
+            (
+                "class_projections",
+                &[
+                    ("classes", "projection_id"),
+                    ("class_relations", "projection_id"),
+                ],
+            ),
+        ];
+        for (parent_table, children) in FAMILIES {
+            if let Some(reused) = self.reused.get(*parent_table) {
+                for parent in reused {
+                    for (child, column) in *children {
+                        let actual: i64 = if *column == "producer" {
+                            let (id, version) = parent
+                                .split_once('\u{1f}')
+                                .context("invalid producer key")?;
+                            db.query_row(
+                                &format!("SELECT count(*) FROM {child} WHERE producer_id=?1 AND producer_version=?2"),
+                                params![id, version], |row| row.get(0),
+                            )?
+                        } else {
+                            db.query_row(
+                                &format!("SELECT count(*) FROM {child} WHERE {column}=?1"),
+                                [parent],
+                                |row| row.get(0),
+                            )?
+                        };
+                        let expected = self
+                            .expected
+                            .get(&(child.to_string(), parent.clone()))
+                            .copied()
+                            .unwrap_or(0);
+                        control_ensure!(
+                            actual == expected,
+                            format!(
+                                "incompatible_index: incomplete immutable {child} for {parent_table}"
+                            )
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn write_native(
     db: &Connection,
     bundle: (
@@ -1223,6 +1484,7 @@ fn write_native(
     revision: IndexPin,
     leader: &topology::LeaderGuard,
     cancel: &CancelFlag,
+    immutable: &mut ImmutableAppend,
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
     let (artifact, capture, graph, classes) = bundle;
     let a = artifact;
@@ -1230,7 +1492,8 @@ fn write_native(
         "pin:v1:{}:{}",
         revision.index_generation, revision.index_revision
     );
-    db.execute(
+    immutable.insert(
+        db,
         "INSERT INTO native_producers VALUES(?1,?2,?3,?4,?5)",
         params![
             a.producer.id,
@@ -1241,23 +1504,33 @@ fn write_native(
         ],
     )?;
     for (ordinal, language) in a.producer.languages.iter().enumerate() {
-        db.execute(
-            "INSERT INTO native_producer_languages VALUES(?1,?2,?3,1,?4)",
-            params![a.producer.id, a.producer.version, language, ordinal as i64],
+        immutable.insert(
+            db,
+            "INSERT INTO native_producer_languages VALUES(?1,?2,?3,?4,?5)",
+            params![
+                a.producer.id,
+                a.producer.version,
+                language,
+                1,
+                ordinal as i64
+            ],
         )?;
     }
-    db.execute(
+    immutable.insert(
+        db,
         "INSERT INTO native_source_sets VALUES(?1,?2)",
         params![a.source_set.id, a.source_set.root_id],
     )?;
     for (ordinal, language) in a.source_set.languages.iter().enumerate() {
-        db.execute(
+        immutable.insert(
+            db,
             "INSERT INTO native_source_set_languages VALUES(?1,?2,?3)",
             params![a.source_set.id, language, ordinal as i64],
         )?;
     }
     for (ordinal, dependency) in a.source_set.dependencies.iter().enumerate() {
-        db.execute(
+        immutable.insert(
+            db,
             "INSERT INTO native_source_set_dependencies VALUES(?1,?2,?3)",
             params![a.source_set.id, dependency, ordinal as i64],
         )?;
@@ -1321,7 +1594,8 @@ fn write_native(
         );
         let ids = v8_document_projection(file, a, graph, classes)?;
         let context = crate::native_ids::extraction_context(&file.language, &[])?;
-        db.execute(
+        immutable.insert(
+            db,
             "INSERT INTO document_versions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 ids.version_id,
@@ -1336,23 +1610,27 @@ fn write_native(
                 file.text.as_bytes(),
             ],
         )?;
-        db.execute(
-            "INSERT INTO graph_projections VALUES(?1,?2,?3,?4,'ready',?5,NULL)",
+        immutable.insert(
+            db,
+            "INSERT INTO graph_projections VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
                 ids.graph_id,
                 ids.version_id,
                 file.language,
                 ids.graph_hash,
+                "ready",
                 if matches!(file.language.as_str(), "java" | "python") {
                     "pending"
                 } else {
                     "notApplicable"
                 },
+                Option::<String>::None,
             ],
         )?;
-        db.execute(
-            "INSERT INTO class_projections VALUES(?1,?2,?3,'ready')",
-            params![ids.class_id, ids.graph_id, ids.class_hash],
+        immutable.insert(
+            db,
+            "INSERT INTO class_projections VALUES(?1,?2,?3,?4)",
+            params![ids.class_id, ids.graph_id, ids.class_hash, "ready"],
         )?;
         let coverage = coverages
             .get(file.path.as_str())
@@ -1386,7 +1664,8 @@ fn write_native(
             ("observed", &coverage.observed_roles),
         ] {
             for (ordinal, role) in roles.iter().enumerate() {
-                db.execute(
+                immutable.insert(
+                    db,
                     "INSERT INTO native_version_coverage_roles VALUES(?1,?2,?3,?4)",
                     params![ids.version_id, kind, role, ordinal as i64],
                 )?;
@@ -1424,14 +1703,15 @@ fn write_native(
             })
             .transpose()?;
         let sig = d.key.signature.as_ref();
-        db.execute("INSERT INTO native_version_declarations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![
+        immutable.insert(db,"INSERT INTO native_version_declarations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![
             version,d.syntax_id,owner,d.kind,d.name,d.lookup_key,sig.is_some(),sig.map(|s|s.type_parameter_count as i64),
             sig.map(|s|s.variadic),d.key.ordinal as i64,d.range.start as i64,d.range.end as i64,
             d.name_range.as_ref().map(|r|r.start as i64),d.name_range.as_ref().map(|r|r.end as i64),
         ])?;
         if let Some(sig) = sig {
             for (ordinal, parameter) in sig.parameter_types.iter().enumerate() {
-                db.execute(
+                immutable.insert(
+                    db,
                     "INSERT INTO native_version_own_signature_types VALUES(?1,?2,?3,?4)",
                     params![version, d.syntax_id, ordinal as i64, parameter],
                 )?;
@@ -1439,19 +1719,20 @@ fn write_native(
         }
         for (ordinal, key) in d.ancestors.iter().enumerate() {
             let sig = key.signature.as_ref();
-            db.execute("INSERT INTO native_version_declaration_ancestors VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![
+            immutable.insert(db,"INSERT INTO native_version_declaration_ancestors VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![
                 version,d.syntax_id,ordinal as i64,key.kind,key.name,key.ordinal as i64,sig.is_some(),
                 sig.map(|s|s.type_parameter_count as i64),sig.map(|s|s.variadic),
             ])?;
             if let Some(sig) = sig {
                 for (parameter_ordinal, parameter) in sig.parameter_types.iter().enumerate() {
-                    db.execute("INSERT INTO native_version_ancestor_signature_types VALUES(?1,?2,?3,?4,?5)",params![
+                    immutable.insert(db,"INSERT INTO native_version_ancestor_signature_types VALUES(?1,?2,?3,?4,?5)",params![
                         version,d.syntax_id,ordinal as i64,parameter_ordinal as i64,parameter,
                     ])?;
                 }
             }
         }
-        db.execute(
+        immutable.insert(
+            db,
             "INSERT INTO native_version_headers VALUES(?1,?2,?3,?4,?5)",
             params![
                 version,
@@ -1467,14 +1748,16 @@ fn write_native(
             ("base", &d.header.bases),
         ] {
             for (ordinal, item) in items.iter().enumerate() {
-                db.execute(
+                immutable.insert(
+                    db,
                     "INSERT INTO native_version_header_items VALUES(?1,?2,?3,?4,?5)",
                     params![version, d.syntax_id, kind, ordinal as i64, item],
                 )?;
             }
         }
         for (ordinal, parameter) in d.header.parameters.iter().enumerate() {
-            db.execute(
+            immutable.insert(
+                db,
                 "INSERT INTO native_version_parameters VALUES(?1,?2,?3,?4,?5,?6)",
                 params![
                     version,
@@ -1493,7 +1776,8 @@ fn write_native(
             .get(&r.document.path)
             .context("native region missing document")?
             .version_id;
-        db.execute(
+        immutable.insert(
+            db,
             "INSERT INTO native_version_control_regions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 version,
@@ -1514,7 +1798,8 @@ fn write_native(
             .get(&c.document.path)
             .context("native call missing document")?
             .version_id;
-        db.execute(
+        immutable.insert(
+            db,
             "INSERT INTO native_version_calls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 version,
@@ -1529,7 +1814,8 @@ fn write_native(
             ],
         )?;
         for (ordinal, region) in c.region_ids.iter().enumerate() {
-            db.execute(
+            immutable.insert(
+                db,
                 "INSERT INTO native_version_call_regions VALUES(?1,?2,?3,?4)",
                 params![version, c.id, region, ordinal as i64],
             )?;
@@ -1628,7 +1914,7 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
     let source = one_row(db, "SELECT id,root_id FROM native_source_sets LIMIT 2")?;
     let revision = one_row(
         db,
-        "SELECT native_revision_id,source_set_id FROM native_revisions LIMIT 2",
+        "SELECT r.native_revision_id,r.source_set_id FROM native_revisions r JOIN index_metadata m ON m.singleton=1 AND r.published_index_revision=m.index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision LIMIT 2",
     )?;
     let expected_source = format!("source-set:v1:{root_id}");
     control_ensure!(
@@ -1643,18 +1929,18 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
             ),
         "incompatible_index: missing native pair metadata"
     );
-    let (count, published): (i64, Option<i64>) = db.query_row(
-        "SELECT count(*),min(published_index_revision) FROM native_revisions",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let current: i64 = db.query_row(
-        "SELECT index_revision FROM index_metadata WHERE singleton=1",
-        [],
-        |r| r.get(0),
-    )?;
+    let (count, first, last, mismatched, current): (i64, Option<i64>, Option<i64>, i64, i64) =
+        db.query_row(
+            "SELECT count(r.id),min(r.published_index_revision),max(r.published_index_revision),
+                coalesce(sum(CASE WHEN r.id IS NULL THEN 0 WHEN r.id='pin:v1:'||m.index_generation||':'||r.published_index_revision
+                  AND r.source_set_id=?1 AND r.published_index_revision BETWEEN 1 AND m.index_revision
+                  THEN 0 ELSE 1 END),0),m.index_revision
+             FROM index_metadata m LEFT JOIN native_revisions r ON true WHERE m.singleton=1",
+            [&expected_source],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
     control_ensure!(
-        count == 1 && published == Some(current),
+        count == current && first == Some(1) && last == Some(current) && mismatched == 0,
         "incompatible_index: native header pin mismatch"
     );
     Ok(())
@@ -1774,7 +2060,7 @@ fn compare_capture_snapshot(
     capture: &crate::capture::Capture,
 ) -> Result<ScanComparison> {
     let mut previous_sources = BTreeMap::new();
-    let mut statement = db.prepare("SELECT d.path,v.content_hash,d.capture_stat FROM revision_documents d JOIN document_versions v ON v.id=d.document_version_id JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision ORDER BY d.path")?;
+    let mut statement = db.prepare("SELECT d.path,v.content_hash,d.capture_stat FROM revision_documents d JOIN document_versions v ON v.id=d.document_version_id JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision ORDER BY d.path")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1800,7 +2086,7 @@ fn compare_capture_snapshot(
 
     let mut previous_inputs = BTreeMap::new();
     let mut statement =
-        db.prepare("SELECT i.input_key,i.payload FROM revision_capture_inputs i JOIN native_revisions r ON r.id=i.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision ORDER BY i.input_key")?;
+        db.prepare("SELECT i.input_key,i.payload FROM revision_capture_inputs i JOIN native_revisions r ON r.id=i.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision ORDER BY i.input_key")?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -1878,7 +2164,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     );
 
     let mut source_paths = BTreeSet::new();
-    let mut file_statement = db.prepare("SELECT d.path,d.capture_stat FROM revision_documents d JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision ORDER BY d.path")?;
+    let mut file_statement = db.prepare("SELECT d.path,d.capture_stat FROM revision_documents d JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision ORDER BY d.path")?;
     let mut files = file_statement.query([])?;
     while let Some(row) = files.next()? {
         let path: String = row.get(0)?;
@@ -1903,7 +2189,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     }
 
     let mut input_statement =
-        db.prepare("SELECT i.input_key,i.payload FROM revision_capture_inputs i JOIN native_revisions r ON r.id=i.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision ORDER BY i.input_key")?;
+        db.prepare("SELECT i.input_key,i.payload FROM revision_capture_inputs i JOIN native_revisions r ON r.id=i.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision ORDER BY i.input_key")?;
     let mut inputs = input_statement.query([])?;
     let mut actual = BTreeSet::new();
     let mut directories = BTreeSet::new();
@@ -2066,7 +2352,7 @@ fn validate_bounded_control(db: &Connection, root_id: &str) -> Result<()> {
     validate_reconcile_inventory(db)?;
     let warnings_bytes: Option<i64> = db
         .query_row(
-            "SELECT length(CAST(r.class_warnings AS BLOB)) FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision",
+            "SELECT length(CAST(r.class_warnings AS BLOB)) FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision",
             [],
             |row| row.get(0),
         )
@@ -2085,13 +2371,21 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
     ensure!(
         count("native_producers")? == 1
             && count("native_source_sets")? == 1
-            && count("native_revisions")? == 1,
+            && count("native_revisions")? >= 1,
         "incompatible_index: missing native pair"
     );
+    let (manifest_rows, projection_rows, inventory_rows): (i64, i64, i64) = db.query_row(
+        "SELECT (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id),
+                (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id AND d.class_projection_id IS NOT NULL),
+                json_array_length(r.source_inventory)
+         FROM native_revisions r JOIN index_metadata m ON m.singleton=1
+           AND r.published_index_revision=m.index_revision
+           AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
     ensure!(
-        count("revision_documents")? == count("document_versions")?
-            && count("revision_documents")? == count("graph_projections")?
-            && count("revision_documents")? == count("class_projections")?,
+        manifest_rows == inventory_rows && projection_rows == manifest_rows,
         "incompatible_index: incomplete revision manifest"
     );
     let mut stmt=db.prepare("SELECT d.source_bytes,d.content_hash,d.byte_length,r.path,r.language,r.source_set_id,g.language
@@ -2159,7 +2453,7 @@ fn v8_native_scope(
     let mut stmt = db.prepare(
         "SELECT rd.revision_id,rd.document_version_id,
         r.native_revision_id,d.producer_id FROM index_metadata m
-        JOIN native_revisions r ON r.published_index_revision=m.index_revision
+        JOIN native_revisions r ON r.published_index_revision=m.index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision
           AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision
         JOIN revision_documents rd ON rd.revision_id=r.id
         JOIN document_versions d ON d.id=rd.document_version_id
@@ -2193,7 +2487,7 @@ fn v8_native_scope(
 fn v8_owner_scope(db: &Connection, owner: &str) -> Result<Option<V8NativeScope>> {
     use crate::native_evidence::DocumentKey;
     let mut stmt=db.prepare("SELECT m.source_set_id,m.language,m.path
-        FROM native_version_declarations d JOIN revision_documents m ON m.document_version_id=d.version_id
+        FROM native_version_declarations d JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.document_version_id=d.version_id
         JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current
         ON current.index_revision=r.published_index_revision WHERE d.syntax_id=?1 LIMIT 2")?;
     let keys: Vec<DocumentKey> = stmt
@@ -3069,26 +3363,26 @@ impl Store {
         }
         json_rows::<Symbol>(
             db,
-            "SELECT n.payload FROM graph_nodes n JOIN revision_documents d ON d.graph_projection_id=n.projection_id ORDER BY n.id",
+            "SELECT n.payload FROM graph_nodes n JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=n.projection_id ORDER BY n.id",
         )?;
         json_rows::<CallSite>(
             db,
-            "SELECT c.payload FROM graph_calls c JOIN revision_documents d ON d.graph_projection_id=c.projection_id ORDER BY c.id",
+            "SELECT c.payload FROM graph_calls c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=c.projection_id ORDER BY c.id",
         )?;
         json_rows::<ControlRegion>(
             db,
-            "SELECT r.payload FROM graph_regions r JOIN revision_documents d ON d.graph_projection_id=r.projection_id ORDER BY r.id",
+            "SELECT r.payload FROM graph_regions r JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=r.projection_id ORDER BY r.id",
         )?;
         json_rows::<crate::classes::ClassDefinition>(
             db,
-            "SELECT c.payload FROM classes c JOIN revision_documents d ON d.class_projection_id=c.projection_id ORDER BY c.id",
+            "SELECT c.payload FROM classes c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.class_projection_id=c.projection_id ORDER BY c.id",
         )?;
         json_rows::<crate::classes::ClassRelation>(
             db,
-            "SELECT c.payload FROM class_relations c JOIN revision_documents d ON d.class_projection_id=c.projection_id ORDER BY c.id",
+            "SELECT c.payload FROM class_relations c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.class_projection_id=c.projection_id ORDER BY c.id",
         )?;
         let (stats, diagnostics, warnings): (String, String, String) = db.query_row(
-            "SELECT m.stats,m.diagnostics,r.class_warnings FROM index_metadata m JOIN native_revisions r ON r.published_index_revision=m.index_revision WHERE m.singleton=1",
+            "SELECT m.stats,m.diagnostics,r.class_warnings FROM index_metadata m JOIN native_revisions r ON r.published_index_revision=m.index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE m.singleton=1",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let _: IndexStats = serde_json::from_str(&stats)?;
@@ -3446,7 +3740,7 @@ impl Store {
             // old-index "requireIndex" fallback. This is one indexed metadata row.
             let warnings_bytes: Option<i64> = db
                 .query_row(
-                    "SELECT length(CAST(r.class_warnings AS BLOB)) FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision",
+                    "SELECT length(CAST(r.class_warnings AS BLOB)) FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision",
                     [],
                     |r| r.get(0),
                 )
@@ -4240,9 +4534,9 @@ impl Store {
                     json(&Vec::<Diagnostic>::new())?,
                 ],
             )?;
-        } else {
-            // Current-only v8 staging deliberately discards the old version tree;
-            // retention/reuse belongs to the later retained-pins/delta slices.
+        } else if rebaseline {
+            // An incompatible/corrupt generation is explicitly replaced, never served.
+            // Only compatible same-generation publication appends history.
             tx.execute_batch("DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
                 DELETE FROM native_version_call_regions; DELETE FROM native_version_calls;
                 DELETE FROM native_version_control_regions; DELETE FROM native_version_own_signature_types;
@@ -4257,13 +4551,22 @@ impl Store {
                 DELETE FROM native_producer_inputs; DELETE FROM native_producer_languages;
                 DELETE FROM native_producers;")?;
         }
+        // The active manifest is full-rewrite, but old same-generation manifests
+        // and their immutable version/projection trees remain for retained pins.
+        let mut immutable = ImmutableAppend::default();
+        let classify_immutable = |error| match target {
+            PublicationTarget::Live => self.report_live_read_failure(error),
+            PublicationTarget::Stage(_) => error,
+        };
         let projections = write_native(
             &tx,
             (native, capture, graph, &classes),
             revision,
             leader,
             cancel,
-        )?;
+            &mut immutable,
+        )
+        .map_err(&classify_immutable)?;
         for f in &graph.files {
             check_cancel(cancel)?;
             during_tx(PublishStage::AfterFile, &tx)?;
@@ -4271,36 +4574,55 @@ impl Store {
                 .get(&f.path)
                 .context("missing graph projection")?;
             for n in graph.nodes.iter().filter(|n| n.path == f.path) {
-                tx.execute(
-                    "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4,?5)",
-                    params![ids.graph_id, n.id, n.name, n.path, json(n)?],
-                )?;
+                immutable
+                    .insert(
+                        &tx,
+                        "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4,?5)",
+                        params![ids.graph_id, n.id, n.name, n.path, json(n)?],
+                    )
+                    .map_err(&classify_immutable)?;
             }
             for c in graph.calls.iter().filter(|c| c.path == f.path) {
-                tx.execute(
-                    "INSERT INTO graph_calls VALUES(?1,?2,?3,NULL,?4,?5)",
-                    params![ids.graph_id, c.id, c.caller, c.path, json(c)?],
-                )?;
+                immutable
+                    .insert(
+                        &tx,
+                        "INSERT INTO graph_calls VALUES(?1,?2,?3,?4,?5,?6)",
+                        params![
+                            ids.graph_id,
+                            c.id,
+                            c.caller,
+                            Option::<String>::None,
+                            c.path,
+                            json(c)?
+                        ],
+                    )
+                    .map_err(&classify_immutable)?;
             }
             for r in graph.regions.iter().filter(|r| r.path == f.path) {
-                tx.execute(
-                    "INSERT INTO graph_regions VALUES(?1,?2,?3,?4,?5)",
-                    params![ids.graph_id, r.id, r.owner, r.path, json(r)?],
-                )?;
+                immutable
+                    .insert(
+                        &tx,
+                        "INSERT INTO graph_regions VALUES(?1,?2,?3,?4,?5)",
+                        params![ids.graph_id, r.id, r.owner, r.path, json(r)?],
+                    )
+                    .map_err(&classify_immutable)?;
             }
             for class in classes.classes.iter().filter(|c| c.symbol.path == f.path) {
-                tx.execute(
-                    "INSERT INTO classes VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                    params![
-                        ids.class_id,
-                        ids.graph_id,
-                        class.symbol.id,
-                        class.symbol.name,
-                        class.qualified_name,
-                        class.symbol.path,
-                        json(class)?,
-                    ],
-                )?;
+                immutable
+                    .insert(
+                        &tx,
+                        "INSERT INTO classes VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                        params![
+                            ids.class_id,
+                            ids.graph_id,
+                            class.symbol.id,
+                            class.symbol.name,
+                            class.qualified_name,
+                            class.symbol.path,
+                            json(class)?,
+                        ],
+                    )
+                    .map_err(&classify_immutable)?;
             }
             for relation in classes.relations.iter().filter(|r| {
                 classes
@@ -4308,18 +4630,22 @@ impl Store {
                     .iter()
                     .any(|c| c.symbol.path == f.path && c.symbol.id == r.owner)
             }) {
-                tx.execute(
-                    "INSERT INTO class_relations VALUES(?1,?2,?3,?4,?5)",
-                    params![
-                        ids.class_id,
-                        relation.id,
-                        relation.owner,
-                        relation.target,
-                        json(relation)?,
-                    ],
-                )?;
+                immutable
+                    .insert(
+                        &tx,
+                        "INSERT INTO class_relations VALUES(?1,?2,?3,?4,?5)",
+                        params![
+                            ids.class_id,
+                            relation.id,
+                            relation.owner,
+                            relation.target,
+                            json(relation)?,
+                        ],
+                    )
+                    .map_err(&classify_immutable)?;
             }
         }
+        immutable.finish(&tx).map_err(&classify_immutable)?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis()
@@ -4387,7 +4713,7 @@ impl Store {
         use crate::native_evidence::{Document, DocumentKey, Producer, Revision, SourceSet};
         let (source_set_id, revision_id): (String, String) = db
             .query_row(
-                "SELECT m.source_set_id,r.native_revision_id FROM revision_documents m
+                "SELECT m.source_set_id,r.native_revision_id FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision
                 JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current
                 ON current.index_revision=r.published_index_revision WHERE m.path=?1",
                 [path],
@@ -4430,7 +4756,7 @@ impl Store {
         )?.query_map([&source_set_id],|r|r.get::<_,String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut revision:Revision=db.query_row(
-            "SELECT native_revision_id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE native_revision_id=?1 AND published_index_revision=(SELECT index_revision FROM index_metadata WHERE singleton=1)",
+            "SELECT native_revision_id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE native_revision_id=?1 AND id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1)",
             [&revision_id],|r|Ok(Revision{id:r.get(0)?,source_set_id:r.get(1)?,
                 documents:vec![],toolchain_hash:r.get(2)?,config_hash:r.get(3)?,dependency_hash:r.get(4)?}),
         )?;
@@ -4474,8 +4800,8 @@ impl Store {
             m.class_projection_id,d.content_hash,d.byte_length,length(d.source_bytes),
             g.graph_hash,g.class_extraction_state,length(CAST(g.class_extraction_payload AS BLOB)),
             c.content_hash,c.state,r.native_revision_id
-            FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
-            JOIN index_metadata current ON current.index_revision=r.published_index_revision
+            FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision JOIN native_revisions r ON r.id=m.revision_id
+            JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision
             JOIN document_versions d ON d.id=m.document_version_id
               AND d.source_set_id=m.source_set_id AND d.language=m.language AND d.path=m.path
             JOIN graph_projections g ON g.id=m.graph_projection_id
@@ -4828,7 +5154,7 @@ impl Store {
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )?;
         let class_id: String = db.query_row(
-            "SELECT m.class_projection_id FROM revision_documents m
+            "SELECT m.class_projection_id FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision
             JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current
             ON current.index_revision=r.published_index_revision WHERE m.path=?1",
             [path],
@@ -4861,7 +5187,7 @@ impl Store {
     ) -> Result<Vec<crate::native_evidence::Declaration>> {
         self.native_at(pin, |db| {
             let mut paths=db.prepare(
-                "SELECT DISTINCT m.path FROM native_version_declarations d JOIN revision_documents m ON m.document_version_id=d.version_id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.language=?1 AND d.lookup_key=?2 ORDER BY m.path LIMIT 5001"
+                "SELECT DISTINCT m.path FROM native_version_declarations d JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.document_version_id=d.version_id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision WHERE m.language=?1 AND d.lookup_key=?2 ORDER BY m.path LIMIT 5001"
             )?.query_map(params![language,lookup_key],|r|r.get::<_,String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(paths.len()<=5000,"incompatible_index: selected lookup document budget exceeded");
@@ -4878,8 +5204,8 @@ impl Store {
     ) -> Result<Vec<crate::native_evidence::Declaration>> {
         use crate::native_evidence::DocumentKey;
         let mut stmt=db.prepare("SELECT DISTINCT m.source_set_id,m.language,m.path
-            FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
-            JOIN index_metadata current ON current.index_revision=r.published_index_revision
+            FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision JOIN native_revisions r ON r.id=m.revision_id
+            JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision
             JOIN native_version_declarations d ON d.version_id=m.document_version_id
             WHERE m.language=?1 AND (?4 OR ((?2 IS NULL AND d.lookup_key IS NULL) OR d.lookup_key=?2))
             AND (?3 IS NULL OR m.path=?3) ORDER BY m.path LIMIT 5001")?;
@@ -4923,7 +5249,7 @@ impl Store {
         self.native_at(pin, |db| {
             let Some(scope) = v8_native_scope(db, key)? else {
                 let path_exists: bool = db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE path=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path=?1)",
                     [&key.path],
                     |r| r.get(0),
                 )?;
@@ -4985,7 +5311,7 @@ impl Store {
                 read_native_calls_v8(db, &scope, owner)
             } else {
                 let dangling: bool = db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM native_version_calls WHERE owner_syntax_id=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM native_version_calls c JOIN revision_documents m ON m.document_version_id=c.version_id AND m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) WHERE c.owner_syntax_id=?1)",
                     [owner],
                     |r| r.get(0),
                 )?;
@@ -5005,7 +5331,7 @@ impl Store {
                 read_native_control_regions_v8(db,&scope,owner)
             } else {
                 let dangling:bool=db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM native_version_control_regions WHERE owner_syntax_id=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM native_version_control_regions c JOIN revision_documents m ON m.document_version_id=c.version_id AND m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) WHERE c.owner_syntax_id=?1)",
                     [owner],|r|r.get(0),
                 )?;
                 ensure!(!dangling,"incompatible_index: native owner absent");
@@ -5032,7 +5358,7 @@ impl Store {
             crate::navigation::NavigationRequest::Member(s) => {
                 let selected: Option<(String, bool, Option<String>)> = tx
                     .query_row(
-                        "SELECT n.path,json_valid(n.payload),CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') ELSE NULL END FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE n.id=?1 LIMIT 1",
+                        "SELECT n.path,json_valid(n.payload),CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') ELSE NULL END FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE n.id=?1 LIMIT 1",
                         [&s.class_id],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
@@ -5056,7 +5382,7 @@ impl Store {
             // Gate allocation of the selected JSON/BLOB before decoding either.
             // This reads only SQLite byte lengths, not every workspace document.
             let sizes: Option<(i64, i64)> = tx.query_row(
-                "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m JOIN document_versions d ON d.id=m.document_version_id WHERE m.path=?1",
+                "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision JOIN document_versions d ON d.id=m.document_version_id WHERE m.path=?1",
                 [&path], |row| Ok((row.get(0)?, row.get(1)?)),
             ).optional()?;
             if let Some((graph_len, native_len)) = sizes {
@@ -5071,7 +5397,7 @@ impl Store {
                 self.attest_selected_document(tx, &path)?;
             } else {
                 let graph_file: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE path=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path=?1)",
                     [&path],
                     |row| row.get(0),
                 )?;
@@ -5129,7 +5455,7 @@ impl Store {
                 .replace('%', "\\%")
                 .replace('_', "\\_")
         );
-        let mut stmt = tx.prepare("SELECT c.id FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE (?1 IS NULL OR c.path=?1)
+        let mut stmt = tx.prepare("SELECT c.id FROM classes c JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.class_projection_id=c.projection_id WHERE (?1 IS NULL OR c.path=?1)
             AND (c.name LIKE ?2 ESCAPE '\\' OR c.qualified_name LIKE ?2 ESCAPE '\\' OR c.id=?3)
             ORDER BY CASE WHEN lower(c.name)=lower(?3) THEN 0 ELSE 1 END,c.qualified_name,c.path,c.id LIMIT ?4 OFFSET ?5")?;
         let ids = stmt
@@ -5242,13 +5568,13 @@ impl Store {
         ensure!(query.len() <= 8192, "search query too long");
         self.with_evidence(|tx| {
         let revision = self.read_status(tx)?.revision;
-        let selected_paths: BTreeSet<String> = tx.prepare("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?
+        let selected_paths: BTreeSet<String> = tx.prepare("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?
             .query_map(params![query,limit.min(150) as i64],|r|r.get::<_,String>(0))?
             .collect::<rusqlite::Result<_>>()?;
         for path in selected_paths {
             self.attest_selected_document(tx, &path)?;
         }
-        let mut stmt = tx.prepare("SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?;
+        let mut stmt = tx.prepare("SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?;
         let values = stmt.query_map(params![query, limit.min(150) as i64], |r| {
             r.get::<_, String>(0)
         })?;
@@ -5280,12 +5606,12 @@ impl Store {
                 "revision conflict"
             );
             let selected_path: Option<String> = tx
-                .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE n.id=?1", [id], |r| r.get(0))
+                .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE n.id=?1", [id], |r| r.get(0))
                 .optional()?;
             if let Some(path) = selected_path {
                 self.attest_selected_document(tx, &path)?;
             }
-            let node: Option<Symbol> = one(tx, "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE n.id=?1", id)?;
+            let node: Option<Symbol> = one(tx, "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE n.id=?1", id)?;
             Ok(node.map(|node| (revision, node)))
         })
     }
@@ -5299,9 +5625,9 @@ impl Store {
         path: &str,
         max_bytes: i64,
     ) -> Result<Option<SourceFile>> {
-        let selected = "FROM revision_documents m
+        let selected = "FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision
             JOIN native_revisions r ON r.id=m.revision_id
-            JOIN index_metadata current ON current.index_revision=r.published_index_revision
+            JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision
             JOIN document_versions d ON d.id=m.document_version_id
             WHERE m.path=?1";
         let sql = format!(
@@ -5401,10 +5727,10 @@ impl Store {
             let revision = self.read_status(tx)?.revision;
             let workspace = Path::new(&self.workspace_root);
             let mut valid_stmt = tx.prepare(
-                "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m WHERE m.path=?1",
+                "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
             let mut count_stmt = tx.prepare(
-                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM revision_documents m WHERE m.path=?1",
+                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
             let mut overlays = Vec::new();
             for (index, item) in items.iter().enumerate().filter(|(_, entry)| entry.kind == "file") {
@@ -5448,9 +5774,9 @@ impl Store {
             let revision = self.read_status(tx)?.revision;
             ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
             let mut stmt = tx.prepare(
-                "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
+                "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision
                 JOIN native_revisions r ON r.id=m.revision_id
-                JOIN index_metadata current ON current.index_revision=r.published_index_revision
+                JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision
                 JOIN document_versions d ON d.id=m.document_version_id
                 ORDER BY m.path LIMIT ?1 OFFSET ?2",
             )?;
@@ -5487,9 +5813,9 @@ impl Store {
             ensure!(expected.is_none_or(|r| r == revision), "revision conflict");
             let projection_id: Option<String> = tx
                 .query_row(
-                    "SELECT m.graph_projection_id FROM revision_documents m
+                    "SELECT m.graph_projection_id FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision
                 JOIN native_revisions r ON r.id=m.revision_id
-                JOIN index_metadata current ON current.index_revision=r.published_index_revision
+                JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision
                 WHERE m.path=?1",
                     [path],
                     |r| r.get(0),
@@ -5530,7 +5856,7 @@ impl Store {
             let selected:Option<(String,String)>=tx.query_row(
                 "SELECT n.path,n.projection_id FROM graph_nodes n JOIN revision_documents m
                 ON m.graph_projection_id=n.projection_id JOIN native_revisions r ON r.id=m.revision_id
-                JOIN index_metadata current ON current.index_revision=r.published_index_revision
+                JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision
                 WHERE n.id=?1",[seed],|r|Ok((r.get(0)?,r.get(1)?)),
             ).optional()?;
             let Some((path,graph_id))=selected else {return Ok(None)};
@@ -5555,9 +5881,9 @@ impl Store {
         let status = self.read_status(db)?;
         let paths: Vec<String> = db
             .prepare(
-                "SELECT m.path FROM revision_documents m
+                "SELECT m.path FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision
             JOIN native_revisions r ON r.id=m.revision_id
-            JOIN index_metadata current ON current.index_revision=r.published_index_revision
+            JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision
             ORDER BY m.path",
             )?
             .query_map([], |row| row.get(0))?
@@ -5575,13 +5901,13 @@ impl Store {
         Ok(Graph {
             schema_version: SCHEMA_VERSION,
             files,
-            nodes: rows(db,"SELECT n.payload FROM graph_nodes n JOIN revision_documents d ON d.graph_projection_id=n.projection_id
-                JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision ORDER BY n.id")?,
-            calls: rows(db,"SELECT c.payload FROM graph_calls c JOIN revision_documents d ON d.graph_projection_id=c.projection_id
-                JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision
+            nodes: rows(db,"SELECT n.payload FROM graph_nodes n JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=n.projection_id
+                JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision ORDER BY n.id")?,
+            calls: rows(db,"SELECT c.payload FROM graph_calls c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=c.projection_id
+                JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision
                 ORDER BY c.path,json_extract(c.payload,'$.range.startByte'),json_extract(c.payload,'$.range.endByte') DESC,c.id")?,
-            regions: rows(db,"SELECT g.payload FROM graph_regions g JOIN revision_documents d ON d.graph_projection_id=g.projection_id
-                JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision ORDER BY g.id")?,
+            regions: rows(db,"SELECT g.payload FROM graph_regions g JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=g.projection_id
+                JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision ORDER BY g.id")?,
             diagnostics: status.diagnostics,
             stats: status.stats,
         })
@@ -5621,7 +5947,7 @@ impl Store {
         for node in &view.nodes {
             let actual: Option<Symbol> = one(
                 tx,
-                "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE n.id=?1",
+                "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
                 &node.id,
             )?;
             ensure!(
@@ -5632,7 +5958,7 @@ impl Store {
         for call in &view.calls {
             let actual: Option<CallSite> = one(
                 tx,
-                "SELECT c.payload FROM graph_calls c JOIN revision_documents m ON m.graph_projection_id=c.projection_id WHERE c.id=?1",
+                "SELECT c.payload FROM graph_calls c JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=c.projection_id WHERE c.id=?1",
                 &call.id,
             )?;
             ensure!(
@@ -5643,7 +5969,7 @@ impl Store {
         for region in &view.regions {
             let actual: Option<ControlRegion> = one(
                 tx,
-                "SELECT g.payload FROM graph_regions g JOIN revision_documents m ON m.graph_projection_id=g.projection_id WHERE g.id=?1",
+                "SELECT g.payload FROM graph_regions g JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=g.projection_id WHERE g.id=?1",
                 &region.id,
             )?;
             ensure!(
@@ -5684,7 +6010,7 @@ impl Store {
             "revision conflict: stale native pin"
         );
         let selected_path: Option<String> = tx
-            .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE n.id=?1", [&query.seed], |r| {
+            .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE n.id=?1", [&query.seed], |r| {
                 r.get(0)
             })
             .optional()?;
@@ -5693,7 +6019,7 @@ impl Store {
         }
         let seed: Option<Symbol> = one(
             tx,
-            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE n.id=?1",
+            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
             &query.seed,
         )?;
         let Some(seed) = seed else { return Ok(None) };
@@ -5701,7 +6027,7 @@ impl Store {
         let mut region_ids = BTreeSet::new();
         let mut truncated = false;
         if !query.exclude_paths.iter().any(|p| seed.path.starts_with(p)) {
-            let mut stmt = tx.prepare("SELECT c.payload FROM graph_calls c JOIN revision_documents m ON m.graph_projection_id=c.projection_id WHERE c.caller=?1 ORDER BY c.path,json_extract(c.payload,'$.range.startByte'),json_extract(c.payload,'$.range.endByte') DESC,c.id LIMIT ?2")?;
+            let mut stmt = tx.prepare("SELECT c.payload FROM graph_calls c JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=c.projection_id WHERE c.caller=?1 ORDER BY c.path,json_extract(c.payload,'$.range.startByte'),json_extract(c.payload,'$.range.endByte') DESC,c.id LIMIT ?2")?;
             let rows = stmt.query_map(params![seed.id, (query.max_calls + 1) as i64], |r| {
                 r.get::<_, String>(0)
             })?;
@@ -5722,7 +6048,7 @@ impl Store {
         while let Some(id) = region_ids.pop_first() {
             let region: Option<ControlRegion> = one(
                 tx,
-                "SELECT g.payload FROM graph_regions g JOIN revision_documents m ON m.graph_projection_id=g.projection_id WHERE g.id=?1",
+                "SELECT g.payload FROM graph_regions g JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=g.projection_id WHERE g.id=?1",
                 &id,
             )?;
             if let Some(region) = region {
@@ -5764,7 +6090,7 @@ impl Store {
     fn selected_anchor_in(db: &Connection, store: &Self, target: &str) -> Result<DurableAnchor> {
         let selected: Option<(String, String)> = db
             .query_row(
-                "SELECT m.language,m.path FROM native_version_declarations d JOIN revision_documents m ON m.document_version_id=d.version_id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE d.syntax_id=?1",
+                "SELECT m.language,m.path FROM native_version_declarations d JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.document_version_id=d.version_id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision WHERE d.syntax_id=?1",
                 [target],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -5782,7 +6108,7 @@ impl Store {
         anchor: &DurableAnchor,
     ) -> Result<Option<(String, Vec<crate::native_evidence::Declaration>)>> {
         let revision: Option<String> = db.query_row(
-            "SELECT r.native_revision_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.source_set_id=?1 AND m.language=?2 AND m.path=?3",
+            "SELECT r.native_revision_id FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision AND r.id='pin:v1:'||current.index_generation||':'||current.index_revision WHERE m.source_set_id=?1 AND m.language=?2 AND m.path=?3",
             params![anchor.document.source_set_id, anchor.document.language, anchor.document.path], |row| row.get(0),
         ).optional()?;
         let Some(revision) = revision else {
@@ -5844,7 +6170,7 @@ impl Store {
         let mut orphaned_ids = vec![];
         for id in ids {
             let exists: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE n.id=?1)",
+                "SELECT EXISTS(SELECT 1 FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE n.id=?1)",
                 [id],
                 |r| r.get(0),
             )?;
@@ -7458,6 +7784,67 @@ mod sqlite_schema_race_tests {
         (
             state, work, store, graph, capture, native, pin, cancel, session,
         )
+    }
+
+    #[test]
+    fn retained_two_revision_tree_survives_partial_third_publication_rollback() {
+        let (_state, work, store, graph, capture, native, first, cancel, session) = ready();
+        let leader = session.leader_guard().unwrap();
+        let second = store
+            .publish_native(&graph, &capture, &native, leader, first, &cancel)
+            .unwrap();
+        assert_eq!(second.index_generation, first.index_generation);
+        assert_eq!(second.index_revision, first.index_revision + 1);
+        fs::write(
+            work.path().join("flow.js"),
+            "function go() { changed(); }\n",
+        )
+        .unwrap();
+        let (edited_graph, edited_native, edited_capture) = index_workspace_bundle(
+            &IndexOptions::new(work.path().to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let before = fs::read(&path).unwrap();
+        let error = store
+            .publish_inner_checked(
+                (&edited_graph, &edited_capture, &edited_native),
+                leader,
+                second,
+                &cancel,
+                |stage, tx| {
+                    if stage == PublishStage::AfterFile {
+                        // The new r3 header/manifest has already been inserted;
+                        // force an actual SQLite error inside its transaction.
+                        tx.execute(
+                            "INSERT INTO native_revisions SELECT * FROM native_revisions WHERE published_index_revision=?1",
+                            [second.index_revision as i64],
+                        )?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("UNIQUE constraint failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "partial r3 write changed r1 or r2 bytes"
+        );
+        assert_eq!(store.status().unwrap().revision, second);
+        let db = Connection::open(path).unwrap();
+        let headers: i64 = db
+            .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(headers, 2);
+        let old = store.source_at("flow.js", Some(first)).unwrap_err();
+        assert!(old.to_string().contains("revision conflict"), "{old:#}");
     }
 
     #[test]

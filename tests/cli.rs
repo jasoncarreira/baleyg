@@ -1924,8 +1924,8 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     let pin_id = format!("pin:v1:{generation}:{revision_number}");
     let (header_pin, header_incarnation, header_revision): (String, String, i64) = db
         .query_row(
-            "SELECT id,reconciled_incarnation,published_index_revision FROM native_revisions",
-            [],
+            "SELECT id,reconciled_incarnation,published_index_revision FROM native_revisions WHERE id=?1",
+            [&pin_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
@@ -1939,15 +1939,15 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
         .unwrap();
     assert_eq!(violations, 0);
     let revision: (String, String, String, String, String) = db.query_row(
-        "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions", [],
+        "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1", [&pin_id],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
     ).unwrap();
     let mut documents = Vec::new();
     let mut stmt = db.prepare(
-        "SELECT v.source_set_id,v.language,m.path,m.revision_id,v.content_hash,v.byte_length,v.source_bytes FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id ORDER BY m.path"
+        "SELECT v.source_set_id,v.language,m.path,m.revision_id,v.content_hash,v.byte_length,v.source_bytes FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id WHERE m.revision_id=?1 ORDER BY m.path"
     ).unwrap();
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([&pin_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1968,12 +1968,59 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
     for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
         let name = name.unwrap();
+        let (predicate, alias) = match name.as_str() {
+            "native_revisions" => ("id=?1", ""),
+            "revision_capture_inputs" | "revision_documents" => ("revision_id=?1", ""),
+            "native_source_sets" => (
+                "id=(SELECT source_set_id FROM native_revisions WHERE id=?1)",
+                "",
+            ),
+            "native_source_set_languages" | "native_source_set_dependencies" => (
+                "source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?1)",
+                "",
+            ),
+            "native_producers" => (
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)",
+                " selected",
+            ),
+            "native_producer_languages" | "native_producer_inputs" => (
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)",
+                " selected",
+            ),
+            "document_versions" => (
+                "id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "graph_projections" => (
+                "id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "graph_nodes" | "graph_calls" | "graph_regions" => (
+                "projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "class_projections" => (
+                "id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "classes" | "class_relations" => (
+                "projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            table if table.starts_with("native_version_") => (
+                "version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            _ => panic!("unexpected v8 evidence table: {name}"),
+        };
         let mut table = db
-            .prepare(&format!("SELECT * FROM {name} ORDER BY rowid"))
+            .prepare(&format!(
+                "SELECT * FROM \"{name}\"{alias} WHERE {predicate} ORDER BY rowid"
+            ))
             .unwrap();
         let columns = table.column_count();
         let records = table
-            .query_map([], |row| {
+            .query_map([&pin_id], |row| {
                 let mut cells = Vec::new();
                 for i in 0..columns {
                     let cell = match row.get_ref(i)? {
