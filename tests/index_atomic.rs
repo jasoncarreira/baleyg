@@ -943,13 +943,12 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         "classes",
     ] {
         assert!(
-            retained_first
+            !retained_first
                 .iter()
                 .find(|(name, _)| name == table)
                 .unwrap()
                 .1
-                .len()
-                > 0,
+                .is_empty(),
             "{table} fixture must be nonempty"
         );
     }
