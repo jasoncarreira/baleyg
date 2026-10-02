@@ -1702,3 +1702,286 @@ async fn class_registry_text_selected_cutoff_pilot() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "32MiB selected tamper pilot; requires explicit resource grant"]
+async fn class_registry_text_selected_tamper_pilot() {
+    use sha2::{Digest, Sha256};
+    let long_line = format!("import {}.{};\n", "p".repeat(1023), "c".repeat(1024));
+    let long_file = long_line.repeat(1018);
+    let last_long = long_line.repeat(742);
+    let short = |p| format!("import {}.{};\n", "p".repeat(p), "c".repeat(984));
+    let selected = "class Selected {}\n";
+    assert_eq!(
+        (
+            long_file.len(),
+            long_file.lines().count(),
+            last_long.len(),
+            short(2).len(),
+            selected.len()
+        ),
+        (2_094_026, 1018, 742 * 2057, 996, 18)
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(long_file.as_bytes())),
+        "58ef1b69f8fbd1d35859a01554980313419a5fdd604c948f0e5e1dab526f8a6f"
+    );
+    for case in ["F", "source", "graph"] {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let state = dir.path().join("state");
+        eprintln!(
+            "{}",
+            json!({"pilot":"class-registry32-tamper","stage":"allocated",
+            "case":case,"temp":dir.path().display().to_string(),
+            "workspace":workspace.display().to_string(),"state":state.display().to_string()})
+        );
+        std::io::Write::flush(&mut std::io::stderr()).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        for number in 0..10 {
+            std::fs::write(workspace.join(format!("a{number:02}.java")), &long_file).unwrap();
+        }
+        std::fs::write(workspace.join("z.java"), selected).unwrap();
+        let options = IndexOptions::new(workspace.clone());
+        let store = common::open_store(&state, &workspace).unwrap();
+        let session = store.leader_session().unwrap();
+        let mut selected_id = None;
+        let mut pin = None;
+        for prefix in [2, 3] {
+            let tail = format!("{last_long}{}", short(prefix));
+            std::fs::write(workspace.join("a10.java"), &tail).unwrap();
+            assert_eq!(
+                (tail.len(), tail.lines().count()),
+                (1_527_290 + prefix - 2, 743)
+            );
+            let tail_hash = if prefix == 2 {
+                "d1c2a5f442abd772f908cb240ff0257521440a1ab66f4cab8032fe94b65b239a"
+            } else {
+                "ae365e4ea1312d100c2075c2de23c22b4b6ae57bfb9697277bf53b2eabe0200e"
+            };
+            assert_eq!(hex::encode(Sha256::digest(tail.as_bytes())), tail_hash);
+            assert_eq!(
+                10 * long_file.len() + tail.len() + selected.len(),
+                22_467_568 + prefix - 2
+            );
+            let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+                &options,
+                store.root_id(),
+                &cancel(),
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(graph.files.len(), 12);
+            assert_eq!(native.revision.documents.len(), 12);
+            assert_eq!(native.coverage.len(), 12);
+            assert!(native.coverage.iter().all(|c| c.state == "complete"));
+            assert_eq!((native.declarations.len(), graph.nodes.len()), (13, 13));
+            let z = graph
+                .nodes
+                .iter()
+                .find(|s| s.path == "z.java" && s.name == "Selected" && s.kind == SymbolKind::Class)
+                .unwrap();
+            if let Some(previous) = &selected_id {
+                assert_eq!(previous, &z.id);
+            }
+            selected_id = Some(z.id.clone());
+            let mut charge = 0;
+            for file in &graph.files {
+                let raw = std::fs::read(workspace.join(&file.path)).unwrap();
+                let digest = hex::encode(Sha256::digest(&raw));
+                let captured = capture.files.iter().find(|f| f.path == file.path).unwrap();
+                let document = native
+                    .revision
+                    .documents
+                    .iter()
+                    .find(|d| d.key.path == file.path)
+                    .unwrap();
+                assert_eq!(
+                    (
+                        file.hash.as_str(),
+                        captured.hash.as_str(),
+                        document.content_hash.as_str()
+                    ),
+                    (digest.as_str(), digest.as_str(), digest.as_str())
+                );
+                assert_eq!(
+                    (file.text.len(), captured.text.len(), document.byte_length),
+                    (raw.len(), raw.len(), raw.len())
+                );
+                let expected = match file.path.as_str() {
+                    "z.java" => 77,
+                    "a10.java" => 742 * 3072 + (prefix + 1 + 2 * 984),
+                    _ => 1018 * 3072,
+                };
+                let f = baleyg::classes::FileExtraction::extract_file(
+                    file,
+                    &graph.nodes,
+                    &cancel(),
+                    baleyg::classes::Limits::default(),
+                )
+                .unwrap();
+                assert_eq!(f.registry_bytes, expected, "{}", file.path);
+                assert!(!f.truncated && !f.registry_incomplete && f.warnings.is_empty());
+                charge += expected;
+            }
+            assert_eq!(charge, 33_554_432 + prefix - 2);
+            let next = store
+                .publish_native(
+                    &graph,
+                    &capture,
+                    &native,
+                    session.leader_guard().unwrap(),
+                    store.index_baseline().unwrap(),
+                    &cancel(),
+                )
+                .unwrap();
+            assert_eq!(next.index_revision, if prefix == 2 { 1 } else { 2 });
+            pin = Some(next);
+        }
+        let pin = pin.unwrap();
+        let app = http::router(
+            http::new(
+                store.clone(),
+                options,
+                TOKEN.into(),
+                "127.0.0.1:7331".parse().unwrap(),
+            )
+            .unwrap(),
+        );
+        let class_url = format!("/api/classes?path=z.java&{}", pin_query(pin));
+        let source_url = format!("/api/source?path=z.java&{}", pin_query(pin));
+        let (status, page) = call(&app, "GET", &class_url, Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{case}: {page}");
+        assert_eq!(page["items"], json!([]));
+        assert_eq!(page["truncated"], true);
+        assert_eq!(
+            page["warnings"],
+            json!([
+                "Class declaration registry text limit reached (32 MiB)",
+                "Incomplete class declaration registry: some declarations may be absent."
+            ])
+        );
+        let (status, source) = call(&app, "GET", &source_url, Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{case}: {source}");
+        assert_eq!(source["file"]["text"], selected);
+        let dbpath = index_db(&state);
+        let db = rusqlite::Connection::open(&dbpath).unwrap();
+        let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        let (version_id,graph_id,payload):(String,String,String)=db.query_row(
+            "SELECT m.document_version_id,m.graph_projection_id,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path='z.java'",
+            [&key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let ready:i64=db.query_row("SELECT count(*) FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=?1 AND g.class_extraction_state='ready' AND g.class_extraction_payload IS NOT NULL",[&key],|r|r.get(0)).unwrap();
+        assert_eq!(ready, 12);
+        let initial_f: baleyg::classes::FileExtraction = serde_json::from_str(&payload).unwrap();
+        assert_eq!((initial_f.source_bytes, initial_f.registry_bytes), (18, 77));
+        let initial_hash: String = db
+            .query_row(
+                "SELECT graph_hash FROM graph_projections WHERE id=?1",
+                [&graph_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mutation = match case {
+            "F" => {
+                assert_eq!(db.execute("UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.source_bytes',0) WHERE id=?1",[&graph_id]).unwrap(),1);
+                let changed: String = db
+                    .query_row(
+                        "SELECT class_extraction_payload FROM graph_projections WHERE id=?1",
+                        [&graph_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let changed: baleyg::classes::FileExtraction =
+                    serde_json::from_str(&changed).unwrap();
+                assert_eq!(changed.source_bytes, 0);
+                assert_eq!(changed.registry_bytes, 77);
+                assert_ne!(changed, initial_f);
+                json!({"case":case,"sourceBytesBefore":18,"sourceBytesAfter":0})
+            }
+            "source" => {
+                let (mut bytes,length,hash):(Vec<u8>,i64,String)=db.query_row(
+                    "SELECT source_bytes,byte_length,content_hash FROM document_versions WHERE id=?1",
+                    [&version_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                assert_eq!(bytes, selected.as_bytes());
+                assert_eq!(length, 18);
+                let offset = bytes.windows(8).position(|w| w == b"Selected").unwrap();
+                bytes[offset..offset + 8].copy_from_slice(b"ForgedXX");
+                assert_eq!(bytes.len(), 18);
+                assert_eq!(
+                    db.execute(
+                        "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+                        rusqlite::params![bytes, &version_id]
+                    )
+                    .unwrap(),
+                    1
+                );
+                let (kind,actual_length,stored_length,stored_hash,actual):(String,i64,i64,String,Vec<u8>)=db.query_row(
+                    "SELECT typeof(source_bytes),length(source_bytes),byte_length,content_hash,source_bytes FROM document_versions WHERE id=?1",
+                    [&version_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+                assert_eq!(
+                    (kind.as_str(), actual_length, stored_length),
+                    ("blob", 18, 18)
+                );
+                assert_eq!(stored_hash, hash);
+                assert_ne!(hex::encode(Sha256::digest(&actual)), hash);
+                assert!(std::str::from_utf8(&actual).unwrap().contains("ForgedXX"));
+                json!({"case":case,"blobType":kind,"length":actual_length,"hashUnchanged":stored_hash})
+            }
+            "graph" => {
+                let symbol = selected_id.as_ref().unwrap();
+                assert_eq!(db.execute("UPDATE graph_nodes SET name='ForgedXX',payload=json_set(payload,'$.name','ForgedXX') WHERE projection_id=?1 AND id=?2",
+                    rusqlite::params![&graph_id,symbol]).unwrap(),1);
+                let (name, raw): (String, String) = db
+                    .query_row(
+                        "SELECT name,payload FROM graph_nodes WHERE projection_id=?1 AND id=?2",
+                        rusqlite::params![&graph_id, symbol],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                let parsed: Symbol = serde_json::from_str(&raw).unwrap();
+                assert_eq!(name, "ForgedXX");
+                assert_eq!(parsed.name, name);
+                assert_eq!(&parsed.id, symbol);
+                let hash: String = db
+                    .query_row(
+                        "SELECT graph_hash FROM graph_projections WHERE id=?1",
+                        [&graph_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(hash, initial_hash);
+                json!({"case":case,"graphNodeId":symbol,"coordinatedName":name,"graphHash":hash})
+            }
+            _ => unreachable!(),
+        };
+        drop(db);
+        let before = std::fs::read(&dbpath).unwrap();
+        let routes = if case == "source" {
+            [&source_url, &class_url]
+        } else {
+            [&class_url, &source_url]
+        };
+        for (ordinal, url) in routes.into_iter().enumerate() {
+            let (status, response) = call(&app, "GET", url, Value::Null).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{case}/{ordinal}: {response}"
+            );
+            assert_eq!(response["error"]["code"], "incompatible_index");
+            assert!(response.get("items").is_none());
+            assert!(!response.to_string().contains("ForgedXX"));
+            println!(
+                "{}",
+                json!({"pilot":"class-registry32-tamper","case":case,"routeOrdinal":ordinal,
+                "independent":ordinal==0,"status":status.as_u16(),"errorCode":response["error"]["code"],
+                "pin":pin,"temp":dir.path().display().to_string(),"mutation":mutation})
+            );
+        }
+        let after = std::fs::read(&dbpath).unwrap();
+        assert_eq!(
+            before, after,
+            "selected reads must not repair changed index bytes"
+        );
+    }
+}
