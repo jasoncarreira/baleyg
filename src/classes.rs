@@ -63,6 +63,69 @@ pub struct Catalog {
     pub warnings: Vec<String>,
     pub truncated: bool,
 }
+/// One value controls extraction and workspace composition, including test-sized caps.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub file_bytes: usize,
+    pub total_bytes: usize,
+    pub visits: usize,
+    pub depth: usize,
+    pub file_classes: usize,
+    pub classes: usize,
+    pub members: usize,
+    pub file_refs: usize,
+    pub records: usize,
+    pub text: usize,
+    pub output_text: usize,
+    pub registry_text: usize,
+    pub files: usize,
+    pub symbols: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            file_bytes: FILE_BYTES,
+            total_bytes: TOTAL_BYTES,
+            visits: VISITS,
+            depth: DEPTH,
+            file_classes: FILE_CLASSES,
+            classes: CLASSES,
+            members: MEMBERS,
+            file_refs: FILE_REFS,
+            records: RECORDS,
+            text: TEXT,
+            output_text: OUTPUT_TEXT,
+            registry_text: REGISTRY_TEXT,
+            files: 100_000,
+            symbols: 1_000_000,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DetailValue {
+    Field(ClassMember),
+    Method(ClassMember),
+    Relation(ClassRelation),
+    ScopeText,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetailItem {
+    pub class_index: usize,
+    pub records: usize,
+    pub text: usize,
+    pub value: DetailValue,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileExtraction {
+    pub path: String,
+    pub source_bytes: usize,
+    pub registry_bytes: usize,
+    pub warnings: Vec<String>,
+    pub truncated: bool,
+    pub registry_incomplete: bool,
+    pub classes: Vec<ClassDefinition>,
+    pub items: Vec<DetailItem>,
+}
 #[derive(Default)]
 struct Scope {
     parent: Option<usize>,
@@ -85,6 +148,8 @@ struct Builder<'a> {
     text_bytes: usize,
     detail_text_bytes: usize,
     registry_complete: bool,
+    limits: Limits,
+    items: Vec<DetailItem>,
 }
 fn check(cancel: &CancelFlag) -> Result<()> {
     ensure!(!cancel.load(Ordering::Relaxed), "class catalog cancelled");
@@ -155,9 +220,176 @@ fn dotted(s: &str) -> bool {
 }
 impl Catalog {
     pub fn build(files: &[SourceFile], nodes: &[Symbol], cancel: &CancelFlag) -> Result<Self> {
+        Self::build_with_limits(files, nodes, cancel, Limits::default())
+    }
+    pub fn build_with_limits(
+        files: &[SourceFile],
+        nodes: &[Symbol],
+        cancel: &CancelFlag,
+        limits: Limits,
+    ) -> Result<Self> {
+        check(cancel)?;
+        if files.len() > limits.files || nodes.len() > limits.symbols {
+            let mut catalog = Self::default();
+            catalog.truncated = true;
+            catalog.warnings.push(format!(
+                "Class catalog input limit exceeded ({} files / {} symbols)",
+                limits.files, limits.symbols
+            ));
+            return Ok(catalog);
+        }
+        let mut extracts = Vec::new();
+        for file in files
+            .iter()
+            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+        {
+            extracts.push(FileExtraction::extract_file(file, nodes, cancel, limits)?);
+        }
+        Self::compose(&extracts, files.len(), nodes.len(), limits)
+    }
+    pub fn compose(
+        extracts: &[FileExtraction],
+        file_count: usize,
+        symbol_count: usize,
+        limits: Limits,
+    ) -> Result<Self> {
+        let mut result = Self::default();
+        if file_count > limits.files || symbol_count > limits.symbols {
+            result.truncated = true;
+            result.warnings.push(format!(
+                "Class catalog input limit exceeded ({} files / {} symbols)",
+                limits.files, limits.symbols
+            ));
+            return Ok(result);
+        }
+        let mut ordered: Vec<_> = extracts.iter().collect();
+        ordered.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let (mut source, mut registry, mut records, mut detail) = (0usize, 0usize, 0usize, 0usize);
+        let (mut registry_complete, mut detail_open) = (true, true);
+        'file_loop: for f in ordered {
+            if source.saturating_add(f.source_bytes) > limits.total_bytes {
+                result.limit_warning(
+                    &format!(
+                        "Class catalog source limit exceeded ({} MiB)",
+                        limits.total_bytes / (1024 * 1024)
+                    ),
+                    limits.text,
+                );
+                registry_complete = false;
+                break;
+            }
+            if registry.saturating_add(f.registry_bytes) > limits.registry_text {
+                result.limit_warning(
+                    &format!(
+                        "Class declaration registry text limit reached ({} MiB)",
+                        limits.registry_text / (1024 * 1024)
+                    ),
+                    limits.text,
+                );
+                registry_complete = false;
+                break;
+            }
+            source += f.source_bytes;
+            registry += f.registry_bytes;
+            for warning in &f.warnings {
+                result.add_warning(warning, limits.text);
+            }
+            result.truncated |= f.truncated;
+            registry_complete &= !f.registry_incomplete;
+            for (index, c) in f.classes.iter().enumerate() {
+                if result.classes.len() == limits.classes {
+                    result.limit_warning(
+                        &format!(
+                            "Class catalog declaration limit reached ({})",
+                            limits.classes
+                        ),
+                        limits.text,
+                    );
+                    registry_complete = false;
+                    break 'file_loop;
+                }
+                let mut c = c.clone();
+                c.fields.clear();
+                c.methods.clear();
+                for item in f.items.iter().filter(|i| i.class_index == index) {
+                    if !detail_open {
+                        c.truncated = true;
+                        continue;
+                    }
+                    if records.saturating_add(item.records) > limits.records
+                        || detail.saturating_add(item.text) > limits.output_text
+                    {
+                        let message = if records.saturating_add(item.records) > limits.records {
+                            format!(
+                                "Class detail limit reached ({} records / {} MiB text / {} visits per file); declaration discovery continues",
+                                limits.records,
+                                limits.output_text / (1024 * 1024),
+                                limits.visits
+                            )
+                        } else {
+                            format!(
+                                "Class detail text limit reached ({} MiB); declaration discovery continues",
+                                limits.output_text / (1024 * 1024)
+                            )
+                        };
+                        result.limit_warning(&message, limits.text);
+                        detail_open = false;
+                        c.truncated = true;
+                        continue;
+                    }
+                    records += item.records;
+                    detail += item.text;
+                    match &item.value {
+                        DetailValue::Field(value) => c.fields.push(value.clone()),
+                        DetailValue::Method(value) => c.methods.push(value.clone()),
+                        DetailValue::Relation(value) => result.relations.push(value.clone()),
+                        DetailValue::ScopeText => (),
+                    }
+                }
+                result.classes.push(c);
+            }
+        }
+        result.classes.sort_by(|a, b| {
+            (&a.symbol.path, a.symbol.range.start_byte, &a.symbol.id).cmp(&(
+                &b.symbol.path,
+                b.symbol.range.start_byte,
+                &b.symbol.id,
+            ))
+        });
+        result.relations.sort_by(|a, b| {
+            (&a.path, a.range.start_byte, &a.id).cmp(&(&b.path, b.range.start_byte, &b.id))
+        });
+        result.relations.dedup_by(|a, b| a.id == b.id);
+        if !result.classes.is_empty() {
+            result.warnings.push("Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
+        }
+        if !registry_complete {
+            result.warnings.push(
+                "Incomplete class declaration registry: some declarations may be absent.".into(),
+            );
+        }
+        Ok(result)
+    }
+    fn add_warning(&mut self, message: &str, text: usize) {
+        if self.warnings.len() < 100 && !self.warnings.iter().any(|s| s == message) {
+            self.warnings.push(message.chars().take(text).collect());
+        }
+    }
+    fn limit_warning(&mut self, message: &str, text: usize) {
+        self.truncated = true;
+        self.add_warning(message, text);
+    }
+}
+impl FileExtraction {
+    pub fn extract_file(
+        file: &SourceFile,
+        nodes: &[Symbol],
+        cancel: &CancelFlag,
+        limits: Limits,
+    ) -> Result<Self> {
         check(cancel)?;
         let mut b = Builder {
-            catalog: Self::default(),
+            catalog: Catalog::default(),
             scopes: vec![],
             pending: vec![],
             symbols: BTreeMap::new(),
@@ -166,45 +398,28 @@ impl Catalog {
             text_bytes: 0,
             detail_text_bytes: 0,
             registry_complete: true,
+            limits,
+            items: vec![],
         };
-        // A hard input cap also bounds auxiliary lookup tables, independent of AST limits.
-        if nodes.len() > 1_000_000 || files.len() > 100_000 {
-            b.registry_limit("Class catalog input limit exceeded (100000 files / 1000000 symbols)");
-            return Ok(b.catalog);
-        }
-        for symbol in nodes {
-            check(cancel)?;
-            if matches!(
-                symbol.kind,
-                SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
-            ) {
+        if file.text.len() > limits.file_bytes {
+            b.registry_limit(&format!(
+                "{}: class source exceeds {} MiB; skipped",
+                file.path,
+                limits.file_bytes / (1024 * 1024)
+            ));
+        } else {
+            for symbol in nodes.iter().filter(|s| {
+                s.path == file.path
+                    && matches!(
+                        s.kind,
+                        SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
+                    )
+            }) {
+                check(cancel)?;
                 b.symbols
                     .entry((&symbol.path, symbol.range.start_byte, symbol.range.end_byte))
                     .or_default()
                     .push(symbol);
-            }
-        }
-        let mut total = 0usize;
-        for file in files {
-            check(cancel)?;
-            if !matches!(file.language.as_str(), "java" | "python") {
-                continue;
-            }
-            total = total.saturating_add(file.text.len());
-            if total > TOTAL_BYTES {
-                b.registry_limit("Class catalog source limit exceeded (256 MiB)");
-                break;
-            }
-            if file.text.len() > FILE_BYTES {
-                b.registry_limit(&format!(
-                    "{}: class source exceeds 2 MiB; skipped",
-                    file.path
-                ));
-                continue;
-            }
-            if b.catalog.classes.len() >= CLASSES {
-                b.registry_limit("Class catalog declaration limit reached (20000)");
-                break;
             }
             let mut parser = tree_sitter::Parser::new();
             parser.set_language(&if file.language == "java" {
@@ -226,9 +441,7 @@ impl Catalog {
                     file.path
                 ));
             }
-            let scope = b.scopes.len();
             b.scopes.push(Scope::default());
-            let before = b.catalog.classes.len();
             let mut ex = Extractor {
                 b: &mut b,
                 file,
@@ -243,35 +456,25 @@ impl Catalog {
                 exhausted: false,
                 detail_visits: 0,
             };
-            ex.module(tree.root_node(), scope)?;
+            ex.module(tree.root_node(), 0)?;
             if ex.exhausted {
-                for c in &mut ex.b.catalog.classes[before..] {
+                for c in &mut ex.b.catalog.classes {
                     c.truncated = true;
                 }
             }
         }
         b.resolve()?;
-        b.catalog.classes.sort_by(|a, b| {
-            (&a.symbol.path, a.symbol.range.start_byte, &a.symbol.id).cmp(&(
-                &b.symbol.path,
-                b.symbol.range.start_byte,
-                &b.symbol.id,
-            ))
-        });
-        b.catalog.relations.sort_by(|a, b| {
-            (&a.path, a.range.start_byte, &a.id).cmp(&(&b.path, b.range.start_byte, &b.id))
-        });
-        b.catalog.relations.dedup_by(|a, b| a.id == b.id);
-        if !b.catalog.classes.is_empty() {
-            b.catalog.warnings.push("Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
-        }
-        if !b.registry_complete {
-            b.catalog.warnings.push(
-                "Incomplete class declaration registry: some declarations may be absent.".into(),
-            );
-        }
         check(cancel)?;
-        Ok(b.catalog)
+        Ok(Self {
+            path: file.path.clone(),
+            source_bytes: file.text.len(),
+            registry_bytes: b.text_bytes,
+            warnings: b.catalog.warnings,
+            truncated: b.catalog.truncated,
+            registry_incomplete: !b.registry_complete,
+            classes: b.catalog.classes,
+            items: b.items,
+        })
     }
 }
 impl Builder<'_> {
@@ -280,14 +483,8 @@ impl Builder<'_> {
         self.limit(message);
     }
     fn reserve_detail_text(&mut self, bytes: usize) -> bool {
-        if self.detail_text_bytes.saturating_add(bytes) > OUTPUT_TEXT {
-            self.detail_text_bytes = OUTPUT_TEXT;
-            self.limit("Class detail text limit reached (64 MiB); declaration discovery continues");
-            false
-        } else {
-            self.detail_text_bytes += bytes;
-            true
-        }
+        self.detail_text_bytes = self.detail_text_bytes.saturating_add(bytes);
+        true
     }
     fn limit(&mut self, message: &str) {
         self.catalog.truncated = true;
@@ -295,7 +492,7 @@ impl Builder<'_> {
         {
             self.catalog
                 .warnings
-                .push(message.chars().take(TEXT).collect());
+                .push(message.chars().take(self.limits.text).collect());
         }
     }
     fn symbol(&self, file: &SourceFile, n: Node<'_>, kind: SymbolKind) -> Option<Symbol> {
@@ -314,12 +511,7 @@ impl Builder<'_> {
     }
     fn reserve_text(&mut self, bytes: usize) -> bool {
         self.text_bytes = self.text_bytes.saturating_add(bytes);
-        if self.text_bytes > REGISTRY_TEXT {
-            self.registry_limit("Class declaration registry text limit reached (32 MiB)");
-            false
-        } else {
-            true
-        }
+        true
     }
     fn bind(&mut self, scope: usize, name: String, value: Option<String>) {
         if name.len() > TEXT
@@ -371,7 +563,7 @@ impl Extractor<'_, '_> {
             return Ok(false);
         }
         self.visits += 1;
-        if depth >= DEPTH || self.visits > VISITS || self.b.text_bytes > REGISTRY_TEXT {
+        if depth >= self.b.limits.depth || self.visits > self.b.limits.visits {
             self.exhausted = true;
             self.b.registry_limit(&format!(
                 "{}: class declaration work limit reached (64 depth / 100000 visits)",
@@ -383,10 +575,7 @@ impl Extractor<'_, '_> {
     }
     fn details(&mut self, index: usize) -> Result<bool> {
         check(self.b.cancel)?;
-        if self.b.records >= RECORDS
-            || self.b.detail_text_bytes >= OUTPUT_TEXT
-            || self.detail_visits >= VISITS
-        {
+        if self.detail_visits >= self.b.limits.visits {
             self.b.catalog.classes[index].truncated = true;
             self.b.limit("Class detail limit reached (250000 records / 64 MiB text / 100000 visits per file); declaration discovery continues");
             return Ok(false);
@@ -398,7 +587,7 @@ impl Extractor<'_, '_> {
             return Ok(false);
         }
         self.detail_visits += 1;
-        if depth >= DEPTH {
+        if depth >= self.b.limits.depth {
             self.b.catalog.classes[index].truncated = true;
             self.b.limit(
                 "Class type detail depth limit reached (64); declaration discovery continues",
@@ -688,7 +877,7 @@ impl Extractor<'_, '_> {
         if !self.tick(depth)? {
             return Ok(());
         }
-        if self.classes >= FILE_CLASSES || self.b.catalog.classes.len() >= CLASSES {
+        if self.classes >= self.b.limits.file_classes {
             self.exhausted = true;
             self.b.registry_limit(&format!(
                 "{}: class declaration limit reached (1000/file, 20000/catalog)",
@@ -710,7 +899,7 @@ impl Extractor<'_, '_> {
         {
             return Ok(());
         }
-        if qualified.len() > TEXT {
+        if qualified.len() > self.b.limits.text {
             self.b
                 .registry_limit("Class qualified name exceeds 2048 bytes");
             return Ok(());
@@ -853,7 +1042,7 @@ impl Extractor<'_, '_> {
             return Ok(());
         }
         let c = &self.b.catalog.classes[index];
-        if c.fields.len() + c.methods.len() >= MEMBERS {
+        if c.fields.len() + c.methods.len() >= self.b.limits.members {
             self.b.catalog.classes[index].truncated = true;
             self.b.limit(&format!(
                 "{}: class member limit reached (256/class)",
@@ -861,7 +1050,8 @@ impl Extractor<'_, '_> {
             ));
             return Ok(());
         }
-        if self.text(name).len() > TEXT || ty.is_some_and(|t| t.end_byte() - t.start_byte() > TEXT)
+        if self.text(name).len() > self.b.limits.text
+            || ty.is_some_and(|t| t.end_byte() - t.start_byte() > self.b.limits.text)
         {
             self.b.catalog.classes[index].truncated = true;
             self.b.limit("Class member text exceeds 2048 bytes");
@@ -890,6 +1080,20 @@ impl Extractor<'_, '_> {
             self.b.catalog.classes[index].truncated = true;
             return Ok(());
         }
+        let text = member.name.len()
+            + member.type_hint.as_ref().map_or(0, String::len)
+            + member.symbol_id.as_ref().map_or(0, String::len)
+            + member.path.len();
+        self.b.items.push(DetailItem {
+            class_index: index,
+            records: 1,
+            text,
+            value: if method {
+                DetailValue::Method(member.clone())
+            } else {
+                DetailValue::Field(member.clone())
+            },
+        });
         let c = &mut self.b.catalog.classes[index];
         if method {
             c.methods.push(member);
@@ -939,13 +1143,14 @@ impl Extractor<'_, '_> {
         let Some(blocked) = self.type_parameters(n, depth + 1, Some(index))? else {
             return Ok(());
         };
-        if !self
-            .b
-            .reserve_detail_text(blocked.iter().map(String::len).sum())
-        {
-            self.b.catalog.classes[index].truncated = true;
-            return Ok(());
-        }
+        let scope_text = blocked.iter().map(String::len).sum();
+        self.b.reserve_detail_text(scope_text);
+        self.b.items.push(DetailItem {
+            class_index: index,
+            records: 0,
+            text: scope_text,
+            value: DetailValue::ScopeText,
+        });
         let method_scope = self.b.scopes.len();
         self.b.scopes.push(Scope {
             parent: Some(scope),
@@ -1123,7 +1328,7 @@ impl Extractor<'_, '_> {
         if !self.details(index)? {
             return Ok(());
         }
-        if self.refs >= FILE_REFS || name.len() > TEXT {
+        if self.refs >= self.b.limits.file_refs || name.len() > self.b.limits.text {
             self.b.catalog.classes[index].truncated = true;
             self.b.limit(&format!(
                 "{}: class reference limit reached (8192/file, 2048 bytes/name)",
@@ -1157,6 +1362,17 @@ impl Extractor<'_, '_> {
             self.b.catalog.classes[index].truncated = true;
             return Ok(());
         }
+        let text = relation.id.len()
+            + relation.owner.len()
+            + relation.type_name.len()
+            + relation.path.len()
+            + self.module.len();
+        self.b.items.push(DetailItem {
+            class_index: index,
+            records: 1,
+            text,
+            value: DetailValue::Relation(relation.clone()),
+        });
         self.b.pending.push(Pending { relation });
         self.refs += 1;
         self.b.records += 1;
@@ -1214,6 +1430,8 @@ mod budget_tests {
                 text_bytes: 0,
                 detail_text_bytes,
                 registry_complete: true,
+                limits: Limits::default(),
+                items: vec![],
             };
             Extractor {
                 b: &mut b,

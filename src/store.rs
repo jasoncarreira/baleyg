@@ -242,9 +242,9 @@ const DATABASE_SCHEMA_VERSION: u32 = 8;
 const PREVIOUS_SCHEMA_VERSION: u32 = 7;
 const PAIRED_V6_SCHEMA_VERSION: u32 = 6;
 const PAIRED_V7_EXTRACTOR_VERSION: &str = "native-paired-v1";
-const EXTRACTOR_VERSION: &str = "native-v4";
+const EXTRACTOR_VERSION: &str = "native-v4-class-compose-v1";
 const CACHE_SCHEMA_V8: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=8), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=8), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-class-compose-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -256,7 +256,7 @@ CREATE UNIQUE INDEX native_revisions_pin ON native_revisions(published_index_rev
 CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,input_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(revision_id,input_key));
 CREATE TABLE document_versions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,UNIQUE(source_set_id,language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(id,source_set_id,language,path),UNIQUE(id,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX document_versions_path ON document_versions(source_set_id,language,path,id);
-CREATE TABLE graph_projections(id TEXT PRIMARY KEY,document_version_id TEXT NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','pending','ready')),class_extraction_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('pending','ready'))),UNIQUE(document_version_id,graph_hash),UNIQUE(id,document_version_id),FOREIGN KEY(document_version_id,language) REFERENCES document_versions(id,language) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE graph_projections(id TEXT PRIMARY KEY,document_version_id TEXT NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(document_version_id,graph_hash),UNIQUE(id,document_version_id),FOREIGN KEY(document_version_id,language) REFERENCES document_versions(id,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX graph_projections_version ON graph_projections(document_version_id,id);
 CREATE TABLE graph_nodes(projection_id TEXT NOT NULL REFERENCES graph_projections(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,name TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id));
 CREATE INDEX graph_nodes_name ON graph_nodes(projection_id,name,id);
@@ -1480,13 +1480,14 @@ fn write_native(
         &crate::capture::Capture,
         &Graph,
         &crate::classes::Catalog,
+        &BTreeMap<String, crate::classes::FileExtraction>,
     ),
     revision: IndexPin,
     leader: &topology::LeaderGuard,
     cancel: &CancelFlag,
     immutable: &mut ImmutableAppend,
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
-    let (artifact, capture, graph, classes) = bundle;
+    let (artifact, capture, graph, classes, extractions) = bundle;
     let a = artifact;
     let revision_key = format!(
         "pin:v1:{}:{}",
@@ -1620,11 +1621,11 @@ fn write_native(
                 ids.graph_hash,
                 "ready",
                 if matches!(file.language.as_str(), "java" | "python") {
-                    "pending"
+                    "ready"
                 } else {
                     "notApplicable"
                 },
-                Option::<String>::None,
+                extractions.get(&file.path).map(json).transpose()?,
             ],
         )?;
         immutable.insert(
@@ -4391,7 +4392,29 @@ impl Store {
         let stats = validate_graph(graph, cancel)?;
         // Parse cached source before taking the writer lock. Projection and graph
         // still publish in one transaction with the same CAS/cancellation guard.
-        let classes = crate::classes::Catalog::build(&graph.files, &graph.nodes, cancel)?;
+        let limits = crate::classes::Limits::default();
+        let extractions: BTreeMap<String, crate::classes::FileExtraction> = graph
+            .files
+            .iter()
+            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+            .map(|file| {
+                Ok((
+                    file.path.clone(),
+                    crate::classes::FileExtraction::extract_file(
+                        file,
+                        &graph.nodes,
+                        cancel,
+                        limits,
+                    )?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let classes = crate::classes::Catalog::compose(
+            &extractions.values().cloned().collect::<Vec<_>>(),
+            graph.files.len(),
+            graph.nodes.len(),
+            limits,
+        )?;
         ensure!(
             classes.relations.iter().all(|r| r.target.is_none()
                 && r.candidate_ids.is_empty()
@@ -4560,7 +4583,7 @@ impl Store {
         };
         let projections = write_native(
             &tx,
-            (native, capture, graph, &classes),
+            (native, capture, graph, &classes, &extractions),
             revision,
             leader,
             cancel,
@@ -4875,15 +4898,19 @@ impl Store {
             class_projection_state.as_deref() == Some("ready")
                 && class_hash.is_some()
                 && class_id.len() <= 16 * 1024
-                && f_length.is_none_or(|n| (0..=64 * 1024 * 1024).contains(&n)),
+                && (if matches!(language.as_str(), "java" | "python") {
+                    f_length.is_some_and(|n| (0..=64 * 1024 * 1024).contains(&n))
+                } else {
+                    f_length.is_none()
+                }),
             "incompatible_index: selected class projection invalid"
         );
         ensure!(
             matches!(
                 (language.as_str(), class_state.as_str()),
-                ("java" | "python", "pending") | ("javascript" | "rust", "notApplicable")
+                ("java" | "python", "ready") | ("javascript" | "rust", "notApplicable")
             ),
-            "incompatible_index: staged class extraction state invalid"
+            "incompatible_index: class extraction state invalid"
         );
         let key = DocumentKey {
             source_set_id: source_set,
@@ -5148,10 +5175,30 @@ impl Store {
         if !matches!(file.language.as_str(), "java" | "python") {
             return Ok(());
         }
-        let catalog = crate::classes::Catalog::build(
-            &graph.files,
-            &graph.nodes,
-            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limits = crate::classes::Limits::default();
+        let extracts = graph
+            .files
+            .iter()
+            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+            .map(|f| crate::classes::FileExtraction::extract_file(f, &graph.nodes, &cancel, limits))
+            .collect::<Result<Vec<_>>>()?;
+        let selected = extracts
+            .iter()
+            .find(|f| f.path == path)
+            .context("incompatible_index: selected class extraction missing")?;
+        let stored: String = db.query_row(
+            "SELECT g.class_extraction_payload FROM revision_documents m JOIN index_metadata a ON a.singleton=1 AND m.revision_id='pin:v1:'||a.index_generation||':'||a.index_revision JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.path=?1",
+            [path], |r| r.get(0))?;
+        ensure!(
+            serde_json::from_str::<crate::classes::FileExtraction>(&stored)? == *selected,
+            "incompatible_index: selected class F differs from authenticated source and graph"
+        );
+        let catalog = crate::classes::Catalog::compose(
+            &extracts,
+            graph.files.len(),
+            graph.nodes.len(),
+            limits,
         )?;
         let class_id: String = db.query_row(
             "SELECT m.class_projection_id FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision
