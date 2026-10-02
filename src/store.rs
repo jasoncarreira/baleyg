@@ -3834,12 +3834,15 @@ impl Store {
         let bootstrap = open_index(&stage.path, false)?;
         let version: u32 = bootstrap.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            version == GRAPH_SCHEMA_VERSION,
+            version == DATABASE_SCHEMA_VERSION,
             "incompatible_index: stage is not an unpublished bootstrap"
         );
+        // The stage must be the exact empty v8 bootstrap we just created.
+        // A published or partially written stage is never a recovery source.
+        validate_v8_bootstrap(&bootstrap)?;
         let expected = self.recovery_baseline(&bootstrap)?;
         ensure!(
-            expected.pin().is_some_and(|pin| pin.index_revision == 0) && !expected.compatible,
+            expected.pin().is_some_and(|pin| pin.index_revision == 0) && expected.compatible,
             "incompatible_index: invalid private stage baseline"
         );
         drop(bootstrap);

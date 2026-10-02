@@ -755,13 +755,40 @@ fn physical_schema_four_rebuild_is_same_file_with_fresh_generation_and_revision_
 fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
     use rusqlite::types::Value;
     let db = rusqlite::Connection::open(path).unwrap();
-    let tables = db
+    let (generation, published_revision, incarnation): (String, i64, String) = db
+        .query_row(
+            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(&generation).is_ok());
+    assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
+    let revision_id = format!("pin:v1:{generation}:{published_revision}");
+    let (header_id, header_incarnation, header_revision): (String, String, i64) = db
+        .query_row(
+            "SELECT id,reconciled_incarnation,published_index_revision FROM native_revisions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(header_id, revision_id);
+    assert_eq!(header_incarnation, incarnation);
+    assert_eq!(header_revision, published_revision);
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0, "revision pin FKs must remain valid");
+    let tables: Vec<String> = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
+    assert_eq!(tables.len(), 28, "compare all v8 evidence tables");
     tables
         .into_iter()
         .map(|table| {
@@ -783,6 +810,26 @@ fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
+            // These three header cells identify this particular publication,
+            // not its source/evidence. Validate them against live metadata and
+            // every dependent revision FK before normalizing for a cold oracle.
+            if table == "native_revisions" {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], format!("t:{revision_id}"));
+                assert_eq!(rows[0][8], format!("t:{incarnation}"));
+                assert_eq!(rows[0][12], format!("i:{published_revision}"));
+                rows[0][0] = "t:<current-pin>".into();
+                rows[0][8] = "t:<leader-incarnation>".into();
+                rows[0][12] = "i:<current-revision>".into();
+            } else if matches!(
+                table.as_str(),
+                "revision_capture_inputs" | "revision_documents"
+            ) {
+                for row in &mut rows {
+                    assert_eq!(row[0], format!("t:{revision_id}"));
+                    row[0] = "t:<current-pin>".into();
+                }
+            }
             rows.sort();
             (table, rows)
         })
