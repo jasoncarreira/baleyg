@@ -380,7 +380,8 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
     if parser.set_language(&language).is_err() {
         return false;
     }
-    let (Some(before), Some(after)) = (parser.parse(&old.text, None), parser.parse(&new.text, None))
+    let (Some(before), Some(after)) =
+        (parser.parse(&old.text, None), parser.parse(&new.text, None))
     else {
         return false;
     };
@@ -423,8 +424,14 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
     let comment = left.kind() == "comment";
     let literal = matches!(
         left.kind(),
-        "number" | "integer" | "integer_literal" | "decimal_integer_literal"
-            | "string" | "string_literal" | "string_fragment" | "raw_string_literal"
+        "number"
+            | "integer"
+            | "integer_literal"
+            | "decimal_integer_literal"
+            | "string"
+            | "string_literal"
+            | "string_fragment"
+            | "raw_string_literal"
     );
     if !comment && !literal {
         return false;
@@ -442,7 +449,8 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
                 || kind.contains("call")
                 || kind.contains("invocation")
                 || (kind.contains("declaration")
-                    && !kind.contains("function") && !kind.contains("method"))
+                    && !kind.contains("function")
+                    && !kind.contains("method"))
                 || kind.contains("parameter")
                 || kind.contains("assignment")
                 || kind.contains("attribute")
@@ -500,24 +508,44 @@ pub fn measure_captured_change_observed(
     let old_options = previous.reconcile_options();
     let new_options = current.reconcile_options();
     if old_options != new_options {
-        return CapturedChange::FullNative { reason: "capture admission changed" };
+        return CapturedChange::FullNative {
+            reason: "capture admission changed",
+        };
     }
-    let optional = [old_options.scip_path.as_deref(), old_options.manifest_path.as_deref()];
+    let optional = [
+        old_options.scip_path.as_deref(),
+        old_options.manifest_path.as_deref(),
+    ];
     let native_inputs = |capture: &Capture| {
-        capture.admitted_inputs()
-            .filter(|(path, _)| !optional.into_iter().flatten().any(|name| *path == Path::new(name)))
+        capture
+            .admitted_inputs()
+            .filter(|(path, _)| {
+                !optional
+                    .into_iter()
+                    .flatten()
+                    .any(|name| *path == Path::new(name))
+            })
             .map(|(path, bytes)| {
-                let digest = bytes.map(|bytes| capture.executable_digest(path)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| hex::encode(Sha256::digest(bytes))));
+                let digest = bytes.map(|bytes| {
+                    capture
+                        .executable_digest(path)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| hex::encode(Sha256::digest(bytes)))
+                });
                 (path.to_owned(), digest)
             })
             .collect::<BTreeMap<_, _>>()
     };
     if native_inputs(previous) != native_inputs(current) {
-        return CapturedChange::FullNative { reason: "captured native input changed" };
+        return CapturedChange::FullNative {
+            reason: "captured native input changed",
+        };
     }
-    let before: BTreeMap<_, _> = previous.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let before: BTreeMap<_, _> = previous
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f))
+        .collect();
     let after: BTreeMap<_, _> = current.files.iter().map(|f| (f.path.as_str(), f)).collect();
     if before.keys().ne(after.keys()) {
         return CapturedChange::FullNative {
@@ -547,9 +575,13 @@ pub fn measure_captured_change_observed(
         Some((path, old, new)) => {
             visit(path);
             if proved_body_only(old, new) {
-                CapturedChange::DocumentLocal { path: path.to_owned() }
+                CapturedChange::DocumentLocal {
+                    path: path.to_owned(),
+                }
             } else {
-                CapturedChange::FullNative { reason: "cross-file effect not proved local" }
+                CapturedChange::FullNative {
+                    reason: "cross-file effect not proved local",
+                }
             }
         }
     }
@@ -582,13 +614,21 @@ pub fn measure_document_fingerprint(
     path: &str,
     options: &IndexOptions,
 ) -> Result<DocumentFingerprint> {
-    let file = capture.files.iter().find(|f| f.path == path).context("missing captured document")?;
+    let file = capture
+        .files
+        .iter()
+        .find(|f| f.path == path)
+        .context("missing captured document")?;
     ensure!(
         hex::encode(Sha256::digest(file.text.as_bytes())) == file.hash
             && capture.hashes.get(path) == Some(&file.hash),
         "captured document hash mismatch"
     );
-    let document = native.revision.documents.iter().find(|d| d.key.path == path)
+    let document = native
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key.path == path)
         .context("missing measured native document")?;
     ensure!(
         document.key.language == file.language
@@ -598,12 +638,20 @@ pub fn measure_document_fingerprint(
             && document.revision_id == native.revision.id,
         "native document is not the captured bytes"
     );
-    let coverage: Vec<_> = native.coverage.iter().filter(|v| v.document_path == path).collect();
+    let coverage: Vec<_> = native
+        .coverage
+        .iter()
+        .filter(|v| v.document_path == path)
+        .collect();
     ensure!(coverage.len() == 1, "missing or duplicate native coverage");
     let coverage = coverage[0];
-    ensure!(coverage.language == file.language && coverage.source_set_id == native.source_set.id
-        && coverage.producer_id == native.producer.id && coverage.revision_id == native.revision.id,
-        "native coverage ownership mismatch");
+    ensure!(
+        coverage.language == file.language
+            && coverage.source_set_id == native.source_set.id
+            && coverage.producer_id == native.producer.id
+            && coverage.revision_id == native.revision.id,
+        "native coverage ownership mismatch"
+    );
     // Do not carry occurrence revision/proof IDs into a reusable version's identity.
     // Every other field, including owner/key/roles and all distinct source facts, stays.
     fn stable_fact<T: Serialize>(fact: &T) -> Result<serde_json::Value> {
@@ -614,12 +662,24 @@ pub fn measure_document_fingerprint(
         }
         Ok(value)
     }
-    let declarations = native.declarations.iter().filter(|d| d.document == document.key)
-        .map(stable_fact).collect::<Result<Vec<_>>>()?;
-    let calls = native.calls.iter().filter(|c| c.document == document.key)
-        .map(stable_fact).collect::<Result<Vec<_>>>()?;
-    let regions = native.control_regions.iter().filter(|r| r.document == document.key)
-        .map(stable_fact).collect::<Result<Vec<_>>>()?;
+    let declarations = native
+        .declarations
+        .iter()
+        .filter(|d| d.document == document.key)
+        .map(stable_fact)
+        .collect::<Result<Vec<_>>>()?;
+    let calls = native
+        .calls
+        .iter()
+        .filter(|c| c.document == document.key)
+        .map(stable_fact)
+        .collect::<Result<Vec<_>>>()?;
+    let regions = native
+        .control_regions
+        .iter()
+        .filter(|r| r.document == document.key)
+        .map(stable_fact)
+        .collect::<Result<Vec<_>>>()?;
     let context = crate::native_ids::extraction_context(&file.language, &[])?;
     let native_value = serde_json::json!({
         "sourceSetId":native.source_set.id,"language":file.language,"path":file.path,
@@ -637,10 +697,14 @@ pub fn measure_document_fingerprint(
     let graph_calls: Vec<_> = graph.calls.iter().filter(|c| c.path == path).collect();
     let graph_regions: Vec<_> = graph.regions.iter().filter(|r| r.path == path).collect();
     let scip_over_cutoff = matches!(file.language.as_str(), "javascript" | "java" | "python")
-        && options.scip_path.as_ref().and_then(|p| capture.bytes(p))
-        .and_then(|bytes| scip::types::Index::parse_from_bytes(bytes).ok())
-        .is_some_and(|index| index.documents.len() > 1_000);
-    let selected_labels: BTreeMap<_, _> = labels.into_iter()
+        && options
+            .scip_path
+            .as_ref()
+            .and_then(|p| capture.bytes(p))
+            .and_then(|bytes| scip::types::Index::parse_from_bytes(bytes).ok())
+            .is_some_and(|index| index.documents.len() > 1_000);
+    let selected_labels: BTreeMap<_, _> = labels
+        .into_iter()
         .filter(|(id, _)| nodes.iter().any(|node| &node.id == id))
         .collect();
     let projection_value = serde_json::json!({

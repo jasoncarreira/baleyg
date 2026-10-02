@@ -63,7 +63,10 @@ impl IndexJobCoordinator {
     /// A staged decision for two immutable admissions. The current v8 publication below
     /// still builds and writes the full native snapshot; the later delta writer consumes
     /// this decision only after it authenticates a selected prior snapshot and fingerprints.
-    pub fn staged_capture_decision(previous: &Capture, current: &Capture) -> indexer::CapturedChange {
+    pub fn staged_capture_decision(
+        previous: &Capture,
+        current: &Capture,
+    ) -> indexer::CapturedChange {
         indexer::measure_captured_change(previous, current)
     }
 

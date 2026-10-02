@@ -1118,35 +1118,76 @@ fn publish_bundle(
 
 #[test]
 fn admitted_body_edit_measures_only_changed_document_not_unrelated_lookup_owners() {
-    use baleyg::{capture::Capture, index_coordinator::IndexJobCoordinator, indexer::{CapturedChange, measure_captured_change_observed}};
+    use baleyg::{
+        capture::Capture,
+        index_coordinator::IndexJobCoordinator,
+        indexer::{CapturedChange, measure_captured_change_observed},
+    };
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "a.js", "function f(){ return 10; }\n");
     // An unrelated pre-existing unresolved/ambiguous lookup cannot force fallback.
-    write(d.path(), "z.js", "function bad(){ missing(); missing(); }\n");
+    write(
+        d.path(),
+        "z.js",
+        "function bad(){ missing(); missing(); }\n",
+    );
     let options = IndexOptions::new(d.path().to_owned());
     let first = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
     write(d.path(), "a.js", "function f(){ return 20; }\n");
     let second = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert_eq!(first.files[0].text.as_bytes(), b"function f(){ return 10; }\n");
-    assert_eq!(second.files[0].text.as_bytes(), b"function f(){ return 20; }\n");
+    assert_eq!(
+        first.files[0].text.as_bytes(),
+        b"function f(){ return 10; }\n"
+    );
+    assert_eq!(
+        second.files[0].text.as_bytes(),
+        b"function f(){ return 20; }\n"
+    );
     let mut measured = vec![];
-    let choice = measure_captured_change_observed(&first, &second, |path| measured.push(path.to_owned()));
-    assert_eq!(choice, CapturedChange::DocumentLocal { path: "a.js".into() });
+    let choice =
+        measure_captured_change_observed(&first, &second, |path| measured.push(path.to_owned()));
+    assert_eq!(
+        choice,
+        CapturedChange::DocumentLocal {
+            path: "a.js".into()
+        }
+    );
     assert_eq!(measured, ["a.js"]);
-    assert_eq!(IndexJobCoordinator::staged_capture_decision(&first, &second), choice);
+    assert_eq!(
+        IndexJobCoordinator::staged_capture_decision(&first, &second),
+        choice
+    );
     assert_eq!(first.files[1], second.files[1]);
 }
 
 #[test]
 fn captured_classifier_falls_back_on_each_unproved_surface_effect() {
-    use baleyg::{capture::Capture, indexer::{CapturedChange, measure_captured_change}};
+    use baleyg::{
+        capture::Capture,
+        indexer::{CapturedChange, measure_captured_change},
+    };
     let samples = [
         ("function f(){ return 1; }\n", "function g(){ return 1; }\n"), // declaration
-        ("function f(){ return 1; }\n", "function f(){ const x=1; return x; }\n"), // scope
-        ("function f(){ return 1; }\n", "import {x} from './x.js'; function f(){ return 1; }\n"), // import
-        ("export function f(){ return 1; }\n", "export {f}; function f(){ return 1; }\n"), // re-export
-        ("function f(){ return old(); }\n", "function f(){ return newer(); }\n"), // lookup observation
-        ("function f(){ return 1; }\n", "function f(){ return (1; }\n"), // parse error
+        (
+            "function f(){ return 1; }\n",
+            "function f(){ const x=1; return x; }\n",
+        ), // scope
+        (
+            "function f(){ return 1; }\n",
+            "import {x} from './x.js'; function f(){ return 1; }\n",
+        ), // import
+        (
+            "export function f(){ return 1; }\n",
+            "export {f}; function f(){ return 1; }\n",
+        ), // re-export
+        (
+            "function f(){ return old(); }\n",
+            "function f(){ return newer(); }\n",
+        ), // lookup observation
+        (
+            "function f(){ return 1; }\n",
+            "function f(){ return (1; }\n",
+        ), // parse error
     ];
     for (old, new) in samples {
         let d = tempfile::tempdir().unwrap();
@@ -1155,19 +1196,38 @@ fn captured_classifier_falls_back_on_each_unproved_surface_effect() {
         let before = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
         write(d.path(), "a.js", new);
         let after = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-        assert!(matches!(measure_captured_change(&before, &after), CapturedChange::FullNative { .. }), "{old:?} -> {new:?}");
+        assert!(
+            matches!(
+                measure_captured_change(&before, &after),
+                CapturedChange::FullNative { .. }
+            ),
+            "{old:?} -> {new:?}"
+        );
     }
     let d = tempfile::tempdir().unwrap();
-    write(d.path(), "a.java", "class A extends Base { int f(){ return 1; } }\n");
+    write(
+        d.path(),
+        "a.java",
+        "class A extends Base { int f(){ return 1; } }\n",
+    );
     let options = IndexOptions::new(d.path().to_owned());
     let before = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    write(d.path(), "a.java", "class A extends Other { int f(){ return 1; } }\n");
+    write(
+        d.path(),
+        "a.java",
+        "class A extends Other { int f(){ return 1; } }\n",
+    );
     let after = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert!(matches!(measure_captured_change(&before, &after), CapturedChange::FullNative { .. }));
+    assert!(matches!(
+        measure_captured_change(&before, &after),
+        CapturedChange::FullNative { .. }
+    ));
     for transition in ["add", "delete", "rename"] {
         let d = tempfile::tempdir().unwrap();
         write(d.path(), "a.js", "function f(){ return 1; }\n");
-        if transition == "delete" || transition == "rename" { write(d.path(), "b.js", "function b(){}\n"); }
+        if transition == "delete" || transition == "rename" {
+            write(d.path(), "b.js", "function b(){}\n");
+        }
         let options = IndexOptions::new(d.path().to_owned());
         let before = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
         match transition {
@@ -1176,15 +1236,22 @@ fn captured_classifier_falls_back_on_each_unproved_surface_effect() {
             _ => fs::rename(d.path().join("b.js"), d.path().join("c.js")).unwrap(),
         }
         let after = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-        assert_eq!(measure_captured_change(&before, &after), CapturedChange::FullNative {
-            reason: "source inventory changed (add/delete/rename)"
-        }, "{transition}");
+        assert_eq!(
+            measure_captured_change(&before, &after),
+            CapturedChange::FullNative {
+                reason: "source inventory changed (add/delete/rename)"
+            },
+            "{transition}"
+        );
     }
 }
 
 #[test]
 fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint() {
-    use baleyg::{indexer::{index_workspace_bundle, measure_document_fingerprint}, store::topology::WorkspaceIdentity};
+    use baleyg::{
+        indexer::{index_workspace_bundle, measure_document_fingerprint},
+        store::topology::WorkspaceIdentity,
+    };
     use protobuf::Message;
     use sha2::{Digest, Sha256};
     for (language, path, source) in [
@@ -1198,7 +1265,11 @@ fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint()
         let mut options = IndexOptions::new(d.path().to_owned());
         let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
         let manifest = serde_json::json!({path:source_hash});
-        fs::write(d.path().join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(
+            d.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
         let mut index = scip::types::Index::new();
         let mut document = scip::types::Document::new();
         document.relative_path = path.into();
@@ -1212,27 +1283,60 @@ fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint()
         index.documents.push(document);
         options.scip_path = Some(d.path().join("index.scip"));
         options.manifest_path = Some(d.path().join("manifest.json"));
-        let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path()).unwrap().record_id;
+        let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path())
+            .unwrap()
+            .record_id;
         fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
         let (first_graph, first_native, first_capture) =
             index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-        let first = measure_document_fingerprint(&first_capture, &first_native, &first_graph, path, &options).unwrap();
+        let first = measure_document_fingerprint(
+            &first_capture,
+            &first_native,
+            &first_graph,
+            path,
+            &options,
+        )
+        .unwrap();
         index.documents[0].occurrences[0].symbol = "scip display f() version two".into();
         fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
         let (second_graph, second_native, second_capture) =
             index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-        let second = measure_document_fingerprint(&second_capture, &second_native, &second_graph, path, &options).unwrap();
+        let second = measure_document_fingerprint(
+            &second_capture,
+            &second_native,
+            &second_graph,
+            path,
+            &options,
+        )
+        .unwrap();
         assert!(first.reusable_native(&second), "{language}");
-        assert_eq!(first_native.declarations.iter().map(|d| &d.syntax_id).collect::<Vec<_>>(),
-            second_native.declarations.iter().map(|d| &d.syntax_id).collect::<Vec<_>>(), "{language}");
+        assert_eq!(
+            first_native
+                .declarations
+                .iter()
+                .map(|d| &d.syntax_id)
+                .collect::<Vec<_>>(),
+            second_native
+                .declarations
+                .iter()
+                .map(|d| &d.syntax_id)
+                .collect::<Vec<_>>(),
+            "{language}"
+        );
         if language == "rust" {
             assert!(first.reusable_projection(&second));
             assert!(second_graph.nodes.iter().all(|n| n.display_label.is_none()));
         } else {
             assert!(!first.reusable_projection(&second), "{language}");
-            assert!(second_graph.nodes.iter().any(|n| n.name == "f" && n.display_label.as_deref() == Some("scip display f() version two")), "{language}");
+            assert!(
+                second_graph.nodes.iter().any(|n| n.name == "f"
+                    && n.display_label.as_deref() == Some("scip display f() version two")),
+                "{language}"
+            );
         }
-        if language != "javascript" { continue; }
+        if language != "javascript" {
+            continue;
+        }
         // Exactly 1,000 documents is admitted; 1,001 drops all optional labels.
         for n in 1..1_000 {
             let mut ghost = scip::types::Document::new();
@@ -1242,7 +1346,8 @@ fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint()
         fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
         let (at_graph, at_native, at_capture) =
             index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-        let at = measure_document_fingerprint(&at_capture, &at_native, &at_graph, path, &options).unwrap();
+        let at = measure_document_fingerprint(&at_capture, &at_native, &at_graph, path, &options)
+            .unwrap();
         assert!(second.reusable_projection(&at));
         assert_eq!(index.documents.len(), 1_000);
         let mut ghost = scip::types::Document::new();
@@ -1251,7 +1356,9 @@ fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint()
         fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
         let (over_graph, over_native, over_capture) =
             index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-        let over = measure_document_fingerprint(&over_capture, &over_native, &over_graph, path, &options).unwrap();
+        let over =
+            measure_document_fingerprint(&over_capture, &over_native, &over_graph, path, &options)
+                .unwrap();
         assert!(at.reusable_native(&over));
         assert!(!at.reusable_projection(&over));
         assert!(over_graph.nodes.iter().all(|n| n.display_label.is_none()));
@@ -1260,64 +1367,107 @@ fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint()
 
 #[test]
 fn full_reuse_fingerprint_authenticates_bytes_admission_producer_coverage_owner_and_projection() {
-    use baleyg::{indexer::{index_workspace_bundle, measure_document_fingerprint}, store::topology::WorkspaceIdentity};
+    use baleyg::{
+        indexer::{index_workspace_bundle, measure_document_fingerprint},
+        store::topology::WorkspaceIdentity,
+    };
     let d = tempfile::tempdir().unwrap();
     let path = "main.js";
     write(d.path(), path, "function f(){ return 10; }\n");
     let options = IndexOptions::new(d.path().to_owned());
-    let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path()).unwrap().record_id;
-    let (graph, native, capture) = index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-    let fingerprint = measure_document_fingerprint(&capture, &native, &graph, path, &options).unwrap();
+    let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path())
+        .unwrap()
+        .record_id;
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
+    let fingerprint =
+        measure_document_fingerprint(&capture, &native, &graph, path, &options).unwrap();
     assert!(fingerprint.reusable_projection(&fingerprint));
     let mut changed_coverage = native.clone();
     changed_coverage.coverage[0].state = "partial".into();
-    let coverage = measure_document_fingerprint(&capture, &changed_coverage, &graph, path, &options).unwrap();
+    let coverage =
+        measure_document_fingerprint(&capture, &changed_coverage, &graph, path, &options).unwrap();
     assert!(!fingerprint.reusable_native(&coverage));
     let mut changed_owner = native.clone();
     changed_owner.declarations[0].key.kind = "field".into();
-    let owner = measure_document_fingerprint(&capture, &changed_owner, &graph, path, &options).unwrap();
+    let owner =
+        measure_document_fingerprint(&capture, &changed_owner, &graph, path, &options).unwrap();
     assert!(!fingerprint.reusable_native(&owner));
     let mut changed_graph = graph.clone();
     changed_graph.nodes[0].display_label = Some("untrusted display only".into());
-    let projection = measure_document_fingerprint(&capture, &native, &changed_graph, path, &options).unwrap();
+    let projection =
+        measure_document_fingerprint(&capture, &native, &changed_graph, path, &options).unwrap();
     assert!(fingerprint.reusable_native(&projection));
     assert!(!fingerprint.reusable_projection(&projection));
     let mut changed_admission = options.clone();
     changed_admission.max_file_bytes += 1;
     let (admission_graph, admission_native, admission_capture) =
         index_workspace_bundle(&changed_admission, &root_id, &cancel(), |_| {}).unwrap();
-    let admission = measure_document_fingerprint(&admission_capture, &admission_native, &admission_graph, path, &changed_admission).unwrap();
+    let admission = measure_document_fingerprint(
+        &admission_capture,
+        &admission_native,
+        &admission_graph,
+        path,
+        &changed_admission,
+    )
+    .unwrap();
     assert!(!fingerprint.reusable_native(&admission));
     write(d.path(), path, "function f(){ return 20; }\n");
     let (changed_graph, changed_native, changed_capture) =
         index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-    let changed = measure_document_fingerprint(&changed_capture, &changed_native, &changed_graph, path, &options).unwrap();
+    let changed = measure_document_fingerprint(
+        &changed_capture,
+        &changed_native,
+        &changed_graph,
+        path,
+        &options,
+    )
+    .unwrap();
     assert!(!fingerprint.reusable_native(&changed));
     assert!(!fingerprint.reusable_projection(&changed));
-    assert_eq!(changed_capture.files[0].text.as_bytes(), b"function f(){ return 20; }\n");
+    assert_eq!(
+        changed_capture.files[0].text.as_bytes(),
+        b"function f(){ return 20; }\n"
+    );
 }
 
 #[test]
 fn captured_optional_labels_are_projection_only_but_admission_or_toolchain_changes_fallback() {
-    use baleyg::{capture::Capture, indexer::{CapturedChange, measure_captured_change}};
+    use baleyg::{
+        capture::Capture,
+        indexer::{CapturedChange, measure_captured_change},
+    };
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "main.js", "function f(){ return 10; }\n");
     let mut options = IndexOptions::new(d.path().to_owned());
     options.scip_path = Some(d.path().join("absent.scip"));
     options.manifest_path = Some(d.path().join("absent.json"));
     let old = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    fs::write(d.path().join("absent.scip"), b"invalid optional presentation").unwrap();
+    fs::write(
+        d.path().join("absent.scip"),
+        b"invalid optional presentation",
+    )
+    .unwrap();
     let optional = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert_eq!(measure_captured_change(&old, &optional), CapturedChange::Unchanged);
+    assert_eq!(
+        measure_captured_change(&old, &optional),
+        CapturedChange::Unchanged
+    );
     write(d.path(), "Cargo.toml", "[package]\nname='different'\n");
     let config = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert_eq!(measure_captured_change(&optional, &config), CapturedChange::FullNative {
-        reason: "captured native input changed",
-    });
+    assert_eq!(
+        measure_captured_change(&optional, &config),
+        CapturedChange::FullNative {
+            reason: "captured native input changed",
+        }
+    );
     let mut altered = options.clone();
     altered.max_file_bytes += 1;
     let admitted = Capture::admit(&altered, &cancel(), &|_| {}).unwrap();
-    assert_eq!(measure_captured_change(&config, &admitted), CapturedChange::FullNative {
-        reason: "capture admission changed",
-    });
+    assert_eq!(
+        measure_captured_change(&config, &admitted),
+        CapturedChange::FullNative {
+            reason: "capture admission changed",
+        }
+    );
 }
