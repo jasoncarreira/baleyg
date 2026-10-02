@@ -23,25 +23,13 @@ fn golden(catalog: &Catalog) {
         n
     });
     let filename = format!("{name}-{ordinal}.json");
+    let path = std::path::Path::new("tests/fixtures/classes/below-cap").join(filename);
     let bytes = serde_json::to_vec(catalog).unwrap();
-    if let Some(directory) = std::env::var_os("BALEYG_CAPTURE_CLASS_GOLDENS") {
-        let directory = std::path::PathBuf::from(directory);
-        assert!(
-            directory.is_absolute(),
-            "golden capture directory must be absolute"
-        );
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(directory.join(filename), bytes).unwrap();
-    } else {
-        let path = std::path::Path::new("tests/fixtures/classes/below-cap").join(filename);
-        if path.exists() {
-            assert_eq!(
-                fs::read(path).unwrap(),
-                bytes,
-                "frozen pre-edit class JSON differs"
-            );
-        }
-    }
+    assert_eq!(
+        fs::read(path).unwrap(),
+        bytes,
+        "frozen pre-edit class JSON differs"
+    );
 }
 fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
     let temp = tempfile::tempdir().unwrap();
