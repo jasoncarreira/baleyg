@@ -433,7 +433,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
         (version, marker.as_str(), generation, revision),
         (
             8,
-            "native-v4",
+            "native-v4-class-compose-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
         )
@@ -1200,4 +1200,472 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     assert_eq!(body["error"]["code"], "invalid_class_request");
     assert_eq!(store.status().unwrap().revision, pin);
     assert_eq!(clone.status().unwrap().revision, pin);
+}
+
+#[tokio::test]
+async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() {
+    let (dir, store, graph, app, _session) = setup();
+    let pin = store.status().unwrap().revision;
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let (state, stored): (String, String) = db.query_row(
+        "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.graph_projection_id=g.id WHERE m.path='Types.java'",
+        [], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).unwrap();
+    assert_eq!(state, "ready");
+    let file = graph.files.iter().find(|f| f.path == "Types.java").unwrap();
+    let expected = baleyg::classes::FileExtraction::extract_file(
+        file,
+        &graph.nodes,
+        &cancel(),
+        baleyg::classes::Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<baleyg::classes::FileExtraction>(&stored).unwrap(),
+        expected
+    );
+    let source = format!("/api/source?path=Types.java&{}", pin_query(pin));
+    let classes = format!("/api/classes?path=Types.java&{}", pin_query(pin));
+    assert_eq!(call(&app, "GET", &source, Value::Null).await.0, 200);
+    assert_eq!(call(&app, "GET", &classes, Value::Null).await.0, 200);
+    let (_,unrelated): (String,Option<String>)=db.query_row(
+        "SELECT class_extraction_state,class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.graph_projection_id=g.id WHERE m.path='unsupported.js'",
+        [],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert!(unrelated.is_none());
+    db.execute(
+        "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.source_bytes',0) WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
+        [],
+    ).unwrap();
+    let mutated: String = db.query_row(
+        "SELECT class_extraction_payload FROM graph_projections WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
+        [], |r| r.get(0),
+    ).unwrap();
+    let changed: baleyg::classes::FileExtraction = serde_json::from_str(&mutated).unwrap();
+    assert!(expected.source_bytes > 0);
+    assert_eq!(changed.source_bytes, 0);
+    assert_ne!(changed, expected);
+    for path in [&source, &classes] {
+        let (status, value) = call(&app, "GET", path, Value::Null).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
+        assert_eq!(value["error"]["code"], "incompatible_index");
+        assert!(!value.to_string().contains("class A extends B"));
+    }
+}
+
+#[tokio::test]
+async fn selected_class_relation_rows_are_witnessed_by_source_and_graph() {
+    let (dir, store, graph, app, _session) = setup();
+    let pin = store.status().unwrap().revision;
+    let seed = id(&graph, "A");
+    let class_url = format!("/api/classes?{}&q=A", pin_query(pin));
+    let (_, baseline) = call(&app, "GET", &class_url, Value::Null).await;
+    assert_eq!(baseline["items"][0]["symbol"]["name"], "A");
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    assert_eq!(db.execute(
+        "UPDATE class_relations SET payload=json_set(payload,'$.typeName','Forged') WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='Types.java') AND id=(SELECT min(id) FROM class_relations WHERE owner=?1)",
+        [&seed],
+    ).unwrap(),1);
+    let (status, value) = call(&app, "GET", &class_url, Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["error"]["code"], "incompatible_index");
+    assert!(!value.to_string().contains("Forged"));
+}
+
+fn write_class_scip_labels(root: &std::path::Path, label_version: &str) {
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    let mut index = scip::types::Index::new();
+    let mut manifest = serde_json::Map::new();
+    for (path, column, name) in [
+        ("A.java", 6, "A"),
+        ("a.py", 6, "P"),
+        ("a.js", 6, "J"),
+        ("a.rs", 7, "R"),
+    ] {
+        let bytes = std::fs::read(root.join("workspace").join(path)).unwrap();
+        manifest.insert(
+            path.into(),
+            Value::String(hex::encode(Sha256::digest(bytes))),
+        );
+        let mut document = scip::types::Document::new();
+        document.relative_path = path.into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, column, column + 1];
+        occurrence.symbol_roles = 1;
+        occurrence.symbol = format!("scip presentation {label_version} {name}");
+        document.occurrences.push(occurrence);
+        index.documents.push(document);
+    }
+    std::fs::write(root.join("labels.scip"), index.write_to_bytes().unwrap()).unwrap();
+    std::fs::write(
+        root.join("labels.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn changed_captured_class_scip_label_recomputes_f_and_new_revision_class_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    for (path, text) in [
+        ("A.java", "class A {}\n"),
+        ("a.py", "class P: pass\n"),
+        ("a.js", "class J {}\n"),
+        ("a.rs", "struct R {}\n"),
+    ] {
+        std::fs::write(workspace.join(path), text).unwrap();
+    }
+    let mut options = IndexOptions::new(workspace.clone());
+    options.scip_path = Some(dir.path().join("labels.scip"));
+    options.manifest_path = Some(dir.path().join("labels.json"));
+    let store = common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let session = store.leader_session().unwrap();
+    let mut observations = Vec::new();
+    for version in ["one", "two"] {
+        write_class_scip_labels(dir.path(), version);
+        let (graph, native, capture) =
+            baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel(), |_| {})
+                .unwrap();
+        for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
+            let symbol = graph
+                .nodes
+                .iter()
+                .find(|s| s.path == path && s.name == name)
+                .unwrap();
+            assert_eq!(
+                symbol.display_label.as_deref(),
+                Some(format!("scip presentation {version} {name}").as_str())
+            );
+        }
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter(|s| s.path == "a.rs")
+                .all(|s| s.display_label.is_none())
+        );
+        let expected = store.index_baseline().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                expected,
+                &cancel(),
+            )
+            .unwrap();
+        observations.push((pin, graph));
+    }
+    let ((first, first_graph), (second, second_graph)) = (&observations[0], &observations[1]);
+    assert_eq!(first.index_generation, second.index_generation);
+    assert_eq!((first.index_revision, second.index_revision), (1, 2));
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    for path in ["A.java", "a.py", "a.js", "a.rs"] {
+        let ids = |revision| -> (String, String, String, Option<String>) {
+            db.query_row("SELECT m.document_version_id,m.graph_projection_id,m.class_projection_id,g.class_extraction_payload FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN graph_projections g ON g.id=m.graph_projection_id WHERE r.published_index_revision=?1 AND m.path=?2",
+                rusqlite::params![revision,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+        };
+        let old = ids(1);
+        let fresh = ids(2);
+        assert_eq!(
+            old.0, fresh.0,
+            "unchanged authenticated source should retain native document: {path}"
+        );
+        if matches!(path, "A.java" | "a.py" | "a.js") {
+            assert_ne!(
+                old.1, fresh.1,
+                "new display label must change graph: {path}"
+            );
+        } else {
+            assert_eq!(old.1, fresh.1, "Rust SCIP label must not be admitted");
+        }
+        if matches!(path, "A.java" | "a.py") {
+            assert_ne!(old.3, fresh.3, "F must be recomputed: {path}");
+            assert_ne!(old.2, fresh.2, "class projection must change: {path}");
+            assert!(old.3.is_some() && fresh.3.is_some());
+        } else {
+            assert!(old.3.is_none() && fresh.3.is_none());
+        }
+    }
+    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
+        let symbol = second_graph
+            .nodes
+            .iter()
+            .find(|s| s.path == path && s.name == name)
+            .unwrap();
+        let before = first_graph
+            .nodes
+            .iter()
+            .find(|s| s.path == path && s.name == name)
+            .unwrap();
+        assert_eq!(
+            symbol.id, before.id,
+            "SCIP label cannot mint a new native ID"
+        );
+    }
+    let app = http::router(
+        http::new(
+            store.clone(),
+            options,
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
+        let (status, page) = call(
+            &app,
+            "GET",
+            &format!("/api/classes?path={path}&q={name}&{}", pin_query(*second)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {page}");
+        assert_eq!(
+            page["items"][0]["symbol"]["displayLabel"],
+            format!("scip presentation two {name}")
+        );
+        let (status, source) = call(
+            &app,
+            "GET",
+            &format!("/api/source?path={path}&{}", pin_query(*second)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{source}");
+    }
+}
+
+#[tokio::test]
+async fn normal_size_captured_java_python_cold_oracle_attests_full_published_catalog() {
+    use baleyg::{
+        classes::{Catalog, FileExtraction, Limits},
+        indexer::index_workspace_bundle,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    for (path, source) in [
+        (
+            "small/java/Csmall0000.java",
+            include_str!("fixtures/classes/below-cap/source/small/java/Csmall0000.java"),
+        ),
+        (
+            "small/python/Csmall0000.py",
+            include_str!("fixtures/classes/below-cap/source/small/python/Csmall0000.py"),
+        ),
+    ] {
+        let target = workspace.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, source).unwrap();
+    }
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let session = store.leader_session().unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let cancel = cancel();
+    let (published_graph, published_native, authenticated_capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    assert_eq!(authenticated_capture.files.len(), 2);
+    let pin = store
+        .publish_native(
+            &published_graph,
+            &authenticated_capture,
+            &published_native,
+            session.leader_guard().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(pin.index_revision, 1);
+
+    // This is a second, isolated cold admission/extraction. Its only inputs are
+    // the captured source bytes and a freshly measured native graph; never the
+    // persisted graph, class rows, or F. Compare both immutable captures first.
+    let (cold_graph, cold_native, cold_capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    cold_capture.verify(&cancel).unwrap();
+    assert_eq!(cold_capture.files, authenticated_capture.files);
+    assert_eq!(cold_capture.hashes, authenticated_capture.hashes);
+    assert!(!cold_native.declarations.is_empty());
+    assert!(!cold_graph.nodes.is_empty());
+    let mut cold_f = Vec::new();
+    for file in &cold_capture.files {
+        cold_f.push(
+            FileExtraction::extract_file(file, &cold_graph.nodes, &cancel, Limits::default())
+                .unwrap(),
+        );
+    }
+    let cold_catalog = Catalog::compose(
+        &cold_f,
+        cold_capture.files.len(),
+        cold_graph.nodes.len(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(!cold_catalog.classes.is_empty());
+    assert!(!cold_catalog.truncated);
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let revision_id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+    for (file, extraction) in cold_capture.files.iter().zip(&cold_f) {
+        let (state, payload): (String, String) = db.query_row(
+            "SELECT g.class_extraction_state,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2",
+            rusqlite::params![revision_id, file.path], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, "ready");
+        assert_eq!(
+            payload.as_bytes(),
+            serde_json::to_vec(extraction).unwrap(),
+            "cold F: {}",
+            file.path
+        );
+        let (_, selected) = store.source_at(&file.path, Some(pin)).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_vec(&selected).unwrap(),
+            serde_json::to_vec(file).unwrap()
+        );
+        let stored_nodes = db.prepare(
+            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path=?2 ORDER BY n.id"
+        ).unwrap().query_map(rusqlite::params![revision_id, file.path], |r| r.get::<_, String>(0))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let mut measured_nodes: Vec<_> = cold_graph
+            .nodes
+            .iter()
+            .filter(|node| node.path == file.path)
+            .collect();
+        measured_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            stored_nodes.len(),
+            measured_nodes.len(),
+            "measured graph: {}",
+            file.path
+        );
+        for (stored, measured) in stored_nodes.iter().zip(measured_nodes) {
+            assert_eq!(
+                stored.as_bytes(),
+                serde_json::to_vec(measured).unwrap(),
+                "measured node: {}",
+                file.path
+            );
+        }
+    }
+    let stored_classes = db.prepare(
+        "SELECT c.payload FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 ORDER BY c.path,json_extract(c.payload,'$.symbol.range.startByte'),c.id"
+    ).unwrap().query_map([&revision_id], |r| r.get::<_, String>(0))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(stored_classes.len(), cold_catalog.classes.len());
+    for (stored, cold) in stored_classes.iter().zip(&cold_catalog.classes) {
+        assert_eq!(
+            stored.as_bytes(),
+            serde_json::to_vec(cold).unwrap(),
+            "full class row: {}",
+            cold.symbol.path
+        );
+    }
+    let stored_relations = db.prepare(
+        "SELECT r.payload FROM class_relations r JOIN revision_documents m ON m.class_projection_id=r.projection_id WHERE m.revision_id=?1 ORDER BY json_extract(r.payload,'$.path'),json_extract(r.payload,'$.range.startByte'),r.id"
+    ).unwrap().query_map([&revision_id], |r| r.get::<_, String>(0))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(stored_relations.len(), cold_catalog.relations.len());
+    for (stored, cold) in stored_relations.iter().zip(&cold_catalog.relations) {
+        assert_eq!(
+            stored.as_bytes(),
+            serde_json::to_vec(cold).unwrap(),
+            "full relation row: {}",
+            cold.path
+        );
+    }
+    let (warnings, truncated): (String, bool) = db
+        .query_row(
+            "SELECT class_warnings,class_truncated FROM native_revisions WHERE id=?1",
+            [&revision_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        warnings.as_bytes(),
+        serde_json::to_vec(&cold_catalog.warnings).unwrap()
+    );
+    assert_eq!(truncated, cold_catalog.truncated);
+    let full_published = Catalog {
+        classes: stored_classes
+            .iter()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect(),
+        relations: stored_relations
+            .iter()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect(),
+        warnings: serde_json::from_str(&warnings).unwrap(),
+        truncated,
+    };
+    assert_eq!(
+        serde_json::to_vec(&full_published).unwrap(),
+        serde_json::to_vec(&cold_catalog).unwrap()
+    );
+
+    let app = http::router(
+        http::new(
+            store.clone(),
+            options,
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    for file in &cold_capture.files {
+        let (status, source) = call(
+            &app,
+            "GET",
+            &format!("/api/source?path={}&{}", file.path, pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{source}");
+        assert_eq!(source["revision"], json!(pin));
+        assert_eq!(source["file"], json!(file));
+        let (status, page) = call(
+            &app,
+            "GET",
+            &format!("/api/classes?path={}&{}", file.path, pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let expected: BTreeMap<_, _> = cold_catalog
+            .classes
+            .iter()
+            .filter(|c| c.symbol.path == file.path)
+            .map(|c| (c.symbol.id.clone(), json!(c)))
+            .collect();
+        let selected: BTreeMap<_, _> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["symbol"]["id"].as_str().unwrap().to_owned(), c.clone()))
+            .collect();
+        assert_eq!(selected, expected, "selected full classes: {}", file.path);
+        assert_eq!(page["warnings"], json!(cold_catalog.warnings));
+        assert_eq!(page["truncated"], json!(cold_catalog.truncated));
+        let first = cold_graph
+            .nodes
+            .iter()
+            .find(|n| n.path == file.path && n.kind == SymbolKind::Class)
+            .unwrap();
+        let (status, symbol) = call(
+            &app,
+            "GET",
+            &format!("/api/symbol?id={}&{}", first.id, pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{symbol}");
+        assert_eq!(
+            symbol["symbol"],
+            json!(first),
+            "selected fresh native graph: {}",
+            file.path
+        );
+    }
 }

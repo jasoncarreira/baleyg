@@ -4,14 +4,45 @@ use baleyg::{
     model::{CancelFlag, Graph},
 };
 use std::{
+    cell::Cell,
     fs,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
+thread_local! { static GOLDEN_ORDINAL: Cell<usize> = const { Cell::new(0) }; }
+fn golden(catalog: &Catalog) {
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_owned();
+    let ordinal = GOLDEN_ORDINAL.with(|counter| {
+        let n = counter.get();
+        counter.set(n + 1);
+        n
+    });
+    let filename = format!("{name}-{ordinal}.json");
+    let path = std::path::Path::new("tests/fixtures/classes/below-cap").join(filename);
+    let bytes = serde_json::to_vec(catalog).unwrap();
+    assert_eq!(
+        fs::read(path).unwrap(),
+        bytes,
+        "frozen pre-edit class JSON differs"
+    );
+}
 fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
+    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
+    let git = temp.path().join(".git");
+    let private = git.join("baleyg");
+    fs::create_dir(&git).unwrap();
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = private.join("workspace-id");
+    // Fixed canonical v4 UUID: temp directory names must not alter frozen symbol IDs.
+    fs::write(&marker, b"123e4567-e89b-42d3-a456-426614174000").unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
     for (path, text) in files {
         let path = temp.path().join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -20,6 +51,7 @@ fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
     let cancel = Arc::new(AtomicBool::new(false));
     let graph = index_workspace(&IndexOptions::new(temp.path().into()), &cancel, |_| {}).unwrap();
     let catalog = Catalog::build(&graph.files, &graph.nodes, &cancel).unwrap();
+    golden(&catalog);
     (graph, catalog)
 }
 fn class<'a>(c: &'a Catalog, name: &str) -> &'a baleyg::classes::ClassDefinition {
@@ -535,4 +567,505 @@ fn method_generic_detail_limit_does_not_stop_declarations_or_leak_partial_blocke
     );
     linked(&c, "p.Owner", "T256", "field", "p.T256");
     linked(&c, "p.Later", "Owner.Nested", "field", "p.Owner.Nested");
+}
+
+#[test]
+fn cohort72_small_java_python_generated_below_cap() {
+    let (_, catalog) = fixture(&[
+        (
+            "small/java/Csmall0000.java",
+            include_str!("fixtures/classes/below-cap/source/small/java/Csmall0000.java"),
+        ),
+        (
+            "small/python/Csmall0000.py",
+            include_str!("fixtures/classes/below-cap/source/small/python/Csmall0000.py"),
+        ),
+    ]);
+    assert!(!catalog.truncated, "{catalog:#?}");
+    assert!(!catalog.classes.is_empty());
+}
+
+// The checked-in cap expectations are hand-authored from D0004 rules, not emitted
+// by the composer. Tiny limits make equality and one-unit overflow observable.
+fn cap_file(
+    path: &str,
+    source_bytes: usize,
+    registry_bytes: usize,
+    class: bool,
+) -> baleyg::classes::FileExtraction {
+    let mut definition: baleyg::classes::ClassDefinition = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][0].clone()
+    ).unwrap();
+    definition.symbol.path = path.into();
+    definition.symbol.id = format!("class-{path}");
+    definition.symbol.name = path.trim_end_matches(".java").into();
+    definition.qualified_name = definition.symbol.name.clone();
+    baleyg::classes::FileExtraction {
+        path: path.into(),
+        source_bytes,
+        registry_bytes,
+        warnings: vec![],
+        truncated: false,
+        registry_incomplete: false,
+        classes: if class { vec![definition] } else { vec![] },
+        items: if class { vec![cap_ref(path)] } else { vec![] },
+    }
+}
+fn cap_ref(path: &str) -> baleyg::classes::DetailItem {
+    use baleyg::classes::{ClassRelation, DetailItem, DetailValue};
+    DetailItem {
+        class_index: 0,
+        records: 0,
+        text: 0,
+        value: DetailValue::Relation(ClassRelation {
+            id: format!("ref-{path}"),
+            owner: format!("class-{path}"),
+            target: None,
+            type_name: "Target".into(),
+            kind: "field".into(),
+            path: path.into(),
+            range: Default::default(),
+            candidate_ids: vec![],
+            match_kind: "unmatched".into(),
+        }),
+    }
+}
+fn cap_expected(
+    name: &str,
+    files: &[baleyg::classes::FileExtraction],
+    count: usize,
+    symbols: usize,
+    limits: baleyg::classes::Limits,
+) -> Catalog {
+    let actual = Catalog::compose(files, count, symbols, limits).unwrap();
+    let expected = fs::read(format!("tests/fixtures/classes/caps/{name}.json")).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        expected,
+        "independent byte-exact normative fixture {name}"
+    );
+    actual
+}
+#[test]
+fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
+    use baleyg::classes::{DetailItem, DetailValue, Limits};
+    let ordinary = Limits::default();
+    let a = cap_file("A.java", 1, 1, true);
+    let b = cap_file("B.java", 1, 1, true);
+    let empty = cap_file("0.java", 1, 1, false);
+    let warned = baleyg::classes::FileExtraction {
+        warnings: vec!["excluded warning".into()],
+        truncated: true,
+        ..b.clone()
+    };
+    let mut limits = ordinary;
+    limits.total_bytes = 1;
+    cap_expected("source-equal", std::slice::from_ref(&a), 1, 1, limits);
+    let result = cap_expected(
+        "source-over",
+        &[empty.clone(), warned.clone()],
+        2,
+        2,
+        limits,
+    );
+    assert!(!result.warnings.iter().any(|w| w == "excluded warning"));
+    limits = ordinary;
+    limits.registry_text = 1;
+    cap_expected("registry-equal", std::slice::from_ref(&a), 1, 1, limits);
+    cap_expected(
+        "registry-over",
+        &[empty.clone(), warned.clone()],
+        2,
+        2,
+        limits,
+    );
+    limits = ordinary;
+    limits.classes = 1;
+    cap_expected("classes-equal", std::slice::from_ref(&a), 1, 1, limits);
+    cap_expected("classes-over", &[a.clone(), b.clone()], 2, 2, limits);
+    let member: baleyg::classes::ClassMember=serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
+    ).unwrap();
+    let mut first = member.clone();
+    first.name = "first".into();
+    first.path = "A.java".into();
+    let mut second = member;
+    second.name = "second".into();
+    second.path = "B.java".into();
+    let mut detailed_a = a.clone();
+    detailed_a.items = vec![
+        cap_ref("A.java"),
+        DetailItem {
+            class_index: 0,
+            records: 1,
+            text: 1,
+            value: DetailValue::Field(first),
+        },
+    ];
+    let mut detailed_b = b.clone();
+    detailed_b.items = vec![
+        cap_ref("B.java"),
+        DetailItem {
+            class_index: 0,
+            records: 1,
+            text: 1,
+            value: DetailValue::Field(second),
+        },
+    ];
+    limits = ordinary;
+    limits.records = 2;
+    cap_expected(
+        "records-equal",
+        &[detailed_a.clone(), detailed_b.clone()],
+        2,
+        2,
+        limits,
+    );
+    limits.records = 1;
+    cap_expected(
+        "records-over",
+        &[detailed_a.clone(), detailed_b.clone()],
+        2,
+        2,
+        limits,
+    );
+    limits = ordinary;
+    limits.output_text = 2;
+    cap_expected(
+        "output-equal",
+        &[detailed_a.clone(), detailed_b.clone()],
+        2,
+        2,
+        limits,
+    );
+    limits.output_text = 1;
+    cap_expected("output-over", &[detailed_a, detailed_b], 2, 2, limits);
+    let mut inside = cap_file("A.java", 1, 1, true);
+    let original: baleyg::classes::ClassMember = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
+    ).unwrap();
+    inside.items = std::iter::once(cap_ref("A.java"))
+        .chain(["first", "second"].into_iter().map(|name| {
+            let mut m = original.clone();
+            m.name = name.into();
+            m.path = "A.java".into();
+            DetailItem {
+                class_index: 0,
+                records: 1,
+                text: 1,
+                value: DetailValue::Field(m),
+            }
+        }))
+        .collect();
+    limits = ordinary;
+    limits.records = 1;
+    cap_expected("records-inside", &[inside.clone(), b.clone()], 2, 2, limits);
+    limits = ordinary;
+    limits.output_text = 1;
+    cap_expected("output-inside", &[inside, b.clone()], 2, 2, limits);
+    limits = ordinary;
+    limits.files = 1;
+    limits.symbols = 1;
+    cap_expected("input-equal", std::slice::from_ref(&a), 1, 1, limits);
+    cap_expected("input-over", std::slice::from_ref(&a), 2, 1, limits);
+    limits = ordinary;
+    limits.total_bytes = 2;
+    let before = cap_expected("moving-before", &[a.clone(), b.clone()], 2, 2, limits);
+    let mut grown = a;
+    grown.source_bytes = 2;
+    let unchanged_b = b.clone();
+    let after = cap_expected("moving-after", &[grown, b.clone()], 2, 2, limits);
+    assert_eq!(
+        b, unchanged_b,
+        "later file F is unchanged by the earlier growth"
+    );
+    #[derive(serde::Serialize)]
+    struct LaterProjection<'a> {
+        classes: Vec<&'a baleyg::classes::ClassDefinition>,
+        relations: Vec<&'a baleyg::classes::ClassRelation>,
+    }
+    let later_projection = |catalog: &Catalog| {
+        serde_json::to_vec(&LaterProjection {
+            classes: catalog
+                .classes
+                .iter()
+                .filter(|c| c.symbol.path == "B.java")
+                .collect(),
+            relations: catalog
+                .relations
+                .iter()
+                .filter(|r| r.path == "B.java")
+                .collect(),
+        })
+        .unwrap()
+    };
+    let before_b = later_projection(&before);
+    let after_b = later_projection(&after);
+    assert_eq!(
+        before_b,
+        include_bytes!("fixtures/classes/caps/moving-later-before.json")
+    );
+    assert_eq!(
+        after_b,
+        include_bytes!("fixtures/classes/caps/moving-later-after.json")
+    );
+    assert_ne!(
+        before_b, after_b,
+        "moving cut must change the later file projection"
+    );
+}
+#[test]
+fn warnings_dedupe_at_100_then_append_ordered_closers() {
+    let mut f = cap_file("A.java", 1, 1, true);
+    f.warnings = (0..105).map(|n| format!("warning-{n}")).collect();
+    f.warnings.push("warning-3".into());
+    f.registry_incomplete = true;
+    let c = Catalog::compose(&[f], 1, 1, baleyg::classes::Limits::default()).unwrap();
+    assert_eq!(c.warnings.len(), 102);
+    assert_eq!(c.warnings[0], "warning-0");
+    assert_eq!(c.warnings[99], "warning-99");
+    assert!(c.warnings[100].starts_with("Declared types are terminal"));
+    assert_eq!(
+        c.warnings[101],
+        "Incomplete class declaration registry: some declarations may be absent."
+    );
+}
+
+#[test]
+fn class_registry_import_charge_tiny_native_pilot() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        store::topology::WorkspaceIdentity,
+    };
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path();
+    eprintln!(
+        "{}",
+        serde_json::json!({"pilot":"class-registry-tiny","stage":"allocated",
+        "workspace":workspace.display().to_string()})
+    );
+    std::io::Write::flush(&mut std::io::stderr()).unwrap();
+    let long = format!("import {}.{};\n", "p".repeat(1023), "c".repeat(1024));
+    let short = |prefix| format!("import {}.{};\n", "p".repeat(prefix), "c".repeat(60));
+    let selected = "class Selected {}\n";
+    assert_eq!(
+        (
+            long.len(),
+            short(100).len(),
+            short(101).len(),
+            selected.len()
+        ),
+        (2057, 170, 171, 18)
+    );
+    fs::write(workspace.join("a00.java"), &long).unwrap();
+    fs::write(workspace.join("z.java"), selected).unwrap();
+    let identity = WorkspaceIdentity::discover(Some(workspace), workspace).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let mut selected_id = None;
+    for prefix in [100, 101] {
+        let short = short(prefix);
+        fs::write(workspace.join("a01.java"), &short).unwrap();
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(workspace.to_owned()),
+            &identity.record_id,
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(graph.files.len(), 3);
+        assert_eq!(native.revision.documents.len(), 3);
+        assert_eq!(native.coverage.len(), 3);
+        assert!(
+            native.coverage.iter().all(|c| c.state == "complete"),
+            "{:#?}",
+            native.coverage
+        );
+        assert!(native.declarations.len() < 100 && graph.nodes.len() < 100);
+        let symbol: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|s| {
+                s.path == "z.java"
+                    && s.name == "Selected"
+                    && s.kind == baleyg::model::SymbolKind::Class
+            })
+            .collect();
+        assert_eq!(symbol.len(), 1, "measured class must be unique");
+        let symbol = symbol[0];
+        if let Some(id) = &selected_id {
+            assert_eq!(id, &symbol.id, "unmodified class ID changed");
+        }
+        selected_id = Some(symbol.id.clone());
+        let qualified = &symbol.name;
+        let class_charge = symbol.id.len()
+            + symbol.name.len()
+            + symbol.path.len()
+            + qualified.len()
+            + symbol.name.len()
+            + qualified.len();
+        let expected = [
+            ("a00.java", long.len(), 1024 + (1023 + 1 + 1024)),
+            ("a01.java", short.len(), 60 + (prefix + 1 + 60)),
+            ("z.java", selected.len(), class_charge),
+        ];
+        let mut files = Vec::new();
+        for (path, size, charge) in expected {
+            let file = graph.files.iter().find(|file| file.path == path).unwrap();
+            let captured = capture.files.iter().find(|file| file.path == path).unwrap();
+            let disk = fs::read(workspace.join(path)).unwrap();
+            let sha = hex::encode(Sha256::digest(&disk));
+            assert_eq!(disk.len(), size);
+            assert_eq!(file.hash, sha);
+            assert_eq!(captured.hash, sha);
+            assert_eq!(captured.text.as_bytes(), disk);
+            let document = native
+                .revision
+                .documents
+                .iter()
+                .find(|d| d.key.path == path)
+                .unwrap();
+            assert_eq!(document.content_hash, sha);
+            assert_eq!(document.byte_length, size);
+            let f = baleyg::classes::FileExtraction::extract_file(
+                file,
+                &graph.nodes,
+                &cancel,
+                baleyg::classes::Limits::default(),
+            )
+            .unwrap();
+            assert_eq!(f.source_bytes, size, "{path}");
+            assert_eq!(f.registry_bytes, charge, "{path}");
+            assert!(
+                !f.truncated && !f.registry_incomplete && f.warnings.is_empty(),
+                "{path}: {f:#?}"
+            );
+            files.push(serde_json::json!({"path":path,"sourceBytes":size,"sha256":sha,"registryBytes":charge}));
+        }
+        println!(
+            "{}",
+            serde_json::json!({"pilot":"class-registry-tiny","prefixBytes":prefix,
+            "workspace":workspace.display().to_string(),"files":files,
+            "nativeDocuments":native.revision.documents.len(),"nativeDeclarations":native.declarations.len(),
+            "graphNodes":graph.nodes.len(),"selectedSymbolId":symbol.id,"selectedIdBytes":symbol.id.len()})
+        );
+    }
+}
+
+#[test]
+fn production_class_limits_are_fixed_at_decision_0004_values() {
+    let limits = baleyg::classes::Limits::default();
+    assert_eq!(limits.file_bytes, 2 * 1024 * 1024);
+    assert_eq!(limits.total_bytes, 256 * 1024 * 1024);
+    assert_eq!(limits.visits, 100_000);
+    assert_eq!(limits.depth, 64);
+    assert_eq!(limits.file_classes, 1_000);
+    assert_eq!(limits.classes, 20_000);
+    assert_eq!(limits.members, 256);
+    assert_eq!(limits.file_refs, 8_192);
+    assert_eq!(limits.records, 250_000);
+    assert_eq!(limits.text, 2_048);
+    assert_eq!(limits.output_text, 64 * 1024 * 1024);
+    assert_eq!(limits.registry_text, 32 * 1024 * 1024);
+    assert_eq!(limits.files, 100_000);
+    assert_eq!(limits.symbols, 1_000_000);
+}
+
+#[test]
+fn tiny_limits_control_measured_names_import_bindings_and_type_parameter_details() {
+    use baleyg::classes::{DetailValue, FileExtraction, Limits};
+    let extract = |path: &str, source: &str, limits: Limits| {
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join(path), source).unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let graph =
+            index_workspace(&IndexOptions::new(work.path().to_owned()), &cancel, |_| {}).unwrap();
+        FileExtraction::extract_file(&graph.files[0], &graph.nodes, &cancel, limits).unwrap()
+    };
+    let default = Limits::default();
+    let long_name = "class LongerName {}";
+    assert_eq!(extract("A.java", long_name, default).classes.len(), 1);
+    let short_text = Limits { text: 2, ..default };
+    let clipped = extract("A.java", long_name, short_text);
+    assert!(clipped.registry_incomplete);
+    assert!(clipped.classes.is_empty());
+    assert_eq!(clipped.warnings, ["Cl", "A."]);
+
+    let import = "import verylongpackage.B; class A { B field; }";
+    assert!(!extract("A.java", import, default).registry_incomplete);
+    let clipped = extract("A.java", import, Limits { text: 5, ..default });
+    assert!(clipped.registry_incomplete);
+    assert_eq!(clipped.classes.len(), 1);
+    assert_eq!(clipped.classes[0].symbol.name, "A");
+    assert_eq!(clipped.warnings, ["Class"]);
+
+    let class_parameters = "class A<T,U> {}";
+    assert_eq!(
+        extract("A.java", class_parameters, default).classes.len(),
+        1
+    );
+    let clipped = extract(
+        "A.java",
+        class_parameters,
+        Limits {
+            members: 1,
+            ..default
+        },
+    );
+    assert!(clipped.registry_incomplete);
+    assert!(clipped.classes.is_empty());
+    assert!(
+        clipped
+            .warnings
+            .iter()
+            .any(|w| w.contains("Class type parameter limit reached (1/declaration)"))
+    );
+
+    let inherited = "class A[T]:\n    class B[U]: pass\n";
+    assert_eq!(extract("a.py", inherited, default).classes.len(), 2);
+    let clipped = extract(
+        "a.py",
+        inherited,
+        Limits {
+            members: 1,
+            ..default
+        },
+    );
+    assert!(clipped.registry_incomplete);
+    assert_eq!(clipped.classes.len(), 1);
+    assert!(
+        clipped
+            .warnings
+            .iter()
+            .any(|w| w.contains("Class inherited type parameter limit reached (1/scope)"))
+    );
+
+    let method = "class A { <T,U> A method(A value) { return value; } A field; class Nested {} }";
+    let ordinary = extract("A.java", method, default);
+    assert!(ordinary.items.iter().any(|item| matches!(&item.value,
+        DetailValue::Relation(relation) if relation.kind == "returns")));
+    let clipped = extract(
+        "A.java",
+        method,
+        Limits {
+            members: 1,
+            ..default
+        },
+    );
+    assert!(
+        clipped
+            .classes
+            .iter()
+            .any(|c| c.qualified_name == "A.Nested")
+    );
+    assert!(
+        clipped
+            .warnings
+            .iter()
+            .any(|w| w.contains("Method type parameter detail limit reached (1)"))
+    );
+    assert!(!clipped.items.iter().any(|item| matches!(&item.value,
+        DetailValue::Relation(relation) if relation.kind == "returns" || relation.kind == "parameter")));
+    assert!(clipped.items.iter().any(|item| matches!(&item.value,
+        DetailValue::Relation(relation) if relation.kind == "field")));
 }
