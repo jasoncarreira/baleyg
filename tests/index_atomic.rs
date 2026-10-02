@@ -2668,13 +2668,13 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
     };
     let (positive, positive_native, positive_capture) = run(&index);
-    let node = |graph: &Graph, path: &str, name: &str| {
+    fn node<'a>(graph: &'a Graph, path: &str, name: &str) -> &'a baleyg::model::Symbol {
         graph
             .nodes
             .iter()
             .find(|n| n.path == path && n.name == name && n.kind == SymbolKind::Class)
             .unwrap()
-    };
+    }
     for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
         assert_eq!(
             node(&positive, path, name).display_label.as_deref(),
