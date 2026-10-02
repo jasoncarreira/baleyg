@@ -583,7 +583,9 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     let selected = store.native_source_at(pin, &corrupted).unwrap_err();
     assert!(
         selected.to_string().contains("incompatible_index")
-            && selected.to_string().contains("native source hash mismatch"),
+            && selected.to_string().contains(
+                "incompatible_index: selected evidence decode failed: incompatible_index: source hash mismatch"
+            ),
         "{selected:#}"
     );
     let closed = original_clone.source_at("flow.rs", Some(pin)).unwrap_err();
@@ -1271,7 +1273,7 @@ fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_wi
         error.to_string().contains("incompatible_index")
             && error
                 .to_string()
-                .contains("selected native declaration inventory differs from source"),
+                .contains("incompatible_index: selected evidence decode failed: incompatible_index: selected native declarations differ from source"),
         "{error:#}"
     );
     let closed = selected_clone
