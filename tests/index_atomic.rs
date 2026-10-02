@@ -69,8 +69,7 @@ fn v8_bootstrap_admits_only_empty_unpublished_evidence() {
     assert!(
         reopened
             .recorded_index_options()
-            .err()
-            .expect("partial bootstrap cannot become an absent-option fallback")
+            .expect_err("partial bootstrap cannot become an absent-option fallback")
             .to_string()
             .contains("partial v8 bootstrap")
     );
@@ -86,8 +85,7 @@ fn published_v8_missing_reconcile_options_never_looks_like_a_bootstrap() {
     assert!(
         store
             .recorded_index_options()
-            .err()
-            .expect("published v8 cannot omit recorded options")
+            .expect_err("published v8 cannot omit recorded options")
             .to_string()
             .contains("missing reconcile options")
     );
