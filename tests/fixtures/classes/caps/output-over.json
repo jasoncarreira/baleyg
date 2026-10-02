@@ -1,0 +1,17 @@
+{
+  "names": [
+    "A",
+    "B"
+  ],
+  "fields": [
+    [
+      "first"
+    ],
+    []
+  ],
+  "warnings": [
+    "Class detail text limit reached (0 MiB); declaration discovery continues",
+    "Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery."
+  ],
+  "truncated": true
+}

@@ -5144,6 +5144,32 @@ impl Store {
             &witness,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )?;
+        let stored_f: Option<String> = db.query_row(
+            "SELECT class_extraction_payload FROM graph_projections WHERE id=?1",
+            [&graph_id],
+            |r| r.get(0),
+        )?;
+        if matches!(language.as_str(), "java" | "python") {
+            let expected_f = crate::classes::FileExtraction::extract_file(
+                &graph.files[0],
+                &graph.nodes,
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                crate::classes::Limits::default(),
+            )?;
+            ensure!(
+                stored_f
+                    .as_deref()
+                    .and_then(|f| serde_json::from_str::<crate::classes::FileExtraction>(f).ok())
+                    .as_ref()
+                    == Some(&expected_f),
+                "incompatible_index: selected F differs from authenticated source and graph"
+            );
+        } else {
+            ensure!(
+                stored_f.is_none(),
+                "incompatible_index: non-class graph carries F"
+            );
+        }
         let catalog = crate::classes::Catalog {
             classes: class_rows,
             relations: class_relations,
@@ -5222,6 +5248,22 @@ impl Store {
         ensure!(
             actual == expected,
             "incompatible_index: selected class projection differs from source"
+        );
+        let mut expected_relations: Vec<_> = catalog
+            .relations
+            .into_iter()
+            .filter(|r| r.path == path)
+            .collect();
+        let mut actual_relations: Vec<crate::classes::ClassRelation> = db
+            .prepare("SELECT payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
+            .query_map([&class_id], |r| r.get::<_, String>(0))?
+            .map(|payload| Ok(serde_json::from_str(&payload?)?))
+            .collect::<Result<_>>()?;
+        expected_relations.sort_by(|a, b| a.id.cmp(&b.id));
+        actual_relations.sort_by(|a, b| a.id.cmp(&b.id));
+        ensure!(
+            actual_relations == expected_relations,
+            "incompatible_index: selected class relationships differ from source"
         );
         Ok(())
     }

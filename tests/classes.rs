@@ -584,3 +584,187 @@ fn cohort72_small_java_python_generated_below_cap() {
     assert!(!catalog.truncated, "{catalog:#?}");
     assert!(!catalog.classes.is_empty());
 }
+
+// The checked-in cap expectations are hand-authored from D0004 rules, not emitted
+// by the composer. Tiny limits make equality and one-unit overflow observable.
+fn cap_file(
+    path: &str,
+    source_bytes: usize,
+    registry_bytes: usize,
+    class: bool,
+) -> baleyg::classes::FileExtraction {
+    let mut definition: baleyg::classes::ClassDefinition = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][0].clone()
+    ).unwrap();
+    definition.symbol.path = path.into();
+    definition.symbol.id = format!("class-{path}");
+    definition.symbol.name = path.trim_end_matches(".java").into();
+    definition.qualified_name = definition.symbol.name.clone();
+    baleyg::classes::FileExtraction {
+        path: path.into(),
+        source_bytes,
+        registry_bytes,
+        warnings: vec![],
+        truncated: false,
+        registry_incomplete: false,
+        classes: if class { vec![definition] } else { vec![] },
+        items: vec![],
+    }
+}
+fn cap_expected(
+    name: &str,
+    files: &[baleyg::classes::FileExtraction],
+    count: usize,
+    symbols: usize,
+    limits: baleyg::classes::Limits,
+) -> Catalog {
+    let actual = Catalog::compose(files, count, symbols, limits).unwrap();
+    let projection = serde_json::json!({
+        "names": actual.classes.iter().map(|c| c.symbol.name.as_str()).collect::<Vec<_>>(),
+        "fields": actual.classes.iter().map(|c| c.fields.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+        "warnings":actual.warnings,"truncated":actual.truncated,
+    });
+    let expected: serde_json::Value = serde_json::from_slice(
+        &fs::read(format!("tests/fixtures/classes/caps/{name}.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(projection, expected, "independent normative fixture {name}");
+    actual
+}
+#[test]
+fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
+    use baleyg::classes::{DetailItem, DetailValue, Limits};
+    let ordinary = Limits::default();
+    let a = cap_file("A.java", 1, 1, true);
+    let b = cap_file("B.java", 1, 1, true);
+    let empty = cap_file("0.java", 1, 1, false);
+    let warned = baleyg::classes::FileExtraction {
+        warnings: vec!["excluded warning".into()],
+        truncated: true,
+        ..b.clone()
+    };
+    let mut limits = ordinary;
+    limits.total_bytes = 1;
+    cap_expected("source-equal", &[a.clone()], 1, 1, limits);
+    let result = cap_expected(
+        "source-over",
+        &[empty.clone(), warned.clone()],
+        2,
+        2,
+        limits,
+    );
+    assert!(!result.warnings.iter().any(|w| w == "excluded warning"));
+    limits = ordinary;
+    limits.registry_text = 1;
+    cap_expected("registry-equal", &[a.clone()], 1, 1, limits);
+    cap_expected(
+        "registry-over",
+        &[empty.clone(), warned.clone()],
+        2,
+        2,
+        limits,
+    );
+    limits = ordinary;
+    limits.classes = 1;
+    cap_expected("classes-equal", &[a.clone()], 1, 1, limits);
+    cap_expected("classes-over", &[a.clone(), b.clone()], 2, 2, limits);
+    let member: baleyg::classes::ClassMember=serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
+    ).unwrap();
+    let mut first = member.clone();
+    first.name = "first".into();
+    let mut second = member;
+    second.name = "second".into();
+    let mut detailed_a = a.clone();
+    detailed_a.items = vec![DetailItem {
+        class_index: 0,
+        records: 1,
+        text: 1,
+        value: DetailValue::Field(first),
+    }];
+    let mut detailed_b = b.clone();
+    detailed_b.items = vec![DetailItem {
+        class_index: 0,
+        records: 1,
+        text: 1,
+        value: DetailValue::Field(second),
+    }];
+    limits = ordinary;
+    limits.records = 2;
+    cap_expected(
+        "records-equal",
+        &[detailed_a.clone(), detailed_b.clone()],
+        2,
+        2,
+        limits,
+    );
+    limits.records = 1;
+    cap_expected(
+        "records-over",
+        &[detailed_a.clone(), detailed_b.clone()],
+        2,
+        2,
+        limits,
+    );
+    limits = ordinary;
+    limits.output_text = 2;
+    cap_expected(
+        "output-equal",
+        &[detailed_a.clone(), detailed_b.clone()],
+        2,
+        2,
+        limits,
+    );
+    limits.output_text = 1;
+    cap_expected("output-over", &[detailed_a, detailed_b], 2, 2, limits);
+    let mut inside = cap_file("A.java", 1, 1, true);
+    let original: baleyg::classes::ClassMember = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
+    ).unwrap();
+    inside.items = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            let mut m = original.clone();
+            m.name = name.into();
+            DetailItem {
+                class_index: 0,
+                records: 1,
+                text: 1,
+                value: DetailValue::Field(m),
+            }
+        })
+        .collect();
+    limits = ordinary;
+    limits.records = 1;
+    cap_expected("records-inside", &[inside.clone(), b.clone()], 2, 2, limits);
+    limits = ordinary;
+    limits.output_text = 1;
+    cap_expected("output-inside", &[inside, b.clone()], 2, 2, limits);
+    limits = ordinary;
+    limits.files = 1;
+    limits.symbols = 1;
+    cap_expected("input-equal", &[a.clone()], 1, 1, limits);
+    cap_expected("input-over", &[a.clone()], 2, 1, limits);
+    limits = ordinary;
+    limits.total_bytes = 2;
+    cap_expected("moving-before", &[a.clone(), b.clone()], 2, 2, limits);
+    let mut grown = a;
+    grown.source_bytes = 2;
+    cap_expected("moving-after", &[grown, b], 2, 2, limits);
+}
+#[test]
+fn warnings_dedupe_at_100_then_append_ordered_closers() {
+    let mut f = cap_file("A.java", 1, 1, true);
+    f.warnings = (0..105).map(|n| format!("warning-{n}")).collect();
+    f.warnings.push("warning-3".into());
+    f.registry_incomplete = true;
+    let c = Catalog::compose(&[f], 1, 1, baleyg::classes::Limits::default()).unwrap();
+    assert_eq!(c.warnings.len(), 102);
+    assert_eq!(c.warnings[0], "warning-0");
+    assert_eq!(c.warnings[99], "warning-99");
+    assert!(c.warnings[100].starts_with("Declared types are terminal"));
+    assert_eq!(
+        c.warnings[101],
+        "Incomplete class declaration registry: some declarations may be absent."
+    );
+}

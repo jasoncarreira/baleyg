@@ -1,0 +1,14 @@
+{
+  "names": [
+    "A"
+  ],
+  "fields": [
+    []
+  ],
+  "warnings": [
+    "Class catalog source limit exceeded (0 MiB)",
+    "Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.",
+    "Incomplete class declaration registry: some declarations may be absent."
+  ],
+  "truncated": true
+}
