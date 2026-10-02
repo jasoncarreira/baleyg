@@ -3248,7 +3248,22 @@ def sink():
         .unwrap();
         assert_eq!(failed["state"], "failed", "{name}: {failed}");
         assert_eq!(failed["error"]["code"], "revision_conflict", "{name}");
-        assert_eq!(real_native_snapshot(&home), native_before, "{name}");
+        // The successful same-byte reindex advanced publication identity. A
+        // stale request must leave that current, fully raw v8 pair untouched.
+        assert_eq!(real_native_snapshot(&home), native_after, "{name}");
+        let unchanged_status: Value = client
+            .get(format!("{url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged_status["revision"], pin,
+            "{name}: current pin changed"
+        );
         drop(server);
     }
 }
