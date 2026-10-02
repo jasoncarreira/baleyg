@@ -1823,7 +1823,7 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
     assert!(error.to_string().contains("revision conflict"), "{error:#}");
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE index_metadata SET extractor_version='native-v4'",
+        "UPDATE index_metadata SET extractor_version='native-v4-class-compose-v1'",
         [],
     )
     .unwrap();
