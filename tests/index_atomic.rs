@@ -197,6 +197,63 @@ fn preexisting_corrupt_index_is_not_reinitialized() {
 }
 
 #[test]
+fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recovery() {
+    use baleyg::{index_coordinator::reconcile_workspace, indexer::IndexOptions};
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    let (state, workspace, store, old_pin, session) = projection_fixture();
+    drop(session);
+    drop(store);
+    let dir = index_dir(state.path());
+    let index = dir.join("index.db");
+    let file = fs::OpenOptions::new().write(true).open(&index).unwrap();
+    file.set_len(128).unwrap();
+    drop(file);
+    let old_bytes = fs::read(&index).unwrap();
+    assert_eq!(&old_bytes[..16], b"SQLite format 3\0");
+    assert!(old_bytes.len() > 20);
+    let old_inode = fs::metadata(&index).unwrap().ino();
+
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(
+        store.status().is_err(),
+        "a damaged published index must not be served"
+    );
+    assert!(
+        store.source_at("flow.js", Some(old_pin)).is_err(),
+        "a damaged source must not be served"
+    );
+    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&index).unwrap().ino(), old_inode);
+    assert!(staged_files(&dir).is_empty());
+
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let failure = reconcile_workspace(&store, &options, &cancelled, |_| {}).unwrap_err();
+    assert!(failure.to_string().contains("cancelled"), "{failure:#}");
+    assert!(store.status().is_err());
+    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&index).unwrap().ino(), old_inode);
+    assert!(staged_files(&dir).is_empty());
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let (recovered, _session) = reconcile_workspace(&store, &options, &ready, |_| {}).unwrap();
+    assert_eq!(recovered.index_revision, 1);
+    assert_ne!(recovered.index_generation, old_pin.index_generation);
+    assert!(store.source_at("flow.js", Some(old_pin)).is_err());
+    assert!(
+        store
+            .source_at("flow.js", Some(recovered))
+            .unwrap()
+            .is_some()
+    );
+    assert!(staged_files(&dir).is_empty());
+}
+
+#[test]
 fn failed_capture_leaves_existing_index_revision_unchanged() {
     use baleyg::{
         indexer::{IndexOptions, index_workspace},
