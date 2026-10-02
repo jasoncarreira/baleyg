@@ -571,11 +571,11 @@ fn cohort72_small_java_python_templates_below_cap() {
     let (_, catalog) = fixture(&[
         (
             "small/java/Csmall0000.java",
-            include_str!("../tools/synthetic-cohorts/templates/small/java.java"),
+            include_str!("fixtures/classes/below-cap/source/small/java/Csmall0000.java"),
         ),
         (
             "small/python/Csmall0000.py",
-            include_str!("../tools/synthetic-cohorts/templates/small/python.py"),
+            include_str!("fixtures/classes/below-cap/source/small/python/Csmall0000.py"),
         ),
     ]);
     assert!(!catalog.truncated, "{catalog:#?}");
