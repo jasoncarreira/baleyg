@@ -39,6 +39,7 @@ fn v8_bootstrap_admits_only_empty_unpublished_evidence() {
     let (state, workspace) = fixture();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert!(store.recorded_index_options().unwrap().is_none());
     assert!(
         store
             .status()
@@ -64,6 +65,31 @@ fn v8_bootstrap_admits_only_empty_unpublished_evidence() {
             .to_string()
             .contains("incompatible_index"),
         "partial v8 bootstrap must fail closed"
+    );
+    assert!(
+        reopened
+            .recorded_index_options()
+            .err()
+            .expect("partial bootstrap cannot become an absent-option fallback")
+            .to_string()
+            .contains("partial v8 bootstrap")
+    );
+}
+
+#[test]
+fn published_v8_missing_reconcile_options_never_looks_like_a_bootstrap() {
+    let (state, _workspace, store, pin, _session) = projection_fixture();
+    assert_eq!(store.status().unwrap().revision, pin);
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    db.execute("UPDATE index_metadata SET reconcile_options=NULL", [])
+        .unwrap();
+    assert!(
+        store
+            .recorded_index_options()
+            .err()
+            .expect("published v8 cannot omit recorded options")
+            .to_string()
+            .contains("missing reconcile options")
     );
 }
 

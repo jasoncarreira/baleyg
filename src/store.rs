@@ -3474,13 +3474,27 @@ impl Store {
         &self.workspace_root
     }
     pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
-        let db = self.cache()?;
+        let mut db = self.cache()?;
+        let tx = storage_result(db.transaction())?;
         let schema: u32 =
-            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+            storage_result(tx.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         if schema != DATABASE_SCHEMA_VERSION {
             return Ok(None);
         }
-        let payload: Option<String> = storage_result(db.query_row(
+        // One snapshot must bind the shape, revision and options. A fresh v8
+        // bootstrap has no options or evidence; a published revision never may.
+        validate_cache_shape(&tx)?;
+        self.verify_metadata_root(&tx)?;
+        let revision: i64 = storage_result(tx.query_row(
+            "SELECT index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        ))?;
+        if revision == 0 {
+            validate_v8_bootstrap(&tx)?;
+            return Ok(None);
+        }
+        let payload: Option<String> = storage_result(tx.query_row(
             "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
             [],
             |row| row.get(0),

@@ -2287,6 +2287,37 @@ fn decoded_jev_rows(export: &Value, table: &str) -> Vec<Value> {
         .collect()
 }
 
+fn assert_native_version_witness(native: &Value, version_id: &Value, path: &str, language: &str) {
+    let versions: Vec<_> = native["allRows"]["document_versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[0] == *version_id)
+        .collect();
+    assert_eq!(
+        versions.len(),
+        1,
+        "one authenticated document version for {path}"
+    );
+    assert_eq!(versions[0][1], native["sourceSet"]["id"]);
+    assert_eq!(versions[0][2], language);
+    assert_eq!(versions[0][3], path);
+    let manifests: Vec<_> = native["allRows"]["revision_documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[4] == *version_id && row[3] == path)
+        .collect();
+    assert_eq!(
+        manifests.len(),
+        1,
+        "one admitted revision document for {path}"
+    );
+    assert_eq!(manifests[0][0], native["revision"]["id"]);
+    assert_eq!(manifests[0][1], native["sourceSet"]["id"]);
+    assert_eq!(manifests[0][2], language);
+}
+
 fn assert_fixture_declaration(
     native: &Value,
     symbol: &Value,
@@ -2296,36 +2327,36 @@ fn assert_fixture_declaration(
     owner: Option<&str>,
     source: &str,
 ) {
-    let matching: Vec<_> = native["allRows"]["native_declarations"]
+    let matching: Vec<_> = native["allRows"]["native_version_declarations"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|row| row[0] == symbol["id"])
+        .filter(|row| row[1] == symbol["id"])
         .collect();
     assert_eq!(matching.len(), 1, "one native declaration for {name}");
     let row = matching[0];
     assert_eq!(symbol["name"], name);
     assert_eq!(symbol["path"], path);
     assert_eq!(symbol["parent"], serde_json::json!(owner));
+    let documents: Vec<_> = native["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|doc| doc["path"] == path)
+        .collect();
+    assert_eq!(documents.len(), 1, "one captured source for {path}");
+    let language = documents[0]["language"].as_str().unwrap();
+    assert_native_version_witness(native, &row[0], path, language);
+    assert_eq!(row[2], serde_json::json!(owner), "{name}: native owner");
+    assert_eq!(row[3], kind, "{name}: native declaration kind");
+    assert_eq!(row[4], name, "{name}: native measured name");
     assert_eq!(
-        row[1], native["sourceSet"]["id"],
-        "{name}: native declaration source set"
-    );
-    assert_eq!(row[3], path, "{name}: native document path");
-    assert_eq!(
-        row[4], native["revision"]["id"],
-        "{name}: native declaration revision"
-    );
-    assert_eq!(row[5], serde_json::json!(owner), "{name}: native owner");
-    assert_eq!(row[6], kind, "{name}: native declaration kind");
-    assert_eq!(row[7], name, "{name}: native measured name");
-    assert_eq!(
-        row[13], symbol["range"]["startByte"],
+        row[10], symbol["range"]["startByte"],
         "{name}: native start"
     );
-    assert_eq!(row[14], symbol["range"]["endByte"], "{name}: native end");
-    let start = row[13].as_u64().unwrap() as usize;
-    let end = row[14].as_u64().unwrap() as usize;
+    assert_eq!(row[11], symbol["range"]["endByte"], "{name}: native end");
+    let start = row[10].as_u64().unwrap() as usize;
+    let end = row[11].as_u64().unwrap() as usize;
     assert!(
         source
             .get(start..end)
@@ -2909,7 +2940,9 @@ def sink():
                 "{name}: sequence selected wrong seed"
             );
             let graph_calls = graph_after["calls"].as_array().unwrap();
-            let native_calls = native_after["allRows"]["native_calls"].as_array().unwrap();
+            let native_calls = native_after["allRows"]["native_version_calls"]
+                .as_array()
+                .unwrap();
             assert_eq!(
                 graph_calls.len(),
                 1,
@@ -2930,24 +2963,15 @@ def sink():
             assert_eq!(call["calleeText"], "sink", "{name}: measured call spelling");
             assert_eq!(call["range"]["startByte"], expected_start, "{name}");
             assert_eq!(call["range"]["endByte"], expected_end, "{name}");
+            assert_native_version_witness(&native_after, &native_call[0], file, name);
             assert_eq!(
-                native_call[0], call["id"],
+                native_call[1], call["id"],
                 "{name}: same measured native call ID"
             );
-            assert_eq!(native_call[1], seed, "{name}: native call owner");
-            assert_eq!(
-                native_call[3], native_after["sourceSet"]["id"],
-                "{name}: call source set"
-            );
-            assert_eq!(
-                native_call[6], native_after["revision"]["id"],
-                "{name}: call revision"
-            );
-            assert_eq!(native_call[4], name, "{name}: native language");
-            assert_eq!(native_call[5], file, "{name}: native call path");
-            assert_eq!(native_call[7], expected_start, "{name}: native start byte");
-            assert_eq!(native_call[8], expected_end, "{name}: native end byte");
-            assert_eq!(native_call[11], "sink", "{name}: native callee spelling");
+            assert_eq!(native_call[2], seed, "{name}: native call owner");
+            assert_eq!(native_call[4], expected_start, "{name}: native start byte");
+            assert_eq!(native_call[5], expected_end, "{name}: native end byte");
+            assert_eq!(native_call[8], "sink", "{name}: native callee spelling");
             fn measured_steps(
                 steps: &[Value],
                 file: &str,
@@ -2978,7 +3002,7 @@ def sink():
                         assert_eq!(step["path"], call["path"]);
                         assert_eq!(step["range"], call["range"]);
                         assert!(
-                            native.iter().any(|row| row[0] == id),
+                            native.iter().any(|row| row[1] == id),
                             "native call ID absent: {id}"
                         );
                         seen.push(id.to_owned());
@@ -3991,7 +4015,7 @@ async fn saved_items_real_index_matrix() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(index_version, 7, "derived index inspection is separate");
+    assert_eq!(index_version, 8, "derived index inspection is separate");
 
     let edited_view_body = serde_json::json!({
         "id":"real-view","title":"Edited","query":{"seed":seed}
