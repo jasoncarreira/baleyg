@@ -662,7 +662,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
         native_error.to_string().contains("incompatible_index")
             && native_error
                 .to_string()
-                .contains("native source hash mismatch"),
+                .contains("incompatible_index: selected evidence decode failed: incompatible_index: source hash mismatch"),
         "{native_error:#}"
     );
     let closed = native_clone.source_at("Large.java", None).unwrap_err();
