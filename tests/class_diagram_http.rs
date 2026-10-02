@@ -1201,3 +1201,64 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     assert_eq!(store.status().unwrap().revision, pin);
     assert_eq!(clone.status().unwrap().revision, pin);
 }
+
+#[tokio::test]
+async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() {
+    let (dir, store, graph, app, _session) = setup();
+    let pin = store.status().unwrap().revision;
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let (state, stored): (String, String) = db.query_row(
+        "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.graph_projection_id=g.id WHERE m.path='Types.java'",
+        [], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).unwrap();
+    assert_eq!(state, "ready");
+    let file = graph.files.iter().find(|f| f.path == "Types.java").unwrap();
+    let expected = baleyg::classes::FileExtraction::extract_file(
+        file,
+        &graph.nodes,
+        &cancel(),
+        baleyg::classes::Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<baleyg::classes::FileExtraction>(&stored).unwrap(),
+        expected
+    );
+    let source = format!("/api/source?path=Types.java&{}", pin_query(pin));
+    let classes = format!("/api/classes?path=Types.java&{}", pin_query(pin));
+    assert_eq!(call(&app, "GET", &source, Value::Null).await.0, 200);
+    assert_eq!(call(&app, "GET", &classes, Value::Null).await.0, 200);
+    let (_,unrelated): (String,Option<String>)=db.query_row(
+        "SELECT class_extraction_state,class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.graph_projection_id=g.id WHERE m.path='unsupported.js'",
+        [],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert!(unrelated.is_none());
+    db.execute(
+        "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.sourceBytes',0) WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
+        [],
+    ).unwrap();
+    for path in [&source, &classes] {
+        let (status, value) = call(&app, "GET", path, Value::Null).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
+        assert_eq!(value["error"]["code"], "incompatible_index");
+        assert!(!value.to_string().contains("class A extends B"));
+    }
+}
+
+#[tokio::test]
+async fn selected_class_relation_rows_are_witnessed_by_source_and_graph() {
+    let (dir, store, graph, app, _session) = setup();
+    let pin = store.status().unwrap().revision;
+    let seed = id(&graph, "A");
+    let class_url = format!("/api/classes?{}&q=A", pin_query(pin));
+    let (_, baseline) = call(&app, "GET", &class_url, Value::Null).await;
+    assert_eq!(baseline["items"][0]["symbol"]["name"], "A");
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    assert_eq!(db.execute(
+        "UPDATE class_relations SET payload=json_set(payload,'$.typeName','Forged') WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='Types.java') AND id=(SELECT min(id) FROM class_relations WHERE owner=?1)",
+        [&seed],
+    ).unwrap(),1);
+    let (status, value) = call(&app, "GET", &class_url, Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["error"]["code"], "incompatible_index");
+    assert!(!value.to_string().contains("Forged"));
+}
