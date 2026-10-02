@@ -927,7 +927,7 @@ fn tiny_limits_control_measured_names_import_bindings_and_type_parameter_details
     let clipped = extract("A.java", long_name, short_text);
     assert!(clipped.registry_incomplete);
     assert!(clipped.classes.is_empty());
-    assert_eq!(clipped.warnings, ["A."]);
+    assert_eq!(clipped.warnings, ["Cl", "A."]);
 
     let import = "import verylongpackage.B; class A { B field; }";
     assert!(!extract("A.java", import, default).registry_incomplete);
