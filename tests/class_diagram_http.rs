@@ -1233,9 +1233,17 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() 
         [],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert!(unrelated.is_none());
     db.execute(
-        "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.sourceBytes',0) WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
+        "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.source_bytes',0) WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
         [],
     ).unwrap();
+    let mutated: String = db.query_row(
+        "SELECT class_extraction_payload FROM graph_projections WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
+        [], |r| r.get(0),
+    ).unwrap();
+    let changed: baleyg::classes::FileExtraction = serde_json::from_str(&mutated).unwrap();
+    assert!(expected.source_bytes > 0);
+    assert_eq!(changed.source_bytes, 0);
+    assert_ne!(changed, expected);
     for path in [&source, &classes] {
         let (status, value) = call(&app, "GET", path, Value::Null).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
