@@ -1438,3 +1438,234 @@ async fn changed_captured_class_scip_label_recomputes_f_and_new_revision_class_p
         assert_eq!(status, StatusCode::OK, "{source}");
     }
 }
+
+#[tokio::test]
+async fn normal_size_captured_java_python_cold_oracle_attests_full_published_catalog() {
+    use baleyg::{
+        classes::{Catalog, FileExtraction, Limits},
+        indexer::index_workspace_bundle,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    for (path, source) in [
+        (
+            "small/java/Csmall0000.java",
+            include_str!("fixtures/classes/below-cap/source/small/java/Csmall0000.java"),
+        ),
+        (
+            "small/python/Csmall0000.py",
+            include_str!("fixtures/classes/below-cap/source/small/python/Csmall0000.py"),
+        ),
+    ] {
+        let target = workspace.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, source).unwrap();
+    }
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let session = store.leader_session().unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let cancel = cancel();
+    let (published_graph, published_native, authenticated_capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    assert_eq!(authenticated_capture.files.len(), 2);
+    let pin = store
+        .publish_native(
+            &published_graph,
+            &authenticated_capture,
+            &published_native,
+            session.leader_guard().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(pin.index_revision, 1);
+
+    // This is a second, isolated cold admission/extraction. Its only inputs are
+    // the captured source bytes and a freshly measured native graph; never the
+    // persisted graph, class rows, or F. Compare both immutable captures first.
+    let (cold_graph, cold_native, cold_capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    cold_capture.verify(&cancel).unwrap();
+    assert_eq!(cold_capture.files, authenticated_capture.files);
+    assert_eq!(cold_capture.hashes, authenticated_capture.hashes);
+    assert!(!cold_native.declarations.is_empty());
+    assert!(!cold_graph.nodes.is_empty());
+    let mut cold_f = Vec::new();
+    for file in &cold_capture.files {
+        cold_f.push(
+            FileExtraction::extract_file(file, &cold_graph.nodes, &cancel, Limits::default())
+                .unwrap(),
+        );
+    }
+    let cold_catalog = Catalog::compose(
+        &cold_f,
+        cold_capture.files.len(),
+        cold_graph.nodes.len(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(!cold_catalog.classes.is_empty());
+    assert!(!cold_catalog.truncated);
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let revision_id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+    for (file, extraction) in cold_capture.files.iter().zip(&cold_f) {
+        let (state, payload): (String, String) = db.query_row(
+            "SELECT g.class_extraction_state,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2",
+            rusqlite::params![revision_id, file.path], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, "ready");
+        assert_eq!(
+            payload.as_bytes(),
+            serde_json::to_vec(extraction).unwrap(),
+            "cold F: {}",
+            file.path
+        );
+        let (_, selected) = store.source_at(&file.path, Some(pin)).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_vec(&selected).unwrap(),
+            serde_json::to_vec(file).unwrap()
+        );
+        let stored_nodes = db.prepare(
+            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path=?2 ORDER BY n.id"
+        ).unwrap().query_map(rusqlite::params![revision_id, file.path], |r| r.get::<_, String>(0))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let mut measured_nodes: Vec<_> = cold_graph
+            .nodes
+            .iter()
+            .filter(|node| node.path == file.path)
+            .collect();
+        measured_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            stored_nodes.len(),
+            measured_nodes.len(),
+            "measured graph: {}",
+            file.path
+        );
+        for (stored, measured) in stored_nodes.iter().zip(measured_nodes) {
+            assert_eq!(
+                stored.as_bytes(),
+                serde_json::to_vec(measured).unwrap(),
+                "measured node: {}",
+                file.path
+            );
+        }
+    }
+    let stored_classes = db.prepare(
+        "SELECT c.payload FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 ORDER BY c.path,json_extract(c.payload,'$.symbol.range.startByte'),c.id"
+    ).unwrap().query_map([&revision_id], |r| r.get::<_, String>(0))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(stored_classes.len(), cold_catalog.classes.len());
+    for (stored, cold) in stored_classes.iter().zip(&cold_catalog.classes) {
+        assert_eq!(
+            stored.as_bytes(),
+            serde_json::to_vec(cold).unwrap(),
+            "full class row: {}",
+            cold.symbol.path
+        );
+    }
+    let stored_relations = db.prepare(
+        "SELECT r.payload FROM class_relations r JOIN revision_documents m ON m.class_projection_id=r.projection_id WHERE m.revision_id=?1 ORDER BY json_extract(r.payload,'$.path'),json_extract(r.payload,'$.range.startByte'),r.id"
+    ).unwrap().query_map([&revision_id], |r| r.get::<_, String>(0))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(stored_relations.len(), cold_catalog.relations.len());
+    for (stored, cold) in stored_relations.iter().zip(&cold_catalog.relations) {
+        assert_eq!(
+            stored.as_bytes(),
+            serde_json::to_vec(cold).unwrap(),
+            "full relation row: {}",
+            cold.path
+        );
+    }
+    let (warnings, truncated): (String, bool) = db
+        .query_row(
+            "SELECT class_warnings,class_truncated FROM native_revisions WHERE id=?1",
+            [&revision_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        warnings.as_bytes(),
+        serde_json::to_vec(&cold_catalog.warnings).unwrap()
+    );
+    assert_eq!(truncated, cold_catalog.truncated);
+    let full_published = Catalog {
+        classes: stored_classes
+            .iter()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect(),
+        relations: stored_relations
+            .iter()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect(),
+        warnings: serde_json::from_str(&warnings).unwrap(),
+        truncated,
+    };
+    assert_eq!(
+        serde_json::to_vec(&full_published).unwrap(),
+        serde_json::to_vec(&cold_catalog).unwrap()
+    );
+
+    let app = http::router(
+        http::new(
+            store.clone(),
+            options,
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    for file in &cold_capture.files {
+        let (status, source) = call(
+            &app,
+            "GET",
+            &format!("/api/source?path={}&{}", file.path, pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{source}");
+        assert_eq!(source["revision"], json!(pin));
+        assert_eq!(source["file"], json!(file));
+        let (status, page) = call(
+            &app,
+            "GET",
+            &format!("/api/classes?path={}&{}", file.path, pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let expected: BTreeMap<_, _> = cold_catalog
+            .classes
+            .iter()
+            .filter(|c| c.symbol.path == file.path)
+            .map(|c| (c.symbol.id.clone(), json!(c)))
+            .collect();
+        let selected: BTreeMap<_, _> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["symbol"]["id"].as_str().unwrap().to_owned(), c.clone()))
+            .collect();
+        assert_eq!(selected, expected, "selected full classes: {}", file.path);
+        assert_eq!(page["warnings"], json!(cold_catalog.warnings));
+        assert_eq!(page["truncated"], json!(cold_catalog.truncated));
+        let first = cold_graph
+            .nodes
+            .iter()
+            .find(|n| n.path == file.path && n.kind == SymbolKind::Class)
+            .unwrap();
+        let (status, symbol) = call(
+            &app,
+            "GET",
+            &format!("/api/symbol?id={}&{}", first.id, pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{symbol}");
+        assert_eq!(
+            symbol["symbol"],
+            json!(first),
+            "selected fresh native graph: {}",
+            file.path
+        );
+    }
+}
