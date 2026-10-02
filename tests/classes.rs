@@ -889,3 +889,134 @@ fn class_registry_import_charge_tiny_native_pilot() {
         );
     }
 }
+
+#[test]
+#[ignore = "resource pilot; requires a one-use 300s grant"]
+fn class_registry_import_charge_one_file_pilot() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        store::topology::WorkspaceIdentity,
+    };
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path();
+    eprintln!(
+        "{}",
+        serde_json::json!({"pilot":"class-registry-one-file","stage":"allocated",
+        "workspace":workspace.display().to_string()})
+    );
+    std::io::Write::flush(&mut std::io::stderr()).unwrap();
+    let line = format!("import {}.{};\n", "p".repeat(1023), "c".repeat(1024));
+    let long = line.repeat(1018);
+    let short = |prefix| format!("import {}.{};\n", "p".repeat(prefix), "c".repeat(60));
+    let selected = "class Selected {}\n";
+    assert_eq!(line.len(), 2057);
+    assert_eq!(long.len(), 2_094_026);
+    assert_eq!(long.lines().count(), 1018);
+    assert_eq!(
+        hex::encode(Sha256::digest(long.as_bytes())),
+        "58ef1b69f8fbd1d35859a01554980313419a5fdd604c948f0e5e1dab526f8a6f"
+    );
+    assert_eq!(
+        (short(100).len(), short(101).len(), selected.len()),
+        (170, 171, 18)
+    );
+    fs::write(workspace.join("a00.java"), &long).unwrap();
+    fs::write(workspace.join("z.java"), selected).unwrap();
+    let identity = WorkspaceIdentity::discover(Some(workspace), workspace).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let mut selected_id = None;
+    for prefix in [100, 101] {
+        let short = short(prefix);
+        fs::write(workspace.join("a01.java"), &short).unwrap();
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(workspace.to_owned()),
+            &identity.record_id,
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(graph.files.len(), 3);
+        assert_eq!(native.revision.documents.len(), 3);
+        assert_eq!(native.coverage.len(), 3);
+        assert!(
+            native.coverage.iter().all(|c| c.state == "complete"),
+            "{:#?}",
+            native.coverage
+        );
+        assert_eq!(native.declarations.len(), 4);
+        assert_eq!(graph.nodes.len(), 4);
+        let measured: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|s| {
+                s.path == "z.java"
+                    && s.name == "Selected"
+                    && s.kind == baleyg::model::SymbolKind::Class
+            })
+            .collect();
+        assert_eq!(measured.len(), 1);
+        let symbol = measured[0];
+        if let Some(id) = &selected_id {
+            assert_eq!(id, &symbol.id, "unchanged class ID");
+        }
+        selected_id = Some(symbol.id.clone());
+        let qualified = &symbol.name;
+        let selected_charge = symbol.id.len()
+            + symbol.name.len()
+            + symbol.path.len()
+            + qualified.len()
+            + symbol.name.len()
+            + qualified.len();
+        assert_eq!(selected_charge, 77);
+        let expected = [
+            ("a00.java", long.len(), 1018 * 3072),
+            ("a01.java", short.len(), 60 + (prefix + 1 + 60)),
+            ("z.java", selected.len(), selected_charge),
+        ];
+        let mut witnessed = Vec::new();
+        for (path, size, charge) in expected {
+            let file = graph.files.iter().find(|f| f.path == path).unwrap();
+            let captured = capture.files.iter().find(|f| f.path == path).unwrap();
+            let bytes = fs::read(workspace.join(path)).unwrap();
+            let sha = hex::encode(Sha256::digest(&bytes));
+            assert_eq!(bytes.len(), size);
+            assert_eq!(file.hash, sha);
+            assert_eq!(captured.hash, sha);
+            assert_eq!(captured.text.as_bytes(), bytes);
+            let doc = native
+                .revision
+                .documents
+                .iter()
+                .find(|d| d.key.path == path)
+                .unwrap();
+            assert_eq!(
+                (doc.content_hash.as_str(), doc.byte_length),
+                (sha.as_str(), size)
+            );
+            let f = baleyg::classes::FileExtraction::extract_file(
+                file,
+                &graph.nodes,
+                &cancel,
+                baleyg::classes::Limits::default(),
+            )
+            .unwrap();
+            assert_eq!((f.source_bytes, f.registry_bytes), (size, charge), "{path}");
+            assert!(
+                !f.truncated && !f.registry_incomplete && f.warnings.is_empty(),
+                "{path}: {f:#?}"
+            );
+            witnessed.push(
+                serde_json::json!({"path":path,"sourceBytes":size,"sha256":sha,
+                "registryBytes":charge}),
+            );
+        }
+        println!(
+            "{}",
+            serde_json::json!({"pilot":"class-registry-one-file","prefixBytes":prefix,
+            "workspace":workspace.display().to_string(),"files":witnessed,
+            "nativeDocuments":native.revision.documents.len(),"nativeDeclarations":native.declarations.len(),
+            "graphNodes":graph.nodes.len(),"selectedSymbolId":symbol.id,"selectedIdBytes":symbol.id.len()})
+        );
+    }
+}
