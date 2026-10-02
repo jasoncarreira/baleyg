@@ -70,6 +70,19 @@ impl IndexJobCoordinator {
         indexer::measure_captured_change(previous, current)
     }
 
+    /// The staged selected-native result is nonpublishable. Only a later delta writer
+    /// can use it after comparing authenticated prior versions; run() still builds full.
+    pub fn staged_capture_measurement(
+        previous: &Capture,
+        current: &Capture,
+        root: &std::path::Path,
+        root_id: &str,
+        cancel: &CancelFlag,
+        on_extract: impl FnMut(&crate::native_evidence::DocumentKey),
+    ) -> Result<indexer::StagedNativeMeasurement> {
+        indexer::measure_captured_native_change(previous, current, root, root_id, cancel, on_extract)
+    }
+
     /// Projection uses the admitted bytes; publication checks drift, cancellation and the
     /// whole expected pair under the writer lock before making graph and native rows visible.
     pub fn run(

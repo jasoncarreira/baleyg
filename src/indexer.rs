@@ -498,8 +498,8 @@ pub fn measure_captured_change(previous: &Capture, current: &Capture) -> Capture
     measure_captured_change_observed(previous, current, |_| {})
 }
 
-/// Observer is called exclusively for the changed document's native-measurement
-/// candidate. It lets tests assert that no unrelated lookup owner was visited.
+/// Classifier candidate callback only. This is NOT a native extraction witness;
+/// the separate selected native stage observes only after successful assembly.
 pub fn measure_captured_change_observed(
     previous: &Capture,
     current: &Capture,
@@ -512,31 +512,15 @@ pub fn measure_captured_change_observed(
             reason: "capture admission changed",
         };
     }
-    let optional = [
-        old_options.scip_path.as_deref(),
-        old_options.manifest_path.as_deref(),
-    ];
-    let native_inputs = |capture: &Capture| {
-        capture
-            .admitted_inputs()
-            .filter(|(path, _)| {
-                !optional
-                    .into_iter()
-                    .flatten()
-                    .any(|name| *path == Path::new(name))
-            })
-            .map(|(path, bytes)| {
-                let digest = bytes.map(|bytes| {
-                    capture
-                        .executable_digest(path)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| hex::encode(Sha256::digest(bytes)))
-                });
-                (path.to_owned(), digest)
-            })
-            .collect::<BTreeMap<_, _>>()
+    let (Ok(previous_native), Ok(current_native)) = (
+        previous.native_input_fingerprints(),
+        current.native_input_fingerprints(),
+    ) else {
+        return CapturedChange::FullNative {
+            reason: "native input authentication unavailable",
+        };
     };
-    if native_inputs(previous) != native_inputs(current) {
+    if previous_native != current_native {
         return CapturedChange::FullNative {
             reason: "captured native input changed",
         };
@@ -585,6 +569,34 @@ pub fn measure_captured_change_observed(
             }
         }
     }
+}
+
+/// Actual selected-document native measurement for a proved local change. The
+/// unchanged full publication path remains separate and still assembles all files.
+#[derive(Debug)]
+pub struct StagedNativeMeasurement {
+    pub decision: CapturedChange,
+    pub selected: Option<native_evidence::SelectedDocument>,
+}
+
+pub fn measure_captured_native_change(
+    previous: &Capture,
+    current: &Capture,
+    root: &Path,
+    root_id: &str,
+    cancel: &CancelFlag,
+    on_extract: impl FnMut(&native_evidence::DocumentKey),
+) -> Result<StagedNativeMeasurement> {
+    let decision = measure_captured_change(previous, current);
+    let selected = match &decision {
+        CapturedChange::DocumentLocal { path } => Some(
+            native_evidence::measure_captured_document(
+                current, root, root_id, path, cancel, on_extract,
+            )?,
+        ),
+        _ => None,
+    };
+    Ok(StagedNativeMeasurement { decision, selected })
 }
 
 /// Fingerprints are internal reuse *conditions*, not a new public source of authority.

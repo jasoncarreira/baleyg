@@ -381,7 +381,13 @@ pub fn from_capture(
     Ok(artifact)
 }
 
-fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
+/// The full captured revision header is shared by full and selected measurement.
+/// Selecting one file must never change the source-set, producer or revision ID.
+fn build_native_header<'a>(
+    capture: &'a Capture,
+    root: &Path,
+    root_id: &str,
+) -> Result<(Artifact, Vec<&'a SourceFile>)> {
     text(root_id)?;
     let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root)?;
     ensure!(
@@ -475,7 +481,7 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
         config_hash: hash(&canonical(&json!(config))),
         dependency_hash: hash(&canonical(&json!(dependencies))),
     };
-    let mut artifact = Artifact {
+    let artifact = Artifact {
         producer,
         source_set,
         revision,
@@ -485,11 +491,84 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
         calls: vec![],
         control_regions: vec![],
     };
+    Ok((artifact, files))
+}
+
+fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
+    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
     let mut ids = IdentityRegistry::default();
     for f in files {
         extract(&mut artifact, f, &mut ids)?;
     }
     Ok(artifact)
+}
+
+/// Native facts for exactly one document of the full admitted revision. This is not
+/// an Artifact and cannot be passed to the v8 publisher or full-bundle validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedDocument {
+    pub producer: Producer,
+    pub source_set: SourceSet,
+    pub revision: Revision,
+    pub document: Document,
+    pub coverage: Coverage,
+    pub provenance: Provenance,
+    pub declarations: Vec<Declaration>,
+    pub calls: Vec<Call>,
+    pub control_regions: Vec<ControlRegion>,
+}
+
+/// Extract only the selected admitted source; all header fields retain the full
+/// captured snapshot identity. `on_extract` attests successful real native assembly,
+/// not a classifier candidate or a full-bundle parse.
+pub(crate) fn measure_captured_document(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    path: &str,
+    cancel: &CancelFlag,
+    mut on_extract: impl FnMut(&DocumentKey),
+) -> Result<SelectedDocument> {
+    capture.verify(cancel)?;
+    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
+    let selected: Vec<_> = files.into_iter().filter(|file| file.path == path).collect();
+    ensure!(selected.len() == 1, "selected native source must be unique and admitted");
+    let file = selected[0];
+    ensure!(capture.hashes.get(path) == Some(&file.hash)
+        && file.hash == hash(file.text.as_bytes()),
+        "selected native source bytes/hash mismatch");
+    let documents: Vec<_> = artifact.revision.documents.iter()
+        .filter(|document| document.key.path == path).cloned().collect();
+    ensure!(documents.len() == 1, "selected native revision document must be unique");
+    let document = documents[0].clone();
+    ensure!(document.key.source_set_id == artifact.source_set.id
+        && document.key.language == file.language
+        && document.content_hash == file.hash
+        && document.byte_length == file.text.len()
+        && document.revision_id == artifact.revision.id,
+        "selected native document not bound to full capture");
+    let mut ids = IdentityRegistry::default();
+    extract(&mut artifact, file, &mut ids)?;
+    ensure!(artifact.coverage.len() == 1 && artifact.provenance.len() == 1
+        && artifact.coverage[0].document_path == path
+        && artifact.provenance[0].document == document.key
+        && artifact.declarations.iter().all(|row| row.document == document.key)
+        && artifact.calls.iter().all(|row| row.document == document.key)
+        && artifact.control_regions.iter().all(|row| row.document == document.key),
+        "selected native facts escaped the admitted document");
+    capture.verify(cancel)?;
+    on_extract(&document.key);
+    Ok(SelectedDocument {
+        producer: artifact.producer,
+        source_set: artifact.source_set,
+        revision: artifact.revision,
+        document,
+        coverage: artifact.coverage.remove(0),
+        provenance: artifact.provenance.remove(0),
+        declarations: artifact.declarations,
+        calls: artifact.calls,
+        control_regions: artifact.control_regions,
+    })
 }
 
 fn kind(lang: &str, n: Node<'_>) -> Option<&'static str> {
