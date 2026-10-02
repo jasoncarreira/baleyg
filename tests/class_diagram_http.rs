@@ -1985,3 +1985,236 @@ async fn class_registry_text_selected_tamper_pilot() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "5000 Java class Store/HTTP scale pilot; requires explicit resource grant"]
+async fn class_declaration_limit_six_document_pilot() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let state = dir.path().join("state");
+    eprintln!(
+        "{}",
+        json!({"pilot":"class-declarations-six-document","stage":"allocated",
+        "temp":dir.path().display().to_string(),"workspace":workspace.display().to_string(),
+        "state":state.display().to_string()})
+    );
+    std::io::Write::flush(&mut std::io::stderr()).unwrap();
+    std::fs::create_dir(&workspace).unwrap();
+    let java = |file, count| {
+        (0..count)
+            .map(|index| format!("class A{file:02}_{index:04} {{}}\n"))
+            .collect::<String>()
+    };
+    let hashes = [
+        "33c7ed9b5733c26dc68c8af77db1e98bdafeb952e93af7480b063c1a04da0dc3",
+        "b3a4c72d612f043dd66165d207d42bb56b448b447d38b52aa7161fc2d2208dfc",
+        "8226459f1f81fde5d8a1dd77fde66ce9244a480227582c58c95c191ec1ed7dd6",
+        "23a37cf8aacb676f1a5e05baa2dd03f2cebd5a9517674c645f884398c1af53c0",
+    ];
+    for (index, expected_hash) in hashes.iter().enumerate() {
+        let source = java(index, 1000);
+        assert_eq!((source.len(), source.lines().count()), (18000, 1000));
+        assert_eq!(
+            hex::encode(Sha256::digest(source.as_bytes())),
+            *expected_hash
+        );
+        std::fs::write(workspace.join(format!("a{index:02}.java")), source).unwrap();
+    }
+    let selected = "class Selected {}\n";
+    assert_eq!(
+        hex::encode(Sha256::digest(selected.as_bytes())),
+        "ed4b90f6df47e5727ff3c68e3a3d95cae670daa9dc621b4b464d814599e104cf"
+    );
+    std::fs::write(workspace.join("z.java"), selected).unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let store = common::open_store(&state, &workspace).unwrap();
+    let session = store.leader_session().unwrap();
+    let mut previous = None;
+    for count in [999, 1000] {
+        let changing = java(4, count);
+        let expected_hash = if count == 999 {
+            "d569e1d49116a3d87d93c3e1966f667a193269ed87d614ffdfea5bbcae233867"
+        } else {
+            "2a20d4202d344b85c7fd0d5d5aefffbb4bc04ba8f45face5e066edabcc89b3b0"
+        };
+        assert_eq!(
+            (changing.len(), changing.lines().count()),
+            (count * 18, count)
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(changing.as_bytes())),
+            expected_hash
+        );
+        std::fs::write(workspace.join("a04.java"), changing).unwrap();
+        let (graph, native, capture) =
+            baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel(), |_| {})
+                .unwrap();
+        assert_eq!(graph.files.len(), 6);
+        assert_eq!(native.revision.documents.len(), 6);
+        assert_eq!(native.coverage.len(), 6);
+        assert!(native.coverage.iter().all(|c| c.state == "complete"));
+        assert_eq!(native.declarations.len(), count + 4007);
+        assert_eq!(graph.nodes.len(), count + 4007);
+        let expected_total = 4 * 18000 + count * 18 + 18;
+        assert_eq!(
+            graph.files.iter().map(|f| f.text.len()).sum::<usize>(),
+            expected_total
+        );
+        assert_eq!(expected_total, 90000 + (count - 999) * 18);
+        let symbol = graph
+            .nodes
+            .iter()
+            .find(|s| s.path == "z.java" && s.name == "Selected" && s.kind == SymbolKind::Class)
+            .unwrap();
+        let mut charges = 0usize;
+        let mut witness = Vec::new();
+        for file in &graph.files {
+            let (length, classes, registry) = if file.path == "z.java" {
+                (18, 1, 77)
+            } else if file.path == "a04.java" {
+                (count * 18, count, count * 79)
+            } else {
+                (18000, 1000, 79000)
+            };
+            let bytes = std::fs::read(workspace.join(&file.path)).unwrap();
+            let digest = hex::encode(Sha256::digest(&bytes));
+            assert_eq!(bytes.len(), length);
+            assert_eq!(file.hash, digest);
+            let captured = capture.files.iter().find(|f| f.path == file.path).unwrap();
+            let doc = native
+                .revision
+                .documents
+                .iter()
+                .find(|d| d.key.path == file.path)
+                .unwrap();
+            assert_eq!(
+                (
+                    captured.hash.as_str(),
+                    doc.content_hash.as_str(),
+                    doc.byte_length
+                ),
+                (digest.as_str(), digest.as_str(), length)
+            );
+            let f = baleyg::classes::FileExtraction::extract_file(
+                file,
+                &graph.nodes,
+                &cancel(),
+                baleyg::classes::Limits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                (f.source_bytes, f.registry_bytes, f.classes.len()),
+                (length, registry, classes)
+            );
+            assert!(
+                !f.truncated && !f.registry_incomplete && f.warnings.is_empty(),
+                "{}: {f:#?}",
+                file.path
+            );
+            charges += registry;
+            witness.push(json!({"path":file.path,"bytes":length,"sha256":digest,
+                "classes":classes,"registryBytes":registry}));
+        }
+        assert_eq!(charges, 394_998 + (count - 999) * 79);
+        let cold = baleyg::classes::Catalog::build(&graph.files, &graph.nodes, &cancel()).unwrap();
+        assert_eq!(cold.classes.len(), count + 4001);
+        assert!(!cold.truncated);
+        assert_eq!(cold.warnings.len(), 1);
+        assert!(cold.warnings[0].starts_with("Declared types are terminal source text"));
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel(),
+            )
+            .unwrap();
+        assert_eq!(pin.index_revision, if count == 999 { 1 } else { 2 });
+        let db = rusqlite::Connection::open(index_db(&state)).unwrap();
+        let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        let ready:i64=db.query_row("SELECT count(*) FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=?1 AND g.class_extraction_state='ready' AND g.class_extraction_payload IS NOT NULL",[&key],|r|r.get(0)).unwrap();
+        assert_eq!(ready, 6);
+        let (version_id,graph_id,class_id,payload):(String,String,String,String)=db.query_row(
+            "SELECT m.document_version_id,m.graph_projection_id,m.class_projection_id,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path='z.java'",
+            [&key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        let z_f: baleyg::classes::FileExtraction = serde_json::from_str(&payload).unwrap();
+        assert_eq!(z_f.registry_bytes, 77);
+        if let Some((prev_version, prev_graph, prev_class, prev_f, prev_symbol)) = &previous {
+            assert_eq!(
+                (&version_id, &graph_id, &class_id, &payload, &symbol.id),
+                (prev_version, prev_graph, prev_class, prev_f, prev_symbol)
+            );
+        } else {
+            previous = Some((
+                version_id.clone(),
+                graph_id.clone(),
+                class_id.clone(),
+                payload.clone(),
+                symbol.id.clone(),
+            ));
+        }
+        let stored_rows: i64 = db
+            .query_row(
+                "SELECT count(*) FROM classes WHERE projection_id=?1",
+                [&class_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_rows, 1);
+        let (header_warnings,header_truncated):(String,bool)=db.query_row(
+            "SELECT class_warnings,class_truncated FROM native_revisions WHERE published_index_revision=?1",
+            [pin.index_revision as i64],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&header_warnings).unwrap(),
+            cold.warnings
+        );
+        assert!(!header_truncated);
+        let app = http::router(
+            http::new(
+                store.clone(),
+                options.clone(),
+                TOKEN.into(),
+                "127.0.0.1:7331".parse().unwrap(),
+            )
+            .unwrap(),
+        );
+        let (status, page) = call(
+            &app,
+            "GET",
+            &format!("/api/classes?path=z.java&{}", pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["revision"], json!(pin));
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["symbol"]["name"], "Selected");
+        assert_eq!(page["warnings"], json!(cold.warnings));
+        assert_eq!(page["truncated"], false);
+        let (status, source) = call(
+            &app,
+            "GET",
+            &format!("/api/source?path=z.java&{}", pin_query(pin)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{source}");
+        assert_eq!(source["revision"], json!(pin));
+        assert_eq!(source["file"]["text"], selected);
+        assert_eq!(
+            source["file"]["hash"],
+            hex::encode(Sha256::digest(selected.as_bytes()))
+        );
+        println!(
+            "{}",
+            json!({"pilot":"class-declarations-six-document","count":count,"pin":pin,
+            "temp":dir.path().display().to_string(),"sourceBytes":expected_total,"registryBytes":charges,
+            "nativeDeclarations":native.declarations.len(),"graphNodes":graph.nodes.len(),
+            "zVersion":version_id,"zGraph":graph_id,"zClass":class_id,"zFRegistry":z_f.registry_bytes,
+            "classRows":stored_rows,"files":witness})
+        );
+    }
+}
