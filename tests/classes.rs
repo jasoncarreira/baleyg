@@ -779,11 +779,24 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
         b, unchanged_b,
         "later file F is unchanged by the earlier growth"
     );
+    #[derive(serde::Serialize)]
+    struct LaterProjection<'a> {
+        classes: Vec<&'a baleyg::classes::ClassDefinition>,
+        relations: Vec<&'a baleyg::classes::ClassRelation>,
+    }
     let later_projection = |catalog: &Catalog| {
-        serde_json::to_vec(&serde_json::json!({
-            "classes": catalog.classes.iter().filter(|c| c.symbol.path == "B.java").collect::<Vec<_>>(),
-            "relations": catalog.relations.iter().filter(|r| r.path == "B.java").collect::<Vec<_>>(),
-        }))
+        serde_json::to_vec(&LaterProjection {
+            classes: catalog
+                .classes
+                .iter()
+                .filter(|c| c.symbol.path == "B.java")
+                .collect(),
+            relations: catalog
+                .relations
+                .iter()
+                .filter(|r| r.path == "B.java")
+                .collect(),
+        })
         .unwrap()
     };
     let before_b = later_projection(&before);
