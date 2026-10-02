@@ -929,10 +929,9 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(workspace.path().to_owned());
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let first = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let leader_session = first_job.session();
+    let first = first_job.run(&options, &cancel, |_| {}).unwrap();
     let reconciled_path = index_dir(state.path()).join("index.db");
     let retained_first = sqlite_snapshot(&reconciled_path, first, false);
     for table in [
@@ -973,10 +972,11 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         "{\"name\":\"after!\"}\n",
     )
     .unwrap();
-    let second = IndexJobCoordinator::prepare(&store, Some(first))
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let second =
+        IndexJobCoordinator::prepare_with_session(&store, Some(first), leader_session.clone())
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
     assert_eq!(second.index_generation, first.index_generation);
     assert_eq!(second.index_revision, first.index_revision + 1);
     assert_eq!(store.status().unwrap().revision, second);
