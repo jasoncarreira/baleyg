@@ -1545,6 +1545,60 @@ fn write_native(
 /// Bounded readiness check for a pair installed by the verified writer. This does not
 /// attest every stored BLOB after out-of-band SQLite mutation. Ordinary Store open stays
 /// bounded; pinned source reads verify the selected BLOB inside their read snapshot.
+/// Schema-8 revision zero is a deliberately empty bootstrap, not a published
+/// native pair. Refuse any staged evidence that appears before the first commit.
+fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
+    let (indexed_at, incarnation, options): (String, Option<String>, Option<String>) = db
+        .query_row(
+            "SELECT indexed_at,reconciled_incarnation,reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    control_ensure!(
+        indexed_at.is_empty() && incarnation.is_none() && options.is_none(),
+        "incompatible_index: invalid v8 bootstrap metadata"
+    );
+    // Fixed identifiers from CACHE_SCHEMA_V8 only. Do not read table names from
+    // sqlite_master or treat a partial publication as a valid empty bootstrap.
+    for name in [
+        "class_projections",
+        "class_relations",
+        "classes",
+        "document_versions",
+        "graph_calls",
+        "graph_nodes",
+        "graph_projections",
+        "graph_regions",
+        "native_producer_inputs",
+        "native_producer_languages",
+        "native_producers",
+        "native_revisions",
+        "native_source_set_dependencies",
+        "native_source_set_languages",
+        "native_source_sets",
+        "native_version_ancestor_signature_types",
+        "native_version_call_regions",
+        "native_version_calls",
+        "native_version_control_regions",
+        "native_version_coverage_roles",
+        "native_version_declaration_ancestors",
+        "native_version_declarations",
+        "native_version_header_items",
+        "native_version_headers",
+        "native_version_own_signature_types",
+        "native_version_parameters",
+        "revision_capture_inputs",
+        "revision_documents",
+    ] {
+        let present: i64 =
+            db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {name})"), [], |row| {
+                row.get(0)
+            })?;
+        control_ensure!(present == 0, "incompatible_index: partial v8 bootstrap");
+    }
+    Ok(())
+}
+
 fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
     fn one_row(db: &Connection, sql: &str) -> Result<Option<(String, String)>> {
         let mut rows = db
@@ -3254,7 +3308,20 @@ impl Store {
             && schema == DATABASE_SCHEMA_VERSION
             && extractor == EXTRACTOR_VERSION
         {
-            match validate_bounded_control(db, &self.identity.record_id) {
+            // Revision zero is the empty v8 bootstrap. It has no native pair
+            // yet; the first successful publication creates that metadata.
+            let validation = if pin.index_revision == 0 {
+                self.decode_control_status_raw(db).and_then(|status| {
+                    control_ensure!(
+                        status.evidence_format.is_none(),
+                        "incompatible_index: bootstrap exposed evidence"
+                    );
+                    Ok(())
+                })
+            } else {
+                validate_bounded_control(db, &self.identity.record_id)
+            };
+            match validation {
                 Ok(()) => true,
                 Err(error) => self.classify_admission_error(error, true)?,
             }
@@ -3310,7 +3377,11 @@ impl Store {
             serde_json::json!({"indexGeneration":row.5,"indexRevision":row.6}),
         )?;
         if schema_version == i64::from(DATABASE_SCHEMA_VERSION) {
-            validate_paired_metadata(db, &self.identity.record_id)?;
+            if pin.index_revision == 0 {
+                validate_v8_bootstrap(db)?;
+            } else {
+                validate_paired_metadata(db, &self.identity.record_id)?;
+            }
         }
         Ok(IndexStatus {
             workspace_root: self.workspace_root.clone(),
@@ -3318,7 +3389,7 @@ impl Store {
             indexed_at: if row.7.is_empty() { None } else { Some(row.7) },
             stats: serde_json::from_str(&row.8)?,
             diagnostics: serde_json::from_str(&row.9)?,
-            evidence_format: (row.0 == i64::from(DATABASE_SCHEMA_VERSION))
+            evidence_format: (row.0 == i64::from(DATABASE_SCHEMA_VERSION) && row.6 > 0)
                 .then(|| EVIDENCE_FORMAT.to_owned()),
         })
     }

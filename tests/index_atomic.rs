@@ -34,6 +34,39 @@ fn projection_fixture() -> (
         .unwrap();
     (state, workspace, store, pin, session)
 }
+#[test]
+fn v8_bootstrap_admits_only_empty_unpublished_evidence() {
+    let (state, workspace) = fixture();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready"),
+        "an empty bootstrap must not serve evidence"
+    );
+    let path = index_dir(state.path()).join("index.db");
+    drop(store);
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute(
+        "INSERT INTO native_source_sets(id,root_id) VALUES('forged-bootstrap','forged-root')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let reopened = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(
+        reopened
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index"),
+        "partial v8 bootstrap must fail closed"
+    );
+}
+
 fn index_dir(state: &Path) -> std::path::PathBuf {
     fs::read_dir(state.join("cache/indexes"))
         .unwrap()
