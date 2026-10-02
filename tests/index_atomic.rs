@@ -1408,16 +1408,26 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         );
     }
 
-    // A valid selected file JSON value with a non-string language is a typed
-    // SQLite extraction conversion, not a generic SQLITE_ERROR.
+    // The selected source's bytes remain the same, but storing them as TEXT
+    // instead of BLOB must produce a typed conversion refusal. No FK or CHECK
+    // is disabled: the source hash and declared byte length still match.
     let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    db.execute(
-        "UPDATE document_versions SET language=7 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+    assert_eq!(
+        db.execute(
+            "UPDATE document_versions SET source_bytes=CAST(source_bytes AS TEXT) WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+            [],
+        )
+        .unwrap(),
+        1
+    );
+    let storage_class: String = db.query_row(
+        "SELECT typeof(source_bytes) FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
-    )
-    .unwrap();
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(storage_class, "text");
     let error = store.files_at(Some(pin), 0, 10).unwrap_err();
     assert!(
         error.to_string().contains("incompatible_index"),
