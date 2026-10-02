@@ -2163,6 +2163,96 @@ mod gc_schema_race_tests {
     }
 
     #[test]
+    fn stale_v8_extractor_marker_is_refused_without_gc_writes_or_deletion() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let store = crate::store::Store::open_for_tests(state.path(), work.path()).unwrap();
+        let pin = store.index_baseline().unwrap();
+        let dir = roots.index_dir(&identity);
+        let path = roots.index_db(&identity);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(
+            inspect_index(&dir, &identity.root_key, now).unwrap(),
+            ("unknown", "recent_open"),
+            "genuine current-v8 cache must pass GC admission"
+        );
+
+        let attacker = rusqlite::Connection::open(&path).unwrap();
+        attacker
+            .execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET extractor_version='native-v4' WHERE singleton=1")
+            .unwrap();
+        assert_eq!(attacker.changes(), 1);
+        let (schema, marker, generation, revision): (i64, String, String, i64) = attacker
+            .query_row(
+                "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (schema, marker.as_str(), generation, revision),
+            (
+                8,
+                "native-v4",
+                pin.index_generation.to_string(),
+                pin.index_revision as i64
+            )
+        );
+        drop(attacker);
+
+        let footprint = || {
+            [
+                path.clone(),
+                dir.join("index.db-wal"),
+                dir.join("index.db-shm"),
+                dir.join("index.db-journal"),
+            ]
+            .map(|p| {
+                let bytes = if p.try_exists().unwrap() {
+                    Some(fs::read(&p).unwrap())
+                } else {
+                    None
+                };
+                (p, bytes)
+            })
+        };
+        let attacked_bytes = footprint();
+        assert!(attacked_bytes[0].1.is_some());
+        assert!(attacked_bytes[1..].iter().all(|(_, bytes)| bytes.is_none()));
+        let refused = inspect_index(&dir, &identity.root_key, now).unwrap_err();
+        assert!(
+            refused.to_string().contains("incompatible index identity"),
+            "{refused:#}"
+        );
+        assert_eq!(
+            footprint(),
+            attacked_bytes,
+            "inspection must not write DB or sidecars"
+        );
+        let derived = roots.gc_report_at(now).unwrap().derived;
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].root_key, identity.root_key);
+        assert_eq!(
+            (derived[0].status, derived[0].reason),
+            ("unknown", "metadata_unreadable")
+        );
+        assert!(dir.exists(), "GC report must not delete rejected index");
+        assert_eq!(
+            footprint(),
+            attacked_bytes,
+            "GC report must not write DB or sidecars"
+        );
+    }
+
+    #[test]
     fn root_loss_requires_proven_pathname_change_not_arbitrary_io_failure() {
         let root = tempfile::tempdir().unwrap();
         let identity = WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap();
