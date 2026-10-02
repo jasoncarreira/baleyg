@@ -3427,10 +3427,18 @@ impl Store {
 
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
         let status = self.read_public_control_status(db)?;
-        ensure!(
-            status.evidence_format.is_some(),
-            "index_not_ready: reindex required"
-        );
+        if status.evidence_format.is_none() {
+            let schema: i64 =
+                storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+            // read_public_control_status has already validated the exact empty
+            // v8 bootstrap in this snapshot. Only that state can make durable
+            // saved reads available without an index; legacy/partial evidence
+            // must not take this typed fallback.
+            if schema == i64::from(DATABASE_SCHEMA_VERSION) && status.revision.index_revision == 0 {
+                return Err(topology::IndexNotReady::new("reindex required").into());
+            }
+            anyhow::bail!("index_not_ready: reindex required");
+        }
         (|| -> Result<()> {
             validate_reconcile_inventory(db)?;
             // Every public v8 derived read needs the same bounded catalog

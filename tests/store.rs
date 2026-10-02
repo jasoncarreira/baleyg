@@ -343,8 +343,10 @@ fn publication_is_atomic_and_reopens() {
             .contains("index_not_ready")
     );
     let baseline = store.index_baseline().unwrap();
-    let before = std::fs::read(index_db(state.path())).unwrap();
     let leader = store.leader().unwrap();
+    // Leader acquisition deliberately updates last_opened_at. Snapshot only
+    // after that heartbeat to assert rejected publishes write zero bytes.
+    let before = std::fs::read(index_db(state.path())).unwrap();
     for error in [
         store
             .publish(&captured.0, &leader, baseline, &cancel())
@@ -1091,8 +1093,9 @@ fn recognized_noncurrent_without_marker_column_is_explicitly_not_ready() {
     }))
     .unwrap();
     store.put_view(&saved).unwrap();
-    let before = std::fs::read(index_db(state.path())).unwrap();
     let leader = store.leader().unwrap();
+    // Exclude the intentional leader heartbeat, not status or saved reads.
+    let before = std::fs::read(index_db(state.path())).unwrap();
     let error = store.status().unwrap_err();
     assert!(error.to_string().contains("index_not_ready"), "{error:#}");
     assert!(!error.to_string().contains("no such column"), "{error:#}");
@@ -2082,14 +2085,9 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
 
     let first = store.saved_views_at(Some(pin)).unwrap_err();
     let first_detail = format!("{first:#}");
-    assert!(
-        first_detail == "Query returned no rows"
-            || first_detail
-                == "incompatible_index: reconciliation required after invalid current index"
-            || first_detail.starts_with(
-                "incompatible_index: selected evidence decode failed: Query returned no rows",
-            ),
-        "{first_detail}"
+    assert_eq!(
+        first_detail,
+        "incompatible_index: selected evidence decode failed: incompatible_index: selected document missing or ambiguous"
     );
     let second = store.saved_view_at("association", Some(pin)).unwrap_err();
     assert_eq!(
@@ -2122,6 +2120,40 @@ fn saved_reads_without_records_are_conservative_and_write_nothing() {
     assert!(
         !roots.record_db(&identity).exists(),
         "saved reads created a durable database"
+    );
+}
+
+#[test]
+fn partial_v8_bootstrap_never_turns_saved_records_into_index_unavailable() {
+    let (state, _work, store) = fixture();
+    let saved: SavedView = serde_json::from_value(serde_json::json!({
+        "id":"saved","title":"Durable","query":{"seed":"missing"}
+    }))
+    .unwrap();
+    store.put_view(&saved).unwrap();
+    let unavailable = store.view("saved").unwrap().unwrap();
+    assert_eq!(unavailable.view, saved);
+    assert_eq!(
+        unavailable.attachment.availability,
+        AttachmentAvailability::IndexUnavailable
+    );
+    let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
+    db.execute(
+        "INSERT INTO native_source_sets(id,root_id) VALUES('forged-bootstrap','forged-root')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let clone = store.clone();
+    let first = store.views().unwrap_err();
+    assert!(
+        first.to_string().contains("incompatible_index"),
+        "{first:#}"
+    );
+    let closed = clone.view("saved").unwrap_err();
+    assert!(
+        closed.to_string().contains("incompatible_index"),
+        "{closed:#}"
     );
 }
 
