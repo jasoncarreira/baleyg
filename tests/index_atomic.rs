@@ -2435,3 +2435,165 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
         );
     }
 }
+
+#[test]
+fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinates() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{CancelFlag, SymbolKind},
+    };
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let java = "/*é*/ class A {}\n";
+    let python = "class P: pass\n";
+    fs::write(workspace.path().join("A.java"), java).unwrap();
+    fs::write(workspace.path().join("a.py"), python).unwrap();
+    fs::write(workspace.path().join("a.js"), "class J {}\n").unwrap();
+    fs::write(workspace.path().join("a.rs"), "struct R {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let scip = state.path().join("labels.scip");
+    let manifest = state.path().join("labels.json");
+    let mut options = IndexOptions::new(workspace.path().to_owned());
+    options.scip_path = Some(scip.clone());
+    options.manifest_path = Some(manifest.clone());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let mut occurrences = |version: &str| {
+        let mut index = scip::types::Index::new();
+        for (path, range, name) in [
+            ("A.java", vec![0, 12, 13], "A"), // default UTF-16; UTF-8 byte columns are 13..14.
+            ("a.py", vec![0, 6, 7], "P"),
+            ("a.js", vec![0, 6, 7], "J"),
+            ("a.rs", vec![0, 7, 8], "R"),
+        ] {
+            let mut doc = scip::types::Document::new();
+            doc.relative_path = path.into();
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = range;
+            occurrence.symbol_roles = 1;
+            occurrence.symbol = format!("scip {version} {name}");
+            doc.occurrences.push(occurrence);
+            index.documents.push(doc);
+        }
+        index
+    };
+    let correct_hashes = serde_json::json!({
+        "A.java":hex::encode(Sha256::digest(java.as_bytes())),
+        "a.py":hex::encode(Sha256::digest(python.as_bytes())),
+        "a.js":hex::encode(Sha256::digest(b"class J {}\n")),
+        "a.rs":hex::encode(Sha256::digest(b"struct R {}\n")),
+    });
+    let mut run = |index: &scip::types::Index, hashes: &serde_json::Value| {
+        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
+        fs::write(&manifest, serde_json::to_vec(hashes).unwrap()).unwrap();
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
+    };
+    let valid = occurrences("valid");
+    let (baseline, base_native, _) = run(&valid, &correct_hashes);
+    let node = |graph: &baleyg::model::Graph, path: &str, name: &str| {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.path == path && n.name == name && n.kind == SymbolKind::Class)
+            .unwrap()
+            .clone()
+    };
+    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
+        assert_eq!(
+            node(&baseline, path, name).display_label.as_deref(),
+            Some(format!("scip valid {name}").as_str())
+        );
+    }
+    assert!(
+        baseline
+            .nodes
+            .iter()
+            .filter(|n| n.path == "a.rs")
+            .all(|n| n.display_label.is_none())
+    );
+    let baseline_ids: Vec<_> = baseline
+        .nodes
+        .iter()
+        .map(|n| (&n.id, &n.provenance))
+        .collect();
+    for scenario in [
+        "stale-manifest",
+        "missing-manifest",
+        "wrong-range",
+        "wrong-name",
+        "reference-role",
+        "duplicate",
+        "ambiguous-range",
+        "unicode-byte-column",
+    ] {
+        let mut index = valid.clone();
+        let mut hashes = correct_hashes.clone();
+        let java_doc = index
+            .documents
+            .iter_mut()
+            .find(|d| d.relative_path == "A.java")
+            .unwrap();
+        match scenario {
+            "stale-manifest" => hashes["A.java"] = serde_json::json!("deadbeef"),
+            "missing-manifest" => {
+                hashes.as_object_mut().unwrap().remove("A.java");
+            }
+            "wrong-range" => java_doc.occurrences[0].range = vec![0, 5, 6],
+            "wrong-name" => java_doc.occurrences[0].symbol = "scip wrong Q".into(),
+            "reference-role" => java_doc.occurrences[0].symbol_roles = 0,
+            "duplicate" => java_doc.occurrences.push(java_doc.occurrences[0].clone()),
+            "ambiguous-range" => {
+                // A second, same-coordinate presentation cannot choose a label.
+                let mut other = java_doc.occurrences[0].clone();
+                other.symbol = "scip second A".into();
+                java_doc.occurrences.push(other);
+            }
+            "unicode-byte-column" => java_doc.occurrences[0].range = vec![0, 13, 14],
+            _ => unreachable!(),
+        }
+        let (graph, native, _) = run(&index, &hashes);
+        assert_eq!(
+            node(&graph, "A.java", "A").display_label,
+            None,
+            "{scenario}"
+        );
+        assert_eq!(
+            node(&graph, "a.py", "P").display_label,
+            node(&baseline, "a.py", "P").display_label
+        );
+        assert_eq!(
+            node(&graph, "a.js", "J").display_label,
+            node(&baseline, "a.js", "J").display_label
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter(|n| n.path == "a.rs")
+                .all(|n| n.display_label.is_none())
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .map(|n| (&n.id, &n.provenance))
+                .collect::<Vec<_>>(),
+            baseline_ids,
+            "native IDs and provenance must not change with SCIP presentation: {scenario}"
+        );
+        assert_eq!(native.producer, base_native.producer);
+        assert_eq!(
+            native
+                .declarations
+                .iter()
+                .map(|d| &d.syntax_id)
+                .collect::<Vec<_>>(),
+            base_native
+                .declarations
+                .iter()
+                .map(|d| &d.syntax_id)
+                .collect::<Vec<_>>()
+        );
+    }
+}
