@@ -260,9 +260,10 @@ fn measured_display_labels(
         let Some(file) = files.get(doc.relative_path.as_str()) else {
             continue;
         };
-        // Optional SCIP is a JavaScript presentation hint only; foreign-language metadata
-        // never lends authority to Java/Rust/Python native facts.
-        if file.language != "javascript"
+        // Optional captured SCIP labels are presentation only. Join them to one
+        // measured native declaration at the captured name coordinate; never use
+        // them to mint IDs, infer relationships, or add unsupported Rust labels.
+        if !matches!(file.language.as_str(), "javascript" | "java" | "python")
             || manifest.get(&file.path) != Some(&file.hash)
             || doc.occurrences.len() > 10_000
         {
@@ -312,6 +313,9 @@ fn measured_display_labels(
             let Some(ds) = ranges.get(&occurrence.range) else {
                 continue;
             };
+            if ds.len() != 1 {
+                continue;
+            }
             for d in ds {
                 // A symbol's text is never a source name; require it at least spells
                 // the exact witnessed name before allowing an unauthenticated label.

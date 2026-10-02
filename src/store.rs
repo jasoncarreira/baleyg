@@ -5586,10 +5586,19 @@ impl Store {
             warnings
                 .push("Class diagrams currently support Java and Python declarations only.".into());
         }
-        let paths: BTreeSet<_> = items
+        let mut paths: BTreeSet<_> = items
             .iter()
             .map(|class| class.symbol.path.as_str())
             .collect();
+        if let Some(selected) = path
+            && matches!(selected.rsplit('.').next(), Some("java" | "py"))
+        {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path=?1)",
+                [selected], |r| r.get(0),
+            )?;
+            if exists { paths.insert(selected); }
+        }
         for path in paths {
             self.attest_selected_class(tx, path)?;
         }
