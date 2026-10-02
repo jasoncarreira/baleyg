@@ -645,7 +645,7 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     };
     let mut limits = ordinary;
     limits.total_bytes = 1;
-    cap_expected("source-equal", &[a.clone()], 1, 1, limits);
+    cap_expected("source-equal", std::slice::from_ref(&a), 1, 1, limits);
     let result = cap_expected(
         "source-over",
         &[empty.clone(), warned.clone()],
@@ -656,7 +656,7 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     assert!(!result.warnings.iter().any(|w| w == "excluded warning"));
     limits = ordinary;
     limits.registry_text = 1;
-    cap_expected("registry-equal", &[a.clone()], 1, 1, limits);
+    cap_expected("registry-equal", std::slice::from_ref(&a), 1, 1, limits);
     cap_expected(
         "registry-over",
         &[empty.clone(), warned.clone()],
@@ -666,7 +666,7 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     );
     limits = ordinary;
     limits.classes = 1;
-    cap_expected("classes-equal", &[a.clone()], 1, 1, limits);
+    cap_expected("classes-equal", std::slice::from_ref(&a), 1, 1, limits);
     cap_expected("classes-over", &[a.clone(), b.clone()], 2, 2, limits);
     let member: baleyg::classes::ClassMember=serde_json::from_value(
         serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
@@ -743,8 +743,8 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     limits = ordinary;
     limits.files = 1;
     limits.symbols = 1;
-    cap_expected("input-equal", &[a.clone()], 1, 1, limits);
-    cap_expected("input-over", &[a.clone()], 2, 1, limits);
+    cap_expected("input-equal", std::slice::from_ref(&a), 1, 1, limits);
+    cap_expected("input-over", std::slice::from_ref(&a), 2, 1, limits);
     limits = ordinary;
     limits.total_bytes = 2;
     cap_expected("moving-before", &[a.clone(), b.clone()], 2, 2, limits);
