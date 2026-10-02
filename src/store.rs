@@ -1214,14 +1214,17 @@ fn v8_document_projection(
 
 fn write_native(
     db: &Connection,
-    artifact: &crate::native_evidence::Artifact,
-    capture: &crate::capture::Capture,
-    graph: &Graph,
-    classes: &crate::classes::Catalog,
+    bundle: (
+        &crate::native_evidence::Artifact,
+        &crate::capture::Capture,
+        &Graph,
+        &crate::classes::Catalog,
+    ),
     revision: IndexPin,
     leader: &topology::LeaderGuard,
     cancel: &CancelFlag,
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
+    let (artifact, capture, graph, classes) = bundle;
     let a = artifact;
     let revision_key = format!(
         "pin:v1:{}:{}",
@@ -4233,7 +4236,11 @@ impl Store {
                 DELETE FROM native_producers;")?;
         }
         let projections = write_native(
-            &tx, native, capture, graph, &classes, revision, leader, cancel,
+            &tx,
+            (native, capture, graph, &classes),
+            revision,
+            leader,
+            cancel,
         )?;
         for f in &graph.files {
             check_cancel(cancel)?;
@@ -4520,7 +4527,7 @@ impl Store {
             class_projection_state.as_deref() == Some("ready")
                 && class_hash.is_some()
                 && class_id.len() <= 16 * 1024
-                && f_length.is_none_or(|n| n >= 0 && n <= 64 * 1024 * 1024),
+                && f_length.is_none_or(|n| (0..=64 * 1024 * 1024).contains(&n)),
             "incompatible_index: selected class projection invalid"
         );
         ensure!(
@@ -5290,7 +5297,7 @@ impl Store {
                     && bytes <= max_bytes
                     && (1usize..5).all(|i| -> bool {
                         row.get::<_, i64>(i)
-                            .is_ok_and(|length| length >= 0 && length <= 16 * 1024)
+                            .is_ok_and(|length| (0..=16 * 1024).contains(&length))
                     }),
                 "incompatible_index: selected source byte budget exceeded"
             );
