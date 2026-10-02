@@ -889,3 +889,22 @@ fn class_registry_import_charge_tiny_native_pilot() {
         );
     }
 }
+
+#[test]
+fn production_class_limits_are_fixed_at_decision_0004_values() {
+    let limits = baleyg::classes::Limits::default();
+    assert_eq!(limits.file_bytes, 2 * 1024 * 1024);
+    assert_eq!(limits.total_bytes, 256 * 1024 * 1024);
+    assert_eq!(limits.visits, 100_000);
+    assert_eq!(limits.depth, 64);
+    assert_eq!(limits.file_classes, 1_000);
+    assert_eq!(limits.classes, 20_000);
+    assert_eq!(limits.members, 256);
+    assert_eq!(limits.file_refs, 8_192);
+    assert_eq!(limits.records, 250_000);
+    assert_eq!(limits.text, 2_048);
+    assert_eq!(limits.output_text, 64 * 1024 * 1024);
+    assert_eq!(limits.registry_text, 32 * 1024 * 1024);
+    assert_eq!(limits.files, 100_000);
+    assert_eq!(limits.symbols, 1_000_000);
+}
