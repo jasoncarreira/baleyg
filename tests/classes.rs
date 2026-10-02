@@ -32,7 +32,17 @@ fn golden(catalog: &Catalog) {
     );
 }
 fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
+    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
+    let git = temp.path().join(".git");
+    let private = git.join("baleyg");
+    fs::create_dir(&git).unwrap();
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = private.join("workspace-id");
+    // Fixed canonical v4 UUID: temp directory names must not alter frozen symbol IDs.
+    fs::write(&marker, b"123e4567-e89b-42d3-a456-426614174000").unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
     for (path, text) in files {
         let path = temp.path().join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
