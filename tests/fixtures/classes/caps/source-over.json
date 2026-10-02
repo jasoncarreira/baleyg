@@ -1,9 +1,1 @@
-{
-  "names": [],
-  "fields": [],
-  "warnings": [
-    "Class catalog source limit exceeded (0 MiB)",
-    "Incomplete class declaration registry: some declarations may be absent."
-  ],
-  "truncated": true
-}
+{"classes":[],"relations":[],"warnings":["Class catalog source limit exceeded (0 MiB)","Incomplete class declaration registry: some declarations may be absent."],"truncated":true}

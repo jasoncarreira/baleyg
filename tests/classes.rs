@@ -608,7 +608,26 @@ fn cap_file(
         truncated: false,
         registry_incomplete: false,
         classes: if class { vec![definition] } else { vec![] },
-        items: vec![],
+        items: if class { vec![cap_ref(path)] } else { vec![] },
+    }
+}
+fn cap_ref(path: &str) -> baleyg::classes::DetailItem {
+    use baleyg::classes::{ClassRelation, DetailItem, DetailValue};
+    DetailItem {
+        class_index: 0,
+        records: 0,
+        text: 0,
+        value: DetailValue::Relation(ClassRelation {
+            id: format!("ref-{path}"),
+            owner: format!("class-{path}"),
+            target: None,
+            type_name: "Target".into(),
+            kind: "field".into(),
+            path: path.into(),
+            range: Default::default(),
+            candidate_ids: vec![],
+            match_kind: "unmatched".into(),
+        }),
     }
 }
 fn cap_expected(
@@ -619,16 +638,12 @@ fn cap_expected(
     limits: baleyg::classes::Limits,
 ) -> Catalog {
     let actual = Catalog::compose(files, count, symbols, limits).unwrap();
-    let projection = serde_json::json!({
-        "names": actual.classes.iter().map(|c| c.symbol.name.as_str()).collect::<Vec<_>>(),
-        "fields": actual.classes.iter().map(|c| c.fields.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()).collect::<Vec<_>>(),
-        "warnings":actual.warnings,"truncated":actual.truncated,
-    });
-    let expected: serde_json::Value = serde_json::from_slice(
-        &fs::read(format!("tests/fixtures/classes/caps/{name}.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(projection, expected, "independent normative fixture {name}");
+    let expected = fs::read(format!("tests/fixtures/classes/caps/{name}.json")).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        expected,
+        "independent byte-exact normative fixture {name}"
+    );
     actual
 }
 #[test]
@@ -673,22 +688,30 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     ).unwrap();
     let mut first = member.clone();
     first.name = "first".into();
+    first.path = "A.java".into();
     let mut second = member;
     second.name = "second".into();
+    second.path = "B.java".into();
     let mut detailed_a = a.clone();
-    detailed_a.items = vec![DetailItem {
-        class_index: 0,
-        records: 1,
-        text: 1,
-        value: DetailValue::Field(first),
-    }];
+    detailed_a.items = vec![
+        cap_ref("A.java"),
+        DetailItem {
+            class_index: 0,
+            records: 1,
+            text: 1,
+            value: DetailValue::Field(first),
+        },
+    ];
     let mut detailed_b = b.clone();
-    detailed_b.items = vec![DetailItem {
-        class_index: 0,
-        records: 1,
-        text: 1,
-        value: DetailValue::Field(second),
-    }];
+    detailed_b.items = vec![
+        cap_ref("B.java"),
+        DetailItem {
+            class_index: 0,
+            records: 1,
+            text: 1,
+            value: DetailValue::Field(second),
+        },
+    ];
     limits = ordinary;
     limits.records = 2;
     cap_expected(
@@ -721,18 +744,18 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     let original: baleyg::classes::ClassMember = serde_json::from_value(
         serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
     ).unwrap();
-    inside.items = ["first", "second"]
-        .into_iter()
-        .map(|name| {
+    inside.items = std::iter::once(cap_ref("A.java"))
+        .chain(["first", "second"].into_iter().map(|name| {
             let mut m = original.clone();
             m.name = name.into();
+            m.path = "A.java".into();
             DetailItem {
                 class_index: 0,
                 records: 1,
                 text: 1,
                 value: DetailValue::Field(m),
             }
-        })
+        }))
         .collect();
     limits = ordinary;
     limits.records = 1;
@@ -747,10 +770,36 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     cap_expected("input-over", std::slice::from_ref(&a), 2, 1, limits);
     limits = ordinary;
     limits.total_bytes = 2;
-    cap_expected("moving-before", &[a.clone(), b.clone()], 2, 2, limits);
+    let before = cap_expected("moving-before", &[a.clone(), b.clone()], 2, 2, limits);
     let mut grown = a;
     grown.source_bytes = 2;
-    cap_expected("moving-after", &[grown, b], 2, 2, limits);
+    let unchanged_b = b.clone();
+    let after = cap_expected("moving-after", &[grown, b.clone()], 2, 2, limits);
+    assert_eq!(
+        b, unchanged_b,
+        "later file F is unchanged by the earlier growth"
+    );
+    let later_projection = |catalog: &Catalog| {
+        serde_json::to_vec(&serde_json::json!({
+            "classes": catalog.classes.iter().filter(|c| c.symbol.path == "B.java").collect::<Vec<_>>(),
+            "relations": catalog.relations.iter().filter(|r| r.path == "B.java").collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    };
+    let before_b = later_projection(&before);
+    let after_b = later_projection(&after);
+    assert_eq!(
+        before_b,
+        include_bytes!("fixtures/classes/caps/moving-later-before.json")
+    );
+    assert_eq!(
+        after_b,
+        include_bytes!("fixtures/classes/caps/moving-later-after.json")
+    );
+    assert_ne!(
+        before_b, after_b,
+        "moving cut must change the later file projection"
+    );
 }
 #[test]
 fn warnings_dedupe_at_100_then_append_ordered_closers() {

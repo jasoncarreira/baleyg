@@ -1,9 +1,1 @@
-{
-  "names": [],
-  "fields": [],
-  "warnings": [
-    "Class declaration registry text limit reached (0 MiB)",
-    "Incomplete class declaration registry: some declarations may be absent."
-  ],
-  "truncated": true
-}
+{"classes":[],"relations":[],"warnings":["Class declaration registry text limit reached (0 MiB)","Incomplete class declaration registry: some declarations may be absent."],"truncated":true}
