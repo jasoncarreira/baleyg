@@ -2459,7 +2459,7 @@ fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinate
     options.scip_path = Some(scip.clone());
     options.manifest_path = Some(manifest.clone());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let mut occurrences = |version: &str| {
+    let occurrences = |version: &str| {
         let mut index = scip::types::Index::new();
         for (path, range, name) in [
             ("A.java", vec![0, 12, 13], "A"), // default UTF-16; UTF-8 byte columns are 13..14.
@@ -2484,7 +2484,7 @@ fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinate
         "a.js":hex::encode(Sha256::digest(b"class J {}\n")),
         "a.rs":hex::encode(Sha256::digest(b"struct R {}\n")),
     });
-    let mut run = |index: &scip::types::Index, hashes: &serde_json::Value| {
+    let run = |index: &scip::types::Index, hashes: &serde_json::Value| {
         fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
         fs::write(&manifest, serde_json::to_vec(hashes).unwrap()).unwrap();
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
