@@ -654,7 +654,7 @@ fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
         let new_key = format!("presentation-{role}:{name}");
         assert_eq!(
             db.execute(
-                "UPDATE capture_inputs SET input_key=?1 WHERE input_key=?2",
+                "UPDATE revision_capture_inputs SET input_key=?1 WHERE input_key=?2",
                 rusqlite::params![new_key, old_key],
             )
             .unwrap(),
@@ -1675,34 +1675,18 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
         .join("index.db");
     {
         let db = rusqlite::Connection::open(&path).unwrap();
-        db.pragma_update(None, "foreign_keys", false).unwrap();
-        let native_tables = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        for table in native_tables {
-            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
-        }
-        for index in ["nodes_path", "calls_path", "regions_path"] {
-            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-        }
-        db.execute_batch(
-            "DROP TABLE capture_inputs;
-             ALTER TABLE files DROP COLUMN capture_stat;
-             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
-             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
-        )
-        .unwrap();
+        rewrite_as_physical_v4(&db);
         db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
+            "INSERT INTO files(path,hash,payload) VALUES('a.js','legacy-hash','{}')",
             [],
         )
         .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
-        db.execute("UPDATE calls SET payload=json_set(payload,'$.target','lexical-guess','$.resolution','internal')",[]).unwrap();
+        db.execute(
+            "INSERT INTO nodes(id,name,path,payload) VALUES('legacy-go','go','a.js','{}')",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO calls(id,caller,target,path,payload) VALUES('legacy-forged','legacy-go','legacy-go','a.js','{\"target\":\"lexical-guess\",\"resolution\":\"internal\"}')",[]).unwrap();
     }
     let mut rebuilt_generation = None;
     for (ordinal, sub) in ["status", "symbols", "query", "export"]
@@ -1752,13 +1736,13 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
             );
         }
     }
-    // Real CLI exploit regression: an exact legacy4 DB with an extra trigger
-    // cannot rebaseline into a forged schema5 publication or write anything.
+    // An extra trigger on the rebuilt current v8 index must never run during
+    // exceptional rebaseline or forge a published graph call.
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch(
-        "CREATE TRIGGER forged_call AFTER INSERT ON calls BEGIN
-        UPDATE calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
-        WHERE id=NEW.id; END;",
+        "CREATE TRIGGER forged_call AFTER INSERT ON graph_calls BEGIN
+        UPDATE graph_calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
+        WHERE projection_id=NEW.projection_id AND id=NEW.id; END;",
     )
     .unwrap();
     drop(db);
@@ -1774,7 +1758,7 @@ fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation(
     let db = rusqlite::Connection::open(&path).unwrap();
     let forged: i64 = db
         .query_row(
-            "SELECT count(*) FROM calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
+            "SELECT count(*) FROM graph_calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
             [],
             |r| r.get(0),
         )
@@ -1860,6 +1844,66 @@ fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
     }
     find(home).expect("published native database")
 }
+// Frozen v4 objects match Store's exact closed-world legacy recognition.
+// This is a physical old-format fixture, not a marker downgrade of a v8 DB.
+const FROZEN_LEGACY4_GRAPH_SQL: &str = "
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX nodes_name ON nodes(name);
+CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX calls_caller ON calls(caller);
+CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+";
+const FROZEN_LEGACY4_CLASS_SQL: &str = "
+CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
+CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX classes_path ON classes(path,id);
+CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX class_relations_owner ON class_relations(owner,id);
+CREATE INDEX class_relations_target ON class_relations(target,id);
+";
+fn rewrite_as_physical_v4(db: &rusqlite::Connection) {
+    let metadata: (String,String,String,String,i64,i64,String,String,String) = db.query_row(
+        "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
+        [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+    ).unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let names: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for name in names {
+        db.execute_batch(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")))
+            .unwrap();
+    }
+    db.execute_batch(FROZEN_LEGACY4_GRAPH_SQL).unwrap();
+    db.execute_batch(FROZEN_LEGACY4_CLASS_SQL).unwrap();
+    db.execute(
+        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        rusqlite::params![
+            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
+            metadata.7, metadata.8
+        ],
+    )
+    .unwrap();
+    db.execute("INSERT INTO class_catalog VALUES(1,'[]',0)", [])
+        .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
 fn real_native_snapshot(home: &std::path::Path) -> Value {
     use rusqlite::types::ValueRef;
     let db = rusqlite::Connection::open(real_index_db(home)).unwrap();
@@ -1868,16 +1912,42 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap();
+    let (generation, revision_number, incarnation): (String, i64, String) = db
+        .query_row(
+            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(&generation).is_ok());
+    assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
+    let pin_id = format!("pin:v1:{generation}:{revision_number}");
+    let (header_pin, header_incarnation, header_revision): (String, String, i64) = db
+        .query_row(
+            "SELECT id,reconciled_incarnation,published_index_revision FROM native_revisions WHERE id=?1",
+            [&pin_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(header_pin, pin_id);
+    assert_eq!(header_incarnation, incarnation);
+    assert_eq!(header_revision, revision_number);
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
     let revision: (String, String, String, String, String) = db.query_row(
-        "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions", [],
+        "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1", [&pin_id],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
     ).unwrap();
     let mut documents = Vec::new();
     let mut stmt = db.prepare(
-        "SELECT source_set_id,language,path,revision_id,content_hash,byte_length,source_bytes FROM native_documents ORDER BY path"
+        "SELECT v.source_set_id,v.language,m.path,m.revision_id,v.content_hash,v.byte_length,v.source_bytes FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id WHERE m.revision_id=?1 ORDER BY m.path"
     ).unwrap();
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([&pin_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1895,15 +1965,62 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             "revisionId":revision,"contentHash":hash,"byteLength":length,"bytesHex":hex::encode(bytes)}));
     }
     let mut all_rows = serde_json::Map::new();
-    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%' ORDER BY name").unwrap();
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
     for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
         let name = name.unwrap();
+        let (predicate, alias) = match name.as_str() {
+            "native_revisions" => ("id=?1", ""),
+            "revision_capture_inputs" | "revision_documents" => ("revision_id=?1", ""),
+            "native_source_sets" => (
+                "id=(SELECT source_set_id FROM native_revisions WHERE id=?1)",
+                "",
+            ),
+            "native_source_set_languages" | "native_source_set_dependencies" => (
+                "source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?1)",
+                "",
+            ),
+            "native_producers" => (
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)",
+                " selected",
+            ),
+            "native_producer_languages" | "native_producer_inputs" => (
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)",
+                " selected",
+            ),
+            "document_versions" => (
+                "id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "graph_projections" => (
+                "id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "graph_nodes" | "graph_calls" | "graph_regions" => (
+                "projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "class_projections" => (
+                "id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "classes" | "class_relations" => (
+                "projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            table if table.starts_with("native_version_") => (
+                "version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            _ => panic!("unexpected v8 evidence table: {name}"),
+        };
         let mut table = db
-            .prepare(&format!("SELECT * FROM {name} ORDER BY rowid"))
+            .prepare(&format!(
+                "SELECT * FROM \"{name}\"{alias} WHERE {predicate} ORDER BY rowid"
+            ))
             .unwrap();
         let columns = table.column_count();
         let records = table
-            .query_map([], |row| {
+            .query_map([&pin_id], |row| {
                 let mut cells = Vec::new();
                 for i in 0..columns {
                     let cell = match row.get_ref(i)? {
@@ -1922,10 +2039,54 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             .unwrap();
         all_rows.insert(name, serde_json::json!(records));
     }
+    assert_eq!(
+        all_rows.len(),
+        28,
+        "retain every v8 evidence table in raw snapshot"
+    );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
             "configHash":revision.3,"dependencyHash":revision.4},
         "documents":documents,"allRows":all_rows})
+}
+
+// Only successful same-byte reindex may ignore per-publication pin cells.
+// All failed/no-op comparisons must keep real_native_snapshot entirely raw.
+fn same_bytes_evidence(snapshot: &Value) -> Value {
+    let pin = snapshot["revision"]["id"].as_str().unwrap().to_owned();
+    let header = snapshot["allRows"]["native_revisions"].as_array().unwrap();
+    assert_eq!(header.len(), 1);
+    let header = header[0].as_array().unwrap();
+    assert_eq!(header[0], pin);
+    assert!(uuid::Uuid::parse_str(header[8].as_str().unwrap()).is_ok());
+    assert!(header[12].as_i64().is_some_and(|revision| revision > 0));
+    for table in ["revision_capture_inputs", "revision_documents"] {
+        for row in snapshot["allRows"][table].as_array().unwrap() {
+            assert_eq!(row[0], pin, "{table} must reference the admitted pin");
+        }
+    }
+    for doc in snapshot["documents"].as_array().unwrap() {
+        assert_eq!(doc["revisionId"], pin);
+    }
+    let mut evidence = snapshot.clone();
+    evidence["revision"]["id"] = serde_json::json!("<current-pin>");
+    for doc in evidence["documents"].as_array_mut().unwrap() {
+        doc["revisionId"] = serde_json::json!("<current-pin>");
+    }
+    let header = evidence["allRows"]["native_revisions"]
+        .as_array_mut()
+        .unwrap()[0]
+        .as_array_mut()
+        .unwrap();
+    header[0] = serde_json::json!("<current-pin>");
+    header[8] = serde_json::json!("<leader-incarnation>");
+    header[12] = serde_json::json!("<current-revision>");
+    for table in ["revision_capture_inputs", "revision_documents"] {
+        for row in evidence["allRows"][table].as_array_mut().unwrap() {
+            row[0] = serde_json::json!("<current-pin>");
+        }
+    }
+    evidence
 }
 
 fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
@@ -2173,6 +2334,37 @@ fn decoded_jev_rows(export: &Value, table: &str) -> Vec<Value> {
         .collect()
 }
 
+fn assert_native_version_witness(native: &Value, version_id: &Value, path: &str, language: &str) {
+    let versions: Vec<_> = native["allRows"]["document_versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[0] == *version_id)
+        .collect();
+    assert_eq!(
+        versions.len(),
+        1,
+        "one authenticated document version for {path}"
+    );
+    assert_eq!(versions[0][1], native["sourceSet"]["id"]);
+    assert_eq!(versions[0][2], language);
+    assert_eq!(versions[0][3], path);
+    let manifests: Vec<_> = native["allRows"]["revision_documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[4] == *version_id && row[3] == path)
+        .collect();
+    assert_eq!(
+        manifests.len(),
+        1,
+        "one admitted revision document for {path}"
+    );
+    assert_eq!(manifests[0][0], native["revision"]["id"]);
+    assert_eq!(manifests[0][1], native["sourceSet"]["id"]);
+    assert_eq!(manifests[0][2], language);
+}
+
 fn assert_fixture_declaration(
     native: &Value,
     symbol: &Value,
@@ -2182,36 +2374,36 @@ fn assert_fixture_declaration(
     owner: Option<&str>,
     source: &str,
 ) {
-    let matching: Vec<_> = native["allRows"]["native_declarations"]
+    let matching: Vec<_> = native["allRows"]["native_version_declarations"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|row| row[0] == symbol["id"])
+        .filter(|row| row[1] == symbol["id"])
         .collect();
     assert_eq!(matching.len(), 1, "one native declaration for {name}");
     let row = matching[0];
     assert_eq!(symbol["name"], name);
     assert_eq!(symbol["path"], path);
     assert_eq!(symbol["parent"], serde_json::json!(owner));
+    let documents: Vec<_> = native["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|doc| doc["path"] == path)
+        .collect();
+    assert_eq!(documents.len(), 1, "one captured source for {path}");
+    let language = documents[0]["language"].as_str().unwrap();
+    assert_native_version_witness(native, &row[0], path, language);
+    assert_eq!(row[2], serde_json::json!(owner), "{name}: native owner");
+    assert_eq!(row[3], kind, "{name}: native declaration kind");
+    assert_eq!(row[4], name, "{name}: native measured name");
     assert_eq!(
-        row[1], native["sourceSet"]["id"],
-        "{name}: native declaration source set"
-    );
-    assert_eq!(row[3], path, "{name}: native document path");
-    assert_eq!(
-        row[4], native["revision"]["id"],
-        "{name}: native declaration revision"
-    );
-    assert_eq!(row[5], serde_json::json!(owner), "{name}: native owner");
-    assert_eq!(row[6], kind, "{name}: native declaration kind");
-    assert_eq!(row[7], name, "{name}: native measured name");
-    assert_eq!(
-        row[13], symbol["range"]["startByte"],
+        row[10], symbol["range"]["startByte"],
         "{name}: native start"
     );
-    assert_eq!(row[14], symbol["range"]["endByte"], "{name}: native end");
-    let start = row[13].as_u64().unwrap() as usize;
-    let end = row[14].as_u64().unwrap() as usize;
+    assert_eq!(row[11], symbol["range"]["endByte"], "{name}: native end");
+    let start = row[10].as_u64().unwrap() as usize;
+    let end = row[11].as_u64().unwrap() as usize;
     assert!(
         source
             .get(start..end)
@@ -2546,9 +2738,39 @@ def sink():
         use sha2::{Digest, Sha256};
         let native_after = real_native_snapshot(&home);
         let graph_after = real_export(&root, &home);
+        let before_header = &native_before["allRows"]["native_revisions"][0];
+        let leader_header = &native_as_leader["allRows"]["native_revisions"][0];
+        let after_header = &native_after["allRows"]["native_revisions"][0];
+        assert_ne!(
+            before_header[0], after_header[0],
+            "{name}: publication pin rotates"
+        );
+        assert_ne!(
+            before_header[8], after_header[8],
+            "{name}: daemon takeover rotates leader"
+        );
         assert_eq!(
-            native_after, native_before,
-            "{name}: complete normalized native rows must be stable"
+            leader_header[8], after_header[8],
+            "{name}: active leader remains stable"
+        );
+        assert_ne!(
+            before_header[12], after_header[12],
+            "{name}: revision advances"
+        );
+        assert_eq!(after_header[12], pin["indexRevision"], "{name}");
+        assert_eq!(
+            after_header[0],
+            format!(
+                "pin:v1:{}:{}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            ),
+            "{name}: header pin must match public status"
+        );
+        assert_eq!(
+            same_bytes_evidence(&native_after),
+            same_bytes_evidence(&native_before),
+            "{name}: all 28 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,
@@ -2765,7 +2987,9 @@ def sink():
                 "{name}: sequence selected wrong seed"
             );
             let graph_calls = graph_after["calls"].as_array().unwrap();
-            let native_calls = native_after["allRows"]["native_calls"].as_array().unwrap();
+            let native_calls = native_after["allRows"]["native_version_calls"]
+                .as_array()
+                .unwrap();
             assert_eq!(
                 graph_calls.len(),
                 1,
@@ -2786,24 +3010,15 @@ def sink():
             assert_eq!(call["calleeText"], "sink", "{name}: measured call spelling");
             assert_eq!(call["range"]["startByte"], expected_start, "{name}");
             assert_eq!(call["range"]["endByte"], expected_end, "{name}");
+            assert_native_version_witness(&native_after, &native_call[0], file, name);
             assert_eq!(
-                native_call[0], call["id"],
+                native_call[1], call["id"],
                 "{name}: same measured native call ID"
             );
-            assert_eq!(native_call[1], seed, "{name}: native call owner");
-            assert_eq!(
-                native_call[3], native_after["sourceSet"]["id"],
-                "{name}: call source set"
-            );
-            assert_eq!(
-                native_call[6], native_after["revision"]["id"],
-                "{name}: call revision"
-            );
-            assert_eq!(native_call[4], name, "{name}: native language");
-            assert_eq!(native_call[5], file, "{name}: native call path");
-            assert_eq!(native_call[7], expected_start, "{name}: native start byte");
-            assert_eq!(native_call[8], expected_end, "{name}: native end byte");
-            assert_eq!(native_call[11], "sink", "{name}: native callee spelling");
+            assert_eq!(native_call[2], seed, "{name}: native call owner");
+            assert_eq!(native_call[4], expected_start, "{name}: native start byte");
+            assert_eq!(native_call[5], expected_end, "{name}: native end byte");
+            assert_eq!(native_call[8], "sink", "{name}: native callee spelling");
             fn measured_steps(
                 steps: &[Value],
                 file: &str,
@@ -2834,7 +3049,7 @@ def sink():
                         assert_eq!(step["path"], call["path"]);
                         assert_eq!(step["range"], call["range"]);
                         assert!(
-                            native.iter().any(|row| row[0] == id),
+                            native.iter().any(|row| row[1] == id),
                             "native call ID absent: {id}"
                         );
                         seen.push(id.to_owned());
@@ -3080,7 +3295,22 @@ def sink():
         .unwrap();
         assert_eq!(failed["state"], "failed", "{name}: {failed}");
         assert_eq!(failed["error"]["code"], "revision_conflict", "{name}");
-        assert_eq!(real_native_snapshot(&home), native_before, "{name}");
+        // The successful same-byte reindex advanced publication identity. A
+        // stale request must leave that current, fully raw v8 pair untouched.
+        assert_eq!(real_native_snapshot(&home), native_after, "{name}");
+        let unchanged_status: Value = client
+            .get(format!("{url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged_status["revision"], pin,
+            "{name}: current pin changed"
+        );
         drop(server);
     }
 }
@@ -3847,7 +4077,7 @@ async fn saved_items_real_index_matrix() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(index_version, 7, "derived index inspection is separate");
+    assert_eq!(index_version, 8, "derived index inspection is separate");
 
     let edited_view_body = serde_json::json!({
         "id":"real-view","title":"Edited","query":{"seed":seed}

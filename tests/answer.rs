@@ -334,20 +334,24 @@ function helper() {}
         .unwrap()
         .join("index.db");
     let db = rusqlite::Connection::open(db_path).unwrap();
-    let id: String = db
-        .query_row("SELECT id FROM calls WHERE path='a.js' LIMIT 1", [], |r| {
-            r.get(0)
+    let (projection_id,id):(String,String) = db
+        .query_row("SELECT c.projection_id,c.id FROM graph_calls c JOIN revision_documents m ON m.graph_projection_id=c.projection_id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js' LIMIT 1", [], |r| {
+            Ok((r.get(0)?,r.get(1)?))
         })
         .unwrap();
     let payload: String = db
-        .query_row("SELECT payload FROM calls WHERE id=?1", [&id], |r| r.get(0))
+        .query_row(
+            "SELECT payload FROM graph_calls WHERE projection_id=?1 AND id=?2",
+            rusqlite::params![projection_id, id],
+            |r| r.get(0),
+        )
         .unwrap();
     let mut forged: Value = serde_json::from_str(&payload).unwrap();
     assert!(forged["calleeText"].is_string());
     forged["calleeText"] = json!("sqlInventedCallee");
     db.execute(
-        "UPDATE calls SET payload=?1 WHERE id=?2",
-        rusqlite::params![forged.to_string(), id],
+        "UPDATE graph_calls SET payload=?1 WHERE projection_id=?2 AND id=?3",
+        rusqlite::params![forged.to_string(), projection_id, id],
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);

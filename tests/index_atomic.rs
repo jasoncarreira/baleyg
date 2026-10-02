@@ -34,6 +34,63 @@ fn projection_fixture() -> (
         .unwrap();
     (state, workspace, store, pin, session)
 }
+#[test]
+fn v8_bootstrap_admits_only_empty_unpublished_evidence() {
+    let (state, workspace) = fixture();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert!(store.recorded_index_options().unwrap().is_none());
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready"),
+        "an empty bootstrap must not serve evidence"
+    );
+    let path = index_dir(state.path()).join("index.db");
+    drop(store);
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute(
+        "INSERT INTO native_source_sets(id,root_id) VALUES('forged-bootstrap','forged-root')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let reopened = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(
+        reopened
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index"),
+        "partial v8 bootstrap must fail closed"
+    );
+    assert!(
+        reopened
+            .recorded_index_options()
+            .expect_err("partial bootstrap cannot become an absent-option fallback")
+            .to_string()
+            .contains("partial v8 bootstrap")
+    );
+}
+
+#[test]
+fn published_v8_missing_reconcile_options_never_looks_like_a_bootstrap() {
+    let (state, _workspace, store, pin, _session) = projection_fixture();
+    assert_eq!(store.status().unwrap().revision, pin);
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    db.execute("UPDATE index_metadata SET reconcile_options=NULL", [])
+        .unwrap();
+    assert!(
+        store
+            .recorded_index_options()
+            .expect_err("published v8 cannot omit recorded options")
+            .to_string()
+            .contains("missing reconcile options")
+    );
+}
+
 fn index_dir(state: &Path) -> std::path::PathBuf {
     fs::read_dir(state.join("cache/indexes"))
         .unwrap()
@@ -197,6 +254,63 @@ fn preexisting_corrupt_index_is_not_reinitialized() {
 }
 
 #[test]
+fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recovery() {
+    use baleyg::{index_coordinator::reconcile_workspace, indexer::IndexOptions};
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    let (state, workspace, store, old_pin, session) = projection_fixture();
+    drop(session);
+    drop(store);
+    let dir = index_dir(state.path());
+    let index = dir.join("index.db");
+    let file = fs::OpenOptions::new().write(true).open(&index).unwrap();
+    file.set_len(128).unwrap();
+    drop(file);
+    let old_bytes = fs::read(&index).unwrap();
+    assert_eq!(&old_bytes[..16], b"SQLite format 3\0");
+    assert!(old_bytes.len() > 20);
+    let old_inode = fs::metadata(&index).unwrap().ino();
+
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(
+        store.status().is_err(),
+        "a damaged published index must not be served"
+    );
+    assert!(
+        store.source_at("flow.js", Some(old_pin)).is_err(),
+        "a damaged source must not be served"
+    );
+    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&index).unwrap().ino(), old_inode);
+    assert!(staged_files(&dir).is_empty());
+
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let failure = reconcile_workspace(&store, &options, &cancelled, |_| {}).unwrap_err();
+    assert!(failure.to_string().contains("cancelled"), "{failure:#}");
+    assert!(store.status().is_err());
+    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&index).unwrap().ino(), old_inode);
+    assert!(staged_files(&dir).is_empty());
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let (recovered, _session) = reconcile_workspace(&store, &options, &ready, |_| {}).unwrap();
+    assert_eq!(recovered.index_revision, 1);
+    assert_ne!(recovered.index_generation, old_pin.index_generation);
+    assert!(store.source_at("flow.js", Some(old_pin)).is_err());
+    assert!(
+        store
+            .source_at("flow.js", Some(recovered))
+            .unwrap()
+            .is_some()
+    );
+    assert!(staged_files(&dir).is_empty());
+}
+
+#[test]
 fn failed_capture_leaves_existing_index_revision_unchanged() {
     use baleyg::{
         indexer::{IndexOptions, index_workspace},
@@ -333,17 +447,15 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     let index = index_dir(state.path()).join("index.db");
     let persisted_source = || {
         let db = rusqlite::Connection::open(&index).unwrap();
-        let (payload, native_bytes, native_hash): (String, Vec<u8>, String) = db
+        let (native_bytes, native_hash): (Vec<u8>, String) = db
             .query_row(
-                "SELECT f.payload,d.source_bytes,d.content_hash FROM files f JOIN native_documents d ON d.path=f.path WHERE f.path='main.js'",
+                "SELECT v.source_bytes,v.content_hash FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.path='main.js'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         (
-            serde_json::from_str::<baleyg::model::SourceFile>(&payload)
-                .unwrap()
-                .text,
+            String::from_utf8(native_bytes.clone()).unwrap(),
             native_bytes,
             native_hash,
         )
@@ -510,19 +622,25 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     let files = db
-        .prepare("SELECT path FROM files ORDER BY path")
+        .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
         .unwrap()
-        .query_map([], |r| r.get::<_, String>(0))
+        .query_map(
+            [format!(
+                "pin:v1:{}:{}",
+                second.index_generation, second.index_revision
+            )],
+            |r| r.get::<_, String>(0),
+        )
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(files, vec!["two.js"]);
     let capture_stat: String = db
         .query_row(
-            "SELECT capture_stat FROM files WHERE path='two.js'",
+            "SELECT capture_stat FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path='two.js'",
             [],
             |r| r.get(0),
         )
@@ -533,7 +651,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
     let package: String = db
         .query_row(
-            "SELECT payload FROM capture_inputs WHERE input_key='config:package.json'",
+            "SELECT payload FROM revision_capture_inputs WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND input_key='config:package.json'",
             [],
             |r| r.get(0),
         )
@@ -544,7 +662,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
     let absent: i64 = db
         .query_row(
-            "SELECT count(*) FROM capture_inputs WHERE payload='{\"state\":\"absent\"}'",
+            "SELECT count(*) FROM revision_capture_inputs WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND payload='{\"state\":\"absent\"}'",
             [],
             |r| r.get(0),
         )
@@ -561,8 +679,68 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
 }
 
+// Frozen v4 objects match Store's exact closed-world legacy recognition.
+// This is a physical old-format fixture, not a marker downgrade of a v8 DB.
+const FROZEN_LEGACY4_GRAPH_SQL: &str = "
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX nodes_name ON nodes(name);
+CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX calls_caller ON calls(caller);
+CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+";
+const FROZEN_LEGACY4_CLASS_SQL: &str = "
+CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
+CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX classes_path ON classes(path,id);
+CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX class_relations_owner ON class_relations(owner,id);
+CREATE INDEX class_relations_target ON class_relations(target,id);
+";
+fn rewrite_as_physical_v4(db: &rusqlite::Connection) {
+    let metadata: (String,String,String,String,i64,i64,String,String,String) = db.query_row(
+        "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
+        [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+    ).unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let names: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for name in names {
+        db.execute_batch(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")))
+            .unwrap();
+    }
+    db.execute_batch(FROZEN_LEGACY4_GRAPH_SQL).unwrap();
+    db.execute_batch(FROZEN_LEGACY4_CLASS_SQL).unwrap();
+    db.execute(
+        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        rusqlite::params![
+            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
+            metadata.7, metadata.8
+        ],
+    )
+    .unwrap();
+    db.execute("INSERT INTO class_catalog VALUES(1,'[]',0)", [])
+        .unwrap();
+    db.pragma_update(None, "user_version", 4).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
 #[test]
-fn schema_six_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
+fn physical_schema_four_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
@@ -582,16 +760,7 @@ fn schema_six_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
     let inode = fs::metadata(&path).unwrap().ino();
     drop(store);
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch(
-        "DROP TABLE capture_inputs;
-        ALTER TABLE files DROP COLUMN capture_stat;
-        ALTER TABLE index_metadata DROP COLUMN reconcile_options;
-        ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
-    )
-    .unwrap();
-    db.execute("UPDATE index_metadata SET schema_version=6", [])
-        .unwrap();
-    db.pragma_update(None, "user_version", 6).unwrap();
+    rewrite_as_physical_v4(&db);
     drop(db);
 
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
@@ -613,24 +782,88 @@ fn schema_six_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
     assert_eq!(store.status().unwrap().revision, rebuilt);
 }
 
-fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
+fn sqlite_snapshot(
+    path: &Path,
+    pin: baleyg::model::IndexPin,
+    normalize_current_publication: bool,
+) -> Vec<(String, Vec<Vec<String>>)> {
     use rusqlite::types::Value;
     let db = rusqlite::Connection::open(path).unwrap();
-    let tables = db
+    let (generation, published_revision, incarnation): (String, i64, String) = db
+        .query_row(
+            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(&generation).is_ok());
+    assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
+    assert_eq!(pin.index_generation.to_string(), generation);
+    if normalize_current_publication {
+        assert_eq!(pin.index_revision as i64, published_revision);
+    }
+    let revision_id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+    let (header_incarnation, header_revision): (String, i64) = db
+        .query_row(
+            "SELECT reconciled_incarnation,published_index_revision FROM native_revisions WHERE id=?1",
+            [&revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(header_revision, pin.index_revision as i64);
+    if normalize_current_publication {
+        assert_eq!(header_incarnation, incarnation);
+    }
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0, "all retained revision FKs must remain valid");
+    let tables: Vec<String> = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
+    assert_eq!(tables.len(), 28, "compare all v8 evidence tables");
     tables
         .into_iter()
         .map(|table| {
-            let escaped = table.replace('"', "\"\"");
-            let mut statement = db.prepare(&format!("SELECT * FROM \"{escaped}\"")).unwrap();
+            // Select the complete revision projection, not all archived rows.
+            // Every table remains in the independent cold-source comparison.
+            let (where_clause, alias) = match table.as_str() {
+                "native_revisions" => ("id=?1", ""),
+                "revision_capture_inputs" | "revision_documents" => ("revision_id=?1", ""),
+                "native_source_sets" => ("id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
+                "native_source_set_languages" | "native_source_set_dependencies" =>
+                    ("source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
+                "native_producers" | "native_producer_languages" | "native_producer_inputs" =>
+                    ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)", "producer"),
+                "document_versions" => ("id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "graph_projections" => ("id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "graph_nodes" | "graph_calls" | "graph_regions" =>
+                    ("projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "class_projections" => ("id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "classes" | "class_relations" =>
+                    ("projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                name if name.starts_with("native_version_") =>
+                    ("version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
+                _ => panic!("unhandled v8 evidence table: {table}"),
+            };
+            // Producer descriptor columns differ: only the parent table uses id/version.
+            let where_clause = if table == "native_producers" {
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)"
+            } else {
+                where_clause
+            };
+            let alias = if alias.is_empty() { "" } else { " selected" };
+            let sql = format!("SELECT * FROM \"{table}\"{alias} WHERE {where_clause}");
+            let mut statement = db.prepare(&sql).unwrap();
             let columns = statement.column_count();
             let mut rows = statement
-                .query_map([], |row| {
+                .query_map([&revision_id], |row| {
                     (0..columns)
                         .map(|column| match row.get::<_, Value>(column)? {
                             Value::Null => Ok("null".to_owned()),
@@ -644,6 +877,24 @@ fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
+            if table == "native_revisions" {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], format!("t:{revision_id}"));
+                assert_eq!(rows[0][8], format!("t:{header_incarnation}"));
+                assert_eq!(rows[0][12], format!("i:{}", pin.index_revision));
+                if normalize_current_publication {
+                    rows[0][0] = "t:<current-pin>".into();
+                    rows[0][8] = "t:<leader-incarnation>".into();
+                    rows[0][12] = "i:<current-revision>".into();
+                }
+            } else if matches!(table.as_str(), "revision_capture_inputs" | "revision_documents") {
+                for row in &mut rows {
+                    assert_eq!(row[0], format!("t:{revision_id}"));
+                    if normalize_current_publication {
+                        row[0] = "t:<current-pin>".into();
+                    }
+                }
+            }
             rows.sort();
             (table, rows)
         })
@@ -662,6 +913,10 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         ("delete.js", "function deleted() {}\n"),
         ("rename-old.js", "function renamed() {}\n"),
         ("ignored.js", "function admittedAfterRuleChange() {}\n"),
+        (
+            "Witness.java",
+            "class Witness { void retained() { measured(); } }\n",
+        ),
     ] {
         fs::write(workspace.path().join(name), source).unwrap();
     }
@@ -674,10 +929,29 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(workspace.path().to_owned());
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let first = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let leader_session = first_job.session();
+    let first = first_job.run(&options, &cancel, |_| {}).unwrap();
+    let reconciled_path = index_dir(state.path()).join("index.db");
+    let retained_first = sqlite_snapshot(&reconciled_path, first, false);
+    for table in [
+        "document_versions",
+        "graph_projections",
+        "class_projections",
+        "native_version_declarations",
+        "graph_nodes",
+        "classes",
+    ] {
+        assert!(
+            !retained_first
+                .iter()
+                .find(|(name, _)| name == table)
+                .unwrap()
+                .1
+                .is_empty(),
+            "{table} fixture must be nonempty"
+        );
+    }
 
     fs::write(
         workspace.path().join("keep.js"),
@@ -697,23 +971,74 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         "{\"name\":\"after!\"}\n",
     )
     .unwrap();
-    IndexJobCoordinator::prepare(&store, Some(first))
-        .unwrap()
-        .run(&options, &cancel, |_| {})
+    let second =
+        IndexJobCoordinator::prepare_with_session(&store, Some(first), leader_session.clone())
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+    assert_eq!(second.index_generation, first.index_generation);
+    assert_eq!(second.index_revision, first.index_revision + 1);
+    assert_eq!(store.status().unwrap().revision, second);
+    assert_eq!(
+        sqlite_snapshot(&reconciled_path, first, false),
+        retained_first,
+        "r1 full evidence must remain immutable after r2"
+    );
+    let r2 = sqlite_snapshot(&reconciled_path, second, true);
+    let paths = |snapshot: &Vec<(String, Vec<Vec<String>>)>| -> std::collections::BTreeSet<String> {
+        snapshot
+            .iter()
+            .find(|(table, _)| table == "revision_documents")
+            .unwrap()
+            .1
+            .iter()
+            .map(|row| row[3].clone())
+            .collect()
+    };
+    let first_paths = paths(&retained_first);
+    let second_paths = paths(&r2);
+    assert!(first_paths.contains("t:delete.js") && first_paths.contains("t:rename-old.js"));
+    assert!(
+        second_paths.contains("t:added.rs")
+            && second_paths.contains("t:rename-new.js")
+            && second_paths.contains("t:ignored.js")
+            && !second_paths.contains("t:delete.js")
+            && !second_paths.contains("t:rename-old.js")
+    );
+    let db = rusqlite::Connection::open(&reconciled_path).unwrap();
+    let headers: i64 = db
+        .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
         .unwrap();
+    assert_eq!(headers, 2, "r1 and r2 headers survive");
+    for pin in [first, second] {
+        let id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        for table in ["revision_documents", "revision_capture_inputs"] {
+            let count: i64 = db
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE revision_id=?1"),
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(count > 0, "{table}: complete {id} evidence must remain");
+        }
+    }
+    let stale = store.source_at("keep.js", Some(first)).unwrap_err();
+    assert!(stale.to_string().contains("revision conflict"), "{stale:#}");
+    drop(db);
 
     let fresh_state = tempfile::tempdir().unwrap();
     fs::set_permissions(fresh_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let fresh = Store::open_for_tests(fresh_state.path(), workspace.path()).unwrap();
-    IndexJobCoordinator::prepare(&fresh, None)
+    let cold_pin = IndexJobCoordinator::prepare(&fresh, None)
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
-    let reconciled_path = index_dir(state.path()).join("index.db");
     let fresh_path = index_dir(fresh_state.path()).join("index.db");
     assert_eq!(
-        sqlite_snapshot(&reconciled_path),
-        sqlite_snapshot(&fresh_path)
+        r2,
+        sqlite_snapshot(&fresh_path, cold_pin, true),
+        "current r2 must equal a full independent cold build, including every selected v8 table"
     );
     let metadata = |path: &Path| {
         let db = rusqlite::Connection::open(path).unwrap();
@@ -757,7 +1082,7 @@ fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
         let db = rusqlite::Connection::open(&path).unwrap();
         let payload: String = db
             .query_row(
-                "SELECT capture_stat FROM files WHERE path='same.js'",
+                "SELECT capture_stat FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path='same.js'",
                 [],
                 |row| row.get(0),
             )
@@ -840,11 +1165,16 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     drop(store);
 
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='obsolete-extractor'",
-        [],
-    )
-    .unwrap();
+    assert!(
+        db.execute(
+            "UPDATE index_metadata SET extractor_version='obsolete-extractor'",
+            []
+        )
+        .is_err(),
+        "v8 metadata must physically forbid unsupported extractor markers"
+    );
+    db.execute("UPDATE index_metadata SET stats='not-json'", [])
+        .unwrap();
     drop(db);
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     assert!(
@@ -865,7 +1195,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
 
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE files SET payload='not-json' WHERE path='one.js'",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
         [],
     )
     .unwrap();
@@ -920,11 +1250,11 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     assert!(failure.to_string().contains("cancelled"));
     let db = rusqlite::Connection::open(&path).unwrap();
     let malformed: String = db
-        .query_row("SELECT payload FROM files WHERE path='one.js'", [], |row| {
+        .query_row("SELECT hex(source_bytes) FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(malformed, "not-json");
+    assert_eq!(malformed, "FF");
     drop(db);
     assert!(store.status().is_err());
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
@@ -945,14 +1275,14 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let db = rusqlite::Connection::open(&path).unwrap();
     let (syntax_id, lookup_key): (String, String) = db
         .query_row(
-            "SELECT syntax_id,lookup_key FROM native_declarations WHERE lookup_key IS NOT NULL AND language='javascript' ORDER BY syntax_id LIMIT 1",
+            "SELECT d.syntax_id,d.lookup_key FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id WHERE d.lookup_key IS NOT NULL AND v.language='javascript' ORDER BY d.syntax_id LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE native_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=?1",
+            "UPDATE native_version_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=?1",
             [&syntax_id],
         )
         .unwrap(),
@@ -979,7 +1309,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let db = rusqlite::Connection::open(&path).unwrap();
     let stored_type: String = db
         .query_row(
-            "SELECT typeof(key_ordinal) FROM native_declarations WHERE syntax_id=?1",
+            "SELECT typeof(key_ordinal) FROM native_version_declarations WHERE syntax_id=?1",
             [&syntax_id],
             |row| row.get(0),
         )
@@ -1133,10 +1463,10 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
     };
     use std::sync::{Arc, atomic::AtomicBool};
     for mutation in [
-        "DELETE FROM capture_inputs WHERE input_key='config:package.json'",
-        "INSERT INTO capture_inputs(input_key,payload) VALUES('unknown:slot','{\"state\":\"absent\"}')",
+        "DELETE FROM revision_capture_inputs WHERE input_key='config:package.json'",
+        "INSERT INTO revision_capture_inputs(revision_id,input_key,payload) SELECT id,'unknown:slot','{\"state\":\"absent\"}' FROM native_revisions WHERE published_index_revision=(SELECT index_revision FROM index_metadata)",
         "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',2)",
-        "UPDATE capture_inputs SET payload=json_set(payload,'$.hash','invalid-digest') WHERE input_key='config:package.json'",
+        "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash','invalid-digest') WHERE input_key='config:package.json'",
     ] {
         let (state, workspace) = fixture();
         fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
@@ -1181,7 +1511,7 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         assert_eq!(store.status().unwrap().revision, repaired);
         let db = rusqlite::Connection::open(&path).unwrap();
         let keys = db
-            .prepare("SELECT input_key FROM capture_inputs ORDER BY input_key")
+            .prepare("SELECT input_key FROM revision_capture_inputs ORDER BY input_key")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
@@ -1201,7 +1531,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
-        "UPDATE files SET payload='not-json' WHERE path='flow.js'",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
     )
     .unwrap();
@@ -1223,7 +1553,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
-        "UPDATE nodes SET payload='not-json' WHERE path='flow.js'",
+        "UPDATE graph_nodes SET payload='not-json' WHERE path='flow.js'",
         [],
     )
     .unwrap();
@@ -1246,7 +1576,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         let clone = store.clone();
         let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
         db.execute(
-            "UPDATE nodes SET payload=?1 WHERE path='flow.js'",
+            "UPDATE graph_nodes SET payload=?1 WHERE path='flow.js'",
             [payload],
         )
         .unwrap();
@@ -1264,16 +1594,26 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         );
     }
 
-    // A valid selected file JSON value with a non-string language is a typed
-    // SQLite extraction conversion, not a generic SQLITE_ERROR.
+    // The selected source's bytes remain the same, but storing them as TEXT
+    // instead of BLOB must produce a typed conversion refusal. No FK or CHECK
+    // is disabled: the source hash and declared byte length still match.
     let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    db.execute(
-        "UPDATE files SET payload=json_set(payload,'$.language',7) WHERE path='flow.js'",
+    assert_eq!(
+        db.execute(
+            "UPDATE document_versions SET source_bytes=CAST(source_bytes AS TEXT) WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+            [],
+        )
+        .unwrap(),
+        1
+    );
+    let storage_class: String = db.query_row(
+        "SELECT typeof(source_bytes) FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
-    )
-    .unwrap();
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(storage_class, "text");
     let error = store.files_at(Some(pin), 0, 10).unwrap_err();
     assert!(
         error.to_string().contains("incompatible_index"),
@@ -1292,7 +1632,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
-        "UPDATE nodes SET payload='not-json' WHERE path='flow.js'",
+        "UPDATE graph_nodes SET payload='not-json' WHERE path='flow.js'",
         [],
     )
     .unwrap();
@@ -1354,7 +1694,7 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
     let inode = fs::metadata(&path).unwrap().ino();
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE files SET payload='not-json' WHERE path='flow.js'",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
     )
     .unwrap();
@@ -1436,6 +1776,10 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
     let inode = fs::metadata(&path).unwrap().ino();
     drop(initial);
     let db = rusqlite::Connection::open(&path).unwrap();
+    // Simulate an out-of-band damaged v8 metadata marker without pretending
+    // this is a physical legacy index. The ordinary SQL CHECK rejects it.
+    db.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
     db.execute("UPDATE index_metadata SET schema_version=6", [])
         .unwrap();
     drop(db);
@@ -1461,6 +1805,8 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
     let stale =
         IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone()).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
+    db.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
     db.execute(
         "UPDATE index_metadata SET extractor_version='changed-after-admission'",
         [],
@@ -1477,7 +1823,7 @@ fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
     assert!(error.to_string().contains("revision conflict"), "{error:#}");
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE index_metadata SET extractor_version='native-paired-v1'",
+        "UPDATE index_metadata SET extractor_version='native-v4'",
         [],
     )
     .unwrap();
@@ -1864,7 +2210,7 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
+        "UPDATE revision_capture_inputs SET payload='not-json' WHERE input_key='root:.'",
         [],
     )
     .unwrap();
@@ -1891,7 +2237,7 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE capture_inputs SET input_key='unexpected:role' WHERE input_key='root:.'",
+        "UPDATE revision_capture_inputs SET input_key='unexpected:role' WHERE input_key='root:.'",
         [],
     )
     .unwrap();
@@ -2066,7 +2412,7 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
     for sql in [
         "UPDATE index_metadata SET stats='not-json'",
         "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
-        "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
+        "UPDATE revision_capture_inputs SET payload='not-json' WHERE input_key='root:.'",
     ] {
         let (state, _workspace, store, pin, _session) = projection_fixture();
         let clone = store.clone();

@@ -52,18 +52,41 @@ fn private_stage_build_is_unpublished_and_cleans_only_its_own_inode() {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!((version, metadata_version), (5, 5));
-        let classes: i64 = db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='class_catalog'",
-            [],
-            |row| row.get(0),
-        )?;
-        let native: i64 = db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='native_revisions'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!((classes, native), (1, 0));
+        assert_eq!((version, metadata_version), (8, 8));
+        for name in [
+            "document_versions",
+            "revision_documents",
+            "graph_projections",
+            "class_projections",
+            "native_revisions",
+        ] {
+            let count: i64 = db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1, "missing staged v8 table {name}");
+        }
+        for name in [
+            "class_catalog",
+            "files",
+            "nodes",
+            "calls",
+            "regions",
+            "native_documents",
+            "native_coverage",
+            "native_provenance",
+        ] {
+            let count: i64 = db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0, "old table leaked into staged v8: {name}");
+        }
+        let manifest: i64 =
+            db.query_row("SELECT count(*) FROM revision_documents", [], |r| r.get(0))?;
+        assert_eq!(manifest, 0, "bootstrap must not publish a partial manifest");
         first_stage = Some(path.to_owned());
         anyhow::bail!("injected before-stage-publication refusal")
     })
@@ -114,35 +137,94 @@ fn pin(store: &Store, revision: u64) -> IndexPin {
         index_revision: revision,
     }
 }
-// Model the old graph-only cache shape, rather than merely lowering its version.
+// Build a physical schema-4 file from the v8 revision. Lowering markers alone is
+// invalid: v8's CHECK constraints and table layout are not the old cache shape.
+const LEGACY_V4_SCHEMA: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
+CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX nodes_name ON nodes(name);
+CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX calls_caller ON calls(caller);
+CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+
+
+CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
+CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE INDEX classes_path ON classes(path,id);
+CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
+CREATE INDEX class_relations_owner ON class_relations(owner,id);
+CREATE INDEX class_relations_target ON class_relations(target,id);
+"#;
 fn downgrade_to_legacy(db: &rusqlite::Connection) {
-    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
-    let tables = db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'native_*'")
+    db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")
+        .unwrap();
+    // Preserve the exact committed pin and selected graph/class DTOs on the SAME inode.
+    // The bootstrap (no published revision) also becomes an empty physical old4 cache.
+    db.execute_batch(r#"
+        CREATE TEMP TABLE old_metadata AS SELECT singleton,4 AS schema_version,
+            'native-v1' AS extractor_version,root_spelling,root_device,root_inode,
+            index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics
+            FROM index_metadata;
+        CREATE TEMP TABLE old_files AS SELECT d.path,d.content_hash AS hash,
+            json_object('path',d.path,'hash',d.content_hash,'language',d.language,
+                'text',CAST(d.source_bytes AS TEXT)) AS payload
+            FROM revision_documents rd JOIN document_versions d ON d.id=rd.document_version_id;
+        CREATE TEMP TABLE old_nodes AS SELECT n.id,n.name,n.path,n.payload
+            FROM graph_nodes n JOIN revision_documents rd ON rd.graph_projection_id=n.projection_id;
+        CREATE TEMP TABLE old_calls AS SELECT c.id,c.caller,c.target,c.path,c.payload
+            FROM graph_calls c JOIN revision_documents rd ON rd.graph_projection_id=c.projection_id;
+        CREATE TEMP TABLE old_regions AS SELECT r.id,r.owner,r.path,r.payload
+            FROM graph_regions r JOIN revision_documents rd ON rd.graph_projection_id=r.projection_id;
+        CREATE TEMP TABLE old_classes AS SELECT c.id,c.name,c.qualified_name,c.path,c.payload
+            FROM classes c JOIN revision_documents rd ON rd.class_projection_id=c.projection_id;
+        CREATE TEMP TABLE old_class_relations AS SELECT c.id,c.owner,c.target,c.payload
+            FROM class_relations c JOIN revision_documents rd ON rd.class_projection_id=c.projection_id;
+        CREATE TEMP TABLE old_class_catalog AS SELECT 1 AS singleton,
+            COALESCE((SELECT class_warnings FROM native_revisions LIMIT 1),'[]') AS warnings,
+            COALESCE((SELECT class_truncated FROM native_revisions LIMIT 1),0) AS truncated;
+    "#).unwrap();
+    let names = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'")
         .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
+        .query_map([], |r| r.get::<_, String>(0))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    for table in tables {
-        db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+    for name in names {
+        assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        db.execute_batch(&format!("DROP TABLE \"{name}\";"))
+            .unwrap();
     }
-    for index in ["nodes_path", "calls_path", "regions_path"] {
-        db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-    }
+    db.execute_batch(LEGACY_V4_SCHEMA).unwrap();
     db.execute_batch(
-        "DROP TABLE capture_inputs;
-         ALTER TABLE files DROP COLUMN capture_stat;
-         ALTER TABLE index_metadata DROP COLUMN reconcile_options;
-         ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
+        r#"
+        INSERT INTO index_metadata SELECT * FROM old_metadata;
+        INSERT INTO files SELECT * FROM old_files;
+        INSERT INTO nodes SELECT * FROM old_nodes;
+        INSERT INTO calls SELECT * FROM old_calls;
+        INSERT INTO regions SELECT * FROM old_regions;
+        INSERT INTO class_catalog SELECT * FROM old_class_catalog;
+        INSERT INTO classes SELECT * FROM old_classes;
+        INSERT INTO class_relations SELECT * FROM old_class_relations;
+        PRAGMA user_version=4;
+        COMMIT;
+        PRAGMA foreign_keys=ON;
+    "#,
     )
     .unwrap();
-    db.execute(
-        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-        [],
-    )
-    .unwrap();
-    db.pragma_update(None, "user_version", 4).unwrap();
+    let leftovers: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN
+        ('document_versions','revision_documents','native_revisions','graph_projections')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        leftovers, 0,
+        "legacy fixture must be physical old4, never marker-only"
+    );
 }
 fn index_db(state: &std::path::Path) -> std::path::PathBuf {
     std::fs::read_dir(state.join("cache/indexes"))
@@ -261,8 +343,10 @@ fn publication_is_atomic_and_reopens() {
             .contains("index_not_ready")
     );
     let baseline = store.index_baseline().unwrap();
-    let before = std::fs::read(index_db(state.path())).unwrap();
     let leader = store.leader().unwrap();
+    // Leader acquisition deliberately updates last_opened_at. Snapshot only
+    // after that heartbeat to assert rejected publishes write zero bytes.
+    let before = std::fs::read(index_db(state.path())).unwrap();
     for error in [
         store
             .publish(&captured.0, &leader, baseline, &cancel())
@@ -446,7 +530,7 @@ fn delete_reader_pins_snapshot_and_blocks_publish() {
     );
     assert_eq!(revision(), 1);
     assert_eq!(
-        db.query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+        db.query_row("SELECT count(*) FROM graph_nodes n JOIN revision_documents rd ON rd.graph_projection_id=n.projection_id", [], |r| r.get::<_, i64>(0))
             .unwrap(),
         captured.0.nodes.len() as i64
     );
@@ -688,6 +772,7 @@ fn legacy_admission_distinguishes_invalid_marker_from_live_decode() {
     let marker_path = index_db(marker_state.path());
     drop(marker_store);
     let marker_db = rusqlite::Connection::open(&marker_path).unwrap();
+    downgrade_to_legacy(&marker_db);
     marker_db
         .execute(
             "UPDATE index_metadata SET extractor_version='wrong-old-extractor'",
@@ -1008,8 +1093,9 @@ fn recognized_noncurrent_without_marker_column_is_explicitly_not_ready() {
     }))
     .unwrap();
     store.put_view(&saved).unwrap();
-    let before = std::fs::read(index_db(state.path())).unwrap();
     let leader = store.leader().unwrap();
+    // Exclude the intentional leader heartbeat, not status or saved reads.
+    let before = std::fs::read(index_db(state.path())).unwrap();
     let error = store.status().unwrap_err();
     assert!(error.to_string().contains("index_not_ready"), "{error:#}");
     assert!(!error.to_string().contains("no such column"), "{error:#}");
@@ -1091,11 +1177,11 @@ fn cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys() {
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.pragma_update(None, "foreign_keys", true).unwrap();
     assert!(
-        db.execute("DELETE FROM files WHERE path='a.js'", [])
+        db.execute("DELETE FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='a.js')", [])
             .is_err()
     );
     let a = symbol_id(&captured.0, "a");
-    assert!(db.execute("DELETE FROM nodes WHERE id=?1", [&a]).is_err());
+    assert!(db.execute("DELETE FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='a.js') AND id=?1", [&a]).is_err());
     drop(db);
     drop(leader);
     drop(store);
@@ -1185,7 +1271,7 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         let db = rusqlite::Connection::open(&path)?;
         db.busy_timeout(std::time::Duration::ZERO)?;
         db.query_row(
-            "SELECT m.index_generation,m.index_revision,f.payload,f.hash,d.source_bytes,d.content_hash FROM index_metadata m JOIN files f ON f.path='a.js' JOIN native_documents d ON d.path=f.path WHERE m.singleton=1",
+            "SELECT m.index_generation,m.index_revision,d.path,d.content_hash,d.source_bytes,d.content_hash FROM index_metadata m JOIN native_revisions r ON r.published_index_revision=m.index_revision JOIN revision_documents rd ON rd.revision_id=r.id JOIN document_versions d ON d.id=rd.document_version_id WHERE m.singleton=1 AND rd.path='a.js'",
                 [],
                 |row| {
                     Ok((
@@ -1230,15 +1316,13 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         }
     }
     match raw_pair {
-        Ok((generation, revision, payload, file_hash, native_bytes, native_hash)) => {
+        Ok((generation, revision, path, file_hash, native_bytes, native_hash)) => {
             assert_eq!(generation, previous.index_generation.to_string());
             assert_eq!(revision, previous.index_revision as i64);
-            let source: SourceFile = serde_json::from_str(&payload).unwrap();
-            assert_eq!(source.text, captured.0.files[0].text);
-            assert_eq!(source.hash, captured.0.files[0].hash);
+            assert_eq!(path, "a.js");
             assert_eq!(file_hash, captured.0.files[0].hash);
             assert_eq!(native_hash, captured.0.files[0].hash);
-            assert_eq!(native_bytes, source.text.as_bytes().to_vec());
+            assert_eq!(native_bytes, captured.0.files[0].text.as_bytes().to_vec());
         }
         Err(error) => assert!(
             matches!(
@@ -1992,7 +2076,7 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
     cache.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
     cache
         .execute(
-            "UPDATE native_documents SET revision_id='revision:v1:dangling' WHERE path='b.js'",
+            "UPDATE revision_documents SET document_version_id='document:v1:dangling' WHERE path='b.js'",
             [],
         )
         .unwrap();
@@ -2001,14 +2085,9 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
 
     let first = store.saved_views_at(Some(pin)).unwrap_err();
     let first_detail = format!("{first:#}");
-    assert!(
-        first_detail == "Query returned no rows"
-            || first_detail
-                == "incompatible_index: reconciliation required after invalid current index"
-            || first_detail.starts_with(
-                "incompatible_index: selected evidence decode failed: Query returned no rows",
-            ),
-        "{first_detail}"
+    assert_eq!(
+        first_detail,
+        "incompatible_index: selected evidence decode failed: incompatible_index: selected document missing or ambiguous"
     );
     let second = store.saved_view_at("association", Some(pin)).unwrap_err();
     assert_eq!(
@@ -2041,6 +2120,40 @@ fn saved_reads_without_records_are_conservative_and_write_nothing() {
     assert!(
         !roots.record_db(&identity).exists(),
         "saved reads created a durable database"
+    );
+}
+
+#[test]
+fn partial_v8_bootstrap_never_turns_saved_records_into_index_unavailable() {
+    let (state, _work, store) = fixture();
+    let saved: SavedView = serde_json::from_value(serde_json::json!({
+        "id":"saved","title":"Durable","query":{"seed":"missing"}
+    }))
+    .unwrap();
+    store.put_view(&saved).unwrap();
+    let unavailable = store.view("saved").unwrap().unwrap();
+    assert_eq!(unavailable.view, saved);
+    assert_eq!(
+        unavailable.attachment.availability,
+        AttachmentAvailability::IndexUnavailable
+    );
+    let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
+    db.execute(
+        "INSERT INTO native_source_sets(id,root_id) VALUES('forged-bootstrap','forged-root')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let clone = store.clone();
+    let first = store.views().unwrap_err();
+    assert!(
+        first.to_string().contains("incompatible_index"),
+        "{first:#}"
+    );
+    let closed = clone.view("saved").unwrap_err();
+    assert!(
+        closed.to_string().contains("incompatible_index"),
+        "{closed:#}"
     );
 }
 

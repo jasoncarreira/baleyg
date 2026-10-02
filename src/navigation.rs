@@ -152,7 +152,7 @@ impl Reader<'_> {
         Ok(result)
     }
     fn symbol(&mut self, id: &str) -> Result<Option<Symbol>> {
-        Ok(self.records("SELECT CASE WHEN length(CAST(payload AS BLOB))<=?2 THEN payload END FROM nodes WHERE id=?1",
+        Ok(self.records("SELECT CASE WHEN length(CAST(payload AS BLOB))<=?2 THEN payload END FROM graph_nodes n JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=n.projection_id WHERE n.id=?1",
             params![id, RECORD_BYTES])?.pop())
     }
     fn add(&mut self, symbol: Symbol, reason: &'static str, certainty: &str) -> Result<()> {
@@ -160,7 +160,7 @@ impl Reader<'_> {
             SymbolKind::Function | SymbolKind::Method => "sequence",
             SymbolKind::Class => {
                 if !self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM classes WHERE id=?1)",
+                    "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.class_projection_id=c.projection_id WHERE c.id=?1)",
                     [&symbol.id],
                     |r| r.get::<_, bool>(0),
                 )? {
@@ -207,15 +207,15 @@ impl Reader<'_> {
         // Count lines inside SQLite: do not copy even a large cached source into Rust.
         // Byte spans always come from measured symbols, never Unicode character offsets.
         let lines: Option<i64> = self.db.query_row(
-            "SELECT 1+length(json_extract(payload,'$.text'))-length(replace(json_extract(payload,'$.text'),char(10),'')) FROM files WHERE path=?1",
+            "SELECT 1+length(v.source_bytes)-length(CAST(replace(CAST(v.source_bytes AS TEXT),char(10),'') AS BLOB)) FROM document_versions v JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.document_version_id=v.id WHERE d.path=?1",
             [&s.path], |r| r.get(0)).optional()?;
         ensure!(
             lines.is_some_and(|lines| s.line as i64 <= lines),
             InvalidRequest("The path or line is not present in the cached revision.")
         );
         let declarations: Vec<Symbol> = self.records(
-            "SELECT CASE WHEN length(CAST(payload AS BLOB))<=?3 THEN payload END FROM nodes
-             WHERE path=?1 AND json_extract(payload,'$.kind') IN ('class','method','function')
+            "SELECT CASE WHEN length(CAST(payload AS BLOB))<=?3 THEN payload END FROM graph_nodes n JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=n.projection_id
+             WHERE n.path=?1 AND json_extract(payload,'$.kind') IN ('class','method','function')
              AND json_extract(payload,'$.range.startLine')=?2 ORDER BY id LIMIT 129",
             params![s.path, s.line as i64, RECORD_BYTES],
         )?;
@@ -224,8 +224,8 @@ impl Reader<'_> {
         }
         for kinds in ["class", "callable"] {
             let symbols: Vec<Symbol> = self.records(
-                "SELECT CASE WHEN length(CAST(payload AS BLOB))<=?4 THEN payload END FROM nodes
-                 WHERE path=?1 AND ((?3='class' AND json_extract(payload,'$.kind')='class')
+                "SELECT CASE WHEN length(CAST(payload AS BLOB))<=?4 THEN payload END FROM graph_nodes n JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=n.projection_id
+                 WHERE n.path=?1 AND ((?3='class' AND json_extract(payload,'$.kind')='class')
                     OR (?3='callable' AND json_extract(payload,'$.kind') IN ('function','method')))
                  AND json_extract(payload,'$.range.startLine')<=?2
                  AND (json_extract(payload,'$.range.endLine')>?2 OR
@@ -246,7 +246,7 @@ impl Reader<'_> {
             return Ok(());
         }
         let matches: i64 = self.db.query_row(
-            "SELECT count(*) FROM (SELECT 1 FROM classes c, json_each(c.payload) a, json_each(a.value) m
+            "SELECT count(*) FROM (SELECT 1 FROM classes c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.class_projection_id=c.projection_id, json_each(c.payload) a, json_each(a.value) m
              WHERE c.id=?1 AND a.key IN ('fields','methods')
              AND json_extract(m.value,'$.name')=?2
              AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4 LIMIT 2)",
@@ -257,7 +257,7 @@ impl Reader<'_> {
         );
         let members: Vec<ClassMember> = self.records(
             "SELECT CASE WHEN length(CAST(m.value AS BLOB))<=?5 THEN m.value END
-             FROM classes c, json_each(c.payload) a, json_each(a.value) m
+             FROM classes c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.class_projection_id=c.projection_id, json_each(c.payload) a, json_each(a.value) m
              WHERE c.id=?1 AND a.key IN ('fields','methods')
              AND json_extract(m.value,'$.name')=?2
              AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4 LIMIT 2",
@@ -288,7 +288,7 @@ pub(crate) fn navigate(
 ) -> Result<NavigationResult> {
     let metadata: Option<bool> = db
         .query_row(
-            "SELECT truncated FROM class_catalog WHERE singleton=1",
+            "SELECT r.class_truncated FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision",
             [],
             |r| r.get(0),
         )
