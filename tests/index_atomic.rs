@@ -881,11 +881,11 @@ fn sqlite_snapshot(
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], format!("t:{revision_id}"));
                 assert_eq!(rows[0][8], format!("t:{header_incarnation}"));
-                assert_eq!(rows[0][12], format!("i:{}", pin.index_revision));
+                assert_eq!(rows[0][14], format!("i:{}", pin.index_revision));
                 if normalize_current_publication {
                     rows[0][0] = "t:<current-pin>".into();
                     rows[0][8] = "t:<leader-incarnation>".into();
-                    rows[0][12] = "i:<current-revision>".into();
+                    rows[0][14] = "i:<current-revision>".into();
                 }
             } else if matches!(table.as_str(), "revision_capture_inputs" | "revision_documents") {
                 for row in &mut rows {
@@ -1023,8 +1023,21 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
             assert!(count > 0, "{table}: complete {id} evidence must remain");
         }
     }
-    let stale = store.source_at("keep.js", Some(first)).unwrap_err();
-    assert!(stale.to_string().contains("revision conflict"), "{stale:#}");
+    assert_eq!(
+        store
+            .source_at("delete.js", Some(first))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function deleted() {}\n"
+    );
+    assert!(
+        store
+            .source_at("delete.js", Some(second))
+            .unwrap()
+            .is_none()
+    );
     drop(db);
 
     let fresh_state = tempfile::tempdir().unwrap();

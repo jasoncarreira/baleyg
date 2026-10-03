@@ -169,6 +169,12 @@ impl Store {
         old_root: bool,
         existing_only: bool,
     ) -> Result<(UseGuard, Connection)> {
+        // This pure atomic refusal precedes identity, SH acquisition and any
+        // topology/queue file preparation. Root-loss paths keep their existing
+        // behavior for every disposition other than KnownOldV8Pending.
+        self.ensure_not_known_old_v8_pending()?;
+        #[cfg(test)]
+        self.test_queue_before_shared_hook.run();
         if !old_root {
             self.identity.verify()?;
         }
@@ -177,6 +183,10 @@ impl Store {
         } else {
             self.roots.index_use(&self.identity)?
         };
+        // A waiter may have obtained SH only after the EX replacement
+        // published: check the same atomic state while protected, before RW
+        // open/create or SQLite journal recovery.
+        self.ensure_not_known_old_v8_pending()?;
         let path = self.request_db_path();
         // The protected directory and file must remain private, regular and tied to the pathname.
         let file = OpenOptions::new()
@@ -271,6 +281,7 @@ impl Store {
         options: &IndexOptions,
         expected: Option<IndexPin>,
     ) -> Result<Request> {
+        self.ensure_not_known_old_v8_pending()?;
         self.enqueue_request_with_hook(options, expected, || {})
     }
     fn enqueue_request_with_hook(
@@ -279,6 +290,7 @@ impl Store {
         expected: Option<IndexPin>,
         after_write_lock: impl FnOnce(),
     ) -> Result<Request> {
+        self.ensure_not_known_old_v8_pending()?;
         self.identity.verify()?;
         let selected = std::fs::symlink_metadata(&options.workspace_root)?;
         ensure!(
@@ -328,6 +340,7 @@ impl Store {
         })
     }
     pub fn request_by_id(&self, id: &str) -> Result<Option<Request>> {
+        self.ensure_not_known_old_v8_pending()?;
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
         }
@@ -345,6 +358,7 @@ impl Store {
         Ok(row)
     }
     pub fn earliest_unfinished_request(&self) -> Result<Option<Request>> {
+        self.ensure_not_known_old_v8_pending()?;
         let (_guard, db) = self.request_connection()?;
         let row = db.query_row(
             &format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') ORDER BY seq LIMIT 1"),
@@ -355,6 +369,7 @@ impl Store {
         Ok(row)
     }
     pub fn current_request(&self) -> Result<Option<Request>> {
+        self.ensure_not_known_old_v8_pending()?;
         let (_guard, db) = self.request_connection()?;
         let row = db
             .query_row(
@@ -379,6 +394,7 @@ impl Store {
     }
     /// Mark old-root rows before replacement work, or fail this holder's rows after root loss.
     pub fn fail_changed_root_requests(&self, session: &LeaderSession) -> Result<usize> {
+        self.ensure_not_known_old_v8_pending()?;
         let old_root = self.identity.root_path_replaced()?;
         if old_root {
             self.verify_old_root_queue_leader(session)?;
@@ -478,6 +494,7 @@ impl Store {
         )
     }
     pub fn claim_request(&self, session: &LeaderSession) -> Result<Option<Request>> {
+        self.ensure_not_known_old_v8_pending()?;
         self.verify_leader_session(session)?;
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -506,6 +523,7 @@ impl Store {
         request: &Request,
         result: Result<IndexPin>,
     ) -> Result<()> {
+        self.ensure_not_known_old_v8_pending()?;
         self.verify_leader_session(session)?;
         {
             let mut slot = self.pending_request_completion.lock().unwrap();
@@ -524,17 +542,20 @@ impl Store {
 
     /// A CLI may retry only its own cached completion while holding that same leader.
     /// Do not convert an ordinary claim/read/publish error into an unbounded retry.
-    pub(crate) fn has_recorded_completion(&self, session: &LeaderSession) -> bool {
-        self.pending_request_completion
+    pub(crate) fn has_recorded_completion(&self, session: &LeaderSession) -> Result<bool> {
+        self.ensure_not_known_old_v8_pending()?;
+        Ok(self
+            .pending_request_completion
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|pending| pending.incarnation == session.incarnation().to_string())
+            .is_some_and(|pending| pending.incarnation == session.incarnation().to_string()))
     }
 
     /// Resolve the one in-flight FIFO head before claiming any newer row. A terminal
     /// reread handles an ambiguous SQLite COMMIT; it must match our cached result.
     pub(crate) fn retry_recorded_completion(&self, session: &LeaderSession) -> Result<bool> {
+        self.ensure_not_known_old_v8_pending()?;
         self.verify_leader_session(session)?;
         let mut slot = self.pending_request_completion.lock().unwrap();
         let Some(pending) = slot.as_ref() else {
@@ -603,6 +624,7 @@ impl Store {
         request: &Request,
         result: Result<IndexPin>,
     ) -> Result<()> {
+        self.ensure_not_known_old_v8_pending()?;
         self.finish_request_outcome(session, request, &CompletionOutcome::from_result(result))
     }
     fn finish_request_outcome(
@@ -611,6 +633,7 @@ impl Store {
         request: &Request,
         outcome: &CompletionOutcome,
     ) -> Result<()> {
+        self.ensure_not_known_old_v8_pending()?;
         self.verify_leader_session(session)?;
         #[cfg(test)]
         if self

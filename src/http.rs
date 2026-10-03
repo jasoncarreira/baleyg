@@ -309,6 +309,9 @@ impl DaemonState {
     }
     /// A leader checks only the queue at idle. Follower retries require an accepted local ID.
     fn start_queue_tick(self: &Arc<Self>) {
+        if self.store.is_known_old_v8_pending() {
+            return;
+        }
         // A synchronous fixture may retain an owner without starting a daemon runtime.
         // Do not consume the start flag until a Tokio executor can own the tick.
         if tokio::runtime::Handle::try_current().is_err() {
@@ -335,6 +338,7 @@ impl DaemonState {
         });
     }
     fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.store.ensure_not_known_old_v8_pending()?;
         #[cfg(test)]
         self.test_queue_before_stream.run();
         let _stream = self.native_stream.lock().unwrap();
@@ -1657,6 +1661,9 @@ async fn start_index(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
+    s.store
+        .ensure_not_known_old_v8_pending()
+        .map_err(ApiError::from)?;
     let request: IndexRequest = if body.is_empty() {
         IndexRequest::default()
     } else {
@@ -1688,6 +1695,9 @@ async fn start_index(
 // An unrelated protected reader remains in control of BUSY; no retry is implicit.
 #[allow(dead_code)]
 fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
+    s.store
+        .ensure_not_known_old_v8_pending()
+        .map_err(ApiError::from)?;
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let job = IndexJob {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1872,6 +1882,9 @@ fn finish_index_job(
 async fn current_job(
     State(s): State<Arc<DaemonState>>,
 ) -> Result<Json<Option<IndexJob>>, ApiError> {
+    s.store
+        .ensure_not_known_old_v8_pending()
+        .map_err(ApiError::from)?;
     let legacy = {
         let jobs = s.jobs.lock().unwrap();
         jobs.current
@@ -1898,6 +1911,9 @@ async fn job(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
 ) -> Result<Json<IndexJob>, ApiError> {
+    s.store
+        .ensure_not_known_old_v8_pending()
+        .map_err(ApiError::from)?;
     let legacy = s.jobs.lock().unwrap().jobs.get(&id).cloned();
     if let Some(legacy) = legacy {
         db(s, |store| store.verify_root()).await?;
@@ -1918,6 +1934,9 @@ async fn cancel_job(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
 ) -> Result<Json<IndexJob>, ApiError> {
+    s.store
+        .ensure_not_known_old_v8_pending()
+        .map_err(ApiError::from)?;
     let legacy = s.jobs.lock().unwrap().jobs.get(&id).cloned();
     if let Some(legacy) = legacy {
         db(s, |store| store.verify_root()).await?;
@@ -2986,6 +3005,84 @@ mod live_tests {
         assert_eq!(provider.budget().unwrap().reserved_cents, 10);
         assert_eq!(provider.budget().unwrap().attempts, 1);
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod frozen_old_http_refusal_tests {
+    use super::*;
+    use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
+    use rusqlite::Connection;
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+
+    #[tokio::test]
+    async fn old_v8_http_index_current_status_and_tick_do_not_touch_queue_or_leader() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function old() {}\n").unwrap();
+        let initial = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let index = roots.index_db(&identity);
+        let queue = roots.requests_db(&identity);
+        let leader = roots.leader_lock(&identity);
+        drop(initial);
+        let old = index.with_file_name("frozen-old-v8.db");
+        let db = Connection::open(&old).unwrap();
+        db.execute_batch(&crate::store::frozen_old_v8_schema().unwrap())
+            .unwrap();
+        db.pragma_update(None, "user_version", 8).unwrap();
+        db.execute("ATTACH DATABASE ?1 AS recent", [index.to_str().unwrap()])
+            .unwrap();
+        db.execute_batch(
+            "INSERT INTO index_metadata SELECT * FROM recent.index_metadata;
+            DETACH DATABASE recent",
+        )
+        .unwrap();
+        drop(db);
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&old, &index).unwrap();
+        let pending = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let state_http = new(
+            pending,
+            IndexOptions::new(work.path().to_owned()),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        let before = fs::read(&index).unwrap();
+        let file = fs::symlink_metadata(&index).unwrap();
+        let leader_before = fs::read(&leader).unwrap();
+        assert!(
+            start_index(State(state_http.clone()), Bytes::new())
+                .await
+                .is_err()
+        );
+        assert!(current_job(State(state_http.clone())).await.is_err());
+        assert!(
+            job(State(state_http.clone()), Path("not-a-uuid".into()))
+                .await
+                .is_err()
+        );
+        assert!(
+            status(State(state_http.clone()), "/status".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert!(state_http.queue_tick().is_err());
+        assert!(start_exceptional_index(state_http.clone()).is_err());
+        assert!(!queue.exists());
+        assert_eq!(fs::read(&index).unwrap(), before);
+        assert_eq!(fs::read(&leader).unwrap(), leader_before);
+        let after = fs::symlink_metadata(&index).unwrap();
+        assert_eq!((after.dev(), after.ino()), (file.dev(), file.ino()));
+        assert!(state_http.jobs.lock().unwrap().current.is_none());
     }
 }
 

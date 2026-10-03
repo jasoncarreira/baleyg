@@ -1333,6 +1333,18 @@ async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_
     let (ready, status) = call(&app, "GET", "/api/status", Value::Null).await;
     assert_eq!(ready, StatusCode::OK);
     assert_eq!(status["revision"], done["revision"]);
+    let (stale_code, stale_body) = call(
+        &app,
+        "GET",
+        &format!(
+            "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+            old.index_generation, old.index_revision
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(stale_code, StatusCode::CONFLICT, "{stale_body}");
+    assert_eq!(stale_body["error"]["code"], "revision_conflict");
     let (accepted, queued) =
         call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
     assert_eq!(accepted, StatusCode::ACCEPTED, "{queued}");
