@@ -1453,10 +1453,100 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
     assert_current_corruption(closed);
 }
 
+fn assert_retained_native_family_parity(
+    store: &Store,
+    pin: IndexPin,
+    measured: &baleyg::native_evidence::Artifact,
+) {
+    use std::collections::BTreeSet;
+
+    assert!(
+        measured
+            .calls
+            .iter()
+            .any(|call| call.document.path == "flow.js")
+    );
+    assert!(
+        measured
+            .control_regions
+            .iter()
+            .any(|region| region.document.path == "flow.java")
+    );
+    let lookups = measured
+        .declarations
+        .iter()
+        .filter_map(|declaration| {
+            declaration
+                .lookup_key
+                .as_ref()
+                .map(|key| (declaration.document.language.clone(), key.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+    for (language, lookup) in lookups {
+        let mut actual = store
+            .native_declarations_at(pin, &language, &lookup)
+            .unwrap();
+        let mut expected = measured
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.document.language == language
+                    && declaration.lookup_key.as_deref() == Some(lookup.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        actual.sort_by(|left, right| left.syntax_id.cmp(&right.syntax_id));
+        expected.sort_by(|left, right| left.syntax_id.cmp(&right.syntax_id));
+        // Whole DTO equality includes the requested document revision and provenance.
+        assert_eq!(actual, expected, "{pin:?}: declaration {language}/{lookup}");
+    }
+    for declaration in &measured.declarations {
+        let mut actual_calls = store.native_calls_at(pin, &declaration.syntax_id).unwrap();
+        let mut expected_calls = measured
+            .calls
+            .iter()
+            .filter(|call| call.owner_syntax_id == declaration.syntax_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        actual_calls.sort_by(|left, right| left.id.cmp(&right.id));
+        expected_calls.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(
+            actual_calls, expected_calls,
+            "{pin:?}: calls for {}",
+            declaration.syntax_id
+        );
+
+        let mut actual_regions = store
+            .native_control_regions_at(pin, &declaration.syntax_id)
+            .unwrap();
+        let mut expected_regions = measured
+            .control_regions
+            .iter()
+            .filter(|region| region.owner_syntax_id == declaration.syntax_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        actual_regions.sort_by(|left, right| left.id.cmp(&right.id));
+        expected_regions.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(
+            actual_regions, expected_regions,
+            "{pin:?}: control regions for {}",
+            declaration.syntax_id
+        );
+    }
+}
+
 #[test]
 fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc() {
     use baleyg::native_evidence::DocumentKey;
     let (state, root, store, cancel) = fixture();
+    // Independent full-rewrite measurements, separate from publish()'s capture.
+    let (_, measured_r1, _) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
     let leader = store.leader().unwrap();
     let r1 = publish(
         &store,
@@ -1477,6 +1567,13 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
     fs::write(
         root.path().join("flow.js"),
         "function changed() { measured(); }\n",
+    )
+    .unwrap();
+    let (_, measured_r2, _) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
     )
     .unwrap();
     let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
@@ -1501,6 +1598,10 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
         source1.1
     );
     assert_eq!(store.graph_at(Some(r1)).unwrap(), graph1);
+    // After both the edit and delete, both old pins must select their own typed
+    // native evidence, not the head's or each other's projection.
+    assert_retained_native_family_parity(&store, r1, &measured_r1);
+    assert_retained_native_family_parity(&store, r2, &measured_r2);
     store.release_revision(r1, &leader).unwrap();
     assert!(
         store
@@ -1509,20 +1610,87 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
             .to_string()
             .contains("revision conflict")
     );
-    store.collect_unreferenced(&leader).unwrap();
-    assert_eq!(store.native_source_at(r2, &key).unwrap().unwrap(), source2);
-    assert!(store.native_source_at(r3, &key).unwrap().is_none());
+    // Release is durable before collection: lose the owner/process now, then
+    // reopen the index while r1's unreachable rows still await fenced GC.
+    drop(leader);
+    drop(store);
+    let cold = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cold_leader = cold.leader().unwrap();
+    // Taking over the leader lock requires paired publication before public
+    // reads, even when the retained rows are intact after the crash window.
+    assert!(
+        cold.status()
+            .unwrap_err()
+            .to_string()
+            .contains("reconciliation required")
+    );
+
     let identity =
         baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
-    let db = Connection::open(
-        state
-            .path()
-            .join("cache/indexes")
-            .join(identity.root_key)
-            .join("index.db"),
-    )
-    .unwrap();
+    let db_path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let r2_id = format!("pin:v1:{}:{}", r2.index_generation, r2.index_revision);
+    let db = Connection::open(&db_path).unwrap();
+    let (version, graph_projection, class_projection): (String, String, String) = db
+        .query_row(
+            "SELECT document_version_id,graph_projection_id,class_projection_id
+             FROM revision_documents WHERE revision_id=?1 AND path='flow.java'",
+            [&r2_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    // A surviving revision owns all three materialized record families before
+    // GC. Recheck these exact IDs after GC rather than only checking FK health.
+    let retained_rows = [
+        ("document_versions", version),
+        ("graph_projections", graph_projection),
+        ("class_projections", class_projection),
+    ];
+    for (table, id) in &retained_rows {
+        let count: i64 = db
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE id=?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "cold reopen lost retained {table}/{id} before GC");
+    }
+    drop(db);
+
+    let r4 = publish(&cold, root.path(), &cancel, r3, &cold_leader).unwrap();
+    assert_eq!(r4.index_generation, r3.index_generation);
+    assert_eq!(r4.index_revision, r3.index_revision + 1);
+    assert_eq!(cold.status().unwrap().revision, r4);
+    assert!(
+        cold.native_source_at(r1, &key)
+            .unwrap_err()
+            .to_string()
+            .contains("revision conflict")
+    );
+    assert_eq!(cold.native_source_at(r2, &key).unwrap().unwrap(), source2);
+    assert!(cold.native_source_at(r3, &key).unwrap().is_none());
+    assert_retained_native_family_parity(&cold, r2, &measured_r2);
+
+    cold.collect_unreferenced(&cold_leader).unwrap();
+    assert_eq!(cold.native_source_at(r2, &key).unwrap().unwrap(), source2);
+    assert!(cold.native_source_at(r3, &key).unwrap().is_none());
+    assert_retained_native_family_parity(&cold, r2, &measured_r2);
+    let db = Connection::open(&db_path).unwrap();
+    for (table, id) in &retained_rows {
+        let count: i64 = db
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE id=?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "fenced GC lost retained {table}/{id}");
+    }
     let missing: i64 = db
         .query_row(
             "SELECT count(*) FROM document_versions v WHERE NOT EXISTS
@@ -1550,22 +1718,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
         )
         .unwrap();
     assert_eq!(tombstone, "released:v1");
-    drop(db);
-    drop(store);
-    let cold = Store::open_for_tests(state.path(), root.path()).unwrap();
-    assert_eq!(cold.status().unwrap().revision, r3);
-    assert!(
-        cold.native_source_at(r1, &key)
-            .unwrap_err()
-            .to_string()
-            .contains("revision conflict")
-    );
-    assert_eq!(
-        cold.native_source_at(r2, &key).unwrap().unwrap(),
-        source2,
-        "reference-safe GC must retain unreleased r2 across reopen"
-    );
-    assert!(cold.native_source_at(r3, &key).unwrap().is_none());
+    assert_eq!(cold.status().unwrap().revision, r4);
 }
 
 #[test]
