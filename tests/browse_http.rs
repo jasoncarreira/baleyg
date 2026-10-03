@@ -225,19 +225,19 @@ async fn strict_errors_revisions_and_auth() {
             pin.index_generation, pin.index_revision
         ),
     ] {
-        assert_eq!(call(&app, "GET", path, Value::Null).await.0, 409);
+        let (status, page) = call(&app, "GET", path, Value::Null).await;
+        assert_eq!(status, 200, "{path}: {page}");
+        assert_eq!(page["revision"], json!(pin), "{path}: retained revision");
     }
-    assert_eq!(
-        call(
-            &app,
-            "POST",
-            "/api/sequence",
-            json!({"seed":seed,"expectedRevision":pin})
-        )
-        .await
-        .0,
-        409
-    );
+    let (status, sequence) = call(
+        &app,
+        "POST",
+        "/api/sequence",
+        json!({"seed":seed,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, 200, "{sequence}");
+    assert_eq!(sequence["revision"], json!(pin));
     for path in ["/api/files", "/api/methods?path=a.js", "/api/sequence"] {
         let request = Request::builder()
             .uri(path)

@@ -130,7 +130,6 @@ pub fn reconcile_workspace(
     cancel: &CancelFlag,
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(IndexPin, Arc<LeaderSession>)> {
-    store.ensure_not_known_old_v8_pending()?;
     if store.is_recreate_pending() {
         let (pin, session) = store.recreate_pending_leader_session(options, cancel)?;
         store.fail_changed_root_requests(&session)?;
@@ -268,25 +267,11 @@ pub(crate) fn finish_reconciled_head(
 
 /// One explicit CLI command commits before waiting. A free lock requires a complete
 /// takeover reconciliation before any queued request is claimed.
-/// Only the explicit CLI index caller reaches this private old-v8 helper.
-/// It does not enter the durable FIFO or the public HTTP reconciliation path.
-fn reconcile_known_old_cli(
-    store: &Store,
-    options: &IndexOptions,
-    cancel: &CancelFlag,
-) -> Result<(IndexPin, Arc<LeaderSession>)> {
-    store.replace_known_old_v8_cli(options, cancel)
-}
-
 pub fn enqueue_and_wait(
     store: &Store,
     options: &IndexOptions,
     cancel: &CancelFlag,
 ) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
-    // CLI admission must precede the ordinary FIFO write and leader lock.
-    if store.is_known_old_v8_pending() {
-        return reconcile_known_old_cli(store, options, cancel);
-    }
     let request = store.enqueue_request(options, None)?;
     let mut held: Option<Arc<LeaderSession>> = None;
     loop {
@@ -397,8 +382,6 @@ pub fn establish_serving_session(
     explicit_options: Option<&IndexOptions>,
     cancel: &CancelFlag,
 ) -> Result<Arc<LeaderSession>> {
-    // Serve's Some(options) is automatic startup, NEVER CLI recovery intent.
-    store.ensure_not_known_old_v8_pending()?;
     if store.is_recreate_pending() {
         let options = explicit_options.ok_or_else(|| {
             anyhow::anyhow!(
@@ -444,79 +427,6 @@ mod tests {
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
-
-    #[test]
-    fn known_old_v8_cli_only_never_enters_public_reconcile_or_serve() {
-        use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
-        use rusqlite::Connection;
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        fs::write(work.path().join("old.js"), "function old() {}\n").unwrap();
-        let initial = Store::open_for_tests(state.path(), work.path()).unwrap();
-        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
-        let roots = TopologyRoots::isolated_for_tests(
-            state.path().join("cache"),
-            state.path().join("data"),
-        );
-        let index = roots.index_db(&identity);
-        let queue = roots.requests_db(&identity);
-        let leader = roots.leader_lock(&identity);
-        let original = initial.index_baseline().unwrap();
-        drop(initial);
-        let prior = index.with_file_name("known-old-v8.db");
-        let db = Connection::open(&prior).unwrap();
-        db.execute_batch(&crate::store::frozen_old_v8_schema().unwrap())
-            .unwrap();
-        db.pragma_update(None, "user_version", 8).unwrap();
-        db.execute("ATTACH DATABASE ?1 AS measured", [index.to_str().unwrap()])
-            .unwrap();
-        db.execute_batch(
-            "INSERT INTO index_metadata SELECT * FROM measured.index_metadata;
-            DETACH DATABASE measured",
-        )
-        .unwrap();
-        drop(db);
-        fs::set_permissions(&prior, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::rename(&prior, &index).unwrap();
-        assert!(!queue.exists());
-        let pending = Store::open_for_tests(state.path(), work.path()).unwrap();
-        assert!(pending.is_known_old_v8_pending());
-        let old_bytes = fs::read(&index).unwrap();
-        let before = fs::symlink_metadata(&index).unwrap();
-        let leader_before = fs::read(&leader).unwrap();
-        let options = IndexOptions::new(work.path().to_owned());
-        let cancel = Arc::new(AtomicBool::new(false));
-        assert!(
-            reconcile_workspace(&pending, &options, &cancel, |_| {})
-                .unwrap_err()
-                .to_string()
-                .contains("recovery_required")
-        );
-        assert!(
-            establish_serving_session(&pending, Some(&options), &cancel)
-                .unwrap_err()
-                .to_string()
-                .contains("recovery_required")
-        );
-        assert_eq!(fs::read(&index).unwrap(), old_bytes);
-        assert_eq!(
-            (
-                fs::symlink_metadata(&index).unwrap().dev(),
-                fs::symlink_metadata(&index).unwrap().ino()
-            ),
-            (before.dev(), before.ino())
-        );
-        assert_eq!(fs::read(&leader).unwrap(), leader_before);
-        assert!(!queue.exists());
-        let (pin, session) = enqueue_and_wait(&pending, &options, &cancel).unwrap();
-        assert_eq!(pin.index_revision, 1);
-        assert_ne!(pin.index_generation, original.index_generation);
-        assert_eq!(pending.status().unwrap().revision, pin);
-        assert!(!queue.exists(), "CLI known-old route must not pre-enqueue");
-        assert!(pending.graph_at(Some(original)).is_err());
-        drop(session);
-    }
 
     /// Per-source (opens, complete reads, hashes), keyed by path.
     type Counts = BTreeMap<String, (usize, usize, usize)>;
