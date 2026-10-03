@@ -1132,11 +1132,97 @@ struct V8DocumentProjection {
     class_hash: String,
 }
 
+// Group immutable publication facts once, outside the IMMEDIATE writer transaction.
+// The original slices retain source order; projection hashing applies its own ID order.
+#[derive(Default)]
+struct PublicationRows<'a> {
+    nodes: Vec<&'a Symbol>,
+    calls: Vec<&'a CallSite>,
+    regions: Vec<&'a ControlRegion>,
+    classes: Vec<&'a crate::classes::ClassDefinition>,
+    relations: Vec<&'a crate::classes::ClassRelation>,
+    native_declarations: Vec<&'a crate::native_evidence::Declaration>,
+    native_calls: Vec<&'a crate::native_evidence::Call>,
+    native_regions: Vec<&'a crate::native_evidence::ControlRegion>,
+}
+fn publication_rows<'a>(
+    graph: &'a Graph,
+    native: &'a crate::native_evidence::Artifact,
+    classes: &'a crate::classes::Catalog,
+) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
+    let mut rows = BTreeMap::<&str, PublicationRows>::new();
+    for file in &graph.files {
+        ensure!(
+            rows.insert(&file.path, PublicationRows::default())
+                .is_none(),
+            "duplicate graph path"
+        );
+    }
+    for node in &graph.nodes {
+        rows.get_mut(node.path.as_str())
+            .context("graph node path missing")?
+            .nodes
+            .push(node);
+    }
+    for call in &graph.calls {
+        rows.get_mut(call.path.as_str())
+            .context("graph call path missing")?
+            .calls
+            .push(call);
+    }
+    for region in &graph.regions {
+        rows.get_mut(region.path.as_str())
+            .context("graph region path missing")?
+            .regions
+            .push(region);
+    }
+    let mut owners = BTreeMap::new();
+    for class in &classes.classes {
+        rows.get_mut(class.symbol.path.as_str())
+            .context("class path missing")?
+            .classes
+            .push(class);
+        ensure!(
+            owners
+                .insert(class.symbol.id.as_str(), class.symbol.path.as_str())
+                .is_none(),
+            "duplicate class owner"
+        );
+    }
+    for relation in &classes.relations {
+        let path = owners
+            .get(relation.owner.as_str())
+            .context("class relation owner missing")?;
+        rows.get_mut(path)
+            .context("class relation path missing")?
+            .relations
+            .push(relation);
+    }
+    for decl in &native.declarations {
+        rows.get_mut(decl.document.path.as_str())
+            .context("native declaration path missing")?
+            .native_declarations
+            .push(decl);
+    }
+    for call in &native.calls {
+        rows.get_mut(call.document.path.as_str())
+            .context("native call path missing")?
+            .native_calls
+            .push(call);
+    }
+    for region in &native.control_regions {
+        rows.get_mut(region.document.path.as_str())
+            .context("native control path missing")?
+            .native_regions
+            .push(region);
+    }
+    Ok(rows)
+}
+
 fn v8_document_projection(
     file: &SourceFile,
     native: &crate::native_evidence::Artifact,
-    graph: &Graph,
-    classes: &crate::classes::Catalog,
+    grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
     let context = crate::native_ids::extraction_context(&file.language, &[])?;
     let version_id = v8_id(
@@ -1148,23 +1234,11 @@ fn v8_document_projection(
             "producerId": native.producer.id, "producerVersion": native.producer.version,
         }),
     );
-    let mut nodes: Vec<_> = graph
-        .nodes
-        .iter()
-        .filter(|node| node.path == file.path)
-        .collect();
+    let mut nodes = grouped.nodes.clone();
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut calls: Vec<_> = graph
-        .calls
-        .iter()
-        .filter(|call| call.path == file.path)
-        .collect();
+    let mut calls = grouped.calls.clone();
     calls.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut regions: Vec<_> = graph
-        .regions
-        .iter()
-        .filter(|region| region.path == file.path)
-        .collect();
+    let mut regions = grouped.regions.clone();
     regions.sort_by(|a, b| a.id.cmp(&b.id));
     let graph_hash = v8_id(
         "",
@@ -1176,21 +1250,9 @@ fn v8_document_projection(
     );
     let graph_hash = graph_hash.trim_start_matches(':').to_owned();
     let graph_id = format!("graph:v1:{graph_hash}");
-    let mut selected_classes: Vec<_> = classes
-        .classes
-        .iter()
-        .filter(|class| class.symbol.path == file.path)
-        .collect();
+    let mut selected_classes = grouped.classes.clone();
     selected_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
-    let mut selected_relations: Vec<_> = classes
-        .relations
-        .iter()
-        .filter(|relation| {
-            selected_classes
-                .iter()
-                .any(|class| class.symbol.id == relation.owner)
-        })
-        .collect();
+    let mut selected_relations = grouped.relations.clone();
     selected_relations.sort_by(|a, b| a.id.cmp(&b.id));
     let class_hash = v8_id(
         "",
@@ -1585,6 +1647,7 @@ fn write_native(
     cancel: &CancelFlag,
     immutable: &mut ImmutableAppend,
     reuse: &PreflightReuse,
+    rows: &BTreeMap<&str, PublicationRows<'_>>,
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
     let (artifact, capture, graph, classes, extractions) = bundle;
     let a = artifact;
@@ -1700,7 +1763,10 @@ fn write_native(
             source.hash == file.hash,
             "native captured source hash differs"
         );
-        let ids = v8_document_projection(file, a, graph, classes)?;
+        let grouped = rows
+            .get(file.path.as_str())
+            .context("publication rows missing")?;
+        let ids = v8_document_projection(file, a, grouped)?;
         let context = crate::native_ids::extraction_context(&file.language, &[])?;
         if !reuse.for_path(&file.path).native {
             immutable.insert(
@@ -1723,20 +1789,20 @@ fn write_native(
                         coverages
                             .get(file.path.as_str())
                             .context("missing native coverage")?,
-                        &a.declarations
+                        &grouped
+                            .native_declarations
                             .iter()
-                            .filter(|d| d.document.path == file.path)
-                            .cloned()
+                            .map(|d| (*d).clone())
                             .collect::<Vec<_>>(),
-                        &a.calls
+                        &grouped
+                            .native_calls
                             .iter()
-                            .filter(|c| c.document.path == file.path)
-                            .cloned()
+                            .map(|c| (*c).clone())
                             .collect::<Vec<_>>(),
-                        &a.control_regions
+                        &grouped
+                            .native_regions
                             .iter()
-                            .filter(|r| r.document.path == file.path)
-                            .cloned()
+                            .map(|r| (*r).clone())
                             .collect::<Vec<_>>(),
                     )?,
                 ],
@@ -5027,9 +5093,9 @@ impl Store {
         &self,
         graph: &Graph,
         native: &crate::native_evidence::Artifact,
-        classes: &crate::classes::Catalog,
         extractions: &BTreeMap<String, crate::classes::FileExtraction>,
         expected: &ExpectedPublication,
+        rows: &BTreeMap<&str, PublicationRows<'_>>,
     ) -> Result<PreflightReuse> {
         if self.disposition() != RecoveryDisposition::Ready
             || !match expected {
@@ -5076,7 +5142,10 @@ impl Store {
             let mut families = BTreeMap::new();
             for file in &graph.files {
                 if let Some((old_version, old_graph, old_class)) = old.get(&file.path) {
-                    let ids = v8_document_projection(file, native, graph, classes)?;
+                    let grouped = rows
+                        .get(file.path.as_str())
+                        .context("publication rows missing")?;
+                    let ids = v8_document_projection(file, native, grouped)?;
                     let reused = ReusedFamilies {
                         native: *old_version == ids.version_id,
                         graph: *old_graph == ids.graph_id,
@@ -5140,6 +5209,28 @@ impl Store {
         // Parse cached source before taking the writer lock. Projection and graph
         // still publish in one transaction with the same CAS/cancellation guard.
         let limits = crate::classes::Limits::default();
+        let class_paths: BTreeSet<_> = graph
+            .files
+            .iter()
+            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+            .map(|f| f.path.as_str())
+            .collect();
+        // Class extraction only consumes class/method/function symbols. Supply
+        // each file's symbols once instead of rescanning the full graph per file.
+        let mut class_symbols: BTreeMap<&str, Vec<Symbol>> = BTreeMap::new();
+        for node in &graph.nodes {
+            if class_paths.contains(node.path.as_str())
+                && matches!(
+                    node.kind,
+                    SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
+                )
+            {
+                class_symbols
+                    .entry(node.path.as_str())
+                    .or_default()
+                    .push(node.clone());
+            }
+        }
         let extractions: BTreeMap<String, crate::classes::FileExtraction> = graph
             .files
             .iter()
@@ -5149,7 +5240,10 @@ impl Store {
                     file.path.clone(),
                     crate::classes::FileExtraction::extract_file(
                         file,
-                        &graph.nodes,
+                        class_symbols
+                            .get(file.path.as_str())
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
                         cancel,
                         limits,
                     )?,
@@ -5174,6 +5268,7 @@ impl Store {
             json(&classes.warnings)?.len() <= 256 * 1024,
             "incompatible_index: class catalog byte budget exceeded before publication"
         );
+        let rows = publication_rows(graph, native, &classes)?;
         check_cancel(cancel)?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
@@ -5195,7 +5290,7 @@ impl Store {
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         let reuse = if matches!(target, PublicationTarget::Live) {
-            self.preflight_reuse(graph, native, &classes, &extractions, &expected)?
+            self.preflight_reuse(graph, native, &extractions, &expected, &rows)?
         } else {
             PreflightReuse::default()
         };
@@ -5332,6 +5427,7 @@ impl Store {
             cancel,
             &mut immutable,
             &reuse,
+            &rows,
         )
         .map_err(&classify_immutable)?;
         for f in &graph.files {
@@ -5340,7 +5436,10 @@ impl Store {
             let ids = projections
                 .get(&f.path)
                 .context("missing graph projection")?;
-            for n in graph.nodes.iter().filter(|n| n.path == f.path) {
+            let grouped = rows
+                .get(f.path.as_str())
+                .context("publication rows missing")?;
+            for n in &grouped.nodes {
                 if reuse.for_path(&f.path).graph {
                     continue;
                 }
@@ -5352,7 +5451,7 @@ impl Store {
                     )
                     .map_err(&classify_immutable)?;
             }
-            for c in graph.calls.iter().filter(|c| c.path == f.path) {
+            for c in &grouped.calls {
                 if reuse.for_path(&f.path).graph {
                     continue;
                 }
@@ -5371,7 +5470,7 @@ impl Store {
                     )
                     .map_err(&classify_immutable)?;
             }
-            for r in graph.regions.iter().filter(|r| r.path == f.path) {
+            for r in &grouped.regions {
                 if reuse.for_path(&f.path).graph {
                     continue;
                 }
@@ -5383,7 +5482,7 @@ impl Store {
                     )
                     .map_err(&classify_immutable)?;
             }
-            for class in classes.classes.iter().filter(|c| c.symbol.path == f.path) {
+            for class in &grouped.classes {
                 if reuse.for_path(&f.path).class {
                     continue;
                 }
@@ -5403,12 +5502,7 @@ impl Store {
                     )
                     .map_err(&classify_immutable)?;
             }
-            for relation in classes.relations.iter().filter(|r| {
-                classes
-                    .classes
-                    .iter()
-                    .any(|c| c.symbol.path == f.path && c.symbol.id == r.owner)
-            }) {
+            for relation in &grouped.relations {
                 if reuse.for_path(&f.path).class {
                     continue;
                 }
@@ -6119,7 +6213,11 @@ impl Store {
             warnings: vec![],
             truncated: false,
         };
-        let ids = v8_document_projection(&graph.files[0], &witness, &graph, &catalog)?;
+        let rows = publication_rows(&graph, &witness, &catalog)?;
+        let grouped = rows
+            .get(graph.files[0].path.as_str())
+            .context("selected rows missing")?;
+        let ids = v8_document_projection(&graph.files[0], &witness, grouped)?;
         ensure!(
             ids.version_id == version_id
                 && ids.graph_id == graph_id
@@ -7540,6 +7638,479 @@ mod rebaseline_fault_tests {
     use super::*;
     use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{fs, sync::atomic::AtomicBool};
+
+    #[test]
+    fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
+        use crate::{capture::Capture, index_coordinator::IndexJobCoordinator, indexer};
+        for failure_at in [PublishStage::AfterFile, PublishStage::BeforeCommit] {
+            let state = tempfile::tempdir().unwrap();
+            let work = tempfile::tempdir().unwrap();
+            fs::write(
+                work.path().join("local.js"),
+                "function local(){return 1;}\n",
+            )
+            .unwrap();
+            fs::write(
+                work.path().join("A.java"),
+                "class A { int run(){return 1;} }\n",
+            )
+            .unwrap();
+            let options = IndexOptions::new(work.path().to_owned());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+            let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+            let session = job.session();
+            let first = job.run(&options, &cancel, |_| {}).unwrap();
+            fs::write(
+                work.path().join("local.js"),
+                "function local(){return 2;}\n",
+            )
+            .unwrap();
+            store.begin_leader_publication(&session).unwrap();
+            let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            let baseline = store.recovery_index_baseline().unwrap();
+            let native = store
+                .prepare_local_native(&capture, &baseline, &cancel)
+                .unwrap()
+                .expect("same-leaf source edit selects one native document");
+            let graph =
+                indexer::project_native(&options, &capture, &native, &cancel, &|_| {}).unwrap();
+            store
+                .validate_native_bundle_with_mode(&graph, &capture, &native, &cancel, true)
+                .unwrap();
+            let err = store
+                .publish_inner_checked_expected(
+                    (&graph, &capture, &native),
+                    session.leader_guard().unwrap(),
+                    ExpectedPublication::Recovery(Box::new(baseline)),
+                    &cancel,
+                    256 * 1024 * 1024 + 16 * 1024,
+                    |stage, _db| {
+                        if stage == failure_at {
+                            // A separate reader must still see the committed old pin.
+                            let outside = store.cache()?;
+                            let before: i64 = outside.query_row(
+                                "SELECT index_revision FROM index_metadata",
+                                [],
+                                |r| r.get(0),
+                            )?;
+                            assert_eq!(
+                                before, first.index_revision as i64,
+                                "uncommitted selected rows remain invisible"
+                            );
+                            anyhow::bail!("injected selective fault");
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("injected selective fault"),
+                "{err:#}"
+            );
+            let db = store.cache().unwrap();
+            let unchanged = ReadRevision::current(&db).unwrap();
+            assert_eq!(unchanged.pin, first, "failure preserves old current pin");
+            let rows: i64 = db
+                .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 1, "no pending revision survives rollback");
+            assert_eq!(
+                db.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            assert!(
+                db.prepare("PRAGMA foreign_key_check")
+                    .unwrap()
+                    .query([])
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .is_none(),
+                "selective rollback leaves all foreign keys valid"
+            );
+            drop(db);
+            let retry =
+                IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+                    .unwrap()
+                    .run(&options, &cancel, |_| {})
+                    .unwrap();
+            assert_eq!(retry.index_revision, first.index_revision + 1);
+            assert!(
+                store
+                    .source_at("local.js", Some(first))
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .text
+                    .contains("return 1")
+            );
+            assert!(
+                store
+                    .source_at("local.js", Some(retry))
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .text
+                    .contains("return 2")
+            );
+            assert_eq!(
+                store
+                    .last_writer_counters()
+                    .unwrap()
+                    .reused_occurrence_reads,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_local_classifier_falls_back_on_affected_uncertainty_not_unrelated_ambiguity() {
+        use crate::{capture::Capture, index_coordinator::IndexJobCoordinator};
+        let cases = [
+            ("unrelated lexical duplicate", "body", true),
+            ("added source", "add", false),
+            ("deleted source", "delete", false),
+            ("renamed path", "rename", false),
+            ("parser recovery", "parse", false),
+            ("changed scope", "scope", false),
+            ("changed import", "import", false),
+            ("changed reexport", "export", false),
+            ("changed supertype", "supertype", false),
+            ("affected unproved lookup", "lookup", false),
+            (
+                "affected lexical duplicate candidate",
+                "ambiguous_lookup",
+                false,
+            ),
+        ];
+        for (label, change, local) in cases {
+            let state = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let path = workspace.path();
+            fs::write(path.join("target.js"), "function target() { return 1; }\n").unwrap();
+            // Duplicate lexical candidates are #22 advisory facts, NOT semantic bindings.
+            fs::write(
+                path.join("duplicate.js"),
+                "function target() { return 3; }\nfunction target() { return 4; }\n",
+            )
+            .unwrap();
+            fs::write(
+                path.join("A.java"),
+                "class A extends Base { int run(){ return 1; } }\nclass Base {}\n",
+            )
+            .unwrap();
+            let options = IndexOptions::new(path.to_owned());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let store = Store::open_for_tests(state.path(), path).unwrap();
+            let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+            let session = job.session();
+            let first = job.run(&options, &cancel, |_| {}).unwrap();
+            let old = store.graph_at(Some(first)).unwrap();
+            assert_eq!(
+                old.nodes
+                    .iter()
+                    .filter(|node| node.name == "target")
+                    .count(),
+                3,
+                "#22 lexical duplicate candidates are advisory, not semantic bindings"
+            );
+            match change {
+                "body" => {
+                    fs::write(path.join("target.js"), "function target() { return 2; }\n").unwrap()
+                }
+                "add" => {
+                    fs::write(path.join("added.js"), "function added() { return 1; }\n").unwrap()
+                }
+                "delete" => fs::remove_file(path.join("duplicate.js")).unwrap(),
+                "rename" => fs::rename(path.join("duplicate.js"), path.join("moved.js")).unwrap(),
+                "parse" => {
+                    fs::write(path.join("target.js"), "function target() { return ( ; }\n").unwrap()
+                }
+                "scope" => fs::write(
+                    path.join("target.js"),
+                    "function target() { { return 2; } }\n",
+                )
+                .unwrap(),
+                "import" => fs::write(
+                    path.join("target.js"),
+                    "import { foo } from './missing.js';\nfunction target() { return 1; }\n",
+                )
+                .unwrap(),
+                "export" => fs::write(
+                    path.join("target.js"),
+                    "export { target };\nfunction target() { return 1; }\n",
+                )
+                .unwrap(),
+                "supertype" => fs::write(
+                    path.join("A.java"),
+                    "class A extends Other { int run(){ return 1; } }\nclass Base {}\n",
+                )
+                .unwrap(),
+                "lookup" => fs::write(
+                    path.join("target.js"),
+                    "function target() { return unknown(); }\n",
+                )
+                .unwrap(),
+                "ambiguous_lookup" => fs::write(
+                    path.join("target.js"),
+                    "function target() { return target(); }\n",
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            let expected = store.recovery_index_baseline().unwrap();
+            assert_eq!(
+                store
+                    .prepare_local_native(&capture, &expected, &cancel)
+                    .unwrap()
+                    .is_some(),
+                local,
+                "{label}: persisted authenticated classifier"
+            );
+            let pin =
+                IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+                    .unwrap()
+                    .run(&options, &cancel, |_| {})
+                    .unwrap();
+            assert_eq!(
+                store.graph_at(Some(first)).unwrap().nodes,
+                old.nodes,
+                "{label}: old pin preserved"
+            );
+            let cold_state = tempfile::tempdir().unwrap();
+            let cold = Store::open_for_tests(cold_state.path(), path).unwrap();
+            let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+            let _cold_session = cold_job.session();
+            let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+            let published = store.graph_at(Some(pin)).unwrap();
+            let oracle = cold.graph_at(Some(cold_pin)).unwrap();
+            assert_eq!(published.nodes, oracle.nodes, "{label}: cold node parity");
+            assert_eq!(published.calls, oracle.calls, "{label}: cold call parity");
+            assert_eq!(
+                published.regions, oracle.regions,
+                "{label}: cold region parity"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "resource-gated exact canonical medium local-update writer counters"]
+    fn canonical_medium_local_update_writes_only_changed_fact_families() {
+        use crate::{
+            capture::Capture,
+            index_coordinator::IndexJobCoordinator,
+            indexer::{self, CapturedChange},
+        };
+        let generated = tempfile::tempdir().unwrap();
+        let output = generated.path().join("canonical");
+        let status = std::process::Command::new("node")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/synthetic-cohorts/generate.mjs"))
+            .arg("--out")
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            fs::read(output.join("manifest.json")).unwrap(),
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tools/synthetic-cohorts/manifest-v1.json")
+            )
+            .unwrap()
+        );
+        let root = output.join("medium");
+        let state = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = job.session();
+        let first_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let first = job.run(&options, &cancel, |_| {}).unwrap();
+        let full = store.last_writer_counters().unwrap();
+        let path = root.join("python/Cmedium0000.py");
+        let original = fs::read_to_string(&path).unwrap();
+        let marker = "def f0(): return ";
+        let offset = original.find(marker).unwrap() + marker.len();
+        let mut source = original.as_bytes().to_vec();
+        assert!(source[offset].is_ascii_digit());
+        source[offset] = if source[offset] == b'1' { b'2' } else { b'1' };
+        fs::write(&path, source).unwrap();
+        let updated_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let mut visits = vec![];
+        let staged = indexer::measure_captured_native_change(
+            &first_capture,
+            &updated_capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            |key| visits.push(key.path.clone()),
+        )
+        .unwrap();
+        assert!(
+            matches!(staged.decision,CapturedChange::DocumentLocal{ref path}
+            if path=="python/Cmedium0000.py")
+        );
+        assert_eq!(
+            visits,
+            ["python/Cmedium0000.py"],
+            "selected native extraction visits exactly one document"
+        );
+        let baseline = store.recovery_index_baseline().unwrap();
+        assert!(
+            store
+                .prepare_local_native(&updated_capture, &baseline, &cancel)
+                .unwrap()
+                .is_some(),
+            "authenticated persisted head also selects one-document native assembly"
+        );
+        let second =
+            IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+                .unwrap()
+                .run(&options, &cancel, |_| {})
+                .unwrap();
+        let local = store.last_writer_counters().unwrap();
+        assert!(
+            local.native.rows > 0 && local.native.rows < full.native.rows / 10,
+            "selected native rows {local:?} vs full {full:?}"
+        );
+        assert!(local.graph.rows > 0 && local.graph.rows < full.graph.rows / 10);
+        assert!(local.class.rows > 0 && local.class.rows < full.class.rows / 10);
+        assert_eq!(local.reused_occurrence_reads, 0);
+        assert_eq!(
+            local.total.rows,
+            local.native.rows + local.graph.rows + local.class.rows + local.manifest.rows
+        );
+        assert_eq!(
+            local.total.bytes,
+            local.native.bytes + local.graph.bytes + local.class.bytes + local.manifest.bytes
+        );
+        assert_eq!(
+            store
+                .source_at("python/Cmedium0000.py", Some(first))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            original
+        );
+        let cold_state = tempfile::tempdir().unwrap();
+        let cold = Store::open_for_tests(cold_state.path(), &root).unwrap();
+        let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+        let _cold_session = cold_job.session();
+        let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+        let actual = store.graph_at(Some(second)).unwrap();
+        let oracle = cold.graph_at(Some(cold_pin)).unwrap();
+        assert_eq!(actual.nodes, oracle.nodes);
+        assert_eq!(actual.calls, oracle.calls);
+        assert_eq!(actual.regions, oracle.regions);
+        eprintln!("canonical medium initial writer {full:?}; selected update writer {local:?}");
+    }
+
+    #[test]
+    #[ignore = "resource-gated canonical medium and large produced-index fact floors"]
+    fn canonical_cohort_produced_native_fact_floors() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        let generated = tempfile::tempdir().unwrap();
+        let output = generated.path().join("canonical");
+        let generator =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/synthetic-cohorts/generate.mjs");
+        let status = std::process::Command::new("node")
+            .arg(generator)
+            .arg("--out")
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(status.success(), "canonical cohort generator failed");
+        assert_eq!(
+            fs::read(output.join("manifest.json")).unwrap(),
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tools/synthetic-cohorts/manifest-v1.json")
+            )
+            .unwrap(),
+            "only exact pinned cohort bytes are eligible"
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        for size in ["medium", "large"] {
+            // Explicit diagnostic only; the default proof always measures both pinned cohorts.
+            if size == "large" && std::env::var_os("BALEYG_ONLY_MEDIUM_DIAGNOSTIC").is_some() {
+                break;
+            }
+            let state = tempfile::tempdir().unwrap();
+            let root = output.join(size);
+            let store = Store::open_for_tests(state.path(), &root).unwrap();
+            let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+            let _session = job.session();
+            let started = std::time::Instant::now();
+            let pin = job
+                .run_observed(
+                    &IndexOptions::new(root),
+                    &cancel,
+                    |_| {},
+                    |_| {
+                        eprintln!(
+                            "{size} prepublication capture/native/graph {:?}",
+                            started.elapsed()
+                        );
+                    },
+                )
+                .unwrap();
+            eprintln!("{size} committed publisher {:?}", started.elapsed());
+            let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+            let revision = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+            let mut counts = BTreeMap::new();
+            for row in db.prepare("SELECT m.language,SUM(
+                (SELECT count(*) FROM native_version_declarations d WHERE d.version_id=m.document_version_id)+
+                (SELECT count(*) FROM native_version_calls c WHERE c.version_id=m.document_version_id)+
+                (SELECT count(*) FROM native_version_control_regions r WHERE r.version_id=m.document_version_id))
+                FROM revision_documents m WHERE m.revision_id=?1 GROUP BY m.language ORDER BY m.language")
+                .unwrap().query_map([&revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))
+                .unwrap() {
+                let (language,facts)=row.unwrap();counts.insert(language,facts);
+            }
+            assert_eq!(counts.len(), 4, "{size}: count each produced language");
+            if size == "medium" {
+                for (language, facts) in &counts {
+                    assert!(
+                        *facts >= 50_000,
+                        "{size}/{language}: produced native facts {facts} below floor"
+                    );
+                }
+            } else {
+                assert!(
+                    counts.values().sum::<i64>() >= 500_000,
+                    "{size}: produced native facts {counts:?} below overall floor"
+                );
+            }
+            let measured = store.last_writer_counters().unwrap();
+            assert!(
+                measured.native.rows > 0
+                    && measured.graph.rows > 0
+                    && measured.class.rows > 0
+                    && measured.manifest.rows >= counts.len() as u64
+            );
+            assert_eq!(
+                measured.total.rows,
+                measured.native.rows
+                    + measured.graph.rows
+                    + measured.class.rows
+                    + measured.manifest.rows
+            );
+            assert_eq!(
+                measured.total.bytes,
+                measured.native.bytes
+                    + measured.graph.bytes
+                    + measured.class.bytes
+                    + measured.manifest.bytes
+            );
+            assert_eq!(measured.reused_occurrence_reads, 0);
+            eprintln!("{size} produced facts {counts:?}; writer rows/bytes {measured:?}");
+        }
+    }
 
     #[test]
     fn local_writer_counters_exclude_unchanged_occurrence_access() {

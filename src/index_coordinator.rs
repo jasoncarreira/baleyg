@@ -104,12 +104,23 @@ impl IndexJobCoordinator {
         observe: impl FnOnce(&Capture),
     ) -> Result<IndexPin> {
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
+        #[cfg(test)]
+        let diagnostic =
+            std::env::var_os("BALEYG_INDEX_PHASE_DIAGNOSTIC").map(|_| std::time::Instant::now());
         self.store.begin_leader_publication(&self.session)?;
         let capture = Capture::admit(options, cancel, &progress)?;
+        #[cfg(test)]
+        if let Some(t) = diagnostic {
+            eprintln!("phase capture {:?}", t.elapsed());
+        }
         let root = std::fs::canonicalize(&options.workspace_root)?;
         let selected = self
             .store
             .prepare_local_native(&capture, &self.expected, cancel)?;
+        #[cfg(test)]
+        if let Some(t) = diagnostic {
+            eprintln!("phase prelock native selection {:?}", t.elapsed());
+        }
         let selective = selected.is_some();
         let native = match selected {
             Some(native) => native,
@@ -117,7 +128,15 @@ impl IndexJobCoordinator {
                 crate::native_evidence::from_capture(&capture, &root, self.store.root_id(), cancel)?
             }
         };
+        #[cfg(test)]
+        if let Some(t) = diagnostic {
+            eprintln!("phase native extraction {:?}", t.elapsed());
+        }
         let graph = indexer::project_native(options, &capture, &native, cancel, &progress)?;
+        #[cfg(test)]
+        if let Some(t) = diagnostic {
+            eprintln!("phase graph projection {:?}", t.elapsed());
+        }
         capture.verify(cancel)?;
         observe(&capture);
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");

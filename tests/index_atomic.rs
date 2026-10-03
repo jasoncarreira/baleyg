@@ -2627,6 +2627,114 @@ fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinate
 }
 
 #[test]
+fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinned_revisions() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator,
+        indexer::IndexOptions,
+        model::{CancelFlag, IndexPin, SymbolKind},
+    };
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let java = "class A {}\n";
+    fs::write(workspace.path().join("A.java"), java).unwrap();
+    let scip = state.path().join("labels.scip");
+    let manifest = state.path().join("labels.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "A.java":hex::encode(Sha256::digest(java.as_bytes()))
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut options = IndexOptions::new(workspace.path().to_owned());
+    options.scip_path = Some(scip.clone());
+    options.manifest_path = Some(manifest);
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let write_label = |label: &str, cutoff: bool| {
+        let mut index = scip::types::Index::new();
+        let mut document = scip::types::Document::new();
+        document.relative_path = "A.java".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 6, 7];
+        occurrence.symbol_roles = 1;
+        occurrence.symbol = format!("scip {label} A");
+        document.occurrences.push(occurrence);
+        index.documents.push(document);
+        if cutoff {
+            for ordinal in 0..1000 {
+                let mut extra = scip::types::Document::new();
+                extra.relative_path = format!("extra-{ordinal}.java");
+                index.documents.push(extra);
+            }
+        }
+        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
+    };
+    let label = |pin: IndexPin| {
+        store
+            .graph_at(Some(pin))
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|n| n.path == "A.java" && n.kind == SymbolKind::Class)
+            .unwrap()
+    };
+    let ids = |pin: IndexPin| {
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        db.query_row("SELECT document_version_id,graph_projection_id,class_projection_id FROM revision_documents WHERE revision_id=?1 AND path='A.java'",
+            [format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision)],
+            |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap()
+    };
+    write_label("one", false);
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
+    write_label("two", false);
+    let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(label(first).display_label.as_deref(), Some("scip one A"));
+    assert_eq!(label(second).display_label.as_deref(), Some("scip two A"));
+    assert_eq!(label(first).id, label(second).id);
+    assert_eq!(label(first).provenance, label(second).provenance);
+    let (native_first, graph_first, class_first) = ids(first);
+    let (native_second, graph_second, class_second) = ids(second);
+    assert_eq!(
+        native_first, native_second,
+        "same captured source reuses native version"
+    );
+    assert_ne!(graph_first, graph_second, "label is graph presentation");
+    assert_ne!(
+        class_first, class_second,
+        "class projection follows graph label"
+    );
+    write_label("cutoff", true);
+    let third = IndexJobCoordinator::prepare_with_session(&store, Some(second), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(
+        label(third).display_label,
+        None,
+        "over-1000 SCIP docs refuse all labels"
+    );
+    assert_eq!(
+        ids(third).0,
+        native_first,
+        "presentation cutoff never alters native version"
+    );
+    assert_eq!(
+        label(second).display_label.as_deref(),
+        Some("scip two A"),
+        "old pin keeps label"
+    );
+}
+
+#[test]
 fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_labels() {
     use baleyg::{
         classes::{Catalog, FileExtraction, Limits},

@@ -541,8 +541,12 @@ fn build_native_header<'a>(
 fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
     let (mut artifact, files) = build_native_header(capture, root, root_id)?;
     let mut ids = IdentityRegistry::default();
-    for f in files {
-        extract(&mut artifact, f, &mut ids)?;
+    for (index, f) in files.into_iter().enumerate() {
+        // The revision header was built from this exact sorted file sequence.
+        // Keep a concrete document witness, rather than scanning the full
+        // revision header once per file.
+        let document = artifact.revision.documents[index].clone();
+        extract_known(&mut artifact, f, &document, &mut ids)?;
     }
     Ok(artifact)
 }
@@ -1074,6 +1078,22 @@ pub(crate) fn selected_source_witness(
 /// Measure exactly one document. Under `occ:v2` this is strictly document-local: it reads only
 /// `f` and the producer/source-set/revision descriptors, never another source document.
 fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Result<()> {
+    let document = a
+        .revision
+        .documents
+        .iter()
+        .find(|document| document.key.path == f.path && document.key.language == f.language)
+        .context("native document not in captured revision")?
+        .clone();
+    extract_known(a, f, &document, ids)
+}
+
+fn extract_known(
+    a: &mut Artifact,
+    f: &SourceFile,
+    document: &Document,
+    ids: &mut IdentityRegistry,
+) -> Result<()> {
     language_order(&f.language)?;
     safe_path(&f.path)?;
     // Occurrence identity binds this captured document version. Authenticate its content hash
@@ -1084,14 +1104,11 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         "native captured source hash mismatch"
     );
     ensure!(
-        a.revision
-            .documents
-            .iter()
-            .any(|d| d.key.source_set_id == a.source_set.id
-                && d.key.language == f.language
-                && d.key.path == f.path
-                && d.content_hash == f.hash
-                && d.byte_length == f.text.len()),
+        document.key.source_set_id == a.source_set.id
+            && document.key.language == f.language
+            && document.key.path == f.path
+            && document.content_hash == f.hash
+            && document.byte_length == f.text.len(),
         "native document not in captured revision"
     );
     let extraction_context = native_extraction_context(&a.producer, &f.language, &a.revision)?;
@@ -1158,6 +1175,8 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         provenance_id: proof_id.clone(),
     });
     let mut state = ParserState {
+        call_start: a.calls.len(),
+        control_start: a.control_regions.len(),
         artifact: a,
         file: f,
         ids,
@@ -1165,28 +1184,19 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         proof_id,
         extraction_context,
         seen: BTreeSet::new(),
+        declaration_ordinals: BTreeMap::new(),
+        call_ordinals: BTreeMap::new(),
+        control_ordinals: BTreeMap::new(),
+        saw_definition: false,
+        saw_call: false,
         visits: 0,
         opaque_rust: false,
     };
     state.walk(tree.root_node(), &module_id, &[], &[], 0)?;
     state.finish_occurrences()?;
     let observed_roles = [
-        (
-            !state
-                .artifact
-                .declarations
-                .iter()
-                .all(|d| d.document != state.document || d.kind == "module"),
-            "definition",
-        ),
-        (
-            !state
-                .artifact
-                .calls
-                .iter()
-                .all(|c| c.document != state.document),
-            "call",
-        ),
+        (state.saw_definition, "definition"),
+        (state.saw_call, "call"),
     ]
     .into_iter()
     .filter_map(|(present, role)| present.then_some(role.into()))
@@ -1230,12 +1240,19 @@ fn occurrence_input(
 }
 struct ParserState<'a> {
     artifact: &'a mut Artifact,
+    call_start: usize,
+    control_start: usize,
     file: &'a SourceFile,
     ids: &'a mut IdentityRegistry,
     document: DocumentKey,
     proof_id: String,
     extraction_context: String,
     seen: BTreeSet<(String, String, usize, usize)>,
+    declaration_ordinals: BTreeMap<String, usize>,
+    call_ordinals: BTreeMap<String, usize>,
+    control_ordinals: BTreeMap<String, usize>,
+    saw_definition: bool,
+    saw_call: bool,
     visits: usize,
     opaque_rust: bool,
 }
@@ -1253,13 +1270,18 @@ impl ParserState<'_> {
     fn finish_occurrences(&mut self) -> Result<()> {
         let mut replacements = BTreeMap::new();
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (i, region) in self.artifact.control_regions.iter().enumerate() {
-            if region.document == self.document {
-                by_owner
-                    .entry(region.owner_syntax_id.clone())
-                    .or_default()
-                    .push(i);
-            }
+        for (offset, region) in self.artifact.control_regions[self.control_start..]
+            .iter()
+            .enumerate()
+        {
+            ensure!(
+                region.document == self.document,
+                "foreign native control in current document"
+            );
+            by_owner
+                .entry(region.owner_syntax_id.clone())
+                .or_default()
+                .push(self.control_start + offset);
         }
         for indexes in by_owner.values_mut() {
             indexes.sort_by_key(|i| {
@@ -1278,10 +1300,8 @@ impl ParserState<'_> {
                 region.ordinal = ordinal;
             }
         }
-        for region in &mut self.artifact.control_regions {
-            if region.document == self.document
-                && let Some(parent) = &mut region.parent_id
-            {
+        for region in &mut self.artifact.control_regions[self.control_start..] {
+            if let Some(parent) = &mut region.parent_id {
                 *parent = replacements
                     .get(parent)
                     .context("native region parent not measured")?
@@ -1289,13 +1309,15 @@ impl ParserState<'_> {
             }
         }
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (i, call) in self.artifact.calls.iter().enumerate() {
-            if call.document == self.document {
-                by_owner
-                    .entry(call.owner_syntax_id.clone())
-                    .or_default()
-                    .push(i);
-            }
+        for (offset, call) in self.artifact.calls[self.call_start..].iter().enumerate() {
+            ensure!(
+                call.document == self.document,
+                "foreign native call in current document"
+            );
+            by_owner
+                .entry(call.owner_syntax_id.clone())
+                .or_default()
+                .push(self.call_start + offset);
         }
         for indexes in by_owner.values_mut() {
             indexes.sort_by_key(|i| {
@@ -1359,22 +1381,19 @@ impl ParserState<'_> {
             && (matches!(k, "implementation" | "anonymousFunction") || name(n, self.file).is_some())
         {
             let mut key = key_of(n, self.file, k);
-            let previous = self
-                .artifact
-                .declarations
-                .iter()
-                .filter(|d| {
-                    d.document == self.document
-                        && d.ancestors == ancestry
-                        && d.key.kind == key.kind
-                        && d.key.name == key.name
-                        && d.key.signature == key.signature
-                        && d.kind != "module"
-                })
-                .count();
-            key.ordinal = previous;
+            // Repeated declaration keys are document-local. A cumulative artifact
+            // scan would make a multi-file full capture quadratic in its facts.
+            // The synthetic module is not a previous measured declaration.
+            if k != "module" {
+                let ordinal_key =
+                    serde_json::to_string(&(&ancestry, &key.kind, &key.name, &key.signature))?;
+                let count = self.declaration_ordinals.entry(ordinal_key).or_default();
+                key.ordinal = *count;
+                *count += 1;
+            }
             let id=self.ids.stable(&json!({"sourceSet":self.artifact.source_set.id,"path":self.file.path,"language":self.file.language,"ancestors":ancestry,"declaration":key}))?;
             let named = name(n, self.file);
+            self.saw_definition |= k != "module";
             self.artifact.declarations.push(Declaration {
                 syntax_id: id.clone(),
                 document: self.document.clone(),
@@ -1411,12 +1430,9 @@ impl ParserState<'_> {
             ancestry.push(key);
         }
         if is_region(n) {
-            let ordinal = self
-                .artifact
-                .control_regions
-                .iter()
-                .filter(|r| r.owner_syntax_id == owner && r.document == self.document)
-                .count();
+            let count = self.control_ordinals.entry(owner.clone()).or_default();
+            let ordinal = *count;
+            *count += 1;
             let range = Range::node(n);
             ensure!(
                 self.seen
@@ -1442,12 +1458,10 @@ impl ParserState<'_> {
             regions.push(id);
         }
         if is_call(&self.file.language, n) {
-            let ordinal = self
-                .artifact
-                .calls
-                .iter()
-                .filter(|c| c.owner_syntax_id == owner && c.document == self.document)
-                .count();
+            let count = self.call_ordinals.entry(owner.clone()).or_default();
+            let ordinal = *count;
+            *count += 1;
+            self.saw_call = true;
             let range = Range::node(n);
             ensure!(
                 self.seen
@@ -1552,6 +1566,14 @@ impl Artifact {
             "native document tuple cardinality"
         );
         let mut docs = BTreeMap::new();
+        let captured_files: BTreeMap<_, _> = files
+            .iter()
+            .map(|f| ((f.language.as_str(), f.path.as_str()), f))
+            .collect();
+        ensure!(
+            captured_files.len() == files.len(),
+            "duplicate captured native path"
+        );
         let mut last: Option<(usize, &str)> = None;
         for d in &self.revision.documents {
             safe_path(&d.key.path)?;
@@ -1561,9 +1583,8 @@ impl Artifact {
                 "unsorted or duplicate native documents"
             );
             last = Some(current);
-            let file = files
-                .iter()
-                .find(|f| f.path == d.key.path && f.language == d.key.language)
+            let file = captured_files
+                .get(&(d.key.language.as_str(), d.key.path.as_str()))
                 .context("native document not captured")?;
             ensure!(
                 d.key.source_set_id == self.source_set.id
