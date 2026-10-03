@@ -571,8 +571,76 @@ pub fn measure_captured_change_observed(
     }
 }
 
-/// Actual selected-document native measurement for a proved local change. The
-/// unchanged full publication path remains separate and still assembles all files.
+/// Classification for the pinned prior manifest. Prior files and input observations
+/// come from one verified SQLite snapshot, never from a live old workspace walk.
+pub(crate) fn measure_persisted_change(
+    previous: &[SourceFile],
+    previous_options: &ReconcileOptions,
+    previous_inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>,
+    current: &Capture,
+) -> Result<CapturedChange> {
+    if previous_options != current.reconcile_options() {
+        return Ok(CapturedChange::FullNative {
+            reason: "capture admission changed",
+        });
+    }
+    let current_inputs = current.persisted_inputs()?;
+    let native_inputs = |inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>| {
+        inputs
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with("config:")
+                    || key.starts_with("toolchain:")
+                    || key.starts_with("ignore:")
+                    || key.starts_with("executable:")
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    if native_inputs(previous_inputs) != native_inputs(&current_inputs) {
+        return Ok(CapturedChange::FullNative {
+            reason: "captured native input changed",
+        });
+    }
+    let before: BTreeMap<_, _> = previous.iter().map(|f| (f.path.as_str(), f)).collect();
+    let after: BTreeMap<_, _> = current.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    if before.keys().ne(after.keys()) {
+        return Ok(CapturedChange::FullNative {
+            reason: "source inventory changed (add/delete/rename)",
+        });
+    }
+    let mut changed = None;
+    for (path, old) in before {
+        let new = after[path];
+        if old.language != new.language {
+            return Ok(CapturedChange::FullNative {
+                reason: "source language changed",
+            });
+        }
+        if old.hash == new.hash {
+            continue;
+        }
+        if changed.is_some() {
+            return Ok(CapturedChange::FullNative {
+                reason: "multiple source documents changed",
+            });
+        }
+        changed = Some((path, old, new));
+    }
+    Ok(match changed {
+        None => CapturedChange::Unchanged,
+        Some((path, old, new)) if proved_body_only(old, new) => CapturedChange::DocumentLocal {
+            path: path.to_owned(),
+        },
+        Some(_) => CapturedChange::FullNative {
+            reason: "cross-file effect not proved local",
+        },
+    })
+}
+
+/// A diagnostic selected-document measurement for two caller-supplied captures.
+/// Publication uses a separate authenticated persisted-manifest path; unproved
+/// edits still use the full native fallback.
 #[derive(Debug)]
 pub struct StagedNativeMeasurement {
     pub decision: CapturedChange,
@@ -730,7 +798,7 @@ pub fn measure_document_fingerprint(
     })
 }
 
-fn project_native(
+pub(crate) fn project_native(
     options: &IndexOptions,
     capture: &Capture,
     native: &native_evidence::Artifact,

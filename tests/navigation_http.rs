@@ -1166,8 +1166,8 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     let (version, graph, class) = admitted_document(&missing_db, "B.java");
     let revision = active_revision(&missing_db);
     assert_eq!(missing_db.execute(
-        "INSERT INTO document_versions(id,source_set_id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes)
-         SELECT 'orphan-version',source_set_id,language,'orphan.java',content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes
+        "INSERT INTO document_versions(id,source_set_id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness)
+         SELECT 'orphan-version',source_set_id,language,'orphan.java',content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness
          FROM document_versions WHERE id=?1",
         [&version],
     ).unwrap(), 1);

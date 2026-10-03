@@ -116,7 +116,8 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     let baseline = store.index_baseline().unwrap();
     let leader = store.leader().unwrap();
     let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
-    assert_ne!(baseline.index_generation, pin.index_generation);
+    // A current v8 empty bootstrap is the same generation; only a rebuild rotates it.
+    assert_eq!(baseline.index_generation, pin.index_generation);
     assert_eq!(
         store.status().unwrap().evidence_format.as_deref(),
         Some("terminal-native-graph-v1")

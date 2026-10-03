@@ -60,9 +60,8 @@ impl IndexJobCoordinator {
         self.session.clone()
     }
 
-    /// A staged decision for two immutable admissions. The current v8 publication below
-    /// still builds and writes the full native snapshot; the later delta writer consumes
-    /// this decision only after it authenticates a selected prior snapshot and fingerprints.
+    /// A diagnostic decision for two immutable admissions. Publication classifies
+    /// its persisted prior manifest in one private read snapshot instead.
     pub fn staged_capture_decision(
         previous: &Capture,
         current: &Capture,
@@ -70,8 +69,8 @@ impl IndexJobCoordinator {
         indexer::measure_captured_change(previous, current)
     }
 
-    /// The staged selected-native result is nonpublishable. Only a later delta writer
-    /// can use it after comparing authenticated prior versions; run() still builds full.
+    /// This stand-alone measurement is nonpublishable without a pinned prior manifest,
+    /// authenticated immutable versions and a writer-transaction CAS.
     pub fn staged_capture_measurement(
         previous: &Capture,
         current: &Capture,
@@ -105,20 +104,62 @@ impl IndexJobCoordinator {
         observe: impl FnOnce(&Capture),
     ) -> Result<IndexPin> {
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
+        #[cfg(test)]
+        let diagnostic =
+            std::env::var_os("BALEYG_INDEX_PHASE_DIAGNOSTIC").map(|_| std::time::Instant::now());
         self.store.begin_leader_publication(&self.session)?;
-        let (graph, native, capture) =
-            indexer::index_workspace_bundle(options, self.store.root_id(), cancel, progress)?;
+        let capture = Capture::admit(options, cancel, &progress)?;
+        #[cfg(test)]
+        if let Some(t) = diagnostic {
+            eprintln!("phase capture {:?}", t.elapsed());
+        }
+        let root = std::fs::canonicalize(&options.workspace_root)?;
+        let selected = self
+            .store
+            .prepare_local_native(&capture, &self.expected, cancel)?;
+        #[cfg(test)]
+        if let Some(t) = diagnostic {
+            eprintln!("phase prelock native selection {:?}", t.elapsed());
+        }
+        let selective = selected.is_some();
+        let native = match selected {
+            Some(native) => native,
+            None => {
+                crate::native_evidence::from_capture(&capture, &root, self.store.root_id(), cancel)?
+            }
+        };
+        #[cfg(test)]
+        if let Some(t) = diagnostic {
+            eprintln!("phase native extraction {:?}", t.elapsed());
+        }
+        let graph = indexer::project_native(options, &capture, &native, cancel, &progress)?;
+        #[cfg(test)]
+        if let Some(t) = diagnostic {
+            eprintln!("phase graph projection {:?}", t.elapsed());
+        }
+        capture.verify(cancel)?;
         observe(&capture);
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         self.store.verify_leader_session(&self.session)?;
-        self.store.publish_native_recovery(
-            &graph,
-            &capture,
-            &native,
-            self.session.leader_guard()?,
-            self.expected,
-            cancel,
-        )
+        if selective {
+            self.store.publish_native_recovery_selective(
+                &graph,
+                &capture,
+                &native,
+                self.session.leader_guard()?,
+                self.expected,
+                cancel,
+            )
+        } else {
+            self.store.publish_native_recovery(
+                &graph,
+                &capture,
+                &native,
+                self.session.leader_guard()?,
+                self.expected,
+                cancel,
+            )
+        }
     }
 }
 

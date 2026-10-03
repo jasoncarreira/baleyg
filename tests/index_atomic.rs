@@ -808,6 +808,236 @@ fn sqlite_snapshot(
 }
 
 #[test]
+fn document_local_delta_and_cross_file_fallback_match_independent_cold_publications() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let padding = "x".repeat(145_000);
+    let js = |value: &str, name: &str| {
+        format!("function {name}() {{ return {value}; /*{padding}*/ }}\n")
+    };
+    for (name, source) in [
+        ("local.js", js("1", "local")),
+        (
+            "A.java",
+            format!("class A {{ int run() {{ return 1; /*{padding}*/ }} }}\n"),
+        ),
+        (
+            "run.py",
+            format!("def run():\n    return 1\n    # {padding}\n"),
+        ),
+        (
+            "run.rs",
+            format!("fn run()->i32 {{ return 1; /*{padding}*/ }}\n"),
+        ),
+    ] {
+        assert!(source.len() > 50_000);
+        fs::write(workspace.path().join(name), source).unwrap();
+    }
+    assert!(
+        fs::read_dir(workspace.path())
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum::<u64>()
+            > 500_000
+    );
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
+    let old_source = store.source_at("local.js", Some(first)).unwrap().unwrap().1;
+    let old_graph = serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap();
+    let old_classes = serde_json::to_value(
+        store
+            .classes_at(Some("A.java"), "", Some(first), 0, 100)
+            .unwrap(),
+    )
+    .unwrap();
+    let old_declarations = serde_json::to_value(
+        store
+            .native_declarations_at(first, "javascript", "local")
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(workspace.path().join("local.js"), js("2", "local")).unwrap();
+    let local = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap_or_else(|error| panic!("local publication: {error:#}"));
+    assert_eq!(
+        store.source_at("local.js", Some(first)).unwrap().unwrap().1,
+        old_source
+    );
+    assert_eq!(
+        serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap(),
+        old_graph
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .classes_at(Some("A.java"), "", Some(first), 0, 100)
+                .unwrap()
+        )
+        .unwrap(),
+        old_classes
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .native_declarations_at(first, "javascript", "local")
+                .unwrap()
+        )
+        .unwrap(),
+        old_declarations
+    );
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    for path in ["A.java", "run.py", "run.rs"] {
+        let version = |pin: baleyg::model::IndexPin| -> String {
+            db.query_row(
+            "SELECT document_version_id FROM revision_documents WHERE revision_id=?1 AND path=?2",
+            rusqlite::params![format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision),path],|r|r.get(0)).unwrap()
+        };
+        assert_eq!(
+            version(first),
+            version(local),
+            "{path}: unchanged native version must be reused"
+        );
+    }
+    drop(db);
+    let compare_cold = |pin| {
+        let fresh_state = tempfile::tempdir().unwrap();
+        fs::set_permissions(fresh_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let cold = Store::open_for_tests(fresh_state.path(), workspace.path()).unwrap();
+        let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+        let _cold_session = cold_job.session();
+        let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+        assert_eq!(
+            sqlite_snapshot(&index_dir(state.path()).join("index.db"), pin, true),
+            sqlite_snapshot(
+                &index_dir(fresh_state.path()).join("index.db"),
+                cold_pin,
+                true
+            )
+        );
+        assert_eq!(
+            store.graph_at(Some(pin)).unwrap().nodes,
+            cold.graph().unwrap().nodes
+        );
+    };
+    compare_cold(local);
+    fs::write(workspace.path().join("local.js"), js("2", "renamed")).unwrap();
+    let fallback = IndexJobCoordinator::prepare_with_session(&store, Some(local), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(
+        store.source_at("local.js", Some(first)).unwrap().unwrap().1,
+        old_source
+    );
+    assert_eq!(
+        serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap(),
+        old_graph
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .classes_at(Some("A.java"), "", Some(first), 0, 100)
+                .unwrap()
+        )
+        .unwrap(),
+        old_classes
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .native_declarations_at(first, "javascript", "local")
+                .unwrap()
+        )
+        .unwrap(),
+        old_declarations
+    );
+    compare_cold(fallback);
+}
+
+#[test]
+fn local_reuse_refuses_corrupt_native_graph_and_class_witnesses_before_commit() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    for (family, mutation) in [
+        (
+            "native",
+            "UPDATE native_version_declarations SET name='forged' WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND name='A'",
+        ),
+        (
+            "graph",
+            "UPDATE graph_nodes SET payload=json_set(payload,'$.name','forged') WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
+        ),
+        (
+            "class",
+            "UPDATE classes SET payload=json_set(payload,'$.qualifiedName','forged') WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM classes WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
+        ),
+        (
+            "file-extraction",
+            "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1)",
+        ),
+    ] {
+        let (state, workspace) = fixture();
+        fs::write(
+            workspace.path().join("local.js"),
+            "function local() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("A.java"),
+            "class A { int run() { return 1; } }\n",
+        )
+        .unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = job.session();
+        let first = job.run(&options, &cancel, |_| {}).unwrap();
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        assert_eq!(
+            db.execute(mutation, []).unwrap(),
+            1,
+            "{family}: corrupt one real row"
+        );
+        drop(db);
+        fs::write(
+            workspace.path().join("local.js"),
+            "function local() { return 2; }\n",
+        )
+        .unwrap();
+        let failure = IndexJobCoordinator::prepare_with_session(&store, Some(first), session)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap_err();
+        assert!(
+            failure.to_string().contains("incompatible_index"),
+            "{family}: {failure:#}"
+        );
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        let revision: i64 = db
+            .query_row("SELECT index_revision FROM index_metadata", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            revision, first.index_revision as i64,
+            "{family}: no partial publication"
+        );
+    }
+}
+
+#[test]
 fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore_change() {
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
@@ -2394,6 +2624,114 @@ fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinate
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinned_revisions() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator,
+        indexer::IndexOptions,
+        model::{CancelFlag, IndexPin, SymbolKind},
+    };
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let java = "class A {}\n";
+    fs::write(workspace.path().join("A.java"), java).unwrap();
+    let scip = state.path().join("labels.scip");
+    let manifest = state.path().join("labels.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "A.java":hex::encode(Sha256::digest(java.as_bytes()))
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut options = IndexOptions::new(workspace.path().to_owned());
+    options.scip_path = Some(scip.clone());
+    options.manifest_path = Some(manifest);
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let write_label = |label: &str, cutoff: bool| {
+        let mut index = scip::types::Index::new();
+        let mut document = scip::types::Document::new();
+        document.relative_path = "A.java".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 6, 7];
+        occurrence.symbol_roles = 1;
+        occurrence.symbol = format!("scip {label} A");
+        document.occurrences.push(occurrence);
+        index.documents.push(document);
+        if cutoff {
+            for ordinal in 0..1000 {
+                let mut extra = scip::types::Document::new();
+                extra.relative_path = format!("extra-{ordinal}.java");
+                index.documents.push(extra);
+            }
+        }
+        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
+    };
+    let label = |pin: IndexPin| {
+        store
+            .graph_at(Some(pin))
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|n| n.path == "A.java" && n.kind == SymbolKind::Class)
+            .unwrap()
+    };
+    let ids = |pin: IndexPin| {
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        db.query_row("SELECT document_version_id,graph_projection_id,class_projection_id FROM revision_documents WHERE revision_id=?1 AND path='A.java'",
+            [format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision)],
+            |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap()
+    };
+    write_label("one", false);
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
+    write_label("two", false);
+    let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(label(first).display_label.as_deref(), Some("scip one A"));
+    assert_eq!(label(second).display_label.as_deref(), Some("scip two A"));
+    assert_eq!(label(first).id, label(second).id);
+    assert_eq!(label(first).provenance, label(second).provenance);
+    let (native_first, graph_first, class_first) = ids(first);
+    let (native_second, graph_second, class_second) = ids(second);
+    assert_eq!(
+        native_first, native_second,
+        "same captured source reuses native version"
+    );
+    assert_ne!(graph_first, graph_second, "label is graph presentation");
+    assert_ne!(
+        class_first, class_second,
+        "class projection follows graph label"
+    );
+    write_label("cutoff", true);
+    let third = IndexJobCoordinator::prepare_with_session(&store, Some(second), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(
+        label(third).display_label,
+        None,
+        "over-1000 SCIP docs refuse all labels"
+    );
+    assert_eq!(
+        ids(third).0,
+        native_first,
+        "presentation cutoff never alters native version"
+    );
+    assert_eq!(
+        label(second).display_label.as_deref(),
+        Some("scip two A"),
+        "old pin keeps label"
+    );
 }
 
 #[test]

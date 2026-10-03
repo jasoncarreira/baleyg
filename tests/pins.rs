@@ -88,7 +88,7 @@ fn pin_shape_and_status() {
         first,
         &temp.path().join("workspace"),
     );
-    assert_ne!(next.index_generation, first.index_generation); // First native publish rebaselines the legacy schema.
+    assert_eq!(next.index_generation, first.index_generation); // A current v8 bootstrap keeps its generation.
     assert_eq!(next.index_revision, 1);
     assert_eq!(store.status().unwrap().revision, next);
 }

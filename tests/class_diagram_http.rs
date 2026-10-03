@@ -438,7 +438,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
         (version, marker.as_str(), generation, revision),
         (
             8,
-            "native-v4-class-compose-v1",
+            "native-v4-delta-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
         )
