@@ -254,21 +254,21 @@ async fn strict_selectors_validation_and_revision() {
         assert_eq!(status, 400, "{body}: {value}");
     }
     let old_source = source("A.java", 3, &dir);
-    let index_generation = store.status().unwrap().revision.index_generation;
+    let old_pin = store.status().unwrap().revision;
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
         session.leader_guard().unwrap(),
-        baleyg::model::IndexPin {
-            index_generation,
-            index_revision: 1,
-        },
+        old_pin,
         &cancel(),
     )
     .unwrap();
-    assert_eq!(call(&app, good).await.0, 409);
-    assert_eq!(call(&app, old_source).await.0, 409);
+    for request in [good, old_source] {
+        let (status, retained) = call(&app, request).await;
+        assert_eq!(status, 200, "{retained}");
+        assert_eq!(retained["revision"], json!(old_pin));
+    }
 }
 #[tokio::test]
 async fn auth_host_origin_are_enforced() {
@@ -1268,4 +1268,166 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
             .to_string()
             .contains("incompatible_index")
     );
+}
+
+#[tokio::test]
+async fn retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_projection() {
+    let (dir, store, old_graph, app, session) = setup(&[("A.java", JAVA)]);
+    let old_pin = store.status().unwrap().revision;
+    let old_request = source("A.java", 2, &dir);
+    let (status, baseline) = call(&app, old_request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{baseline}");
+    let selected_class = id(&old_graph, "A");
+    let selected_member = member(&dir, selected_class, "first", 0);
+    let (_, baseline_member) = call(&app, selected_member.clone()).await;
+    let root = dir.path().join("workspace");
+    std::fs::write(root.join("A.java"), "class Changed { void later() {} }\n").unwrap();
+    let options = IndexOptions::new(root.clone());
+    let changed = index_workspace(&options, &cancel(), |_| {}).unwrap();
+    let new_pin = publish_bundle(
+        &store,
+        &changed,
+        &root,
+        session.leader_guard().unwrap(),
+        old_pin,
+        &cancel(),
+    )
+    .unwrap();
+    assert_ne!(new_pin, old_pin);
+    assert_eq!(
+        call(&app, old_request.clone()).await,
+        (StatusCode::OK, baseline.clone())
+    );
+    assert_eq!(
+        call(&app, selected_member.clone()).await,
+        (StatusCode::OK, baseline_member.clone())
+    );
+    use baleyg::{
+        classes::{Catalog, FileExtraction, Limits},
+        indexer::index_workspace_bundle,
+    };
+    let authenticated = store.source_at("A.java", Some(old_pin)).unwrap().unwrap().1;
+    assert_eq!(authenticated.text, JAVA);
+    std::fs::write(root.join("A.java"), &authenticated.text).unwrap();
+    let (fresh_graph, fresh_native, fresh_capture) = index_workspace_bundle(
+        &IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel(),
+        |_| {},
+    )
+    .unwrap();
+    fresh_capture.verify(&cancel()).unwrap();
+    assert!(!fresh_native.declarations.is_empty());
+    assert_eq!(
+        fresh_graph
+            .files
+            .iter()
+            .find(|file| file.path == "A.java")
+            .unwrap(),
+        &authenticated
+    );
+    let extracts: Vec<_> = fresh_graph
+        .files
+        .iter()
+        .filter(|file| matches!(file.language.as_str(), "java" | "python"))
+        .map(|file| {
+            FileExtraction::extract_file(file, &fresh_graph.nodes, &cancel(), Limits::default())
+                .unwrap()
+        })
+        .collect();
+    let cold_catalog = Catalog::compose(
+        &extracts,
+        fresh_graph.files.len(),
+        fresh_graph.nodes.len(),
+        Limits::default(),
+    )
+    .unwrap();
+    let cold_class = cold_catalog
+        .classes
+        .iter()
+        .find(|class| class.symbol.name == "A")
+        .unwrap();
+    let cold_first = cold_class
+        .fields
+        .iter()
+        .find(|field| field.name == "first")
+        .unwrap();
+    assert_eq!(selected_member["classId"], json!(cold_class.symbol.id));
+    assert_eq!(selected_member["memberName"], json!(cold_first.name));
+    assert_eq!(
+        selected_member["startByte"],
+        json!(cold_first.range.start_byte)
+    );
+    assert_eq!(selected_member["endByte"], json!(cold_first.range.end_byte));
+    let measured_a = fresh_graph
+        .nodes
+        .iter()
+        .find(|node| node.path == "A.java" && node.name == "A" && node.kind == SymbolKind::Class)
+        .unwrap();
+    assert_eq!(
+        measured_a.range.start_line, 2,
+        "literal JAVA line-2 declaration"
+    );
+    assert_eq!(measured_a.id, cold_class.symbol.id);
+    let expected_targets = json!([{"symbol":measured_a,"action":"class",
+        "reason":"declaration","matchKind":"measured"}]);
+    assert_eq!(
+        baseline["targets"], expected_targets,
+        "old navigation target must come from freshly measured graph"
+    );
+    assert_eq!(baseline["revision"], json!(old_pin));
+    // The literal `B first, second` class field is not executable.
+    // Its source-backed selector has no target, so navigation returns the
+    // exact no-target warning rather than inventing a type-hint link.
+    assert_eq!(baseline_member["targets"], json!([]));
+    assert_eq!(
+        baseline_member["warnings"],
+        json!(["No indexed navigation target on this source line."])
+    );
+    assert_eq!(baseline_member["truncated"], json!(false));
+    assert_eq!(baseline_member["requireIndex"], json!(false));
+    std::fs::write(root.join("A.java"), "class Changed { void later() {} }\n").unwrap();
+    // Construct a NEW Store/router after r2, with no cached r1 HTTP packet.
+    // Source bytes and measured graph/Catalog supply the independent oracle.
+    let cold_store = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
+    assert_eq!(cold_store.status().unwrap().revision, new_pin);
+    let cold_app = http::router(
+        http::new(
+            cold_store,
+            IndexOptions::new(root.clone()),
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let (cold_status, cold_navigation) = call(&cold_app, old_request).await;
+    assert_eq!(cold_status, StatusCode::OK, "{cold_navigation}");
+    assert_eq!(cold_navigation["revision"], json!(old_pin));
+    assert_eq!(
+        cold_navigation["targets"], expected_targets,
+        "uncached old-pin navigation must name measured class A exactly"
+    );
+    assert_eq!(cold_navigation["warnings"], json!([]));
+    assert_eq!(cold_navigation["truncated"], json!(false));
+    assert_eq!(cold_navigation["requireIndex"], json!(false));
+    let (cold_member_status, cold_member) = call(&cold_app, selected_member).await;
+    assert_eq!(cold_member_status, StatusCode::OK, "{cold_member}");
+    assert_eq!(cold_member["revision"], json!(old_pin));
+    assert_eq!(cold_member["targets"], json!([]));
+    assert_eq!(
+        cold_member["warnings"],
+        json!(["No indexed navigation target on this source line."])
+    );
+    assert_eq!(cold_member["truncated"], json!(false));
+    assert_eq!(cold_member["requireIndex"], json!(false));
+    assert_eq!(cold_member, baseline_member);
+    store
+        .release_revision(old_pin, session.leader_guard().unwrap())
+        .unwrap();
+    let old_request = json!({"expectedRevision":old_pin,"path":"A.java","line":2});
+    assert_eq!(call(&app, old_request).await.0, StatusCode::CONFLICT);
+    store
+        .collect_unreferenced(session.leader_guard().unwrap())
+        .unwrap();
+    assert_eq!(store.status().unwrap().revision, new_pin);
 }

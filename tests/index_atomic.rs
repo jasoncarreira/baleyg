@@ -571,7 +571,16 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         .unwrap();
     assert_eq!(next.index_generation, first.index_generation);
     assert_eq!(next.index_revision, first.index_revision + 1);
-    assert!(store.source_at("main.js", Some(first)).is_err());
+    assert_eq!(
+        store
+            .source_at("main.js", Some(first))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        original,
+        "retained P remains readable after Q publication"
+    );
     assert_eq!(
         store
             .source_at("main.js", Some(next))
@@ -679,109 +688,6 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
 }
 
-// Frozen v4 objects match Store's exact closed-world legacy recognition.
-// This is a physical old-format fixture, not a marker downgrade of a v8 DB.
-const FROZEN_LEGACY4_GRAPH_SQL: &str = "
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
-CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
-CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX nodes_name ON nodes(name);
-CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX calls_caller ON calls(caller);
-CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-";
-const FROZEN_LEGACY4_CLASS_SQL: &str = "
-CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
-CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
-CREATE INDEX classes_path ON classes(path,id);
-CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX class_relations_owner ON class_relations(owner,id);
-CREATE INDEX class_relations_target ON class_relations(target,id);
-";
-fn rewrite_as_physical_v4(db: &rusqlite::Connection) {
-    let metadata: (String,String,String,String,i64,i64,String,String,String) = db.query_row(
-        "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
-        [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
-    ).unwrap();
-    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-    let names: Vec<String> = db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    for name in names {
-        db.execute_batch(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")))
-            .unwrap();
-    }
-    db.execute_batch(FROZEN_LEGACY4_GRAPH_SQL).unwrap();
-    db.execute_batch(FROZEN_LEGACY4_CLASS_SQL).unwrap();
-    db.execute(
-        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        rusqlite::params![
-            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
-            metadata.7, metadata.8
-        ],
-    )
-    .unwrap();
-    db.execute("INSERT INTO class_catalog VALUES(1,'[]',0)", [])
-        .unwrap();
-    db.pragma_update(None, "user_version", 4).unwrap();
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
-}
-
-#[test]
-fn physical_schema_four_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
-    use std::{
-        os::unix::fs::MetadataExt,
-        sync::{Arc, atomic::AtomicBool},
-    };
-    let (state, workspace) = fixture();
-    fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let options = IndexOptions::new(workspace.path().to_owned());
-    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
-    let session = job.session();
-    let current = job.run(&options, &cancel, |_| {}).unwrap();
-    let path = index_dir(state.path()).join("index.db");
-    let inode = fs::metadata(&path).unwrap().ino();
-    drop(store);
-    let db = rusqlite::Connection::open(&path).unwrap();
-    rewrite_as_physical_v4(&db);
-    drop(db);
-
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    assert_eq!(store.index_baseline().unwrap(), current);
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("index_not_ready")
-    );
-    let rebuilt = IndexJobCoordinator::prepare_with_session(&store, Some(current), session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    assert_ne!(rebuilt.index_generation, current.index_generation);
-    assert_eq!(rebuilt.index_revision, 1);
-    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    assert_eq!(store.status().unwrap().revision, rebuilt);
-}
-
 fn sqlite_snapshot(
     path: &Path,
     pin: baleyg::model::IndexPin,
@@ -881,11 +787,11 @@ fn sqlite_snapshot(
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], format!("t:{revision_id}"));
                 assert_eq!(rows[0][8], format!("t:{header_incarnation}"));
-                assert_eq!(rows[0][12], format!("i:{}", pin.index_revision));
+                assert_eq!(rows[0][14], format!("i:{}", pin.index_revision));
                 if normalize_current_publication {
                     rows[0][0] = "t:<current-pin>".into();
                     rows[0][8] = "t:<leader-incarnation>".into();
-                    rows[0][12] = "i:<current-revision>".into();
+                    rows[0][14] = "i:<current-revision>".into();
                 }
             } else if matches!(table.as_str(), "revision_capture_inputs" | "revision_documents") {
                 for row in &mut rows {
@@ -1023,8 +929,21 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
             assert!(count > 0, "{table}: complete {id} evidence must remain");
         }
     }
-    let stale = store.source_at("keep.js", Some(first)).unwrap_err();
-    assert!(stale.to_string().contains("revision conflict"), "{stale:#}");
+    assert_eq!(
+        store
+            .source_at("delete.js", Some(first))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function deleted() {}\n"
+    );
+    assert!(
+        store
+            .source_at("delete.js", Some(second))
+            .unwrap()
+            .is_none()
+    );
     drop(db);
 
     let fresh_state = tempfile::tempdir().unwrap();
@@ -1457,7 +1376,7 @@ fn exceptional_format_is_typed_deferred_refusal_without_file_mutation() {
 }
 
 #[test]
-fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_state() {
+fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state() {
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
@@ -1755,127 +1674,6 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
     assert_eq!(
         store.files_at(Some(recovered), 0, 10).unwrap()["items"][0]["path"],
         "flow.js"
-    );
-}
-
-#[test]
-fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
-    use std::{
-        os::unix::fs::MetadataExt,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-    };
-
-    let (state, workspace, initial, old, session) = projection_fixture();
-    let path = index_dir(state.path()).join("index.db");
-    let inode = fs::metadata(&path).unwrap().ino();
-    drop(initial);
-    let db = rusqlite::Connection::open(&path).unwrap();
-    // Simulate an out-of-band damaged v8 metadata marker without pretending
-    // this is a physical legacy index. The ordinary SQL CHECK rejects it.
-    db.pragma_update(None, "ignore_check_constraints", true)
-        .unwrap();
-    db.execute("UPDATE index_metadata SET schema_version=6", [])
-        .unwrap();
-    drop(db);
-
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let clone = store.clone();
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-    assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-    assert_eq!(store.index_baseline().unwrap(), old);
-
-    let stale =
-        IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone()).unwrap();
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.pragma_update(None, "ignore_check_constraints", true)
-        .unwrap();
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='changed-after-admission'",
-        [],
-    )
-    .unwrap();
-    drop(db);
-    let error = stale
-        .run(
-            &IndexOptions::new(workspace.path().to_owned()),
-            &Arc::new(AtomicBool::new(false)),
-            |_| {},
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("revision conflict"), "{error:#}");
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='native-v4-class-compose-v1'",
-        [],
-    )
-    .unwrap();
-    drop(db);
-
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
-    let error = IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
-        .unwrap()
-        .run(
-            &IndexOptions::new(workspace.path().to_owned()),
-            &cancel,
-            |_| {},
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("cancelled"), "{error:#}");
-    let db = rusqlite::Connection::open(&path).unwrap();
-    assert_eq!(
-        db.query_row("SELECT schema_version FROM index_metadata", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        6
-    );
-    drop(db);
-    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-
-    cancel.store(false, Ordering::Release);
-    let recovered = IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
-        .unwrap()
-        .run(
-            &IndexOptions::new(workspace.path().to_owned()),
-            &cancel,
-            |_| {},
-        )
-        .unwrap();
-    assert_eq!(recovered.index_revision, 1);
-    assert_ne!(recovered.index_generation, old.index_generation);
-    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    assert_eq!(store.status().unwrap().revision, recovered);
-    assert_eq!(clone.status().unwrap().revision, recovered);
-    assert!(
-        IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
-            .err()
-            .expect("old pin must conflict")
-            .to_string()
-            .contains("revision conflict")
     );
 }
 

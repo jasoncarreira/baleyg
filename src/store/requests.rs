@@ -169,6 +169,9 @@ impl Store {
         old_root: bool,
         existing_only: bool,
     ) -> Result<(UseGuard, Connection)> {
+        // Root-loss paths keep their existing queue admission barriers.
+        #[cfg(test)]
+        self.test_queue_before_shared_hook.run();
         if !old_root {
             self.identity.verify()?;
         }
@@ -177,6 +180,9 @@ impl Store {
         } else {
             self.roots.index_use(&self.identity)?
         };
+        // A waiter may have obtained SH only after the EX replacement
+        // published: check the same atomic state while protected, before RW
+        // open/create or SQLite journal recovery.
         let path = self.request_db_path();
         // The protected directory and file must remain private, regular and tied to the pathname.
         let file = OpenOptions::new()
@@ -524,12 +530,13 @@ impl Store {
 
     /// A CLI may retry only its own cached completion while holding that same leader.
     /// Do not convert an ordinary claim/read/publish error into an unbounded retry.
-    pub(crate) fn has_recorded_completion(&self, session: &LeaderSession) -> bool {
-        self.pending_request_completion
+    pub(crate) fn has_recorded_completion(&self, session: &LeaderSession) -> Result<bool> {
+        Ok(self
+            .pending_request_completion
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|pending| pending.incarnation == session.incarnation().to_string())
+            .is_some_and(|pending| pending.incarnation == session.incarnation().to_string()))
     }
 
     /// Resolve the one in-flight FIFO head before claiming any newer row. A terminal

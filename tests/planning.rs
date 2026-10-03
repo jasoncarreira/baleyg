@@ -227,8 +227,17 @@ fn revision_drift_rejected_snapshot_remains_immutable() {
             .to_string()
             .contains("revision conflict")
     );
-    assert!(store.source_at("a.js", Some(p.revision)).is_err());
-    // Offline immutable packets remain reproducible; HTTP owns the current-revision guard.
+    assert_eq!(
+        store
+            .source_at("a.js", Some(p.revision))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        CODE,
+        "read-only retained source remains available after publication"
+    );
+    // Offline immutable packets remain reproducible; preparation still requires current revision.
     assert_eq!(preview(&p).unwrap(), preview(&p).unwrap());
 }
 #[test]

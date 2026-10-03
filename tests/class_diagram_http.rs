@@ -119,6 +119,15 @@ fn request(seed: String, store: &Store) -> ClassDiagramRequest {
         include_hierarchy: false,
     }
 }
+fn request_json(request: &ClassDiagramRequest) -> Value {
+    json!({
+        "seed": &request.seed,
+        "expectedRevision": &request.expected_revision,
+        "expanded": &request.expanded,
+        "includeUnmatched": request.include_unmatched,
+        "includeHierarchy": request.include_hierarchy,
+    })
+}
 async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -261,28 +270,24 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
         &cancel(),
     )
     .unwrap();
-    assert_eq!(
-        call(
-            &app,
-            "GET",
-            &format!("/api/classes?{}", pin_query(pin)),
-            Value::Null
-        )
-        .await
-        .0,
-        409
-    );
-    assert_eq!(
-        call(
-            &app,
-            "POST",
-            "/api/class-diagram",
-            json!({"seed":seed,"expectedRevision":pin})
-        )
-        .await
-        .0,
-        409
-    );
+    let (status, retained_classes) = call(
+        &app,
+        "GET",
+        &format!("/api/classes?{}", pin_query(pin)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{retained_classes}");
+    assert_eq!(retained_classes["revision"], json!(pin));
+    let (status, retained_diagram) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":seed,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, 200, "{retained_diagram}");
+    assert_eq!(retained_diagram["revision"], json!(pin));
     for path in ["/classes.js", "/classes.css"] {
         let req = Request::builder()
             .uri(path)
@@ -495,9 +500,12 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(next.index_revision, 1);
     assert_eq!(store.status().unwrap().revision, next);
     assert_eq!(store.graph().unwrap().nodes, graph.nodes);
-    assert_eq!(
-        store.class_diagram_at(&q).unwrap_err().to_string(),
-        "revision conflict"
+    assert!(
+        store
+            .class_diagram_at(&q)
+            .unwrap_err()
+            .to_string()
+            .starts_with("revision conflict")
     );
     let mut current = q.clone();
     current.expected_revision = next;
@@ -1668,4 +1676,168 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             file.path
         );
     }
+}
+
+#[tokio::test]
+async fn retained_class_page_and_diagram_are_byte_stable_after_full_rewrite() {
+    let (dir, store, graph, app, session) = setup();
+    let old = store.status().unwrap().revision;
+    let page_route = format!("/api/classes?path=Types.java&{}", pin_query(old));
+    let (status, page) = call(&app, "GET", &page_route, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let old_request = request(id(&graph, "A"), &store);
+    let (status, diagram) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        request_json(&old_request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{diagram}");
+    let root = dir.path().join("workspace");
+    std::fs::write(
+        root.join("Types.java"),
+        "class Replacement { void newMethod() {} }\n",
+    )
+    .unwrap();
+    let changed = index_workspace(&IndexOptions::new(root.clone()), &cancel(), |_| {}).unwrap();
+    let new_pin = publish_bundle(
+        &store,
+        &changed,
+        &root,
+        session.leader_guard().unwrap(),
+        old,
+        &cancel(),
+    )
+    .unwrap();
+    assert_ne!(old, new_pin);
+    use baleyg::{
+        classes::{Catalog, FileExtraction, Limits},
+        indexer::index_workspace_bundle,
+    };
+    // The r1 bytes come from an authenticated selected source, NOT the old
+    // persisted F, graph projection, class rows or earlier HTTP response.
+    let old_source = store.source_at("Types.java", Some(old)).unwrap().unwrap().1;
+    assert_eq!(
+        old_source.text, JAVA,
+        "literal pre-rewrite class source oracle"
+    );
+    std::fs::write(root.join("Types.java"), &old_source.text).unwrap();
+    let (fresh_graph, fresh_native, fresh_capture) = index_workspace_bundle(
+        &IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel(),
+        |_| {},
+    )
+    .unwrap();
+    fresh_capture.verify(&cancel()).unwrap();
+    assert!(!fresh_native.declarations.is_empty());
+    assert_eq!(
+        fresh_graph
+            .files
+            .iter()
+            .find(|f| f.path == "Types.java")
+            .unwrap(),
+        &old_source
+    );
+    let fresh_f: Vec<_> = fresh_graph
+        .files
+        .iter()
+        .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+        .map(|f| {
+            FileExtraction::extract_file(f, &fresh_graph.nodes, &cancel(), Limits::default())
+                .unwrap()
+        })
+        .collect();
+    let cold_catalog = Catalog::compose(
+        &fresh_f,
+        fresh_graph.files.len(),
+        fresh_graph.nodes.len(),
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(!cold_catalog.truncated);
+    assert!(
+        cold_catalog
+            .classes
+            .iter()
+            .any(|class| class.symbol.name == "A")
+    );
+    std::fs::write(
+        root.join("Types.java"),
+        "class Replacement { void newMethod() {} }\n",
+    )
+    .unwrap();
+    let cold_app = http::router(
+        http::new(
+            store.clone(),
+            IndexOptions::new(root.clone()),
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap(),
+    );
+    let (cold_code, cold_page) = call(&cold_app, "GET", &page_route, Value::Null).await;
+    assert_eq!(cold_code, StatusCode::OK, "{cold_page}");
+    let mut expected_classes: Vec<_> = cold_catalog
+        .classes
+        .iter()
+        .filter(|class| class.symbol.path == "Types.java")
+        .map(|class| json!(class))
+        .collect();
+    expected_classes.sort_by_key(|class| class["symbol"]["id"].as_str().unwrap().to_owned());
+    let mut cold_classes = cold_page["items"].as_array().unwrap().clone();
+    cold_classes.sort_by_key(|class| class["symbol"]["id"].as_str().unwrap().to_owned());
+    assert_eq!(
+        cold_classes, expected_classes,
+        "cold old-pin full Catalog page"
+    );
+    assert_eq!(cold_page["warnings"], json!(cold_catalog.warnings));
+    assert_eq!(cold_page["truncated"], json!(cold_catalog.truncated));
+    let (cold_diagram_code, cold_diagram) = call(
+        &cold_app,
+        "POST",
+        "/api/class-diagram",
+        request_json(&old_request),
+    )
+    .await;
+    assert_eq!(cold_diagram_code, StatusCode::OK, "{cold_diagram}");
+    let expected_a = cold_catalog
+        .classes
+        .iter()
+        .find(|class| class.symbol.name == "A")
+        .unwrap();
+    assert_eq!(cold_diagram["revision"], json!(old));
+    assert_eq!(cold_diagram["seed"], json!(expected_a.symbol.id));
+    assert_eq!(
+        cold_diagram["nodes"],
+        json!([{
+            "id":expected_a.symbol.id,"class":expected_a,
+            "label":expected_a.qualified_name,"kind":"class","expandable":true
+        }])
+    );
+    assert_eq!(cold_diagram["edges"], json!([]));
+    assert_eq!(
+        call(&app, "GET", &page_route, Value::Null).await,
+        (StatusCode::OK, cold_page.clone())
+    );
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/class-diagram",
+            request_json(&old_request)
+        )
+        .await,
+        (StatusCode::OK, cold_diagram.clone())
+    );
+    assert_eq!(page["items"], cold_page["items"]);
+    assert_eq!(diagram["nodes"], cold_diagram["nodes"]);
+    store
+        .release_revision(old, session.leader_guard().unwrap())
+        .unwrap();
+    assert_eq!(
+        call(&app, "GET", &page_route, Value::Null).await.0,
+        StatusCode::CONFLICT
+    );
 }

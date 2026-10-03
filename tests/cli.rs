@@ -1639,193 +1639,6 @@ fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
     assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
 }
 
-#[test]
-fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation() {
-    let temp = TempDir::new().unwrap();
-    let root = temp.path().join("source");
-    let home = temp.path().join("home");
-    fs::create_dir(&root).unwrap();
-    fs::write(root.join("a.js"), "function go() { foo(); }").unwrap();
-    let first = command(&root, &home, "index").output().unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
-    let old_pin = first["status"]["revision"].clone();
-    let symbols = command(&root, &home, "symbols")
-        .arg("--search")
-        .arg("go")
-        .output()
-        .unwrap();
-    assert!(symbols.status.success());
-    let symbols: Value = serde_json::from_slice(&symbols.stdout).unwrap();
-    let valid_seed = symbols["items"][0]["id"].as_str().unwrap().to_owned();
-    let cached = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
-    } else {
-        home.join(".cache/baleyg/indexes")
-    };
-    let path = fs::read_dir(cached)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap()
-        .join("index.db");
-    {
-        let db = rusqlite::Connection::open(&path).unwrap();
-        rewrite_as_physical_v4(&db);
-        db.execute(
-            "INSERT INTO files(path,hash,payload) VALUES('a.js','legacy-hash','{}')",
-            [],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO nodes(id,name,path,payload) VALUES('legacy-go','go','a.js','{}')",
-            [],
-        )
-        .unwrap();
-        db.execute("INSERT INTO calls(id,caller,target,path,payload) VALUES('legacy-forged','legacy-go','legacy-go','a.js','{\"target\":\"lexical-guess\",\"resolution\":\"internal\"}')",[]).unwrap();
-    }
-    let mut rebuilt_generation = None;
-    for (ordinal, sub) in ["status", "symbols", "query", "export"]
-        .into_iter()
-        .enumerate()
-    {
-        let mut cmd = command(&root, &home, sub);
-        if sub == "query" {
-            cmd.arg("--seed").arg(&valid_seed);
-        }
-        let export_path = temp.path().join("rebuilt-export.json");
-        if sub == "export" {
-            cmd.arg("--output").arg(&export_path);
-        }
-        let result = cmd.output().unwrap();
-        assert!(
-            result.status.success(),
-            "{sub}: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let db = rusqlite::Connection::open(&path).unwrap();
-        let (generation, revision): (String, i64) = db
-            .query_row(
-                "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_ne!(generation, old_pin["indexGeneration"].as_str().unwrap());
-        if let Some(expected) = rebuilt_generation.as_ref() {
-            assert_eq!(&generation, expected);
-        } else {
-            rebuilt_generation = Some(generation.clone());
-        }
-        assert_eq!(revision, i64::try_from(ordinal + 1).unwrap());
-        let visible = format!(
-            "{}{}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert!(!visible.contains("lexical-guess"));
-        if sub == "export" {
-            assert!(export_path.exists());
-            assert!(
-                !String::from_utf8_lossy(&fs::read(&export_path).unwrap())
-                    .contains("lexical-guess")
-            );
-        }
-    }
-    // An extra trigger on the rebuilt current v8 index must never run during
-    // exceptional rebaseline or forge a published graph call.
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch(
-        "CREATE TRIGGER forged_call AFTER INSERT ON graph_calls BEGIN
-        UPDATE graph_calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
-        WHERE projection_id=NEW.projection_id AND id=NEW.id; END;",
-    )
-    .unwrap();
-    drop(db);
-    let dangerous_bytes = fs::read(&path).unwrap();
-    let rejected = command(&root, &home, "index").output().unwrap();
-    assert!(!rejected.status.success());
-    let message = String::from_utf8_lossy(&rejected.stderr);
-    assert!(message.contains("incompatible_index"), "{message}");
-    assert_eq!(fs::read(&path).unwrap(), dangerous_bytes);
-    let blocked_export = command(&root, &home, "export").output().unwrap();
-    assert!(!blocked_export.status.success());
-    assert!(!String::from_utf8_lossy(&blocked_export.stdout).contains("FORGED-NOT-MEASURED"));
-    let db = rusqlite::Connection::open(&path).unwrap();
-    let forged: i64 = db
-        .query_row(
-            "SELECT count(*) FROM graph_calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(forged, 0, "unknown trigger executed despite refusal");
-    db.execute_batch("DROP TRIGGER forged_call").unwrap();
-    drop(db);
-    let next = command(&root, &home, "index").output().unwrap();
-    assert!(
-        next.status.success(),
-        "{}",
-        String::from_utf8_lossy(&next.stderr)
-    );
-    let next: Value = serde_json::from_slice(&next.stdout).unwrap();
-    assert_ne!(
-        next["status"]["revision"]["indexGeneration"],
-        old_pin["indexGeneration"]
-    );
-    assert_eq!(next["status"]["evidenceFormat"], "terminal-native-graph-v1");
-    let status = command(&root, &home, "status").output().unwrap();
-    assert!(status.status.success());
-    let ready: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(
-        ready["revision"]["indexGeneration"],
-        next["status"]["revision"]["indexGeneration"]
-    );
-    assert_eq!(
-        ready["revision"]["indexRevision"].as_u64().unwrap(),
-        next["status"]["revision"]["indexRevision"]
-            .as_u64()
-            .unwrap()
-            + 1
-    );
-    let queried = command(&root, &home, "query")
-        .arg("--seed")
-        .arg(&valid_seed)
-        .output()
-        .unwrap();
-    assert!(
-        queried.status.success(),
-        "{}",
-        String::from_utf8_lossy(&queried.stderr)
-    );
-    let view: Value = serde_json::from_slice(&queried.stdout).unwrap();
-    assert_eq!(
-        view["revision"]["indexGeneration"],
-        ready["revision"]["indexGeneration"]
-    );
-    assert_eq!(
-        view["revision"]["indexRevision"].as_u64().unwrap(),
-        ready["revision"]["indexRevision"].as_u64().unwrap() + 1
-    );
-    assert!(
-        view["calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|call| call.get("target").is_none())
-    );
-    assert!(!view.to_string().contains("lexical-guess"));
-    let exported = command(&root, &home, "export").output().unwrap();
-    assert!(exported.status.success());
-    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
-    assert_eq!(graph["files"][0]["text"], "function go() { foo(); }");
-    assert!(!graph.to_string().contains("lexical-guess"));
-}
-
 // Read the normalized publication, including every native row, from the real daemon's database.
 fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
     fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1844,66 +1657,6 @@ fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
     }
     find(home).expect("published native database")
 }
-// Frozen v4 objects match Store's exact closed-world legacy recognition.
-// This is a physical old-format fixture, not a marker downgrade of a v8 DB.
-const FROZEN_LEGACY4_GRAPH_SQL: &str = "
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
-CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
-CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX nodes_name ON nodes(name);
-CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX calls_caller ON calls(caller);
-CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-";
-const FROZEN_LEGACY4_CLASS_SQL: &str = "
-CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
-CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
-CREATE INDEX classes_path ON classes(path,id);
-CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX class_relations_owner ON class_relations(owner,id);
-CREATE INDEX class_relations_target ON class_relations(target,id);
-";
-fn rewrite_as_physical_v4(db: &rusqlite::Connection) {
-    let metadata: (String,String,String,String,i64,i64,String,String,String) = db.query_row(
-        "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
-        [],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
-    ).unwrap();
-    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-    let names: Vec<String> = db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    for name in names {
-        db.execute_batch(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")))
-            .unwrap();
-    }
-    db.execute_batch(FROZEN_LEGACY4_GRAPH_SQL).unwrap();
-    db.execute_batch(FROZEN_LEGACY4_CLASS_SQL).unwrap();
-    db.execute(
-        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        rusqlite::params![
-            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
-            metadata.7, metadata.8
-        ],
-    )
-    .unwrap();
-    db.execute("INSERT INTO class_catalog VALUES(1,'[]',0)", [])
-        .unwrap();
-    db.pragma_update(None, "user_version", 4).unwrap();
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
-}
-
 fn real_native_snapshot(home: &std::path::Path) -> Value {
     use rusqlite::types::ValueRef;
     let db = rusqlite::Connection::open(real_index_db(home)).unwrap();
@@ -2059,7 +1812,7 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
     let header = header[0].as_array().unwrap();
     assert_eq!(header[0], pin);
     assert!(uuid::Uuid::parse_str(header[8].as_str().unwrap()).is_ok());
-    assert!(header[12].as_i64().is_some_and(|revision| revision > 0));
+    assert!(header[14].as_i64().is_some_and(|revision| revision > 0));
     for table in ["revision_capture_inputs", "revision_documents"] {
         for row in snapshot["allRows"][table].as_array().unwrap() {
             assert_eq!(row[0], pin, "{table} must reference the admitted pin");
@@ -2080,7 +1833,7 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
         .unwrap();
     header[0] = serde_json::json!("<current-pin>");
     header[8] = serde_json::json!("<leader-incarnation>");
-    header[12] = serde_json::json!("<current-revision>");
+    header[14] = serde_json::json!("<current-revision>");
     for table in ["revision_capture_inputs", "revision_documents"] {
         for row in evidence["allRows"][table].as_array_mut().unwrap() {
             row[0] = serde_json::json!("<current-pin>");
@@ -2754,10 +2507,10 @@ def sink():
             "{name}: active leader remains stable"
         );
         assert_ne!(
-            before_header[12], after_header[12],
+            before_header[14], after_header[14],
             "{name}: revision advances"
         );
-        assert_eq!(after_header[12], pin["indexRevision"], "{name}");
+        assert_eq!(after_header[14], pin["indexRevision"], "{name}");
         assert_eq!(
             after_header[0],
             format!(
@@ -4231,9 +3984,18 @@ async fn saved_items_real_index_matrix() {
         saved_pin_route("/api/views", &pin),
         saved_pin_route("/api/annotations", &pin),
     ] {
-        let (status, error) =
+        let (status, response) =
             real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
-        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{route}: {error}");
+        assert_eq!(status, reqwest::StatusCode::OK, "{route}: {response}");
+        let selected = if route.contains("/real-view") {
+            &response
+        } else {
+            &response[0]
+        };
+        assert_eq!(selected["indexGeneration"], pin["indexGeneration"]);
+        assert_eq!(selected["indexRevision"], pin["indexRevision"]);
+        assert_eq!(selected["attachment"]["result"]["status"], "attached");
+        assert_eq!(selected["attachment"]["result"]["targetId"], seed);
     }
     for (route, body) in [
         (
@@ -4267,11 +4029,8 @@ async fn saved_items_real_index_matrix() {
         Some(query.clone()),
     )
     .await;
-    assert_eq!(
-        status,
-        reqwest::StatusCode::CONFLICT,
-        "stale replay must not resolve the surviving ordinal in Q: {stale_query}"
-    );
+    assert_eq!(status, reqwest::StatusCode::OK, "{stale_query}");
+    assert_eq!(stale_query["revision"], pin, "retained query must select P");
     let (status, current_query) = real_api(
         &client,
         &url,

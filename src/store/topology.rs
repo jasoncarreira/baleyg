@@ -1728,10 +1728,8 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(matches!(version, 4..=8), "incompatible index schema");
-    // GC classifies only exact known historical or current cache formats.
-    // The same structural and extractor-marker check applies before it can
-    // declare an index eligible for deletion or report it as recently opened.
+    ensure!(version == 8, "incompatible index schema");
+    // Only the current cache shape can authorize GC or a recent-open report.
     super::validate_cache_shape(db)?;
     let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
     ensure!(count == 1, "incompatible index metadata cardinality");
@@ -1739,11 +1737,8 @@ fn inspect_index_with_open_hook(
         "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,last_opened_at FROM index_metadata WHERE singleton=1", [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
     ensure!(
-        ((version == 4 && schema == 4 && extractor == "native-v1")
-            || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1")
-            || (version == 6 && schema == 6 && extractor == "native-paired-v1")
-            || (version == 7 && schema == 7 && extractor == "native-paired-v1")
-            || (version == 8 && schema == 8 && extractor == super::EXTRACTOR_VERSION))
+        schema == 8
+            && extractor == super::EXTRACTOR_VERSION
             && Path::new(&spelling).is_absolute()
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"

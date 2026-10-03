@@ -245,8 +245,9 @@ async fn query_optional_pin_matrix() {
         &Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
-    let (status, stale) = call(&app, "POST", &pinned("/api/query", &pin), body.clone()).await;
-    assert_eq!(status, 409, "{stale}");
+    let (status, retained) = call(&app, "POST", &pinned("/api/query", &pin), body.clone()).await;
+    assert_eq!(status, 200, "{retained}");
+    assert_eq!(retained["revision"], json!(pin));
     let (status, current) = call(&app, "POST", &pinned("/api/query", &next), body.clone()).await;
     assert_eq!(status, 200, "{current}");
     assert_eq!(current["revision"], json!(next));
@@ -425,8 +426,12 @@ async fn saved_read_pin_and_ownership_matrix() {
     )
     .unwrap();
     for route in [pinned("/api/views", &pin), pinned("/api/annotations", &pin)] {
-        let (status, error) = call(&app, "GET", &route, Value::Null).await;
-        assert_eq!(status, 409, "{route}: {error}");
+        let (status, retained) = call(&app, "GET", &route, Value::Null).await;
+        assert_eq!(status, 200, "{route}: {retained}");
+        for entry in retained.as_array().unwrap() {
+            assert_eq!(entry["indexGeneration"], pin.index_generation.to_string());
+            assert_eq!(entry["indexRevision"], json!(pin.index_revision));
+        }
     }
     assert_eq!(
         call(&app, "PUT", &pinned("/api/views/owned", &pin), view)
@@ -734,4 +739,91 @@ fn publish_bundle(
         "published graph must match captured source"
     );
     store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
+}
+
+#[tokio::test]
+async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest() {
+    let (temp, store, graph, app, seed, session) = fixture();
+    let root = temp.path().join("workspace");
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let r1 = publish_bundle(
+        &store,
+        &graph,
+        &root,
+        session.leader_guard().unwrap(),
+        store.index_baseline().unwrap(),
+        &cancel,
+    )
+    .unwrap();
+    let view = json!({"id":"old-view","title":"Old","query":{"seed":seed},"pins":{},"hidden":[]});
+    let annotation = json!({"id":"old-note","nodeId":seed,"body":"Measured"});
+    let (status, attached_view) =
+        call(&app, "PUT", &pinned("/api/views/old-view", &r1), view).await;
+    assert_eq!(status, 200, "{attached_view}");
+    let (status, attached_note) = call(
+        &app,
+        "PUT",
+        &pinned("/api/annotations/old-note", &r1),
+        annotation,
+    )
+    .await;
+    assert_eq!(status, 200, "{attached_note}");
+    assert_eq!(attached_view["attachment"]["result"]["status"], "attached");
+    assert_eq!(attached_note["attachment"]["result"]["status"], "attached");
+    std::fs::write(root.join("a.js"), "function replacement() {}\n").unwrap();
+    let updated = index_workspace(&IndexOptions::new(root.clone()), &cancel, |_| {}).unwrap();
+    let r2 = publish_bundle(
+        &store,
+        &updated,
+        &root,
+        session.leader_guard().unwrap(),
+        r1,
+        &cancel,
+    )
+    .unwrap();
+    assert_ne!(r1, r2);
+    let (code, old_view) = call(
+        &app,
+        "GET",
+        &pinned("/api/views/old-view", &r1),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, 200, "{old_view}");
+    assert_eq!(old_view, attached_view);
+    let (code, old_notes) = call(&app, "GET", &pinned("/api/annotations", &r1), Value::Null).await;
+    assert_eq!(code, 200, "{old_notes}");
+    let matching_notes: Vec<_> = old_notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|state| state["annotation"]["id"] == "old-note")
+        .collect();
+    assert_eq!(matching_notes.len(), 1, "{old_notes}");
+    assert_eq!(matching_notes[0], &attached_note);
+    let current_views = call(&app, "GET", "/api/views", Value::Null).await.1;
+    assert_ne!(
+        current_views[0]["attachment"]["result"]["status"],
+        "attached"
+    );
+    store
+        .release_revision(r1, session.leader_guard().unwrap())
+        .unwrap();
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            &pinned("/api/views/old-view", &r1),
+            Value::Null
+        )
+        .await
+        .0,
+        409
+    );
+    assert_eq!(
+        call(&app, "GET", &pinned("/api/annotations", &r1), Value::Null)
+            .await
+            .0,
+        409
+    );
 }

@@ -212,7 +212,7 @@ fn retry_cli_recorded_completion(
     cancel: &CancelFlag,
     initial: anyhow::Error,
 ) -> Result<()> {
-    if !store.has_recorded_completion(session) || !retryable_cli_completion_error(&initial) {
+    if !store.has_recorded_completion(session)? || !retryable_cli_completion_error(&initial) {
         return Err(initial);
     }
     loop {

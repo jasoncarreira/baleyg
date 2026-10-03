@@ -247,12 +247,20 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     let closed = store
         .native_source_at(baseline, &artifact.revision.documents[0].key)
         .unwrap_err();
-    assert_eq!(closed.to_string(), "revision conflict: stale native pin");
+    assert_eq!(
+        closed.to_string(),
+        "revision conflict: foreign or missing native pin"
+    );
     drop(db);
     let next = publish(&store, root.path(), &cancel, pin, &leader).unwrap();
     assert_eq!(next.index_generation, pin.index_generation);
     assert_eq!(next.index_revision, pin.index_revision + 1);
-    assert!(store.native_declarations_at(pin, "java", "Demo").is_err());
+    assert!(
+        !store
+            .native_declarations_at(pin, "java", "Demo")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -372,139 +380,6 @@ fn empty_workspace_has_native_pair_without_document_rows() {
             .get::<_, i64>(0))
             .unwrap(),
         1
-    );
-}
-
-#[test]
-fn known_old_schema_four_remains_unready_until_full_native_reindex() {
-    let (state, root, store, cancel) = fixture();
-    let original = store.index_baseline().unwrap();
-    let path = state
-        .path()
-        .join("cache/indexes")
-        .join(
-            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
-                .unwrap()
-                .root_key,
-        )
-        .join("index.db");
-    let db = Connection::open(&path).unwrap();
-    // Build a genuine old4 physical index, not a counterfeit metadata marker:
-    // v8's metadata CHECK forbids a schema_version=4 update in place.
-    let metadata: (String, String, String, String, i64, i64, String, String, String) = db
-        .query_row(
-            "SELECT root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics FROM index_metadata",
-            [],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
-        )
-        .unwrap();
-    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-    let tables: Vec<String> = db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    for table in tables {
-        db.execute_batch(&format!("DROP TABLE \"{}\"", table.replace('"', "\"\"")))
-            .unwrap();
-    }
-    // validate_cache_shape compares sqlite_master SQL exactly, including SQL text
-    // and object order. These are verbatim CACHE_SCHEMA_V6 + CLASS_SCHEMA.
-    db.execute_batch(r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL, extractor_version TEXT NOT NULL, root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL);
-CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, payload TEXT NOT NULL);
-CREATE TABLE nodes(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX nodes_name ON nodes(name);
-CREATE TABLE calls(id TEXT PRIMARY KEY, caller TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX calls_caller ON calls(caller);
-CREATE TABLE regions(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, path TEXT NOT NULL REFERENCES files(path) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-
-CREATE TABLE class_catalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1), warnings TEXT NOT NULL, truncated INTEGER NOT NULL);
-CREATE TABLE classes(id TEXT PRIMARY KEY REFERENCES nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, qualified_name TEXT NOT NULL, path TEXT NOT NULL, payload TEXT NOT NULL);
-CREATE INDEX classes_path ON classes(path,id);
-CREATE TABLE class_relations(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, target TEXT REFERENCES classes(id) DEFERRABLE INITIALLY DEFERRED, payload TEXT NOT NULL);
-CREATE INDEX class_relations_owner ON class_relations(owner,id);
-CREATE INDEX class_relations_target ON class_relations(target,id);
-"#).unwrap();
-    db.execute(
-        "INSERT INTO class_catalog(singleton,warnings,truncated) VALUES(1,'[]',0)",
-        [],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO index_metadata VALUES(1,4,'native-v1',?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        rusqlite::params![
-            metadata.0, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6,
-            metadata.7, metadata.8
-        ],
-    )
-    .unwrap();
-    db.pragma_update(None, "user_version", 4).unwrap();
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='revision_documents'",
-            [],
-            |row| row.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='files'",
-            [],
-            |row| row.get::<_, i64>(0)
-        )
-        .unwrap(),
-        1
-    );
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='class_catalog'",
-            [],
-            |row| row.get::<_, i64>(0)
-        )
-        .unwrap(),
-        1
-    );
-    drop(db);
-    assert_eq!(store.index_baseline().unwrap(), original);
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("index_not_ready")
-    );
-    let leader = store.leader().unwrap();
-    let before = fs::read(&path).unwrap();
-    let (graph, native, capture) = index_workspace_bundle(
-        &IndexOptions::new(root.path().to_owned()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    cancel.store(true, std::sync::atomic::Ordering::Release);
-    assert!(
-        store
-            .publish_native(&graph, &capture, &native, &leader, original, &cancel)
-            .is_err()
-    );
-    assert_eq!(fs::read(&path).unwrap(), before);
-    cancel.store(false, std::sync::atomic::Ordering::Release);
-    let pin = store
-        .publish_native(&graph, &capture, &native, &leader, original, &cancel)
-        .unwrap();
-    assert_ne!(pin.index_generation, original.index_generation);
-    assert_eq!(pin.index_revision, original.index_revision + 1);
-    assert_eq!(store.status().unwrap().revision, pin);
-    assert!(
-        store
-            .native_source_at(original, &native.revision.documents[0].key)
-            .is_err()
     );
 }
 
@@ -761,7 +636,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
                 .native_source_at(first, &old_key)
                 .unwrap_err()
                 .to_string(),
-            "revision conflict: stale native pin",
+            "revision conflict: foreign or missing native pin",
             "{old_version} old pin must conflict"
         );
     }
@@ -1576,4 +1451,471 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
         .native_declarations_at(pin, "java", "go")
         .unwrap_err();
     assert_current_corruption(closed);
+}
+
+fn assert_retained_native_family_parity(
+    store: &Store,
+    pin: IndexPin,
+    measured: &baleyg::native_evidence::Artifact,
+) {
+    use std::collections::BTreeSet;
+
+    assert!(
+        measured
+            .calls
+            .iter()
+            .any(|call| call.document.path == "flow.js")
+    );
+    assert!(
+        measured
+            .control_regions
+            .iter()
+            .any(|region| region.document.path == "flow.java")
+    );
+    let lookups = measured
+        .declarations
+        .iter()
+        .filter_map(|declaration| {
+            declaration
+                .lookup_key
+                .as_ref()
+                .map(|key| (declaration.document.language.clone(), key.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+    for (language, lookup) in lookups {
+        let mut actual = store
+            .native_declarations_at(pin, &language, &lookup)
+            .unwrap();
+        let mut expected = measured
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.document.language == language
+                    && declaration.lookup_key.as_deref() == Some(lookup.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        actual.sort_by(|left, right| left.syntax_id.cmp(&right.syntax_id));
+        expected.sort_by(|left, right| left.syntax_id.cmp(&right.syntax_id));
+        // Whole DTO equality includes the requested document revision and provenance.
+        assert_eq!(actual, expected, "{pin:?}: declaration {language}/{lookup}");
+    }
+    for declaration in &measured.declarations {
+        let mut actual_calls = store.native_calls_at(pin, &declaration.syntax_id).unwrap();
+        let mut expected_calls = measured
+            .calls
+            .iter()
+            .filter(|call| call.owner_syntax_id == declaration.syntax_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        actual_calls.sort_by(|left, right| left.id.cmp(&right.id));
+        expected_calls.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(
+            actual_calls, expected_calls,
+            "{pin:?}: calls for {}",
+            declaration.syntax_id
+        );
+
+        let mut actual_regions = store
+            .native_control_regions_at(pin, &declaration.syntax_id)
+            .unwrap();
+        let mut expected_regions = measured
+            .control_regions
+            .iter()
+            .filter(|region| region.owner_syntax_id == declaration.syntax_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        actual_regions.sort_by(|left, right| left.id.cmp(&right.id));
+        expected_regions.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(
+            actual_regions, expected_regions,
+            "{pin:?}: control regions for {}",
+            declaration.syntax_id
+        );
+    }
+}
+
+#[test]
+fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc() {
+    use baleyg::native_evidence::DocumentKey;
+    let (state, root, store, cancel) = fixture();
+    // Independent full-rewrite measurements, separate from publish()'s capture.
+    let (_, measured_r1, _) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let leader = store.leader().unwrap();
+    let r1 = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let key = DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "javascript".into(),
+        path: "flow.js".into(),
+    };
+    let source1 = store.native_source_at(r1, &key).unwrap().unwrap();
+    let coverage1 = store.native_coverage_at(r1, &key).unwrap().unwrap();
+    let graph1 = store.graph().unwrap();
+    fs::write(
+        root.path().join("flow.js"),
+        "function changed() { measured(); }\n",
+    )
+    .unwrap();
+    let (_, measured_r2, _) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
+    let source2 = store.native_source_at(r2, &key).unwrap().unwrap();
+    assert_ne!(source1.1, source2.1);
+    fs::remove_file(root.path().join("flow.js")).unwrap();
+    let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
+    assert!(store.native_source_at(r3, &key).unwrap().is_none());
+    assert_eq!(store.native_source_at(r1, &key).unwrap().unwrap(), source1);
+    assert_eq!(
+        store.native_coverage_at(r1, &key).unwrap().unwrap(),
+        coverage1
+    );
+    assert_eq!(
+        store
+            .source_at("flow.js", Some(r1))
+            .unwrap()
+            .unwrap()
+            .1
+            .text
+            .as_bytes(),
+        source1.1
+    );
+    assert_eq!(store.graph_at(Some(r1)).unwrap(), graph1);
+    // After both the edit and delete, both old pins must select their own typed
+    // native evidence, not the head's or each other's projection.
+    assert_retained_native_family_parity(&store, r1, &measured_r1);
+    assert_retained_native_family_parity(&store, r2, &measured_r2);
+    store.release_revision(r1, &leader).unwrap();
+    assert!(
+        store
+            .native_source_at(r1, &key)
+            .unwrap_err()
+            .to_string()
+            .contains("revision conflict")
+    );
+    // Release is durable before collection: lose the owner/process now, then
+    // reopen the index while r1's unreachable rows still await fenced GC.
+    drop(leader);
+    drop(store);
+    let cold = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cold_leader = cold.leader().unwrap();
+    // Taking over the leader lock requires paired publication before public
+    // reads, even when the retained rows are intact after the crash window.
+    assert!(
+        cold.status()
+            .unwrap_err()
+            .to_string()
+            .contains("reconciliation required")
+    );
+
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db_path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let r2_id = format!("pin:v1:{}:{}", r2.index_generation, r2.index_revision);
+    let db = Connection::open(&db_path).unwrap();
+    let (version, graph_projection, class_projection): (String, String, String) = db
+        .query_row(
+            "SELECT document_version_id,graph_projection_id,class_projection_id
+             FROM revision_documents WHERE revision_id=?1 AND path='flow.java'",
+            [&r2_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    // A surviving revision owns all three materialized record families before
+    // GC. Recheck these exact IDs after GC rather than only checking FK health.
+    let retained_rows = [
+        ("document_versions", version),
+        ("graph_projections", graph_projection),
+        ("class_projections", class_projection),
+    ];
+    for (table, id) in &retained_rows {
+        let count: i64 = db
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE id=?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "cold reopen lost retained {table}/{id} before GC");
+    }
+    drop(db);
+
+    let r4 = publish(&cold, root.path(), &cancel, r3, &cold_leader).unwrap();
+    assert_eq!(r4.index_generation, r3.index_generation);
+    assert_eq!(r4.index_revision, r3.index_revision + 1);
+    assert_eq!(cold.status().unwrap().revision, r4);
+    assert!(
+        cold.native_source_at(r1, &key)
+            .unwrap_err()
+            .to_string()
+            .contains("revision conflict")
+    );
+    assert_eq!(cold.native_source_at(r2, &key).unwrap().unwrap(), source2);
+    assert!(cold.native_source_at(r3, &key).unwrap().is_none());
+    assert_retained_native_family_parity(&cold, r2, &measured_r2);
+
+    cold.collect_unreferenced(&cold_leader).unwrap();
+    assert_eq!(cold.native_source_at(r2, &key).unwrap().unwrap(), source2);
+    assert!(cold.native_source_at(r3, &key).unwrap().is_none());
+    assert_retained_native_family_parity(&cold, r2, &measured_r2);
+    let db = Connection::open(&db_path).unwrap();
+    for (table, id) in &retained_rows {
+        let count: i64 = db
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE id=?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "fenced GC lost retained {table}/{id}");
+    }
+    let missing: i64 = db
+        .query_row(
+            "SELECT count(*) FROM document_versions v WHERE NOT EXISTS
+        (SELECT 1 FROM revision_documents m WHERE m.document_version_id=v.id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing, 0);
+    let fk: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fk, 0);
+    let tombstone: String = db
+        .query_row(
+            "SELECT payload FROM revision_capture_inputs
+        WHERE revision_id=?1 AND input_key='__released:v1'",
+            [format!(
+                "pin:v1:{}:{}",
+                r1.index_generation, r1.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tombstone, "released:v1");
+    assert_eq!(cold.status().unwrap().revision, r4);
+}
+
+#[test]
+fn malformed_and_foreign_release_pins_do_not_write_and_header_gaps_remain_corruption() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let r1 = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    fs::write(root.path().join("flow.js"), "function next() { next(); }\n").unwrap();
+    let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let before = fs::read(&path).unwrap();
+    for pin in [
+        r2,
+        baleyg::model::IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: r1.index_revision,
+        },
+        baleyg::model::IndexPin {
+            index_generation: r1.index_generation,
+            index_revision: r2.index_revision + 1,
+        },
+    ] {
+        assert!(
+            store
+                .release_revision(pin, &leader)
+                .unwrap_err()
+                .to_string()
+                .contains("revision conflict")
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "invalid release touched the database"
+        );
+    }
+    drop(leader);
+    drop(store);
+    let db = Connection::open(&path).unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    db.execute(
+        "DELETE FROM revision_documents WHERE revision_id=?1",
+        [format!(
+            "pin:v1:{}:{}",
+            r1.index_generation, r1.index_revision
+        )],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM revision_capture_inputs WHERE revision_id=?1",
+        [format!(
+            "pin:v1:{}:{}",
+            r1.index_generation, r1.index_revision
+        )],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM native_revisions WHERE published_index_revision=?1",
+        [r1.index_revision as i64],
+    )
+    .unwrap();
+    drop(db);
+    let malformed = fs::read(&path).unwrap();
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert!(
+        reopened
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        malformed,
+        "malformed gap was rewritten"
+    );
+}
+
+#[test]
+fn retained_graph_header_preserves_distinct_stats_and_diagnostics_and_matches_live_head_bytes() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let initial = store.index_baseline().unwrap();
+    let publish_measured = |expected| {
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(root.path().to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        store
+            .publish_native(&graph, &capture, &native, &leader, expected, &cancel)
+            .unwrap()
+    };
+    let r1 = publish_measured(initial);
+    let graph1 = store.graph_at(Some(r1)).unwrap();
+    // A genuinely incomplete source yields native partial coverage, from which
+    // the indexer derives the persisted diagnostic; never invent a graph row.
+    fs::write(root.path().join("incomplete.js"), "function broken( {\n").unwrap();
+    let r2 = publish_measured(r1);
+    let graph2 = store.graph_at(Some(r2)).unwrap();
+    assert_ne!(graph1.stats, graph2.stats);
+    assert!(
+        graph2
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path.as_deref() == Some("incomplete.js"))
+    );
+    assert_ne!(graph1.diagnostics, graph2.diagnostics);
+    assert_eq!(store.graph_at(Some(r1)).unwrap(), graph1);
+    assert_eq!(store.graph_at(None).unwrap(), graph2);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let (stats, diagnostics, head_stats, head_diagnostics): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = db.query_row(
+        "SELECT CAST(r.graph_stats AS BLOB),CAST(r.graph_diagnostics AS BLOB),CAST(m.stats AS BLOB),CAST(m.diagnostics AS BLOB)
+         FROM native_revisions r JOIN index_metadata m ON r.id='pin:v1:'||m.index_generation||':'||m.index_revision",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).unwrap();
+    assert_eq!(stats, head_stats);
+    assert_eq!(diagnostics, head_diagnostics);
+}
+
+#[test]
+fn invalid_retained_header_json_refuses_old_pin_without_mutating_sqlite_or_sidecars() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let r1 = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    fs::write(root.path().join("flow.js"), "function changed() {}\n").unwrap();
+    let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    drop(store);
+    let db = Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE native_revisions SET graph_diagnostics='[42]' WHERE published_index_revision=?1",
+        [r1.index_revision as i64],
+    )
+    .unwrap();
+    drop(db);
+    let bytes = fs::read(&path).unwrap();
+    let sidecars: Vec<_> = ["-wal", "-shm", "-journal"]
+        .iter()
+        .map(|s| path.with_file_name(format!("index.db{s}")))
+        .filter(|p| p.exists())
+        .collect();
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(reopened.status().unwrap().revision, r2);
+    assert!(
+        reopened
+            .graph_at(Some(r1))
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        sidecars,
+        ["-wal", "-shm", "-journal"]
+            .iter()
+            .map(|s| path.with_file_name(format!("index.db{s}")))
+            .filter(|p| p.exists())
+            .collect::<Vec<_>>()
+    );
 }
