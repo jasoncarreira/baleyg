@@ -184,16 +184,14 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
         )
         .unwrap();
     std::fs::remove_file(workspace.join("lib.rs")).unwrap();
-    assert_eq!(
-        request(
-            &app,
-            "POST",
-            "/api/sequence",
-            json!({"seed":seed,"expectedRevision":pin})
-        )
-        .await
-        .0,
-        409
-    );
+    let (code, retained) = request(
+        &app,
+        "POST",
+        "/api/sequence",
+        json!({"seed":seed,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(code, 200, "{retained}");
+    assert_eq!(retained["revision"], json!(pin));
     assert!(!sentinel.exists());
 }

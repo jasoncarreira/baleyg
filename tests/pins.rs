@@ -224,9 +224,8 @@ fn query_replay_pin_is_checked_in_target_snapshot() {
         },
         IndexPin {
             index_generation: next.index_generation,
-            index_revision: pin.index_revision,
+            index_revision: next.index_revision + 1,
         },
-        pin,
     ] {
         let error = store.query_view_at(&query, Some(&stale)).unwrap_err();
         assert!(
@@ -234,6 +233,9 @@ fn query_replay_pin_is_checked_in_target_snapshot() {
             "{stale:?}: {error:#}"
         );
     }
+    let retained = store.query_view_at(&query, Some(&pin)).unwrap().unwrap();
+    assert_eq!(retained.revision, pin);
+    assert_eq!(retained.nodes[0].id, query.seed);
 }
 
 #[test]

@@ -245,8 +245,9 @@ async fn query_optional_pin_matrix() {
         &Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
-    let (status, stale) = call(&app, "POST", &pinned("/api/query", &pin), body.clone()).await;
-    assert_eq!(status, 409, "{stale}");
+    let (status, retained) = call(&app, "POST", &pinned("/api/query", &pin), body.clone()).await;
+    assert_eq!(status, 200, "{retained}");
+    assert_eq!(retained["revision"], json!(pin));
     let (status, current) = call(&app, "POST", &pinned("/api/query", &next), body.clone()).await;
     assert_eq!(status, 200, "{current}");
     assert_eq!(current["revision"], json!(next));
@@ -425,8 +426,12 @@ async fn saved_read_pin_and_ownership_matrix() {
     )
     .unwrap();
     for route in [pinned("/api/views", &pin), pinned("/api/annotations", &pin)] {
-        let (status, error) = call(&app, "GET", &route, Value::Null).await;
-        assert_eq!(status, 409, "{route}: {error}");
+        let (status, retained) = call(&app, "GET", &route, Value::Null).await;
+        assert_eq!(status, 200, "{route}: {retained}");
+        for entry in retained.as_array().unwrap() {
+            assert_eq!(entry["indexGeneration"], pin.index_generation.to_string());
+            assert_eq!(entry["indexRevision"], json!(pin.index_revision));
+        }
     }
     assert_eq!(
         call(&app, "PUT", &pinned("/api/views/owned", &pin), view)

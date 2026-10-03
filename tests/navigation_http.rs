@@ -254,21 +254,21 @@ async fn strict_selectors_validation_and_revision() {
         assert_eq!(status, 400, "{body}: {value}");
     }
     let old_source = source("A.java", 3, &dir);
-    let index_generation = store.status().unwrap().revision.index_generation;
+    let old_pin = store.status().unwrap().revision;
     publish_bundle(
         &store,
         &graph,
         &dir.path().join("workspace"),
         session.leader_guard().unwrap(),
-        baleyg::model::IndexPin {
-            index_generation,
-            index_revision: 1,
-        },
+        old_pin,
         &cancel(),
     )
     .unwrap();
-    assert_eq!(call(&app, good).await.0, 409);
-    assert_eq!(call(&app, old_source).await.0, 409);
+    for request in [good, old_source] {
+        let (status, retained) = call(&app, request).await;
+        assert_eq!(status, 200, "{retained}");
+        assert_eq!(retained["revision"], json!(old_pin));
+    }
 }
 #[tokio::test]
 async fn auth_host_origin_are_enforced() {
