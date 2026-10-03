@@ -468,11 +468,13 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         os::unix::fs::PermissionsExt,
         process::Stdio,
     };
-    struct Server(std::process::Child);
+    struct Server(Option<std::process::Child>);
     impl Drop for Server {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
     let temp = TempDir::new().unwrap();
@@ -515,7 +517,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         .spawn()
         .unwrap();
     let stderr = child.stderr.take().unwrap();
-    let server = Server(child);
+    let mut server = Server(Some(child));
     let startup = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         tokio::task::spawn_blocking(move || {
@@ -541,6 +543,44 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         !startup.contains("Evidence unavailable at startup"),
         "{startup}"
     );
+    // The banner is printed before axum polls its SIGTERM handler. A successful
+    // HTTP response proves the listener and graceful-shutdown future are active.
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if reqwest::get(format!("http://127.0.0.1:{port}/healthz"))
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon health endpoint did not become ready");
+    // The banner precedes an asynchronous queue tick. SIGKILL can interrupt
+    // requests.db creation before its schema transaction commits; that partial
+    // queue must remain incompatible. Model a clean cross-CWD takeover instead:
+    // SIGTERM lets the daemon finish in-flight blocking work before it exits.
+    let pid = server.0.as_ref().unwrap().id();
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(status) = server.0.as_mut().unwrap().try_wait().unwrap() {
+            // Reaped children must not be killed again by the cleanup guard.
+            let _ = server.0.take();
+            assert!(
+                status.success(),
+                "daemon failed graceful shutdown: {status}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon did not stop gracefully before cross-CWD takeover"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     drop(server);
     let export = command(&root, &home, "export")
         .current_dir(&second_cwd)
