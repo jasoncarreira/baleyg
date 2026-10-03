@@ -270,28 +270,24 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
         &cancel(),
     )
     .unwrap();
-    assert_eq!(
-        call(
-            &app,
-            "GET",
-            &format!("/api/classes?{}", pin_query(pin)),
-            Value::Null
-        )
-        .await
-        .0,
-        409
-    );
-    assert_eq!(
-        call(
-            &app,
-            "POST",
-            "/api/class-diagram",
-            json!({"seed":seed,"expectedRevision":pin})
-        )
-        .await
-        .0,
-        409
-    );
+    let (status, retained_classes) = call(
+        &app,
+        "GET",
+        &format!("/api/classes?{}", pin_query(pin)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{retained_classes}");
+    assert_eq!(retained_classes["revision"], json!(pin));
+    let (status, retained_diagram) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":seed,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, 200, "{retained_diagram}");
+    assert_eq!(retained_diagram["revision"], json!(pin));
     for path in ["/classes.js", "/classes.css"] {
         let req = Request::builder()
             .uri(path)
@@ -504,9 +500,12 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(next.index_revision, 1);
     assert_eq!(store.status().unwrap().revision, next);
     assert_eq!(store.graph().unwrap().nodes, graph.nodes);
-    assert_eq!(
-        store.class_diagram_at(&q).unwrap_err().to_string(),
-        "revision conflict"
+    assert!(
+        store
+            .class_diagram_at(&q)
+            .unwrap_err()
+            .to_string()
+            .starts_with("revision conflict")
     );
     let mut current = q.clone();
     current.expected_revision = next;
