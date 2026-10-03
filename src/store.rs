@@ -10146,7 +10146,17 @@ mod frozen_old_v8_replacement_tests {
         assert!(store.status().is_err());
         drop(store);
         let admitted = Store::open_for_tests(state.path(), work.path()).unwrap();
-        let new_pin = admitted.status().unwrap().revision;
+        assert!(!admitted.is_known_old_v8_pending());
+        assert!(
+            admitted
+                .status()
+                .unwrap_err()
+                .to_string()
+                .contains("leader lock is not held")
+        );
+        let db = admitted.cache().unwrap();
+        assert!(admitted.recovery_baseline(&db).unwrap().compatible);
+        let new_pin = admitted.read_status(&db).unwrap().revision;
         assert_eq!(new_pin.index_revision, 1);
         assert_ne!(new_pin.index_generation, old.index_generation);
     }
@@ -10204,6 +10214,19 @@ mod frozen_old_v8_replacement_tests {
                 );
             }
             drop(store);
+            match fault {
+                "corrupt" => assert!(
+                    verify_index_file(&path)
+                        .unwrap_err()
+                        .is::<ExceptionalIndexFormat>()
+                ),
+                "sidecar" => {
+                    let refusal = reject_sidecars(&path, true).unwrap_err();
+                    assert!(refusal.to_string().contains("recovery_required"));
+                    assert!(refusal.to_string().contains("index.db-journal"));
+                }
+                _ => unreachable!(),
+            }
             match Store::open_for_tests(state.path(), work.path()) {
                 Ok(reopened) => {
                     assert!(!reopened.is_known_old_v8_pending());
