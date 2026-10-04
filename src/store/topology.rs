@@ -630,6 +630,21 @@ impl WorkspaceIdentity {
     pub fn verify(&self) -> Result<()> {
         self.verify_with_marker(false)
     }
+    /// Recheck the same open root and marker without discovering or creating a
+    /// different identity when another owner repaired a pending derived index.
+    pub(crate) fn verified_clone(&self) -> Result<Self> {
+        self.verify()?;
+        Ok(Self {
+            root: self.root.clone(),
+            root_key: self.root_key.clone(),
+            record_id: self.record_id.clone(),
+            device: self.device,
+            inode: self.inode,
+            git_dir: self.git_dir.clone(),
+            marker: self.marker,
+            root_handle: self.root_handle.try_clone()?,
+        })
+    }
     pub fn verify_readonly(&self) -> Result<()> {
         self.verify_with_marker(true)
     }

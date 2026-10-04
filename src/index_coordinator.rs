@@ -6,7 +6,7 @@ use crate::{
     model::{CancelFlag, IndexPin, IndexProgress},
     store::{RecoveryBaseline, Store, topology::LeaderSession},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
 
 pub struct IndexJobCoordinator {
@@ -266,6 +266,20 @@ pub fn drain_requests_observed(
     session: &Arc<LeaderSession>,
     progress: impl Fn(&str, IndexProgress) + Sync,
 ) -> Result<usize> {
+    drain_requests_observed_with_cancel(
+        store,
+        session,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        progress,
+    )
+}
+
+fn drain_requests_observed_with_cancel(
+    store: &Store,
+    session: &Arc<LeaderSession>,
+    cancel: &CancelFlag,
+    progress: impl Fn(&str, IndexProgress) + Sync,
+) -> Result<usize> {
     if store.root_path_replaced()? {
         store.fail_changed_root_requests(session)?;
         anyhow::bail!("root_changed: old leader stopped after queue failure transition");
@@ -275,7 +289,14 @@ pub fn drain_requests_observed(
     // A prior attempt may have published but failed its queue terminal write. Resolve
     // that exact cached result before any new claim or native publication.
     let mut completed = usize::from(store.retry_recorded_completion(session)?);
-    while let Some(request) = store.claim_request(session)? {
+    loop {
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "index wait interrupted; inspect the accepted request's durable state"
+        );
+        let Some(request) = store.claim_request(session)? else {
+            break;
+        };
         let outcome = (|| {
             let options = request.options(std::path::Path::new(store.workspace_root()))?;
             let coordinator = IndexJobCoordinator::prepare_with_session(
@@ -283,11 +304,7 @@ pub fn drain_requests_observed(
                 request.expected,
                 session.clone(),
             )?;
-            coordinator.run(
-                &options,
-                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                |p| progress(&request.id, p),
-            )
+            coordinator.run(&options, cancel, |p| progress(&request.id, p))
         })();
         // No unverified worker can mark a request terminal. On fencing loss leave it running
         // for the next incarnation to reclaim after its complete root reconciliation.
@@ -351,10 +368,20 @@ pub(crate) fn finish_reconciled_head(
     session: &Arc<LeaderSession>,
     options: &IndexOptions,
     pin: IndexPin,
+    head_before_capture: Option<&str>,
 ) -> Result<()> {
+    // An ACK admitted during capture did not cause that publication. It must
+    // be claimed and indexed from its own options, not marked done by an
+    // earlier recovery pin with superficially matching options.
+    let Some(prior_id) = head_before_capture else {
+        return Ok(());
+    };
     let Some(head) = store.earliest_unfinished_request()? else {
         return Ok(());
     };
+    if head.id != prior_id {
+        return Ok(());
+    }
     let Ok(selected) = head.options(std::path::Path::new(store.workspace_root())) else {
         return Ok(());
     };
@@ -395,8 +422,10 @@ pub fn enqueue_and_wait_observed(
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
     let request = store.enqueue_request(options, None)?;
+    let mut observed_store = store.clone();
     let mut held: Option<Arc<LeaderSession>> = None;
     loop {
+        let store = &observed_store;
         if store.root_path_replaced()? {
             if let Some(session) = &held {
                 store.fail_changed_root_requests(session)?;
@@ -409,10 +438,40 @@ pub fn enqueue_and_wait_observed(
                 "done" => {
                     let session = match held.take() {
                         Some(session) => session,
-                        None => store.follower_session()?,
+                        None => match store.follower_session() {
+                            Ok(session) => session,
+                            Err(error)
+                                if store.is_recreate_pending()
+                                    && error.to_string()
+                                        == "recovery_required: exceptional index recovery deferred" =>
+                            {
+                                // A daemon finished our accepted row while this
+                                // process still held its pre-repair disposition.
+                                // Re-admit only the same existing root/index;
+                                // never report success from queue bytes alone.
+                                let refreshed=store.reopen_existing_current_root().with_context(||format!(
+                                    "accepted request {} is done in durable queue, but current publication cannot be verified",
+                                    request.id
+                                ))?;
+                                ensure!(
+                                    !refreshed.is_recreate_pending(),
+                                    "storage_busy: completed request has no verified publication"
+                                );
+                                observed_store = refreshed;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        },
                     };
                     session.verify()?;
-                    return Ok((row.revision.expect("done request has revision"), session));
+                    let pin = row.revision.expect("done request has revision");
+                    let current = store.status()?.revision;
+                    ensure!(
+                        pin.index_generation == current.index_generation
+                            && pin.index_revision <= current.index_revision,
+                        "storage_busy: completed request pin is not retained by current publication"
+                    );
+                    return Ok((pin, session));
                 }
                 "failed" => anyhow::bail!(
                     "{}: queued indexing failed",
@@ -426,11 +485,18 @@ pub fn enqueue_and_wait_observed(
             "index wait interrupted; accepted request remains queued"
         );
         if held.is_none() && store.is_recreate_pending() {
+            let head_before_capture = store.earliest_unfinished_request()?.map(|row| row.id);
             match store.recreate_pending_leader_session(options, cancel) {
                 Ok((pin, session)) => {
                     store.fail_changed_root_requests(&session)?;
                     held = Some(session.clone());
-                    if let Err(error) = finish_reconciled_head(store, &session, options, pin) {
+                    if let Err(error) = finish_reconciled_head(
+                        store,
+                        &session,
+                        options,
+                        pin,
+                        head_before_capture.as_deref(),
+                    ) {
                         retry_cli_recorded_completion(store, &session, cancel, error)?;
                     }
                 }
@@ -440,6 +506,29 @@ pub fn enqueue_and_wait_observed(
                             .downcast_ref::<crate::store::topology::StorageBusy>()
                             .is_some()
                     }) => {}
+                Err(error)
+                    if error.to_string()
+                        == "recovery_required: exceptional index recovery deferred" =>
+                {
+                    // A second owner may have repaired index.db after our
+                    // admission snapshot. Refresh only the same verified root
+                    // and existing index; never reuse stale recreation authority.
+                    match store.reopen_existing_current_root() {
+                        Ok(refreshed) if !refreshed.is_recreate_pending() => {
+                            observed_store=refreshed;
+                            continue;
+                        }
+                        Ok(_) => {
+                            let row=store.request_by_id(&request.id)?;
+                            anyhow::bail!("recovery_required: accepted request {} remains {}; index still requires verified recovery",
+                                request.id,row.map(|r|r.state).unwrap_or_else(||"unavailable".into()));
+                        }
+                        Err(wait) if retryable_cli_completion_error(&wait) => {},
+                        Err(wait) => return Err(wait).context(format!(
+                            "accepted request {} has a durable queue row; recovery could not be refreshed",
+                            request.id)),
+                    }
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -481,13 +570,23 @@ pub fn enqueue_and_wait_observed(
                         }
                     }
                 }
-                Err(error) if format!("{error:#}").contains("storage_busy") => {}
+                Err(error)
+                    if format!("{error:#}").contains("storage_busy")
+                        || (store.is_recreate_pending()
+                            && format!("{error:#}").contains("recovery_required")) =>
+                {
+                    // Another verified owner may still hold the old use lock.
+                    // Our request is already durable; wait rather than exit
+                    // with an unreported queued acknowledgement.
+                }
                 Err(error) => return Err(error),
             }
         }
         if let Some(session) = &held {
             loop {
-                match drain_requests_observed(store, session, |_, phase| progress(phase)) {
+                match drain_requests_observed_with_cancel(store, session, cancel, |_, phase| {
+                    progress(phase)
+                }) {
                     Ok(_) => break,
                     Err(error) => retry_cli_recorded_completion(store, session, cancel, error)?,
                 }
@@ -570,6 +669,62 @@ mod tests {
             )
             .collect();
         (files, ops)
+    }
+
+    #[test]
+    fn cli_ctrl_c_during_request_capture_interrupts_drain_and_records_failure() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, old_owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        drop(old_owner);
+        let ahead = store.enqueue_request(&options, None).unwrap();
+        let captures = std::sync::atomic::AtomicUsize::new(0);
+        let error = enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
+            if phase.phase == "timing:capture" && captures.fetch_add(1, Ordering::AcqRel) > 0 {
+                cancel.store(true, Ordering::Release);
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            captures.load(Ordering::Acquire),
+            2,
+            "first capture satisfied earlier FIFO row; second was CLI's own drain"
+        );
+        assert!(error.to_string().contains("interrupted"), "{error:#}");
+        assert_eq!(
+            store.request_by_id(&ahead.id).unwrap().unwrap().state,
+            "done"
+        );
+        let row = store.current_request().unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.error_code.as_deref(), Some("index_failed"));
+    }
+
+    #[test]
+    fn recovery_pin_must_not_complete_a_request_admitted_after_its_capture() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (old_pin, session) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        // The owner published its source capture first; only then did a client
+        // commit this new ACK. It cannot claim that earlier publication.
+        let later = store.enqueue_request(&options, None).unwrap();
+        finish_reconciled_head(&store, &session, &options, old_pin, None).unwrap();
+        assert_eq!(
+            store.request_by_id(&later.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(drain_requests(&store, &session).unwrap(), 1);
+        let completed = store.request_by_id(&later.id).unwrap().unwrap();
+        assert_eq!(completed.state, "done");
+        assert!(completed.revision.unwrap().index_revision > old_pin.index_revision);
     }
 
     #[test]

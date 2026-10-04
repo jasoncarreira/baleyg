@@ -164,6 +164,25 @@ impl Store {
         // but it must never recreate a missing queue containing old-root ACKs.
         self.request_connection_for_root_loss(false, self.is_root_replaced())
     }
+    /// Read an already-admitted queue without creating requests.db or its schema.
+    /// A vanished queue we previously observed is not equivalent to a virgin Ready index.
+    fn existing_request_connection(&self) -> Result<Option<(UseGuard, Connection)>> {
+        match self.request_connection_for_root_loss(false, true) {
+            Ok(pair) => Ok(Some(pair)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                ensure!(
+                    self.request_file_witness.lock().unwrap().is_none(),
+                    "incompatible_queue: previously observed requests.db disappeared"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
     fn request_connection_for_root_loss(
         &self,
         old_root: bool,
@@ -337,7 +356,9 @@ impl Store {
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
         }
-        let (_guard, db) = self.request_connection()?;
+        let Some((_guard, db)) = self.existing_request_connection()? else {
+            return Ok(None);
+        };
         #[cfg(test)]
         self.test_queue_select_hook.run();
         let row = db
@@ -351,7 +372,9 @@ impl Store {
         Ok(row)
     }
     pub fn earliest_unfinished_request(&self) -> Result<Option<Request>> {
-        let (_guard, db) = self.request_connection()?;
+        let Some((_guard, db)) = self.existing_request_connection()? else {
+            return Ok(None);
+        };
         let row = db.query_row(
             &format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') ORDER BY seq LIMIT 1"),
             [],
@@ -361,11 +384,13 @@ impl Store {
         Ok(row)
     }
     pub fn current_request(&self) -> Result<Option<Request>> {
-        let (_guard, db) = self.request_connection()?;
+        let Some((_guard, db)) = self.existing_request_connection()? else {
+            return Ok(None);
+        };
         let row = db
             .query_row(
-                &format!("SELECT {COLUMNS} FROM requests ORDER BY seq DESC LIMIT 1"),
-                [],
+                &format!("SELECT {COLUMNS} FROM requests WHERE root_device=?1 AND root_inode=?2 ORDER BY seq DESC LIMIT 1"),
+                params![self.identity.device.to_string(), self.identity.inode.to_string()],
                 read,
             )
             .optional()?;

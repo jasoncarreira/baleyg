@@ -57,6 +57,8 @@ pub struct Store {
     #[cfg(test)]
     test_exclusive_recovery_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
+    test_refresh_between_check_and_open: Arc<TestOneShotHook>,
+    #[cfg(test)]
     test_queue_finish_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     test_queue_post_commit_failures: Arc<std::sync::atomic::AtomicUsize>,
@@ -3423,6 +3425,8 @@ impl Store {
             #[cfg(test)]
             test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
+            test_refresh_between_check_and_open: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
             test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             test_queue_post_commit_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3494,6 +3498,32 @@ impl Store {
         Ok(status)
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
+    /// An accepted CLI row may outlive this Store's exceptional-disposition
+    /// snapshot while another verified owner repairs index.db. This observational
+    /// refresh is existing-only all the way through the SQLite open: it cannot
+    /// initialize storage, rediscover/create a root marker, or rotate a pin.
+    pub(crate) fn reopen_existing_current_root(&self) -> Result<Self> {
+        self.identity.verify()?;
+        let use_guard = self.roots.index_use_existing(&self.identity)?;
+        let path = self.roots.index_db(&self.identity);
+        // O_NOFOLLOW gives a stable inode from the *actual existing open*, not
+        // just a prior pathname check. A same-UID unlink can ignore SH, so also
+        // bind that inode to the pathname before AND after the read-only open.
+        let witness = IndexFileWitness::open(&path)?;
+        let reopened = Self::unopened(self.roots.clone(), self.identity.verified_clone()?)?;
+        #[cfg(test)]
+        self.test_refresh_between_check_and_open.run();
+        witness.verify()?;
+        let mut db = reopened.cache()?;
+        let tx = storage_result(db.transaction())?;
+        let _ = reopened.recovery_baseline(&tx)?;
+        drop(tx);
+        drop(db);
+        witness.verify()?;
+        use_guard.verify()?;
+        self.identity.verify()?;
+        Ok(reopened)
+    }
     pub fn open_for_tests(state: &Path, workspace: &Path) -> Result<Self> {
         let identity = topology::WorkspaceIdentity::discover(Some(workspace), workspace)?;
         let roots =
@@ -11587,6 +11617,125 @@ mod selected_source_budget_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("byte budget exceeded")
+        );
+    }
+}
+
+#[cfg(test)]
+mod accepted_cli_refresh_race_tests {
+    use super::*;
+    use crate::indexer::IndexOptions;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Store,
+        IndexPin,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let (pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        drop(owner);
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        assert_eq!(accepted.state, "queued");
+        let index = store.roots.index_db(&store.identity);
+        let queue = store.request_db_path();
+        (state, workspace, store, pin, index, queue)
+    }
+
+    #[test]
+    fn missing_index_between_refresh_check_and_open_must_never_recreate_publication() {
+        let (_state, _workspace, store, old_pin, index, queue) = fixture();
+        let before_index = std::fs::read(&index).unwrap();
+        let before_queue = std::fs::read(&queue).unwrap();
+        let old_path = index.with_file_name("index.db.saved-old-pin");
+        let moving = index.clone();
+        let saved = old_path.clone();
+        store.test_refresh_between_check_and_open.set(move || {
+            std::fs::rename(&moving, &saved).unwrap();
+        });
+        let result = store.reopen_existing_current_root();
+        assert!(
+            result.is_err(),
+            "an accepted-CLI observation must not bootstrap after index deletion"
+        );
+        assert!(
+            !index.exists(),
+            "deleted index pathname must not be recreated"
+        );
+        assert_eq!(
+            std::fs::read(&old_path).unwrap(),
+            before_index,
+            "prior committed generation survives"
+        );
+        assert_eq!(
+            std::fs::read(&queue).unwrap(),
+            before_queue,
+            "accepted FIFO row stays durable and queued"
+        );
+        assert_eq!(
+            store
+                .request_by_id(&store.current_request().unwrap().unwrap().id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+        assert_eq!(old_pin.index_revision, 1);
+        std::fs::rename(&old_path, &index).unwrap();
+        let recovered = Store::open_for_tests(_state.path(), _workspace.path()).unwrap();
+        assert_eq!(
+            recovered.index_baseline().unwrap(),
+            old_pin,
+            "restored prior index retains its exact generation and revision"
+        );
+        assert_eq!(
+            recovered.current_request().unwrap().unwrap().state,
+            "queued"
+        );
+    }
+
+    #[test]
+    fn replacement_inode_between_refresh_check_and_open_must_never_claim_success() {
+        let (_state, _workspace, store, old_pin, index, queue) = fixture();
+        let before_index = std::fs::read(&index).unwrap();
+        let before_queue = std::fs::read(&queue).unwrap();
+        let old_inode = std::fs::metadata(&index).unwrap().ino();
+        let swap = index.with_file_name("index.db.swap-private");
+        std::fs::write(&swap, &before_index).unwrap();
+        std::fs::set_permissions(&swap, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let swapping = index.clone();
+        store.test_refresh_between_check_and_open.set(move || {
+            std::fs::rename(&swap, &swapping).unwrap();
+        });
+        let result = store.reopen_existing_current_root();
+        assert!(
+            result.is_err(),
+            "byte-identical replacement inode cannot borrow old admission"
+        );
+        assert_ne!(std::fs::metadata(&index).unwrap().ino(), old_inode);
+        assert_eq!(std::fs::read(&index).unwrap(), before_index);
+        assert_eq!(
+            store.index_baseline().unwrap(),
+            old_pin,
+            "same committed pin remains; no new generation or publication"
+        );
+        assert_eq!(
+            std::fs::read(&queue).unwrap(),
+            before_queue,
+            "queue must not be changed by rejected refresh"
         );
     }
 }

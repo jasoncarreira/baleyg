@@ -3,6 +3,39 @@ use baleyg::{indexer::IndexOptions, store::Store};
 use std::fs;
 
 #[test]
+fn absent_queue_readers_are_existing_only_and_leave_home_bytes_unchanged() {
+    for read in ["current", "by_id"] {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let queue = store.request_db_path();
+        assert!(
+            !queue.exists(),
+            "fresh Ready index must not eagerly create requests.db"
+        );
+        let before = std::fs::read_dir(queue.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        let result = match read {
+            "current" => store.current_request().unwrap(),
+            "by_id" => store
+                .request_by_id(&uuid::Uuid::new_v4().to_string())
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(result.is_none());
+        assert!(!queue.exists(), "{read} unexpectedly created requests.db");
+        let after = std::fs::read_dir(queue.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(before, after, "{read} mutated the Ready queue directory");
+    }
+}
+
+#[test]
 fn durable_fifo_and_incarnation_fence() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -48,6 +81,230 @@ fn durable_fifo_and_incarnation_fence() {
     assert_eq!(reopened.current_request().unwrap().unwrap().id, b.id);
     let more = reopened.enqueue_request(&options, None).unwrap();
     assert!(more.seq > b.seq);
+}
+
+#[test]
+fn published_pin_before_completion_crash_child() {
+    let Ok(state) = std::env::var("BALEYG_TEST_CRASH_GAP_STATE") else {
+        return;
+    };
+    let workspace =
+        std::path::PathBuf::from(std::env::var("BALEYG_TEST_CRASH_GAP_WORKSPACE").unwrap());
+    let proof = std::path::PathBuf::from(std::env::var("BALEYG_TEST_CRASH_GAP_PROOF").unwrap());
+    let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
+    let options = IndexOptions::new(workspace);
+    let owner = store.leader_session().unwrap();
+    let claimed = store.claim_request(&owner).unwrap().unwrap();
+    assert_eq!(claimed.state, "running");
+    let coordinator = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
+        &store,
+        claimed.expected,
+        owner.clone(),
+    )
+    .unwrap();
+    let pin = coordinator
+        .run(
+            &options,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(
+        store.status().unwrap().revision,
+        pin,
+        "publication committed"
+    );
+    assert_eq!(
+        store.request_by_id(&claimed.id).unwrap().unwrap().state,
+        "running",
+        "no terminal write has happened yet"
+    );
+    let mut marker = fs::File::create(&proof).unwrap();
+    use std::io::Write;
+    writeln!(
+        marker,
+        "{} {} {}",
+        claimed.id, pin.index_generation, pin.index_revision
+    )
+    .unwrap();
+    marker.sync_all().unwrap();
+    // Exit without Rust drops or request completion. Locks vanish as with a crash.
+    std::process::exit(37);
+}
+
+#[test]
+fn real_process_death_after_request_publish_reclaims_without_false_done() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (before, owner) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    drop(owner);
+    let accepted = store.enqueue_request(&options, None).unwrap();
+    let proof = state.path().join("post-publication-proof");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("published_pin_before_completion_crash_child")
+        .env("BALEYG_TEST_CRASH_GAP_STATE", state.path())
+        .env("BALEYG_TEST_CRASH_GAP_WORKSPACE", workspace.path())
+        .env("BALEYG_TEST_CRASH_GAP_PROOF", &proof)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "child must exit after verified commit; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let proof = fs::read_to_string(&proof).unwrap();
+    let fields: Vec<_> = proof.split_whitespace().collect();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0], accepted.id);
+    let parent = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let after_commit = parent.index_baseline().unwrap();
+    assert_eq!(after_commit.index_generation.to_string(), fields[1]);
+    assert_eq!(after_commit.index_revision.to_string(), fields[2]);
+    assert!(after_commit.index_revision > before.index_revision);
+    let unfinished = parent.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(
+        unfinished.state, "running",
+        "the crash cannot pretend the ACK finished"
+    );
+    assert!(unfinished.revision.is_none());
+    let (takeover, new_owner) = baleyg::index_coordinator::reconcile_workspace(
+        &parent,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    assert!(takeover.index_revision > after_commit.index_revision);
+    assert_eq!(
+        baleyg::index_coordinator::drain_requests(&parent, &new_owner).unwrap(),
+        1
+    );
+    let done = parent.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    assert!(
+        done.revision.unwrap().index_revision > takeover.index_revision,
+        "repeat-after-commit across process death is allowed, false earlier completion is not"
+    );
+}
+
+#[test]
+fn new_leader_reclaims_running_head_before_later_queued_row() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let original = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, old_owner) = baleyg::index_coordinator::reconcile_workspace(
+        &original,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    let first = original.enqueue_request(&options, None).unwrap();
+    let running = original.claim_request(&old_owner).unwrap().unwrap();
+    assert_eq!(running.id, first.id);
+    assert_eq!(running.state, "running");
+    let old_incarnation = running.claim_incarnation.unwrap();
+    let next = original.enqueue_request(&options, None).unwrap();
+    assert!(
+        original.claim_request(&old_owner).unwrap().is_none(),
+        "do not skip running FIFO head"
+    );
+    drop(old_owner);
+    drop(original);
+    let replacement = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let (_, new_owner) = baleyg::index_coordinator::reconcile_workspace(
+        &replacement,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        baleyg::index_coordinator::drain_requests(&replacement, &new_owner).unwrap(),
+        2
+    );
+    let a = replacement.request_by_id(&first.id).unwrap().unwrap();
+    let b = replacement.request_by_id(&next.id).unwrap().unwrap();
+    assert_eq!((a.state.as_str(), b.state.as_str()), ("done", "done"));
+    assert_ne!(a.claim_incarnation.unwrap(), old_incarnation);
+    assert!(
+        a.revision.unwrap().index_revision < b.revision.unwrap().index_revision,
+        "reclaimed running head must publish before later queue admission"
+    );
+}
+
+#[test]
+fn cli_accepted_during_held_exceptional_owner_waits_until_recreation_completes() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let old = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, old_owner) = baleyg::index_coordinator::reconcile_workspace(
+        &old,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+        Some(workspace.path()),
+        workspace.path(),
+    )
+    .unwrap();
+    fs::write(roots.index_db(&identity), b"bad sqlite index header").unwrap();
+    let waiting = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(
+        waiting.status().is_err(),
+        "corrupt index cannot present a ready head"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let options_for_cli = options.clone();
+    let cli = std::thread::spawn(move || {
+        let result = baleyg::index_coordinator::enqueue_and_wait(
+            &waiting,
+            &options_for_cli,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .map(|(pin, _)| pin);
+        tx.send(result).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(80))
+            .is_err(),
+        "an accepted CLI request must not exit recovery_required while old owner holds EX"
+    );
+    let ack = old.current_request().unwrap().unwrap();
+    assert_eq!(
+        ack.state, "queued",
+        "CLI acknowledgement must already be durable"
+    );
+    drop(old_owner);
+    let pin = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    cli.join().unwrap();
+    assert_eq!(old.request_by_id(&ack.id).unwrap().unwrap().state, "done");
+    assert_eq!(pin.index_revision, 1, "recreated generation first pin");
 }
 
 #[test]
@@ -252,8 +509,16 @@ fn replacement_root_can_accept_while_old_holder_is_live_then_recover_index_only(
     fs::write(root.join("a.js"), "function newName() {}\n").unwrap();
     let replacement = Store::open_for_tests(state.path(), &root).unwrap();
     assert!(replacement.status().is_err());
+    assert!(
+        replacement.current_request().unwrap().is_none(),
+        "healthy replacement root must ignore the old root's newest job row"
+    );
     let options = IndexOptions::new(root.clone());
     let second = replacement.enqueue_request(&options, None).unwrap();
+    assert_eq!(
+        replacement.current_request().unwrap().unwrap().id,
+        second.id
+    );
     assert_ne!(first.root_inode, second.root_inode);
     assert!(
         replacement.leader_session().is_err(),

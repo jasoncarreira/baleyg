@@ -328,8 +328,10 @@ impl DaemonState {
                 };
                 let worker = state.clone();
                 let result = tokio::task::spawn_blocking(move || worker.queue_tick()).await;
-                if let Err(error) = result {
-                    eprintln!("queue tick failed: {error}");
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("queue tick failed: {error:#}"),
+                    Err(error) => eprintln!("queue tick worker failed: {error:#}"),
                 }
             }
         });
@@ -365,13 +367,24 @@ impl DaemonState {
         drop(pending);
         #[cfg(test)]
         self.test_queue_after_pending_snapshot.run();
-        if self.store.is_recreate_pending() && !pending_local && !self.store.is_root_replaced() {
-            // Admission can follow an empty snapshot before an old-leader drain.
-            // A corrupt-index request must wait for the next exceptional tick;
-            // RootReplaced still has to fail old-root durable requests below.
+        // A CLI process or a previous daemon has no ID in this daemon's local
+        // pending vector. Its durable FIFO row must still drive exceptional
+        // recovery; the existing-only read leaves a virgin Ready queue absent.
+        let durable_pending = self.store.is_recreate_pending()
+            && !pending_local
+            && !self.store.is_root_replaced()
+            && self.store.earliest_unfinished_request()?.is_some();
+        if self.store.is_recreate_pending()
+            && !pending_local
+            && !durable_pending
+            && !self.store.is_root_replaced()
+        {
+            // Admission may follow an empty snapshot; no verified durable
+            // request exists yet. RootReplaced still takes its fence below.
             return Ok(());
         }
-        if self.store.is_recreate_pending() && pending_local {
+        if self.store.is_recreate_pending() && (pending_local || durable_pending) {
+            let head_before_capture = self.store.earliest_unfinished_request()?.map(|row| row.id);
             // The native stream excludes the tick while the old owner is removed.
             // No retained SH guard may enter the nonblocking EX attempt.
             drop(self.serving_session.lock().unwrap().take());
@@ -387,6 +400,7 @@ impl DaemonState {
                         &session,
                         &self.options,
                         pin,
+                        head_before_capture.as_deref(),
                     )?;
                 }
                 Err(error)
@@ -447,7 +461,30 @@ impl DaemonState {
                             None,
                             session.clone(),
                         )?;
-                    coordinator.run(&self.options, &Arc::new(AtomicBool::new(false)), |_| {})?;
+                    let before = self.store.index_baseline()?;
+                    if let Err(error) =
+                        coordinator.run(&self.options, &Arc::new(AtomicBool::new(false)), |_| {})
+                    {
+                        // This follower has acquired and verified leadership, but
+                        // capture failed before any queue claim. Match the leader's
+                        // terminal failure path only if publication did not commit.
+                        // A lost fence or changed root must never fail another row.
+                        self.store.verify_leader_session(&session)?;
+                        self.store.fail_changed_root_requests(&session)?;
+                        if self.store.index_baseline()? != before {
+                            return Err(error);
+                        }
+                        if let Some(claimed) = self.store.claim_request(&session)? {
+                            eprintln!(
+                                "queue takeover failed for accepted {}: {error:#}",
+                                claimed.id
+                            );
+                            self.store
+                                .record_and_finish_request(&session, &claimed, Err(error))?;
+                            return Ok(1);
+                        }
+                        return Err(error);
+                    }
                     let processed = crate::index_coordinator::drain_requests_observed(
                         &self.store,
                         &session,
@@ -3193,6 +3230,65 @@ mod serving_holder_tests {
         );
         assert_eq!(state.queue_takeover_attempts.load(Ordering::Acquire), 1);
     }
+
+    #[tokio::test]
+    async fn failed_follower_takeover_does_not_recapture_every_tick_forever() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("a.js");
+        fs::write(&source, "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let owner_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root);
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
+            &owner_store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &options.workspace_root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let state = new(
+            follower_store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let accepted = follower_store.enqueue_request(&options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(accepted.id.clone());
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            fs::read(&source).is_err(),
+            "fixture must fail real captured source reads"
+        );
+        drop(owner);
+        let _ = state.queue_tick();
+        let after_first = follower_store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(
+            after_first.state, "failed",
+            "verified takeover must terminally report index_failed, not leave queued"
+        );
+        assert_eq!(after_first.error_code.as_deref(), Some("index_failed"));
+        let first_attempts = state.queue_takeover_attempts.load(Ordering::Acquire);
+        for _ in 0..3 {
+            let _ = state.queue_tick();
+        }
+        assert_eq!(
+            state.queue_takeover_attempts.load(Ordering::Acquire),
+            first_attempts,
+            "terminal failure must stop repeated full-workspace takeovers"
+        );
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -3286,6 +3382,95 @@ mod exceptional_recovery_tests {
             old_generation: pin.index_generation,
             index_path,
         }
+    }
+
+    #[tokio::test]
+    async fn browser_q1_then_cli_q2_exceptional_fifo_survives_owner_contention() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let reader = roots.index_use_existing(&identity).unwrap();
+        let (status, Json(browser)) = start_index(State(state.clone()), Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let q1 = store.request_by_id(&browser.id).unwrap().unwrap();
+        assert_eq!(q1.state, "queued");
+        let cli_store =
+            Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
+                .unwrap();
+        let options = state.options.clone();
+        let cli = tokio::task::spawn_blocking(move || {
+            crate::index_coordinator::enqueue_and_wait(
+                &cli_store,
+                &options,
+                &Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let q2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(row) = store.current_request().unwrap()
+                    && row.id != q1.id
+                {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("CLI failed to durably ACK while independent reader held");
+        assert!(
+            q2.seq > q1.seq,
+            "actual browser POST must precede CLI ACK in durable FIFO"
+        );
+        assert_eq!(q2.state, "queued");
+        assert_eq!(
+            store.request_by_id(&q1.id).unwrap().unwrap().state,
+            "queued"
+        );
+        drop(reader);
+        let (cli_pin, _) = tokio::time::timeout(std::time::Duration::from_secs(15), cli)
+            .await
+            .expect("accepted CLI did not finish after reader release")
+            .unwrap()
+            .unwrap();
+        let browser_done = store.request_by_id(&q1.id).unwrap().unwrap();
+        let cli_done = store.request_by_id(&q2.id).unwrap().unwrap();
+        assert_eq!(
+            (browser_done.state.as_str(), cli_done.state.as_str()),
+            ("done", "done")
+        );
+        assert_eq!(browser_done.revision.unwrap().index_revision, 1);
+        assert_eq!(cli_done.revision.unwrap().index_revision, 2);
+        assert_eq!(cli_done.revision.unwrap(), cli_pin);
+    }
+
+    #[tokio::test]
+    async fn cli_accepted_exceptional_request_without_local_pending_id_must_be_driven() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let accepted = store.enqueue_request(&state.options, None).unwrap();
+        assert!(
+            state.pending_requests.lock().unwrap().is_empty(),
+            "a separate CLI process cannot populate daemon-local pending_requests"
+        );
+        let original_queue = std::fs::read(store.request_db_path()).unwrap();
+        state.queue_tick().unwrap();
+        let row = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(
+            row.state, "done",
+            "daemon must reconcile any durable queued CLI row, not only local POST ids"
+        );
+        assert_eq!(row.revision.unwrap(), store.status().unwrap().revision);
+        assert_eq!(
+            row.revision.unwrap().index_revision,
+            1,
+            "exceptional generation begins at the first fully recaptured pin"
+        );
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(roots.leader(&identity).is_err(), "new owner remains held");
+        assert_ne!(
+            std::fs::read(store.request_db_path()).unwrap(),
+            original_queue,
+            "accepted row needs a durable terminal transition"
+        );
     }
 
     fn assert_reclaimed_fifo(
@@ -3401,7 +3586,10 @@ mod exceptional_recovery_tests {
             "old leader drained a recovery request"
         );
         assert!(admitted.finished_at.is_none());
-        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(
+            state.retained_serving_session().is_err(),
+            "durable post-snapshot ACK prompted EX attempt and released old holder; independent reader still fences recreation"
+        );
         let worker = state.clone();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),

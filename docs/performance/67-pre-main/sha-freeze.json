@@ -1,8 +1,28 @@
 {
-  "release_sha256": "426e9ebbcdad81fdc0407d321b7fcc957ea794d89aab47f3ee0d287b65dd1a4e",
+  "release_sha256": "84fd779baaae8a1f701394eb49c18455493e34acd84fc13dee0148a14cf29dc3",
   "frozen_runner_sha256": "bcda02f75be5cefcc7f8658965ab59ed05fce306c211a576e9619f2db3fe50a2",
   "mixed_runner_sha256": "1eee5ac38db8a7c1ea6694b841cc2caf3ab5a36dfb4193fe28cb24407f379600",
-  "source_last_modified_before_common_cohort": "topology #16 comment completed before mixed-medium release build",
-  "superseded_frozen_release_sha256": "f8fdf4d093c7ac153e7af96f06bc76ded048e926b98ffd211dfdd521d82b5fc4",
-  "superseded_log": "frozen-before-topology-comment.log"
+  "source_freeze": "Owner-required strict existing-only accepted-CLI refresh completed before Rust 1.99 full gates, unchanged verifier, release build and sequential frozen/mixed recertification",
+  "canonical_manifest_sha256": "8b8deea8592cfd069a1500bcad9d634a8b4d343477e769b2f2aed0dd61bee046",
+  "completed_cohorts": {
+    "frozen": {
+      "medium_samples": 20,
+      "large_samples": 20,
+      "medium_p95_s": 0.7522,
+      "large_p95_s": 4.628,
+      "raw_log_sha256": "edaae56855bb4846413464f47d66bfa6eb6a9803d41f446b7536fe4ed5bf200a"
+    },
+    "mixed_medium": {
+      "samples": 20,
+      "p95_s": 0.7639,
+      "raw_log_sha256": "ebe2f6094d281806fc4a8d33797e2fdbda31e1bf2b5795dfcf2a9098a359e7a8"
+    },
+    "mixed_large": {
+      "samples": 20,
+      "p95_s": 4.5031,
+      "raw_log_sha256": "ec11b827d52191199d6c2d694a9ed1fe8f3e97b72889305b8515a1a47cdd8fd0"
+    }
+  },
+  "prior_pre_hardening_release_sha256": "9ce891636bd9c38f93534159c1a96386170e837e2d0e75aeefc8ffb0741f9337",
+  "prior_draft_head_release_sha256": "426e9ebbcdad81fdc0407d321b7fcc957ea794d89aab47f3ee0d287b65dd1a4e"
 }

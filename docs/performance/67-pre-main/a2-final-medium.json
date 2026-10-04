@@ -6,7 +6,7 @@
       "index_phases_ms": {},
       "label": "serve-first-ready",
       "phase_visibility": "Serve callback suppresses index-phase markers",
-      "readiness_output": "Baleyg: http://127.0.0.1:62682/\nState: /private/var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-a2-common-medium-7undap41/private-home/Library/Caches/dev.odin.baleyg\nToken file: /private/var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-a2-common-medium-7undap41/serve-token\nRefresh is explicit. No repository commands run.\nLive inference disabled. Offline preview/export/import only.\n"
+      "readiness_output": "Baleyg: http://127.0.0.1:62682/\nState: <private-scratch>/private-home/Library/Caches/dev.odin.baleyg\nToken file: <private-scratch>/serve-token\nRefresh is explicit. No repository commands run.\nLive inference disabled. Offline preview/export/import only.\n"
     },
     {
       "elapsed_s": 0.0087,
@@ -35,11 +35,11 @@
           "symbols": 217249,
           "unresolved": 557984
         },
-        "workspaceRoot": "/private/var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-a2-common-medium-7undap41/corpus"
+        "workspaceRoot": "<private-scratch>/corpus"
       }
     }
   ],
-  "private_home": "/private/var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-a2-common-medium-7undap41/private-home",
+  "private_home": "<private-scratch>/private-home",
   "snapshots": [
     {
       "binding_sha": [
@@ -96,5 +96,5 @@
       "selected_ids_sha256": "cbfee9eee37f284359b359754399fc63d619a78d1ca3d61cf7d533bf4c54e959"
     }
   ],
-  "workspace": "/private/var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-a2-common-medium-7undap41/corpus"
+  "workspace": "<private-scratch>/corpus"
 }
