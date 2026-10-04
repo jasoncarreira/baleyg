@@ -964,7 +964,7 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
 }
 
 #[test]
-fn local_reuse_refuses_corrupt_native_graph_and_class_witnesses_before_commit() {
+fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
@@ -1016,24 +1016,52 @@ fn local_reuse_refuses_corrupt_native_graph_and_class_witnesses_before_commit() 
             "function local() { return 2; }\n",
         )
         .unwrap();
-        let failure = IndexJobCoordinator::prepare_with_session(&store, Some(first), session)
-            .unwrap()
-            .run(&options, &cancel, |_| {})
-            .unwrap_err();
-        assert!(
-            failure.to_string().contains("incompatible_index"),
-            "{family}: {failure:#}"
-        );
-        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-        let revision: i64 = db
-            .query_row("SELECT index_revision FROM index_metadata", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(
-            revision, first.index_revision as i64,
-            "{family}: no partial publication"
-        );
+        let publication =
+            IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+                .unwrap()
+                .run(&options, &cancel, |_| {});
+        match publication {
+            Ok(second) => {
+                assert_eq!(
+                    second.index_revision,
+                    first.index_revision + 1,
+                    "{family}: only complete publications advance the pin"
+                );
+                let selected = match family {
+                    "native" => store
+                        .native_declarations_at(second, "java", "A")
+                        .map(|_| ())
+                        .unwrap_err(),
+                    "graph" => store.graph_at(Some(second)).map(|_| ()).unwrap_err(),
+                    "class" | "file-extraction" => store
+                        .classes_at(Some("A.java"), "", Some(second), 0, 10)
+                        .map(|_| ())
+                        .unwrap_err(),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    selected.to_string().contains("incompatible_index"),
+                    "{family}: selected-read attestation must refuse forgery: {selected:#}"
+                );
+            }
+            Err(failure) => {
+                assert!(
+                    failure.to_string().contains("incompatible_index"),
+                    "{family}: {failure:#}"
+                );
+                let db =
+                    rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+                let revision: i64 = db
+                    .query_row("SELECT index_revision FROM index_metadata", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    revision, first.index_revision as i64,
+                    "{family}: precommit refusal leaves complete old pin"
+                );
+            }
+        }
     }
 }
 

@@ -142,6 +142,14 @@ enum ExpectedPublication {
     Pin(IndexPin),
     Recovery(Box<RecoveryBaseline>),
 }
+impl ExpectedPublication {
+    fn pin(&self) -> Option<IndexPin> {
+        match self {
+            Self::Pin(pin) => Some(*pin),
+            Self::Recovery(baseline) => baseline.pin(),
+        }
+    }
+}
 #[derive(Clone, Copy)]
 enum PublicationTarget<'a> {
     Live,
@@ -1286,6 +1294,23 @@ struct ReusedFamilies {
 struct PreflightReuse {
     pin: Option<IndexPin>,
     families: BTreeMap<String, ReusedFamilies>,
+    // The fast local route carries IDs only from the selected validated head.
+    // No unchanged occurrence row is decoded or re-derived for publication.
+    existing_ids: BTreeMap<String, V8DocumentProjection>,
+}
+
+pub(crate) struct LocalPrepared {
+    pub(crate) changed_path: String,
+    pub(crate) native: crate::native_evidence::Artifact,
+    prior_pin: IndexPin,
+    prior_ids: BTreeMap<String, V8DocumentProjection>,
+    prior_coverage: BTreeMap<String, crate::native_evidence::Coverage>,
+    prior_extractions: BTreeMap<String, crate::classes::FileExtraction>,
+    old_stats: IndexStats,
+    old_diagnostics: Vec<Diagnostic>,
+    old_class_warnings: Vec<String>,
+    old_class_truncated: bool,
+    old_changed_counts: (usize, usize, usize),
 }
 impl PreflightReuse {
     fn for_path(&self, path: &str) -> ReusedFamilies {
@@ -1766,7 +1791,17 @@ fn write_native(
         let grouped = rows
             .get(file.path.as_str())
             .context("publication rows missing")?;
-        let ids = v8_document_projection(file, a, grouped)?;
+        let ids = if let Some(existing) = reuse.existing_ids.get(&file.path) {
+            V8DocumentProjection {
+                version_id: existing.version_id.clone(),
+                graph_id: existing.graph_id.clone(),
+                class_id: existing.class_id.clone(),
+                graph_hash: existing.graph_hash.clone(),
+                class_hash: existing.class_hash.clone(),
+            }
+        } else {
+            v8_document_projection(file, a, grouped)?
+        };
         let context = crate::native_ids::extraction_context(&file.language, &[])?;
         if !reuse.for_path(&file.path).native {
             immutable.insert(
@@ -4249,9 +4284,45 @@ impl Store {
     pub(crate) fn verify_leader_session(&self, session: &topology::LeaderSession) -> Result<()> {
         session.belongs_to(&self.identity, &self.roots.leader_lock(&self.identity))
     }
+    fn compose_selected_class_catalog(
+        graph: &Graph,
+        extractions: &BTreeMap<String, crate::classes::FileExtraction>,
+        limits: crate::classes::Limits,
+    ) -> Result<crate::classes::Catalog> {
+        // The local graph materializes only the changed document's nodes.
+        // Apply the unchanged class cap to the selected FULL revision's
+        // authenticated prior+delta symbol count, not graph.nodes.len().
+        crate::classes::Catalog::compose(
+            &extractions.values().cloned().collect::<Vec<_>>(),
+            graph.files.len(),
+            graph.stats.symbols,
+            limits,
+        )
+    }
+
     #[allow(dead_code)] // Internal diagnostics; exercised by the writer-lock regression test.
     pub(crate) fn last_writer_counters(&self) -> Option<WriterCounters> {
         *self.writer_counters.lock().unwrap()
+    }
+
+    /// Release CLI evidence for the last successful publication. Counts are
+    /// SQLite bound values, not whole-database payloads or file-system bytes.
+    pub fn last_writer_diagnostic(&self) -> Option<String> {
+        let counters = (*self.writer_counters.lock().unwrap())?;
+        Some(format!(
+            "index-writer manifest_rows={} manifest_bind_bytes={} native_rows={} native_bind_bytes={} graph_rows={} graph_bind_bytes={} class_rows={} class_bind_bytes={} total_rows={} total_bind_bytes={} reused_occurrence_reads={}",
+            counters.manifest.rows,
+            counters.manifest.bytes,
+            counters.native.rows,
+            counters.native.bytes,
+            counters.graph.rows,
+            counters.graph.bytes,
+            counters.class.rows,
+            counters.class.bytes,
+            counters.total.rows,
+            counters.total.bytes,
+            counters.reused_occurrence_reads,
+        ))
     }
     pub(crate) fn begin_leader_publication(&self, session: &topology::LeaderSession) -> Result<()> {
         self.verify_leader_session(session)?;
@@ -4428,6 +4499,7 @@ impl Store {
             false,
         )
     }
+    #[allow(dead_code)] // Test seam for the original full-artifact selective rollback matrix.
     pub(crate) fn publish_native_recovery_selective(
         &self,
         graph: &Graph,
@@ -4447,6 +4519,55 @@ impl Store {
             true,
         )
     }
+    pub(crate) fn publish_local_native_recovery(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        prepared: LocalPrepared,
+        leader: &topology::LeaderGuard,
+        expected: RecoveryBaseline,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        ensure!(
+            capture.files == graph.files && expected.pin() == Some(prepared.prior_pin),
+            "revision conflict: changed-only graph or expected head differs"
+        );
+        capture.claim_graph_projection()?;
+        ensure!(
+            capture.graph_projection_count() == 1
+                && capture.source_operations.len() == capture.files.len()
+                && capture
+                    .source_operations
+                    .values()
+                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+            "native_evidence_required: incomplete selected capture"
+        );
+        let mut native = prepared.native.clone();
+        for file in &capture.files {
+            if file.path == prepared.changed_path {
+                continue;
+            }
+            let mut coverage = prepared
+                .prior_coverage
+                .get(&file.path)
+                .context("reused document coverage missing from selected head")?
+                .clone();
+            coverage.revision_id.clone_from(&native.revision.id);
+            native.coverage.push(coverage);
+        }
+        self.publish_inner_checked_target_with_local(
+            (graph, capture, &native),
+            leader,
+            PublicationPlan {
+                expected: ExpectedPublication::Recovery(Box::new(expected)),
+                target: PublicationTarget::Live,
+            },
+            cancel,
+            (256 * 1024 * 1024 + 16 * 1024, Some(&prepared)),
+            |_, _| Ok(()),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)] // The selective proof is internal to this publication seam.
     fn publish_native_expected(
         &self,
@@ -4915,8 +5036,216 @@ impl Store {
         })
     }
 
+    /// Option C: admit a proven single-document body edit without decoding any
+    /// unchanged occurrence or projection row. IDs must come from the selected
+    /// same-generation head, never an orphan or a matching historical version.
+    pub(crate) fn prepare_local_revision(
+        &self,
+        capture: &crate::capture::Capture,
+        expected: &RecoveryBaseline,
+        cancel: &CancelFlag,
+    ) -> Result<Option<LocalPrepared>> {
+        use crate::{indexer::CapturedChange, native_evidence};
+        use sha2::Digest;
+        if !expected.compatible
+            || self.disposition() != RecoveryDisposition::Ready
+            || !expected.pin().is_some_and(|pin| pin.index_revision > 0)
+        {
+            return Ok(None);
+        }
+        self.with_prior_publication_snapshot(|db| {
+            let selected = ReadRevision::current(db)?;
+            ensure!(expected.pin() == Some(selected.pin),
+                "revision conflict: local source snapshot changed");
+            // The selected head is a prior validated publication. Do not decode
+            // its unchanged fact/projection rows; selected reads still attest
+            // them, and the current captured source bytes are checked below.
+            let previous_options: crate::indexer::ReconcileOptions = db.query_row(
+                "SELECT reconcile_options FROM index_metadata WHERE singleton=1", [],
+                |r| r.get::<_, String>(0))?.parse::<serde_json::Value>()
+                    .and_then(serde_json::from_value)?;
+            let mut previous_inputs = BTreeMap::new();
+            for row in db.prepare("SELECT input_key,payload FROM revision_capture_inputs WHERE revision_id=?1 ORDER BY input_key")?
+                .query_map([&selected.key], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            {
+                let (key, payload) = row?;
+                ensure!(previous_inputs.insert(key, serde_json::from_str(&payload)?).is_none(),
+                    "incompatible_index: duplicate prior capture input");
+            }
+            // Presentation labels can alter unchanged graph projections. A
+            // changed SCIP or presentation manifest is not a local publication.
+            let current_inputs: BTreeMap<_, _> = capture.persisted_inputs()?.into_iter().collect();
+            if previous_inputs.iter().filter(|(key, _)| key.starts_with("presentation-"))
+                .ne(current_inputs.iter().filter(|(key, _)| key.starts_with("presentation-")))
+            {
+                return Ok(None);
+            }
+            let mut previous = Vec::new();
+            let mut prior_ids = BTreeMap::new();
+            let mut prior_coverage = BTreeMap::new();
+            let mut prior_extractions = BTreeMap::new();
+            let mut changed_counts = BTreeMap::new();
+            let source_set_id = format!("source-set:v1:{}", self.root_id());
+            let producer_id = crate::native_evidence::PRODUCER;
+            let producer_version = crate::native_evidence::NATIVE_VERSION;
+            let mut statement = db.prepare("SELECT m.path,m.language,v.content_hash,v.byte_length,v.source_bytes,
+                v.extraction_context,v.producer_id,v.producer_version,m.document_version_id,
+                m.graph_projection_id,m.class_projection_id,g.graph_hash,c.content_hash,
+                g.class_extraction_payload,m.coverage_requested,m.coverage_selected,
+                m.coverage_state,m.coverage_diagnostic
+                FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id
+                JOIN graph_projections g ON g.id=m.graph_projection_id
+                LEFT JOIN class_projections c ON c.id=m.class_projection_id
+                WHERE m.revision_id=?1 ORDER BY m.ordinal")?;
+            for row in statement.query_map([&selected.key], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?, r.get::<_, Vec<u8>>(4)?, r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?,
+                    r.get::<_, String>(9)?, r.get::<_, Option<String>>(10)?,
+                    r.get::<_, String>(11)?, r.get::<_, Option<String>>(12)?,
+                    r.get::<_, Option<String>>(13)?, r.get::<_, bool>(14)?,
+                    r.get::<_, bool>(15)?, r.get::<_, String>(16)?,
+                    r.get::<_, Option<String>>(17)?))
+            })? {
+                let (path,language,hash,length,bytes,context,id,version,version_id,
+                    graph_id,class_id,graph_hash,class_hash,extraction,requested,covered,state,diagnostic)=row?;
+                ensure!(length >= 0 && length as usize == bytes.len()
+                    && hash == hex::encode(sha2::Sha256::digest(&bytes)),
+                    "incompatible_index: prior captured source witness mismatch");
+                ensure!(id == producer_id && version == producer_version
+                    && context == crate::native_ids::extraction_context(&language, &[])?
+                    && class_id.is_some() && class_hash.is_some(),
+                    "incompatible_index: prior document producer/context missing");
+                let source = SourceFile {path:path.clone(),language:language.clone(),hash:hash.clone(),text:String::from_utf8(bytes)?};
+                previous.push(source);
+                ensure!(prior_ids.insert(path.clone(), V8DocumentProjection {
+                    version_id, graph_id, class_id:class_id.context("class projection missing")?,
+                    graph_hash,class_hash:class_hash.context("class hash missing")?,
+                }).is_none(),"incompatible_index: duplicate local manifest path");
+                prior_coverage.insert(path.clone(), native_evidence::Coverage {
+                    producer_id:producer_id.to_owned(),language:language.clone(),
+                    source_set_id:source_set_id.clone(),document_path:path.clone(),
+                    revision_id:String::new(),requested,selected:covered,state,diagnostic,
+                    supported_roles:vec!["definition".into(),"call".into()],
+                    observed_roles:vec!["definition".into(),"call".into()],
+                });
+                if let Some(payload) = extraction {
+                    prior_extractions.insert(path.clone(), serde_json::from_str(&payload)?);
+                }
+                changed_counts.insert(path, (0_usize,0_usize,0_usize));
+            }
+            let decision = crate::indexer::measure_persisted_change(
+                &previous, &previous_options, &previous_inputs, capture)?;
+            let path = match decision {
+                CapturedChange::DocumentLocal {path} => path,
+                _ => return Ok(None),
+            };
+            let old_coverage=prior_coverage.get(&path).context("local coverage missing")?;
+            if old_coverage.state != "complete" { return Ok(None); }
+            let changed_file=capture.files.iter().find(|f|f.path==path).context("changed file missing")?;
+            let stored=prior_ids.get(&path).context("prior changed version missing")?;
+            ensure!(previous.iter().find(|f|f.path==path).is_some_and(|f|f.hash != changed_file.hash),
+                "local edit did not change captured content hash");
+            // The new document is extracted and fully checked; prior versions
+            // are linked only by exact captured identity and selected ancestry.
+            for file in &capture.files {
+                if file.path != path {
+                    let old=previous.iter().find(|f|f.path==file.path).context("old manifest path missing")?;
+                    ensure!(old.language==file.language && old.hash==file.hash,
+                        "incompatible_index: unchanged document identity mismatch");
+                }
+            }
+            let measured=native_evidence::measure_captured_document(
+                capture,Path::new(&self.workspace_root),self.root_id(),&path,cancel,|_|{})?;
+            if measured.coverage.state != "complete" { return Ok(None); }
+            let native=native_evidence::validated_changed_artifact(capture,measured,cancel)?;
+            // The prior graph counts are used only for this changed path's
+            // header delta, not to authorize any old semantic fact.
+            let count = |table: &str| -> Result<usize> {
+                Ok(db.query_row(&format!("SELECT count(*) FROM {table} WHERE projection_id=?1"),
+                    [&stored.graph_id],|r|r.get::<_,i64>(0))? as usize)
+            };
+            let old_changed_counts=(count("graph_nodes")?,count("graph_calls")?,count("graph_regions")?);
+            let (stats,diagnostics,warnings,truncated):(String,String,String,bool)=db.query_row(
+                "SELECT m.stats,m.diagnostics,r.class_warnings,r.class_truncated
+                 FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1",
+                [&selected.key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            let _: BTreeMap<_, _> = changed_counts;
+            Ok(Some(LocalPrepared {changed_path:path,native,prior_pin:selected.pin,
+                prior_ids,prior_coverage,prior_extractions,
+                old_stats:serde_json::from_str(&stats)?,old_diagnostics:serde_json::from_str(&diagnostics)?,
+                old_class_warnings:serde_json::from_str(&warnings)?,old_class_truncated:truncated,
+                old_changed_counts}))
+        })
+    }
+
+    /// Finalize a changed-only graph before claiming the capture's sole graph
+    /// projection. A moving class cap or changed per-file F uses the existing
+    /// full-native same-capture fallback instead of reusing an unproved class.
+    pub(crate) fn compose_local_revision(
+        &self,
+        capture: &crate::capture::Capture,
+        prepared: &LocalPrepared,
+        changed: Graph,
+        cancel: &CancelFlag,
+    ) -> Result<Option<Graph>> {
+        ensure!(
+            changed.files.len() == 1 && changed.files[0].path == prepared.changed_path,
+            "selected graph must cover exactly the measured document"
+        );
+        crate::indexer::validate_native_graph_records(&changed, &prepared.native, cancel)?;
+        if matches!(changed.files[0].language.as_str(), "java" | "python") {
+            let extraction = crate::classes::FileExtraction::extract_file(
+                &changed.files[0],
+                &changed.nodes,
+                cancel,
+                crate::classes::Limits::default(),
+            )?;
+            if prepared.prior_extractions.get(&prepared.changed_path) != Some(&extraction) {
+                return Ok(None);
+            }
+        }
+        let mut stats = prepared.old_stats.clone();
+        let (old_nodes, old_calls, old_regions) = prepared.old_changed_counts;
+        stats.symbols = stats
+            .symbols
+            .checked_sub(old_nodes)
+            .and_then(|n| n.checked_add(changed.nodes.len()))
+            .context("incompatible_index: invalid prior symbol summary")?;
+        stats.calls = stats
+            .calls
+            .checked_sub(old_calls)
+            .and_then(|n| n.checked_add(changed.calls.len()))
+            .context("incompatible_index: invalid prior call summary")?;
+        stats.regions = stats
+            .regions
+            .checked_sub(old_regions)
+            .and_then(|n| n.checked_add(changed.regions.len()))
+            .context("incompatible_index: invalid prior region summary")?;
+        stats.unresolved = stats.calls;
+        ensure!(
+            stats.files == capture.files.len()
+                && !prepared
+                    .old_diagnostics
+                    .iter()
+                    .any(|d| d.path.as_deref() == Some(&prepared.changed_path))
+                && changed.diagnostics.is_empty(),
+            "incompatible_index: local graph summary differs from complete coverage"
+        );
+        Ok(Some(Graph {
+            files: capture.files.clone(),
+            nodes: changed.nodes,
+            calls: changed.calls,
+            regions: changed.regions,
+            diagnostics: prepared.old_diagnostics.clone(),
+            stats,
+            ..Graph::default()
+        }))
+    }
+
     /// Produce a selectively assembled native revision only for a proved local edit
     /// (or unchanged captured sources). Other changes use the full native path.
+    #[allow(dead_code)] // Test seam; the production fast path admits changed-only facts.
     pub(crate) fn prepare_local_native(
         &self,
         capture: &crate::capture::Capture,
@@ -5089,6 +5418,121 @@ impl Store {
 
     /// Authenticate candidates in a read snapshot before entering the writer lock.
     /// A missing or corrupt prior witness is never treated as permission to reuse.
+    fn preflight_local_reuse(
+        &self,
+        graph: &Graph,
+        prepared: &LocalPrepared,
+    ) -> Result<PreflightReuse> {
+        self.with_prior_publication_snapshot(|db| {
+            let selected = ReadRevision::current(db)?;
+            ensure!(
+                selected.pin == prepared.prior_pin,
+                "revision conflict: selected local head changed"
+            );
+            let files: BTreeMap<_, _> = graph
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file))
+                .collect();
+            ensure!(
+                files.len() == prepared.prior_ids.len(),
+                "incompatible_index: local manifest inventory changed"
+            );
+            let mut families = BTreeMap::new();
+            let mut existing_ids = BTreeMap::new();
+            let mut count = 0;
+            let mut statement = db.prepare(
+                "SELECT m.path,m.language,m.document_version_id,
+                m.graph_projection_id,m.class_projection_id,v.content_hash,v.extraction_context,
+                v.producer_id,v.producer_version
+                FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id
+                WHERE m.revision_id=?1 ORDER BY m.ordinal",
+            )?;
+            for row in statement.query_map([&selected.key], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            })? {
+                let (
+                    path,
+                    language,
+                    version_id,
+                    graph_id,
+                    class_id,
+                    hash,
+                    context,
+                    producer_id,
+                    producer_version,
+                ) = row?;
+                count += 1;
+                let old = prepared
+                    .prior_ids
+                    .get(&path)
+                    .context("prior selected ID missing")?;
+                ensure!(
+                    old.version_id == version_id
+                        && old.graph_id == graph_id
+                        && Some(old.class_id.as_str()) == class_id.as_deref(),
+                    "incompatible_index: local selected manifest changed"
+                );
+                let file = files.get(path.as_str()).context("local source missing")?;
+                ensure!(
+                    file.language == language
+                        && producer_id == prepared.native.producer.id
+                        && producer_version == prepared.native.producer.version
+                        && context == crate::native_ids::extraction_context(&language, &[])?,
+                    "incompatible_index: local producer or extraction context changed"
+                );
+                if path != prepared.changed_path {
+                    ensure!(
+                        hash == file.hash,
+                        "incompatible_index: reusable captured content hash differs"
+                    );
+                    ensure!(
+                        families
+                            .insert(
+                                path.clone(),
+                                ReusedFamilies {
+                                    native: true,
+                                    graph: true,
+                                    class: true,
+                                }
+                            )
+                            .is_none(),
+                        "incompatible_index: duplicate reused path"
+                    );
+                    existing_ids.insert(
+                        path,
+                        V8DocumentProjection {
+                            version_id,
+                            graph_id,
+                            class_id: old.class_id.clone(),
+                            graph_hash: old.graph_hash.clone(),
+                            class_hash: old.class_hash.clone(),
+                        },
+                    );
+                }
+            }
+            ensure!(
+                count == files.len() && existing_ids.len() + 1 == count,
+                "incompatible_index: local selected head incomplete"
+            );
+            Ok(PreflightReuse {
+                pin: Some(selected.pin),
+                families,
+                existing_ids,
+            })
+        })
+    }
+
     fn preflight_reuse(
         &self,
         graph: &Graph,
@@ -5178,6 +5622,7 @@ impl Store {
             Ok(PreflightReuse {
                 pin: Some(selected.pin),
                 families,
+                existing_ids: BTreeMap::new(),
             })
         })
     }
@@ -5192,6 +5637,29 @@ impl Store {
         plan: PublicationPlan<'_>,
         cancel: &CancelFlag,
         max_graph_json_bytes: usize,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        self.publish_inner_checked_target_with_local(
+            bundle,
+            leader,
+            plan,
+            cancel,
+            (max_graph_json_bytes, None),
+            during_tx,
+        )
+    }
+
+    fn publish_inner_checked_target_with_local(
+        &self,
+        bundle: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+        ),
+        leader: &topology::LeaderGuard,
+        plan: PublicationPlan<'_>,
+        cancel: &CancelFlag,
+        (max_graph_json_bytes, local): (usize, Option<&LocalPrepared>),
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
         let PublicationPlan { expected, target } = plan;
@@ -5205,7 +5673,15 @@ impl Store {
             "unsupported graph schema"
         );
         check_cancel(cancel)?;
-        let stats = validate_graph(graph, cancel)?;
+        let stats = if let Some(prepared) = local {
+            ensure!(
+                prepared.prior_pin == expected.pin().context("local expected pin missing")?,
+                "revision conflict: local prepared pin changed"
+            );
+            graph.stats.clone()
+        } else {
+            validate_graph(graph, cancel)?
+        };
         // Parse cached source before taking the writer lock. Projection and graph
         // still publish in one transaction with the same CAS/cancellation guard.
         let limits = crate::classes::Limits::default();
@@ -5231,31 +5707,42 @@ impl Store {
                     .push(node.clone());
             }
         }
-        let extractions: BTreeMap<String, crate::classes::FileExtraction> = graph
-            .files
-            .iter()
-            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-            .map(|file| {
-                Ok((
-                    file.path.clone(),
-                    crate::classes::FileExtraction::extract_file(
-                        file,
-                        class_symbols
-                            .get(file.path.as_str())
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
-                        cancel,
-                        limits,
-                    )?,
-                ))
-            })
-            .collect::<Result<_>>()?;
-        let classes = crate::classes::Catalog::compose(
-            &extractions.values().cloned().collect::<Vec<_>>(),
-            graph.files.len(),
-            graph.nodes.len(),
-            limits,
-        )?;
+        let extractions: BTreeMap<String, crate::classes::FileExtraction> =
+            if let Some(prepared) = local {
+                ensure!(
+                    prepared.prior_extractions.len() == class_paths.len(),
+                    "incompatible_index: local class extraction inventory incomplete"
+                );
+                prepared.prior_extractions.clone()
+            } else {
+                graph
+                    .files
+                    .iter()
+                    .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+                    .map(|file| {
+                        Ok((
+                            file.path.clone(),
+                            crate::classes::FileExtraction::extract_file(
+                                file,
+                                class_symbols
+                                    .get(file.path.as_str())
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                                cancel,
+                                limits,
+                            )?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?
+            };
+        let classes = Self::compose_selected_class_catalog(graph, &extractions, limits)?;
+        if let Some(prepared) = local {
+            ensure!(
+                classes.warnings == prepared.old_class_warnings
+                    && classes.truncated == prepared.old_class_truncated,
+                "incompatible_index: local class catalog differs from trusted head"
+            );
+        }
         ensure!(
             classes.relations.iter().all(|r| r.target.is_none()
                 && r.candidate_ids.is_empty()
@@ -5289,7 +5776,13 @@ impl Store {
         // values from different connections cannot fence a concurrent SQL rewrite.
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
-        let reuse = if matches!(target, PublicationTarget::Live) {
+        let reuse = if let Some(prepared) = local {
+            ensure!(
+                matches!(target, PublicationTarget::Live),
+                "local evidence cannot use a private stage"
+            );
+            self.preflight_local_reuse(graph, prepared)?
+        } else if matches!(target, PublicationTarget::Live) {
             self.preflight_reuse(graph, native, &extractions, &expected, &rows)?
         } else {
             PreflightReuse::default()
@@ -8110,6 +8603,24 @@ mod rebaseline_fault_tests {
             assert_eq!(measured.reused_occurrence_reads, 0);
             eprintln!("{size} produced facts {counts:?}; writer rows/bytes {measured:?}");
         }
+    }
+
+    #[test]
+    fn local_class_catalog_cap_uses_selected_full_revision_symbol_summary() {
+        let limits = crate::classes::Limits::default();
+        let mut local = Graph::default();
+        // Materialized graph has only one changed document, but the trusted
+        // selected-revision summary is above the unchanged 1M-symbol cap.
+        local.stats.symbols = limits.symbols + 1;
+        let actual =
+            Store::compose_selected_class_catalog(&local, &BTreeMap::new(), limits).unwrap();
+        let full = crate::classes::Catalog::compose(&[], 0, local.stats.symbols, limits).unwrap();
+        let incorrect_changed_only =
+            crate::classes::Catalog::compose(&[], 0, local.nodes.len(), limits).unwrap();
+        assert_eq!(actual.warnings, full.warnings);
+        assert!(actual.truncated && full.truncated);
+        assert_ne!(actual.warnings, incorrect_changed_only.warnings);
+        assert!(!incorrect_changed_only.truncated);
     }
 
     #[test]

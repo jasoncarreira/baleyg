@@ -1314,6 +1314,51 @@ fn index_forwards_pair_and_reports_pair() {
         String::from_utf8_lossy(&result.stderr)
     );
     let published: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let timings = String::from_utf8_lossy(&result.stderr);
+    for phase in [
+        "outside_setup",
+        "capture",
+        "measure",
+        "compose",
+        "attest",
+        "publish",
+        "queue_and_jobs",
+        "outside_status_output",
+    ] {
+        let prefix = format!("index-phase {phase}_ms=");
+        assert!(
+            timings.lines().any(|line| line.starts_with(&prefix)
+                && line[prefix.len()..]
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|ms| ms.parse::<f64>().is_ok_and(|value| value >= 0.0))),
+            "missing release CLI phase {phase}: {timings}"
+        );
+    }
+    let writer = timings
+        .lines()
+        .find(|line| line.starts_with("index-writer "))
+        .expect("release CLI must report the committed writer counters");
+    let values: std::collections::HashMap<_, _> = writer
+        .split_whitespace()
+        .skip(1)
+        .map(|field| {
+            let (name, value) = field.split_once('=').unwrap();
+            (name, value.parse::<u64>().unwrap())
+        })
+        .collect();
+    for suffix in ["rows", "bind_bytes"] {
+        assert_eq!(
+            values[&*format!("total_{suffix}")],
+            ["manifest", "native", "graph", "class"]
+                .iter()
+                .map(|name| values[&*format!("{name}_{suffix}")])
+                .sum::<u64>(),
+            "{suffix}: postcommit family accounting"
+        );
+    }
+    assert_eq!(values["reused_occurrence_reads"], 0);
+    assert!(timings.lines().any(|line| line == "index-mode full"));
     assert_eq!(
         published["status"]["revision"],
         published["publishedRevision"]
