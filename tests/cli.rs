@@ -1802,8 +1802,21 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
         documents.push(serde_json::json!({"sourceSetId":set,"language":language,"path":path,
             "revisionId":revision,"contentHash":hash,"byteLength":length,"bytesHex":hex::encode(bytes)}));
     }
+    let new_binding_count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_producer_bindings WHERE revision_id=?1",
+            [&pin_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        new_binding_count, 1,
+        "each new published revision has an executable binding"
+    );
     let mut all_rows = serde_json::Map::new();
-    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
+    // Generation-specific binding control is checked separately; compare the
+    // actual native/graph/class evidence across independent CLI/daemon roots.
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name!='native_binding_epoch' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
     for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
         let name = name.unwrap();
         let (predicate, alias) = match name.as_str() {

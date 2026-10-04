@@ -2555,6 +2555,90 @@ mod live_tests {
         assert_eq!(question_error(busy.into()).1, "storage_busy");
     }
 
+    #[test]
+    fn preview_fence_failure_restores_evicted_and_same_id_packets() {
+        let revision = IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: 1,
+        };
+        let packet = QuestionPacket {
+            packet_id: "original".into(),
+            revision,
+            request: QuestionRequest {
+                seed: "seed".into(),
+                question: "what?".into(),
+                expected_revision: revision,
+                evidence_depth: 0,
+                max_visible: 1,
+                allow_deeper_display: false,
+                focus_terms: vec![],
+            },
+            context: ViewResult {
+                revision,
+                query: ViewQuery {
+                    seed: "seed".into(),
+                    depth: 0,
+                    max_nodes: 1,
+                    max_calls: 1,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                nodes: vec![],
+                calls: vec![],
+                regions: vec![],
+                truncated: false,
+                omitted_nodes: 0,
+                warnings: vec![],
+            },
+            source_files: vec![],
+            warnings: vec![],
+        };
+        let mut cache = PacketCache::default();
+        for i in 0..MAX_PACKETS {
+            let mut item = packet.clone();
+            item.packet_id = format!("packet-{i}");
+            cache.remember(Arc::new(item), MAX_PACKET_BYTES);
+        }
+        let original: Vec<_> = cache
+            .packets
+            .iter()
+            .map(|(p, bytes)| (p.clone(), *bytes))
+            .collect();
+        let original_bytes = cache.bytes;
+        let mut incoming = packet.clone();
+        incoming.packet_id = "new".into();
+        let failed = cache.remember_fenced(Arc::new(incoming), MAX_PACKET_BYTES, || {
+            anyhow::bail!("index_not_ready: incarnation lost")
+        });
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .starts_with("index_not_ready")
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+        let mut replacement = packet;
+        replacement.packet_id = "packet-3".into();
+        assert!(
+            cache
+                .remember_fenced(Arc::new(replacement), MAX_PACKET_BYTES + 1, || {
+                    anyhow::bail!("root_changed: root replaced")
+                })
+                .is_err()
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+    }
+
     #[tokio::test]
     async fn preview_root_change_after_serialization_discards_packet() {
         let dir = tempfile::tempdir().unwrap();
@@ -3937,10 +4021,48 @@ mod normal_post_capture_cancellation_tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
+        assert!(
+            matches!(tables.len(), 28 | 30),
+            "compare the complete legacy or extended v8 evidence inventory"
+        );
+        let mut expected = vec![
+            "class_projections",
+            "class_relations",
+            "classes",
+            "document_versions",
+            "graph_calls",
+            "graph_nodes",
+            "graph_projections",
+            "graph_regions",
+            "native_producer_inputs",
+            "native_producer_languages",
+            "native_producers",
+            "native_revisions",
+            "native_source_set_dependencies",
+            "native_source_set_languages",
+            "native_source_sets",
+            "native_version_ancestor_signature_types",
+            "native_version_call_regions",
+            "native_version_calls",
+            "native_version_control_regions",
+            "native_version_coverage_roles",
+            "native_version_declaration_ancestors",
+            "native_version_declarations",
+            "native_version_header_items",
+            "native_version_headers",
+            "native_version_own_signature_types",
+            "native_version_parameters",
+            "revision_capture_inputs",
+            "revision_documents",
+        ];
+        if tables.len() == 30 {
+            expected.extend(["native_binding_epoch", "revision_producer_bindings"]);
+            expected.sort_unstable();
+        }
         assert_eq!(
-            tables.len(),
-            28,
-            "compare the complete v8 evidence inventory"
+            tables.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected,
+            "exact v8 table names: complete legacy 28 or paired producer-binding 30"
         );
         for required in [
             "document_versions",

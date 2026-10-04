@@ -398,19 +398,56 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
         .take_while(|(x, y)| x == y)
         .count();
     let (a_end, b_end) = (a.len() - suffix, b.len() - suffix);
-    // An insertion/deletion, or a boundary-crossing token edit, is not proved local.
-    if prefix == a_end || prefix == b_end {
-        return false;
-    }
+    // One side can be empty for a length-changing edit at the end of a
+    // literal/comment. Anchor that side to its preceding byte; the unchanged
+    // whole-tree shape and exact bytes outside both leaves still fence it.
     fn changed_leaf<'a>(root: Node<'a>, start: usize, end: usize) -> Option<Node<'a>> {
-        let mut node = root.descendant_for_byte_range(start, end)?;
-        while node.child_count() > 0 {
-            let child = (0..node.child_count())
-                .filter_map(|i| node.child(i))
-                .find(|n| n.start_byte() <= start && n.end_byte() >= end)?;
-            node = child;
+        // A zero-width side of a length-changing edit can lie at either leaf
+        // edge. Inserting `1` before `70000` leaves the old-side edit at the
+        // start of the numeric token, where probing only the prior byte sees
+        // whitespace, not the measured literal. Check both adjacent leaves;
+        // the matched kind, return-body ancestry, identical complete tree
+        // shape and unchanged bytes outside the leaf are proved below.
+        let probes = if start == end {
+            [
+                start.checked_sub(1).map(|previous| (previous, start)),
+                (start < root.end_byte()).then_some((start, start + 1)),
+            ]
+        } else {
+            [Some((start, end)), None]
+        };
+        for (probe_start, probe_end) in probes.into_iter().flatten() {
+            let Some(mut node) = root.descendant_for_byte_range(probe_start, probe_end) else {
+                continue;
+            };
+            while node.child_count() > 0 {
+                let Some(child) = (0..node.child_count())
+                    .filter_map(|i| node.child(i))
+                    .find(|n| n.start_byte() <= probe_start && n.end_byte() >= probe_end)
+                else {
+                    break;
+                };
+                node = child;
+            }
+            if node.is_named()
+                && matches!(
+                    node.kind(),
+                    "comment"
+                        | "number"
+                        | "integer"
+                        | "integer_literal"
+                        | "decimal_integer_literal"
+                        | "string"
+                        | "string_literal"
+                        | "string_fragment"
+                        | "raw_string_literal"
+                        | "identifier"
+                )
+            {
+                return Some(node);
+            }
         }
-        (node.start_byte() <= start && node.end_byte() >= end).then_some(node)
+        None
     }
     let Some(left) = changed_leaf(before.root_node(), prefix, a_end) else {
         return false;
@@ -433,22 +470,95 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
             | "string_fragment"
             | "raw_string_literal"
     );
-    if !comment && !literal {
+    // Returned identifiers are safe only when both names have a preceding
+    // syntactic local binding in this function. An imported/global name could
+    // change cross-file reference evidence even with the same tree shape.
+    fn local_binding(node: Node<'_>, source: &[u8]) -> bool {
+        if node.kind() != "identifier" {
+            return false;
+        }
+        let name = &source[node.byte_range()];
+        let mut parent = node.parent();
+        let function = loop {
+            let Some(current) = parent else {
+                return false;
+            };
+            if matches!(
+                current.kind(),
+                "function_declaration"
+                    | "function_definition"
+                    | "function_item"
+                    | "method_declaration"
+            ) {
+                break current;
+            }
+            parent = current.parent();
+        };
+        let Some(body) = function.child_by_field_name("body") else {
+            return false;
+        };
+        fn has_binding(root: Node<'_>, name: &[u8], before: usize, source: &[u8]) -> bool {
+            if root.start_byte() >= before {
+                return false;
+            }
+            let field = match root.kind() {
+                "variable_declarator" => "name",
+                "let_declaration" => "pattern",
+                "assignment" => "left",
+                _ => "",
+            };
+            if !field.is_empty()
+                && root.child_by_field_name(field).is_some_and(|bound| {
+                    bound.kind() == "identifier" && &source[bound.byte_range()] == name
+                })
+            {
+                return true;
+            }
+            (0..root.child_count())
+                .filter_map(|i| root.child(i))
+                .any(|child| has_binding(child, name, before, source))
+        }
+        has_binding(body, name, node.start_byte(), source)
+    }
+    let returned_identifier =
+        left.kind() == "identifier" && local_binding(left, a) && local_binding(right, b);
+    if !comment && !literal && !returned_identifier {
         return false;
     }
-    fn safe_ancestry(mut node: Node<'_>, comment: bool) -> bool {
+    fn safe_ancestry(mut node: Node<'_>, comment: bool, language: &str) -> bool {
         let mut body = false;
         let mut function = false;
         let mut returned = false;
         while let Some(parent) = node.parent() {
             let kind = parent.kind();
+            // Rust's final bare expression is a returned value, but only when
+            // the edited leaf itself is the last named child of this exact
+            // function body's block. Headers, calls and nested expressions do
+            // not gain a new proof from this rule.
+            if language == "rust" && kind == "block" && parent.named_child_count() > 0 {
+                returned |= parent
+                    .named_child(parent.named_child_count() - 1)
+                    .is_some_and(|last| last.id() == node.id())
+                    && parent.parent().is_some_and(|owner| {
+                        owner.kind() == "function_item"
+                            && owner
+                                .child_by_field_name("body")
+                                .is_some_and(|body| body.id() == parent.id())
+                    });
+            }
             if kind.contains("import")
-                || kind.contains("export")
-                || (kind.contains("class") && !matches!(kind, "class_body" | "class_declaration"))
+                || (kind.contains("export")
+                    && !(kind == "export_statement" && body && function && (comment || returned)))
+                || (kind.contains("class")
+                    && !matches!(
+                        kind,
+                        "class_body" | "class_declaration" | "class_definition"
+                    ))
                 || kind.contains("super")
                 || kind.contains("call")
                 || kind.contains("invocation")
                 || (kind.contains("declaration")
+                    && !matches!(kind, "class_declaration")
                     && !kind.contains("function")
                     && !kind.contains("method"))
                 || kind.contains("parameter")
@@ -467,7 +577,8 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
         }
         body && function && (comment || returned)
     }
-    if !safe_ancestry(left, comment) || !safe_ancestry(right, comment) {
+    if !safe_ancestry(left, comment, &old.language) || !safe_ancestry(right, comment, &new.language)
+    {
         return false;
     }
     // Identical tree shape is necessary, not sufficient: the exact bytes outside the
@@ -1193,6 +1304,276 @@ pub(crate) fn native_js_kind(n: Node<'_>) -> Option<&'static str> {
         "formal_parameter" => "parameter",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod local_classification_tests {
+    use super::proved_body_only;
+    use crate::model::SourceFile;
+
+    fn file(language: &str, text: &str) -> SourceFile {
+        SourceFile {
+            path: format!("selected.{language}"),
+            language: language.into(),
+            hash: String::new(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn length_changing_method_and_function_bodies_are_local_only_with_identical_surface() {
+        for (language, before, after) in [
+            (
+                "javascript",
+                "function work() { return 1; }",
+                "function work() { return 10000; }",
+            ),
+            (
+                "java",
+                "class A { int work() { return 1; } }",
+                "class A { int work() { return 10000; } }",
+            ),
+            (
+                "java",
+                "public class Cmedium0000 { public static int f0(){return 70000;} }",
+                "public class Cmedium0000 { public static int f0(){return 170000;} }",
+            ),
+            (
+                "javascript",
+                "export function f0(){return 7000;}",
+                "export function f0(){return 17000;}",
+            ),
+            ("rust", "pub fn f0()->i32{100}", "pub fn f0()->i32{1100}"),
+            (
+                "python",
+                "def work():\n    return 1\n",
+                "def work():\n    return 10000\n",
+            ),
+            (
+                "rust",
+                "fn work() -> u64 { return 1; }",
+                "fn work() -> u64 { return 10000; }",
+            ),
+        ] {
+            assert!(
+                proved_body_only(&file(language, before), &file(language, after)),
+                "{language}: a single longer literal in the body is local"
+            );
+            assert!(
+                proved_body_only(&file(language, after), &file(language, before)),
+                "{language}: a single shorter literal in the body is local"
+            );
+        }
+    }
+
+    #[test]
+    fn exported_function_and_rust_tail_changes_still_reject_headers_imports_and_calls() {
+        for (language, before, after) in [
+            (
+                "javascript",
+                "export function f0(){return 7000;}",
+                "export function renamed(){return 7000;}",
+            ),
+            (
+                "javascript",
+                "export function f0(){return old();}",
+                "export function f0(){return other();}",
+            ),
+            (
+                "javascript",
+                "export function f0(){return 7000;}",
+                "import {f0} from './peer.js'; export function f0(){return 7000;}",
+            ),
+            (
+                "rust",
+                "pub fn f0()->i32{100}",
+                "pub fn renamed()->i32{100}",
+            ),
+            ("rust", "pub fn f0()->i32{100}", "pub fn f0()->i64{100}"),
+            (
+                "rust",
+                "pub fn f0()->i32{old()}",
+                "pub fn f0()->i32{other()}",
+            ),
+        ] {
+            assert!(
+                !proved_body_only(&file(language, before), &file(language, after)),
+                "{language}: unproved exported/tail surface must take FULL"
+            );
+        }
+    }
+
+    #[test]
+    fn noncallee_return_identifiers_change_only_the_measured_document() {
+        for (language, before, after) in [
+            (
+                "javascript",
+                "function f() { let local=1, other=2; return local+1; }",
+                "function f() { let local=1, other=2; return other+1; }",
+            ),
+            (
+                "java",
+                "class A { int f() { int local=1, other=2; return local+1; } }",
+                "class A { int f() { int local=1, other=2; return other+1; } }",
+            ),
+            (
+                "python",
+                "def f():\n    local=1; other=2\n    return local+1\n",
+                "def f():\n    local=1; other=2\n    return other+1\n",
+            ),
+            (
+                "rust",
+                "fn f()->i32 { let local=1; let other=2; return local+1; }",
+                "fn f()->i32 { let local=1; let other=2; return other+1; }",
+            ),
+        ] {
+            assert!(
+                proved_body_only(&file(language, before), &file(language, after)),
+                "{language}: returned non-callee identifier is document local"
+            );
+        }
+        assert!(
+            !proved_body_only(
+                &file(
+                    "python",
+                    "from a import peer\nfrom b import other\ndef f():\n    return peer\n"
+                ),
+                &file(
+                    "python",
+                    "from a import peer\nfrom b import other\ndef f():\n    return other\n"
+                )
+            ),
+            "imported/global return references need FULL fallback"
+        );
+        assert!(
+            !proved_body_only(
+                &file("javascript", "function f() { return caller(); }"),
+                &file("javascript", "function f() { return other(); }")
+            ),
+            "callee edits remain FULL fallback even with identical AST shape"
+        );
+    }
+
+    #[test]
+    fn declaration_and_cross_file_edges_never_gain_local_permission() {
+        for (language, before, after) in [
+            (
+                "javascript",
+                "function work(a) { return 1; }",
+                "function work(abc) { return 1; }",
+            ),
+            (
+                "java",
+                "class A extends B { int work() { return 1; } }",
+                "class A extends XYZ { int work() { return 1; } }",
+            ),
+            (
+                "python",
+                "from a import T\ndef work():\n    return 1\n",
+                "from b import T\ndef work():\n    return 1\n",
+            ),
+            (
+                "rust",
+                "fn work() -> u64 { return 1; }",
+                "fn work() -> i64 { return 1; }",
+            ),
+            (
+                "javascript",
+                "function work() { return 1; }",
+                "function work() { return called(); }",
+            ),
+        ] {
+            assert!(
+                !proved_body_only(&file(language, before), &file(language, after)),
+                "{language}: declaration, dependency or tree-shape changes need FULL"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "AST-only frozen 40-path preflight; never count as benchmark evidence"]
+    fn frozen_medium_large_mixed_edits_have_proved_local_ast_body_shape() {
+        use sha2::{Digest, Sha256};
+        use std::{fs, process::Command};
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = temp.path().join("frozen");
+        let generated = Command::new("node")
+            .arg("tools/synthetic-cohorts/generate.mjs")
+            .arg("--out")
+            .arg(&corpus)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "pinned generator: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
+            ),
+            "8b8deea8592cfd069a1500bcad9d634a8b4d343477e769b2f2aed0dd61bee046"
+        );
+        let mut paths = 0;
+        for size in ["medium", "large"] {
+            for ordinal in 0..5 {
+                for (language, extension) in [
+                    ("java", "java"),
+                    ("python", "py"),
+                    ("javascript", "js"),
+                    ("rust", "rs"),
+                ] {
+                    let path = if language == "rust" {
+                        corpus.join(format!("{size}/rust/g00/C{size}{ordinal:04}.{extension}"))
+                    } else {
+                        corpus.join(format!("{size}/{language}/C{size}{ordinal:04}.{extension}"))
+                    };
+                    let before = fs::read_to_string(&path).unwrap();
+                    let after = if ordinal >= 3 {
+                        let peer = if matches!(language, "java" | "javascript") {
+                            "peerValue"
+                        } else {
+                            "peer_value"
+                        };
+                        let marker = format!("return local+{peer}");
+                        assert!(before.contains(&marker), "{path:?}");
+                        before.replacen(&marker, &format!("return {peer}+{peer}"), 1)
+                    } else {
+                        let marker = match language {
+                            "java" => "public static int f0(){return ",
+                            "python" => "def f0(): return ",
+                            "javascript" => "export function f0(){return ",
+                            "rust" => "pub fn f0()->i32{",
+                            _ => unreachable!(),
+                        };
+                        let begin = before.find(marker).unwrap() + marker.len();
+                        let end = begin
+                            + before[begin..]
+                                .bytes()
+                                .take_while(u8::is_ascii_digit)
+                                .count();
+                        let old = &before[begin..end];
+                        let value = old.parse::<u64>().unwrap()
+                            + if ordinal == 1 {
+                                1
+                            } else {
+                                10_u64.pow(old.len() as u32)
+                            };
+                        format!("{}{}{}", &before[..begin], value, &before[end..])
+                    };
+                    assert_ne!(before, after, "{path:?}: real changed body");
+                    assert!(
+                        proved_body_only(&file(language, &before), &file(language, &after)),
+                        "{path:?}: frozen mixed edit AST must be locally proved"
+                    );
+                    paths += 1;
+                }
+            }
+        }
+        assert_eq!(paths, 40);
+    }
 }
 
 #[cfg(test)]

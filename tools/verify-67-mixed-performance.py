@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Reproduce #67 native local-update measurements on mac-mini-m5-pro-v1.
+"""Supplemental #67 mixed-body local-update measurements on mac-mini-m5-pro-v1.
 
 Runs the real release CLI. Every timed publication is checked against its own
 persisted revision manifest before any percentile is computed.
 """
+import argparse
 import hashlib
 import json
 import math
@@ -91,13 +92,13 @@ def check_selected_local_ids(db, prior, current, changed_path, size, n):
         sum(a.document_version_id=b.document_version_id),
         sum(a.graph_projection_id=b.graph_projection_id),
         sum(a.class_projection_id IS b.class_projection_id),
-        sum(CASE WHEN a.path=?3 AND a.language='python' THEN 1 ELSE 0 END),
-        sum(CASE WHEN a.path=?3 AND a.language='python'
+        sum(CASE WHEN a.path=?3 THEN 1 ELSE 0 END),
+        sum(CASE WHEN a.path=?3
             AND a.document_version_id!=b.document_version_id
             AND a.graph_projection_id!=b.graph_projection_id
             AND a.class_projection_id IS NOT b.class_projection_id
             THEN 1 ELSE 0 END),
-        sum(CASE WHEN NOT (a.path=?3 AND a.language='python')
+        sum(CASE WHEN a.path!=?3
             AND (a.document_version_id!=b.document_version_id
                  OR a.graph_projection_id!=b.graph_projection_id
                  OR a.class_projection_id IS NOT b.class_projection_id)
@@ -153,18 +154,38 @@ def index(binary, root, home, size):
                      "reused_occurrence_reads": values["reused_occurrence_reads"]}
 
 
-def edit_leaf(path):
+def edit_leaf(path, language, kind):
+    """One proven method/function-body edit, never a declaration or import.
+
+    Every timed revision has its own changed path and full produced-fact checks.
+    A returned identifier is accepted only when both names are local bindings.
+    """
     raw = path.read_bytes()
-    marker = b"def f0(): return "
-    require(raw.count(marker) == 1, f"leaf not unique: {path}")
-    start = raw.index(marker) + len(marker)
-    end = raw.index(b"\n", start)
-    old = raw[start:end]
-    require(old.isdigit(), "leaf is not a numeric body literal")
-    replacement = str(int(old) + 1).encode()
-    require(len(old) == len(replacement) and old != replacement,
-            f"edit must be a non-no-op fixed-width numeric body edit: {path}")
-    path.write_bytes(raw[:start] + replacement + raw[end:])
+    if kind == "identifier":
+        peer = b"peerValue" if language in ("java", "javascript") else b"peer_value"
+        marker = b"return local+" + peer
+        require(marker in raw, f"non-numeric local return absent: {path}")
+        first = raw.index(marker) + len(b"return ")
+        old, replacement = b"local", peer
+    else:
+        patterns = {
+            "python": rb"def f0\(\): return (?P<value>\d+)",
+            "java": rb"public static int f0\(\)\{return (?P<value>\d+)",
+            "javascript": rb"export function f0\(\)\{return (?P<value>\d+)",
+            "rust": rb"pub fn f0\(\)->i32\{(?P<value>\d+)",
+        }
+        matches = list(re.finditer(patterns[language], raw))
+        require(len(matches) == 1, f"one declared numeric body return required: {path}")
+        match = matches[0]
+        first = match.start("value")
+        old = match.group("value")
+        replacement = str(int(old) + (10 ** len(old) if kind == "grow" else 1)).encode()
+        require(kind in ("grow", "fixed") and old != replacement,
+                f"numeric body edit must not be a no-op: {path}")
+        require((len(replacement) > len(old)) == (kind == "grow"),
+                f"grow/fixed body length contract failed: {path}")
+    require(raw[first:first+len(old)] == old, f"body edit boundary moved: {path}")
+    path.write_bytes(raw[:first] + replacement + raw[first+len(old):])
     return old.decode(), replacement.decode()
 
 
@@ -198,6 +219,9 @@ def parity_digest(db, revision):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Additional mixed AC8 evidence; run each size separately under the verifier timeout")
+    parser.add_argument("--size", choices=("medium", "large"), required=True)
+    selected_size = parser.parse_args().size
     signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(RuntimeError("reference 1750-second hard deadline")))
     signal.alarm(1750)
     require(platform.system() == "Darwin", "AC8 must run on actual Mac mini M5 Pro")
@@ -215,21 +239,30 @@ def main():
                 "generator output does not exactly match pinned manifest bytes/hashes")
         print(f"canonical manifest sha256={hashlib.sha256(pinned).hexdigest()}; host={model}", flush=True)
         measurements = {}
-        for size in ("medium", "large"):
+        for size in (selected_size,):
             workspace = scratch / f"{size}-workspace"
             home = scratch / f"{size}-private-home"
             home.mkdir(mode=0o700)
             shutil.copytree(corpus / size, workspace)
             setup_seconds, initial = index(BINARY, workspace, home, size)
             require(initial["mode"] == "full", f"{size}: cold setup must fully measure the pinned corpus")
+            print(json.dumps({"size": size, "phase": "initial_cold", "seconds": round(setup_seconds, 4),
+                              "index_phases_ms": initial["phases_ms"]}), flush=True)
             samples = []
             edited_paths = set()
-            for n in range(20):  # independent canonical single-document revisions
-                leaf = workspace / "python" / f"C{size}{n:04d}.py"
+            for n in range(20):  # independent, mixed-language single-document revisions
+                language = ("java", "python", "javascript", "rust")[n % 4]
+                suffix = {"java": "java", "python": "py", "javascript": "js", "rust": "rs"}[language]
+                leaf_ordinal = n // 4
+                relative = Path(language) / f"C{size}{leaf_ordinal:04d}.{suffix}"
+                if language == "rust":
+                    relative = Path("rust/g00") / relative.name
+                leaf = workspace / relative
                 changed_path = leaf.relative_to(workspace).as_posix()
                 require(changed_path not in edited_paths, f"{size}: duplicate edited leaf {changed_path}")
                 edited_paths.add(changed_path)
-                before_literal, after_literal = edit_leaf(leaf)
+                kind = ("grow", "fixed", "grow", "identifier", "identifier")[leaf_ordinal]
+                before_literal, after_literal = edit_leaf(leaf, language, kind)
                 seconds, own = index(BINARY, workspace, home, size)
                 require(own["mode"] == "local", f"{size} run {n}: not a proven-local publication")
                 if size == "large":
@@ -272,46 +305,40 @@ def main():
                                   "local_p95_seconds": p95, "local_threshold_seconds": 2 if size == "medium" else 5}
             require(p95 <= measurements[size]["local_threshold_seconds"],
                     f"{size} local p95 {p95}s exceeds {measurements[size]['local_threshold_seconds']}s; owner decision required")
-        # Declaration-surface update MUST take captured FULL-native fallback.
-        size = "medium"
-        workspace = scratch / "medium-workspace"
-        leaf = workspace / "python/Cmedium0000.py"
-        raw = leaf.read_bytes()
-        require(b"def f0(): return 2" in raw, "missing measured local head")
-        leaf.write_bytes(raw.replace(b"def f0(): return 2", b"def f0(revision=0): return 2", 1))
-        home = scratch / "medium-private-home"
-        fallback_seconds, fallback = index(BINARY, workspace, home, size)
-        require(fallback["mode"] == "full", "declaration-surface edit did not take FULL-native fallback")
-        # Independent isolated index state, but the SAME workspace root: native
-        # IDs bind the authenticated root identity and cannot be compared across roots.
-        cold_workspace = workspace
-        cold_home = scratch / "fallback-independent-home"
-        cold_home.mkdir(mode=0o700)
-        cold_seconds, cold = index(BINARY, cold_workspace, cold_home, size)
-        require(cold["mode"] == "full", "independent cold oracle did not measure full native")
-        warm_db = sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)
-        cold_db = sqlite3.connect(f"file:{db_for(cold_home)}?mode=ro", uri=True)
-        try:
-            warm_digest = parity_digest(warm_db, fallback["revision"])
-            cold_digest = parity_digest(cold_db, cold["revision"])
-        finally:
-            warm_db.close()
-            cold_db.close()
-        require(warm_digest == cold_digest, "declaration-surface FULL fallback parity failed against independent cold snapshot; owner decision required: " +
-                json.dumps({key: [warm_digest[key], cold_digest[key]] for key in warm_digest if warm_digest[key] != cold_digest[key]}))
+            # Independent FULL/cold publication of the exact final mixed
+            # revision, using the same workspace root but isolated index state.
+            # This is not an extra timed LOCAL sample and cannot hide misses.
+            independent = scratch / f"{size}-mixed-independent-home"
+            independent.mkdir(mode=0o700)
+            cold_seconds, cold = index(BINARY, workspace, independent, size)
+            require(cold["mode"] == "full", f"{size}: independent same-root oracle must be FULL")
+            print(json.dumps({"size": size, "phase": "independent_cold", "seconds": round(cold_seconds, 4),
+                              "index_phases_ms": cold["phases_ms"]}), flush=True)
+            warm_db = sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)
+            cold_db = sqlite3.connect(f"file:{db_for(independent)}?mode=ro", uri=True)
+            try:
+                warm_digest = parity_digest(warm_db, samples[-1]["revision"])
+                cold_digest = parity_digest(cold_db, cold["revision"])
+            finally:
+                warm_db.close()
+                cold_db.close()
+            require(warm_digest == cold_digest,
+                    f"{size}: final mixed LOCAL graph/native/class F differs from independent cold oracle: " +
+                    json.dumps({key: [warm_digest[key], cold_digest[key]]
+                                for key in warm_digest if warm_digest[key] != cold_digest[key]}))
+            measurements[size]["independent_cold_seconds"] = round(cold_seconds, 4)
+            measurements[size]["independent_cold"] = cold
+            measurements[size]["row_digest_parity"] = warm_digest
         report = {"host": model, "chip": "Apple M5 Pro", "manifest_sha256": hashlib.sha256(pinned).hexdigest(),
-                  "method": "release native CLI, exact pinned cold setup then twenty sequential same-width edits to distinct canonical Python leaves per size, monotonic subprocess wall time including capture/native/class/commit and CLI completion; p95 nearest-rank; isolated HOME/XDG and scratch outside checkout",
-                  "measurements": measurements,
-                  "surface_fallback": {"seconds": round(fallback_seconds, 4), **fallback,
-                                       "independent_cold_seconds": round(cold_seconds, 4),
-                                       "independent_cold": cold, "row_digest_parity": warm_digest},
-                  "writer_note": "Postcommit per-family writer row and SQLite-bound byte counters, plus zero reused occurrence reads; these are not dbstat payload or file-system byte growth"}
-        print("REFERENCE_67_RESULT=" + json.dumps(report, sort_keys=True), flush=True)
+                  "method": "ADDITIVE mixed-body cohort only: frozen canonical corpus and floors, 20 distinct local edits per size (5 Java, 5 Python, 5 JS, 5 Rust; 8 length-changing and 8 nonnumeric per size), full CLI wall time, nearest-rank p95, independent cold FULL parity at final selected mixed revision, no excluded failures; original frozen 20+20 Python method remains in verify-67-performance.py",
+                  "size": selected_size, "measurements": measurements,
+                  "writer_note": "postcommit per-family row and SQLite-bound byte counters and zero reused occurrence reads; no dbstat payload or file-system growth"}
+        print("REFERENCE_67_MIXED_RESULT=" + json.dumps(report, sort_keys=True), flush=True)
 
 
 if __name__ == "__main__":
     try:
         main()
     except (RuntimeError, subprocess.TimeoutExpired, sqlite3.Error) as exc:
-        print(f"reference-performance gate FAILED: {exc}", file=sys.stderr, flush=True)
+        print(f"mixed reference-performance gate FAILED: {exc}", file=sys.stderr, flush=True)
         sys.exit(1)

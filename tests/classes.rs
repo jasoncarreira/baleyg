@@ -1069,3 +1069,46 @@ fn tiny_limits_control_measured_names_import_bindings_and_type_parameter_details
     assert!(clipped.items.iter().any(|item| matches!(&item.value,
         DetailValue::Relation(relation) if relation.kind == "field")));
 }
+
+#[test]
+fn decision_0004_per_file_f_is_independent_of_other_workspace_documents() {
+    use baleyg::classes::{FileExtraction, Limits};
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path().join("A.java");
+    let b = temp.path().join("B.java");
+    let stable = "class A { int f() { return 1; } }\n";
+    fs::write(&a, stable).unwrap();
+    fs::write(&b, "class B { int x() { return 1; } }\n").unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(temp.path().into());
+    let selected_f = |graph: &Graph| {
+        let file = graph
+            .files
+            .iter()
+            .find(|file| file.path == "A.java")
+            .unwrap();
+        let symbols: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.path == "A.java")
+            .cloned()
+            .collect();
+        FileExtraction::extract_file(file, &symbols, &cancel, Limits::default()).unwrap()
+    };
+    let before = index_workspace(&options, &cancel, |_| {}).unwrap();
+    let f_before = selected_f(&before);
+    fs::write(&b, "class B { int totallyDifferent() { return 78901; } }\n").unwrap();
+    let after_unrelated_edit = index_workspace(&options, &cancel, |_| {}).unwrap();
+    assert_eq!(
+        selected_f(&after_unrelated_edit),
+        f_before,
+        "Decision 0004 F must not depend on unrelated workspace bytes or classes"
+    );
+    fs::write(&a, "class A { int f() { return 12345; } }\n").unwrap();
+    let after_own_edit = index_workspace(&options, &cancel, |_| {}).unwrap();
+    assert_ne!(
+        selected_f(&after_own_edit),
+        f_before,
+        "F still authenticates its own source and class/method ranges"
+    );
+}

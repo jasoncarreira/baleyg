@@ -298,6 +298,128 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
     }
 }
 #[test]
+fn selected_class_pages_and_diagrams_refuse_fk_valid_f_and_class_forgeries() {
+    for (family, mutation) in [
+        (
+            "F",
+            "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java' LIMIT 1)",
+        ),
+        (
+            "class",
+            "UPDATE classes SET payload=json_set(payload,'$.qualifiedName','forged') WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='Types.java' LIMIT 1) AND id=(SELECT id FROM classes WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='Types.java' LIMIT 1) LIMIT 1)",
+        ),
+    ] {
+        let (dir, store, graph, _app, _session) = setup();
+        let pin = store.status().unwrap().revision;
+        let page = store
+            .classes_at(Some("Types.java"), "", Some(pin), 0, 10)
+            .unwrap();
+        assert!(page.items.len() >= 4);
+        let diagram = request(id(&graph, "A"), &store);
+        assert!(store.class_diagram_at(&diagram).is_ok());
+        let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+        assert_eq!(
+            db.execute(mutation, []).unwrap(),
+            1,
+            "{family}: mutate one real selected row"
+        );
+        drop(db);
+        for error in [
+            store
+                .classes_at(Some("Types.java"), "", Some(pin), 0, 10)
+                .map(|_| ())
+                .unwrap_err(),
+            store.class_diagram_at(&diagram).map(|_| ()).unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("incompatible_index"),
+                "{family}: {error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_class_pagination_spans_paths_in_one_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    for n in 0..12 {
+        std::fs::write(
+            workspace.join(format!("C{n:02}.java")),
+            format!("class C{n:02} {{ int run() {{ return {n}; }} }}\n"),
+        )
+        .unwrap();
+    }
+    let options = IndexOptions::new(workspace.clone());
+    let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
+    let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    let session = store.leader_session().unwrap();
+    let pin = publish_bundle(
+        &store,
+        &graph,
+        &workspace,
+        session.leader_guard().unwrap(),
+        store.index_baseline().unwrap(),
+        &cancel(),
+    )
+    .unwrap();
+    let first = store.classes_at(None, "", Some(pin), 0, 10).unwrap();
+    assert_eq!(first.items.len(), 10);
+    assert_eq!(first.next_offset, Some(10));
+    let second = store.classes_at(None, "", Some(pin), 10, 10).unwrap();
+    assert_eq!(second.items.len(), 2);
+    assert_eq!(second.next_offset, None);
+    let diagram = request(id(&graph, "C11"), &store);
+    assert!(store.class_diagram_at(&diagram).is_ok());
+}
+
+/// Run explicitly in release mode on the reference host. The regular test
+/// suite retains fast selected-path correctness coverage above.
+#[test]
+#[ignore = "release medium cohort: cargo test --release --test class_diagram_http selected_class_pages_medium_release_latency -- --ignored"]
+fn selected_class_pages_medium_release_latency() {
+    use baleyg::index_coordinator::IndexJobCoordinator;
+    let scratch = tempfile::tempdir().unwrap();
+    let canonical = scratch.path().join("canonical");
+    let generated = std::process::Command::new("node")
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tools/synthetic-cohorts/generate.mjs"),
+        )
+        .arg("--out")
+        .arg(&canonical)
+        .status()
+        .unwrap();
+    assert!(generated.success());
+    assert_eq!(
+        std::fs::read(canonical.join("manifest.json")).unwrap(),
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tools/synthetic-cohorts/manifest-v1.json")
+        )
+        .unwrap()
+    );
+    let workspace = canonical.join("medium");
+    let store = crate::common::open_store(&scratch.path().join("state"), &workspace).unwrap();
+    let options = IndexOptions::new(workspace);
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let _session = job.session();
+    let pin = job.run(&options, &cancel(), |_| {}).unwrap();
+    for (limit, upper_bound) in [(1, 5.0), (10, 10.0)] {
+        let start = std::time::Instant::now();
+        let page = store.classes_at(None, "", Some(pin), 0, limit).unwrap();
+        let seconds = start.elapsed().as_secs_f64();
+        assert_eq!(page.items.len(), limit);
+        eprintln!("selected medium class page limit={limit} seconds={seconds:.4}");
+        assert!(
+            seconds <= upper_bound,
+            "selected medium class page must not attest/reparse each full workspace"
+        );
+    }
+}
+
+#[test]
 fn projection_bounds_preserve_expansion_roots_edges_and_cycles() {
     let mut source = String::from("class Seed { Missing missing;\n");
     for i in 0..40 {

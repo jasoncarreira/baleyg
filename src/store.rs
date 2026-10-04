@@ -318,6 +318,12 @@ CREATE TABLE native_version_control_regions(version_id TEXT NOT NULL,id TEXT NOT
 CREATE INDEX native_version_regions_owner ON native_version_control_regions(version_id,owner_syntax_id,ordinal);
 CREATE TABLE native_version_call_regions(version_id TEXT NOT NULL,call_id TEXT NOT NULL,region_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(version_id,call_id,ordinal),UNIQUE(version_id,call_id,region_id),FOREIGN KEY(version_id,call_id) REFERENCES native_version_calls(version_id,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(version_id,region_id) REFERENCES native_version_control_regions(version_id,id) DEFERRABLE INITIALLY DEFERRED);
 "#;
+// Additive schema8 extension. An existing v8 cache keeps every row, generation,
+// pin, and queue; the first new publication installs these two tables atomically.
+const PRODUCER_BINDING_SCHEMA_V8: &str = r#"
+CREATE TABLE native_binding_epoch(singleton INTEGER PRIMARY KEY CHECK(singleton=1),index_generation TEXT NOT NULL,first_revision INTEGER NOT NULL CHECK(first_revision BETWEEN 1 AND 9007199254740991));
+CREATE TABLE revision_producer_bindings(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,producer_sha TEXT NOT NULL CHECK(length(producer_sha)=64),binding_sha TEXT NOT NULL CHECK(length(binding_sha)=64));
+"#;
 /// A normal connection keeps the verified index use lock until SQLite closes.
 struct IndexConnection {
     db: Connection,
@@ -646,11 +652,22 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         "incompatible_index: unknown schema version"
     );
     expected.execute_batch(CACHE_SCHEMA_V8)?;
+    let actual = objects(db)?;
+    if actual == objects(&expected)? {
+        return Ok(());
+    }
+    expected.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
     control_ensure!(
-        objects(db)? == objects(&expected)?,
+        actual == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
     );
     Ok(())
+}
+fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_binding_epoch')",
+        [], |r| r.get(0),
+    )?)
 }
 fn open_index_marker_probe(path: &Path, writable: bool) -> Result<Connection> {
     use rusqlite::OpenFlags;
@@ -1152,6 +1169,33 @@ struct PublicationRows<'a> {
     native_declarations: Vec<&'a crate::native_evidence::Declaration>,
     native_calls: Vec<&'a crate::native_evidence::Call>,
     native_regions: Vec<&'a crate::native_evidence::ControlRegion>,
+}
+fn publication_native_witness(
+    document: &crate::native_evidence::Document,
+    producer: &crate::native_evidence::Producer,
+    coverage: &crate::native_evidence::Coverage,
+    grouped: &PublicationRows<'_>,
+) -> Result<String> {
+    crate::native_evidence::document_witness(
+        document,
+        producer,
+        coverage,
+        &grouped
+            .native_declarations
+            .iter()
+            .map(|d| (*d).clone())
+            .collect::<Vec<_>>(),
+        &grouped
+            .native_calls
+            .iter()
+            .map(|c| (*c).clone())
+            .collect::<Vec<_>>(),
+        &grouped
+            .native_regions
+            .iter()
+            .map(|r| (*r).clone())
+            .collect::<Vec<_>>(),
+    )
 }
 fn publication_rows<'a>(
     graph: &'a Graph,
@@ -1680,17 +1724,34 @@ fn write_native(
         "pin:v1:{}:{}",
         revision.index_generation, revision.index_revision
     );
-    immutable.insert(
-        db,
-        "INSERT INTO native_producers VALUES(?1,?2,?3,?4,?5)",
-        params![
-            a.producer.id,
-            a.producer.version,
-            a.producer.executable_hash,
-            a.producer.kind,
-            a.producer.position_encoding
-        ],
-    )?;
+    let origin: Option<(String,String,String,String,String)> = db.query_row(
+        "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).optional()?;
+    if let Some((id, version, _, kind, encoding)) = &origin {
+        ensure!(
+            id == &a.producer.id
+                && version == &a.producer.version
+                && kind == &a.producer.kind
+                && encoding == &a.producer.position_encoding,
+            "incompatible_index: native producer schema/extractor descriptor differs"
+        );
+    } else {
+        immutable.insert(
+            db,
+            "INSERT INTO native_producers VALUES(?1,?2,?3,?4,?5)",
+            params![
+                a.producer.id,
+                a.producer.version,
+                a.producer.executable_hash,
+                a.producer.kind,
+                a.producer.position_encoding
+            ],
+        )?;
+    }
+    // The immutable row is the generation origin. Each NEW revision records the
+    // validated executing hash in revision_capture_inputs + its SHA binding.
+
     for (ordinal, language) in a.producer.languages.iter().enumerate() {
         immutable.insert(
             db,
@@ -1818,27 +1879,13 @@ fn write_native(
                     a.producer.version,
                     file.text.len() as i64,
                     file.text.as_bytes(),
-                    crate::native_evidence::document_witness(
+                    publication_native_witness(
                         doc,
                         &a.producer,
                         coverages
                             .get(file.path.as_str())
                             .context("missing native coverage")?,
-                        &grouped
-                            .native_declarations
-                            .iter()
-                            .map(|d| (*d).clone())
-                            .collect::<Vec<_>>(),
-                        &grouped
-                            .native_calls
-                            .iter()
-                            .map(|c| (*c).clone())
-                            .collect::<Vec<_>>(),
-                        &grouped
-                            .native_regions
-                            .iter()
-                            .map(|r| (*r).clone())
-                            .collect::<Vec<_>>(),
+                        grouped,
                     )?,
                 ],
             )?;
@@ -2150,6 +2197,184 @@ fn bounded_graph_pair(db: &Connection, sql: &str) -> Result<()> {
         "incompatible_index: graph metadata field or pair budget exceeded"
     );
     Ok(())
+}
+
+/// Unkeyed, recomputable consistency binding for post-upgrade revisions.
+/// Publication has already authenticated the actual executable and raw capture;
+/// selected reads compare only immutable persisted SHA identities and header.
+/// This does not resist a coordinated rewrite of all fields by the same user.
+fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(String, String)> {
+    let (source_set, native_revision, toolchain, config, dependency, published): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+    ) = db.query_row(
+        "SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,
+                dependency_hash,published_index_revision FROM native_revisions WHERE id=?1",
+        [revision_key],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        },
+    )?;
+    ensure!(
+        native_revision.starts_with("revision:v1:")
+            && [toolchain.as_str(), config.as_str(), dependency.as_str()]
+                .iter()
+                .all(|hash| hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+        "incompatible_index: invalid selected producer header"
+    );
+    let (producer_id, producer_version, origin_hash, kind, encoding): (
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = db.query_row(
+        "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    ensure!(
+        producer_id == crate::native_evidence::PRODUCER
+            && producer_version == crate::native_evidence::NATIVE_VERSION
+            && kind == "native"
+            && encoding == "utf8",
+        "incompatible_index: selected native producer descriptor differs"
+    );
+    let mut identities = Vec::new();
+    let mut selectors = BTreeSet::new();
+    let mut executable = None;
+    let mut rows = db.prepare(
+        "SELECT input_key,payload FROM revision_capture_inputs WHERE revision_id=?1
+         AND (input_key LIKE 'toolchain:%' OR input_key LIKE 'executable:%') ORDER BY input_key",
+    )?;
+    for row in rows.query_map([revision_key], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (key, raw) = row?;
+        ensure!(
+            key.len() <= 8192 && raw.len() <= 8192,
+            "incompatible_index: selected producer input byte budget exceeded"
+        );
+        let observation: crate::capture::CaptureInputObservation = serde_json::from_str(&raw)?;
+        ensure!(
+            json(&observation)? == raw,
+            "incompatible_index: noncanonical producer input"
+        );
+        if let Some(relative) = key.strip_prefix("toolchain:") {
+            ensure!(
+                crate::capture::ROOT_INPUTS[22..].contains(&relative)
+                    && selectors.insert(relative.to_owned())
+                    && matches!(
+                        observation,
+                        crate::capture::CaptureInputObservation::Present { .. }
+                            | crate::capture::CaptureInputObservation::Absent
+                    ),
+                "incompatible_index: selected producer selector role differs"
+            );
+        } else if let Some(path) = key.strip_prefix("executable:") {
+            let crate::capture::CaptureInputObservation::Present { ref hash, .. } = observation
+            else {
+                anyhow::bail!("incompatible_index: selected executable input absent");
+            };
+            ensure!(
+                Path::new(path).is_absolute()
+                    && hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    && executable.replace(hash.clone()).is_none(),
+                "incompatible_index: selected executable input differs"
+            );
+        } else {
+            anyhow::bail!("incompatible_index: selected producer input role differs");
+        }
+        identities.push(serde_json::json!({"key":key,"observation":observation}));
+    }
+    ensure!(
+        selectors.len() == crate::capture::ROOT_INPUTS[22..].len()
+            && identities.len() == selectors.len() + 1,
+        "incompatible_index: selected producer input inventory incomplete"
+    );
+    let executable = executable.context("incompatible_index: selected executable input missing")?;
+    let canonical = crate::native_ids::canonical(&serde_json::json!({
+        "revisionKey":revision_key, "sourceSetId":source_set,
+        "nativeRevisionId":native_revision, "publishedIndexRevision":published,
+        "toolchainHash":toolchain, "configHash":config, "dependencyHash":dependency,
+        "producerId":producer_id, "producerVersion":producer_version,
+        "originExecutableHash":origin_hash, "kind":kind, "positionEncoding":encoding,
+        "executingHash":executable, "selectorsAndExecutable":identities,
+    }));
+    Ok((
+        executable,
+        crate::native_ids::digest(b"baleyg.revision-producer-binding.v1\0", &canonical),
+    ))
+}
+
+fn selected_producer_hash(db: &Connection, selected: &ReadRevision) -> Result<String> {
+    let (executable, derived) = revision_producer_binding(db, &selected.key)?;
+    let origin: String = db.query_row(
+        "SELECT executable_hash FROM native_producers LIMIT 1",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_revision_producer_bindings(db)? {
+        ensure!(
+            executable == origin,
+            "incompatible_index: legacy selected producer differs from origin"
+        );
+        return Ok(executable);
+    }
+    let epoch: Vec<(String, i64)> = db
+        .prepare("SELECT index_generation,first_revision FROM native_binding_epoch LIMIT 2")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let head_revision: i64 = db.query_row(
+        "SELECT index_revision FROM index_metadata WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        epoch.len() == 1
+            && epoch[0].0 == selected.pin.index_generation.to_string()
+            && epoch[0].1 >= 1
+            && epoch[0].1 <= head_revision,
+        "incompatible_index: selected producer binding epoch invalid"
+    );
+    let persisted: Option<(String, String)> = db
+        .query_row(
+            "SELECT producer_sha,binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [&selected.key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if selected.pin.index_revision < epoch[0].1 as u64 {
+        ensure!(
+            executable == origin && persisted.is_none(),
+            "incompatible_index: legacy selected producer provenance differs"
+        );
+    } else {
+        let (producer_sha, binding_sha) =
+            persisted.context("incompatible_index: selected revision producer binding missing")?;
+        ensure!(
+            producer_sha == executable && binding_sha == derived,
+            "incompatible_index: selected revision producer binding differs"
+        );
+    }
+    Ok(executable)
 }
 
 fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
@@ -4955,12 +5180,13 @@ impl Store {
                 && producer_version == crate::native_evidence::NATIVE_VERSION,
             "incompatible_index: reusable native source/context differs from capture"
         );
-        let (executable_hash, kind, position_encoding): (String, String, String) = db.query_row(
+        let (_origin, kind, position_encoding): (String, String, String) = db.query_row(
             "SELECT executable_hash,kind,position_encoding FROM native_producers
                 WHERE id=?1 AND version=?2",
             params![producer_id, producer_version],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        let executable_hash = selected_producer_hash(db, selected)?;
         let producer = Producer { id:producer_id,version:producer_version,executable_hash,
             kind,languages:db.prepare("SELECT language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal")?
                 .query_map(params![scope.producer_id,crate::native_evidence::NATIVE_VERSION],|r|r.get(0))?
@@ -5211,17 +5437,6 @@ impl Store {
             "selected graph must cover exactly the measured document"
         );
         crate::indexer::validate_native_graph_records(&changed, &prepared.native, cancel)?;
-        if matches!(changed.files[0].language.as_str(), "java" | "python") {
-            let extraction = crate::classes::FileExtraction::extract_file(
-                &changed.files[0],
-                &changed.nodes,
-                cancel,
-                crate::classes::Limits::default(),
-            )?;
-            if prepared.prior_extractions.get(&prepared.changed_path) != Some(&extraction) {
-                return Ok(None);
-            }
-        }
         let mut stats = prepared.old_stats.clone();
         let (old_nodes, old_calls, old_regions) = prepared.old_changed_counts;
         stats.symbols = stats
@@ -5249,7 +5464,7 @@ impl Store {
                 && changed.diagnostics.is_empty(),
             "incompatible_index: local graph summary differs from complete coverage"
         );
-        Ok(Some(Graph {
+        let composed = Graph {
             files: capture.files.clone(),
             nodes: changed.nodes,
             calls: changed.calls,
@@ -5257,7 +5472,48 @@ impl Store {
             diagnostics: prepared.old_diagnostics.clone(),
             stats,
             ..Graph::default()
-        }))
+        };
+        if matches!(
+            composed
+                .files
+                .iter()
+                .find(|f| f.path == prepared.changed_path)
+                .map(|f| f.language.as_str()),
+            Some("java" | "python")
+        ) {
+            let file = composed
+                .files
+                .iter()
+                .find(|f| f.path == prepared.changed_path)
+                .context("changed class source absent")?;
+            let extracted = crate::classes::FileExtraction::extract_file(
+                file,
+                &composed.nodes,
+                cancel,
+                crate::classes::Limits::default(),
+            )?;
+            if prepared.prior_extractions.get(&file.path) != Some(&extracted) {
+                let mut next = prepared.prior_extractions.clone();
+                ensure!(
+                    next.insert(file.path.clone(), extracted).is_some(),
+                    "incompatible_index: prior class extraction absent"
+                );
+                let catalog = Self::compose_selected_class_catalog(
+                    &composed,
+                    &next,
+                    crate::classes::Limits::default(),
+                )?;
+                // If this method-body edit moves a class cap or warning, use
+                // the full same-capture fallback. Equal F takes the original
+                // one-composition fast path and never pays a second O(files).
+                if catalog.warnings != prepared.old_class_warnings
+                    || catalog.truncated != prepared.old_class_truncated
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(composed))
     }
 
     /// Produce a selectively assembled native revision only for a proved local edit
@@ -5581,6 +5837,11 @@ impl Store {
             }
             // Decode and verify the current snapshot outside the IMMEDIATE transaction.
             self.validate_recovery_decode_rows(db)?;
+            let drift = selected_producer_hash(db, &selected)? != native.producer.executable_hash;
+            let documents: BTreeMap<_, _> = native.revision.documents.iter()
+                .map(|doc| (doc.key.path.as_str(), doc)).collect();
+            let coverages: BTreeMap<_, _> = native.coverage.iter()
+                .map(|coverage| (coverage.document_path.as_str(), coverage)).collect();
             let mut old = BTreeMap::new();
             let mut stmt = db.prepare(
                 "SELECT path,document_version_id,graph_projection_id,class_projection_id
@@ -5602,11 +5863,30 @@ impl Store {
             }
             let mut families = BTreeMap::new();
             for file in &graph.files {
+                let grouped = rows.get(file.path.as_str()).context("publication rows missing")?;
+                let ids = v8_document_projection(file, native, grouped)?;
+                if drift {
+                        // The new executable FULLY measured this document.
+                        // Equal document/version inputs cannot silently acquire
+                        // different measured facts under Decision 0003.
+                        let prior_witness: Option<String> = db.query_row(
+                            "SELECT native_witness FROM document_versions WHERE id=?1",
+                            [&ids.version_id], |r| r.get(0),
+                        ).optional()?;
+                        if let Some(prior_witness) = prior_witness {
+                            let measured = publication_native_witness(
+                                documents.get(file.path.as_str())
+                                    .context("new native document absent")?,
+                                &native.producer,
+                                coverages.get(file.path.as_str())
+                                    .context("new native coverage absent")?,
+                                grouped,
+                            )?;
+                            ensure!(measured == prior_witness,
+                                "native_producer_version_required: measured facts changed under the same nativeProducerVersion; bump producer version before indexing");
+                        }
+                    }
                 if let Some((old_version, old_graph, old_class)) = old.get(&file.path) {
-                    let grouped = rows
-                        .get(file.path.as_str())
-                        .context("publication rows missing")?;
-                    let ids = v8_document_projection(file, native, grouped)?;
                     let reused = ReusedFamilies {
                         native: *old_version == ids.version_id,
                         graph: *old_graph == ids.graph_id,
@@ -5724,34 +6004,53 @@ impl Store {
                     .push(node.clone());
             }
         }
-        let extractions: BTreeMap<String, crate::classes::FileExtraction> =
-            if let Some(prepared) = local {
+        let extractions: BTreeMap<String, crate::classes::FileExtraction> = if let Some(prepared) =
+            local
+        {
+            ensure!(
+                prepared.prior_extractions.len() == class_paths.len(),
+                "incompatible_index: local class extraction inventory incomplete"
+            );
+            let mut extractions = prepared.prior_extractions.clone();
+            if let Some(file) = graph.files.iter().find(|f| {
+                f.path == prepared.changed_path && matches!(f.language.as_str(), "java" | "python")
+            }) {
+                let extracted = crate::classes::FileExtraction::extract_file(
+                    file,
+                    class_symbols
+                        .get(file.path.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    cancel,
+                    limits,
+                )?;
                 ensure!(
-                    prepared.prior_extractions.len() == class_paths.len(),
-                    "incompatible_index: local class extraction inventory incomplete"
+                    extractions.insert(file.path.clone(), extracted).is_some(),
+                    "incompatible_index: prior class extraction absent"
                 );
-                prepared.prior_extractions.clone()
-            } else {
-                graph
-                    .files
-                    .iter()
-                    .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-                    .map(|file| {
-                        Ok((
-                            file.path.clone(),
-                            crate::classes::FileExtraction::extract_file(
-                                file,
-                                class_symbols
-                                    .get(file.path.as_str())
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]),
-                                cancel,
-                                limits,
-                            )?,
-                        ))
-                    })
-                    .collect::<Result<_>>()?
-            };
+            }
+            extractions
+        } else {
+            graph
+                .files
+                .iter()
+                .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+                .map(|file| {
+                    Ok((
+                        file.path.clone(),
+                        crate::classes::FileExtraction::extract_file(
+                            file,
+                            class_symbols
+                                .get(file.path.as_str())
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                            cancel,
+                            limits,
+                        )?,
+                    ))
+                })
+                .collect::<Result<_>>()?
+        };
         let classes = Self::compose_selected_class_catalog(graph, &extractions, limits)?;
         if let Some(prepared) = local {
             ensure!(
@@ -5904,6 +6203,12 @@ impl Store {
                     .context("revision overflow")?
             },
         };
+        let binding_extension = has_revision_producer_bindings(&tx)?;
+        if rebaseline && binding_extension {
+            tx.execute_batch(
+                "DELETE FROM revision_producer_bindings; DELETE FROM native_binding_epoch;",
+            )?;
+        }
         if rebaseline {
             // An incompatible/corrupt generation is explicitly replaced, never served.
             // Only compatible same-generation publication appends history.
@@ -5920,6 +6225,20 @@ impl Store {
                 DELETE FROM native_source_set_languages; DELETE FROM native_source_sets;
                 DELETE FROM native_producer_inputs; DELETE FROM native_producer_languages;
                 DELETE FROM native_producers;")?;
+        }
+        if !binding_extension {
+            // DDL and epoch are committed with the FIRST newly bound revision.
+            // Readers before commit see the original exact v8 shape and old pins.
+            tx.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
+        }
+        if !binding_extension || rebaseline {
+            tx.execute(
+                "INSERT INTO native_binding_epoch VALUES(1,?1,?2)",
+                params![
+                    revision.index_generation.to_string(),
+                    revision.index_revision as i64
+                ],
+            )?;
         }
         // The active manifest is full-rewrite, but old same-generation manifests
         // and their immutable version/projection trees remain for retained pins.
@@ -5939,7 +6258,20 @@ impl Store {
             &reuse,
             &rows,
         )
-        .map_err(&classify_immutable)?;
+        .map_err(classify_immutable)?;
+        let revision_key = format!(
+            "pin:v1:{}:{}",
+            revision.index_generation, revision.index_revision
+        );
+        let (executing_hash, binding_sha) = revision_producer_binding(&tx, &revision_key)?;
+        ensure!(
+            executing_hash == native.producer.executable_hash,
+            "incompatible_index: published producer differs from captured executable"
+        );
+        tx.execute(
+            "INSERT INTO revision_producer_bindings VALUES(?1,?2,?3)",
+            params![revision_key, executing_hash, binding_sha],
+        )?;
         for f in &graph.files {
             check_cancel(cancel)?;
             during_tx(PublishStage::AfterFile, &tx)?;
@@ -5959,7 +6291,7 @@ impl Store {
                         "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4,?5)",
                         params![ids.graph_id, n.id, n.name, n.path, json(n)?],
                     )
-                    .map_err(&classify_immutable)?;
+                    .map_err(classify_immutable)?;
             }
             for c in &grouped.calls {
                 if reuse.for_path(&f.path).graph {
@@ -5978,7 +6310,7 @@ impl Store {
                             json(c)?
                         ],
                     )
-                    .map_err(&classify_immutable)?;
+                    .map_err(classify_immutable)?;
             }
             for r in &grouped.regions {
                 if reuse.for_path(&f.path).graph {
@@ -5990,7 +6322,7 @@ impl Store {
                         "INSERT INTO graph_regions VALUES(?1,?2,?3,?4,?5)",
                         params![ids.graph_id, r.id, r.owner, r.path, json(r)?],
                     )
-                    .map_err(&classify_immutable)?;
+                    .map_err(classify_immutable)?;
             }
             for class in &grouped.classes {
                 if reuse.for_path(&f.path).class {
@@ -6010,7 +6342,7 @@ impl Store {
                             json(class)?,
                         ],
                     )
-                    .map_err(&classify_immutable)?;
+                    .map_err(classify_immutable)?;
             }
             for relation in &grouped.relations {
                 if reuse.for_path(&f.path).class {
@@ -6028,10 +6360,10 @@ impl Store {
                             json(relation)?,
                         ],
                     )
-                    .map_err(&classify_immutable)?;
+                    .map_err(classify_immutable)?;
             }
         }
-        immutable.finish(&tx).map_err(&classify_immutable)?;
+        immutable.finish(&tx).map_err(classify_immutable)?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis()
@@ -6121,7 +6453,11 @@ impl Store {
             |r| r.get(0),
         )?;
         ensure!(exists, "revision conflict: released or missing native pin");
-        Ok(ReadRevision { pin, key })
+        let selected = ReadRevision { pin, key };
+        selected_producer_hash(db, &selected)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))?;
+        Ok(selected)
     }
 
     fn native_at<T>(
@@ -6285,6 +6621,7 @@ impl Store {
             "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",[],
             |r|Ok(Producer{id:r.get(0)?,version:r.get(1)?,executable_hash:r.get(2)?,kind:r.get(3)?,languages:vec![],position_encoding:r.get(4)?}),
         )?;
+        producer.executable_hash = selected_producer_hash(db, selected)?;
         producer.languages=db.prepare(
             "SELECT language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal"
         )?.query_map(params![producer.id,producer.version],|r|r.get::<_,String>(0))?
@@ -6741,90 +7078,137 @@ impl Store {
 
     /// Class DTOs are selected presentation projections; compare only this
     /// document's rows with a bounded in-memory class build from attested bytes.
-    fn attest_selected_class_for(
+    /// Attest only the returned paths under one pinned read transaction. The
+    /// other files' previously validated F rows are immutable inputs to the
+    /// class catalog (T00); never re-parse the whole selected workspace here.
+    fn attest_selected_classes_for(
         &self,
         db: &Connection,
-        path: &str,
+        paths: &BTreeSet<&str>,
         selected: &ReadRevision,
     ) -> Result<()> {
-        self.attest_selected_document_for(db, path, selected)?;
-        let graph = self.read_graph_for(db, selected)?;
-        let file = graph
-            .files
-            .iter()
-            .find(|file| file.path == path)
-            .context("incompatible_index: selected class source missing")?;
-        if !matches!(file.language.as_str(), "java" | "python") {
+        if paths.is_empty() {
             return Ok(());
         }
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for path in paths {
+            self.attest_selected_document_for(db, path, selected)?;
+        }
+        self.attest_selected_classes_inner(db, paths, selected)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))
+    }
+
+    fn attest_selected_classes_inner(
+        &self,
+        db: &Connection,
+        paths: &BTreeSet<&str>,
+        selected: &ReadRevision,
+    ) -> Result<()> {
         let limits = crate::classes::Limits::default();
-        let extracts = graph
-            .files
-            .iter()
-            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-            .map(|f| crate::classes::FileExtraction::extract_file(f, &graph.nodes, &cancel, limits))
-            .collect::<Result<Vec<_>>>()?;
-        let selected_extraction = extracts
-            .iter()
-            .find(|f| f.path == path)
-            .context("incompatible_index: selected class extraction missing")?;
-        let stored: String = db.query_row(
-            "SELECT g.class_extraction_payload FROM revision_documents m
+        let (stats_length, raw_stats, raw_warnings, truncated): (i64, String, String, bool) = db
+            .query_row(
+            "SELECT length(CAST(graph_stats AS BLOB)),graph_stats,class_warnings,class_truncated
+             FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        ensure!(
+            (0..=GRAPH_FIELD_MAX_BYTES).contains(&stats_length) && raw_warnings.len() <= 256 * 1024,
+            "incompatible_index: selected class metadata byte budget exceeded"
+        );
+        let stats: IndexStats = serde_json::from_str(&raw_stats)?;
+        let warnings: Vec<String> = serde_json::from_str(&raw_warnings)?;
+        let (file_count, class_file_count): (i64, i64) = db.query_row(
+            "SELECT count(*),sum(CASE WHEN language IN ('java','python') THEN 1 ELSE 0 END)
+             FROM revision_documents WHERE revision_id=?1",
+            [&selected.key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        ensure!(
+            file_count >= 0 && file_count as usize == stats.files && class_file_count >= 0,
+            "incompatible_index: selected class inventory differs from graph summary"
+        );
+        let mut extracts = Vec::new();
+        let mut f_bytes = 0usize;
+        let mut statement = db.prepare(
+            "SELECT m.path,g.class_extraction_payload FROM revision_documents m
              JOIN graph_projections g ON g.id=m.graph_projection_id
-             WHERE m.revision_id=?2 AND m.path=?1",
-            params![path, selected.key],
-            |r| r.get(0),
+               AND g.document_version_id=m.document_version_id
+             WHERE m.revision_id=?1 AND m.language IN ('java','python') ORDER BY m.path",
         )?;
+        for row in statement.query_map([&selected.key], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (path, raw_f) = row?;
+            f_bytes = f_bytes
+                .checked_add(raw_f.len())
+                .context("incompatible_index: selected F byte budget overflow")?;
+            ensure!(
+                raw_f.len() <= 64 * 1024 * 1024 && f_bytes <= 512 * 1024 * 1024,
+                "incompatible_index: selected F byte budget exceeded"
+            );
+            let extract: crate::classes::FileExtraction = serde_json::from_str(&raw_f)?;
+            ensure!(
+                extract.path == path,
+                "incompatible_index: selected F document identity differs"
+            );
+            extracts.push(extract);
+        }
         ensure!(
-            serde_json::from_str::<crate::classes::FileExtraction>(&stored)?
-                == *selected_extraction,
-            "incompatible_index: selected class F differs from authenticated source and graph"
+            extracts.len() == class_file_count as usize,
+            "incompatible_index: selected class extraction inventory incomplete"
         );
-        let catalog = crate::classes::Catalog::compose(
-            &extracts,
-            graph.files.len(),
-            graph.nodes.len(),
-            limits,
-        )?;
-        let class_id: String = db.query_row(
-            "SELECT m.class_projection_id FROM revision_documents m
-             WHERE m.revision_id=?2 AND m.path=?1",
-            params![path, selected.key],
-            |r| r.get(0),
-        )?;
-        let mut expected: Vec<_> = catalog
-            .classes
-            .into_iter()
-            .filter(|c| c.symbol.path == path)
-            .collect();
-        let mut actual: Vec<crate::classes::ClassDefinition> = db
-            .prepare("SELECT payload FROM classes WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&class_id], |r| r.get::<_, String>(0))?
-            .map(|payload| Ok(serde_json::from_str(&payload?)?))
-            .collect::<Result<_>>()?;
-        expected.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
-        actual.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+        let catalog =
+            crate::classes::Catalog::compose(&extracts, stats.files, stats.symbols, limits)?;
         ensure!(
-            actual == expected,
-            "incompatible_index: selected class projection differs from source"
+            catalog.warnings == warnings && catalog.truncated == truncated,
+            "incompatible_index: selected class catalog metadata differs"
         );
-        let mut expected_relations: Vec<_> = catalog
-            .relations
-            .into_iter()
-            .filter(|r| r.path == path)
-            .collect();
-        let mut actual_relations: Vec<crate::classes::ClassRelation> = db
-            .prepare("SELECT payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&class_id], |r| r.get::<_, String>(0))?
-            .map(|payload| Ok(serde_json::from_str(&payload?)?))
-            .collect::<Result<_>>()?;
-        expected_relations.sort_by(|a, b| a.id.cmp(&b.id));
-        actual_relations.sort_by(|a, b| a.id.cmp(&b.id));
-        ensure!(
-            actual_relations == expected_relations,
-            "incompatible_index: selected class relationships differ from source"
-        );
+        for path in paths {
+            let (language, class_id): (String, String) = db.query_row(
+                "SELECT language,class_projection_id FROM revision_documents
+                 WHERE revision_id=?1 AND path=?2",
+                params![selected.key, path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if !matches!(language.as_str(), "java" | "python") {
+                continue;
+            }
+            let mut expected: Vec<_> = catalog
+                .classes
+                .iter()
+                .filter(|class| class.symbol.path == *path)
+                .cloned()
+                .collect();
+            let mut actual: Vec<crate::classes::ClassDefinition> = db
+                .prepare("SELECT payload FROM classes WHERE projection_id=?1 ORDER BY id")?
+                .query_map([&class_id], |r| r.get::<_, String>(0))?
+                .map(|payload| Ok(serde_json::from_str(&payload?)?))
+                .collect::<Result<_>>()?;
+            expected.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+            actual.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+            ensure!(
+                actual == expected,
+                "incompatible_index: selected class projection differs from stored F catalog"
+            );
+            let mut expected_relations: Vec<_> = catalog
+                .relations
+                .iter()
+                .filter(|relation| relation.path == *path)
+                .cloned()
+                .collect();
+            let mut actual_relations: Vec<crate::classes::ClassRelation> = db
+                .prepare("SELECT payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
+                .query_map([&class_id], |r| r.get::<_, String>(0))?
+                .map(|payload| Ok(serde_json::from_str(&payload?)?))
+                .collect::<Result<_>>()?;
+            expected_relations.sort_by(|a, b| a.id.cmp(&b.id));
+            actual_relations.sort_by(|a, b| a.id.cmp(&b.id));
+            ensure!(
+                actual_relations == expected_relations,
+                "incompatible_index: selected class relationships differ from stored F catalog"
+            );
+        }
         Ok(())
     }
 
@@ -7182,9 +7566,7 @@ impl Store {
             )?;
             if exists { paths.insert(selected); }
         }
-        for path in paths {
-            self.attest_selected_class_for(tx, path, &selected_revision)?;
-        }
+        self.attest_selected_classes_for(tx, &paths, &selected_revision)?;
         Ok(ClassPage {
             revision,
             items,
@@ -7228,9 +7610,7 @@ impl Store {
                 .values()
                 .map(|class| class.symbol.path.as_str())
                 .collect();
-            for path in paths {
-                self.attest_selected_class_for(tx, path, &selected)?;
-            }
+            self.attest_selected_classes_for(tx, &paths, &selected)?;
             class_diagram::project(
                 revision,
                 &seeds,
