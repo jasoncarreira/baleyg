@@ -263,7 +263,10 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname==="/api/query"&&new URL(request.url()).searchParams.has("indexGeneration"));
   const staleResponsePromise=page.waitForResponse(response=>response.request().method()==="POST"&&new URL(response.url()).pathname==="/api/query"&&new URL(response.url()).searchParams.has("indexGeneration"));
   await staleRow.getByRole("button",{name:"Load",exact:true}).click();const staleRequest=await staleRequestPromise,staleResponse=await staleResponsePromise;
-  assertPinnedUrl(staleRequest.url(),P);assert.equal(staleRequest.postDataJSON().seed,seed);assert.equal(staleResponse.status(),409);await delay(800);
+  assertPinnedUrl(staleRequest.url(),P);assert.equal(staleRequest.postDataJSON().seed,seed);assert.equal(staleResponse.status(),200);
+  const staleData=await staleResponse.json();assert.deepEqual(staleData.revision,P);assert.notDeepEqual(staleData.revision,Q);
+  assert.ok(staleData.calls.some(call=>call.calleeText==="old_step"),JSON.stringify(staleData));
+  assert.doesNotMatch(JSON.stringify(staleData),/new_step/);await delay(800);
   assert.equal(requests.filter(request=>new URL(request.url).pathname==="/api/query").length,baseline+1,"stale replay must not retry");
   assert.doesNotMatch(await page.locator("#calls").textContent(),/new_step/);
 

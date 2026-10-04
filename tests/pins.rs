@@ -88,7 +88,7 @@ fn pin_shape_and_status() {
         first,
         &temp.path().join("workspace"),
     );
-    assert_ne!(next.index_generation, first.index_generation); // First native publish rebaselines the legacy schema.
+    assert_eq!(next.index_generation, first.index_generation); // A current v8 bootstrap keeps its generation.
     assert_eq!(next.index_revision, 1);
     assert_eq!(store.status().unwrap().revision, next);
 }
@@ -224,9 +224,8 @@ fn query_replay_pin_is_checked_in_target_snapshot() {
         },
         IndexPin {
             index_generation: next.index_generation,
-            index_revision: pin.index_revision,
+            index_revision: next.index_revision + 1,
         },
-        pin,
     ] {
         let error = store.query_view_at(&query, Some(&stale)).unwrap_err();
         assert!(
@@ -234,6 +233,9 @@ fn query_replay_pin_is_checked_in_target_snapshot() {
             "{stale:?}: {error:#}"
         );
     }
+    let retained = store.query_view_at(&query, Some(&pin)).unwrap().unwrap();
+    assert_eq!(retained.revision, pin);
+    assert_eq!(retained.nodes[0].id, query.seed);
 }
 
 #[test]

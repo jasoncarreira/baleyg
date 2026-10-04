@@ -1728,10 +1728,8 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(matches!(version, 4..=7), "incompatible index schema");
-    // GC may classify only the two exact cache formats this binary knows.
-    // The same structural and extractor-marker check applies before it can
-    // declare an index eligible for deletion or report it as recently opened.
+    ensure!(version == 8, "incompatible index schema");
+    // Only the current cache shape can authorize GC or a recent-open report.
     super::validate_cache_shape(db)?;
     let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
     ensure!(count == 1, "incompatible index metadata cardinality");
@@ -1739,10 +1737,8 @@ fn inspect_index_with_open_hook(
         "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,last_opened_at FROM index_metadata WHERE singleton=1", [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
     ensure!(
-        ((version == 4 && schema == 4 && extractor == "native-v1")
-            || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1")
-            || (version == 6 && schema == 6 && extractor == "native-paired-v1")
-            || (version == 7 && schema == 7 && extractor == "native-paired-v1"))
+        schema == 8
+            && extractor == super::EXTRACTOR_VERSION
             && Path::new(&spelling).is_absolute()
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"
@@ -2119,7 +2115,8 @@ mod gc_schema_race_tests {
         assert!(
             refused
                 .to_string()
-                .contains("incompatible_index: unknown cache object")
+                .contains("incompatible_index: unknown cache object"),
+            "{refused:#}"
         );
         let ddl_bytes = after_external.into_inner().unwrap();
         assert_eq!(
@@ -2145,8 +2142,8 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                5,
-                "native-no-lexical-v1",
+                8,
+                "native-v4-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
             )
@@ -2157,6 +2154,96 @@ mod gc_schema_race_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("incompatible_index")
+        );
+    }
+
+    #[test]
+    fn stale_v8_extractor_marker_is_refused_without_gc_writes_or_deletion() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let store = crate::store::Store::open_for_tests(state.path(), work.path()).unwrap();
+        let pin = store.index_baseline().unwrap();
+        let dir = roots.index_dir(&identity);
+        let path = roots.index_db(&identity);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(
+            inspect_index(&dir, &identity.root_key, now).unwrap(),
+            ("unknown", "recent_open"),
+            "genuine current-v8 cache must pass GC admission"
+        );
+
+        let attacker = rusqlite::Connection::open(&path).unwrap();
+        attacker
+            .execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET extractor_version='native-v4' WHERE singleton=1")
+            .unwrap();
+        assert_eq!(attacker.changes(), 1);
+        let (schema, marker, generation, revision): (i64, String, String, i64) = attacker
+            .query_row(
+                "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (schema, marker.as_str(), generation, revision),
+            (
+                8,
+                "native-v4",
+                pin.index_generation.to_string(),
+                pin.index_revision as i64
+            )
+        );
+        drop(attacker);
+
+        let footprint = || {
+            [
+                path.clone(),
+                dir.join("index.db-wal"),
+                dir.join("index.db-shm"),
+                dir.join("index.db-journal"),
+            ]
+            .map(|p| {
+                let bytes = if p.try_exists().unwrap() {
+                    Some(fs::read(&p).unwrap())
+                } else {
+                    None
+                };
+                (p, bytes)
+            })
+        };
+        let attacked_bytes = footprint();
+        assert!(attacked_bytes[0].1.is_some());
+        assert!(attacked_bytes[1..].iter().all(|(_, bytes)| bytes.is_none()));
+        let refused = inspect_index(&dir, &identity.root_key, now).unwrap_err();
+        assert!(
+            refused.to_string().contains("incompatible index identity"),
+            "{refused:#}"
+        );
+        assert_eq!(
+            footprint(),
+            attacked_bytes,
+            "inspection must not write DB or sidecars"
+        );
+        let derived = roots.gc_report_at(now).unwrap().derived;
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].root_key, identity.root_key);
+        assert_eq!(
+            (derived[0].status, derived[0].reason),
+            ("unknown", "metadata_unreadable")
+        );
+        assert!(dir.exists(), "GC report must not delete rejected index");
+        assert_eq!(
+            footprint(),
+            attacked_bytes,
+            "GC report must not write DB or sidecars"
         );
     }
 

@@ -1547,7 +1547,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        8
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -2212,7 +2212,7 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
 }
 
 #[test]
-fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema8_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2233,17 +2233,15 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
         (entry.status, entry.reason)
     };
     assert_eq!(inspect(), ("unknown", "recent_open"));
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='native-v1'",
-        [],
-    )
-    .unwrap();
-    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='native-no-lexical-v1'",
-        [],
-    )
-    .unwrap();
+    // v8's CHECK forbids spoofing an old extractor on the current layout.
+    assert!(
+        db.execute(
+            "UPDATE index_metadata SET extractor_version='native-v1'",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute_batch("CREATE TABLE unsupported(id INTEGER)")
         .unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
@@ -2252,20 +2250,14 @@ fn gc_classifies_exact_safe_schema5_and_known_legacy4_but_refuses_spoofed_shapes
         .unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
     db.execute_batch("DROP VIEW unapproved_view").unwrap();
-    db.pragma_update(None, "user_version", 6).unwrap();
-    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
-    db.pragma_update(None, "user_version", 5).unwrap();
-    assert_eq!(inspect(), ("unknown", "recent_open"));
-    db.execute(
-        "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-        [],
-    )
-    .unwrap();
-    db.pragma_update(None, "user_version", 4).unwrap();
-    assert_eq!(inspect(), ("unknown", "recent_open"));
-    db.execute_batch("CREATE TRIGGER unapproved_trigger AFTER INSERT ON calls BEGIN SELECT RAISE(FAIL,'FORGED'); END;").unwrap();
+    db.execute_batch("CREATE TRIGGER unapproved_trigger AFTER INSERT ON graph_calls BEGIN SELECT RAISE(FAIL, 'FORGED'); END;")
+        .unwrap();
     assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
+    assert_eq!(inspect(), ("unknown", "recent_open"));
+    db.pragma_update(None, "user_version", 7).unwrap();
+    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    db.pragma_update(None, "user_version", 8).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();

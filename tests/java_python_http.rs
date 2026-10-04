@@ -469,19 +469,19 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
             pinned(&f, &format!("/api/source?path={path}")),
             pinned(&f, "/api/files"),
         ] {
-            assert_eq!(call(&f.app, "GET", &endpoint, Value::Null).await.0, 409);
+            let (status, retained) = call(&f.app, "GET", &endpoint, Value::Null).await;
+            assert_eq!(status, 200, "{endpoint}: {retained}");
+            assert_eq!(retained["revision"], json!(f.pin), "{endpoint}");
         }
-        assert_eq!(
-            call(
-                &f.app,
-                "POST",
-                "/api/sequence",
-                json!({"seed":seed,"expectedRevision":f.pin})
-            )
-            .await
-            .0,
-            409
-        );
+        let (status, retained_sequence) = call(
+            &f.app,
+            "POST",
+            "/api/sequence",
+            json!({"seed":seed,"expectedRevision":f.pin}),
+        )
+        .await;
+        assert_eq!(status, 200, "{retained_sequence}");
+        assert_eq!(retained_sequence["revision"], json!(f.pin));
         assert_eq!(
             call(
                 &f.app,

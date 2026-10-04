@@ -2555,6 +2555,90 @@ mod live_tests {
         assert_eq!(question_error(busy.into()).1, "storage_busy");
     }
 
+    #[test]
+    fn preview_fence_failure_restores_evicted_and_same_id_packets() {
+        let revision = IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: 1,
+        };
+        let packet = QuestionPacket {
+            packet_id: "original".into(),
+            revision,
+            request: QuestionRequest {
+                seed: "seed".into(),
+                question: "what?".into(),
+                expected_revision: revision,
+                evidence_depth: 0,
+                max_visible: 1,
+                allow_deeper_display: false,
+                focus_terms: vec![],
+            },
+            context: ViewResult {
+                revision,
+                query: ViewQuery {
+                    seed: "seed".into(),
+                    depth: 0,
+                    max_nodes: 1,
+                    max_calls: 1,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                nodes: vec![],
+                calls: vec![],
+                regions: vec![],
+                truncated: false,
+                omitted_nodes: 0,
+                warnings: vec![],
+            },
+            source_files: vec![],
+            warnings: vec![],
+        };
+        let mut cache = PacketCache::default();
+        for i in 0..MAX_PACKETS {
+            let mut item = packet.clone();
+            item.packet_id = format!("packet-{i}");
+            cache.remember(Arc::new(item), MAX_PACKET_BYTES);
+        }
+        let original: Vec<_> = cache
+            .packets
+            .iter()
+            .map(|(p, bytes)| (p.clone(), *bytes))
+            .collect();
+        let original_bytes = cache.bytes;
+        let mut incoming = packet.clone();
+        incoming.packet_id = "new".into();
+        let failed = cache.remember_fenced(Arc::new(incoming), MAX_PACKET_BYTES, || {
+            anyhow::bail!("index_not_ready: incarnation lost")
+        });
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .starts_with("index_not_ready")
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+        let mut replacement = packet;
+        replacement.packet_id = "packet-3".into();
+        assert!(
+            cache
+                .remember_fenced(Arc::new(replacement), MAX_PACKET_BYTES + 1, || {
+                    anyhow::bail!("root_changed: root replaced")
+                })
+                .is_err()
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+    }
+
     #[tokio::test]
     async fn preview_root_change_after_serialization_discards_packet() {
         let dir = tempfile::tempdir().unwrap();
@@ -2837,7 +2921,7 @@ mod live_tests {
             let db = rusqlite::Connection::open(db_path).unwrap();
             let mut bytes: Vec<u8> = db
                 .query_row(
-                    "SELECT source_bytes FROM native_documents WHERE path='a.js'",
+                    "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js'",
                     [],
                     |row| row.get(0),
                 )
@@ -2845,7 +2929,7 @@ mod live_tests {
             bytes[0] ^= 1;
             assert_eq!(
                 db.execute(
-                    "UPDATE native_documents SET source_bytes=?1 WHERE path='a.js'",
+                    "UPDATE document_versions SET source_bytes=?1 WHERE id=(SELECT m.document_version_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js')",
                     [bytes],
                 )
                 .unwrap(),
@@ -2990,7 +3074,7 @@ mod live_tests {
 }
 
 #[cfg(test)]
-mod queue_idle_follower_tests {
+mod serving_holder_tests {
     use super::*;
     use std::fs;
 
@@ -3930,27 +4014,68 @@ mod normal_post_capture_cancellation_tests {
             index_generation: uuid::Uuid::parse_str(&generation).unwrap(),
             index_revision: u64::try_from(revision).unwrap(),
         };
-        let mut tables = vec![
-            "files".to_owned(),
-            "nodes".to_owned(),
-            "calls".to_owned(),
-            "regions".to_owned(),
-            "class_catalog".to_owned(),
-            "classes".to_owned(),
-            "class_relations".to_owned(),
-        ];
-        let mut names = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'native_*' ORDER BY name")
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        tables.extend(
-            names
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap(),
+        assert!(
+            matches!(tables.len(), 28 | 30),
+            "compare the complete legacy or extended v8 evidence inventory"
         );
-        drop(names);
-        assert!(tables.iter().any(|table| table == "native_documents"));
+        let mut expected = vec![
+            "class_projections",
+            "class_relations",
+            "classes",
+            "document_versions",
+            "graph_calls",
+            "graph_nodes",
+            "graph_projections",
+            "graph_regions",
+            "native_producer_inputs",
+            "native_producer_languages",
+            "native_producers",
+            "native_revisions",
+            "native_source_set_dependencies",
+            "native_source_set_languages",
+            "native_source_sets",
+            "native_version_ancestor_signature_types",
+            "native_version_call_regions",
+            "native_version_calls",
+            "native_version_control_regions",
+            "native_version_coverage_roles",
+            "native_version_declaration_ancestors",
+            "native_version_declarations",
+            "native_version_header_items",
+            "native_version_headers",
+            "native_version_own_signature_types",
+            "native_version_parameters",
+            "revision_capture_inputs",
+            "revision_documents",
+        ];
+        if tables.len() == 30 {
+            expected.extend(["native_binding_epoch", "revision_producer_bindings"]);
+            expected.sort_unstable();
+        }
+        assert_eq!(
+            tables.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected,
+            "exact v8 table names: complete legacy 28 or paired producer-binding 30"
+        );
+        for required in [
+            "document_versions",
+            "revision_documents",
+            "graph_nodes",
+            "native_version_declarations",
+            "class_projections",
+        ] {
+            assert!(
+                tables.iter().any(|table| table == required),
+                "missing {required}"
+            );
+        }
         let mut rows = BTreeMap::new();
         for table in tables {
             assert!(
@@ -4069,12 +4194,19 @@ mod normal_post_capture_cancellation_tests {
         assert_eq!(completed["state"], "done", "{completed}");
         let after = pair_snapshot(&index);
         assert!(after.pin.index_revision > before.pin.index_revision);
-        assert_ne!(after.rows["files"], before.rows["files"]);
         assert_ne!(
-            after.rows["native_documents"],
-            before.rows["native_documents"]
+            after.rows["revision_documents"],
+            before.rows["revision_documents"]
         );
-        assert!(after.rows["files"].iter().any(|row| row.contains("two.js")));
+        assert_ne!(
+            after.rows["document_versions"],
+            before.rows["document_versions"]
+        );
+        assert!(
+            after.rows["document_versions"]
+                .iter()
+                .any(|row| row.contains("two.js"))
+        );
         assert_eq!(
             after.pin,
             serde_json::from_value(completed["revision"].clone()).unwrap()
@@ -4369,255 +4501,5 @@ mod dependency_lifecycle_tests {
         let generation = state.dependencies.lock().unwrap().generation;
         state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
         assert!(state.catalog_snapshot(pin1).is_none());
-    }
-}
-
-#[cfg(test)]
-mod rebaseline_packet_cache_tests {
-    use super::*;
-    use crate::indexer::index_workspace_bundle;
-    use std::{fs, sync::atomic::AtomicBool};
-
-    #[test]
-    fn preview_fence_failure_restores_evicted_and_same_id_packets() {
-        let revision = IndexPin {
-            index_generation: uuid::Uuid::new_v4(),
-            index_revision: 1,
-        };
-        let packet = QuestionPacket {
-            packet_id: "original".into(),
-            revision,
-            request: QuestionRequest {
-                seed: "seed".into(),
-                question: "what?".into(),
-                expected_revision: revision,
-                evidence_depth: 0,
-                max_visible: 1,
-                allow_deeper_display: false,
-                focus_terms: vec![],
-            },
-            context: ViewResult {
-                revision,
-                query: ViewQuery {
-                    seed: "seed".into(),
-                    depth: 0,
-                    max_nodes: 1,
-                    max_calls: 1,
-                    include_callbacks: false,
-                    exclude_paths: vec![],
-                },
-                nodes: vec![],
-                calls: vec![],
-                regions: vec![],
-                truncated: false,
-                omitted_nodes: 0,
-                warnings: vec![],
-            },
-            source_files: vec![],
-            warnings: vec![],
-        };
-        let mut cache = PacketCache::default();
-        for i in 0..MAX_PACKETS {
-            let mut item = packet.clone();
-            item.packet_id = format!("packet-{i}");
-            cache.remember(Arc::new(item), MAX_PACKET_BYTES);
-        }
-        let original: Vec<_> = cache
-            .packets
-            .iter()
-            .map(|(p, bytes)| (p.clone(), *bytes))
-            .collect();
-        let original_bytes = cache.bytes;
-        let mut incoming = packet.clone();
-        incoming.packet_id = "new".into();
-        let failed = cache.remember_fenced(Arc::new(incoming), MAX_PACKET_BYTES, || {
-            anyhow::bail!("index_not_ready: incarnation lost")
-        });
-        assert!(
-            failed
-                .unwrap_err()
-                .to_string()
-                .starts_with("index_not_ready")
-        );
-        assert_eq!(cache.bytes, original_bytes);
-        assert_eq!(cache.packets.len(), MAX_PACKETS);
-        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
-            assert!(Arc::ptr_eq(actual, before));
-            assert_eq!(size, expected);
-        }
-        let mut replacement = packet;
-        replacement.packet_id = "packet-3".into();
-        assert!(
-            cache
-                .remember_fenced(
-                    Arc::new(replacement),
-                    MAX_PACKET_BYTES + 1,
-                    || anyhow::bail!("root_changed: root replaced")
-                )
-                .is_err()
-        );
-        assert_eq!(cache.bytes, original_bytes);
-        assert_eq!(cache.packets.len(), MAX_PACKETS);
-        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
-            assert!(Arc::ptr_eq(actual, before));
-            assert_eq!(size, expected);
-        }
-    }
-
-    #[test]
-    fn failed_known_old_commit_keeps_private_packet_cache_success_clears_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        fs::create_dir(&workspace).unwrap();
-        fs::write(workspace.join("one.js"), "function go() { measured(); }\n").unwrap();
-        let options = IndexOptions::new(workspace.clone());
-        let ready = Arc::new(AtomicBool::new(false));
-        let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
-        let (graph, native, capture) =
-            index_workspace_bundle(&options, store.root_id(), &ready, |_| {}).unwrap();
-        let old = store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                &store.leader().unwrap(),
-                store.index_baseline().unwrap(),
-                &ready,
-            )
-            .unwrap();
-        let db_path = fs::read_dir(temp.path().join("state/cache/indexes"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.is_dir())
-            .unwrap()
-            .join("index.db");
-        let db = rusqlite::Connection::open(&db_path).unwrap();
-        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        let tables = {
-            let mut stmt = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'",
-                )
-                .unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        for table in tables {
-            db.execute(&format!("DROP TABLE \"{table}\""), []).unwrap();
-        }
-        for index in ["nodes_path", "calls_path", "regions_path"] {
-            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-        }
-        db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-            [],
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
-        drop(db);
-        let old_bytes = fs::read(&db_path).unwrap();
-        let state = new(
-            store.clone(),
-            options,
-            "0123456789abcdef".repeat(4),
-            "127.0.0.1:7332".parse().unwrap(),
-        )
-        .unwrap();
-        let seed = graph
-            .nodes
-            .iter()
-            .find(|n| n.name == "go")
-            .unwrap()
-            .id
-            .clone();
-        let packet = Arc::new(QuestionPacket {
-            packet_id: "cached-before-old".into(),
-            revision: old,
-            request: QuestionRequest {
-                seed: seed.clone(),
-                question: "what?".into(),
-                expected_revision: old,
-                evidence_depth: 0,
-                max_visible: 1,
-                allow_deeper_display: false,
-                focus_terms: vec![],
-            },
-            context: ViewResult {
-                revision: old,
-                query: ViewQuery {
-                    seed,
-                    depth: 0,
-                    max_nodes: 1,
-                    max_calls: 1,
-                    include_callbacks: false,
-                    exclude_paths: vec![],
-                },
-                nodes: vec![],
-                calls: vec![],
-                regions: vec![],
-                truncated: false,
-                omitted_nodes: 0,
-                warnings: vec![],
-            },
-            source_files: vec![],
-            warnings: vec![],
-        });
-        state.packets.lock().unwrap().remember(packet, 128);
-        let register = |id: &str| {
-            state.jobs.lock().unwrap().jobs.insert(
-                id.into(),
-                IndexJob {
-                    id: id.into(),
-                    state: "running".into(),
-                    progress: IndexProgress::default(),
-                    revision: None,
-                    error: None,
-                    submitted_at: now(),
-                    started_at: Some(now()),
-                    finished_at: None,
-                },
-            )
-        };
-        register("failed");
-        let cancelled = Arc::new(AtomicBool::new(true));
-        let error = store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                &store.leader().unwrap(),
-                old,
-                &cancelled,
-            )
-            .unwrap_err();
-        finish_index_job(&state, "failed", Err(error), &cancelled);
-        assert_eq!(state.jobs.lock().unwrap().jobs["failed"].state, "cancelled");
-        assert_eq!(state.packets.lock().unwrap().packets.len(), 1);
-        assert_eq!(state.packets.lock().unwrap().bytes, 128);
-        assert_eq!(fs::read(&db_path).unwrap(), old_bytes);
-        assert!(
-            store
-                .status()
-                .unwrap_err()
-                .to_string()
-                .contains("index_not_ready")
-        );
-        register("committed");
-        let revision = store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                &store.leader().unwrap(),
-                old,
-                &ready,
-            )
-            .unwrap();
-        finish_index_job(&state, "committed", Ok(revision), &ready);
-        assert_ne!(revision.index_generation, old.index_generation);
-        assert_eq!(state.packets.lock().unwrap().packets.len(), 0);
-        assert_eq!(state.packets.lock().unwrap().bytes, 0);
     }
 }

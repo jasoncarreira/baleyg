@@ -60,6 +60,30 @@ impl IndexJobCoordinator {
         self.session.clone()
     }
 
+    /// A diagnostic decision for two immutable admissions. Publication classifies
+    /// its persisted prior manifest in one private read snapshot instead.
+    pub fn staged_capture_decision(
+        previous: &Capture,
+        current: &Capture,
+    ) -> indexer::CapturedChange {
+        indexer::measure_captured_change(previous, current)
+    }
+
+    /// This stand-alone measurement is nonpublishable without a pinned prior manifest,
+    /// authenticated immutable versions and a writer-transaction CAS.
+    pub fn staged_capture_measurement(
+        previous: &Capture,
+        current: &Capture,
+        root: &std::path::Path,
+        root_id: &str,
+        cancel: &CancelFlag,
+        on_extract: impl FnMut(&crate::native_evidence::DocumentKey),
+    ) -> Result<indexer::StagedNativeMeasurement> {
+        indexer::measure_captured_native_change(
+            previous, current, root, root_id, cancel, on_extract,
+        )
+    }
+
     /// Projection uses the admitted bytes; publication checks drift, cancellation and the
     /// whole expected pair under the writer lock before making graph and native rows visible.
     pub fn run(
@@ -80,20 +104,93 @@ impl IndexJobCoordinator {
         observe: impl FnOnce(&Capture),
     ) -> Result<IndexPin> {
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
+        let mut phase_start = std::time::Instant::now();
+        let report = |name: &str, elapsed: std::time::Duration| {
+            progress(IndexProgress {
+                phase: format!("timing:{name}"),
+                completed: elapsed.as_micros() as usize,
+                total: 1,
+            });
+        };
         self.store.begin_leader_publication(&self.session)?;
-        let (graph, native, capture) =
-            indexer::index_workspace_bundle(options, self.store.root_id(), cancel, progress)?;
+        let capture = Capture::admit(options, cancel, &progress)?;
+        report("capture", phase_start.elapsed());
+        phase_start = std::time::Instant::now();
+        let root = std::fs::canonicalize(&options.workspace_root)?;
+        if let Some(prepared) =
+            self.store
+                .prepare_local_revision(&capture, &self.expected, cancel)?
+        {
+            report("measure", phase_start.elapsed());
+            phase_start = std::time::Instant::now();
+            let changed = indexer::project_native_document(
+                options,
+                &capture,
+                &prepared.native,
+                &prepared.changed_path,
+                cancel,
+                &progress,
+            )?;
+            if let Some(graph) = self
+                .store
+                .compose_local_revision(&capture, &prepared, changed, cancel)?
+            {
+                progress(IndexProgress {
+                    phase: "mode:local".into(),
+                    completed: 0,
+                    total: 1,
+                });
+                report("compose", phase_start.elapsed());
+                phase_start = std::time::Instant::now();
+                capture.verify(cancel)?;
+                observe(&capture);
+                ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
+                self.store.verify_leader_session(&self.session)?;
+                report("attest", phase_start.elapsed());
+                phase_start = std::time::Instant::now();
+                let pin = self.store.publish_local_native_recovery(
+                    &graph,
+                    &capture,
+                    prepared,
+                    self.session.leader_guard()?,
+                    self.expected,
+                    cancel,
+                )?;
+                report("publish", phase_start.elapsed());
+                return Ok(pin);
+            }
+            // A moved D4 class cut is unproved: recalculate every native fact
+            // from the SAME authenticated capture, without a second admission.
+            phase_start = std::time::Instant::now();
+        }
+        progress(IndexProgress {
+            phase: "mode:full".into(),
+            completed: 0,
+            total: 1,
+        });
+        let native =
+            crate::native_evidence::from_capture(&capture, &root, self.store.root_id(), cancel)?;
+        report("measure", phase_start.elapsed());
+        phase_start = std::time::Instant::now();
+        let graph = indexer::project_native(options, &capture, &native, cancel, &progress)?;
+        report("compose", phase_start.elapsed());
+        phase_start = std::time::Instant::now();
+        capture.verify(cancel)?;
         observe(&capture);
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         self.store.verify_leader_session(&self.session)?;
-        self.store.publish_native_recovery(
+        report("attest", phase_start.elapsed());
+        phase_start = std::time::Instant::now();
+        let published = self.store.publish_native_recovery(
             &graph,
             &capture,
             &native,
             self.session.leader_guard()?,
             self.expected,
             cancel,
-        )
+        )?;
+        report("publish", phase_start.elapsed());
+        Ok(published)
     }
 }
 
@@ -187,7 +284,7 @@ fn retry_cli_recorded_completion(
     cancel: &CancelFlag,
     initial: anyhow::Error,
 ) -> Result<()> {
-    if !store.has_recorded_completion(session) || !retryable_cli_completion_error(&initial) {
+    if !store.has_recorded_completion(session)? || !retryable_cli_completion_error(&initial) {
         return Err(initial);
     }
     loop {
@@ -246,6 +343,16 @@ pub fn enqueue_and_wait(
     store: &Store,
     options: &IndexOptions,
     cancel: &CancelFlag,
+) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
+    enqueue_and_wait_observed(store, options, cancel, |_| {})
+}
+
+/// CLI-only progress observer; the durable queue and publication route remain shared.
+pub fn enqueue_and_wait_observed(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
     let request = store.enqueue_request(options, None)?;
     let mut held: Option<Arc<LeaderSession>> = None;
@@ -313,7 +420,7 @@ pub fn enqueue_and_wait(
                         .unwrap_or_else(|| options.clone());
                     let startup =
                         IndexJobCoordinator::prepare_with_session(store, None, session.clone())?;
-                    let takeover_pin = startup.run(&reconcile_options, cancel, |_| {})?;
+                    let takeover_pin = startup.run(&reconcile_options, cancel, &progress)?;
                     // Retain the verified owner before any terminal write can fail.
                     held = Some(session.clone());
                     if let Some(head) = earliest
@@ -340,7 +447,7 @@ pub fn enqueue_and_wait(
         }
         if let Some(session) = &held {
             loop {
-                match drain_requests(store, session) {
+                match drain_requests_observed(store, session, |_, phase| progress(phase)) {
                     Ok(_) => break,
                     Err(error) => retry_cli_recorded_completion(store, session, cancel, error)?,
                 }

@@ -18,6 +18,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 #[derive(Parser)]
@@ -335,7 +336,12 @@ async fn main() -> Result<()> {
             eprintln!("Forgot record {}", args.record_id);
         }
         Command::Index(args) => {
+            let command_start = Instant::now();
             let (store, options, _) = args.resolve()?;
+            eprintln!(
+                "index-phase outside_setup_ms={:.3}",
+                command_start.elapsed().as_secs_f64() * 1e3
+            );
             let worker_store = store.clone();
             let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
@@ -343,15 +349,40 @@ async fn main() -> Result<()> {
                 shutdown_signal().await;
                 flag.store(true, Ordering::Release);
             });
+            let queue_start = Instant::now();
             let work = tokio::task::spawn_blocking(move || {
-                baleyg::index_coordinator::enqueue_and_wait(&worker_store, &options, &cancel)
+                baleyg::index_coordinator::enqueue_and_wait_observed(
+                    &worker_store,
+                    &options,
+                    &cancel,
+                    |phase| {
+                        if let Some(name) = phase.phase.strip_prefix("timing:") {
+                            eprintln!("index-phase {name}_ms={:.3}", phase.completed as f64 / 1e3);
+                        } else if let Some(mode) = phase.phase.strip_prefix("mode:") {
+                            eprintln!("index-mode {mode}");
+                        }
+                    },
+                )
             })
             .await
             .context("index worker panicked")?;
+            eprintln!(
+                "index-phase queue_and_jobs_ms={:.3}",
+                queue_start.elapsed().as_secs_f64() * 1e3
+            );
             signal.abort();
             let (revision, session) = work?;
+            if let Some(diagnostic) = store.last_writer_diagnostic() {
+                eprintln!("{diagnostic}");
+            }
+            let status_start = Instant::now();
             let output = serde_json::json!({"publishedRevision":revision,"status":store.status()?});
             write_session_json(&output, &session, std::io::stdout().lock())?;
+            eprintln!(
+                "index-phase outside_status_output_ms={:.3} total_ms={:.3}",
+                status_start.elapsed().as_secs_f64() * 1e3,
+                command_start.elapsed().as_secs_f64() * 1e3
+            );
         }
         Command::Serve(args) => {
             ensure!(

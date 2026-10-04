@@ -24,10 +24,10 @@ where
 }
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
-const PRODUCER: &str = "baleyg.native.syntax";
+pub(crate) const PRODUCER: &str = "baleyg.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v3";
+pub(crate) const NATIVE_VERSION: &str = "native-v4";
 /// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
 /// descriptor `(id, version)` and language. `extract` measures one document from only its own
 /// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
@@ -45,6 +45,43 @@ const EXTRACTION_INPUTS: &[(&str, &str, &[LanguageInventory])] = &[(
         ("javascript", &[]),
     ],
 )];
+
+// Private unit-test fault injection only. Integration tests compile the ordinary
+// library, and release builds have no override, branch, or alternate inventory.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ExtractionAuthFault {
+    Undeclared,
+    Mismatched,
+}
+#[cfg(test)]
+thread_local! {
+    static EXTRACTION_AUTH_FAULT: std::cell::RefCell<Option<(String, String, ExtractionAuthFault)>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+struct ExtractionAuthFaultGuard;
+#[cfg(test)]
+impl Drop for ExtractionAuthFaultGuard {
+    fn drop(&mut self) {
+        EXTRACTION_AUTH_FAULT.with(|fault| *fault.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+fn inject_extraction_auth_fault(
+    revision: &str,
+    language: &str,
+    fault: ExtractionAuthFault,
+) -> ExtractionAuthFaultGuard {
+    EXTRACTION_AUTH_FAULT.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "nested extraction authentication injection"
+        );
+        *slot.borrow_mut() = Some((revision.to_owned(), language.to_owned(), fault));
+    });
+    ExtractionAuthFaultGuard
+}
 /// Authenticate the declared inventory of `producer` for `language` against the captured
 /// revision and derive the document's extraction context. This is the fail-closed
 /// precondition for minting any `occ:v2` ID: an undeclared descriptor/language or a declared
@@ -54,35 +91,72 @@ fn native_extraction_context(
     language: &str,
     revision: &Revision,
 ) -> Result<String> {
+    #[cfg(test)]
+    if let Some(fault) = EXTRACTION_AUTH_FAULT.with(|slot| {
+        slot.borrow().as_ref().and_then(|(id, lang, fault)| {
+            (id == &revision.id && lang == language).then_some(*fault)
+        })
+    }) {
+        return match fault {
+            ExtractionAuthFault::Undeclared => {
+                anyhow::bail!("undeclared native extraction-input inventory")
+            }
+            ExtractionAuthFault::Mismatched => authenticated_extraction_context(
+                language,
+                &["config"],
+                &[("config", Some(b"test-only mismatched captured config"))],
+                revision,
+            ),
+        };
+    }
     let inventory = EXTRACTION_INPUTS
         .iter()
         .find(|(id, version, _)| *id == producer.id && *version == producer.version)
         .and_then(|(_, _, languages)| languages.iter().find(|(l, _)| *l == language))
         .map(|(_, inventory)| *inventory)
         .context("undeclared native extraction-input inventory")?;
-    authenticated_extraction_context(language, inventory, revision)
+    // The v4 parser reads no external component: all grammars and normalization tables are
+    // fixed in this executable. Other captured inputs affect revision admission, not syntax.
+    authenticated_extraction_context(language, inventory, &[], revision)
 }
 fn authenticated_extraction_context(
     language: &str,
     inventory: &[&str],
+    observed: &[(&str, Option<&[u8]>)],
     revision: &Revision,
 ) -> Result<String> {
-    let mut components = inventory
-        .iter()
-        .map(|name| {
-            let hash = match *name {
-                "toolchain" => &revision.toolchain_hash,
-                "config" => &revision.config_hash,
-                "dependency" => &revision.dependency_hash,
-                _ => anyhow::bail!("undeclared native extraction component: {name}"),
-            };
-            ensure!(
-                valid_hash(hash),
-                "unauthenticated native extraction component: {name}"
-            );
-            Ok(((*name).to_owned(), hash.clone()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut declared = BTreeSet::new();
+    for name in inventory {
+        ensure!(
+            matches!(*name, "toolchain" | "config" | "dependency") && declared.insert(*name),
+            "unsupported or duplicate native extraction component: {name}"
+        );
+    }
+    let mut captured = BTreeMap::new();
+    for (name, bytes) in observed {
+        ensure!(
+            declared.contains(name) && captured.insert(*name, *bytes).is_none(),
+            "undeclared or duplicate captured native extraction component: {name}"
+        );
+    }
+    let mut components = Vec::with_capacity(inventory.len());
+    for name in inventory {
+        let bytes = captured
+            .get(name)
+            .context("absent native extraction component capture")?
+            .context("absent native extraction component bytes")?;
+        let expected = match *name {
+            "toolchain" => &revision.toolchain_hash,
+            "config" => &revision.config_hash,
+            "dependency" => &revision.dependency_hash,
+            _ => unreachable!(),
+        };
+        ensure!(
+            valid_hash(expected) && hash(bytes) == *expected,
+            "mismatched native extraction component: {name}"
+        );
+        components.push(((*name).to_owned(), expected.clone()));
+    }
     components.sort();
     extraction_context(language, &components)
 }
@@ -321,6 +395,52 @@ pub struct Artifact {
     pub control_regions: Vec<ControlRegion>,
 }
 
+/// Canonical evidence checksum for a document version. Revision-scoped proof IDs are
+/// deliberately projected at the requested pin rather than stored in this witness.
+/// The caller must independently bind source bytes, producer and manifest identity.
+pub(crate) fn document_witness(
+    document: &Document,
+    producer: &Producer,
+    coverage: &Coverage,
+    declarations: &[Declaration],
+    calls: &[Call],
+    regions: &[ControlRegion],
+) -> Result<String> {
+    fn stable<T: Serialize>(items: &[T]) -> Result<Vec<Value>> {
+        let mut facts: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                let mut value = serde_json::to_value(item)?;
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("revisionId");
+                    object.remove("provenanceId");
+                }
+                Ok(value)
+            })
+            .collect::<Result<_>>()?;
+        // Canonicalization walks and sorts nested JSON. Compute each sort key
+        // once; recalculating it for every comparison dominates reuse checks.
+        facts.sort_by_cached_key(canonical);
+        Ok(facts)
+    }
+    let mut coverage = serde_json::to_value(coverage)?;
+    coverage
+        .as_object_mut()
+        .context("invalid coverage")?
+        .remove("revisionId");
+    Ok(digest(
+        b"baleyg.native-version-witness.v1\0",
+        &canonical(&json!({
+            "documentKey": document.key, "contentHash": document.content_hash,
+            "byteLength": document.byte_length, "producerId": producer.id,
+            "producerVersion": producer.version,
+            "extractionContext": extraction_context(&document.key.language, &[])?,
+            "coverage": coverage, "declarations": stable(declarations)?,
+            "calls": stable(calls)?, "regions": stable(regions)?,
+        })),
+    ))
+}
+
 pub fn lookup(language: &str, name: &str) -> Result<String> {
     text(name)?;
     Ok(match language {
@@ -362,7 +482,13 @@ pub fn from_capture(
     Ok(artifact)
 }
 
-fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
+/// The full captured revision header is shared by full and selected measurement.
+/// Selecting one file must never change the source-set, producer or revision ID.
+fn build_native_header<'a>(
+    capture: &'a Capture,
+    root: &Path,
+    root_id: &str,
+) -> Result<(Artifact, Vec<&'a SourceFile>)> {
     text(root_id)?;
     let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root)?;
     ensure!(
@@ -456,7 +582,7 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
         config_hash: hash(&canonical(&json!(config))),
         dependency_hash: hash(&canonical(&json!(dependencies))),
     };
-    let mut artifact = Artifact {
+    let artifact = Artifact {
         producer,
         source_set,
         revision,
@@ -466,10 +592,254 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
         calls: vec![],
         control_regions: vec![],
     };
+    Ok((artifact, files))
+}
+
+fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
+    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
     let mut ids = IdentityRegistry::default();
-    for f in files {
-        extract(&mut artifact, f, &mut ids)?;
+    for (index, f) in files.into_iter().enumerate() {
+        // The revision header was built from this exact sorted file sequence.
+        // Keep a concrete document witness, rather than scanning the full
+        // revision header once per file.
+        let document = artifact.revision.documents[index].clone();
+        extract_known(&mut artifact, f, &document, &mut ids)?;
     }
+    Ok(artifact)
+}
+
+/// Native facts for exactly one document of the full admitted revision. This is not
+/// an Artifact and cannot be passed to the v8 publisher or full-bundle validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedDocument {
+    pub producer: Producer,
+    pub source_set: SourceSet,
+    pub revision: Revision,
+    pub document: Document,
+    pub coverage: Coverage,
+    pub provenance: Provenance,
+    pub declarations: Vec<Declaration>,
+    pub calls: Vec<Call>,
+    pub control_regions: Vec<ControlRegion>,
+}
+
+/// Extract only the selected admitted source; all header fields retain the full
+/// captured snapshot identity. `on_extract` attests successful real native assembly,
+/// not a classifier candidate or a full-bundle parse.
+pub(crate) fn measure_captured_document(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    path: &str,
+    cancel: &CancelFlag,
+    mut on_extract: impl FnMut(&DocumentKey),
+) -> Result<SelectedDocument> {
+    capture.verify(cancel)?;
+    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
+    let selected: Vec<_> = files.into_iter().filter(|file| file.path == path).collect();
+    ensure!(
+        selected.len() == 1,
+        "selected native source must be unique and admitted"
+    );
+    let file = selected[0];
+    ensure!(
+        capture.hashes.get(path) == Some(&file.hash) && file.hash == hash(file.text.as_bytes()),
+        "selected native source bytes/hash mismatch"
+    );
+    let documents: Vec<_> = artifact
+        .revision
+        .documents
+        .iter()
+        .filter(|document| document.key.path == path)
+        .cloned()
+        .collect();
+    ensure!(
+        documents.len() == 1,
+        "selected native revision document must be unique"
+    );
+    let document = documents[0].clone();
+    ensure!(
+        document.key.source_set_id == artifact.source_set.id
+            && document.key.language == file.language
+            && document.content_hash == file.hash
+            && document.byte_length == file.text.len()
+            && document.revision_id == artifact.revision.id,
+        "selected native document not bound to full capture"
+    );
+    let mut ids = IdentityRegistry::default();
+    extract(&mut artifact, file, &mut ids)?;
+    ensure!(
+        artifact.coverage.len() == 1
+            && artifact.provenance.len() == 1
+            && artifact.coverage[0].document_path == path
+            && artifact.provenance[0].document == document.key
+            && artifact
+                .declarations
+                .iter()
+                .all(|row| row.document == document.key)
+            && artifact
+                .calls
+                .iter()
+                .all(|row| row.document == document.key)
+            && artifact
+                .control_regions
+                .iter()
+                .all(|row| row.document == document.key),
+        "selected native facts escaped the admitted document"
+    );
+    capture.verify(cancel)?;
+    on_extract(&document.key);
+    Ok(SelectedDocument {
+        producer: artifact.producer,
+        source_set: artifact.source_set,
+        revision: artifact.revision,
+        document,
+        coverage: artifact.coverage.remove(0),
+        provenance: artifact.provenance.remove(0),
+        declarations: artifact.declarations,
+        calls: artifact.calls,
+        control_regions: artifact.control_regions,
+    })
+}
+
+/// Authenticate a newly measured document on its own. Unchanged rows in the
+/// captured revision are already validated immutable rows of this generation;
+/// callers carry only their manifest identities, not their occurrence records.
+pub(crate) fn validated_changed_artifact(
+    capture: &Capture,
+    selected: SelectedDocument,
+    cancel: &CancelFlag,
+) -> Result<Artifact> {
+    let file = capture
+        .files
+        .iter()
+        .find(|file| file.path == selected.document.key.path)
+        .context("changed native source missing from capture")?;
+    let full_documents = selected.revision.documents.clone();
+    let mut artifact = Artifact {
+        producer: selected.producer,
+        source_set: selected.source_set,
+        revision: Revision {
+            documents: vec![selected.document],
+            ..selected.revision
+        },
+        coverage: vec![selected.coverage],
+        provenance: vec![selected.provenance],
+        declarations: selected.declarations,
+        calls: selected.calls,
+        control_regions: selected.control_regions,
+    };
+    artifact.validate_structure(std::slice::from_ref(file))?;
+    capture.verify(cancel)?;
+    artifact.revision.documents = full_documents;
+    Ok(artifact)
+}
+
+/// Assemble a full captured revision from one measured document and independently
+/// authenticated immutable prior versions. Rebinding changes ONLY requested-revision
+/// coverage/provenance; stable syntax and occurrence IDs are never inferred anew.
+#[allow(dead_code)] // Kept for the bounded legacy diagnostic tests; Option C publishes changed-only facts.
+pub(crate) fn assemble_selected_revision(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    selected: Vec<SelectedDocument>,
+    cancel: &CancelFlag,
+) -> Result<Artifact> {
+    capture.verify(cancel)?;
+    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
+    let mut by_path = BTreeMap::new();
+    for entry in selected {
+        ensure!(
+            by_path
+                .insert(entry.document.key.path.clone(), entry)
+                .is_none(),
+            "duplicate selected native document"
+        );
+    }
+    ensure!(
+        by_path.len() == files.len(),
+        "missing selected native document"
+    );
+    for file in &files {
+        let mut entry = by_path
+            .remove(&file.path)
+            .context("selected native document absent")?;
+        let document = artifact
+            .revision
+            .documents
+            .iter()
+            .find(|d| d.key.path == file.path)
+            .context("captured document absent")?;
+        ensure!(
+            entry.producer == artifact.producer
+                && entry.source_set == artifact.source_set
+                && entry.revision.source_set_id == artifact.revision.source_set_id
+                && entry.revision.toolchain_hash == artifact.revision.toolchain_hash
+                && entry.revision.config_hash == artifact.revision.config_hash
+                && entry.revision.dependency_hash == artifact.revision.dependency_hash
+                && entry.document.key == document.key
+                && entry.document.content_hash == document.content_hash
+                && entry.document.byte_length == document.byte_length
+                && file.hash == document.content_hash
+                && hash(file.text.as_bytes()) == file.hash,
+            "selected native document not authenticated to capture"
+        );
+        let old_revision = &entry.revision.id;
+        let old_proof = &entry.provenance.id;
+        ensure!(
+            entry.document.revision_id == *old_revision
+                && entry.coverage.revision_id == *old_revision
+                && entry.provenance.revision_id == *old_revision
+                && entry.provenance.document == document.key
+                && entry.provenance.content_hash == document.content_hash
+                && entry.declarations.iter().all(|d| d.document == document.key
+                    && d.revision_id == *old_revision
+                    && d.provenance_id == *old_proof)
+                && entry.calls.iter().all(|c| c.document == document.key
+                    && c.revision_id == *old_revision
+                    && c.provenance_id == *old_proof)
+                && entry
+                    .control_regions
+                    .iter()
+                    .all(|r| r.document == document.key
+                        && r.revision_id == *old_revision
+                        && r.provenance_id == *old_proof),
+            "selected native facts escaped prior document"
+        );
+        let new_revision = &artifact.revision.id;
+        let proof = format!(
+            "native-proof:v1:{}",
+            digest(
+                b"baleyg.native-proof.v1\0",
+                &canonical(
+                    &json!({"producerId":PRODUCER,"document":document.key,"revisionId":new_revision})
+                )
+            )
+        );
+        entry.coverage.revision_id.clone_from(new_revision);
+        entry.provenance.revision_id.clone_from(new_revision);
+        entry.provenance.id = proof.clone();
+        for d in &mut entry.declarations {
+            d.revision_id.clone_from(new_revision);
+            d.provenance_id.clone_from(&proof);
+        }
+        for c in &mut entry.calls {
+            c.revision_id.clone_from(new_revision);
+            c.provenance_id.clone_from(&proof);
+        }
+        for r in &mut entry.control_regions {
+            r.revision_id.clone_from(new_revision);
+            r.provenance_id.clone_from(&proof);
+        }
+        artifact.coverage.push(entry.coverage);
+        artifact.provenance.push(entry.provenance);
+        artifact.declarations.extend(entry.declarations);
+        artifact.calls.extend(entry.calls);
+        artifact.control_regions.extend(entry.control_regions);
+    }
+    artifact.validate_structure(&capture.files)?;
+    capture.verify(cancel)?;
     Ok(artifact)
 }
 
@@ -799,20 +1169,37 @@ pub(crate) fn selected_source_witness(
 /// Measure exactly one document. Under `occ:v2` this is strictly document-local: it reads only
 /// `f` and the producer/source-set/revision descriptors, never another source document.
 fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Result<()> {
+    let document = a
+        .revision
+        .documents
+        .iter()
+        .find(|document| document.key.path == f.path && document.key.language == f.language)
+        .context("native document not in captured revision")?
+        .clone();
+    extract_known(a, f, &document, ids)
+}
+
+fn extract_known(
+    a: &mut Artifact,
+    f: &SourceFile,
+    document: &Document,
+    ids: &mut IdentityRegistry,
+) -> Result<()> {
     language_order(&f.language)?;
     safe_path(&f.path)?;
     // Occurrence identity binds this captured document version. Authenticate its content hash
     // and extraction context against the captured revision before measuring, so a failed
     // precondition mints no occ:v2 record at all.
     ensure!(
-        a.revision
-            .documents
-            .iter()
-            .any(|d| d.key.source_set_id == a.source_set.id
-                && d.key.language == f.language
-                && d.key.path == f.path
-                && d.content_hash == f.hash
-                && d.byte_length == f.text.len()),
+        f.hash == hash(f.text.as_bytes()),
+        "native captured source hash mismatch"
+    );
+    ensure!(
+        document.key.source_set_id == a.source_set.id
+            && document.key.language == f.language
+            && document.key.path == f.path
+            && document.content_hash == f.hash
+            && document.byte_length == f.text.len(),
         "native document not in captured revision"
     );
     let extraction_context = native_extraction_context(&a.producer, &f.language, &a.revision)?;
@@ -879,6 +1266,8 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         provenance_id: proof_id.clone(),
     });
     let mut state = ParserState {
+        call_start: a.calls.len(),
+        control_start: a.control_regions.len(),
         artifact: a,
         file: f,
         ids,
@@ -886,28 +1275,19 @@ fn extract(a: &mut Artifact, f: &SourceFile, ids: &mut IdentityRegistry) -> Resu
         proof_id,
         extraction_context,
         seen: BTreeSet::new(),
+        declaration_ordinals: BTreeMap::new(),
+        call_ordinals: BTreeMap::new(),
+        control_ordinals: BTreeMap::new(),
+        saw_definition: false,
+        saw_call: false,
         visits: 0,
         opaque_rust: false,
     };
     state.walk(tree.root_node(), &module_id, &[], &[], 0)?;
     state.finish_occurrences()?;
     let observed_roles = [
-        (
-            !state
-                .artifact
-                .declarations
-                .iter()
-                .all(|d| d.document != state.document || d.kind == "module"),
-            "definition",
-        ),
-        (
-            !state
-                .artifact
-                .calls
-                .iter()
-                .all(|c| c.document != state.document),
-            "call",
-        ),
+        (state.saw_definition, "definition"),
+        (state.saw_call, "call"),
     ]
     .into_iter()
     .filter_map(|(present, role)| present.then_some(role.into()))
@@ -951,12 +1331,19 @@ fn occurrence_input(
 }
 struct ParserState<'a> {
     artifact: &'a mut Artifact,
+    call_start: usize,
+    control_start: usize,
     file: &'a SourceFile,
     ids: &'a mut IdentityRegistry,
     document: DocumentKey,
     proof_id: String,
     extraction_context: String,
     seen: BTreeSet<(String, String, usize, usize)>,
+    declaration_ordinals: BTreeMap<String, usize>,
+    call_ordinals: BTreeMap<String, usize>,
+    control_ordinals: BTreeMap<String, usize>,
+    saw_definition: bool,
+    saw_call: bool,
     visits: usize,
     opaque_rust: bool,
 }
@@ -974,13 +1361,18 @@ impl ParserState<'_> {
     fn finish_occurrences(&mut self) -> Result<()> {
         let mut replacements = BTreeMap::new();
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (i, region) in self.artifact.control_regions.iter().enumerate() {
-            if region.document == self.document {
-                by_owner
-                    .entry(region.owner_syntax_id.clone())
-                    .or_default()
-                    .push(i);
-            }
+        for (offset, region) in self.artifact.control_regions[self.control_start..]
+            .iter()
+            .enumerate()
+        {
+            ensure!(
+                region.document == self.document,
+                "foreign native control in current document"
+            );
+            by_owner
+                .entry(region.owner_syntax_id.clone())
+                .or_default()
+                .push(self.control_start + offset);
         }
         for indexes in by_owner.values_mut() {
             indexes.sort_by_key(|i| {
@@ -999,10 +1391,8 @@ impl ParserState<'_> {
                 region.ordinal = ordinal;
             }
         }
-        for region in &mut self.artifact.control_regions {
-            if region.document == self.document
-                && let Some(parent) = &mut region.parent_id
-            {
+        for region in &mut self.artifact.control_regions[self.control_start..] {
+            if let Some(parent) = &mut region.parent_id {
                 *parent = replacements
                     .get(parent)
                     .context("native region parent not measured")?
@@ -1010,13 +1400,15 @@ impl ParserState<'_> {
             }
         }
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (i, call) in self.artifact.calls.iter().enumerate() {
-            if call.document == self.document {
-                by_owner
-                    .entry(call.owner_syntax_id.clone())
-                    .or_default()
-                    .push(i);
-            }
+        for (offset, call) in self.artifact.calls[self.call_start..].iter().enumerate() {
+            ensure!(
+                call.document == self.document,
+                "foreign native call in current document"
+            );
+            by_owner
+                .entry(call.owner_syntax_id.clone())
+                .or_default()
+                .push(self.call_start + offset);
         }
         for indexes in by_owner.values_mut() {
             indexes.sort_by_key(|i| {
@@ -1080,22 +1472,19 @@ impl ParserState<'_> {
             && (matches!(k, "implementation" | "anonymousFunction") || name(n, self.file).is_some())
         {
             let mut key = key_of(n, self.file, k);
-            let previous = self
-                .artifact
-                .declarations
-                .iter()
-                .filter(|d| {
-                    d.document == self.document
-                        && d.ancestors == ancestry
-                        && d.key.kind == key.kind
-                        && d.key.name == key.name
-                        && d.key.signature == key.signature
-                        && d.kind != "module"
-                })
-                .count();
-            key.ordinal = previous;
+            // Repeated declaration keys are document-local. A cumulative artifact
+            // scan would make a multi-file full capture quadratic in its facts.
+            // The synthetic module is not a previous measured declaration.
+            if k != "module" {
+                let ordinal_key =
+                    serde_json::to_string(&(&ancestry, &key.kind, &key.name, &key.signature))?;
+                let count = self.declaration_ordinals.entry(ordinal_key).or_default();
+                key.ordinal = *count;
+                *count += 1;
+            }
             let id=self.ids.stable(&json!({"sourceSet":self.artifact.source_set.id,"path":self.file.path,"language":self.file.language,"ancestors":ancestry,"declaration":key}))?;
             let named = name(n, self.file);
+            self.saw_definition |= k != "module";
             self.artifact.declarations.push(Declaration {
                 syntax_id: id.clone(),
                 document: self.document.clone(),
@@ -1132,12 +1521,9 @@ impl ParserState<'_> {
             ancestry.push(key);
         }
         if is_region(n) {
-            let ordinal = self
-                .artifact
-                .control_regions
-                .iter()
-                .filter(|r| r.owner_syntax_id == owner && r.document == self.document)
-                .count();
+            let count = self.control_ordinals.entry(owner.clone()).or_default();
+            let ordinal = *count;
+            *count += 1;
             let range = Range::node(n);
             ensure!(
                 self.seen
@@ -1163,12 +1549,10 @@ impl ParserState<'_> {
             regions.push(id);
         }
         if is_call(&self.file.language, n) {
-            let ordinal = self
-                .artifact
-                .calls
-                .iter()
-                .filter(|c| c.owner_syntax_id == owner && c.document == self.document)
-                .count();
+            let count = self.call_ordinals.entry(owner.clone()).or_default();
+            let ordinal = *count;
+            *count += 1;
+            self.saw_call = true;
             let range = Range::node(n);
             ensure!(
                 self.seen
@@ -1198,6 +1582,27 @@ impl ParserState<'_> {
 }
 
 impl Artifact {
+    /// Validates a selectively assembled revision. The caller already checked each
+    /// reused stored witness against captured source and normalized immutable rows;
+    /// this checks all resulting IDs/ownership and the full current capture header.
+    pub(crate) fn validate_selective(
+        &self,
+        capture: &Capture,
+        root: &Path,
+        root_id: &str,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        capture.verify(cancel)?;
+        let (header, _) = build_native_header(capture, root, root_id)?;
+        ensure!(
+            self.producer == header.producer
+                && self.source_set == header.source_set
+                && self.revision == header.revision,
+            "selective native header differs from captured revision"
+        );
+        self.validate_structure(&capture.files)?;
+        capture.verify(cancel)
+    }
     /// Reconstruct the native syntax from already-admitted immutable buffers; no source file
     /// is opened or hashed again. Comparison forbids well-shaped fabricated evidence.
     /// Honors the caller's cancellation before and after the re-derivation.
@@ -1252,6 +1657,14 @@ impl Artifact {
             "native document tuple cardinality"
         );
         let mut docs = BTreeMap::new();
+        let captured_files: BTreeMap<_, _> = files
+            .iter()
+            .map(|f| ((f.language.as_str(), f.path.as_str()), f))
+            .collect();
+        ensure!(
+            captured_files.len() == files.len(),
+            "duplicate captured native path"
+        );
         let mut last: Option<(usize, &str)> = None;
         for d in &self.revision.documents {
             safe_path(&d.key.path)?;
@@ -1261,9 +1674,8 @@ impl Artifact {
                 "unsorted or duplicate native documents"
             );
             last = Some(current);
-            let file = files
-                .iter()
-                .find(|f| f.path == d.key.path && f.language == d.key.language)
+            let file = captured_files
+                .get(&(d.key.language.as_str(), d.key.path.as_str()))
                 .context("native document not captured")?;
             ensure!(
                 d.key.source_set_id == self.source_set.id
@@ -1634,19 +2046,58 @@ mod occurrence_identity_tests {
         }
         // An undeclared producer version (e.g. the withdrawn occ:v1 producer) or language has
         // no authenticated inventory, so it fails closed.
-        for version in ["native-v2", "native-v4"] {
+        for version in ["native-v2", "native-v3"] {
             assert!(native_extraction_context(&producer(version), "rust", &revision).is_err());
         }
         assert!(native_extraction_context(&producer(NATIVE_VERSION), "go", &revision).is_err());
-        // A declared component resolves only to its captured revision digest.
+        let mut captured = revision.clone();
+        captured.config_hash = hash(b"captured config");
         assert_eq!(
-            authenticated_extraction_context("rust", &["config"], &revision).unwrap(),
-            extraction_context("rust", &[("config".into(), revision.config_hash.clone())]).unwrap()
+            authenticated_extraction_context(
+                "rust",
+                &["config"],
+                &[("config", Some(b"captured config"))],
+                &captured,
+            )
+            .unwrap(),
+            extraction_context("rust", &[("config".into(), captured.config_hash.clone())]).unwrap()
         );
-        assert!(authenticated_extraction_context("rust", &["settings"], &revision).is_err());
-        let mut unauthenticated = revision.clone();
-        unauthenticated.config_hash = "not-a-captured-digest".into();
-        assert!(authenticated_extraction_context("rust", &["config"], &unauthenticated).is_err());
+        for (inventory, observed) in [
+            (vec!["config"], vec![]),
+            (vec!["config"], vec![("config", None)]),
+            (
+                vec!["config"],
+                vec![("config", Some(b"stale config".as_slice()))],
+            ),
+            (
+                vec![],
+                vec![("config", Some(b"captured config".as_slice()))],
+            ),
+            (
+                vec!["settings"],
+                vec![("settings", Some(b"captured config".as_slice()))],
+            ),
+            (
+                vec!["config", "config"],
+                vec![("config", Some(b"captured config".as_slice()))],
+            ),
+        ] {
+            assert!(
+                authenticated_extraction_context("rust", &inventory, &observed, &captured).is_err(),
+                "{inventory:?} {observed:?}"
+            );
+        }
+        let mut forged_digest = captured.clone();
+        forged_digest.config_hash = "not-a-captured-digest".into();
+        assert!(
+            authenticated_extraction_context(
+                "rust",
+                &["config"],
+                &[("config", Some(b"captured config"))],
+                &forged_digest,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1659,7 +2110,57 @@ mod occurrence_identity_tests {
         artifact.calls.clear();
         artifact.control_regions.clear();
         assert!(extract(&mut artifact, &forged, &mut IdentityRegistry::default()).is_err());
+        forged = source.clone();
+        forged.text.push_str(" // changed after admission");
+        assert!(extract(&mut artifact, &forged, &mut IdentityRegistry::default()).is_err());
         assert!(artifact.calls.is_empty() && artifact.control_regions.is_empty());
+    }
+
+    #[test]
+    fn cached_witness_sort_matches_legacy_and_preserves_equal_key_order() {
+        let values = [
+            serde_json::json!({"b": 2, "a": 1}),
+            serde_json::json!({"a": 0}),
+            serde_json::json!({"a": 1, "b": 2}),
+            serde_json::json!({"a": 1, "b": 2}),
+        ];
+        let mut legacy: Vec<_> = values.iter().cloned().enumerate().collect();
+        let mut cached = legacy.clone();
+        legacy.sort_by_key(|(_, value)| canonical(value));
+        cached.sort_by_cached_key(|(_, value)| canonical(value));
+        assert_eq!(cached, legacy);
+        assert_eq!(
+            cached
+                .iter()
+                .map(|(ordinal, _)| *ordinal)
+                .collect::<Vec<_>>(),
+            [1, 0, 2, 3]
+        );
+        let source = file("function f() { g(); if (x) { h(); } }");
+        let a = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
+        let b = selected(&source, "revision:v1:r2", NATIVE_VERSION).unwrap();
+        let witness = |artifact: &Artifact| {
+            document_witness(
+                &artifact.revision.documents[0],
+                &artifact.producer,
+                &artifact.coverage[0],
+                &artifact.declarations,
+                &artifact.calls,
+                &artifact.control_regions,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            witness(&a),
+            "6535526d0cd8de8719f134b7153f5447d7553108981de89519b8bdc7d2eab35f",
+            "native witness bytes must retain the legacy canonical digest"
+        );
+        assert_eq!(
+            witness(&a),
+            witness(&b),
+            "revision labels do not enter native witness"
+        );
+        assert!(a.calls.iter().all(|row| row.id.starts_with("occ:v2:")));
     }
 
     #[test]
@@ -1774,5 +2275,163 @@ mod cached_executable_digest_tests {
                 .any(|expected| row.syntax_id == expected.syntax_id)
         }));
         drop(session);
+    }
+
+    fn all_index_rows(db_path: &Path) -> Vec<(String, Vec<String>)> {
+        use rusqlite::{Connection, types::Value};
+        let db = Connection::open(db_path).unwrap();
+        let tables = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut statement = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+                let count = statement.column_count();
+                let mut rows = statement
+                    .query_map([], |row| {
+                        (0..count)
+                            .map(|column| row.get::<_, Value>(column).map(|v| format!("{v:?}")))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| format!("{row:?}"))
+                    .collect::<Vec<_>>();
+                rows.sort();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rejected_extraction_components_cannot_publish_or_mint_occurrences() {
+        use crate::store::topology::WorkspaceIdentity;
+        use rusqlite::Connection;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Types.java"),
+            "class A { int go() { return helper(); } int helper() { return 1; } }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let session = store.leader_session().unwrap();
+        let leader = session.leader_guard().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let first = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let db_path = state
+            .path()
+            .join("cache/indexes")
+            .join(
+                WorkspaceIdentity::discover(Some(workspace.path()), workspace.path())
+                    .unwrap()
+                    .root_key,
+            )
+            .join("index.db");
+        let old_rows = all_index_rows(&db_path);
+        let old_source = store
+            .native_source_at(first, &native.revision.documents[0].key)
+            .unwrap();
+        let old_graph = store.graph_at(Some(first)).unwrap();
+        let old_class =
+            serde_json::to_value(store.classes_at(None, "", Some(first), 0, 100).unwrap()).unwrap();
+        let old_occurrences: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM native_version_calls WHERE id LIKE 'occ:v2:%') +
+                    (SELECT count(*) FROM native_version_control_regions WHERE id LIKE 'occ:v2:%')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(old_occurrences > 0);
+
+        fs::write(
+            workspace.path().join("Types.java"),
+            "class A { int go() { return helper() + 1; } int helper() { return 1; } }\n",
+        )
+        .unwrap();
+        // Admission and production measurement complete before the injected
+        // component fault. Only the publication boundary receives the fault.
+        let (next_graph, next_native, next_capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        assert_ne!(next_native.revision.id, native.revision.id);
+        for (fault, diagnostic) in [
+            (
+                ExtractionAuthFault::Undeclared,
+                "undeclared native extraction-input inventory",
+            ),
+            (
+                ExtractionAuthFault::Mismatched,
+                "mismatched native extraction component: config",
+            ),
+        ] {
+            let guard = inject_extraction_auth_fault(&next_native.revision.id, "java", fault);
+            let error = store
+                .publish_native(
+                    &next_graph,
+                    &next_capture,
+                    &next_native,
+                    leader,
+                    first,
+                    &cancel,
+                )
+                .unwrap_err();
+            drop(guard);
+            assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+            assert_eq!(store.status().unwrap().revision, first);
+            assert_eq!(
+                store
+                    .native_source_at(first, &native.revision.documents[0].key)
+                    .unwrap(),
+                old_source
+            );
+            assert_eq!(store.graph_at(Some(first)).unwrap(), old_graph);
+            assert_eq!(
+                serde_json::to_value(store.classes_at(None, "", Some(first), 0, 100).unwrap())
+                    .unwrap(),
+                old_class
+            );
+            assert_eq!(
+                all_index_rows(&db_path),
+                old_rows,
+                "failed auth changed old or added a new native revision"
+            );
+            let db = Connection::open(&db_path).unwrap();
+            let published: i64 = db
+                .query_row("SELECT count(*) FROM native_revisions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(published, 1, "new revision escaped component refusal");
+            let occurrence_count: i64 = db.query_row(
+                "SELECT (SELECT count(*) FROM native_version_calls WHERE id LIKE 'occ:v2:%') +
+                        (SELECT count(*) FROM native_version_control_regions WHERE id LIKE 'occ:v2:%')",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(
+                occurrence_count, old_occurrences,
+                "new occ:v2 record escaped component refusal"
+            );
+        }
     }
 }

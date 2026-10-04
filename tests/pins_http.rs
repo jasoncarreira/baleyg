@@ -390,7 +390,7 @@ fn sqlite_journal_child() {
     // Uncommitted spill rows exercise rollback without corrupting the published pair.
     for i in 0..100 {
         db.execute(
-            "INSERT INTO files(path,hash,payload) VALUES(?1,'x',?2)",
+            "INSERT INTO revision_capture_inputs(revision_id,input_key,payload) SELECT id,?1,?2 FROM native_revisions ORDER BY published_index_revision DESC LIMIT 1",
             rusqlite::params![format!("spill-{i}"), "x".repeat(4096)],
         )
         .unwrap();

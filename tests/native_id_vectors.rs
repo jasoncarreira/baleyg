@@ -231,3 +231,26 @@ fn every_decision_0003_extraction_context_and_occurrence_vector() {
     ));
     assert!(v1_digest.starts_with("ccc4d599"), "{v1_digest}");
 }
+
+#[test]
+fn native_v4_occurrence_changes_only_descriptor_input() {
+    let content_hash = hex::encode(Sha256::digest(b"f();"));
+    let context = baleyg::native_ids::extraction_context("javascript", &[]).unwrap();
+    let input = |version| {
+        json!({"contentHash":content_hash,"extractionContext":context,
+            "nativeProducerId":"baleyg.native.syntax","nativeProducerVersion":version,
+            "ownerSyntaxId":"sid:v1:6cce6099437ddb2256f7ae368d29c0b5",
+            "kind":"call","ordinal":0})
+    };
+    let v3 = input("native-v3");
+    let v4 = input("native-v4");
+    let mut registry = baleyg::native_ids::IdentityRegistry::default();
+    let old = registry.occurrence(&v3).unwrap();
+    let current = registry.occurrence(&v4).unwrap();
+    assert_ne!(old, current);
+    let canonical = encode(&v4);
+    assert_eq!(canonical, baleyg::native_ids::canonical(&v4));
+    let digest =
+        Sha256::digest([b"baleyg.occurrence.v2\0".as_slice(), canonical.as_slice()].concat());
+    assert_eq!(current, format!("occ:v2:{}", &hex::encode(digest)[..32]));
+}

@@ -575,6 +575,85 @@ impl Capture {
                 .is_some_and(|bytes| Arc::ptr_eq(bytes, &self.executable_bytes)))
         .then_some(self.executable_digest.as_str())
     }
+    /// Compare the native roles of admitted inputs, not presentation pathnames. A single
+    /// optional SCIP/manifest pathname can also be a root config, nested ignore file,
+    /// toolchain selector, or this executable. Its native role must never be filtered.
+    /// The executable uses its admitted Arc digest; do not rehash its bytes.
+    pub(crate) fn native_input_fingerprints(&self) -> Result<BTreeMap<String, Option<String>>> {
+        let mut result = BTreeMap::new();
+        for (path, expected) in &self.inputs {
+            let mut roles = Vec::new();
+            if path == &self.executable_path {
+                roles.push(format!("executable:{}", path.to_string_lossy()));
+            }
+            if path.starts_with(&self.root) {
+                let relative = path
+                    .strip_prefix(&self.root)?
+                    .to_str()
+                    .context("non-UTF8 native input path")?
+                    .replace('\\', "/");
+                if matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(".gitignore" | ".ignore")
+                ) {
+                    roles.push(format!("ignore:{relative}"));
+                } else if matches!(relative.as_str(), "rust-toolchain" | "rust-toolchain.toml") {
+                    roles.push(format!("toolchain:{relative}"));
+                } else if ROOT_INPUTS.contains(&relative.as_str()) {
+                    roles.push(format!("config:{relative}"));
+                }
+            }
+            if roles.is_empty() {
+                continue;
+            }
+            let bytes = self
+                .input_bytes
+                .get(path)
+                .context("missing admitted native input")?;
+            let digest = match (expected, bytes) {
+                (None, None) => None,
+                (Some(stat), Some(bytes)) => {
+                    ensure!(
+                        stat.kind == 2 && stat.len == bytes.len() as u64,
+                        "malformed admitted native input"
+                    );
+                    Some(if path == &self.executable_path {
+                        self.executable_digest(path)
+                            .context("native executable Arc identity mismatch")?
+                            .to_owned()
+                    } else {
+                        hash(bytes)
+                    })
+                }
+                _ => anyhow::bail!("native input bytes/stamp mismatch"),
+            };
+            for role in roles {
+                ensure!(
+                    result.insert(role, digest.clone()).is_none(),
+                    "duplicate admitted native input role"
+                );
+            }
+        }
+        ensure!(
+            result.keys().any(|key| key.starts_with("executable:")),
+            "missing admitted native executable role"
+        );
+        ensure!(
+            ROOT_INPUTS.iter().all(|name| {
+                result.contains_key(&format!(
+                    "{}:{name}",
+                    if matches!(*name, "rust-toolchain" | "rust-toolchain.toml") {
+                        "toolchain"
+                    } else {
+                        "config"
+                    }
+                ))
+            }),
+            "missing admitted native config/toolchain role"
+        );
+        Ok(result)
+    }
+
     pub(crate) fn admitted_inputs(&self) -> impl Iterator<Item = (&Path, Option<&[u8]>)> {
         self.input_bytes
             .iter()
