@@ -808,6 +808,169 @@ fn sqlite_snapshot(
 }
 
 #[test]
+fn parse_error_retained_pin_matches_independent_cold_and_advisory_uses_exact_token() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+        native_evidence::DocumentKey,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let (state, workspace) = fixture();
+    let root = workspace.path();
+    let source = "function foo() { return 1; } function caller() { obj.foo(); obj.foo.bar(); }\n";
+    fs::write(root.join("calls.js"), source).unwrap();
+    fs::write(root.join("broken.js"), "function sound() {}\n").unwrap();
+    let options = IndexOptions::new(root.to_owned());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), root).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let before = job.run(&options, &cancel, |_| {}).unwrap();
+    let path = index_dir(state.path()).join("index.db");
+    let old_rows = sqlite_snapshot(&path, before, false);
+    let old_graph = store.graph_at(Some(before)).unwrap();
+
+    // The changed document has a genuine parser error. A new isolated index in
+    // this SAME workspace is the independent full-native oracle, never a copied F.
+    fs::write(root.join("broken.js"), "function broken( {\n").unwrap();
+    let parsed = IndexJobCoordinator::prepare_with_session(&store, Some(before), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(sqlite_snapshot(&path, before, false), old_rows);
+    assert_eq!(store.graph_at(Some(before)).unwrap(), old_graph);
+    let parsed_graph = store.graph_at(Some(parsed)).unwrap();
+    assert!(parsed_graph.stats.parse_error_files > 0);
+    let parsed_classes =
+        serde_json::to_value(store.classes_at(None, "", Some(parsed), 0, 100).unwrap()).unwrap();
+
+    // #22 advisory is only this same-pin native primitive, never a binding.
+    // Compare actual captured token bytes, then exact language/source-set key.
+    let key = DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "javascript".into(),
+        path: "calls.js".into(),
+    };
+    let selected = store.native_source_at(parsed, &key).unwrap().unwrap();
+    let captured = std::str::from_utf8(&selected.1).unwrap();
+    let coverage = store.native_coverage_at(parsed, &key).unwrap().unwrap();
+    let owners = store
+        .native_declarations_at(parsed, "javascript", "caller")
+        .unwrap();
+    assert_eq!(owners.len(), 1);
+    let calls = store.native_calls_at(parsed, &owners[0].syntax_id).unwrap();
+    let positive = calls
+        .iter()
+        .find(|call| &captured[call.range.start..call.range.end] == "obj.foo()")
+        .expect("positive captured call");
+    let token = positive
+        .callee_range
+        .as_ref()
+        .expect("exact identifier range");
+    assert_eq!(&captured[token.start..token.end], "foo");
+    assert_eq!(positive.spelling.as_deref(), Some("foo"));
+    let candidates = store
+        .native_declarations_at(parsed, "javascript", "foo")
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].document.source_set_id, key.source_set_id);
+    assert_eq!(candidates[0].document.language, key.language);
+    assert_eq!(positive.revision_id, coverage.revision_id);
+    assert_eq!(candidates[0].revision_id, coverage.revision_id);
+    assert!(positive.provenance_id.starts_with("native-proof:v1:"));
+    assert!(candidates[0].provenance_id.starts_with("native-proof:v1:"));
+
+    let compound = calls
+        .iter()
+        .find(|call| &captured[call.range.start..call.range.end] == "obj.foo.bar()")
+        .expect("compound captured call");
+    let compound_token = compound
+        .callee_range
+        .as_ref()
+        .expect("terminal identifier range");
+    assert_eq!(&captured[compound_token.start..compound_token.end], "bar");
+    assert_ne!(
+        &captured[compound_token.start..compound_token.end],
+        "obj.foo.bar"
+    );
+    assert!(
+        store
+            .native_declarations_at(parsed, "javascript", "bar")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .native_declarations_at(parsed, "javascript", "obj.foo.bar")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(compound.revision_id, coverage.revision_id);
+
+    // A fresh independent full build shares the captured workspace root but not
+    // state or stored native/class/graph projections. Taking its leader lock can
+    // retire the first store's public reader; collect those DTOs above first.
+    let cold_state = tempfile::tempdir().unwrap();
+    fs::set_permissions(cold_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let cold = Store::open_for_tests(cold_state.path(), root).unwrap();
+    let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+    let _cold_session = cold_job.session();
+    let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+    assert_eq!(
+        sqlite_snapshot(&path, parsed, true),
+        sqlite_snapshot(
+            &index_dir(cold_state.path()).join("index.db"),
+            cold_pin,
+            true
+        ),
+        "all 28 selected v8 evidence tables: source/hash, revision, coverage, provenance, IDs, ordered native children, graph, class/warnings/truncated"
+    );
+    assert_eq!(sqlite_snapshot(&path, before, false), old_rows);
+    assert_eq!(parsed_graph, cold.graph_at(Some(cold_pin)).unwrap());
+    let mut cold_classes =
+        serde_json::to_value(cold.classes_at(None, "", Some(cold_pin), 0, 100).unwrap()).unwrap();
+    let mut parsed_classes = parsed_classes;
+    assert_eq!(
+        parsed_classes["revision"]["indexRevision"],
+        parsed.index_revision
+    );
+    assert_eq!(
+        cold_classes["revision"]["indexRevision"],
+        cold_pin.index_revision
+    );
+    parsed_classes.as_object_mut().unwrap().remove("revision");
+    cold_classes.as_object_mut().unwrap().remove("revision");
+    assert_eq!(parsed_classes, cold_classes);
+    assert_eq!(
+        selected.1,
+        cold.native_source_at(cold_pin, &key).unwrap().unwrap().1
+    );
+    assert_eq!(
+        coverage,
+        cold.native_coverage_at(cold_pin, &key).unwrap().unwrap()
+    );
+    let cold_owner = cold
+        .native_declarations_at(cold_pin, "javascript", "caller")
+        .unwrap();
+    assert_eq!(owners, cold_owner);
+    assert_eq!(
+        calls,
+        cold.native_calls_at(cold_pin, &cold_owner[0].syntax_id)
+            .unwrap()
+    );
+    assert_eq!(
+        candidates,
+        cold.native_declarations_at(cold_pin, "javascript", "foo")
+            .unwrap()
+    );
+    assert!(
+        cold.native_declarations_at(cold_pin, "javascript", "bar")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn document_local_delta_and_cross_file_fallback_match_independent_cold_publications() {
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,

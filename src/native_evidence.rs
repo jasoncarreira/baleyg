@@ -45,6 +45,43 @@ const EXTRACTION_INPUTS: &[(&str, &str, &[LanguageInventory])] = &[(
         ("javascript", &[]),
     ],
 )];
+
+// Private unit-test fault injection only. Integration tests compile the ordinary
+// library, and release builds have no override, branch, or alternate inventory.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ExtractionAuthFault {
+    Undeclared,
+    Mismatched,
+}
+#[cfg(test)]
+thread_local! {
+    static EXTRACTION_AUTH_FAULT: std::cell::RefCell<Option<(String, String, ExtractionAuthFault)>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+struct ExtractionAuthFaultGuard;
+#[cfg(test)]
+impl Drop for ExtractionAuthFaultGuard {
+    fn drop(&mut self) {
+        EXTRACTION_AUTH_FAULT.with(|fault| *fault.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+fn inject_extraction_auth_fault(
+    revision: &str,
+    language: &str,
+    fault: ExtractionAuthFault,
+) -> ExtractionAuthFaultGuard {
+    EXTRACTION_AUTH_FAULT.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "nested extraction authentication injection"
+        );
+        *slot.borrow_mut() = Some((revision.to_owned(), language.to_owned(), fault));
+    });
+    ExtractionAuthFaultGuard
+}
 /// Authenticate the declared inventory of `producer` for `language` against the captured
 /// revision and derive the document's extraction context. This is the fail-closed
 /// precondition for minting any `occ:v2` ID: an undeclared descriptor/language or a declared
@@ -54,6 +91,24 @@ fn native_extraction_context(
     language: &str,
     revision: &Revision,
 ) -> Result<String> {
+    #[cfg(test)]
+    if let Some(fault) = EXTRACTION_AUTH_FAULT.with(|slot| {
+        slot.borrow().as_ref().and_then(|(id, lang, fault)| {
+            (id == &revision.id && lang == language).then_some(*fault)
+        })
+    }) {
+        return match fault {
+            ExtractionAuthFault::Undeclared => {
+                anyhow::bail!("undeclared native extraction-input inventory")
+            }
+            ExtractionAuthFault::Mismatched => authenticated_extraction_context(
+                language,
+                &["config"],
+                &[("config", Some(b"test-only mismatched captured config"))],
+                revision,
+            ),
+        };
+    }
     let inventory = EXTRACTION_INPUTS
         .iter()
         .find(|(id, version, _)| *id == producer.id && *version == producer.version)
@@ -2220,5 +2275,163 @@ mod cached_executable_digest_tests {
                 .any(|expected| row.syntax_id == expected.syntax_id)
         }));
         drop(session);
+    }
+
+    fn all_index_rows(db_path: &Path) -> Vec<(String, Vec<String>)> {
+        use rusqlite::{Connection, types::Value};
+        let db = Connection::open(db_path).unwrap();
+        let tables = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut statement = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+                let count = statement.column_count();
+                let mut rows = statement
+                    .query_map([], |row| {
+                        (0..count)
+                            .map(|column| row.get::<_, Value>(column).map(|v| format!("{v:?}")))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| format!("{row:?}"))
+                    .collect::<Vec<_>>();
+                rows.sort();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rejected_extraction_components_cannot_publish_or_mint_occurrences() {
+        use crate::store::topology::WorkspaceIdentity;
+        use rusqlite::Connection;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Types.java"),
+            "class A { int go() { return helper(); } int helper() { return 1; } }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let session = store.leader_session().unwrap();
+        let leader = session.leader_guard().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let first = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let db_path = state
+            .path()
+            .join("cache/indexes")
+            .join(
+                WorkspaceIdentity::discover(Some(workspace.path()), workspace.path())
+                    .unwrap()
+                    .root_key,
+            )
+            .join("index.db");
+        let old_rows = all_index_rows(&db_path);
+        let old_source = store
+            .native_source_at(first, &native.revision.documents[0].key)
+            .unwrap();
+        let old_graph = store.graph_at(Some(first)).unwrap();
+        let old_class =
+            serde_json::to_value(store.classes_at(None, "", Some(first), 0, 100).unwrap()).unwrap();
+        let old_occurrences: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM native_version_calls WHERE id LIKE 'occ:v2:%') +
+                    (SELECT count(*) FROM native_version_control_regions WHERE id LIKE 'occ:v2:%')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(old_occurrences > 0);
+
+        fs::write(
+            workspace.path().join("Types.java"),
+            "class A { int go() { return helper() + 1; } int helper() { return 1; } }\n",
+        )
+        .unwrap();
+        // Admission and production measurement complete before the injected
+        // component fault. Only the publication boundary receives the fault.
+        let (next_graph, next_native, next_capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        assert_ne!(next_native.revision.id, native.revision.id);
+        for (fault, diagnostic) in [
+            (
+                ExtractionAuthFault::Undeclared,
+                "undeclared native extraction-input inventory",
+            ),
+            (
+                ExtractionAuthFault::Mismatched,
+                "mismatched native extraction component: config",
+            ),
+        ] {
+            let guard = inject_extraction_auth_fault(&next_native.revision.id, "java", fault);
+            let error = store
+                .publish_native(
+                    &next_graph,
+                    &next_capture,
+                    &next_native,
+                    leader,
+                    first,
+                    &cancel,
+                )
+                .unwrap_err();
+            drop(guard);
+            assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+            assert_eq!(store.status().unwrap().revision, first);
+            assert_eq!(
+                store
+                    .native_source_at(first, &native.revision.documents[0].key)
+                    .unwrap(),
+                old_source
+            );
+            assert_eq!(store.graph_at(Some(first)).unwrap(), old_graph);
+            assert_eq!(
+                serde_json::to_value(store.classes_at(None, "", Some(first), 0, 100).unwrap())
+                    .unwrap(),
+                old_class
+            );
+            assert_eq!(
+                all_index_rows(&db_path),
+                old_rows,
+                "failed auth changed old or added a new native revision"
+            );
+            let db = Connection::open(&db_path).unwrap();
+            let published: i64 = db
+                .query_row("SELECT count(*) FROM native_revisions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(published, 1, "new revision escaped component refusal");
+            let occurrence_count: i64 = db.query_row(
+                "SELECT (SELECT count(*) FROM native_version_calls WHERE id LIKE 'occ:v2:%') +
+                        (SELECT count(*) FROM native_version_control_regions WHERE id LIKE 'occ:v2:%')",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(
+                occurrence_count, old_occurrences,
+                "new occ:v2 record escaped component refusal"
+            );
+        }
     }
 }
