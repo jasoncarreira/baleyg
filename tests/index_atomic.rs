@@ -986,6 +986,10 @@ fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
             "file-extraction",
             "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1)",
         ),
+        (
+            "source-set",
+            "UPDATE revision_documents SET source_set_id='forged-source-set' WHERE path='A.java'",
+        ),
     ] {
         let (state, workspace) = fixture();
         fs::write(
@@ -1005,6 +1009,11 @@ fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
         let session = job.session();
         let first = job.run(&options, &cancel, |_| {}).unwrap();
         let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        if family == "source-set" {
+            // This adversarial row violates the composite document-version FK;
+            // all existing graph/native/class forgeries above remain FK-valid.
+            db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        }
         assert_eq!(
             db.execute(mutation, []).unwrap(),
             1,
@@ -1037,6 +1046,7 @@ fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
                         .classes_at(Some("A.java"), "", Some(second), 0, 10)
                         .map(|_| ())
                         .unwrap_err(),
+                    "source-set" => panic!("source-set mismatch must fail before commit"),
                     _ => unreachable!(),
                 };
                 assert!(

@@ -5088,7 +5088,7 @@ impl Store {
             let source_set_id = format!("source-set:v1:{}", self.root_id());
             let producer_id = crate::native_evidence::PRODUCER;
             let producer_version = crate::native_evidence::NATIVE_VERSION;
-            let mut statement = db.prepare("SELECT m.path,m.language,v.content_hash,v.byte_length,v.source_bytes,
+            let mut statement = db.prepare("SELECT m.source_set_id,m.path,m.language,v.content_hash,v.byte_length,v.source_bytes,
                 v.extraction_context,v.producer_id,v.producer_version,m.document_version_id,
                 m.graph_projection_id,m.class_projection_id,g.graph_hash,c.content_hash,
                 g.class_extraction_payload,m.coverage_requested,m.coverage_selected,
@@ -5099,16 +5099,18 @@ impl Store {
                 WHERE m.revision_id=?1 ORDER BY m.ordinal")?;
             for row in statement.query_map([&selected.key], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?, r.get::<_, Vec<u8>>(4)?, r.get::<_, String>(5)?,
+                    r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, Vec<u8>>(5)?,
                     r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?,
-                    r.get::<_, String>(9)?, r.get::<_, Option<String>>(10)?,
-                    r.get::<_, String>(11)?, r.get::<_, Option<String>>(12)?,
-                    r.get::<_, Option<String>>(13)?, r.get::<_, bool>(14)?,
-                    r.get::<_, bool>(15)?, r.get::<_, String>(16)?,
-                    r.get::<_, Option<String>>(17)?))
+                    r.get::<_, String>(9)?, r.get::<_, String>(10)?,
+                    r.get::<_, Option<String>>(11)?, r.get::<_, String>(12)?,
+                    r.get::<_, Option<String>>(13)?, r.get::<_, Option<String>>(14)?,
+                    r.get::<_, bool>(15)?, r.get::<_, bool>(16)?,
+                    r.get::<_, String>(17)?, r.get::<_, Option<String>>(18)?))
             })? {
-                let (path,language,hash,length,bytes,context,id,version,version_id,
+                let (row_source_set_id,path,language,hash,length,bytes,context,id,version,version_id,
                     graph_id,class_id,graph_hash,class_hash,extraction,requested,covered,state,diagnostic)=row?;
+                ensure!(row_source_set_id == source_set_id,
+                    "incompatible_index: prior manifest source-set identity mismatch");
                 ensure!(length >= 0 && length as usize == bytes.len()
                     && hash == hex::encode(sha2::Sha256::digest(&bytes)),
                     "incompatible_index: prior captured source witness mismatch");
@@ -5144,14 +5146,29 @@ impl Store {
             if old_coverage.state != "complete" { return Ok(None); }
             let changed_file=capture.files.iter().find(|f|f.path==path).context("changed file missing")?;
             let stored=prior_ids.get(&path).context("prior changed version missing")?;
-            ensure!(previous.iter().find(|f|f.path==path).is_some_and(|f|f.hash != changed_file.hash),
+            // The captured root has one source-set identity; the selected SQL
+            // rows above must belong to it. Reject collisions instead of letting
+            // a same-path row in another language silently shadow an old fact.
+            let previous_by_key: BTreeMap<(&str, &str, &str), &SourceFile> = previous
+                .iter()
+                .map(|f| ((source_set_id.as_str(), f.language.as_str(), f.path.as_str()), f))
+                .collect();
+            ensure!(previous_by_key.len() == previous.len(),
+                "incompatible_index: duplicate prior document identity");
+            let changed_key = (source_set_id.as_str(), changed_file.language.as_str(), path.as_str());
+            let prior_changed = previous_by_key.get(&changed_key)
+                .context("incompatible_index: changed document identity missing")?;
+            ensure!(prior_changed.language == changed_file.language
+                && prior_changed.hash != changed_file.hash,
                 "local edit did not change captured content hash");
             // The new document is extracted and fully checked; prior versions
             // are linked only by exact captured identity and selected ancestry.
             for file in &capture.files {
                 if file.path != path {
-                    let old=previous.iter().find(|f|f.path==file.path).context("old manifest path missing")?;
-                    ensure!(old.language==file.language && old.hash==file.hash,
+                    let key = (source_set_id.as_str(), file.language.as_str(), file.path.as_str());
+                    let old = previous_by_key.get(&key)
+                        .context("incompatible_index: unchanged document identity missing")?;
+                    ensure!(old.language == file.language && old.hash == file.hash,
                         "incompatible_index: unchanged document identity mismatch");
                 }
             }

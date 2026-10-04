@@ -77,6 +77,43 @@ def published(db, output, size):
             "produced_native_facts_total": sum(counts.values())}
 
 
+def check_selected_local_ids(db, prior, current, changed_path, size, n):
+    expected_docs = 1000 if size == "medium" else 10000
+    prior_count = db.execute(
+        "SELECT count(*) FROM revision_documents WHERE revision_id=?", (prior,)
+    ).fetchone()[0]
+    # Join by the FULL selected document key. Counts alone could
+    # hide a second changed path whose IDs coincidentally offset.
+    identity = db.execute("""SELECT count(*),
+        sum(a.document_version_id=b.document_version_id),
+        sum(a.graph_projection_id=b.graph_projection_id),
+        sum(a.class_projection_id IS b.class_projection_id),
+        sum(CASE WHEN a.path=?3 AND a.language='python' THEN 1 ELSE 0 END),
+        sum(CASE WHEN a.path=?3 AND a.language='python'
+            AND a.document_version_id!=b.document_version_id
+            AND a.graph_projection_id!=b.graph_projection_id
+            AND a.class_projection_id IS NOT b.class_projection_id
+            THEN 1 ELSE 0 END),
+        sum(CASE WHEN NOT (a.path=?3 AND a.language='python')
+            AND (a.document_version_id!=b.document_version_id
+                 OR a.graph_projection_id!=b.graph_projection_id
+                 OR a.class_projection_id IS NOT b.class_projection_id)
+            THEN 1 ELSE 0 END)
+        FROM revision_documents a JOIN revision_documents b
+        USING(source_set_id,language,path)
+        WHERE a.revision_id=?1 AND b.revision_id=?2""",
+        (current, prior, changed_path)).fetchone()
+    reuse = dict(zip(("documents", "native_versions", "graph_projections",
+                      "class_projections"), identity[:4]))
+    require(prior_count == expected_docs and reuse["documents"] == expected_docs
+            and identity[4:] == (1, 1, 0)
+            and all(reuse[name] == expected_docs - 1 for name in
+                ("native_versions", "graph_projections", "class_projections")),
+            f"{size} run {n}: full-key prior/selected ID proof failed: "
+            f"prior={prior_count}, reuse={reuse}, target/changed/other={identity[4:]}")
+    return reuse
+
+
 def index(binary, root, home, size):
     env = os.environ.copy()
     env.update(HOME=str(home), XDG_CACHE_HOME=str(home / ".cache"),
@@ -183,30 +220,25 @@ def main():
             setup_seconds, initial = index(BINARY, workspace, home, size)
             require(initial["mode"] == "full", f"{size}: cold setup must fully measure the pinned corpus")
             samples = []
+            edited_paths = set()
             for n in range(20):  # independent canonical single-document revisions
                 leaf = workspace / "python" / f"C{size}{n:04d}.py"
+                changed_path = leaf.relative_to(workspace).as_posix()
+                require(changed_path not in edited_paths, f"{size}: duplicate edited leaf {changed_path}")
+                edited_paths.add(changed_path)
                 before_literal, after_literal = edit_leaf(leaf)
                 seconds, own = index(BINARY, workspace, home, size)
                 require(own["mode"] == "local", f"{size} run {n}: not a proven-local publication")
+                if size == "large":
+                    require(all(0 < own["phases_ms"][phase] <= seconds * 1000 for phase in
+                                ("capture", "measure", "compose", "attest", "publish", "queue_and_jobs")),
+                            f"large run {n}: missing or invalid per-local phase diagnostics: {own['phases_ms']}")
                 after_db = sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)
                 try:
                     current = own["revision"]
                     generation, number = current.rsplit(":", 1)
                     prior = f"{generation}:{int(number)-1}"
-                    reuse = after_db.execute("""SELECT count(*),
-                        sum(a.document_version_id=b.document_version_id),
-                        sum(a.graph_projection_id=b.graph_projection_id),
-                        sum(a.class_projection_id IS b.class_projection_id)
-                        FROM revision_documents a JOIN revision_documents b
-                        USING(source_set_id,language,path)
-                        WHERE a.revision_id=? AND b.revision_id=?""",
-                        (prior,current)).fetchone()
-                    reuse = dict(zip(("documents","native_versions","graph_projections",
-                                      "class_projections"), reuse))
-                    require(reuse["documents"] == (1000 if size == "medium" else 10000)
-                            and all(reuse[name] == reuse["documents"]-1 for name in
-                                ("native_versions","graph_projections","class_projections")),
-                            f"{size} run {n}: not one changed-document projection: {reuse}")
+                    reuse = check_selected_local_ids(after_db, prior, current, changed_path, size, n)
                 finally:
                     after_db.close()
                 counters = own["writer_bind"]
