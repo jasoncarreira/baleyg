@@ -964,7 +964,7 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
 }
 
 #[test]
-fn local_reuse_refuses_corrupt_native_graph_and_class_witnesses_before_commit() {
+fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
@@ -986,6 +986,10 @@ fn local_reuse_refuses_corrupt_native_graph_and_class_witnesses_before_commit() 
             "file-extraction",
             "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1)",
         ),
+        (
+            "source-set",
+            "UPDATE revision_documents SET source_set_id='forged-source-set' WHERE path='A.java'",
+        ),
     ] {
         let (state, workspace) = fixture();
         fs::write(
@@ -1005,6 +1009,11 @@ fn local_reuse_refuses_corrupt_native_graph_and_class_witnesses_before_commit() 
         let session = job.session();
         let first = job.run(&options, &cancel, |_| {}).unwrap();
         let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        if family == "source-set" {
+            // This adversarial row violates the composite document-version FK;
+            // all existing graph/native/class forgeries above remain FK-valid.
+            db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        }
         assert_eq!(
             db.execute(mutation, []).unwrap(),
             1,
@@ -1016,24 +1025,53 @@ fn local_reuse_refuses_corrupt_native_graph_and_class_witnesses_before_commit() 
             "function local() { return 2; }\n",
         )
         .unwrap();
-        let failure = IndexJobCoordinator::prepare_with_session(&store, Some(first), session)
-            .unwrap()
-            .run(&options, &cancel, |_| {})
-            .unwrap_err();
-        assert!(
-            failure.to_string().contains("incompatible_index"),
-            "{family}: {failure:#}"
-        );
-        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-        let revision: i64 = db
-            .query_row("SELECT index_revision FROM index_metadata", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(
-            revision, first.index_revision as i64,
-            "{family}: no partial publication"
-        );
+        let publication =
+            IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+                .unwrap()
+                .run(&options, &cancel, |_| {});
+        match publication {
+            Ok(second) => {
+                assert_eq!(
+                    second.index_revision,
+                    first.index_revision + 1,
+                    "{family}: only complete publications advance the pin"
+                );
+                let selected = match family {
+                    "native" => store
+                        .native_declarations_at(second, "java", "A")
+                        .map(|_| ())
+                        .unwrap_err(),
+                    "graph" => store.graph_at(Some(second)).map(|_| ()).unwrap_err(),
+                    "class" | "file-extraction" => store
+                        .classes_at(Some("A.java"), "", Some(second), 0, 10)
+                        .map(|_| ())
+                        .unwrap_err(),
+                    "source-set" => panic!("source-set mismatch must fail before commit"),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    selected.to_string().contains("incompatible_index"),
+                    "{family}: selected-read attestation must refuse forgery: {selected:#}"
+                );
+            }
+            Err(failure) => {
+                assert!(
+                    failure.to_string().contains("incompatible_index"),
+                    "{family}: {failure:#}"
+                );
+                let db =
+                    rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+                let revision: i64 = db
+                    .query_row("SELECT index_revision FROM index_metadata", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    revision, first.index_revision as i64,
+                    "{family}: precommit refusal leaves complete old pin"
+                );
+            }
+        }
     }
 }
 

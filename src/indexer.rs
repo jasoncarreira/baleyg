@@ -805,12 +805,62 @@ pub(crate) fn project_native(
     cancel: &CancelFlag,
     progress: &impl Fn(IndexProgress),
 ) -> Result<Graph> {
+    project_native_selected(options, capture, native, cancel, progress, None)
+}
+
+/// The fast local path projects only the fully validated changed document.
+/// The writer retains prior projection IDs for every unchanged manifest entry.
+pub(crate) fn project_native_document(
+    options: &IndexOptions,
+    capture: &Capture,
+    native: &native_evidence::Artifact,
+    path: &str,
+    cancel: &CancelFlag,
+    progress: &impl Fn(IndexProgress),
+) -> Result<Graph> {
+    ensure!(
+        native.declarations.iter().all(|d| d.document.path == path)
+            && native.calls.iter().all(|c| c.document.path == path)
+            && native
+                .control_regions
+                .iter()
+                .all(|r| r.document.path == path)
+            && native.coverage.len() == 1
+            && native.coverage[0].document_path == path,
+        "selected native projection contains another document"
+    );
+    project_native_selected(options, capture, native, cancel, progress, Some(path))
+}
+
+fn project_native_selected(
+    options: &IndexOptions,
+    capture: &Capture,
+    native: &native_evidence::Artifact,
+    cancel: &CancelFlag,
+    progress: &impl Fn(IndexProgress),
+    selected: Option<&str>,
+) -> Result<Graph> {
     ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
-    capture.claim_graph_projection()?;
-    let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    if selected.is_none() {
+        capture.claim_graph_projection()?;
+    }
+    let selected_files: Vec<_> = capture
+        .files
+        .iter()
+        .filter(|f| selected.is_none_or(|path| f.path == path))
+        .cloned()
+        .collect();
+    ensure!(
+        selected.is_none() || selected_files.len() == 1,
+        "selected graph source is missing or ambiguous"
+    );
+    let files: BTreeMap<_, _> = selected_files
+        .iter()
+        .map(|f| (f.path.as_str(), f))
+        .collect();
     let lines = line_indexes(&files);
     let mut graph = Graph {
-        files: capture.files.clone(),
+        files: selected_files.clone(),
         ..Graph::default()
     };
     let display_labels = measured_display_labels(options, capture, native);

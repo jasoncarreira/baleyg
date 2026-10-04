@@ -24,7 +24,7 @@ where
 }
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
-const PRODUCER: &str = "baleyg.native.syntax";
+pub(crate) const PRODUCER: &str = "baleyg.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
 pub(crate) const NATIVE_VERSION: &str = "native-v4";
@@ -363,7 +363,9 @@ pub(crate) fn document_witness(
                 Ok(value)
             })
             .collect::<Result<_>>()?;
-        facts.sort_by_key(canonical);
+        // Canonicalization walks and sorts nested JSON. Compute each sort key
+        // once; recalculating it for every comparison dominates reuse checks.
+        facts.sort_by_cached_key(canonical);
         Ok(facts)
     }
     let mut coverage = serde_json::to_value(coverage)?;
@@ -645,9 +647,43 @@ pub(crate) fn measure_captured_document(
     })
 }
 
+/// Authenticate a newly measured document on its own. Unchanged rows in the
+/// captured revision are already validated immutable rows of this generation;
+/// callers carry only their manifest identities, not their occurrence records.
+pub(crate) fn validated_changed_artifact(
+    capture: &Capture,
+    selected: SelectedDocument,
+    cancel: &CancelFlag,
+) -> Result<Artifact> {
+    let file = capture
+        .files
+        .iter()
+        .find(|file| file.path == selected.document.key.path)
+        .context("changed native source missing from capture")?;
+    let full_documents = selected.revision.documents.clone();
+    let mut artifact = Artifact {
+        producer: selected.producer,
+        source_set: selected.source_set,
+        revision: Revision {
+            documents: vec![selected.document],
+            ..selected.revision
+        },
+        coverage: vec![selected.coverage],
+        provenance: vec![selected.provenance],
+        declarations: selected.declarations,
+        calls: selected.calls,
+        control_regions: selected.control_regions,
+    };
+    artifact.validate_structure(std::slice::from_ref(file))?;
+    capture.verify(cancel)?;
+    artifact.revision.documents = full_documents;
+    Ok(artifact)
+}
+
 /// Assemble a full captured revision from one measured document and independently
 /// authenticated immutable prior versions. Rebinding changes ONLY requested-revision
 /// coverage/provenance; stable syntax and occurrence IDs are never inferred anew.
+#[allow(dead_code)] // Kept for the bounded legacy diagnostic tests; Option C publishes changed-only facts.
 pub(crate) fn assemble_selected_revision(
     capture: &Capture,
     root: &Path,
@@ -2023,6 +2059,53 @@ mod occurrence_identity_tests {
         forged.text.push_str(" // changed after admission");
         assert!(extract(&mut artifact, &forged, &mut IdentityRegistry::default()).is_err());
         assert!(artifact.calls.is_empty() && artifact.control_regions.is_empty());
+    }
+
+    #[test]
+    fn cached_witness_sort_matches_legacy_and_preserves_equal_key_order() {
+        let values = [
+            serde_json::json!({"b": 2, "a": 1}),
+            serde_json::json!({"a": 0}),
+            serde_json::json!({"a": 1, "b": 2}),
+            serde_json::json!({"a": 1, "b": 2}),
+        ];
+        let mut legacy: Vec<_> = values.iter().cloned().enumerate().collect();
+        let mut cached = legacy.clone();
+        legacy.sort_by_key(|(_, value)| canonical(value));
+        cached.sort_by_cached_key(|(_, value)| canonical(value));
+        assert_eq!(cached, legacy);
+        assert_eq!(
+            cached
+                .iter()
+                .map(|(ordinal, _)| *ordinal)
+                .collect::<Vec<_>>(),
+            [1, 0, 2, 3]
+        );
+        let source = file("function f() { g(); if (x) { h(); } }");
+        let a = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
+        let b = selected(&source, "revision:v1:r2", NATIVE_VERSION).unwrap();
+        let witness = |artifact: &Artifact| {
+            document_witness(
+                &artifact.revision.documents[0],
+                &artifact.producer,
+                &artifact.coverage[0],
+                &artifact.declarations,
+                &artifact.calls,
+                &artifact.control_regions,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            witness(&a),
+            "6535526d0cd8de8719f134b7153f5447d7553108981de89519b8bdc7d2eab35f",
+            "native witness bytes must retain the legacy canonical digest"
+        );
+        assert_eq!(
+            witness(&a),
+            witness(&b),
+            "revision labels do not enter native witness"
+        );
+        assert!(a.calls.iter().all(|row| row.id.starts_with("occ:v2:")));
     }
 
     #[test]
