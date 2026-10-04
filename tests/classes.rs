@@ -773,11 +773,15 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     let before = cap_expected("moving-before", &[a.clone(), b.clone()], 2, 2, limits);
     let mut grown = a;
     grown.source_bytes = 2;
-    let unchanged_b = b.clone();
-    let after = cap_expected("moving-after", &[grown, b.clone()], 2, 2, limits);
+    let before_f_b = serde_json::to_vec(&b).unwrap();
+    // Produce B's per-file extraction independently of the earlier A growth;
+    // comparing B to its own clone would prove nothing about the cut.
+    let after_f_b = cap_file("B.java", 1, 1, true);
+    let after_f_b_bytes = serde_json::to_vec(&after_f_b).unwrap();
+    let after = cap_expected("moving-after", &[grown, after_f_b], 2, 2, limits);
     assert_eq!(
-        b, unchanged_b,
-        "later file F is unchanged by the earlier growth"
+        before_f_b, after_f_b_bytes,
+        "the later file's independent F must not change with earlier growth"
     );
     #[derive(serde::Serialize)]
     struct LaterProjection<'a> {

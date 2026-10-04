@@ -1,0 +1,29 @@
+{
+  "publishedRevision": {
+    "indexGeneration": "2fb19443-71ee-4b5b-9d43-4c8109a3d4dd",
+    "indexRevision": 4
+  },
+  "status": {
+    "diagnostics": [],
+    "evidenceFormat": "terminal-native-graph-v1",
+    "indexedAt": "1791141333635",
+    "revision": {
+      "indexGeneration": "2fb19443-71ee-4b5b-9d43-4c8109a3d4dd",
+      "indexRevision": 4
+    },
+    "stats": {
+      "ambiguous": 0,
+      "calls": 557984,
+      "changedFiles": [],
+      "external": 0,
+      "files": 1000,
+      "internal": 0,
+      "parseErrorFiles": 0,
+      "regions": 160140,
+      "semanticState": "unavailable",
+      "symbols": 217249,
+      "unresolved": 557984
+    },
+    "workspaceRoot": "/private/var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-a2-common-medium-7undap41/corpus"
+  }
+}

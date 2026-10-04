@@ -1276,7 +1276,11 @@ fn v8_document_projection(
     native: &crate::native_evidence::Artifact,
     grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
-    let context = crate::native_ids::extraction_context(&file.language, &[])?;
+    let context = crate::native_evidence::native_extraction_context(
+        &native.producer,
+        &file.language,
+        &native.revision,
+    )?;
     let version_id = v8_id(
         "document:v1",
         b"baleyg.document-version.v1\0",
@@ -1863,7 +1867,11 @@ fn write_native(
         } else {
             v8_document_projection(file, a, grouped)?
         };
-        let context = crate::native_ids::extraction_context(&file.language, &[])?;
+        let context = crate::native_evidence::native_extraction_context(
+            &a.producer,
+            &file.language,
+            &a.revision,
+        )?;
         if !reuse.for_path(&file.path).native {
             immutable.insert(
                 db,
@@ -3363,31 +3371,7 @@ impl Store {
     ) -> Result<Self> {
         identity.verify()?;
         roots.prepare_index(&identity)?;
-        let store = Self {
-            workspace_root: identity
-                .root
-                .to_str()
-                .context("workspace path is not UTF-8")?
-                .to_owned(),
-            roots,
-            identity: Arc::new(identity),
-            recovery_required: Arc::new(AtomicBool::new(false)),
-            recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
-            obsolete_format_marker: Arc::new(Mutex::new(None)),
-            pending_request_completion: Arc::new(Mutex::new(None)),
-            request_file_witness: Arc::new(Mutex::new(None)),
-            writer_counters: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
-            #[cfg(test)]
-            test_queue_select_hook: Arc::new(TestOneShotHook::default()),
-            #[cfg(test)]
-            test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
-            #[cfg(test)]
-            test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            test_queue_post_commit_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        };
+        let store = Self::unopened(roots, identity)?;
         if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.leader(&store.identity)?;
             store.initialize(&leader, before_publish)?;
@@ -3413,6 +3397,101 @@ impl Store {
             }
             Err(error) => Err(error),
         }
+    }
+    fn unopened(
+        roots: topology::TopologyRoots,
+        identity: topology::WorkspaceIdentity,
+    ) -> Result<Self> {
+        Ok(Self {
+            workspace_root: identity
+                .root
+                .to_str()
+                .context("workspace path is not UTF-8")?
+                .to_owned(),
+            roots,
+            identity: Arc::new(identity),
+            recovery_required: Arc::new(AtomicBool::new(false)),
+            recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
+            obsolete_format_marker: Arc::new(Mutex::new(None)),
+            pending_request_completion: Arc::new(Mutex::new(None)),
+            request_file_witness: Arc::new(Mutex::new(None)),
+            writer_counters: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_queue_select_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_queue_post_commit_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+    /// Observe only an already-published index. In particular, this path may
+    /// not create HOME/cache, a Git identity marker, an index or a use lock.
+    pub fn status_existing_readonly(
+        roots: topology::TopologyRoots,
+        identity: topology::WorkspaceIdentity,
+    ) -> Result<IndexStatus> {
+        let identity = identity.attach_existing_marker_readonly()?;
+        roots.reject_root_overlap(&identity)?;
+        let index = roots.index_db(&identity);
+        ensure!(
+            index_path_present(&index)?,
+            "index_not_ready: no published index"
+        );
+        let store = Self::unopened(roots, identity)?;
+        let guard = store.roots.index_use_existing_readonly(&store.identity)?;
+        // Even a read-only SQLite open can try to recover a hot journal or
+        // create WAL shared-memory sidecars. Status explicitly reports busy
+        // instead of recovering, creating sidecars or ignoring live WAL.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = index.with_file_name(format!(
+                "{}{}",
+                index
+                    .file_name()
+                    .context("index filename missing")?
+                    .to_string_lossy(),
+                suffix
+            ));
+            match std::fs::symlink_metadata(sidecar) {
+                Ok(_) => anyhow::bail!("storage_busy: index journal sidecar present"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let db = open_index(&index, false).map_err(|error| {
+            if recovery_class(&error) == RecoveryClass::RecreatePending {
+                anyhow::anyhow!(
+                    "recovery_required: exceptional index format; run explicit baleyg index"
+                )
+            } else {
+                error
+            }
+        })?;
+        // Status does not replay saved options, but malformed/relative saved
+        // inputs must still refuse rather than look like a healthy publication.
+        let (revision, raw_options): (i64, Option<String>) = db.query_row(
+            "SELECT index_revision,reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        ensure!(revision > 0, "index_not_ready: no published revision");
+        let raw_options = raw_options.context("incompatible_index: missing reconcile options")?;
+        let options: crate::indexer::ReconcileOptions = serde_json::from_str(&raw_options)
+            .context("incompatible_index: invalid reconcile options")?;
+        ensure!(
+            json(&options)? == raw_options && options.version == 1,
+            "incompatible_index: unsupported reconcile options"
+        );
+        options.require_absolute_optional_inputs().context(
+            "recovery_required: recorded relative index input; run explicit baleyg index",
+        )?;
+        let status = store.read_status(&db)?;
+        store.identity.verify_readonly()?;
+        guard.verify()?;
+        Ok(status)
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
     pub fn open_for_tests(state: &Path, workspace: &Path) -> Result<Self> {
@@ -3951,98 +4030,6 @@ impl Store {
             RecoveryClass::Hard => error,
         }
     }
-    fn validate_recovery_decode_rows(&self, db: &Connection) -> Result<()> {
-        fn json_rows<T: DeserializeOwned>(db: &Connection, sql: &str) -> Result<()> {
-            let mut statement = db.prepare(sql)?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-            for payload in rows {
-                let _: T = serde_json::from_str(&payload?)?;
-            }
-            Ok(())
-        }
-        let mut stmt = db.prepare(
-            "SELECT language,path,content_hash,source_bytes FROM document_versions ORDER BY path",
-        )?;
-        for row in stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-            ))
-        })? {
-            use sha2::{Digest, Sha256};
-            let (language, path, hash, bytes) = row?;
-            ensure!(
-                hash == hex::encode(Sha256::digest(&bytes)),
-                "incompatible_index: stored source hash mismatch"
-            );
-            let _ = SourceFile {
-                language,
-                path,
-                hash,
-                text: String::from_utf8(bytes)?,
-            };
-        }
-        json_rows::<Symbol>(
-            db,
-            "SELECT n.payload FROM graph_nodes n JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=n.projection_id ORDER BY n.id",
-        )?;
-        json_rows::<CallSite>(
-            db,
-            "SELECT c.payload FROM graph_calls c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=c.projection_id ORDER BY c.id",
-        )?;
-        json_rows::<ControlRegion>(
-            db,
-            "SELECT r.payload FROM graph_regions r JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.graph_projection_id=r.projection_id ORDER BY r.id",
-        )?;
-        json_rows::<crate::classes::ClassDefinition>(
-            db,
-            "SELECT c.payload FROM classes c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.class_projection_id=c.projection_id ORDER BY c.id",
-        )?;
-        json_rows::<crate::classes::ClassRelation>(
-            db,
-            "SELECT c.payload FROM class_relations c JOIN revision_documents d ON d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND d.class_projection_id=c.projection_id ORDER BY c.id",
-        )?;
-        let (stats, diagnostics, warnings): (String, String, String) = db.query_row(
-            "SELECT m.stats,m.diagnostics,r.class_warnings FROM index_metadata m JOIN native_revisions r ON r.published_index_revision=m.index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE m.singleton=1",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        let _: IndexStats = serde_json::from_str(&stats)?;
-        let _: Vec<Diagnostic> = serde_json::from_str(&diagnostics)?;
-        let _: Vec<String> = serde_json::from_str(&warnings)?;
-
-        macro_rules! scan {
-            ($sql:expr, $( $index:literal => $kind:ty ),+ $(,)?) => {{
-                let mut statement = db.prepare($sql)?;
-                let rows = statement.query_map([], |row| {
-                    $(let _: $kind = row.get($index)?;)+
-                    Ok(())
-                })?;
-                for row in rows { row?; }
-            }};
-        }
-        scan!("SELECT ordinal FROM native_producer_languages", 0 => i64);
-        scan!("SELECT ordinal FROM native_source_set_languages", 0 => i64);
-        scan!("SELECT ordinal FROM native_source_set_dependencies", 0 => i64);
-        scan!("SELECT byte_length FROM document_versions", 0 => i64);
-        scan!("SELECT coverage_requested,coverage_selected,coverage_diagnostic FROM revision_documents", 0 => bool, 1 => bool, 2 => Option<String>);
-        scan!("SELECT ordinal FROM native_version_coverage_roles", 0 => i64);
-        scan!("SELECT key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations",
-            0 => bool, 1 => Option<i64>, 2 => Option<bool>, 3 => i64, 4 => i64, 5 => i64, 6 => Option<i64>, 7 => Option<i64>);
-        scan!("SELECT ordinal,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_version_declaration_ancestors",
-            0 => i64, 1 => i64, 2 => bool, 3 => Option<i64>, 4 => Option<bool>);
-        scan!("SELECT ordinal FROM native_version_own_signature_types", 0 => i64);
-        scan!("SELECT ancestor_ordinal,ordinal FROM native_version_ancestor_signature_types", 0 => i64, 1 => i64);
-        scan!("SELECT ordinal FROM native_version_header_items", 0 => i64);
-        scan!("SELECT ordinal,variadic FROM native_version_parameters", 0 => i64, 1 => bool);
-        scan!("SELECT ordinal,start_byte,end_byte,callee_start,callee_end FROM native_version_calls",
-            0 => i64, 1 => i64, 2 => i64, 3 => Option<i64>, 4 => Option<i64>);
-        scan!("SELECT ordinal FROM native_version_call_regions", 0 => i64);
-        scan!("SELECT ordinal,start_byte,end_byte FROM native_version_control_regions", 0 => i64, 1 => i64, 2 => i64);
-        Ok(())
-    }
-
     fn verify_metadata_root(&self, db: &Connection) -> Result<()> {
         let (count, typed): (i64, bool) = db.query_row(
             "SELECT count(*),coalesce(min(singleton=1 AND typeof(root_spelling)='text' AND typeof(root_device)='text' AND typeof(root_inode)='text'),0) FROM index_metadata",
@@ -5175,7 +5162,12 @@ impl Store {
                 && bytes == file.text.as_bytes()
                 && length == bytes.len() as i64
                 && hash == hex::encode(Sha256::digest(&bytes))
-                && context == crate::native_ids::extraction_context(&file.language, &[])?
+                && context
+                    == crate::native_evidence::declared_selected_extraction_context(
+                        &producer_id,
+                        &producer_version,
+                        &file.language,
+                    )?
                 && producer_id == scope.producer_id
                 && producer_version == crate::native_evidence::NATIVE_VERSION,
             "incompatible_index: reusable native source/context differs from capture"
@@ -5265,6 +5257,231 @@ impl Store {
     /// Option C: admit a proven single-document body edit without decoding any
     /// unchanged occurrence or projection row. IDs must come from the selected
     /// same-generation head, never an orphan or a matching historical version.
+    /// A leader Serve can advance an unchanged, already-validated head without
+    /// re-extracting native facts. This is deliberately stricter than stat
+    /// equality: Capture::admit has freshly read and SHA-256 hashed every source,
+    /// and selected_source_row_for authenticates the saved bytes of every reused
+    /// version before any metadata-only writer transaction starts.
+    pub(crate) fn publish_unchanged_native_recovery(
+        &self,
+        capture: &crate::capture::Capture,
+        leader: &topology::LeaderGuard,
+        expected: &RecoveryBaseline,
+        cancel: &CancelFlag,
+    ) -> Result<Option<IndexPin>> {
+        if !expected.compatible
+            || self.disposition() != RecoveryDisposition::Ready
+            || !expected.pin().is_some_and(|pin| pin.index_revision > 0)
+        {
+            return Ok(None);
+        }
+        check_cancel(cancel)?;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        ensure!(
+            capture.source_operations.len() == capture.files.len()
+                && capture
+                    .source_operations
+                    .values()
+                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+            "native_evidence_required: every unchanged source must be read and hashed"
+        );
+        let mut db = self.cache_write()?;
+        let admitted_version: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        let selected = ReadRevision::current(&db)?;
+        if expected.pin() != Some(selected.pin) {
+            anyhow::bail!("revision conflict: Serve selected head changed");
+        }
+        // Public reads are deliberately blocked while a leader is publishing.
+        // Apply their paired metadata/inventory checks in this private fenced
+        // snapshot instead of calling read_status, which requires public-ready.
+        let selected_baseline = self.recovery_baseline(&db)?;
+        ensure!(
+            selected_baseline.compatible && selected_baseline.pin == Some(selected.pin),
+            "incompatible_index: selected Serve head is not validated"
+        );
+        validate_paired_metadata(&db, &self.identity.record_id)?;
+        validate_reconcile_inventory(&db)?;
+        let class_warning_bytes: Option<i64> = db
+            .query_row(
+                "SELECT length(CAST(class_warnings AS BLOB)) FROM native_revisions WHERE id=?1",
+                [&selected.key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ensure!(
+            class_warning_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)),
+            "incompatible_index: selected class catalog budget exceeded or missing"
+        );
+        if !has_revision_producer_bindings(&db)? {
+            // Legacy 28-table indexes use the ordinary FULL publication path,
+            // which atomically introduces the paired producer-binding extension.
+            return Ok(None);
+        }
+        let current_executable = std::env::current_exe()?;
+        let executing_hash = capture
+            .executable_digest(&current_executable)
+            .context("native_evidence_required: executable was not hashed at admission")?;
+        if selected_producer_hash(&db, &selected)? != executing_hash {
+            // Decision 0005: even identical source bytes cannot reuse native
+            // facts when the executing producer changed. FULL measurement wins.
+            return Ok(None);
+        }
+        let prior_options: String = db.query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if prior_options != json(capture.reconcile_options())? {
+            return Ok(None);
+        }
+        let comparison = compare_capture_snapshot(&db, capture)?;
+        if comparison.changed() || comparison.examined == 0 {
+            // This compares the freshly hashed source content AND the captured
+            // root, directory, config, selector and presentation observations.
+            return Ok(None);
+        }
+        for source in &capture.files {
+            check_cancel(cancel)?;
+            let stored = self
+                .selected_source_row_for(&db, &source.path, &selected)?
+                .context("incompatible_index: selected reused source missing")?;
+            ensure!(
+                stored == *source,
+                "incompatible_index: selected reused source bytes differ"
+            );
+            // The prior head has already validated these immutable versions.
+            // Check their indexed version/projection links without re-parsing
+            // millions of native and graph facts. Selected reads still deeply
+            // attest a requested projection before returning its evidence.
+            let linked: Option<(String, String, String, String, String)> = db
+                .query_row(
+                    "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
+                 FROM revision_documents m
+                 JOIN document_versions v ON v.id=m.document_version_id
+                   AND v.language=m.language AND v.path=m.path
+                 JOIN graph_projections g ON g.id=m.graph_projection_id
+                   AND g.document_version_id=m.document_version_id AND g.language=m.language
+                 JOIN class_projections c ON c.id=m.class_projection_id
+                   AND c.graph_projection_id=m.graph_projection_id
+                 WHERE m.revision_id=?1 AND m.path=?2",
+                    params![selected.key, source.path],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let (graph_state, class_state, context, producer_id, producer_version) =
+                linked.context("incompatible_index: selected reusable projection link missing")?;
+            ensure!(
+                graph_state == "ready"
+                    && class_state == "ready"
+                    && producer_id == crate::native_evidence::PRODUCER
+                    && producer_version == crate::native_evidence::NATIVE_VERSION
+                    && context
+                        == crate::native_evidence::declared_selected_extraction_context(
+                            &producer_id,
+                            &producer_version,
+                            &source.language,
+                        )?,
+                "incompatible_index: selected reusable projection link or extraction context invalid"
+            );
+        }
+        // The same connection fences the authenticated preflight against a
+        // concurrent direct SQL rewrite. The leader/use guards exclude normal
+        // writers, while the metadata CAS excludes stale in-process requests.
+        let after_preflight: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        ensure!(
+            after_preflight == admitted_version,
+            "incompatible_index: index changed during unchanged preflight"
+        );
+        capture.verify(cancel)?;
+        leader.verify()?;
+        self.identity.verify()?;
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let current = self.recovery_baseline(&tx)?;
+        let locked_version: i64 =
+            storage_result(tx.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        ensure!(
+            locked_version == admitted_version
+                && current.pin == expected.pin()
+                && current.witness == expected.witness
+                && current.compatible,
+            "revision conflict: unchanged Serve baseline changed"
+        );
+        self.ensure_not_recreate_pending()?;
+        let revision = IndexPin {
+            index_generation: selected.pin.index_generation,
+            index_revision: selected
+                .pin
+                .index_revision
+                .checked_add(1)
+                .context("revision overflow")?,
+        };
+        let revision_key = format!(
+            "pin:v1:{}:{}",
+            revision.index_generation, revision.index_revision
+        );
+        let copied = tx.execute(
+            "INSERT INTO native_revisions SELECT ?1,source_set_id,toolchain_hash,config_hash,             dependency_hash,native_revision_id,source_inventory,dependency_observations,             ?2,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics,?3             FROM native_revisions WHERE id=?4",
+            params![revision_key, leader.incarnation.to_string(), revision.index_revision as i64, selected.key],
+        )?;
+        ensure!(
+            copied == 1,
+            "incompatible_index: selected native header missing"
+        );
+        tx.execute(
+            "INSERT INTO revision_capture_inputs SELECT ?1,input_key,payload             FROM revision_capture_inputs WHERE revision_id=?2",
+            params![revision_key, selected.key],
+        )?;
+        let copied = tx.execute(
+            "INSERT INTO revision_documents SELECT ?1,source_set_id,language,path,document_version_id,             graph_projection_id,class_projection_id,capture_stat,coverage_requested,             coverage_selected,coverage_state,coverage_diagnostic,ordinal             FROM revision_documents WHERE revision_id=?2",
+            params![revision_key, selected.key],
+        )?;
+        ensure!(
+            copied == capture.files.len(),
+            "incompatible_index: incomplete unchanged revision manifest"
+        );
+        let (bound_hash, binding_sha) = revision_producer_binding(&tx, &revision_key)?;
+        ensure!(
+            bound_hash == executing_hash,
+            "incompatible_index: executing producer binding changed"
+        );
+        tx.execute(
+            "INSERT INTO revision_producer_bindings VALUES(?1,?2,?3)",
+            params![revision_key, bound_hash, binding_sha],
+        )?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis()
+            .to_string();
+        ensure!(
+            tx.execute(
+                "UPDATE index_metadata SET index_revision=?1,indexed_at=?2,                 reconciled_incarnation=?3 WHERE singleton=1",
+                params![revision.index_revision as i64, timestamp, leader.incarnation.to_string()],
+            )? == 1,
+            "incompatible_index: missing metadata head"
+        );
+        validate_paired_metadata(&tx, &self.identity.record_id)?;
+        check_cancel(cancel)?;
+        capture.verify(cancel)?;
+        leader.verify()?;
+        self.identity.verify()?;
+        storage_result(tx.commit())?;
+        self.recovery_disposition
+            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
+        self.recovery_required.store(false, Ordering::Release);
+        Ok(Some(revision))
+    }
+
     pub(crate) fn prepare_local_revision(
         &self,
         capture: &crate::capture::Capture,
@@ -5341,7 +5558,9 @@ impl Store {
                     && hash == hex::encode(sha2::Sha256::digest(&bytes)),
                     "incompatible_index: prior captured source witness mismatch");
                 ensure!(id == producer_id && version == producer_version
-                    && context == crate::native_ids::extraction_context(&language, &[])?
+                    && context == crate::native_evidence::declared_selected_extraction_context(
+                        &id, &version, &language,
+                    )?
                     && class_id.is_some() && class_hash.is_some(),
                     "incompatible_index: prior document producer/context missing");
                 let source = SourceFile {path:path.clone(),language:language.clone(),hash:hash.clone(),text:String::from_utf8(bytes)?};
@@ -5536,7 +5755,8 @@ impl Store {
             let selected=ReadRevision::current(db)?;
             ensure!(expected.pin()==Some(selected.pin),
                 "revision conflict: prior local snapshot changed");
-            self.validate_recovery_decode_rows(db)?;
+            // Actual selected reuse is authenticated by selected_reusable_native below;
+            // unrelated retained versions must not be decoded.
             let previous_options:crate::indexer::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1",[],
                 |r|r.get::<_,String>(0))?.parse::<serde_json::Value>()
@@ -5761,7 +5981,12 @@ impl Store {
                     file.language == language
                         && producer_id == prepared.native.producer.id
                         && producer_version == prepared.native.producer.version
-                        && context == crate::native_ids::extraction_context(&language, &[])?,
+                        && context
+                            == crate::native_evidence::native_extraction_context(
+                                &prepared.native.producer,
+                                &language,
+                                &prepared.native.revision,
+                            )?,
                     "incompatible_index: local producer or extraction context changed"
                 );
                 if path != prepared.changed_path {
@@ -5835,8 +6060,8 @@ impl Store {
             {
                 return Ok(PreflightReuse::default());
             }
-            // Decode and verify the current snapshot outside the IMMEDIATE transaction.
-            self.validate_recovery_decode_rows(db)?;
+            // T00 attests only versions actually reused below. Unselected
+            // historical versions must not affect this fresh publication.
             let drift = selected_producer_hash(db, &selected)? != native.producer.executable_hash;
             let documents: BTreeMap<_, _> = native.revision.documents.iter()
                 .map(|doc| (doc.key.path.as_str(), doc)).collect();
@@ -8568,6 +8793,29 @@ mod rebaseline_fault_tests {
             store
                 .validate_native_bundle_with_mode(&graph, &capture, &native, &cancel, true)
                 .unwrap();
+            let prepared = store
+                .prepare_local_revision(&capture, &baseline, &cancel)
+                .unwrap()
+                .expect("same-leaf edit has local selected projection");
+            let inventory_fault = crate::native_evidence::inject_extraction_auth_fault(
+                &prepared.native.revision.id,
+                "java",
+                crate::native_evidence::ExtractionAuthFault::Mismatched,
+            );
+            let mismatch = store
+                .preflight_local_reuse(&graph, &prepared)
+                .err()
+                .expect("synthetic mismatched declared component must refuse local reuse");
+            assert!(
+                format!("{mismatch:#}").contains("mismatched native extraction component: config"),
+                "local reuse ignored producer's declared extraction inventory: {mismatch:#}"
+            );
+            drop(inventory_fault);
+            assert_eq!(
+                ReadRevision::current(&store.cache().unwrap()).unwrap().pin,
+                first,
+                "refused local preflight installed partial metadata"
+            );
             let err = store
                 .publish_inner_checked_expected(
                     (&graph, &capture, &native),

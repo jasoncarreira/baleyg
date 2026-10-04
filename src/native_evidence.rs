@@ -50,7 +50,7 @@ const EXTRACTION_INPUTS: &[(&str, &str, &[LanguageInventory])] = &[(
 // library, and release builds have no override, branch, or alternate inventory.
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum ExtractionAuthFault {
+pub(crate) enum ExtractionAuthFault {
     Undeclared,
     Mismatched,
 }
@@ -60,7 +60,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
-struct ExtractionAuthFaultGuard;
+pub(crate) struct ExtractionAuthFaultGuard;
 #[cfg(test)]
 impl Drop for ExtractionAuthFaultGuard {
     fn drop(&mut self) {
@@ -68,7 +68,7 @@ impl Drop for ExtractionAuthFaultGuard {
     }
 }
 #[cfg(test)]
-fn inject_extraction_auth_fault(
+pub(crate) fn inject_extraction_auth_fault(
     revision: &str,
     language: &str,
     fault: ExtractionAuthFault,
@@ -86,7 +86,7 @@ fn inject_extraction_auth_fault(
 /// revision and derive the document's extraction context. This is the fail-closed
 /// precondition for minting any `occ:v2` ID: an undeclared descriptor/language or a declared
 /// component without a valid captured revision digest refuses, and nothing is minted.
-fn native_extraction_context(
+pub(crate) fn native_extraction_context(
     producer: &Producer,
     language: &str,
     revision: &Revision,
@@ -109,16 +109,45 @@ fn native_extraction_context(
             ),
         };
     }
-    let inventory = EXTRACTION_INPUTS
-        .iter()
-        .find(|(id, version, _)| *id == producer.id && *version == producer.version)
-        .and_then(|(_, _, languages)| languages.iter().find(|(l, _)| *l == language))
-        .map(|(_, inventory)| *inventory)
-        .context("undeclared native extraction-input inventory")?;
+    let inventory = declared_extraction_inputs(&producer.id, &producer.version, language)?;
     // The v4 parser reads no external component: all grammars and normalization tables are
     // fixed in this executable. Other captured inputs affect revision admission, not syntax.
     authenticated_extraction_context(language, inventory, &[], revision)
 }
+fn declared_extraction_inputs(
+    producer_id: &str,
+    producer_version: &str,
+    language: &str,
+) -> Result<&'static [&'static str]> {
+    EXTRACTION_INPUTS
+        .iter()
+        .find(|(id, version, _)| *id == producer_id && *version == producer_version)
+        .and_then(|(_, _, languages)| languages.iter().find(|(l, _)| *l == language))
+        .map(|(_, inventory)| *inventory)
+        .context("undeclared native extraction-input inventory")
+}
+
+/// Verify the descriptor's declared inventory before matching a stored witness.
+/// This v4 producer declares no external per-document inputs. Should a future
+/// producer declare any, selected reuse MUST supply captured bytes rather than
+/// silently comparing against the old empty extraction context.
+pub(crate) fn declared_selected_extraction_context(
+    producer_id: &str,
+    producer_version: &str,
+    language: &str,
+) -> Result<String> {
+    let inventory = declared_extraction_inputs(producer_id, producer_version, language)?;
+    selected_extraction_context_for_inventory(language, inventory)
+}
+
+fn selected_extraction_context_for_inventory(language: &str, inventory: &[&str]) -> Result<String> {
+    ensure!(
+        inventory.is_empty(),
+        "external native extraction inputs require captured selected-reuse proof"
+    );
+    extraction_context(language, &[])
+}
+
 fn authenticated_extraction_context(
     language: &str,
     inventory: &[&str],
@@ -2039,9 +2068,22 @@ mod occurrence_identity_tests {
             .unwrap()
             .revision;
         for language in LANGUAGES {
+            let measured =
+                native_extraction_context(&producer(NATIVE_VERSION), language, &revision).unwrap();
+            let reusable =
+                declared_selected_extraction_context(PRODUCER, NATIVE_VERSION, language).unwrap();
             assert_eq!(
-                native_extraction_context(&producer(NATIVE_VERSION), language, &revision).unwrap(),
-                extraction_context(language, &[]).unwrap()
+                measured, reusable,
+                "witness and selected reuse used different declared inventory"
+            );
+            assert_eq!(
+                measured,
+                extraction_context(language, &[]).unwrap(),
+                "current empty-inventory occ:v2 identity changed"
+            );
+            assert!(
+                selected_extraction_context_for_inventory(language, &["config"]).is_err(),
+                "synthetic nonempty declaration must not reuse an unauthenticated empty context"
             );
         }
         // An undeclared producer version (e.g. the withdrawn occ:v1 producer) or language has

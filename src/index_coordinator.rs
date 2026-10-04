@@ -103,6 +103,29 @@ impl IndexJobCoordinator {
         progress: impl Fn(IndexProgress) + Sync,
         observe: impl FnOnce(&Capture),
     ) -> Result<IndexPin> {
+        self.run_with_capture(options, cancel, progress, observe, false)
+    }
+
+    /// Only unchanged leader Serve may reuse selected native versions without
+    /// invoking extraction. Explicit index and accepted requests keep their
+    /// existing fully validated publication path.
+    pub fn run_serving(
+        self,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        progress: impl Fn(IndexProgress) + Sync,
+    ) -> Result<IndexPin> {
+        self.run_with_capture(options, cancel, progress, |_| {}, true)
+    }
+
+    fn run_with_capture(
+        self,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        progress: impl Fn(IndexProgress) + Sync,
+        observe: impl FnOnce(&Capture),
+        serving_fast: bool,
+    ) -> Result<IndexPin> {
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         let mut phase_start = std::time::Instant::now();
         let report = |name: &str, elapsed: std::time::Duration| {
@@ -116,6 +139,23 @@ impl IndexJobCoordinator {
         let capture = Capture::admit(options, cancel, &progress)?;
         report("capture", phase_start.elapsed());
         phase_start = std::time::Instant::now();
+        if serving_fast
+            && let Some(pin) = self.store.publish_unchanged_native_recovery(
+                &capture,
+                self.session.leader_guard()?,
+                &self.expected,
+                cancel,
+            )?
+        {
+            progress(IndexProgress {
+                phase: "mode:unchanged".into(),
+                completed: 0,
+                total: 1,
+            });
+            report("publish", phase_start.elapsed());
+            observe(&capture);
+            return Ok(pin);
+        }
         let root = std::fs::canonicalize(&options.workspace_root)?;
         if let Some(prepared) =
             self.store
@@ -491,7 +531,7 @@ pub fn establish_serving_session(
                 expected,
                 session.clone(),
             )?;
-            coordinator.run(&options, cancel, |_| {})?;
+            coordinator.run_serving(&options, cancel, |_| {})?;
             session.verify()?;
             Ok(session)
         }

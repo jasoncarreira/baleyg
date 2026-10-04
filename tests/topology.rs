@@ -2225,10 +2225,12 @@ fn gc_classifies_current_schema8_but_refuses_spoofed_shapes() {
     let inspect = || {
         let before = gc_manifest(temp.path());
         let entry = roots.gc_report_at(now).unwrap().derived.remove(0);
+        // The full inventory records every pathname plus each file's bytes:
+        // equality rules out both mutation and a covert derived-index deletion.
         assert_eq!(
             before,
             gc_manifest(temp.path()),
-            "GC must not mutate any index bytes"
+            "GC report must not mutate or delete any index bytes"
         );
         (entry.status, entry.reason)
     };
@@ -2244,19 +2246,19 @@ fn gc_classifies_current_schema8_but_refuses_spoofed_shapes() {
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute_batch("CREATE TABLE unsupported(id INTEGER)")
         .unwrap();
-    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.execute_batch("DROP TABLE unsupported").unwrap();
     db.execute_batch("CREATE VIEW unapproved_view AS SELECT 1")
         .unwrap();
-    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.execute_batch("DROP VIEW unapproved_view").unwrap();
     db.execute_batch("CREATE TRIGGER unapproved_trigger AFTER INSERT ON graph_calls BEGIN SELECT RAISE(FAIL, 'FORGED'); END;")
         .unwrap();
-    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.pragma_update(None, "user_version", 7).unwrap();
-    assert_eq!(inspect(), ("unknown", "metadata_unreadable"));
+    assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.pragma_update(None, "user_version", 8).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])

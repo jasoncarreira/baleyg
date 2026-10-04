@@ -869,7 +869,11 @@ pub fn measure_document_fingerprint(
         .filter(|r| r.document == document.key)
         .map(stable_fact)
         .collect::<Result<Vec<_>>>()?;
-    let context = crate::native_ids::extraction_context(&file.language, &[])?;
+    let context = crate::native_evidence::native_extraction_context(
+        &native.producer,
+        &file.language,
+        &native.revision,
+    )?;
     let native_value = serde_json::json!({
         "sourceSetId":native.source_set.id,"language":file.language,"path":file.path,
         "contentHash":file.hash,"byteLength":file.text.len(),"extractionContext":context,

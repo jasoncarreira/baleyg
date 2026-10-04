@@ -159,6 +159,485 @@ fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Comman
     c
 }
 
+#[test]
+fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_not() {
+    use std::{os::unix::fs::MetadataExt, time::Duration};
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn serve(root: &std::path::Path, home: &std::path::Path, log: &std::path::Path) -> Server {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let child = command(root, home, "serve")
+            .arg("--bind")
+            .arg(address.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(fs::File::create(log).unwrap()))
+            .spawn()
+            .unwrap();
+        let mut server = Server(child);
+        for _ in 0..150 {
+            if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
+                return server;
+            }
+            if let Some(status) = server.0.try_wait().unwrap() {
+                panic!(
+                    "Serve exited {status}: {}",
+                    fs::read_to_string(log).unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("Serve not ready: {}", fs::read_to_string(log).unwrap());
+    }
+    fn pin_and_ids(db: &rusqlite::Connection) -> (i64, Vec<(i64, String, String, String)>) {
+        let rev = db
+            .query_row("SELECT index_revision FROM index_metadata", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut statement = db.prepare(
+            "SELECT h.published_index_revision,m.document_version_id,m.graph_projection_id,m.class_projection_id
+             FROM revision_documents m JOIN native_revisions h ON h.id=m.revision_id
+             ORDER BY h.published_index_revision,m.path",
+        ).unwrap();
+        let ids = statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        (rev, ids)
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    let file = root.join("a.js");
+    fs::write(&file, "function seed() { return 42; }\n").unwrap();
+    let first = command(&root, &home, "index").output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let dbpath = real_index_db(&home);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    let (r1, old_ids) = pin_and_ids(&db);
+    assert_eq!(r1, 1);
+    let immutable = [
+        "document_versions",
+        "graph_projections",
+        "class_projections",
+        "graph_nodes",
+        "graph_calls",
+        "graph_regions",
+        "classes",
+        "class_relations",
+        "native_version_declarations",
+        "native_version_calls",
+    ];
+    let old_counts: Vec<i64> = immutable
+        .iter()
+        .map(|table| {
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        })
+        .collect();
+    let queue = dbpath.with_file_name("requests.db");
+    let queue_before = fs::read(&queue).unwrap();
+    drop(db);
+
+    let first_log = temp.path().join("serve-unchanged.log");
+    let leader = serve(&root, &home, &first_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    let (r2, ids) = pin_and_ids(&db);
+    assert_eq!(r2, 2, "new header+manifest pin required");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        (&ids[0].1, &ids[0].2, &ids[0].3),
+        (&ids[1].1, &ids[1].2, &ids[1].3)
+    );
+    for (table, count) in immutable.iter().zip(old_counts.iter()) {
+        let after: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, *count,
+            "{table} gained immutable rows on unchanged Serve"
+        );
+    }
+    assert_eq!(fs::read(&queue).unwrap(), queue_before);
+    assert!(
+        !fs::read_to_string(&first_log)
+            .unwrap()
+            .contains("Evidence unavailable")
+    );
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["revision"]["indexRevision"],
+        2
+    );
+    drop(db);
+    drop(leader);
+
+    let old_stat = fs::metadata(&file).unwrap();
+    let old_bytes = fs::read(&file).unwrap();
+    fs::write(
+        &file,
+        String::from_utf8(old_bytes.clone())
+            .unwrap()
+            .replace("seed", "sued"),
+    )
+    .unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+    let timestamps = [
+        libc::timespec {
+            tv_sec: old_stat.atime(),
+            tv_nsec: old_stat.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: old_stat.mtime(),
+            tv_nsec: old_stat.mtime_nsec(),
+        },
+    ];
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), timestamps.as_ptr(), 0) },
+        0
+    );
+    assert_eq!(
+        fs::metadata(&file).unwrap().mtime_nsec(),
+        old_stat.mtime_nsec()
+    );
+    assert_eq!(fs::read(&file).unwrap().len(), old_bytes.len());
+    let changed_log = temp.path().join("serve-changed.log");
+    let changed = serve(&root, &home, &changed_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    let (r3, next_ids) = pin_and_ids(&db);
+    assert_eq!(r3, 3, "new bytes must FULL publish, never reuse old pin");
+    assert_eq!(next_ids.len(), 3);
+    assert_eq!(next_ids[0].1, next_ids[1].1);
+    assert_ne!(
+        next_ids[1].1, next_ids[2].1,
+        "same-length/mtime edit reused stale bytes"
+    );
+    assert_eq!(next_ids[0].1, old_ids[0].1, "retained old pin changed");
+    drop(db);
+    drop(changed);
+
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    let selected_id = &next_ids[2].1;
+    assert_eq!(
+        db.execute(
+            "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+            rusqlite::params![vec![b'x'; old_bytes.len()], selected_id]
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    let corrupt_log = temp.path().join("serve-corrupt.log");
+    let rejected = serve(&root, &home, &corrupt_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    assert_eq!(
+        pin_and_ids(&db),
+        (3, next_ids.clone()),
+        "corrupt selected source was republished"
+    );
+    let headers: i64 = db
+        .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
+        .unwrap();
+    let bindings: i64 = db
+        .query_row("SELECT count(*) FROM revision_producer_bindings", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        (headers, bindings),
+        (3, 3),
+        "refused Serve installed partial metadata"
+    );
+    drop(db);
+    assert!(
+        fs::read_to_string(corrupt_log)
+            .unwrap()
+            .contains("Evidence unavailable at startup")
+    );
+    drop(rejected);
+
+    // A one-sided producer-binding rewrite must refuse before a new header.
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    db.execute(
+        "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+        rusqlite::params![fs::read(&file).unwrap(), selected_id],
+    )
+    .unwrap();
+    let head_key: String = db
+        .query_row(
+            "SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let old_binding: String = db
+        .query_row(
+            "SELECT binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [&head_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE revision_producer_bindings SET binding_sha=?1 WHERE revision_id=?2",
+        rusqlite::params!["0".repeat(64), head_key],
+    )
+    .unwrap();
+    drop(db);
+    let link_log = temp.path().join("serve-binding.log");
+    let rejected_binding = serve(&root, &home, &link_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    assert_eq!(
+        pin_and_ids(&db).0,
+        3,
+        "bad selected producer binding reused"
+    );
+    assert!(
+        fs::read_to_string(&link_log)
+            .unwrap()
+            .contains("Evidence unavailable at startup")
+    );
+    drop(rejected_binding);
+    db.execute(
+        "UPDATE revision_producer_bindings SET binding_sha=?1 WHERE revision_id=?2",
+        rusqlite::params![old_binding, head_key],
+    )
+    .unwrap();
+
+    // Source bytes alone cannot authorize a new header: the selected native
+    // extraction context must match the producer's DECLARED input inventory.
+    let old_context: String = db
+        .query_row(
+            "SELECT extraction_context FROM document_versions WHERE id=?1",
+            [selected_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE document_versions SET extraction_context=?1 WHERE id=?2",
+        rusqlite::params!["0".repeat(64), selected_id],
+    )
+    .unwrap();
+    drop(db);
+    let context_log = temp.path().join("serve-context.log");
+    let rejected_context = serve(&root, &home, &context_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    assert_eq!(
+        pin_and_ids(&db).0,
+        3,
+        "mismatched extraction inventory context reused"
+    );
+    assert!(
+        fs::read_to_string(&context_log)
+            .unwrap()
+            .contains("Evidence unavailable at startup")
+    );
+    drop(rejected_context);
+    db.execute(
+        "UPDATE document_versions SET extraction_context=?1 WHERE id=?2",
+        rusqlite::params![old_context, selected_id],
+    )
+    .unwrap();
+
+    // A valid-looking child-row rewrite is not trusted by selected readers.
+    // Under T00, Serve may reuse the previously validated immutable projection
+    // without a whole-workspace reparse; a selected read MUST still reject it.
+    let (node_id, old_payload): (String, String) = db
+        .query_row(
+            "SELECT id,payload FROM graph_nodes WHERE projection_id=?1 LIMIT 1",
+            [&next_ids[2].2],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut tampered: Value = serde_json::from_str(&old_payload).unwrap();
+    tampered["name"] = Value::String("forged-name".into());
+    db.execute(
+        "UPDATE graph_nodes SET payload=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&tampered).unwrap(), node_id],
+    )
+    .unwrap();
+    drop(db);
+    let child_log = temp.path().join("serve-child.log");
+    let child_server = serve(&root, &home, &child_log);
+    let selected = command(&root, &home, "symbols").output().unwrap();
+    assert!(
+        !selected.status.success(),
+        "selected graph child rewrite escaped attestation"
+    );
+    assert!(
+        selected.stdout.is_empty(),
+        "forged selected facts escaped on stdout"
+    );
+    drop(child_server);
+}
+
+#[test]
+fn status_only_observes_existing_index_and_refuses_busy_without_writes() {
+    use std::{collections::BTreeMap, os::fd::AsRawFd, path::Path};
+    fn snapshot(roots: &[&Path]) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        let mut result = BTreeMap::new();
+        let mut pending = roots
+            .iter()
+            .map(|root| root.to_path_buf())
+            .collect::<Vec<_>>();
+        while let Some(path) = pending.pop() {
+            if !path.exists() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                result.insert(path.clone(), None);
+                pending.extend(
+                    fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else {
+                result.insert(path.clone(), Some(fs::read(&path).unwrap()));
+            }
+        }
+        result
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}\n").unwrap();
+    let virgin = snapshot(&[&root, &home]);
+    let absent = command(&root, &home, "status").output().unwrap();
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&absent.stderr).contains("index_not_ready"));
+    assert_eq!(
+        snapshot(&[&root, &home]),
+        virgin,
+        "virgin Status created state"
+    );
+
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let pin =
+        serde_json::from_slice::<Value>(&indexed.stdout).unwrap()["publishedRevision"].clone();
+    let indexes = home.join(if cfg!(target_os = "macos") {
+        "Library/Caches/dev.odin.baleyg/indexes"
+    } else {
+        ".cache/baleyg/indexes"
+    });
+    let dir = fs::read_dir(&indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let use_lock = indexes.join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let index_db = dir.join("index.db");
+    let persisted = snapshot(&[&root, &home]);
+    for _ in 0..2 {
+        let observed = command(&root, &home, "status").output().unwrap();
+        assert!(
+            observed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&observed.stderr)
+        );
+        let observed: Value = serde_json::from_slice(&observed.stdout).unwrap();
+        assert_eq!(observed["revision"], pin);
+        assert_eq!(
+            snapshot(&[&root, &home]),
+            persisted,
+            "Status modified index, queue, marker, use lock or HOME"
+        );
+    }
+    let lock = fs::OpenOptions::new().read(true).open(&use_lock).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let busy = command(&root, &home, "status").output().unwrap();
+    assert!(!busy.status.success());
+    assert!(busy.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("storage_busy"));
+    assert_eq!(
+        snapshot(&[&root, &home]),
+        persisted,
+        "busy Status modified state"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(lock);
+
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = index_db.with_file_name(format!("index.db{suffix}"));
+        fs::write(&sidecar, b"a journal sentinel").unwrap();
+        let with_sidecar = snapshot(&[&root, &home]);
+        let busy = command(&root, &home, "status").output().unwrap();
+        assert!(!busy.status.success());
+        assert!(busy.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&busy.stderr).contains("storage_busy"));
+        assert_eq!(
+            snapshot(&[&root, &home]),
+            with_sidecar,
+            "Status modified SQLite sidecar"
+        );
+        fs::remove_file(&sidecar).unwrap();
+    }
+    assert_eq!(snapshot(&[&root, &home]), persisted);
+    // A replaced root with no marker cannot recreate it or access the old index.
+    let moved = temp.path().join("old-workspace");
+    fs::rename(&root, &moved).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    let replaced = snapshot(&[&root, &moved, &home]);
+    let old_root = command(&root, &home, "status").output().unwrap();
+    assert!(!old_root.status.success());
+    assert!(old_root.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&old_root.stderr).contains("index_not_ready"));
+    assert_eq!(snapshot(&[&root, &moved, &home]), replaced);
+    fs::remove_dir_all(&root).unwrap();
+    fs::rename(&moved, &root).unwrap();
+    assert_eq!(snapshot(&[&root, &home]), persisted);
+    // An obsolete index cannot be repaired or upgraded by Status.
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    db.pragma_update(None, "user_version", 7_u32).unwrap();
+    drop(db);
+    let obsolete_bytes = snapshot(&[&root, &home]);
+    let obsolete = command(&root, &home, "status").output().unwrap();
+    assert!(!obsolete.status.success());
+    assert!(obsolete.stdout.is_empty());
+    assert_eq!(snapshot(&[&root, &home]), obsolete_bytes);
+    // Corrupting or removing the Git marker cannot repair it via Status.
+    let marker = root.join(".git/baleyg/workspace-id");
+    fs::write(&marker, b"not-a-marker").unwrap();
+    let tampered = snapshot(&[&root, &home]);
+    let invalid = command(&root, &home, "status").output().unwrap();
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert_eq!(snapshot(&[&root, &home]), tampered);
+}
+
 fn write_optional_presentation(dir: &std::path::Path, label: &str, source_hash: &str) {
     use protobuf::Message;
     let mut index = scip::types::Index::new();
@@ -195,7 +674,17 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
             "{key} must be removed from the child environment"
         );
     }
-    let output = cmd.output().unwrap();
+    let absent = cmd.output().unwrap();
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert!(!home.exists(), "Status cannot bootstrap an index or HOME");
+    let indexed = command(&workspace, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let output = command(&workspace, &home, "status").output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -203,6 +692,7 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     );
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 0);
+    assert_eq!(status["revision"]["indexRevision"], 1);
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.odin.baleyg"
     } else {
@@ -264,7 +754,7 @@ function boundary() {}
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 1);
-    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert_eq!(status["revision"]["indexRevision"], 1);
     let exported = command(&root, &home, "export").output().unwrap();
     assert!(exported.status.success());
     let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
@@ -288,7 +778,7 @@ function boundary() {}
         3_145_728
     );
     assert_eq!(
-        revision, 3,
+        revision, 2,
         "export must perform exactly one recorded-option takeover"
     );
 
@@ -378,7 +868,7 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&status.stderr)
     );
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert_eq!(status["revision"]["indexRevision"], 1);
     assert_eq!(
         status["revision"]["indexGeneration"],
         initial["publishedRevision"]["indexGeneration"]
@@ -1244,14 +1734,10 @@ fn fixed_locations_and_removed_flag() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let initial = command(&root, &home, "status").output().unwrap();
-    assert!(
-        initial.status.success(),
-        "{}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
-    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
-    assert_eq!(initial["revision"]["indexRevision"], 1);
+    let absent = command(&root, &home, "status").output().unwrap();
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert!(!home.exists(), "Status must not create fixed locations");
     let status = command(&root, &home, "index").output().unwrap();
     assert!(
         status.status.success(),
@@ -1260,11 +1746,7 @@ fn fixed_locations_and_removed_flag() {
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
     let first = &first["status"];
-    assert_eq!(first["revision"]["indexRevision"], 2);
-    assert_eq!(
-        first["revision"]["indexGeneration"],
-        initial["revision"]["indexGeneration"]
-    );
+    assert_eq!(first["revision"]["indexRevision"], 1);
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -1295,8 +1777,64 @@ fn fixed_locations_and_removed_flag() {
         final_status["revision"]["indexGeneration"],
         first["revision"]["indexGeneration"]
     );
-    assert_eq!(final_status["revision"]["indexRevision"], 3);
+    assert_eq!(final_status["revision"]["indexRevision"], 1);
 }
+#[test]
+fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}\n").unwrap();
+    let quiet = command(&root, &home, "index")
+        .env_remove("BALEYG_INDEX_DIAGNOSTICS")
+        .output()
+        .unwrap();
+    assert!(
+        quiet.status.success(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    for marker in ["index-phase ", "index-mode ", "index-writer "] {
+        assert!(
+            !quiet_stderr.contains(marker),
+            "default CLI emitted {marker}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&quiet.stdout).unwrap()["publishedRevision"]["indexRevision"],
+        1
+    );
+    let diagnostic = command(&root, &home, "index")
+        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        diagnostic.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diagnostic.stderr)
+    );
+    let diagnostic_stderr = String::from_utf8_lossy(&diagnostic.stderr);
+    for marker in [
+        "index-mode full",
+        "index-writer ",
+        "index-phase capture_ms=",
+        "index-phase publish_ms=",
+        "index-phase outside_status_output_ms=",
+    ] {
+        assert_eq!(
+            diagnostic_stderr.matches(marker).count(),
+            1,
+            "opt-in telemetry missing or duplicated {marker}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&diagnostic.stdout).unwrap()["publishedRevision"]["indexRevision"],
+        2
+    );
+}
+
 #[test]
 fn index_forwards_pair_and_reports_pair() {
     let temp = TempDir::new().unwrap();
@@ -1304,10 +1842,14 @@ fn index_forwards_pair_and_reports_pair() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let initial = command(&root, &home, "status").output().unwrap();
-    assert!(initial.status.success());
-    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
-    let result = command(&root, &home, "index").output().unwrap();
+    let absent = command(&root, &home, "status").output().unwrap();
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert!(!home.exists(), "Status may not create an index");
+    let result = command(&root, &home, "index")
+        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .output()
+        .unwrap();
     assert!(
         result.status.success(),
         "{}",
@@ -1367,10 +1909,16 @@ fn index_forwards_pair_and_reports_pair() {
         published["status"]["evidenceFormat"],
         "terminal-native-graph-v1"
     );
-    assert_eq!(published["publishedRevision"]["indexRevision"], 2);
+    assert_eq!(published["publishedRevision"]["indexRevision"], 1);
     assert_eq!(
-        published["publishedRevision"]["indexGeneration"],
-        initial["revision"]["indexGeneration"]
+        uuid::Uuid::parse_str(
+            published["publishedRevision"]["indexGeneration"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap()
+        .get_version_num(),
+        4
     );
 }
 #[test]
@@ -1424,14 +1972,14 @@ fn current_commands_pair_matrix() {
         status["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert_eq!(status["revision"]["indexRevision"], 1);
     let symbols: Value =
         serde_json::from_slice(&command(&root, &home, "symbols").output().unwrap().stdout).unwrap();
     assert_eq!(
         symbols["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(symbols["revision"]["indexRevision"], 3);
+    assert_eq!(symbols["revision"]["indexRevision"], 2);
     let seed = symbols["items"]
         .as_array()
         .unwrap()
@@ -1450,7 +1998,7 @@ fn current_commands_pair_matrix() {
     )
     .unwrap();
     assert_eq!(query["revision"]["indexGeneration"], pin["indexGeneration"]);
-    assert_eq!(query["revision"]["indexRevision"], 4);
+    assert_eq!(query["revision"]["indexRevision"], 3);
     let exported: Value =
         serde_json::from_slice(&command(&root, &home, "export").output().unwrap().stdout).unwrap();
     assert_eq!(exported["files"].as_array().unwrap().len(), 1);
@@ -1460,7 +2008,7 @@ fn current_commands_pair_matrix() {
         status["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(status["revision"]["indexRevision"], 6);
+    assert_eq!(status["revision"]["indexRevision"], 4);
 }
 
 #[test]
@@ -4403,9 +4951,9 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    // Full-rewrite staging publishes per CLI command: index r1, original export r2,
-    // changed export r3, this status r4, stale export r5, latest status r6.
-    assert_eq!(status["revision"]["indexRevision"], 4);
+    // Only writer commands publish: index r1, original export r2,
+    // changed export r3, read-only status r3, stale export r4, latest status r4.
+    assert_eq!(status["revision"]["indexRevision"], 3);
     assert_eq!(
         status["revision"]["indexGeneration"],
         first_pin["publishedRevision"]["indexGeneration"]
@@ -4435,5 +4983,5 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(latest.status.success());
     let latest: Value = serde_json::from_slice(&latest.stdout).unwrap();
-    assert_eq!(latest["revision"]["indexRevision"], 6);
+    assert_eq!(latest["revision"]["indexRevision"], 4);
 }

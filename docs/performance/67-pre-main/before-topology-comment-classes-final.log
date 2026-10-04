@@ -1,0 +1,4 @@
+{"limit": 1, "elapsed_s": 0.1678, "status": 200, "items": 1, "revision": {"indexGeneration": "60959b1e-87a6-46ec-9c62-4808e33e67c9", "indexRevision": 3}, "response_bytes": 16323}
+{"limit": 20, "elapsed_s": 2.533, "status": 200, "items": 20, "revision": {"indexGeneration": "60959b1e-87a6-46ec-9c62-4808e33e67c9", "indexRevision": 3}, "response_bytes": 319081}
+{"limit": 100, "elapsed_s": 12.5582, "status": 200, "items": 100, "revision": {"indexGeneration": "60959b1e-87a6-46ec-9c62-4808e33e67c9", "indexRevision": 3}, "response_bytes": 1593802}
+{"limit": 100, "elapsed_s": 12.5824, "status": 200, "items": 100, "revision": {"indexGeneration": "60959b1e-87a6-46ec-9c62-4808e33e67c9", "indexRevision": 3}, "response_bytes": 1593802}

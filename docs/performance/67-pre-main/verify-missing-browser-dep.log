@@ -1,0 +1,2050 @@
+==> verify lane rust (exit 0)
+    Checking baleyg v0.1.0 (/Users/jcarreira/projects/odin/baleyg-67-pre-main-integration)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.44s
+   Compiling baleyg v0.1.0 (/Users/jcarreira/projects/odin/baleyg-67-pre-main-integration)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.21s
+     Running unittests src/lib.rs (target/debug/deps/baleyg-ac940bfeb5641327)
+
+running 143 tests
+test dependency_rust::budget_tests::declaration_budget_counts_all_owned_text ... ok
+test http::dependency_lifecycle_tests::refresh_bursts_admit_one_worker_and_keep_only_latest_generation ... ok
+test capture::tests::missing_executable_refuses_admission ... ok
+test capture::tests::cached_executable_digest_rejects_wrong_path_and_replaced_arc ... ok
+test dependency_rust::budget_tests::exhausted_declaration_budget_marks_package_partial_without_storing_text ... ok
+test http::exceptional_recovery_tests::independent_shared_reader_process ... ok
+test capture::tests::nonregular_or_empty_executable_refuses_admission ... ok
+test capture::tests::executable_cutoff_and_stable_source_operation_counts ... ok
+test capture::tests::required_inputs_and_uncertain_sources_take_unconditional_hash_path ... ok
+test acp::tests::rejects_source_state_before_creating_directories ... ok
+test http::live_tests::acp_controlled_errors_are_exact_and_sanitized ... ok
+test acp::tests::durable_allowance_binding_and_exhaustion ... ok
+test acp::tests::deleted_or_truncated_ledger_never_resets ... ok
+test http::live_tests::live_error_classification_is_allowlisted_and_redacted ... ok
+test acp::tests::cancellation_kills_descendant_group ... ok
+test acp::tests::process_failure_output_bound_and_private_environment ... ok
+test http::live_tests::outer_http_fence_covers_native_composition_not_durable_payloads ... ok
+test classes::budget_tests::exhausted_detail_budgets_still_discover_classes_and_duplicate_bindings ... ok
+test http::exceptional_recovery_tests::failed_worker_never_installs_owner_or_reports_completed ... ok
+test http::live_tests::preview_fence_failure_restores_evicted_and_same_id_packets ... ok
+test http::live_tests::preview_root_change_after_serialization_discards_packet ... ok
+test http::live_tests::question_error_keeps_typed_refusals_and_selection_errors ... ok
+test http::exceptional_recovery_tests::leader_remains_locked_across_worker_result_and_atomic_install ... ok
+test http::exceptional_recovery_tests::cancellation_after_durable_recovery_reports_completed_with_new_owner ... ok
+test http::live_tests::packet_fence_survives_provider_await_and_takeover ... ok
+test http::live_tests::corrupt_selected_cached_source_prevents_live_provider_call ... ok
+test http::live_tests::context_exceeded_is_actionable_and_retains_reservation ... ok
+test http::live_tests::live_response_is_labeled_and_accounted ... ok
+test http::exceptional_recovery_tests::concurrent_posts_queue_two_requests_across_exceptional_recovery ... ok
+test http::exceptional_recovery_tests::idle_tick_cannot_drain_request_admitted_after_empty_pending_snapshot ... ok
+test http::dependency_lifecycle_tests::dependency_status_whole_response_fence ... ok
+test http::live_tests::live_response_is_rejected_if_snapshot_changes_during_call ... ok
+test http::live_tests::pinned_packet_conflicts_even_when_provider_fails ... ok
+test http::dependency_lifecycle_tests::stale_generation_cancel_and_revision_never_publish ... ok
+test acp::tests::validated_success_invalid_failure_and_shutdown_retain_attempts ... ok
+test index_coordinator::tests::reused_leader_is_reverified_after_capture_before_publish ... ok
+test indexer::line_index_tests::line_index_matches_prefix_scan_on_every_offset ... ok
+test indexer::local_classification_tests::declaration_and_cross_file_edges_never_gain_local_permission ... ok
+test indexer::local_classification_tests::exported_function_and_rust_tail_changes_still_reject_headers_imports_and_calls ... ok
+test indexer::local_classification_tests::frozen_medium_large_mixed_edits_have_proved_local_ast_body_shape ... ignored, AST-only frozen 40-path preflight; never count as benchmark evidence
+test indexer::local_classification_tests::length_changing_method_and_function_bodies_are_local_only_with_identical_surface ... ok
+test indexer::local_classification_tests::noncallee_return_identifiers_change_only_the_measured_document ... ok
+test http::exceptional_recovery_tests::timer_tick_quiesces_protected_select_before_ex_and_fences_injected_tick ... ok
+test indexer_rust::extraction_budget_tests::external_records_are_bounded_but_workspace_extraction_is_unchanged ... ok
+test indexer_rust::extraction_budget_tests::external_visits_are_bounded_even_when_records_are_sparse ... ok
+test live_jev::tests::deleted_or_truncated_database_never_restores_budget ... ok
+test live_jev::tests::independent_processes_share_cap ... ok
+test http::exceptional_recovery_tests::multiple_posts_commit_fifo_while_other_process_holds_leader ... ok
+test http::exceptional_recovery_tests::timer_tick_with_independent_shared_reader_defers_without_changing_both_dbs ... ok
+test live_jev::tests::process_reservation_worker ... ok
+test live_jev::tests::rejects_insecure_files_and_unknown_schema ... ok
+test index_coordinator::tests::pending_read_refuses_unknown_options_and_daemon_config_does_not_fallback ... ok
+test live_jev::tests::reservation_concurrent_reopen_and_binding ... ok
+test index_coordinator::tests::reused_leader_session_is_bound_to_its_store_before_capture ... ok
+test live_jev::tests::unlinked_sidecar_metadata_is_safe_but_main_file_stays_strict ... ok
+test live_jev::tests::simultaneous_initial_open_is_safe ... ok
+test mcp::catalog::tests::every_reference_closed_and_enums_present ... ok
+test mcp::catalog::tests::exact_full_catalog_and_bounds ... ok
+test mcp::session::tests::cancel_reuse_stale_completion ... ok
+test mcp::session::tests::client_info_title_validation ... ok
+test mcp::session::tests::known_tool_wrong_argument_type_is_application_validation ... ok
+test mcp::session::tests::legacy_progress_token_integer_boundary_and_recovery ... ok
+test mcp::session::tests::normalized_pending_aliases ... ok
+test mcp::session::tests::oversized_id_does_not_select_or_register ... ok
+test mcp::session::tests::pinned_capability_fields_and_mode_switches ... ok
+test mcp::session::tests::validation_and_lifecycle ... ok
+test mcp::tests::marker_guard_does_not_repair ... ok
+test mcp::tests::root_guard ... ok
+test mcp::tools::tests::closed_application_objects_and_pins ... ok
+test mcp::catalog::tests::advertised_path_and_basis_patterns_match_contract_cases ... ok
+test mcp::tools::tests::find_and_inspect_boundaries ... ok
+test mcp::tools::tests::exact_envelopes_identity_precedence_and_complete_wire_bound ... ok
+test mcp::tools::tests::source_path_hash_and_line_matrix ... ok
+test mcp::wire::tests::canonical_string_id_boundaries_and_aliases ... ok
+test index_coordinator::queue_completion_retry_tests::cli_cached_claim_mismatch_fails_closed_instead_of_retrying_forever ... ok
+test mcp::wire::tests::exact_ids ... ok
+test mcp::wire::tests::framing_and_recovery ... ok
+test mcp::wire::tests::parse_precedence ... ok
+test mcp::wire::tests::id_boundaries ... ok
+test mcp::tools::tests::marker_verification_error_is_sanitized_and_does_not_repair ... ok
+test native_evidence::occurrence_identity_tests::cached_witness_sort_matches_legacy_and_preserves_equal_key_order ... ok
+test native_evidence::occurrence_identity_tests::document_version_keeps_occurrence_ids_across_revisions ... ok
+test native_evidence::occurrence_identity_tests::failed_precondition_mints_no_occurrence ... ok
+test native_evidence::occurrence_identity_tests::native_producer_declares_and_authenticates_an_explicit_empty_inventory ... ok
+test index_coordinator::tests::coordinator_capture_opens_reads_and_hashes_each_source_once ... ok
+test store::rebaseline_fault_tests::canonical_cohort_produced_native_fact_floors ... ignored, resource-gated canonical medium and large produced-index fact floors
+test store::rebaseline_fault_tests::canonical_medium_local_update_writes_only_changed_fact_families ... ignored, resource-gated exact canonical medium local-update writer counters
+test http::normal_post_capture_cancellation_tests::accepted_job_cannot_be_cancelled_and_full_pair_changes_only_after_leader_drains ... ok
+test http::serving_holder_tests::failed_pending_read_keeps_same_id_for_holder_loss_takeover ... ok
+test http::serving_holder_tests::verified_holder_needs_no_index_open_and_lost_holder_triggers_takeover ... ok
+test index_coordinator::tests::explicit_reconcile_replaces_corruption_without_upgrading_a_reader ... ok
+test store::rebaseline_fault_tests::local_class_catalog_cap_uses_selected_full_revision_symbol_summary ... ok
+test live_jev::tests::cancellation_retains_pending_attempt ... ok
+test index_coordinator::queue_completion_retry_tests::ambiguous_committed_terminal_is_verified_without_republishing_head ... ok
+test live_jev::tests::mock_success_and_failed_responses_are_audited_and_retained ... ok
+test store::rebaseline_fault_tests::captured_sixfold_escaped_source_is_selectable_below_explicit_json_ceiling ... ok
+test store::rebaseline_fault_tests::captured_long_call_exceeds_injected_small_graph_cap_and_remains_selectable ... ok
+test native_evidence::cached_executable_digest_tests::admitted_executable_digest_survives_projection_validation_and_paired_publish ... ok
+test index_coordinator::queue_completion_retry_tests::failed_terminal_write_retries_exact_published_head_before_next_fifo_claim ... ok
+test live_jev::tests::rounded_success_preserves_raw_and_historical_failure_without_refunds ... ok
+test http::live_tests::rounded_live_response_warns_and_invalid_response_is_actionable ... ok
+test store::rebaseline_fault_tests::wal_header_without_sidecars_is_not_corruption_authority ... ok
+test store::rebaseline_fault_tests::one_byte_over_encoded_source_cap_never_enters_paired_cas ... ok
+test index_coordinator::queue_completion_retry_tests::cli_takeover_fast_path_retries_cached_first_completion_before_next_head ... ok
+test store::rebaseline_fault_tests::local_writer_counters_exclude_unchanged_occurrence_access ... ok
+test store::rebaseline_fault_tests::staged_hot_journal_after_validation_refuses_without_deleting_sidecar ... ok
+test store::rebaseline_fault_tests::real_source_above_injected_ancillary_cap_keeps_selected_source_available ... ok
+test store::requests::root_failure_tests::ready_leader_without_accepted_queue_skips_without_creating_db ... ok
+test store::sqlite_schema_race_tests::durable_fallback_classifier_excludes_operational_and_current_corruption_errors ... ok
+test live_jev::tests::invalid_and_empty_packet_never_reserve ... ok
+test acp::tests::nonzero_diagnostics_only_surface_fixed_allowlisted_categories ... ok
+test native_evidence::cached_executable_digest_tests::rejected_extraction_components_cannot_publish_or_mint_occurrences ... ok
+test store::requests::root_failure_tests::root_loss_serializes_prior_accept_and_refuses_late_insert_under_writer_lock ... ok
+test store::sqlite_schema_race_tests::recovery_classifier_separates_corruption_from_operational_storage_errors ... ok
+test store::requests::root_failure_tests::exceptional_dispositions_cannot_treat_missing_queue_as_empty ... ok
+test store::rebaseline_fault_tests::obsolete_metadata_marker_recreates_fresh_pin_and_preserves_requests ... ok
+test index_coordinator::queue_completion_retry_tests::cli_ordinary_drain_retries_cached_completion_without_republishing ... ok
+test store::selected_source_budget_tests::selected_length_guard_precedes_json_and_blob_decode ... ok
+test store::rebaseline_fault_tests::only_short_or_invalid_magic_headers_request_typed_recreation ... ok
+test store::rebaseline_fault_tests::private_stage_uses_paired_writer_without_admitting_corrupt_live_evidence ... ok
+test store::sqlite_schema_race_tests::changed_metadata_between_admission_and_leader_lock_refuses_before_update ... ok
+test store::rebaseline_fault_tests::cancellation_at_before_commit_rolls_back_entire_native_class_graph_pair ... ok
+test store::sqlite_schema_race_tests::persisted_scan_classifies_same_size_preserved_mtime_edit_by_ctime ... ok
+test store::sqlite_schema_race_tests::failed_takeover_before_writer_transaction_closes_every_clone ... ok
+test store::topology::gc_schema_race_tests::root_loss_requires_proven_pathname_change_not_arbitrary_io_failure ... ok
+test store::topology::gc_schema_race_tests::obsolete_orphan_schema_reports_unknown_without_upgrading_or_deleting ... ok
+test store::sqlite_schema_race_tests::real_revision_private_recovery_before_commit_error_rolls_back_same_inode ... ok
+test store::topology::gc_schema_race_tests::extra_view_after_readonly_open_before_snapshot_never_attests_gc_or_deletion ... ok
+test store::topology::gc_schema_race_tests::stale_v8_extractor_marker_is_refused_without_gc_writes_or_deletion ... ok
+test store::sqlite_schema_race_tests::second_connection_adds_legacy_trigger_after_admission_before_publish_lock ... ok
+test store::sqlite_schema_race_tests::tree_metadata_applies_no_overlay_before_post_fence ... ok
+test store::sqlite_schema_race_tests::response_post_fence_discards_none_and_empty_results ... ok
+test store::sqlite_schema_race_tests::retained_two_revision_tree_survives_partial_third_publication_rollback ... ok
+test store::sqlite_schema_race_tests::direct_response_pre_fence_rejects_root_lock_and_incarnation_changes ... ok
+test store::sqlite_schema_race_tests::second_connection_adds_view_after_admission_before_status_and_leader_snapshot ... ok
+test store::rebaseline_fault_tests::large_real_native_pair_cancels_at_before_commit_without_partial_rows ... ok
+test store::sqlite_schema_race_tests::response_fences_root_lock_and_error_results_before_release ... ok
+test store::rebaseline_fault_tests::exceptional_activation_is_atomic_and_keeps_pending_on_ambiguous_failure ... ok
+test store::topology::gc_schema_race_tests::historical_index_orphans_report_only_when_exact_shape_and_root_prove_eligibility ... ok
+test store::rebaseline_fault_tests::selective_publication_faults_rollback_and_retry_same_expected_pin ... ok
+test store::sqlite_schema_race_tests::live_read_reporter_separates_root_storage_corruption_from_operational_errors ... ok
+test store::sqlite_schema_race_tests::selected_operational_errors_do_not_latch_but_integrity_failure_closes_clones ... ok
+test store::rebaseline_fault_tests::persisted_local_classifier_falls_back_on_affected_uncertainty_not_unrelated_ambiguity ... ok
+
+test result: ok. 140 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 23.14s
+
+     Running unittests src/main.rs (target/debug/deps/baleyg-2fd26c0dc601e24f)
+
+running 5 tests
+test rust_source_arguments::roots_are_explicit_named_paths_not_commands ... ok
+test workspace_defaults::serve_defaults_to_cwd_and_browses_the_index_workspace ... ok
+test trusted_toolchain_probe_tests::rejects_workspace_compiler_without_execution ... ok
+test session_output_tests::index_output_holds_leader_until_write_finishes ... ok
+test trusted_toolchain_probe_tests::trusted_probe_uses_fixed_metadata_arguments ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/acp_http.rs (target/debug/deps/acp_http-87c88ad0abfb0ec7)
+
+running 8 tests
+test routes_keep_auth_host_and_origin_guards ... ok
+test body_overrides_invalid_shapes_and_size_are_rejected_without_reservation ... ok
+test stale_preflight_does_not_reserve ... ok
+test success_is_labeled_and_allowance_is_separate_and_retained ... ok
+test disabled_and_missing_are_safe ... ok
+test invalid_answer_and_provider_errors_are_sanitized ... ok
+test stale_success_and_failure_are_rejected_after_process ... ok
+test controlled_process_diagnostics_are_actionable_but_never_echo_output ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.87s
+
+     Running tests/anchors.rs (target/debug/deps/anchors-6fb3f389c6c8957e)
+
+running 9 tests
+test invalid_cross_revision_witness_is_rejected ... ok
+test invalid_document_revision_and_continuity_associations_fail_closed ... ok
+test ordered_failure_precedence ... ok
+test worked_audit_vectors ... ok
+test full_ordered_group_vectors_and_golden_fixture ... ok
+test generated_semantic_contract_anchors_are_the_rust_golden ... ok
+test authored_semantic_contract_cases_execute_through_production_audit ... ok
+test capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits ... ok
+test production_duplicate_cross_revision_is_never_inferred_unchanged ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/answer.rs (target/debug/deps/answer-aeb25d0f60d6602b)
+
+running 10 tests
+test prompt_preserves_full_graph_and_each_complete_source_once ... ok
+test enforces_answer_cardinality_and_byte_limits ... ok
+test rejects_stale_mutated_packets_and_strict_schema_violations ... ok
+test rejects_blank_evidence_and_bounds_each_unverified_limitation ... ok
+test prompt_keeps_pair ... ok
+test rejects_bad_paths_quotes_and_ranges ... ok
+test valid_answer_roundtrips_plain_text_and_branch_citations ... ok
+test first_question_preview_rejects_same_pin_forged_graph_callee_before_packet_creation ... ok
+test oversized_numbered_prompt_fails_instead_of_truncating_complete_source ... ok
+test unicode_crlf_blank_lines_and_final_newline_coordinates ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+     Running tests/behavior.rs (target/debug/deps/behavior-21152b421a34df31)
+
+running 21 tests
+test malformed_source_and_unsupported_language_fail_soft ... ok
+test optional_detection_uses_syntax_not_argument_text ... ok
+test loops_group_evaluation_without_unrolling ... ok
+test optional_computed_access_does_not_execute_key_unconditionally ... ok
+test imports_group_by_module_and_never_infer_instance_types ... ok
+test effects_and_unresolved_argument_effects_are_never_hidden ... ok
+test nested_evaluation_precedes_outer_and_callbacks_do_not_run ... ok
+test short_circuit_and_ternary_calls_stay_in_guarded_arms ... ok
+test atomic_write_retains_static_paths_and_exact_call_evidence ... ok
+test logging_in_guards_and_warning_calls_are_retained ... ok
+test participant_limit_keeps_source_backed_call_evidence ... ok
+test external_participant_cap_preserves_every_measured_call ... ok
+test exits_omit_unreachable_and_guard_remaining_paths ... ok
+test unsupported_and_optional_chain_fail_closed ... ok
+test for_of_computed_binding_and_destructuring_boundaries ... ok
+test standard_globals_are_identified_without_changing_measured_resolution ... ok
+test bounded_output_and_honest_visual_grouping ... ok
+test unsupported_loop_transfers_are_explicit_and_do_return_terminates ... ok
+test computed_receiver_order_and_finally_completion ... ok
+test import_shadowing_mutation_and_computed_members_fail_closed ... ok
+test builtin_identification_respects_lexical_parameters_and_mutations ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running tests/browse_http.rs (target/debug/deps/browse_http-e9a10a9a81b303aa)
+
+running 3 tests
+test catalog_pages_inline_methods_and_conservative_checks ... ok
+test cached_snapshot_is_independent_of_workspace_and_raw_query ... ok
+test strict_errors_revisions_and_auth ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/class_diagram_http.rs (target/debug/deps/class_diagram_http-14266065c554ddce)
+
+running 30 tests
+test changed_captured_class_scip_label_recomputes_f_and_new_revision_class_projection ... ok
+test hierarchy_edge_caps_are_connected_and_deterministic ... ok
+test projection_bounds_preserve_expansion_roots_edges_and_cycles ... ok
+test incompatible_index_refuses_without_migrating_durable_data ... ok
+test one_hop_incoming_methods_terminal_hints_and_cached_only ... ok
+test hierarchy_mandatory_paths_reject_total_response_byte_overflow ... ok
+test hierarchy_cycles_deduplicate_and_unknown_bases_stay_terminal_opt_in ... ok
+test hierarchy_node_search_caps_and_impossible_mandatory_paths_are_explicit ... ok
+test hierarchy_oversize_mandatory_evidence_fails_instead_of_stranding_roots ... ok
+test selected_class_pages_medium_release_latency ... ignored, release medium cohort: cargo test --release --test class_diagram_http selected_class_pages_medium_release_latency -- --ignored
+test automatic_hierarchy_is_opt_in_directional_transitive_and_cache_only ... ok
+test diagram_byte_budget_preserves_expansion_bridges_and_exact_relation_evidence ... ok
+test edge_limit_is_explicit_without_dangling_nodes ... ok
+test hierarchy_precedes_associations_and_reserves_deep_manual_neighbor_bridges ... ok
+test outgoing_declarations_precede_high_fan_in_before_caps ... ok
+test repeated_references_are_grouped_before_caps_with_real_evidence ... ok
+test terminal_hints_and_parent_cycles_fail_readably ... ok
+test ready_file_extraction_is_persisted_and_selected_http_reads_attest_it ... ok
+test selected_class_relation_rows_are_witnessed_by_source_and_graph ... ok
+test selected_class_pagination_spans_paths_in_one_revision ... ok
+test selected_class_and_symbol_routes_reject_same_pin_graph_call_forgery ... ok
+test failed_publication_keeps_projection_atomic_with_graph ... ok
+test same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes ... ok
+test authentication_strict_requests_revision_and_disconnected_expansion ... ok
+test search_pagination_literal_wildcards_and_supported_languages ... ok
+test retained_class_page_and_diagram_are_byte_stable_after_full_rewrite ... ok
+test selected_class_pages_and_diagrams_refuse_fk_valid_f_and_class_forgeries ... ok
+test normal_size_captured_java_python_cold_oracle_attests_full_published_catalog ... ok
+test presentation_byte_budget_clips_members_and_paginates_without_skipping_rows ... ok
+test selected_class_json_decode_and_clipping_fail_closed_without_retyping_invalid_requests ... ok
+
+test result: ok. 29 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.86s
+
+     Running tests/classes.rs (target/debug/deps/classes-9ea988afdac458fa)
+
+running 29 tests
+test hand_authored_workspace_cap_boundaries_and_moving_cut ... ok
+test production_class_limits_are_fixed_at_decision_0004_values ... ok
+test direct_python_methods_keep_measured_ids_including_legacy_function_kind ... ok
+test java_records_interfaces_enums_and_annotations_have_explicit_members_only ... ok
+test generic_base_arguments_are_not_additional_inheritance_edges ... ok
+test java_static_imports_block_wrong_same_package_candidates ... ok
+test duplicate_qualified_classes_stay_ambiguous ... ok
+test cancellation_and_old_or_unsupported_snapshots_are_safe ... ok
+test python_imports_annotations_members_and_nested_classes ... ok
+test generic_and_namespace_shadowing_also_blocks_dotted_names ... ok
+test java_scopes_never_guess_global_names_or_generic_parameters ... ok
+test warnings_dedupe_at_100_then_append_ordered_closers ... ok
+test method_generic_detail_limit_does_not_stop_declarations_or_leak_partial_blockers ... ok
+test java_members_inheritance_generics_and_nested_classes_are_source_bound ... ok
+test java_fully_qualified_and_python_init_relative_imports_are_scoped_candidates ... ok
+test class_registry_import_charge_tiny_native_pilot ... ok
+test member_clipping_preserves_later_nested_and_duplicate_declaration_registry ... ok
+test decision_0004_per_file_f_is_independent_of_other_workspace_documents ... ok
+test python_nested_classes_preserve_outer_generic_parameter_shadowing ... ok
+test python_nested_class_bodies_skip_enclosing_class_namespace_but_bases_do_not ... ok
+test python_literal_and_annotated_metadata_are_not_type_links ... ok
+test python_relative_imports_cannot_escape_package_root ... ok
+test python_typing_aliases_do_not_turn_literal_values_or_metadata_into_types ... ok
+test cohort72_small_java_python_generated_below_cap ... ok
+test python_shadowing_and_type_parameters_do_not_claim_workspace_targets ... ok
+test recovered_syntax_and_oversized_cached_sources_report_incompleteness ... ok
+test candidate_limit_never_turns_large_duplicate_sets_into_unique_matches ... ok
+test missing_measured_symbols_and_member_limits_are_explicit ... ok
+test tiny_limits_control_measured_names_import_bindings_and_type_parameter_details ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/cli.rs (target/debug/deps/cli-31768b4b0028060c)
+
+running 34 tests
+test cli_refuses_remote_bind_and_invalid_limits ... ok
+test external_destinations_are_rejected_before_git_marker_creation ... ok
+test acp_requires_complete_explicit_allowance_flags ... ok
+test forget_yes_refuses_unknown_sqlite_schema_without_removing_state ... ok
+test live_jev_requires_paired_explicit_budget_flags ... ok
+test forget_cli_requires_confirmation_and_preserves_unrelated_state ... ok
+test readiness_stderr_category_never_copies_secret_or_temp_path ... ok
+test private_readiness_report_is_mode_600_bounded_and_never_copies_raw_stderr ... ok
+test overlapping_git_workspace_refuses_before_marker_or_managed_entries ... ok
+test live_jev_missing_key_fails_without_creating_budget ... ok
+test malformed_jev_environment_never_echoes_credential_bytes ... ok
+test cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots ... ok
+test gc_report_without_workspace_does_not_create_state ... ok
+test index_forwards_pair_and_reports_pair ... ok
+test index_process_holds_leader_while_stdout_is_blocked ... ok
+test fixed_locations_and_removed_flag ... ok
+test export_path_refusals ... ok
+test standalone_read_refuses_legacy_relative_recorded_presentation_options ... ok
+test serve_ingress_persists_relative_presentation_paths_before_cross_cwd_takeover ... ok
+test cli_index_diagnostics_are_opt_in_without_changing_publication ... ok
+test corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_when_busy ... ok
+test explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_options ... ok
+test status_only_observes_existing_index_and_refuses_busy_without_writes ... ok
+test standalone_takeover_keeps_configured_missing_presentation_absent ... ok
+test standalone_takeover_replays_original_relative_presentation_from_another_cwd ... ok
+test gc_cli_reports_multiple_indexes_in_sorted_order ... ok
+test cli_round_trip_uses_persistent_store_and_never_executes_workspace ... ok
+test optional_captured_scip_changes_presentation_without_native_identity_or_full_rewrite_breakage ... ok
+test standalone_takeover_reuses_recorded_nondefault_file_cap ... ok
+test saved_items_real_index_matrix ... ok
+test unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_not ... ok
+test real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached_packet ... ok
+test current_commands_pair_matrix ... ok
+test real_cli_and_authenticated_daemon_share_native_pair_for_every_language_and_empty_root ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.36s
+
+     Running tests/dependencies.rs (target/debug/deps/dependencies-d476adbf91f0744b)
+
+running 19 tests
+test local_catalog_smoke ... ignored, explicit local-source smoke; uses only configured roots
+test absent_manifest_returns_explicit_unsupported_catalog ... ok
+test cancellation_stops_build ... ok
+test missing_lock_does_not_scan_cache_or_guess_version ... ok
+test lock_paths_cannot_select_arbitrary_nested_cache_files ... ok
+test identity_and_alias_amplification_is_bounded ... ok
+test duplicate_registry_candidates_are_ambiguous ... ok
+test unsupported_registry_and_config_fail_closed ... ok
+test package_discovery_bound_is_explicit ... ok
+test oversized_and_excluded_sources_are_honest ... ok
+test standard_library_prioritized_and_unavailable_explicit ... ok
+test workspace_paths_allowed_but_parent_paths_blocked ... ok
+test exact_locked_candidates_aliases_and_separate_sources ... ok
+test symlink_package_manifest_and_sources_never_followed ... ok
+test source_capability_pins_original_root_after_root_replacement ... ok
+test source_hash_and_catalog_identity_change_with_bytes_and_revision ... ok
+test per_package_symbol_bound_prioritizes_types_and_continues_other_packages ... ok
+test metadata_byte_budget_does_not_select_unsearched_cache_match ... ok
+test per_package_file_bound_is_partial ... ok
+
+test result: ok. 18 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/dependency_declarations.rs (target/debug/deps/dependency_declarations-86f97f08fd9732af)
+
+running 16 tests
+test bounds_external_crate_names_and_source_metadata_before_per_symbol_allocation ... ok
+test malformed_rust_marks_the_catalog_partial ... ok
+test ranges_preserve_utf8_byte_offsets_and_line_positions ... ok
+test handles_trait_signatures_associated_types_and_foreign_declarations ... ok
+test warns_on_cfg_paths_and_reexports_without_following_or_evaluating_them ... ok
+test bounds_signature_bytes_on_utf8_boundaries_and_source_size ... ok
+test skips_nested_declarations_in_all_behavior_and_macro_bodies ... ok
+test overflowing_owner_and_impl_names_skip_methods_and_preserve_following_items ... ok
+test extracts_lexical_declarations_and_keeps_impl_distinct_from_types ... ok
+test overflowing_lexical_scope_skips_subtree_without_fabricating_truncated_paths ... ok
+test package_source_path_and_span_all_contribute_to_ids ... ok
+test source_layout_and_inline_module_paths_are_only_syntax_candidates ... ok
+test bounds_declaration_count_and_retains_explicit_partial_warning ... ok
+test huge_module_name_does_not_multiply_source_text_across_children ... ok
+test bounds_depth_and_ast_visits_without_visiting_expression_trees ... ok
+test large_function_body_does_not_consume_declaration_walk_budget ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/dependency_http.rs (target/debug/deps/dependency_http-00685f508accac96)
+
+running 8 tests
+test all_dependency_endpoints_require_auth_host_and_origin ... ok
+test successful_workspace_index_automatically_rebuilds_catalog ... ok
+test sources_keep_pinned_roots_and_reject_symlink_replacement ... ok
+test request_validation_and_capability_only_access ... ok
+test disabled_and_shutdown_do_not_launch_catalog_work ... ok
+test startup_catalog_is_separate_paged_and_source_is_explicit ... ok
+test workspace_generation_reuse ... ok
+test source_hash_and_workspace_revision_reject_stale_reads ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.48s
+
+     Running tests/dependency_links.rs (target/debug/deps/dependency_links-f9451ac676449f82)
+
+running 16 tests
+test exact_path_adds_terminal_type_and_preserves_all_measured_evidence ... ok
+test macros_are_opaque_not_apparent_binding_sources ... ok
+test participant_cap_retains_original_target_on_overflow ... ok
+test actual_acp_cached_source_links_constructor_but_never_infers_open_receiver ... ok
+test cargo_alias_maps_to_declared_crate_prefix_not_package_name ... ok
+test shared_package_alias_is_ambiguous_even_when_one_version_has_no_type ... ok
+test fluent_chain_children_are_visited_but_return_types_and_receivers_are_unknown ... ok
+test transitive_crate_names_and_renamed_package_names_are_not_call_prefixes ... ok
+test duplicate_declarations_and_package_versions_are_ambiguous ... ok
+test stale_revision_non_rust_wrong_source_and_oversized_source_do_nothing ... ok
+test plain_and_group_imports_are_explicit_syntax_candidates ... ok
+test candidate_terminal_id_cannot_be_used_as_workspace_sequence_root ... ok
+test workspace_paths_and_bare_names_are_not_global_matches ... ok
+test globs_in_sibling_scopes_do_not_hide_candidate_but_enclosing_globs_do ... ok
+test only_type_declarations_and_non_resolved_calls_are_candidates ... ok
+test known_bindings_modules_aliases_and_renamed_imports_block_candidates ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running tests/file_tree.rs (target/debug/deps/file_tree-07b0f623e1455c3c)
+
+running 3 tests
+test shallow_metadata_sorted_pages_and_validation ... ok
+test symlinks_are_metadata_never_traversed_even_after_rename ... ok
+test scan_is_bounded_and_explicit ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests/file_tree_http.rs (target/debug/deps/file_tree_http-9c2c150a718c18c4)
+
+running 4 tests
+test cwd_metadata_maps_nested_index_without_content_or_mutation ... ok
+test symlink_listing_and_intermediate_escape_rejected ... ok
+test reasons_distinguish_languages_pending_files_and_workspace_boundary ... ok
+test paths_errors_auth_and_guards ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests/gc_record_report.rs (target/debug/deps/gc_record_report-3251080a471ba6ac)
+
+running 5 tests
+test leave_hot_journal_child ... ok
+test incomplete_record_does_not_hide_valid_peer_or_create_missing_lock ... ok
+test symlink_record_directory_never_probes_outside_with_or_without_database ... ok
+test hostile_path_text_and_non_utf8_entries_cannot_spoof_status_or_abort_inventory ... ok
+test report_continues_past_busy_and_hot_journal_records_without_writes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/http.rs (target/debug/deps/http-961eddf4a581e8ed)
+
+running 14 tests
+test token_security ... ok
+test local_design_assets_preserve_same_origin_guards ... ok
+test rejects_bad_startup ... ok
+test guards_public_and_private ... ok
+test validation_and_limit ... ok
+test dependency_status_whole_response_fence ... ok
+test jobs_publish_and_cancel ... ok
+test explicit_recovery_releases_only_daemon_old_owner_and_retries_after_foreign_reader ... ok
+test source_is_snapshot_and_revision_checked ... ok
+test queued_request_is_durable_and_non_cancellable_during_lock_contention ... ok
+test index_request_without_startup_session_takes_over_after_ack ... ok
+test explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_new_leader ... ok
+test live_control_corruption_returns_typed_503_and_hard_latches_clones ... ok
+test active_job_cancellation_does_not_publish ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.74s
+
+     Running tests/identity.rs (target/debug/deps/identity-a686a9dee19733f6)
+
+running 3 tests
+test class_field_calls_keep_measured_declaration_owners_without_execution_claims ... ok
+test injected_sql_failure_after_insert_preserves_previous_revision ... ok
+test real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/index_atomic.rs (target/debug/deps/index_atomic-7087732b6d7f2537)
+
+running 37 tests
+test canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retains_old_pin ... ignored, pinned medium Cmedium0000 Java prefix insertion requires two cold indices; run explicitly
+test crash_left_partial_stage_is_not_published_or_mistaken_for_the_index ... ok
+test failed_stage_does_not_publish_or_leave_its_temp_file ... ok
+test captured_java_python_scip_labels_require_unique_measured_names_and_coordinates ... ok
+test first_index_is_invisible_until_validated_and_synced ... ok
+test failed_capture_leaves_existing_index_revision_unchanged ... ok
+test exceptional_format_is_typed_deferred_refusal_without_file_mutation ... ok
+test captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_labels ... ok
+test drift_refusal_preserves_populated_store_pair_and_graph ... ok
+test full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime ... ok
+test live_root_mismatch_precedes_typed_control_corruption_without_latching ... ok
+test full_reconcile_replaces_persisted_source_and_input_inventory ... ok
+test preexisting_corrupt_index_is_not_reinitialized ... ok
+test bounded_control_decode_rebuilds_and_failed_attempt_stays_closed ... ok
+test additive_producer_binding_keeps_same_generation_legacy_pin_and_queue ... ok
+test live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin ... ok
+test live_structural_inventory_and_control_first_reads_fail_closed ... ok
+test metadata_real_revision_uses_private_witness_and_recovers_same_inode ... ok
+test published_v8_missing_reconcile_options_never_looks_like_a_bootstrap ... ok
+test live_control_corruption_status_first_is_typed_and_clone_shared ... ok
+test truncated_stage_is_rejected_before_publication ... ok
+test published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recovery ... ok
+test coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication ... ok
+test live_control_decode_corruption_latches_direct_reads_and_control_clones ... ok
+test v8_bootstrap_admits_only_empty_unpublished_evidence ... ok
+test reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore_change ... ok
+test selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit ... ok
+test same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinned_revisions ... ok
+test exported_javascript_and_bare_rust_tail_local_match_independent_cold ... ok
+test new_producer_binding_refuses_unilateral_executable_header_and_binding_tamper ... ok
+test current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state ... ok
+test parse_error_retained_pin_matches_independent_cold_and_advisory_uses_exact_token ... ok
+test extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed ... ok
+test private_metadata_witness_distinguishes_nul_real_and_multichunk_blob ... ok
+test local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery ... ok
+test selected_projection_json_failures_latch_only_selected_reads ... ok
+test document_local_delta_and_cross_file_fallback_match_independent_cold_publications ... ok
+
+test result: ok. 36 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 10.43s
+
+     Running tests/indexer.rs (target/debug/deps/indexer-d1e93e56834a201a)
+
+running 32 tests
+test direct_symlink_artifacts_and_config_are_never_read ... ok
+test java_python_discovery_respects_ignored_environments_and_source_symlinks ... ok
+test hard_linked_nonsource_inputs_share_immutable_bytes ... ok
+test graph_ids_and_ranges_are_exact_native_artifact_projection ... ok
+test initializer_calls_keep_executable_owner_and_control_guard_in_four_languages ... ok
+test discovery_ignores_secrets_builds_and_symlinks ... ok
+test conventional_java_source_packages_are_not_confused_with_build_outputs ... ok
+test cancellation_and_size_limits ... ok
+test measured_callees_are_terminal_not_targets ... ok
+test native_null_callee_spelling_remains_explicit_json_null ... ok
+test nested_calls_have_unique_ids_and_parse_errors_are_visible ... ok
+test declaration_ids_survive_body_only_change_but_calls_are_revision_local ... ok
+test old_lexical_callsite_fields_are_rejected_on_deserialization ... ok
+test python_assignment_rhs_calls_remain_owned_by_enclosing_function ... ok
+test rust_impl_and_trait_methods_keep_measured_method_kind_and_free_functions ... ok
+test full_reuse_fingerprint_authenticates_bytes_admission_producer_coverage_owner_and_projection ... ok
+test admitted_body_edit_measures_only_changed_document_not_unrelated_lookup_owners ... ok
+test optional_executable_alias_keeps_authenticated_native_role_without_editing_binary ... ok
+test pure_fixture_and_determinism ... ok
+test stable_capture_counts_one_open_read_hash_per_source_and_verifies_unchanged ... ok
+test root_dependency_drift_changes_native_revision_not_stable_or_occurrence_ids ... ok
+test captured_optional_labels_are_projection_only_but_admission_or_toolchain_changes_fallback ... ok
+test capture_rejects_absent_present_and_cancellation_but_accepts_empty_root ... ok
+test identity_aliases_and_nonregular_sources_fail_admission ... ok
+test untrusted_display_metadata_never_promotes_graph_edges_or_ids ... ok
+test optional_native_input_aliases_force_full_native_fallback ... ok
+test scip_label_requires_exact_captured_hash_and_name_token_and_never_supplies_identity ... ok
+test declared_inputs_and_root_refuse_cutoff_drift ... ok
+test capture_rejects_cutoff_source_and_directory_inventory_drift ... ok
+test measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint ... ok
+test four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_executable ... ok
+test captured_classifier_falls_back_on_each_unproved_surface_effect ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/java_behavior.rs (target/debug/deps/java_behavior-2a977898988eab94)
+
+running 11 tests
+test malformed_body_is_not_a_false_linear_trace ... ok
+test ternary_while_and_break_are_structured_not_flattened ... ok
+test nested_lambda_and_anonymous_bodies_never_execute_at_construction ... ok
+test receiver_arguments_constructor_assignment_order_and_measured_evidence ... ok
+test exhausted_argument_visit_budget_never_implies_enclosing_invocation ... ok
+test explicit_and_compact_constructors_are_navigable ... ok
+test branches_returns_throws_and_short_circuit_guard_suffixes ... ok
+test for_loops_initialize_once_and_guard_body_updates_and_suffix ... ok
+test signatures_and_annotation_defaults_have_no_invocation_body ... ok
+test unsupported_control_and_initialization_forms_are_opaque ... ok
+test depth_steps_participants_and_wide_inert_work_are_bounded ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/java_indexer.rs (target/debug/deps/java_indexer-2b9776378a00960f)
+
+running 3 tests
+test recovery_and_cancellation_are_explicit ... ok
+test lexical_owners_constructors_lambdas_anonymous_classes_and_utf8 ... ok
+test shared_start_call_ids_are_unique_and_publishable ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/java_python_http.rs (target/debug/deps/java_python_http-8f87b10d40471370)
+
+running 4 tests
+test declarations_without_bodies_are_navigable_without_fabricated_calls ... ok
+test cached_java_python_sequences_keep_measured_calls_after_source_deletion ... ok
+test mixed_catalog_tree_and_lexical_parents_remain_language_neutral ... ok
+test java_python_cached_endpoints_enforce_revision_and_auth ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
+
+     Running tests/jev.rs (target/debug/deps/jev-7aed9e601a2b1153)
+
+running 14 tests
+test synthetic_response_maps_aliases_back_to_native_ids_for_all_labels ... ok
+test display_score_uses_essential_probability_not_confidence_or_label ... ok
+test empty_candidate_packet_requires_empty_answers ... ok
+test hundredth_rounding_allows_float_noise_without_changing_score ... ok
+test request_contains_complete_evidence_once_and_bound_choice_per_call ... ok
+test wire_keeps_pair ... ok
+test hundredth_rounding_preserves_labels_and_original_scores ... ok
+test hundredth_rounding_rejects_larger_and_arbitrary_precision_errors ... ok
+test probability_sum_tolerance ... ok
+test lossless_tables_preserve_all_reference_fields_and_nested_region_parents ... ok
+test rejects_schema_deviations_and_bad_coverage ... ok
+test rounding_warnings_count_only_distributions_needing_exception ... ok
+test rejects_tampered_packets_and_answers_for_another_question_with_same_calls ... ok
+test request_byte_limit_never_truncates_and_counts_utf8 ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.94s
+
+     Running tests/live_jev.rs (target/debug/deps/live_jev-eda046226a078b72)
+
+running 1 test
+test public_budget_is_serializable_and_provider_is_send_sync ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/live_jev_http.rs (target/debug/deps/live_jev_http-acdeecd7fe8a4484)
+
+running 4 tests
+test new_routes_preserve_security_guards_and_limits ... ok
+test offline_constructor_exposes_disabled_status_and_never_runs ... ok
+test imported_rounded_response_adds_warning_only_after_validation ... ok
+test enabled_status_exhaustion_and_stale_preflight_are_offline ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+
+     Running tests/mcp_protocol.rs (target/debug/deps/mcp_protocol-6aa0d8529d17e529)
+
+running 13 tests
+test eof_and_cancellation_are_silent_for_no_pending_request ... ok
+test framing_ids_negotiation_and_application_validation ... ok
+test legacy_title_recovery_max_id_and_root_selection ... ok
+test golden_modern_legacy_transcripts ... ok
+test unusable_index_sentinels_do_not_change_unavailable_projection_or_get_repaired ... ok
+test both_modes_full_catalog_tools_and_lifecycle ... ok
+test exact_frames_split_utf8_crlf_and_eof ... ok
+test ordinary_cancellation_and_eof_without_private_race_hook ... ok
+test golden_tool_envelopes_and_maximum_ids_both_modes ... ok
+test modern_legacy_client_info_title ... ok
+test workspace_selection_startup_side_effects_and_final_identity ... ok
+test linked_git_worktrees_get_distinct_selected_markers ... ok
+test id_boundaries_binary_both_modes_and_unselected ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+     Running tests/native_evidence.rs (target/debug/deps/native_evidence-1fcfa72cf1992121)
+
+running 20 tests
+test canonical_controls_are_six_ascii_bytes_and_unicode_is_not_normalized ... ok
+test closed_records_reject_unknown_fields_and_fabricated_semantics ... ok
+test unicode_lookup_normalizes_without_changing_exact_identity_bytes ... ok
+test identity_excludes_body_and_revision_and_occurrence_is_document_version_local ... ok
+test every_nullable_native_field_requires_presence_even_when_null ... ok
+test unreadable_required_input_fails_closed ... ok
+test validation_refuses_cutoff_drift_without_source_reread ... ok
+test parser_recovery_reports_partial_not_false_complete ... ok
+test direct_native_opaque_macro_does_not_overflow_or_invent_calls ... ok
+test unverifiable_expression_keeps_independent_nullable_callee ... ok
+test source_grounded_four_language_headers_owners_and_control_regions ... ok
+test nested_occurrences_sort_before_hashing_and_unverifiable_callees_remain_nullable ... ok
+test nonopaque_rust_nesting_retains_fail_closed_depth_guard ... ok
+test every_native_kind_rejects_well_shaped_forgery_against_immutable_capture ... ok
+test presentation_inputs_are_recaptured_but_excluded_from_native_revision_identity ... ok
+test four_languages_and_empty_workspace_share_closed_native_memory ... ok
+test source_body_only_changes_revision_not_stable_declaration ... ok
+test editing_one_document_reidentifies_only_its_own_occurrences ... ok
+test max_file_bytes_and_previously_absent_required_input_change_native_basis ... ok
+test required_inputs_are_rehashed_when_stats_look_unchanged_and_ignore_changes_are_native_config ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/native_id_vectors.rs (target/debug/deps/native_id_vectors-11b411182e131243)
+
+running 3 tests
+test native_v4_occurrence_changes_only_descriptor_input ... ok
+test every_decision_0003_extraction_context_and_occurrence_vector ... ok
+test every_normative_stable_id_vector ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/native_store.rs (target/debug/deps/native_store-55dad0e6b0a06e15)
+
+running 21 tests
+test empty_workspace_has_native_pair_without_document_rows ... ok
+test selected_class_payload_oversize_refuses_before_json_decode ... ok
+test selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope ... ok
+test selected_native_text_total_budget_is_not_count_times_single_row_limit ... ok
+test extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_witness ... ok
+test amplified_selected_ancillary_rows_refuse_before_typed_materialization ... ok
+test invalid_retained_header_json_refuses_old_pin_without_mutating_sqlite_or_sidecars ... ok
+test malformed_and_foreign_release_pins_do_not_write_and_header_gaps_remain_corruption ... ok
+test pinned_graph_call_payload_must_match_native_before_query_and_sequence ... ok
+test retained_graph_header_preserves_distinct_stats_and_diagnostics_and_matches_live_head_bytes ... ok
+test invalid_native_and_conflict_never_change_published_pair ... ok
+test selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change ... ok
+test direct_native_ranges_regions_and_coverage_reject_selected_sql_edits ... ok
+test metadata_status_and_selected_source_reads_do_not_conflate_other_documents ... ok
+test graph_node_call_and_region_payloads_each_have_predecode_byte_envelope ... ok
+test single_oversized_fk_valid_native_child_text_refuses_before_materialization ... ok
+test index_from_another_native_producer_version_is_rebuilt_not_served ... ok
+test selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin ... ok
+test four_languages_normalized_rows_and_pinned_bytes_are_coherent ... ok
+test status_many_documents_only_checks_paired_metadata_not_every_blob ... ok
+test retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.35s
+
+     Running tests/navigation_http.rs (target/debug/deps/navigation_http-7f3c17f65e86e622)
+
+running 20 tests
+test auth_host_origin_are_enforced ... ok
+test java_same_class_calls_do_not_cross_receivers_or_lexical_scopes ... ok
+test java_same_class_candidates_exclude_constructors_and_keep_internal_targets ... ok
+test java_same_class_row_and_structural_work_limits_are_explicit ... ok
+test java_same_class_does_not_infer_inheritance_or_constructor_callers ... ok
+test java_same_class_multiline_unicode_and_nested_arguments_remain_line_based ... ok
+test java_same_class_proof_requires_exact_calls_callers_owners_and_target_syntax ... ok
+test ambiguity_preserves_all_cached_candidates_and_unresolved_calls_are_not_guessed ... ok
+test java_same_class_calls_preserve_overloads_measured_nodes_and_cached_revision ... ok
+test cached_only_source_lines_utf8_and_measured_ranges ... ok
+test java_same_class_source_and_response_budgets_fail_closed ... ok
+test source_candidate_count_and_huge_cached_text_have_fixed_output_limits ... ok
+test exact_members_overloads_shared_fields_and_crossfile_types ... ok
+test unsupported_classes_never_become_class_targets_but_methods_remain_measured ... ok
+test java_field_envelope_is_exact_across_comments_lines_shared_declarations_and_utf8 ... ok
+test cached_java_source_budget_and_unproven_member_shape_do_not_guess ... ok
+test retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_projection ... ok
+test strict_selectors_validation_and_revision ... ok
+test navigation_selected_graph_path_is_authenticated_without_scanning_other_documents ... ok
+test schema8_class_corruption_refuses_without_old_projection_guidance ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.22s
+
+     Running tests/pins.rs (target/debug/deps/pins-c98d2840173a864f)
+
+running 5 tests
+test current_store_producer_matrix ... ok
+test pin_shape_and_status ... ok
+test query_replay_pin_is_checked_in_target_snapshot ... ok
+test store_pinned_read_matrix ... ok
+test pair_recreation_cas ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+     Running tests/pins_http.rs (target/debug/deps/pins_http-b2ff0f3004f2061b)
+
+running 7 tests
+test sqlite_journal_child ... ok
+test active_and_hot_journal_keep_pinned_http_safe ... ok
+test producer_endpoint_matrix ... ok
+test index_admission_and_publication_pair ... ok
+test required_endpoint_matrix ... ok
+test recreated_index_rejects_old_generation_at_reused_numeric_revision ... ok
+test optional_endpoint_matrix ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s
+
+     Running tests/planning.rs (target/debug/deps/planning-c219057fb1feaf68)
+
+running 13 tests
+test strict_requests_and_limits ... ok
+test variable_question_packet_is_source_only_not_an_executable_seed ... ok
+test exact_coverage_rejects_unknown_duplicate_missing_and_wrong_packet ... ok
+test display_scores_reject_nonfinite_and_out_of_range_values ... ok
+test display_scores_rank_membership_but_output_stays_in_source_order ... ok
+test candidate_limit_reports_incomplete_evidence ... ok
+test complete_source_packet_size_limit_errors_without_truncating ... ok
+test local_literal_only_uncertainty_and_no_budget_filling ... ok
+test assembly_preserves_boundaries_and_never_expands_callbacks ... ok
+test direct_default_source_order_budget_and_actual_regions ... ok
+test scores_never_promote_lower_labels_or_override_direct_display_policy ... ok
+test revision_drift_rejected_snapshot_remains_immutable ... ok
+test packet_snapshot_unique_candidates_complete_source_and_stable_hash ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s
+
+     Running tests/privacy.rs (target/debug/deps/privacy-1021e93b1a0f36bf)
+
+running 1 test
+test state_and_databases_are_private_and_symlink_safe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/python_behavior.rs (target/debug/deps/python_behavior-e7f5052ae78fc25c)
+
+running 18 tests
+test evaluation_order_source_evidence_and_no_constructor_guess ... ok
+test short_circuit_conditional_expression_and_assignment_order ... ok
+test postponed_nested_async_factory_is_straight_and_body_stays_deferred ... ok
+test plain_nested_definition_binds_without_executing_its_body ... ok
+test loop_targets_evaluate_addresses_without_getter_claims ... ok
+test class_annotations_remain_inside_class_execution_boundary ... ok
+test loops_keep_conditions_inside_loop_and_transfers_stop_path ... ok
+test identifier_binding_does_not_relabel_complex_writes ... ok
+test nested_definitions_class_execution_and_lambda_invocation_are_separate ... ok
+test visit_cutoff_guards_enclosing_invocation_after_omitted_arguments ... ok
+test branches_elif_return_and_raise_guard_suffix ... ok
+test future_annotations_does_not_change_local_assignment_execution ... ok
+test local_annotations_never_execute_and_valued_targets_keep_assignment_order ... ok
+test definition_header_shortcuts_are_bounded ... ok
+test step_participant_depth_and_width_bounds_are_explicit ... ok
+test eager_or_unsupported_definition_headers_keep_continuation_guards ... ok
+test only_proven_module_future_header_defers_annotations ... ok
+test unsupported_forms_are_boundaries_not_unconditional_calls ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/python_indexer.rs (target/debug/deps/python_indexer-54d393157feff13c)
+
+running 2 tests
+test recovery_annotations_and_cancellation_are_explicit ... ok
+test scopes_defaults_decorators_async_lambdas_utf8_and_publication ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/questions_http.rs (target/debug/deps/questions_http-23e0c766ca908641)
+
+running 8 tests
+test strict_inputs_guards_and_body_limits_apply_to_question_routes ... ok
+test cached_packet_refuses_changed_selected_graph_call_under_same_pin ... ok
+test oversized_export_explains_how_to_narrow_without_truncation ... ok
+test cached_packet_checks_only_its_selected_source_and_graph_witnesses ... ok
+test packet_operation_pair_matrix ... ok
+test offline_roundtrip_is_stable_and_preserves_display_policy ... ok
+test cache_is_bounded_and_failed_previews_do_not_evict ... ok
+test bad_choices_missing_packets_and_stale_revisions_are_client_errors ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+
+     Running tests/requests.rs (target/debug/deps/requests-4d3bab1da61f24f9)
+
+running 18 tests
+test queue_hot_journal_child ... ok
+test concurrent_first_queue_open_is_atomic_and_fifo ... ok
+test hot_journal_rolls_back_before_queue_identity_and_ack ... ok
+test incompatible_or_corrupt_existing_queue_never_gets_fresh_ack ... ok
+test request_rejects_symlink_to_captured_workspace ... ok
+test request_rejects_relative_external_input_before_ack ... ok
+test replacement_queue_write_refusal_preserves_old_index_before_ex ... ok
+test root_failure_commit_error_never_authorizes_index_swap ... ok
+test unchanged_root_with_changed_workspace_marker_cannot_fail_queue_rows ... ok
+test old_holder_fails_queued_and_running_rows_after_root_is_moved ... ok
+test live_old_holder_rejects_replaced_same_key_queue_inode ... ok
+test replacement_rechecks_old_index_under_ex_before_any_rename ... ok
+test durable_fifo_and_incarnation_fence ... ok
+test replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue ... ok
+test replacement_refuses_foreign_index_marker_and_sidecars_without_queue_transition ... ok
+test replacement_refuses_missing_or_foreign_queue_without_swapping_index ... ok
+test first_cli_takeover_capture_satisfies_fifo_head_once ... ok
+test replacement_root_can_accept_while_old_holder_is_live_then_recover_index_only ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+
+     Running tests/rust_behavior.rs (target/debug/deps/rust_behavior-71e63a738d1ff3ac)
+
+running 35 tests
+test dynamic_callees_keep_an_unresolved_boundary_lane ... ok
+test assignment_evaluates_rhs_before_place_and_marks_write ... ok
+test chain_arguments_and_unrelated_chains_keep_original_evidence ... ok
+test confirmed_internal_targets_are_not_replaced_by_source_hints ... ok
+test if_let_evaluates_value_and_keeps_body_guarded ... ok
+test deep_opaque_macro_is_not_traversed_for_grouping ... ok
+test depth_limit_is_explicit ... ok
+test cache_is_sufficient_and_missing_calls_are_not_invented ... ok
+test bare_use_does_not_guard_runtime_calls ... ok
+test async_await_and_opaque_bodies_are_honest ... ok
+test grouping_depth_budget_is_independent_and_keeps_measured_steps ... ok
+test branches_and_return_guard_suffix ... ok
+test imported_constructor_is_only_a_source_callee_hint ... ok
+test bounds_are_explicit ... ok
+test grouping_work_budget_is_independent_and_keeps_measured_steps ... ok
+test nested_calls_keep_evaluation_order_and_evidence ... ok
+test open_options_chain_and_inert_imports ... ok
+test outer_call_is_omitted_after_unconditional_argument_return ... ok
+test match_guards_remain_inside_alternatives ... ok
+test actual_acp_open_options_chain_is_presentational ... ok
+test method_fixture_covers_larger_guarded_workflow ... ok
+test real_auth_function_is_supported_from_cached_source ... ok
+test question_mark_guards_arguments_outer_call_and_suffix ... ok
+test short_circuit_rhs_and_following_effects_are_guarded ... ok
+test participant_limit_preserves_call_evidence ... ok
+test show_all_does_not_filter_rust_calls ... ok
+test source_hint_labels_are_bounded_without_identity_collisions ... ok
+test source_hint_limit_degrades_lanes_without_losing_calls_or_groups ... ok
+test loops_are_not_unrolled_and_return_hides_iteration_tail ... ok
+test try_chain_results_stay_syntactic_and_guards_are_preserved ... ok
+test receiver_names_are_stable_source_groups_not_object_identity ... ok
+test real_acp_calls_have_source_hints_not_inferred_types ... ok
+test all_return_match_and_unconditional_loop_return_omit_suffix ... ok
+test unsafe_macro_and_compound_assignment_guard_suffix ... ok
+test chain_control_and_opaque_arguments_are_not_hidden ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/rust_browse_http.rs (target/debug/deps/rust_browse_http-7505ab30cac9f6a3)
+
+running 1 test
+test rust_methods_sequence_and_source_survive_live_file_removal ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/rust_indexer.rs (target/debug/deps/rust_indexer-a3b92a98fc5a85de)
+
+running 4 tests
+test recovered_rust_retains_syntax_and_cached_source ... ok
+test mixed_discovery_exact_ranges_owners_macros_and_utf8 ... ok
+test cargo_hash_inputs_and_fresh_scip_do_not_resolve_rust ... ok
+test chained_calls_have_unique_range_ids_and_publish ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/rust_sources_http.rs (target/debug/deps/rust_sources_http-2ee690054578a833)
+
+running 7 tests
+test descriptor_is_pinned_and_exact_size_bound_is_accepted ... ok
+test candidates_are_separate_and_ranges_match_returned_snapshot ... ok
+test guards_apply_to_every_external_endpoint ... ok
+test old_constructors_have_no_roots_and_configuration_is_validated ... ok
+test extraction_budget_returns_explicit_partial_candidates ... ok
+test symlinks_and_non_regular_files_are_never_read ... ok
+test invalid_paths_unknown_roots_limits_and_parse_warnings ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+     Running tests/store.rs (target/debug/deps/store-6da946cbd981267e)
+
+running 26 tests
+test graph_call_dto_rejects_lexical_proof_fields ... ok
+test incompatible_index_refuses_without_touching_legacy_state ... ok
+test private_stage_build_is_unpublished_and_cleans_only_its_own_inode ... ok
+test durable_storage_io_failure_is_never_converted_to_orphan_success ... ok
+test malformed_persisted_anchors_fail_closed_without_an_index ... ok
+test partial_v8_bootstrap_never_turns_saved_records_into_index_unavailable ... ok
+test refuses_unversioned_existing_index_without_migration ... ok
+test concurrent_publish_cas_has_one_winner ... ok
+test durable_orphan_fallback_does_not_mask_current_index_corruption ... ok
+test recognized_noncurrent_without_marker_column_is_explicitly_not_ready ... ok
+test null_current_marker_latches_before_durable_orphan_fallback ... ok
+test failed_leader_on_current_root_mismatch_never_enables_durable_orphans ... ok
+test delete_reader_pins_snapshot_and_blocks_publish ... ok
+test live_current_decode_failure_hard_latches_saved_views ... ok
+test active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_managed ... ok
+test saved_reads_without_records_are_conservative_and_write_nothing ... ok
+test literal_search_and_snapshot_only_sources ... ok
+test safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervenes ... ok
+test cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys ... ok
+test same_path_different_association_is_missing_but_dangling_revision_fails_closed ... ok
+test durable_orphans_after_failed_takeover_but_not_current_marker_corruption ... ok
+test traversal_cycles_bounds_callbacks_and_boundaries ... ok
+test durable_user_data_survives_cache_loss_and_resolves_orphans ... ok
+test publication_is_atomic_and_reopens ... ok
+test malformed_graph_rolls_back_and_structural_stats_are_recounted ... ok
+test removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.94s
+
+     Running tests/topology.rs (target/debug/deps/topology-3d7b22dd92635379)
+
+running 61 tests
+test durable_creator_child ... ok
+test exclusive_recovery_reader_child ... ok
+test durable_absent_parent_is_verified ... ok
+test external_write_destinations ... ok
+test durable_existing_lock_replacement_checks_new_inode_and_holder ... ok
+test fixed_paths_and_unsafe_components ... ok
+test exclusive_deletion_waits_for_shared_process ... ok
+test discovery_matrix ... ok
+test durable_incomplete_and_incompatible_refused ... ok
+test exceptional_leader_refuses_missing_or_unsafe_retained_path_without_creation ... ok
+test exceptional_recovery_requires_closed_readers_and_retains_both_lock_inodes ... ok
+test durable_existing_lock_unlink_never_recreates ... ok
+test durable_non_git_move_retains_old_record_and_root_row ... ok
+test every_marker_sync_stage_is_required_for_creator_and_adopter ... ok
+test implicit_filesystem_root_is_refused ... ok
+test durable_marker_change_refuses_real_operation ... ok
+test implicit_home_child ... ok
+test durable_first_creator_process_contention_and_retry ... ok
+test durable_annotation_first_commit_fault_and_sync_fault ... ok
+test leader_child ... ok
+test forget_rechecks_sqlite_schema_after_confirmation ... ok
+test implicit_home_is_refused_in_isolated_child ... ok
+test marker_child ... ok
+test malformed_anchor_documents_fail_before_persistence ... ok
+test durable_first_save_empty_record_and_payloads ... ok
+test forget_empty_record_and_recovery_sidecars_refuse ... ok
+test guard_drop_unlocks_even_when_fork_child_keeps_descriptor ... ok
+test path_identity_is_sha256_of_canonical_absolute_root_bytes ... ok
+test durable_git_move_and_copy_share_payload_without_rewriting ... ok
+test marker_sync_faults_refuse_creator_and_adopter ... ok
+test marker_race_and_durability ... ok
+test existing_saved_writers_use_exclusive_lock_and_orphan_sidecars_refuse ... ok
+test roots_overlapping_fixed_locations_are_refused_before_creation ... ok
+test multiprocess_lock_protocol ... ok
+test pause_before_incarnation_and_sync_fault ... ok
+test shared_holder_child ... ok
+test forget_requires_safe_exclusive_record_and_recreates_on_later_save ... ok
+test shared_use_cannot_remove_last_and_live_holder_blocks_exclusive ... ok
+test paused_creator_and_adopter_share_the_single_marker ... ok
+test stale_leader_child ... ok
+test saved_anchor_raw_bytes_survive_edits ... ok
+test saved_anchor_rejects_target_replacement ... ok
+test stale_use_child ... ok
+test stale_inode_waiters_reopen_before_success ... ok
+test suspended_leader_is_not_displaced ... ok
+test verified_follower_requires_held_matching_leader_inode_and_incarnation ... ok
+test persistent_short_and_malformed_markers_remain_unchanged ... ok
+test short_marker_disappearing_or_replaced_at_barrier_is_not_regenerated ... ok
+test server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input ... ok
+test git_marker_matrix ... ok
+test view_anchor_raw_bytes_survive_edits ... ok
+test saved_anchor_atomic_first_save_and_delete_edit_races ... ok
+test forget_refuses_countable_records_with_unknown_sqlite_schema ... ok
+test gc_refuses_countable_records_with_missing_durable_columns ... ok
+test gc_rejects_dangling_recovery_sidecars_without_writes ... ok
+test gc_classifies_current_schema8_but_refuses_spoofed_shapes ... ok
+test gc_age_and_record_inventory_are_read_only ... ok
+test index_delete_journal_no_wal ... ok
+test index_open_and_generation ... ok
+test leader_records_open_age_and_follower_preserves_it ... ok
+test gc_report_sorts_multiple_derived_records_and_missing_paths ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+
+     Running tests/topology_http.rs (target/debug/deps/topology_http-6154a05082733031)
+
+running 7 tests
+test workspace_root_changed ... ok
+test schema5_is_not_native_anchor_evidence ... ok
+test durable_crud_matrix ... ok
+test missing_anchor_document_keeps_authenticated_saved_routes_listable ... ok
+test query_optional_pin_matrix ... ok
+test saved_views_and_annotations_attach_to_the_requested_retained_manifest ... ok
+test saved_read_pin_and_ownership_matrix ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
+
+==> verify lane semantic (exit 0)
+✔ unique body edit (4.227792ms)
+✔ duplicate body edit with proven continuity (0.459709ms)
+✔ inserted earlier same-name sibling changes focused header (0.258208ms)
+✔ different-header sibling inserted after unique member (0.2685ms)
+✔ duplicate count changes (0.630125ms)
+✔ same-count duplicate membership unknown (0.338125ms)
+✔ same-count duplicate membership changed (0.285125ms)
+✔ same-revision duplicate ignores contradictory continuity state (0.226084ms)
+✔ missing old identity never name-searches (0.140625ms)
+✔ ANCHOR.unique.changedSibling (0.645834ms)
+✔ ANCHOR.duplicate.unknown (1.779125ms)
+✔ ANCHOR.duplicate.changed (0.39225ms)
+✔ ANCHOR.missing.old (0.364209ms)
+✔ ANCHOR.continuity.unchangedWithoutEvidence (0.276ms)
+✔ ANCHOR.continuity.unknownWithEvidence (0.263875ms)
+✔ ANCHOR.inventory.hash (0.28875ms)
+✔ authored source refs materialize only typed slots without computing traversal or rewriting arrays (1.986875ms)
+✔ failure keeps invalid attempted request and authored error without graph calculation (0.189125ms)
+✔ typed answer reference and malformed-slot baseline-to-single-mutation controls (7.218334ms)
+✔ AUTHOR.IDS computes native declaration, header and occurrence identities without answers (132.221792ms)
+✔ AUTHOR.HASHES prints expected and actual captured bytes without writing expected files (140.542834ms)
+✔ AUTHOR.ARGS rejects any generation or arbitrary extra flags (0.38225ms)
+✔ COORD.CONVERSION unicode scalar, UTF-16 and UTF-8 on CRLF source (1.442208ms)
+✔ WITNESS.SPELLING validates separate spelling when calleeRange is null (0.485709ms)
+✔ COORD.INVALID_UTF8 rejects malformed exact source bytes (0.097417ms)
+✔ COORD.CACHE mutated caller buffers and evicted sources convert afresh (0.618291ms)
+✔ source-backed counts: exact read and measured call (55.838166ms)
+✔ captured resolved disposition (27.164125ms)
+✔ captured provenExternal disposition (26.325709ms)
+✔ captured ambiguous disposition (152.226084ms)
+✔ captured unresolved disposition (25.921916ms)
+✔ unsupported is checked against native source capability (23.981208ms)
+✔ callable reference outside callee counts as negative, not a second call (25.516833ms)
+✔ unsupported source capability rejects an authored label (25.071709ms)
+✔ corpus profile enforces all floors, not only totals (25.248083ms)
+✔ draft language corpus skips only count floors; example and draft stay in their own directories (35.585125ms)
+✔ exact mutation controls on source-backed native membership and captured dispositions (54.838458ms)
+✔ normalizer fixture call candidate (35.804416ms)
+✔ category-specific source witnesses and unique scenario anchors (61.276833ms)
+✔ captured import usage supports only importsAliases, not callableValues (46.03575ms)
+✔ normalized source-backed recursive call has one call and one anchored recursion scenario (30.758291ms)
+✔ nested declaration-name anchors use the measured parent, not the focused declaration (33.362083ms)
+✔ member-name reference inside a larger measured callee cannot be a callable-value negative (32.521041ms)
+✔ UTF-16 callable negative converts to UTF-8 source before comparison (28.633542ms)
+✔ two independently captured producers cannot inflate one measured reference (32.487208ms)
+✔ same-name overload category requires two independently measured sibling names (27.8305ms)
+✔ unicode coordinates require source bytes; ASCII anchors cannot be relabelled (56.522583ms)
+✔ coverageFreshness requires an authenticated partial tuple, not a relabelled scenario (28.482959ms)
+✔ relationshipsDispatch requires a captured dispatch fact, not a reference name (61.195084ms)
+✔ captured directed relationship counts once and rejects wrong direction or producer copy (37.599625ms)
+✔ source-backed write reference role (25.699708ms)
+✔ source-backed type reference role (23.904792ms)
+✔ measured declaration site supports definition and alias roles once per reference (25.398833ms)
+✔ each independent corpus minimum and each of eight category and five outcome floors (1.679667ms)
+✔ captured proof cannot be relabelled to an unrelated fact (25.659333ms)
+✔ two captured semantic producers cannot inflate one unsupported source span (31.176667ms)
+✔ unsupported copies in UTF-16 and scalar encodings share one source-byte span (28.592ms)
+✔ measured same-name Java sibling category does not require a signature heuristic (653.509375ms)
+✔ temporary captured Java corpus reaches each exact floor through checkCounts (629.821583ms)
+✔ captured Java corpus checks independently removable role floors (7493.043167ms)
+✔ captured Java role dependencies fail before the floor for read and import (1801.257ms)
+✔ integrated captured corpus rejects each count below its exact floor (14943.456125ms)
+✔ Java overloads accept distinct signatures but reject unrelated names and containers (1490.752792ms)
+✔ second captured producer cannot duplicate a directed edge at the corpus floor (509.334125ms)
+✔ example anchor snapshots parse as native JavaScript scripts; duplicate exports fail (175.413083ms)
+✔ example source bytes, immutable IDs and per-document occurrences (0.502166ms)
+✔ undeclared, unknown, duplicate or unauthenticated extraction inventory fails closed (59.234959ms)
+✔ withdrawn occ:v1 rows and v1-derived values are rejected by the occ:v2 checker (14.996041ms)
+✔ authored graph answers select latest declaration proofs, never old occurrences (4.246ms)
+✔ six authored anchor branches retain actual source declarations (0.079083ms)
+✔ durable anchor order uses captured revision and document without collapsing duplicates (0.213084ms)
+✔ negative input history-zero/older-r0-fallback fails at GRAPH.PROVENANCE (1.027084ms)
+✔ negative input history-unchanged/unreturned-declaration fails at GRAPH.PROVENANCE (2.189583ms)
+✔ negative input history-unchanged/foreign-document fails at GRAPH.PROVENANCE (1.436417ms)
+✔ negative input history-unchanged/old-call-binding fails at GRAPH.TRAVERSAL (0.847333ms)
+✔ negative input history-unchanged/old-reference-proof fails at GRAPH.PROVENANCE (1.059875ms)
+✔ negative input history-other-producer/Q-proof-in-P-answer fails at GRAPH.PROVENANCE (4.919084ms)
+✔ negative input history-unchanged/promoted-r1-proof-as-r2 fails at GRAPH.PROVENANCE (1.2215ms)
+✔ negative input history-zero/missing-zero-fact-coverage fails at GRAPH.COVERAGE (0.546417ms)
+✔ negative input history-changed/relabelled-stale fails at GRAPH.PROVENANCE (1.130375ms)
+✔ negative input history-unchanged/relabelled-possibly-stale fails at GRAPH.PROVENANCE (1.929541ms)
+✔ negative input history-foreign/forbidden-coverage-warning fails at WARNING.KEYS (1.0485ms)
+✔ complete real fixture check, including source-backed durable anchors (23.492875ms)
+✔ discovered fixtures are validated from the caller-selected root without a language registry (12.857334ms)
+Checking fixture /var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-fixture-discovery-F7DAJe/example
+✔ runner verifies a valid copied example and does not silently skip it (1354.91525ms)
+✔ the committed example publication passes no-write checks (127.23175ms)
+Checking fixture /var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-fixture-discovery-LBtMEs/example
+Checking fixture /var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-fixture-discovery-LBtMEs/java
+✔ a source-backed Java corpus is discovered and published through the common runner (6969.986ms)
+Checking fixture /var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-fixture-discovery-XAWruZ/javascript
+✔ a copied minimal example cannot evade corpus floors by changing its profile (189.950583ms)
+Checking fixture /var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-fixture-discovery-lcxWht/javascript (DRAFT: count floors not enforced)
+Checking fixture /var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-fixture-discovery-lcxWht/javascript
+✔ a draft language corpus passes every invariant without floors until it is marked corpus (1181.762ms)
+✔ the literal example cannot claim the draft profile (30.215709ms)
+✔ discovery rejects unknown directory name with stable assertion and path (26.8745ms)
+✔ discovery rejects a corpus descriptor with the wrong language or profile (32.453791ms)
+✔ duplicate nested language fixture and absent descriptor are rejected (82.663625ms)
+Checking fixture /var/folders/hy/gnjttg5x5_n6tpgxprm02r8w0000gn/T/baleyg-fixture-discovery-oQAoBM/example
+✔ absent declared input fails a concrete inventory assertion (93.069708ms)
+▶ FORMAT.REGISTRY: every type and every required object field is closed
+  ✔ Text (0.560459ms)
+  ✔ Language (0.066459ms)
+  ✔ UInt (0.045792ms)
+  ✔ Hash (0.066667ms)
+  ✔ Path (0.095625ms)
+  ✔ Range (0.509417ms)
+  ✔ Kind (0.048917ms)
+  ✔ SyntaxId (0.057625ms)
+  ✔ OccurrenceId (0.064042ms)
+  ✔ Role (0.074125ms)
+  ✔ Resolution (0.047709ms)
+  ✔ Producer (0.342709ms)
+  ✔ SourceSet (0.2065ms)
+  ✔ DocumentKey (0.222375ms)
+  ✔ Document (0.200333ms)
+  ✔ Revision (0.232542ms)
+  ✔ Coverage (0.521042ms)
+  ✔ SemanticBasis (1.16575ms)
+  ✔ Provenance (0.316709ms)
+  ✔ Signature (0.09875ms)
+  ✔ Key (0.110792ms)
+  ✔ Parameter (0.087ms)
+  ✔ Header (0.408208ms)
+  ✔ Declaration (0.867166ms)
+  ✔ SymbolKey (0.268583ms)
+  ✔ Target (0.038083ms)
+  ✔ Symbol (0.621875ms)
+  ✔ MeasuredAnchor (0.259333ms)
+  ✔ Join (0.224625ms)
+  ✔ DeclarationBinding (0.253834ms)
+  ✔ TypeRelationship (0.233958ms)
+  ✔ Call (0.514625ms)
+  ✔ ControlRegion (0.507209ms)
+  ✔ Reference (0.980667ms)
+  ✔ CallBinding (0.587875ms)
+  ✔ DurableAnchor (0.280375ms)
+  ✔ GroupContinuity (0.117167ms)
+  ✔ AnchorResult (0.087625ms)
+  ✔ GraphRequest (0.333334ms)
+  ✔ GraphNode (0.170208ms)
+  ✔ GraphEdge (0.348166ms)
+  ✔ Frontier (0.25575ms)
+  ✔ Warning (0.365166ms)
+  ✔ GraphResult (0.497667ms)
+  ✔ Error (0.140833ms)
+  ✔ Success (0.130917ms)
+  ✔ Failure (0.102333ms)
+  ✔ GraphAnswer (0.028209ms)
+  ✔ SyntaxDigestInput (0.233333ms)
+  ✔ ExtractionContextComponent (0.099542ms)
+  ✔ ExtractionContextInput (0.158667ms)
+  ✔ OccurrenceDigestInput (0.2835ms)
+  ✔ SourceManifestRow (0.106875ms)
+  ✔ SourceManifestInput (0.016084ms)
+  ✔ SiblingGroupInput (0.06975ms)
+  ✔ HeaderDigestInput (0.018166ms)
+  ✔ PositionRange (0.135125ms)
+  ✔ SourceWitness (0.112584ms)
+  ✔ WitnessEntry (0.127083ms)
+  ✔ CapturedDocument (0.17075ms)
+  ✔ CapturedRevision (0.280417ms)
+  ✔ ComparisonContext (0.149041ms)
+  ✔ CaptureFile (0.500792ms)
+  ✔ MeasurementSupport (28.588459ms)
+  ✔ CoverageIntent (0.340583ms)
+  ✔ FixtureV1 (1.513292ms)
+  ✔ AnchorSelector (0.325792ms)
+  ✔ NativeDeclaration (0.649584ms)
+  ✔ NativeCall (4.400125ms)
+  ✔ NativeControl (0.386208ms)
+  ✔ NativeReference (0.313583ms)
+  ✔ NativeArtifact (0.211042ms)
+  ✔ IdentityRef (0.055ms)
+  ✔ RecordRef (0.061917ms)
+  ✔ TargetRef (0.022833ms)
+  ✔ TypeRelationshipFact (0.337833ms)
+  ✔ InternalTargetRef (0.154292ms)
+  ✔ ReferenceEvidenceTemplate (0.278792ms)
+  ✔ ReferenceFact (0.278458ms)
+  ✔ DeclarationBindingFact (0.7ms)
+  ✔ CallBindingFact (3.493083ms)
+  ✔ SymbolFact (0.241291ms)
+  ✔ CoverageFact (0.196542ms)
+  ✔ ProvenanceFact (0.190417ms)
+  ✔ Fact (0.041333ms)
+  ✔ Scenario (0.2015ms)
+  ✔ AnnotationFile (0.260834ms)
+  ✔ SemanticCapture (0.15475ms)
+  ✔ ReferenceJoinDiagnostic (0.194625ms)
+  ✔ NonExactReferenceJoin (0.239166ms)
+  ✔ ReferenceAnchor (0.258916ms)
+  ✔ NormalizedRecordsV1 (1.560125ms)
+  ✔ AttemptedGraphRequest (0.3645ms)
+  ✔ AnswerCase (0.332167ms)
+  ✔ AnswersInputV1 (0.1295ms)
+  ✔ MaterializedAnswerCase (0.220708ms)
+  ✔ AnswersV1 (0.108459ms)
+  ✔ JoinDisposition (0.149666ms)
+  ✔ ResolutionDisposition (0.155ms)
+  ✔ Disposition (0.0265ms)
+  ✔ CallableValueNegative (0.2365ms)
+  ✔ DispositionsV1 (0.370916ms)
+  ✔ AnchorResultTemplate (0.169042ms)
+  ✔ AnchorCase (0.258042ms)
+  ✔ AnchorCasesV1 (0.115542ms)
+  ✔ CategoryCount (0.112167ms)
+  ✔ OutcomeCount (0.107333ms)
+  ✔ CountsV1 (0.614125ms)
+  ✔ FileDigest (0.152667ms)
+  ✔ ManifestV1 (0.64025ms)
+  ✔ BundleDigestInput (0.231708ms)
+  ✔ InputDigestRow (0.114042ms)
+  ✔ InputDigestInput (0.022125ms)
+  ✔ TargetTemplate (0.023292ms)
+  ✔ DeclarationBindingTemplate (0.2995ms)
+  ✔ DeclarationBindingEvidenceTemplate (0.122166ms)
+  ✔ CallBindingEvidenceTemplate (0.274834ms)
+  ✔ CallBindingTemplate (0.464958ms)
+  ✔ SymbolTemplate (0.607291ms)
+  ✔ GraphRequestTemplate (0.355083ms)
+  ✔ GraphNodeTemplate (0.148709ms)
+  ✔ GraphEdgeTemplate (0.298417ms)
+  ✔ FrontierTemplate (0.237958ms)
+  ✔ GraphResultTemplate (0.350583ms)
+  ✔ SuccessTemplate (0.099208ms)
+  ✔ FailureTemplate (0.074834ms)
+  ✔ GraphAnswerTemplate (0.025916ms)
+✔ FORMAT.REGISTRY: every type and every required object field is closed (76.28525ms)
+✔ FORMAT.UNIONS: every variant has closed fields (0.7235ms)
+✔ RELATIONSHIP_FORMAT: explicit and independent relationshipKind for all three values (0.480875ms)
+✔ RELATIONSHIP_FORMAT.NESTED: captured relationship facts enforce source and closed enum (1.967208ms)
+✔ FORMAT.ENVELOPES: comparison, diagnostics, requested limits and exclusive answers (0.327542ms)
+✔ CANONICAL.INTAKE: duplicate-safe strict Unicode and integer tokens (0.9135ms)
+✔ FORMAT.POPULATED: all named shapes reject nested omission and unknown keys (397.782209ms)
+✔ FORMAT.TYPED_REFS: only declared identity and record slots accept their own refs (0.471ms)
+✔ FORMAT.ENVELOPES.POPULATED: authored and published request policy stays distinct (2.812417ms)
+✔ CANONICAL.INTAKE: only JSON whitespace, no BOM, no sparse arrays (0.479958ms)
+✔ MUTATION.REGISTRY: baseline is checked before mutation and IDs remain enumerable (0.696291ms)
+✔ FORMAT.UNIONS.POPULATED: each nested union variant enforces closed fields (42.610584ms)
+✔ FORMAT.SCHEMA_MATRIX: populated alternatives and registered precise negative controls (1915.662459ms)
+✔ IDENTITY.ADMISSION verifies source-derived snapshot and independent producers (42.958709ms)
+✔ IDENTITY.DIGEST rejects changed capture and unlisted snapshot file (34.845209ms)
+✔ IDENTITY.PATH rejects symlink source and traversal (14.740209ms)
+✔ DISCOVERY.JAVASCRIPT_COEXISTENCE does not conflate example and corpus (5.186167ms)
+✔ IDENTITY.UTF8 rejects malformed authored JSON without replacement decoding (13.153667ms)
+✔ IDENTITY.COVERAGE rejects dangling tuples and incomplete support while retaining valid intent (97.190709ms)
+✔ IDENTITY.SOURCE_SET and producer descriptors require supported unique admissions (48.617041ms)
+✔ IDENTITY.INVENTORY rejects unlisted root files, duplicate annotation and root symlink (45.259916ms)
+✔ DISCOVERY.PROFILE rejects forged descriptors and nested fixture routing (10.60375ms)
+✔ IDENTITY.COVERAGE excludes Java alias but admits Java definition and JS alias (49.568792ms)
+✔ IDENTITY.CHRONOLOGY retains opaque, per-source-set authored order (107.591625ms)
+✔ IDENTITY.INVENTORY closes unknown nested inputs while excluding generated bundles (49.870833ms)
+✔ IDENTITY.SEMANTIC rejects a proof claiming another captured producer or source bytes (57.7715ms)
+✔ IDENTITY.SEMANTIC admits source-derived utf8 relationship (44.581083ms)
+✔ IDENTITY.SEMANTIC admits source-derived utf16 relationship (49.607917ms)
+✔ IDENTITY.SEMANTIC admits source-derived unicodeScalar relationship (49.298375ms)
+✔ IDENTITY.SEMANTIC relationship utf8-split-scalar (63.2645ms)
+✔ IDENTITY.SEMANTIC relationship utf16-split-surrogate (57.621083ms)
+✔ IDENTITY.SEMANTIC relationship scalar-out-of-bounds (62.9295ms)
+✔ IDENTITY.SEMANTIC relationship declaration-boundary (58.091708ms)
+✔ IDENTITY.SEMANTIC relationship reversed-name-range (50.269709ms)
+✔ IDENTITY.SEMANTIC relationship witness-split-scalar (46.306458ms)
+✔ IDENTITY.SEMANTIC relationship witness-out-of-bounds (48.485666ms)
+✔ IDENTITY.SEMANTIC relationship witness-outside-declaration (54.151041ms)
+✔ IDENTITY.SEMANTIC relationship changed-witness-text (61.2915ms)
+✔ IDENTITY.SEMANTIC relationship witness-encoding-disagreement (58.901209ms)
+✔ IDENTITY.SEMANTIC relationship name-range-disagreement (59.780709ms)
+✔ IDENTITY.SEMANTIC relationship different-same-spelled-declaration (61.368709ms)
+✔ IDENTITY.SEMANTIC relationship source-ref-mismatch (53.791917ms)
+✔ IDENTITY.SEMANTIC relationship source-revision-mismatch (56.109667ms)
+✔ IDENTITY.SEMANTIC relationship source-document-mismatch (97.437875ms)
+✔ BASIS.* validates each captured descriptor and byte claim before freshness (60.726166ms)
+✔ BASIS.RAW_FACT compares captured wrapper fields without depending on JSON key order (42.369042ms)
+✔ FRESHNESS.TWO_REVISION_CONTEXT retains r1 proof but compares pinned r2 snapshot (73.932542ms)
+✔ FRESHNESS.COMPONENTS requested producer, manifest, toolchain and config cannot borrow capture (130.362583ms)
+✔ TARGET_STALENESS.TWO_REVISION_CONTEXT evaluates at the binding revision, not the r2 comparison (108.325791ms)
+✔ FRESHNESS.REQUESTED_DESCRIPTOR compares independently without requiring requested executable (125.046208ms)
+✔ FRESHNESS.SOURCE_SET treats identical caller bytes on another admitted set as possiblyStale (52.75475ms)
+✔ BASIS.RAW_FACT rejects missing and contradictory captured semantic proof (76.1955ms)
+✔ TARGET_STALENESS verifies the captured declaration; later r2 changes never mark the r1 binding stale (134.226625ms)
+✔ BASIS.RAW_RELATIONSHIP binds a separate relationship proof to the captured source (86.195208ms)
+✔ IDENTITY.SEMANTIC rejects normalized provenance in raw capture (46.0845ms)
+✔ FRESHNESS.COVERAGE keeps partial fresh, complete stale and failed refresh historical (78.68425ms)
+✔ graph projection rejects incomplete records rather than silently reusing comparison labels (0.810875ms)
+✔ failed refresh selects latest declaration proofs only, plus zero-fact coverage and r2 measured call (1.189ms)
+✔ changed bytes stale, partial earlier coverage warns, omitted alone does not (0.65525ms)
+▶ all graph evidence negatives use exact checker controls
+  ✔ GRAPH.oldR1Call (1.021833ms)
+  ✔ GRAPH.unlinkedProof (0.52775ms)
+  ✔ GRAPH.relabelProof (0.474834ms)
+  ✔ GRAPH.coverageMissing (0.491292ms)
+  ✔ GRAPH.coverageExtra (0.710166ms)
+  ✔ GRAPH.coverageOrder (0.504583ms)
+  ✔ GRAPH.proofMissing (0.741167ms)
+  ✔ GRAPH.proofExtra (0.866917ms)
+  ✔ GRAPH.proofOrder (0.547333ms)
+✔ all graph evidence negatives use exact checker controls (7.384916ms)
+✔ admitted failed/omitted refresh selects source-backed declaration proofs, warning keys and r2 call only (231.809791ms)
+▶ captured r2 binding cannot survive a failed or omitted current tuple
+  ✔ GRAPH.capturedR2Binding.failed (0.511167ms)
+  ✔ GRAPH.capturedR2Binding.omitted (0.700792ms)
+✔ captured r2 binding cannot survive a failed or omitted current tuple (68.85925ms)
+✔ an admitted r1 graph projects captured r1 proof and target against r1, not comparison r2 (116.955916ms)
+✔ a contradictory ambiguous binding group returns every member's proof on its edge (0.474375ms)
+✔ real fixture projection at a non-comparison revision fails closed on incomplete records (95.031167ms)
+✔ eight hand-authored pinned FIFO, cycle, diamond, callback, depth, node and call cap cases (29.027ms)
+✔ typed request failures preserve pinned order and no fallback (0.24925ms)
+✔ failed and omitted r2 keep measured calls as missingEvidence when only r1 call facts exist (1.301917ms)
+▶ graph checker negative controls compare exact fields, proof and warning keys
+  ✔ GRAPH.authored-edge (1.522292ms)
+  ✔ GRAPH.authored-proof (0.641417ms)
+  ✔ GRAPH.authored-warning (0.584708ms)
+✔ graph checker negative controls compare exact fields, proof and warning keys (6.900375ms)
+✔ latest prior tuple selects only captured returned declaration proofs; changed bytes and partial warnings (5.266959ms)
+▶ captured chain rejects relabelled and unlinked historical proofs with precise fields
+  ✔ GRAPH.history.relabel (1.445291ms)
+  ✔ GRAPH.history.unlinked (2.414167ms)
+✔ captured chain rejects relabelled and unlinked historical proofs with precise fields (4.137208ms)
+✔ captured failed and omitted refresh answers pass the complete graph checker (270.96125ms)
+▶ captured current binding: selected complete/partial self-call and failed leaked edge
+  ✔ GRAPH.captured.failed-leaked-binding (0.693334ms)
+✔ captured current binding: selected complete/partial self-call and failed leaked edge (132.97325ms)
+▶ source-backed impossible r2 call facts reject atomically; absence remains a missingEvidence boundary
+  ✔ failed tuple with physically present r2 binding (28.772ms)
+  ✔ omitted tuple with physically present r2 binding (32.5295ms)
+  ✔ complete read-only tuple cannot carry a call binding (31.375792ms)
+  ✔ partial tuple not observing call cannot carry a call binding (35.575042ms)
+✔ source-backed impossible r2 call facts reject atomically; absence remains a missingEvidence boundary (144.347041ms)
+✔ exact callee binding survives independently unsupported invocation measurement (45.856209ms)
+✔ selected partial unsupported non-exact call stays diagnostic-only without observed call (38.905666ms)
+✔ captured reference roles must be observed by its selected producer/document tuple (32.006583ms)
+✔ finite graph boundaries: cap with no work, defaults, syntax-only, resolution precedence (1.014542ms)
+✔ historical tuple and fact selection exclude foreign producer, document, and unreturned declarations (0.286084ms)
+▶ graph assembly controls reject old occurrence, promoted and foreign facts, zero fallback and request/frontier drift
+  ✔ GRAPH.assembled.old-r1-binding (0.522083ms)
+  ✔ GRAPH.assembled.promoted-proof (0.3755ms)
+  ✔ GRAPH.assembled.relabelled-proof (0.356833ms)
+  ✔ GRAPH.assembled.unlinked-proof (0.717458ms)
+  ✔ GRAPH.assembled.unreturned-proof (0.525042ms)
+  ✔ GRAPH.assembled.foreign-producer (0.370125ms)
+  ✔ GRAPH.assembled.foreign-document (0.348875ms)
+  ✔ GRAPH.assembled.zero-fact-older-fallback (0.307166ms)
+  ✔ GRAPH.assembled.effective-request (0.612875ms)
+  ✔ GRAPH.assembled.frontier (0.518083ms)
+✔ graph assembly controls reject old occurrence, promoted and foreign facts, zero fallback and request/frontier drift (5.240916ms)
+✔ IDENTITY.VECTORS all 64 full digests, domains and canonical inputs from descriptors (13.685ms)
+✔ IDENTITY.EXTRACTION_CONTEXT Decision 0003 vectors: capture digests, canonical bytes and SHA-256 (0.222958ms)
+✔ IDENTITY.OCCURRENCE Decision 0003 occ:v2 vectors byte for byte (0.384458ms)
+✔ IDENTITY.OCCURRENCE withdrawn revision-bound occ:v1 input and values are rejected (0.46625ms)
+✔ IDENTITY.OCCURRENCE same document, producer and context share an ID; any input change re-identifies (0.319791ms)
+✔ IDENTITY.COLLISION retained revisions and distinct full hashes sharing a prefix (0.34ms)
+✔ IDENTITY.ORDINAL immutable document, parent, exact name and signature scopes (0.547542ms)
+✔ IDENTITY.MANIFEST pinned empty and populated bytes, sorted and sensitive (0.2955ms)
+✔ IDENTITY.CANONICAL every control and closed nested input (0.605042ms)
+✔ IDENTITY.OCCURRENCE_ORDINAL owner and kind isolate measured namespaces (0.296666ms)
+✔ IDENTITY.ADMISSION verifies source-derived snapshot and independent producers (38.611167ms)
+✔ IDENTITY.DIGEST rejects changed capture and unlisted snapshot file (40.213208ms)
+✔ IDENTITY.PATH rejects symlink source and traversal (14.737208ms)
+✔ DISCOVERY.JAVASCRIPT_COEXISTENCE does not conflate example and corpus (5.024584ms)
+✔ IDENTITY.UTF8 rejects malformed authored JSON without replacement decoding (15.371459ms)
+✔ IDENTITY.COVERAGE rejects dangling tuples and incomplete support while retaining valid intent (85.530292ms)
+✔ IDENTITY.SOURCE_SET and producer descriptors require supported unique admissions (49.934ms)
+✔ IDENTITY.INVENTORY rejects unlisted root files, duplicate annotation and root symlink (46.400833ms)
+✔ DISCOVERY.PROFILE rejects forged descriptors and nested fixture routing (9.70475ms)
+✔ IDENTITY.COVERAGE excludes Java alias but admits Java definition and JS alias (50.849958ms)
+✔ IDENTITY.CHRONOLOGY retains opaque, per-source-set authored order (84.767542ms)
+✔ IDENTITY.INVENTORY closes unknown nested inputs while excluding generated bundles (51.845333ms)
+✔ IDENTITY.SEMANTIC rejects a proof claiming another captured producer or source bytes (59.053625ms)
+✔ IDENTITY.SEMANTIC admits source-derived utf8 relationship (42.675375ms)
+✔ IDENTITY.SEMANTIC admits source-derived utf16 relationship (44.553125ms)
+✔ IDENTITY.SEMANTIC admits source-derived unicodeScalar relationship (51.781625ms)
+✔ IDENTITY.SEMANTIC relationship utf8-split-scalar (63.143375ms)
+✔ IDENTITY.SEMANTIC relationship utf16-split-surrogate (57.958417ms)
+✔ IDENTITY.SEMANTIC relationship scalar-out-of-bounds (58.106542ms)
+✔ IDENTITY.SEMANTIC relationship declaration-boundary (61.037209ms)
+✔ IDENTITY.SEMANTIC relationship reversed-name-range (57.560625ms)
+✔ IDENTITY.SEMANTIC relationship witness-split-scalar (46.770292ms)
+✔ IDENTITY.SEMANTIC relationship witness-out-of-bounds (46.830292ms)
+✔ IDENTITY.SEMANTIC relationship witness-outside-declaration (49.014625ms)
+✔ IDENTITY.SEMANTIC relationship changed-witness-text (53.940667ms)
+✔ IDENTITY.SEMANTIC relationship witness-encoding-disagreement (64.589125ms)
+✔ IDENTITY.SEMANTIC relationship name-range-disagreement (54.50575ms)
+✔ IDENTITY.SEMANTIC relationship different-same-spelled-declaration (61.960584ms)
+✔ IDENTITY.SEMANTIC relationship source-ref-mismatch (56.390875ms)
+✔ IDENTITY.SEMANTIC relationship source-revision-mismatch (51.509959ms)
+✔ IDENTITY.SEMANTIC relationship source-document-mismatch (64.0235ms)
+✔ LOOKUP.LEXICAL decoding and language normalization preserve raw spelling identity (1.311375ms)
+✔ ROLE.APPLICABILITY alias is absent in Java and requires definition on declaration (0.135625ms)
+✔ LOOKUP and ROLE raw spelling, declaration sites and all language roles (0.644917ms)
+✔ NORMALIZE.SOURCE identity and native diagnostic independence (59.617417ms)
+✔ NORMALIZE.DUPLICATE owner/kind/range rejected (35.248875ms)
+✔ NORMALIZE.OCCURRENCE source-derived call/reference ordinals and exact tuple joins (36.694375ms)
+✔ NORMALIZE.CALLEE does not guess a range from the separate spelling witness (41.425125ms)
+✔ NORMALIZE.REFERENCE_JOIN non-exact diagnostics do not fabricate reference records (96.648417ms)
+✔ NORMALIZE.RELATIONSHIP maps all authored kinds with directed internal source (0.254083ms)
+✔ NORMALIZE.JOIN counts distinct measured candidate IDs and exact tuple (33.166625ms)
+✔ measured mutation: missing header name (31.506375ms)
+✔ measured mutation: duplicate witness (30.962958ms)
+✔ measured mutation: changed leaf value (41.60325ms)
+✔ measured mutation: name span outside declaration (29.3535ms)
+✔ measured mutation: header mismatch (32.351125ms)
+✔ measured mutation: anonymous name (25.037ms)
+✔ measured mutation: missing call spelling (23.304125ms)
+✔ measured mutation: callee mismatch (22.388583ms)
+✔ measured mutation: call outside owner (22.346625ms)
+✔ measured mutation: missing reference spelling (36.687417ms)
+✔ measured mutation: reference bytes differ (29.593125ms)
+✔ measured mutation: bad owner (30.782708ms)
+✔ measured mutation: duplicate call location (29.588208ms)
+✔ measured mutation: duplicate reference location (28.91175ms)
+✔ source leaves include parameter, signature, modifiers, bases, and result type (32.861458ms)
+✔ source identity and ordering are deterministic under shuffled rows and nativeId changes (29.200292ms)
+✔ control chain requires unique ordered containing regions (27.365167ms)
+✔ real measured target() retains all four independent nullable spelling/callee combinations (29.213ms)
+▶ nullable call spelling controls use admitted source and exact logical failures
+  ✔ F2.spelling-witness-missing (1.091334ms)
+  ✔ F2.authored-spelling-changed (0.682083ms)
+  ✔ F2.spelling-witness-encoding (0.66775ms)
+  ✔ F2.callee-outside-invocation (1.009042ms)
+✔ nullable call spelling controls use admitted source and exact logical failures (30.645625ms)
+✔ semantic proof, symbol, declaration binding, relationship, reference, call and maps (68.253625ms)
+✔ join matching does not cross owner, family, bytes, revision or producer support (25.40725ms)
+✔ same-producer contradictory targets preserve each proof and never change measured join (47.6755ms)
+✔ nested source-derived keys and actual Unicode/CRLF byte offsets (50.827917ms)
+✔ isolated r1/r2 comparison keeps historical provenance and never rebinds r1 call to r2 (119.5145ms)
+✔ all three semantic joins retain non-exact diagnostics without fabricated occurrence or binding (56.109334ms)
+✔ all three relationship kinds preserve direction and independent semantic proof on admitted input (48.472417ms)
+✔ anchor case must link captured and current revision and a measured current target (27.413584ms)
+✔ coverage tuple, state, roles, diagnostics and producer partitions (37.646583ms)
+✔ two semantic producers retain separate proof and binding partitions on the same measured call (73.505041ms)
+✔ unchanged caller with changed target bytes has a possiblyStale proof; v1 staleTarget stays false (96.303459ms)
+✔ producer conventions bind native ranges, witnesses and semantic anchors (69.363042ms)
+✔ coverage intent requires partial diagnostic for unsupported or missing requested role (25.4125ms)
+✔ cross-namespace references and external relationship key cannot shadow valid maps (50.070375ms)
+✔ admitted other-source-set measured target needs an external boundary (65.588542ms)
+✔ UTF-16 and Unicode scalar producer offsets convert against astral CRLF source (84.7555ms)
+✔ coverage requires role-specific measurement families and either call anchor family (29.813459ms)
+✔ coverage intent reconciles all six states and unrelated unavailable families (31.576792ms)
+✔ source-derived native reference IDs produce a complete ambiguous join diagnostic at the unit seam (43.322875ms)
+✔ same-proof same-target duplicates collapse, conflicting non-target fields reject (40.930875ms)
+✔ immediate source owner and overload signatures determine nested keys and ordinals (23.455667ms)
+✔ equal-name overload ordinals follow measured source order, not native row order (25.983292ms)
+✔ publication: independent pristine generations are byte-identical; both check commands never write (1235.258125ms)
+✔ publication: admitted native raw order and native IDs do not change semantic IDs (399.284083ms)
+✔ publication: changed admitted answer bytes invalidate manifest with zero writes (515.690208ms)
+✔ publication: failed compile or bundle write preserves prior valid manifest and bundle (832.177458ms)
+✔ publication: concurrent identical generations both succeed on one immutable bundle (666.020125ms)
+✔ publication: conflicting existing immutable bundle is rejected without replacement (412.067917ms)
+✔ publication: published hash changes fail exact hash assertion without writes (300.385417ms)
+✔ publication: manifest paths, hashes and canonical bytes are checked without writes (966.977ms)
+✔ CLI generate and check admit the directory's profile and language, like discovery (60.251917ms)
+✔ CLI rejects unknown/duplicate flags, missing values and unknown fixtures (0.299ms)
+✔ publication control: independently edited input rejects the exact manifest (645.63275ms)
+✔ loaded exact claims retain full member/proof closure and canonical bytes for one, two and three targets (245.067084ms)
+✔ a byte-identical output duplicate is rejected; two distinct admitted proofs cannot collapse (43.050166ms)
+✔ all resolution cardinalities, six dispatch classes, producer isolation and nonexact groups (309.541ms)
+✔ historical proof remains linked to r1; a changed r2 target never marks the r1 binding stale (63.799083ms)
+✔ two measured revisions close each call, fact, proof and historical group independently (75.266917ms)
+✔ admitted target tuples in two documents, source sets and revisions cannot replace the claim (249.638458ms)
+✔ two producers keep full separate proof inventories; reassignment merges only their raw claim group (57.781333ms)
+✔ source-backed agreeing duplicate claims keep each provenance and agree at normalization/checker boundary (175.281375ms)
+✔ source-backed contradictory nonexact targets and mismatched non-target claims fail both boundaries (83.192333ms)
+✔ finite loaded binding controls run valid baseline before each one-property mutation (1630.052542ms)
+✔ internal and external exact claims resolve to ambiguous Target[] with both proofs (41.108833ms)
+✔ admitted target claims reject wrong measured refs and inconsistent contributors (53.260417ms)
+▶ source-derived three-producer, two-document, r1/r2 coverage and historical proofs
+  ✔ U1.missing-coverage (2.813375ms)
+  ✔ U1.extra-coverage (1.696ms)
+  ✔ U1.duplicate-coverage (1.452708ms)
+  ✔ U1.swapped-coverage-producer (1.830125ms)
+  ✔ U1.swapped-coverage-document (1.552208ms)
+  ✔ U1.swapped-coverage-revision (1.454625ms)
+  ✔ U1.swapped-coverage-set (1.294667ms)
+  ✔ U1.requested-bit (1.498292ms)
+  ✔ U1.selected-bit (1.331875ms)
+  ✔ U1.diagnostic-bit (1.604417ms)
+  ✔ U1.state-bit (1.499333ms)
+  ✔ U1.role-order (1.203917ms)
+  ✔ U1.role-duplicate (1.213792ms)
+  ✔ U1.role-subset (1.25375ms)
+  ✔ U1.identity-format (1.294ms)
+  ✔ U1.identity-comparison (1.719625ms)
+  ✔ U1.identity-producer (1.536333ms)
+  ✔ U1.identity-source-set (1.731375ms)
+  ✔ U1.identity-revision (1.63625ms)
+  ✔ U1.identity-document-hash (1.105917ms)
+  ✔ U1.identity-document-length (1.071875ms)
+  ✔ U1.roles-extra-supported (1.214125ms)
+  ✔ U1.roles-unsupported-request (1.434ms)
+  ✔ U1.basis-producer-id (1.440708ms)
+  ✔ U1.basis-language (1.589584ms)
+  ✔ U1.basis-source-set (1.382792ms)
+  ✔ U1.basis-revision (1.407917ms)
+  ✔ U1.basis-version (1.521208ms)
+  ✔ U1.basis-producer-hash (8.950791ms)
+  ✔ U1.basis-artifact-hash (1.523167ms)
+  ✔ U1.basis-manifest (1.260083ms)
+  ✔ U1.basis-toolchain (3.071958ms)
+  ✔ U1.basis-config (2.284042ms)
+  ✔ U1.basis-dependency (1.256583ms)
+  ✔ U1.basis-lookup (2.502459ms)
+  ✔ U1.fresh-promotion (1.982208ms)
+✔ source-derived three-producer, two-document, r1/r2 coverage and historical proofs (197.041458ms)
+▶ FRESHNESS.USE keeps captured historical tuple and rejects wrong producer, revision and missing proof
+  ✔ U1.use-wrong-producer (0.203375ms)
+  ✔ U1.use-wrong-revision (0.076333ms)
+  ✔ U1.use-wrong-proof (0.052208ms)
+  ✔ U1.use-missing-tuple (0.046792ms)
+✔ FRESHNESS.USE keeps captured historical tuple and rejects wrong producer, revision and missing proof (84.8835ms)
+▶ FRESHNESS.TARGET verifies the captured declaration; v1 staleTarget is false
+  ✔ U1.target-true-invalid (0.286708ms)
+  ✔ U1.target-missing-captured (0.109709ms)
+  ✔ U1.target-wrong-proof (0.079708ms)
+✔ FRESHNESS.TARGET verifies the captured declaration; v1 staleTarget is false (58.374333ms)
+✔ identical caller bytes with changed revision or manifest are possiblyStale, not fresh (43.54825ms)
+✔ captured semantic proof is fresh when every requested component matches (43.388ms)
+▶ requested producer components do not fall back to captured identity
+  ✔ absent (45.204666ms)
+  ✔ version (42.085042ms)
+  ✔ hash (43.758041ms)
+  ✔ encoding (39.740625ms)
+  ✔ languages (43.565792ms)
+  ✔ kind (40.928333ms)
+✔ requested producer components do not fall back to captured identity (255.961625ms)
+▶ role-family support cannot be replaced by a coverage label
+  ✔ U1.reference-family-unavailable (2.097042ms)
+  ✔ U1.requested-role-swap (1.254292ms)
+✔ role-family support cannot be replaced by a coverage label (43.559709ms)
+✔ Java alias is inapplicable even when a coverage claim names it (39.455083ms)
+▶ captured semantic provenance inventory closes in both directions
+  ✔ U1.normalized-proof-omitted (2.063542ms)
+  ✔ U1.normalized-proof-conflict (1.176834ms)
+✔ captured semantic provenance inventory closes in both directions (40.353375ms)
+▶ each admitted top-level identity field and inventory row is independently checked
+  ✔ U1.inventory-comparison-set (1.750916ms)
+  ✔ U1.inventory-comparison-producers (0.992459ms)
+  ✔ U1.inventory-producer-id (1.349417ms)
+  ✔ U1.inventory-producer-kind (0.917708ms)
+  ✔ U1.inventory-producer-version (0.886542ms)
+  ✔ U1.inventory-producer-executableHash (1.002958ms)
+  ✔ U1.inventory-producer-languages (0.805917ms)
+  ✔ U1.inventory-producer-positionEncoding (1.628583ms)
+  ✔ U1.inventory-producer-row (1.281ms)
+  ✔ U1.inventory-source-set-id (0.927833ms)
+  ✔ U1.inventory-source-set-rootId (1.003084ms)
+  ✔ U1.inventory-source-set-languages (1.008291ms)
+  ✔ U1.inventory-source-set-dependencies (1.265292ms)
+  ✔ U1.inventory-source-set-row (0.888917ms)
+  ✔ U1.inventory-revision-id (0.859375ms)
+  ✔ U1.inventory-revision-sourceSetId (1.101875ms)
+  ✔ U1.inventory-revision-toolchainHash (1.015583ms)
+  ✔ U1.inventory-revision-configHash (1.124583ms)
+  ✔ U1.inventory-revision-dependencyHash (1.064417ms)
+  ✔ U1.inventory-revision-row (2.079291ms)
+  ✔ U1.inventory-revision-documents (0.994666ms)
+  ✔ U1.inventory-document-key (0.952792ms)
+  ✔ U1.inventory-document-revision (1.798125ms)
+  ✔ U1.inventory-document-hash (0.975459ms)
+  ✔ U1.inventory-document-length (0.919916ms)
+✔ each admitted top-level identity field and inventory row is independently checked (80.758334ms)
+▶ captured byte sources and digests cannot counterfeit semantic basis
+  ✔ U1.capture-executable-byte (1.481709ms)
+  ✔ U1.capture-semantic-artifact-byte (1.241041ms)
+  ✔ U1.capture-toolchain-byte (2.125334ms)
+  ✔ U1.capture-config-byte (1.155541ms)
+  ✔ U1.capture-dependency-byte (1.156792ms)
+✔ captured byte sources and digests cannot counterfeit semantic basis (53.22775ms)
+▶ every captured coverage state resists independent requested, selected, diagnostic and state contradictions
+  ✔ U1.state-notRequested-requested (1.40725ms)
+  ✔ U1.state-notRequested-selected (1.168292ms)
+  ✔ U1.state-notRequested-diagnostic (2.11825ms)
+  ✔ U1.state-notRequested-state (1.266125ms)
+  ✔ U1.state-omitted-requested (1.188125ms)
+  ✔ U1.state-omitted-selected (1.138583ms)
+  ✔ U1.state-omitted-diagnostic (1.572042ms)
+  ✔ U1.state-omitted-state (1.055042ms)
+  ✔ U1.state-unsupported-requested (0.967583ms)
+  ✔ U1.state-unsupported-selected (0.973333ms)
+  ✔ U1.state-unsupported-diagnostic (1.22325ms)
+  ✔ U1.state-unsupported-state (1.015792ms)
+  ✔ U1.state-failed-requested (1.014ms)
+  ✔ U1.state-failed-selected (1.0065ms)
+  ✔ U1.state-failed-diagnostic (2.382791ms)
+  ✔ U1.state-failed-state (1.157041ms)
+  ✔ U1.state-partial-requested (1.0495ms)
+  ✔ U1.state-partial-selected (0.927583ms)
+  ✔ U1.state-partial-diagnostic (0.923208ms)
+  ✔ U1.state-partial-state (1.183875ms)
+  ✔ U1.state-complete-requested (0.936291ms)
+  ✔ U1.state-complete-selected (0.918625ms)
+  ✔ U1.state-complete-diagnostic (0.94125ms)
+  ✔ U1.state-complete-state (1.19975ms)
+✔ every captured coverage state resists independent requested, selected, diagnostic and state contradictions (75.291375ms)
+▶ all role families require their own admitted measurement support
+  ✔ U1.family-definition-reference (2.006875ms)
+  ✔ U1.family-definition-declarationName (1.039ms)
+  ✔ U1.family-read-reference (1.065166ms)
+  ✔ U1.family-write-reference (1.149ms)
+  ✔ U1.family-type-reference (1.018666ms)
+  ✔ U1.family-import-reference (1.186083ms)
+  ✔ U1.family-alias-reference (0.944916ms)
+  ✔ U1.family-alias-declarationName (1.190625ms)
+✔ all role families require their own admitted measurement support (65.464417ms)
+▶ call capability uses measured callee OR invocation, never neither
+  ✔ callee-only (1.123334ms)
+  ✔ invocation-only (0.860167ms)
+  ✔ neither (0.523ms)
+✔ call capability uses measured callee OR invocation, never neither (38.798292ms)
+▶ captured zero-fact complete tuple remains distinct from later omitted coverage
+  ✔ U1.zero-fact-captured-tuple-not-requested-r2 (0.211416ms)
+✔ captured zero-fact complete tuple remains distinct from later omitted coverage (44.840042ms)
+▶ both semantic producers retain historical r1 proofs despite failed r2 refresh
+  ✔ U1.historical-two-not-r2 (0.158417ms)
+  ✔ U1.historical-one-not-r2 (0.047458ms)
+✔ both semantic producers retain historical r1 proofs despite failed r2 refresh (38.556875ms)
+▶ selected unsupported request and missing supported observation are distinct valid partial states
+  ✔ U1.partial-unsupported-request-not-complete (1.0255ms)
+  ✔ U1.partial-missing-observation-not-complete (1.411167ms)
+✔ selected unsupported request and missing supported observation are distinct valid partial states (39.160917ms)
+▶ requested, supported and observed role sets reject ordering, repetition, applicability and subset violations
+  ✔ U1.role-set-requested-order (1.355667ms)
+  ✔ U1.role-set-requested-duplicate (1.714708ms)
+  ✔ U1.role-set-supported-order (0.994667ms)
+  ✔ U1.role-set-supported-duplicate (0.952958ms)
+  ✔ U1.role-set-observed-order (0.951333ms)
+  ✔ U1.role-set-observed-duplicate (0.998ms)
+  ✔ U1.role-set-observed-not-requested (1.872208ms)
+  ✔ U1.role-set-observed-not-supported (1.214ms)
+✔ requested, supported and observed role sets reject ordering, repetition, applicability and subset violations (47.35875ms)
+▶ required identity fields are independently rejected as format omissions
+  ✔ U1.shape-comparison-sourceSetId (1.15ms)
+  ✔ U1.shape-comparison-revisionId (0.881375ms)
+  ✔ U1.shape-comparison-producers (0.826541ms)
+  ✔ U1.shape-producer-id (1.247ms)
+  ✔ U1.shape-producer-kind (1.617458ms)
+  ✔ U1.shape-producer-version (0.952417ms)
+  ✔ U1.shape-producer-executableHash (0.8225ms)
+  ✔ U1.shape-producer-languages (0.879417ms)
+  ✔ U1.shape-producer-positionEncoding (1.045083ms)
+  ✔ U1.shape-source-set-id (0.968ms)
+  ✔ U1.shape-source-set-rootId (1.1405ms)
+  ✔ U1.shape-source-set-languages (1.145334ms)
+  ✔ U1.shape-source-set-dependencies (0.846125ms)
+  ✔ U1.shape-revision-id (0.828292ms)
+  ✔ U1.shape-revision-sourceSetId (0.906041ms)
+  ✔ U1.shape-revision-documents (1.114917ms)
+  ✔ U1.shape-revision-toolchainHash (0.906667ms)
+  ✔ U1.shape-revision-configHash (0.813334ms)
+  ✔ U1.shape-revision-dependencyHash (0.74475ms)
+  ✔ U1.shape-document-key (0.742458ms)
+  ✔ U1.shape-document-revisionId (1.204625ms)
+  ✔ U1.shape-document-contentHash (0.868875ms)
+  ✔ U1.shape-document-byteLength (0.8205ms)
+✔ required identity fields are independently rejected as format omissions (74.078291ms)
+▶ semantic facts require selected coverage; valid historical proofs stay on their r1 tuple
+  ✔ U1.fact-two-unselected (1.78675ms)
+  ✔ U1.fact-one-unselected (2.042917ms)
+✔ semantic facts require selected coverage; valid historical proofs stay on their r1 tuple (54.199625ms)
+▶ Java alias is inapplicable in requested, supported and observed role sets
+  ✔ U1.java-requested-alias (1.412958ms)
+  ✔ U1.java-supported-alias (1.869167ms)
+  ✔ U1.java-observed-alias (1.144166ms)
+✔ Java alias is inapplicable in requested, supported and observed role sets (43.676584ms)
+▶ semantic proof envelope, lookup keys and capture descriptors bind to admitted bytes
+  ✔ U1.basis-proof-id (1.582958ms)
+  ✔ U1.basis-proof-document (1.52675ms)
+  ✔ U1.basis-proof-content-hash (1.987458ms)
+  ✔ U1.basis-proof-evidence-kind (1.628959ms)
+  ✔ U1.basis-lookup-duplicate (1.445875ms)
+  ✔ U1.basis-lookup-identity (1.349167ms)
+  ✔ U1.capture-executable-1-digest (1.621541ms)
+  ✔ U1.capture-artifact-one-digest (1.147666ms)
+  ✔ U1.capture-toolchain-digest (1.113666ms)
+  ✔ U1.capture-config-digest (1.203917ms)
+  ✔ U1.capture-dependency-digest (1.349458ms)
+✔ semantic proof envelope, lookup keys and capture descriptors bind to admitted bytes (55.73225ms)
+▶ v1 staleTarget: cross-revision targets are rejected, same-revision targets are never stale, others are null
+  ✔ U1.target-same-revision-true-bit-base (0.189208ms)
+  ✔ U1.target-same-revision-true-bit-changed (0.085208ms)
+  ✔ U1.target-external-null (0.077792ms)
+  ✔ U1.target-no-target-null (0.034875ms)
+✔ v1 staleTarget: cross-revision targets are rejected, same-revision targets are never stale, others are null (35.486416ms)
+▶ both producer uses reject absent tuples, wrong proofs and cross-revision attachment
+  ✔ U1.use-two-absent-tuple (0.137459ms)
+  ✔ U1.use-two-wrong-tuple (0.061208ms)
+  ✔ U1.use-two-missing-proof (0.063ms)
+  ✔ U1.use-two-wrong-producer-proof (0.056042ms)
+  ✔ U1.use-two-cross-revision-proof (0.058416ms)
+  ✔ U1.use-one-absent-tuple (0.061792ms)
+  ✔ U1.use-one-wrong-tuple (0.137333ms)
+  ✔ U1.use-one-missing-proof (0.05975ms)
+  ✔ U1.use-one-wrong-producer-proof (0.049209ms)
+  ✔ U1.use-one-cross-revision-proof (0.045916ms)
+✔ both producer uses reject absent tuples, wrong proofs and cross-revision attachment (41.503583ms)
+▶ native proof uses authenticated freshness seam for fresh, stale and possiblyStale
+  ✔ U1.native-fresh-false-fresh (2.629334ms)
+  ✔ U1.native-stale-false-fresh (2.328709ms)
+  ✔ U1.native-possiblyStale-false-fresh (2.028959ms)
+✔ native proof uses authenticated freshness seam for fresh, stale and possiblyStale (109.842041ms)
+▶ admitted changed and missing selected bytes outrank same-byte component drift
+  ✔ U1.freshness-changed-bytes-complete-stale (1.627541ms)
+  ✔ U1.freshness-missing-bytes-complete-stale (1.324167ms)
+  ✔ U1.freshness-partial-fresh-not-possibly-stale (1.746ms)
+✔ admitted changed and missing selected bytes outrank same-byte component drift (93.782042ms)
+▶ authenticated component comparison isolates each same-byte request change
+  ✔ revisionId-changed (0.305208ms)
+  ✔ revisionId-unavailable (0.070375ms)
+  ✔ sourceManifestHash-changed (0.113791ms)
+  ✔ sourceManifestHash-unavailable (0.066917ms)
+  ✔ toolchainHash-changed (0.107542ms)
+  ✔ toolchainHash-unavailable (0.064042ms)
+  ✔ configHash-changed (0.084333ms)
+  ✔ configHash-unavailable (0.056958ms)
+  ✔ dependencyHash-changed (0.09ms)
+  ✔ dependencyHash-unavailable (0.074208ms)
+  ✔ sourceSetId-changed (0.090459ms)
+  ✔ sourceSetId-unavailable (0.066834ms)
+  ✔ producerId-changed (0.085916ms)
+  ✔ producerId-unavailable (0.053041ms)
+  ✔ producerKind-changed (0.087166ms)
+  ✔ producerKind-unavailable (0.055875ms)
+  ✔ producerVersion-changed (0.080917ms)
+  ✔ producerVersion-unavailable (0.054542ms)
+  ✔ producerHash-changed (0.078458ms)
+  ✔ producerHash-unavailable (0.054375ms)
+  ✔ language-changed (0.094375ms)
+  ✔ language-unavailable (0.062291ms)
+  ✔ positionEncoding-changed (0.083875ms)
+  ✔ positionEncoding-unavailable (0.059375ms)
+  ✔ producerLanguages-changed (0.090333ms)
+  ✔ producerLanguages-unavailable (0.061917ms)
+✔ authenticated component comparison isolates each same-byte request change (466.002584ms)
+✔ integrated admitted r1/r2 snapshots with two source sets preserve independent coverage and proofs (103.261625ms)
+✔ admitted source bytes produce exact/unmatched/unsupported joins for all four families (407.563084ms)
+✔ per-fact installed identity, source proof, native refs, and diagnostic-only mapping (316.152875ms)
+✔ native controls overlap invocations but cannot join any family (71.659208ms)
+✔ real emoji prefix maps UTF-8, UTF-16 and scalar positions to the same native byte span (78.401167ms)
+✔ bad byte/scalar boundaries and tuple, family, owner, support facts (453.157917ms)
+✔ alternate admitted source tuples, native support and candidate inventory boundaries (520.047625ms)
+✔ reference site, roles and measured identity require independently admitted source (628.361667ms)
+✔ valid external, ambiguous semantic resolution, unresolved and target cardinality (188.650667ms)
+✔ two distinct measured declaration identities at the same owner and anchor are ambiguous, not installed (21.683667ms)
+✔ contradictory exact reference targets retain both proofs and reject forged first-wins (33.915917ms)
+✔ identical repeated facts keep distinct proof contributors; conflicting facts reject (188.833ms)
+✔ exact Reference membership and fact-linked diagnostic are closed (163.759541ms)
+✔ diagnostics derive candidate and support state, never install unmatched reference (403.840875ms)
+✔ captured-but-unselected semantic producer cannot use valid proof, including unmatched joins (65.677583ms)
+✔ independent measured source baseline, ownership, candidates, and native proof inventory (4.992791ms)
+✔ measured Java ordinary functions reject even with independent byte witnesses (0.57ms)
+✔ admitted fixture/capture bytes independently match measured source projection (49.440459ms)
+✔ MEASUREMENT.WITNESS.spelling (35.786542ms)
+✔ MEASUREMENT.WITNESS.header (36.786334ms)
+✔ MEASUREMENT.WITNESS.extra (49.060834ms)
+✔ MEASUREMENT.ENCODING.witness (54.036333ms)
+✔ MEASUREMENT.RANGE.outside (45.257958ms)
+✔ MEASUREMENT.RANGE.reversed (57.853292ms)
+✔ MEASUREMENT.OWNER.cross (83.992625ms)
+✔ MEASUREMENT.REGION.missing (35.150125ms)
+✔ RECORDS.MEMBERSHIP.call (37.037541ms)
+✔ RECORDS.MEMBERSHIP.id (43.240084ms)
+✔ ID.ORDINAL.call (44.487375ms)
+✔ native diagnostic ID and nullable callee spelling never change measured identity (2.3425ms)
+✔ 64 independent vector descriptor encodings, full domain hashes and literal anchors (5.709167ms)
+✔ UTF-8, UTF-16 and scalar positions convert independently from actual source bytes (73.167416ms)
+✔ utf8 split-scalar position is invalidRange (0.588417ms)
+✔ utf16 split-scalar position is invalidRange (0.311167ms)
+✔ measured java lexical spelling \u0074arget (22.190417ms)
+✔ measured java lexical spelling target (22.320791ms)
+✔ measured javascript lexical spelling \u{74}arget (21.159792ms)
+✔ measured rust lexical spelling r#café (21.285792ms)
+✔ measured rust lexical spelling café (23.557792ms)
+✔ measured rust lexical spelling café (19.611ms)
+✔ measured python lexical spelling ｆｏｏ (20.16075ms)
+✔ measured python lexical spelling foo (17.33225ms)
+✔ Java method projection and non-Java signature exclusion (1.134667ms)
+✔ every non-null header leaf needs an exact independent witness (3.253208ms)
+✔ nested source owners and ancestor descriptors, not IDs (75.016875ms)
+✔ control containment, parent order and region membership are source-derived (3.218042ms)
+✔ declared sibling ordinal comes from numeric source order, never adapter order (1.315833ms)
+✔ identical bytes keep syntax and occurrence IDs across revisions; records and proof freshness stay revision-scoped (1.483916ms)
+✔ admitted body-only revision preserves syntax IDs and changes occurrence IDs (25.000666ms)
+✔ document module owns top-level measured calls; only empty module may have an empty range (0.740917ms)
+✔ Java method and constructor signatures have distinct real source leaves (204.981459ms)
+✔ source witness changed, wrong encoding, absent null-callee spelling, and empty occurrences reject precisely (2.442792ms)
+✔ changed selected bytes mark historical native proofs stale, even with matching declarations (0.742167ms)
+✔ reference measurement alone never fabricates a Call or normalized Reference (22.461958ms)
+✔ equal-span module is a required immediate parent, without joining child ancestry (40.009375ms)
+✔ a controlled digest collision rejects full descriptors before map insertion (2.221208ms)
+✔ measured IDs require the full lowercase digest before truncation (1.037334ms)
+✔ two source calls and two controls use independent ASCII-id storage order (27.476ms)
+✔ admitted relocation changes ancestor syntax and descendant occurrence identities (50.851ms)
+✔ admitted inserted call and control shift real source ordinals and IDs (44.066125ms)
+✔ source rename, document path, container, and ordinal shifts cannot retain stale stable IDs (3.336458ms)
+✔ admitted control cycles, invalid regions, and duplicate occurrences reject precisely (126.346709ms)
+✔ ID.SOURCE.rename (36.361083ms)
+✔ ID.SOURCE.path (39.138167ms)
+✔ ID.SOURCE.container (42.803792ms)
+✔ ID.ORDINAL.source-call (39.234834ms)
+✔ MEASUREMENT.CONTROL.cycle (39.7065ms)
+✔ MEASUREMENT.REGION.noncontaining (36.998833ms)
+✔ MEASUREMENT.REGION.adapter-order (35.123834ms)
+✔ ID.ORDINAL.reference (35.244125ms)
+✔ ID.ORDINAL.control (41.88425ms)
+✔ RECORDS.ORDER.calls (39.268458ms)
+✔ RECORDS.ORDER.controls (35.33925ms)
+✔ MEASUREMENT.OWNER.document.parent (39.638083ms)
+✔ MEASUREMENT.OWNER.document.call (34.678125ms)
+✔ MEASUREMENT.OWNER.document.control (37.973125ms)
+✔ MEASUREMENT.OWNER.document.reference (35.325416ms)
+✔ MEASUREMENT.CONTROL.document.parent (42.824542ms)
+✔ MEASUREMENT.REGION.document.chain (45.162208ms)
+✔ MEASUREMENT.OWNER.sourceSet.parent (41.7875ms)
+✔ MEASUREMENT.OWNER.sourceSet.call (46.463791ms)
+✔ MEASUREMENT.OWNER.sourceSet.control (45.990083ms)
+✔ MEASUREMENT.OWNER.sourceSet.reference (40.047333ms)
+✔ MEASUREMENT.CONTROL.sourceSet.parent (48.826ms)
+✔ MEASUREMENT.REGION.sourceSet.chain (43.13275ms)
+✔ MEASUREMENT.OWNER.revision.parent (45.757542ms)
+✔ MEASUREMENT.OWNER.revision.call (41.797958ms)
+✔ MEASUREMENT.OWNER.revision.control (41.4715ms)
+✔ MEASUREMENT.OWNER.revision.reference (40.786333ms)
+✔ MEASUREMENT.CONTROL.revision.parent (35.802708ms)
+✔ MEASUREMENT.REGION.revision.chain (39.725041ms)
+✔ MEASUREMENT.OWNER.cross-revision (37.974375ms)
+✔ MEASUREMENT.CONTROL.cross-revision (52.7485ms)
+✔ MEASUREMENT.REGION.cross-revision (45.245667ms)
+✔ MEASUREMENT.REGION.cross-owner (36.775834ms)
+✔ MEASUREMENT.CONTROL.cross-owner (34.399167ms)
+✔ captured extends, implements and overrides; explicit external targets and exact declaration-name binding (67.907417ms)
+✔ SYMBOL.FACT (50.109375ms)
+✔ SYMBOL.SCOPE (78.23575ms)
+✔ SYMBOL.FACT.key (93.144417ms)
+✔ SYMBOL.TARGET.sourceSet (90.821792ms)
+✔ SYMBOL.TARGET.duplicate (55.947625ms)
+✔ SYMBOL.TARGET (45.492458ms)
+✔ DECLARATION_BINDING.JOIN (53.299167ms)
+✔ DECLARATION_BINDING.JOIN.symbols (57.408334ms)
+✔ DECLARATION_BINDING.JOIN.family (57.156917ms)
+✔ DECLARATION_BINDING.JOIN.tuple (78.634459ms)
+✔ DECLARATION_BINDING.PROOF (71.170083ms)
+✔ RELATIONSHIP.KIND (55.898416ms)
+✔ RELATIONSHIP.SOURCE (51.728417ms)
+✔ RELATIONSHIP.TARGET (52.490125ms)
+✔ RELATIONSHIP.PROOF (52.169875ms)
+✔ RELATIONSHIP.TARGET.document (51.679833ms)
+✔ RELATIONSHIP.TARGET.sourceSet (56.741541ms)
+✔ RELATIONSHIP.TARGET.revision.output (57.133833ms)
+✔ RECORDS.MEMBERSHIP.missing (51.2615ms)
+✔ RECORDS.MEMBERSHIP.extra (65.224333ms)
+✔ RECORDS.MEMBERSHIP.duplicate (51.827042ms)
+✔ RECORDS.ORDER (52.137209ms)
+✔ unlocated symbol and non-exact declaration-name diagnostic do not install a declaration (58.663458ms)
+✔ source inheritance alone never creates an uncaptured relationship (21.955834ms)
+✔ explicit external relationship target and document-scoped key remain source facts (24.689375ms)
+✔ Java mixed bases take each relationship kind from its captured proof (24.533625ms)
+✔ semantic kind comes from captured proof, not Java heritage spelling (26.151416ms)
+✔ Java override marker and literal parameter spelling do not control semantic proof (56.711584ms)
+✔ opaque external relationship keeps independent source provenance (29.9885ms)
+✔ RELATIONSHIP.TARGET.admittedHistorical (62.095709ms)
+✔ SYMBOL.TARGET.admittedHistorical (56.401875ms)
+✔ DECLARATION_BINDING.JOIN.nonExactSyntaxId (53.966125ms)
+✔ SYMBOL.SCOPE.raw (46.730375ms)
+✔ SYMBOL.TARGET.duplicate.raw (47.121666ms)
+✔ SYMBOL.FACT.conflict.raw (49.278875ms)
+✔ SYMBOL.TARGET.raw (45.753958ms)
+✔ DECLARATION_BINDING.JOIN.raw (42.002583ms)
+✔ DECLARATION_BINDING.JOIN.family.raw (46.176709ms)
+✔ DECLARATION_BINDING.JOIN.tuple.raw (48.712709ms)
+✔ RELATIONSHIP.SOURCE.raw (43.033042ms)
+✔ RELATIONSHIP.TARGET.raw (49.721625ms)
+✔ RELATIONSHIP.TARGET.revision (43.764041ms)
+✔ SYMBOL.FACT.key.raw (48.91775ms)
+✔ SYMBOL.FACT.display.raw (50.814875ms)
+✔ RELATIONSHIP.KIND.shape.missing (42.858667ms)
+✔ RELATIONSHIP.KIND.shape.default (37.619208ms)
+✔ RELATIONSHIP.KIND.shape.discriminator-substituted (33.68825ms)
+✔ RELATIONSHIP.KIND.shape.external-source (31.668625ms)
+✔ SYMBOL.FACT.evidenceKind (32.341667ms)
+✔ DECLARATION_BINDING.PROOF.evidenceKind (32.178167ms)
+✔ RELATIONSHIP.PROOF.evidenceKind (31.273375ms)
+✔ Rust source has measured supertrait and trait implementation direction (21.808167ms)
+✔ Python measured parenthesized inheritance needs an explicit extends fact (39.556333ms)
+✔ Rust and Python semantics do not depend on a header base projection (112.725459ms)
+✔ source-backed cross-document generic inheritance has exact measured target IDs in Java, Rust and Python (65.980458ms)
+✔ Java measured override crosses source documents without an optional annotation (15.455125ms)
+✔ cross-file relation needs captured independent semantic proof, not syntax similarity (57.658917ms)
+✔ all warnings-v1 keys use enum ordering, stale aggregation and shared-edge dedup (0.766417ms)
+✔ unselected omitted, limits and boundary do not imply coverage warning; syntax-only is exact (0.471417ms)
+▶ warning negatives run exact checker controls
+  ✔ WARNING.missing (0.295541ms)
+  ✔ WARNING.extra (0.147167ms)
+  ✔ WARNING.duplicate (0.107916ms)
+  ✔ WARNING.order (0.291292ms)
+  ✔ WARNING.shape (1.02875ms)
+  ✔ WARNING.foreignBindingProof (0.168291ms)
+  ✔ WARNING.selectedOnly (0.136667ms)
+✔ warning negatives run exact checker controls (2.829958ms)
+ℹ tests 858
+ℹ suites 0
+ℹ pass 858
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 28745.900834
+Checking fixture /Users/jcarreira/projects/odin/baleyg-67-pre-main-integration/tests/fixtures/semantic-evidence/v1/example
+Checked 1 discovered fixture(s)
+==> verify lane cohorts (exit 0)
+✔ all generated source parses with pinned grammars and meets source-derived composition (15614.87925ms)
+✔ CLI demands a fresh explicit destination (87.465916ms)
+✔ two cohorts match pinned bytes, hashes, inventory and exact per-language totals (8527.603459ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 24269.742042
+==> verify lane checks (exit 1)
+✔ offline ACP handshake selects sonnet and uses no tools or capabilities (1.305792ms)
+✔ environment is allowlisted, never inherited keys or provider config (0.127583ms)
+✔ every incomplete stop and errors after text fail (0.443208ms)
+✔ missing auth and unavailable or mismatched model prevent prompt (0.179166ms)
+✔ auth/model changes, permission requests, tool use and nontext invalidate output (0.201ms)
+✔ strict JSON schema rejects fences, prose, partial and foreign answers (0.270083ms)
+✔ bounded input and answer collection (3.293667ms)
+✔ usage cost is finite USD estimate only (0.108333ms)
+✔ CLI invalid input emits no success and redacts secret-bearing errors (152.461542ms)
+✔ cleanup kills offline fake adapter and descendant without a separate group (42.879417ms)
+✔ private failure record is bounded even after escaping and never copies provider errors (1.407584ms)
+✔ raw subscription plan normalizes only known optional Claude prefix (0.179ms)
+✔ auth waits for notification, times out boundedly, and rejects known non-account (0.789916ms)
+✔ runSession does not prompt until delayed subscription notification arrives (0.515833ms)
+✔ first collector invalidation category survives later invalid events (0.09425ms)
+✔ SDK diagnostics map only exact known templates and enum values (0.088334ms)
+✔ known inference 401 is authentication failure even with account status (0.110625ms)
+✔ revoked OAuth inference credential has a fixed safe category and no retry (0.077333ms)
+✔ observed authentication prefix is classified without exposing provider text (0.046291ms)
+ℹ tests 19
+ℹ suites 0
+ℹ pass 19
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 275.902583
+✔ factory config uses the closed supported schema (0.870042ms)
+✔ resolver accepts only canonical Baleyg issue references (242.042958ms)
+✔ recognized issue lookup failures remain failures (81.203125ms)
+✔ verify is one executable command and retains all checks (384.885833ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 748.59175
+node:internal/modules/cjs/loader:1424
+  throw err;
+  ^
+
+Error: Cannot find module 'playwright'
+Require stack:
+- /Users/jcarreira/projects/odin/baleyg-67-pre-main-integration/tests/browser/saved-items.test.cjs
+    at Module._resolveFilename (node:internal/modules/cjs/loader:1421:15)
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1059:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1064:22)
+    at Module._load (node:internal/modules/cjs/loader:1227:37)
+    at TracingChannel.traceSync (node:diagnostics_channel:328:14)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:245:24)
+    at Module.require (node:internal/modules/cjs/loader:1504:12)
+    at require (node:internal/modules/helpers:152:16)
+    at Object.<anonymous> (/Users/jcarreira/projects/odin/baleyg-67-pre-main-integration/tests/browser/saved-items.test.cjs:13:22)
+    at Module._compile (node:internal/modules/cjs/loader:1761:14) {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [
+    '/Users/jcarreira/projects/odin/baleyg-67-pre-main-integration/tests/browser/saved-items.test.cjs'
+  ]
+}
+
+Node.js v24.11.1
+verify: failed lane(s): checks

@@ -1,6 +1,6 @@
 # PR #98 AC8 — frozen and additive local-edit evidence
 
-**Status:** both independent release-mode gates PASS on the current PR runtime source; Claude rereview remains pending. This is post-publication PR-branch evidence; it does not amend the frozen canonical corpus, floors, original benchmark, or Factory state.
+**Status:** both independent release-mode gates PASSED on the PR #98 runtime. Claude publicly APPROVED WITH FOLLOW-UP, and PR #98 merged into `feature/67` as `0bfa5091f9fb5fa35c055d1618d390f975ec7226`. This is post-publication PR-branch evidence; it does not amend the frozen canonical corpus, floors, original benchmark, or Factory state. Owner-scoped pre-main Status/Serve and reviewer-follow-up runtime edits require separate renewed gates on their final release bytes.
 
 - Host: `Mac17,16`, Apple M5 Pro, arm64. Frozen manifest SHA-256: `8b8deea8592cfd069a1500bcad9d634a8b4d343477e769b2f2aed0dd61bee046`.
 - Release executable: `target/release/baleyg` SHA-256 `b5cab066a7af9c631a0ef7e478bb1e9acc601cb16cc69135784c83715e30a7b2` (default Rust 1.98 release build in the isolated PR worktree). Both runners measured these exact executable bytes; no runtime source or runner change occurred between the final runs.
