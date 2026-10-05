@@ -363,7 +363,7 @@ CREATE TABLE revision_producer_bindings(revision_id TEXT PRIMARY KEY REFERENCES 
 "#;
 /// A normal connection keeps the verified index use lock until SQLite closes.
 struct IndexConnection {
-    db: Connection,
+    db: ProtectedSqliteConnection,
     _use_guard: topology::UseGuard,
 }
 impl Deref for IndexConnection {
@@ -381,7 +381,7 @@ impl DerefMut for IndexConnection {
 // the caller's verified exclusive leader guard alive across its transaction.
 enum PublicationConnection {
     Live(IndexConnection),
-    Stage(Connection),
+    Stage(ProtectedSqliteConnection),
 }
 impl Deref for PublicationConnection {
     type Target = Connection;
@@ -541,12 +541,225 @@ const MAX_RETAINED_SQLITE_WITNESSES: usize = 4096;
 #[derive(Default)]
 struct RetainedSqliteWitnesses {
     by_path: std::collections::HashMap<std::path::PathBuf, Vec<Arc<std::fs::File>>>,
+    live: std::collections::HashMap<(std::path::PathBuf, u64, u64), usize>,
     count: usize,
 }
 static RETAINED_SQLITE_WITNESSES: std::sync::OnceLock<Mutex<RetainedSqliteWitnesses>> =
     std::sync::OnceLock::new();
 fn sqlite_witnesses() -> &'static Mutex<RetainedSqliteWitnesses> {
     RETAINED_SQLITE_WITNESSES.get_or_init(|| Mutex::new(RetainedSqliteWitnesses::default()))
+}
+
+// Every managed SQLite opener carries a live-inode registration until SQLite closes.
+pub(crate) struct ProtectedSqliteConnection {
+    db: Option<Connection>,
+    key: (std::path::PathBuf, u64, u64),
+}
+impl Deref for ProtectedSqliteConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.db.as_ref().expect("closed SQLite connection")
+    }
+}
+impl DerefMut for ProtectedSqliteConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.db.as_mut().expect("closed SQLite connection")
+    }
+}
+impl Drop for ProtectedSqliteConnection {
+    fn drop(&mut self) {
+        let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+        drop(self.db.take());
+        let live = registry
+            .live
+            .get_mut(&self.key)
+            .expect("registered SQLite connection");
+        *live -= 1;
+        if *live == 0 {
+            registry.live.remove(&self.key);
+        }
+    }
+}
+fn protected_sqlite_open(
+    path: &Path,
+    flags: rusqlite::OpenFlags,
+) -> Result<ProtectedSqliteConnection> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        path.is_absolute(),
+        "unsafe_index: SQLite path must be absolute"
+    );
+    let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    let named = std::fs::symlink_metadata(path)?;
+    ensure!(
+        named.is_file() && !named.file_type().is_symlink(),
+        "unsafe_index: SQLite pathname changed"
+    );
+    let file = registry
+        .by_path
+        .get(path)
+        .and_then(|files| {
+            files.iter().find(|file| {
+                file.metadata()
+                    .is_ok_and(|m| (m.dev(), m.ino()) == (named.dev(), named.ino()))
+            })
+        })
+        .context("unsafe_index: SQLite witness missing")?;
+    let held = file.metadata()?;
+    ensure!(
+        (held.dev(), held.ino()) == (named.dev(), named.ino()),
+        "unsafe_index: SQLite witness changed"
+    );
+    let db = Connection::open_with_flags(path, flags)?;
+    let after = std::fs::symlink_metadata(path)?;
+    ensure!(
+        (after.dev(), after.ino()) == (named.dev(), named.ino()),
+        "unsafe_index: SQLite pathname changed during open"
+    );
+    let key = (path.to_owned(), named.dev(), named.ino());
+    *registry.live.entry(key.clone()).or_default() += 1;
+    Ok(ProtectedSqliteConnection { db: Some(db), key })
+}
+
+/// Rename and release only the exact obsolete inode while holding verified EX
+/// and the process-wide opener mutex. No managed connection can slip between
+/// the live-count proof, rename and descriptor close.
+fn replace_index_and_release_obsolete(
+    old: IndexFileWitness,
+    stage: &Path,
+    leader: &topology::LeaderGuard,
+    roots: &topology::TopologyRoots,
+    identity: &topology::WorkspaceIdentity,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let old_path = old.path.clone();
+    let path = old_path.as_path();
+    leader.verify_exclusive_use(&roots.index_use_lock(identity))?;
+    ensure!(
+        path == roots.index_db(identity),
+        "unsafe_index: wrong obsolete index path"
+    );
+    old.verify()?;
+    let held = old.file.metadata()?;
+    let inode = (held.dev(), held.ino());
+    let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    ensure!(
+        registry
+            .live
+            .get(&(path.to_owned(), inode.0, inode.1))
+            .copied()
+            .unwrap_or(0)
+            == 0,
+        "storage_busy: obsolete index has live SQLite connections"
+    );
+    let files = registry
+        .by_path
+        .get_mut(path)
+        .context("unsafe_index: obsolete witness missing")?;
+    let position = files
+        .iter()
+        .position(|file| file.metadata().is_ok_and(|m| (m.dev(), m.ino()) == inode))
+        .context("unsafe_index: obsolete witness identity changed")?;
+    ensure!(
+        Arc::strong_count(&files[position]) == 2,
+        "storage_busy: obsolete index witness still borrowed"
+    );
+    ensure!(
+        registry.live.keys().all(|(named, _, _)| named != stage),
+        "storage_busy: staged index still has live SQLite connections"
+    );
+    let staged_files = registry
+        .by_path
+        .get(stage)
+        .context("unsafe_index: staged witness missing")?;
+    ensure!(
+        staged_files.len() == 1,
+        "unsafe_index: unexpected staged witness count"
+    );
+    std::fs::rename(stage, path)?;
+    drop(old);
+    let files = registry
+        .by_path
+        .get_mut(path)
+        .expect("verified obsolete witness");
+    let file = files.remove(position);
+    if files.is_empty() {
+        registry.by_path.remove(path);
+    }
+    registry.count -= 1;
+    drop(file);
+    let staged = registry
+        .by_path
+        .remove(stage)
+        .expect("verified staged witness");
+    registry
+        .by_path
+        .entry(path.to_owned())
+        .or_default()
+        .extend(staged);
+    Ok(())
+}
+
+/// Called only after GC has unlinked an exact managed SQLite inode while it
+/// still holds the nonblocking verified EX index-use guard. Unrelated witnesses
+/// (including another incarnation at the same name) are never released.
+#[allow(dead_code)] // The GC deletion slice calls this after its guarded unlink.
+pub(crate) fn release_deleted_sqlite_witness(
+    path: &Path,
+    inode: (u64, u64),
+    exclusive: &topology::UseGuard,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        path.is_absolute() && inode.0 != 0 && inode.1 != 0,
+        "unsafe_index: unproved SQLite inode identity"
+    );
+    ensure!(
+        matches!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("index.db" | "requests.db")
+        ),
+        "unsafe_index: not a managed SQLite database"
+    );
+    let parent = path
+        .parent()
+        .context("unsafe_index: missing index directory")?;
+    let lock = parent.with_extension("lock");
+    exclusive.verify_exclusive_path(&lock)?;
+    let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => anyhow::bail!("unsafe_index: SQLite pathname still exists"),
+    }
+    ensure!(
+        registry
+            .live
+            .get(&(path.to_owned(), inode.0, inode.1))
+            .copied()
+            .unwrap_or(0)
+            == 0,
+        "storage_busy: deleted SQLite inode has live connections"
+    );
+    let files = registry
+        .by_path
+        .get_mut(path)
+        .context("unsafe_index: deleted SQLite witness missing")?;
+    let position = files
+        .iter()
+        .position(|file| file.metadata().is_ok_and(|m| (m.dev(), m.ino()) == inode))
+        .context("unsafe_index: deleted SQLite witness identity changed")?;
+    ensure!(
+        Arc::strong_count(&files[position]) == 1,
+        "storage_busy: deleted SQLite witness still borrowed"
+    );
+    let file = files.remove(position);
+    if files.is_empty() {
+        registry.by_path.remove(path);
+    }
+    registry.count -= 1;
+    drop(file);
+    Ok(())
 }
 
 fn retained_sqlite_file(
@@ -572,6 +785,24 @@ fn retained_sqlite_file(
                 return Ok(file.clone());
             }
         }
+    }
+    // A staged inode may have been renamed to index.db. Reuse its exact
+    // descriptor rather than open a second fd for the same SQLite inode.
+    if let Ok(named) = std::fs::symlink_metadata(path)
+        && named.is_file()
+        && !named.file_type().is_symlink()
+        && let Some(file) = witnesses.by_path.values().flatten().find(|file| {
+            file.metadata()
+                .is_ok_and(|m| (m.dev(), m.ino()) == (named.dev(), named.ino()))
+        })
+    {
+        let file = file.clone();
+        witnesses
+            .by_path
+            .entry(path.to_owned())
+            .or_default()
+            .push(file.clone());
+        return Ok(file);
     }
     ensure!(
         witnesses.count < MAX_RETAINED_SQLITE_WITNESSES,
@@ -907,7 +1138,7 @@ fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
         [], |r| r.get(0),
     )?)
 }
-fn open_index_marker_probe(path: &Path, writable: bool) -> Result<Connection> {
+fn open_index_marker_probe(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
     use rusqlite::OpenFlags;
     reject_sidecars(path, writable)?;
     verify_index_file(path)?;
@@ -916,7 +1147,7 @@ fn open_index_marker_probe(path: &Path, writable: bool) -> Result<Connection> {
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let db = storage_result(Connection::open_with_flags(path, flags))?;
+    let db = protected_sqlite_open(path, flags)?;
     storage_result(db.busy_timeout(Duration::ZERO))?;
     storage_result(db.pragma_update(None, "temp_store", "MEMORY"))?;
     storage_result(db.pragma_update(None, "foreign_keys", "ON"))?;
@@ -963,7 +1194,7 @@ fn read_index_format_marker(db: &Connection) -> Result<IndexFormatMarker> {
     })
 }
 
-fn open_index(path: &Path, writable: bool) -> Result<Connection> {
+fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
     let db = open_index_marker_probe(path, writable)?;
     let marker = read_index_format_marker(&db)?;
     if marker.is_obsolete() {
@@ -3890,7 +4121,7 @@ impl Store {
             file,
             published: false,
         };
-        let db = Connection::open_with_flags(
+        let db = protected_sqlite_open(
             &staged.path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
@@ -4176,12 +4407,18 @@ impl Store {
                 return Err(error);
             }
         }
-        if let Err(error) = std::fs::rename(&stage.path, &path) {
+        if let Err(error) = replace_index_and_release_obsolete(
+            old,
+            &stage.path,
+            leader,
+            &self.roots,
+            &self.identity,
+        ) {
             if let (Some(journal), Some(backup)) = (&journal, &backup) {
                 restore_index_journal(journal, backup, &dir)
                     .context("incomplete_recovery: journal restoration failed")?;
             }
-            return Err(error.into());
+            return Err(error);
         }
         // The atomic rename may already be durable even if any later step fails.
         // Never let the stage guard unlink the now-live replacement inode.
@@ -4246,7 +4483,38 @@ impl Store {
             !index_path_present(&path)?,
             "incompatible_index: index appeared during initialization"
         );
-        std::fs::rename(&staged.path, &path)?;
+        {
+            let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+            ensure!(
+                registry
+                    .live
+                    .keys()
+                    .all(|(named, _, _)| named != &staged.path),
+                "storage_busy: staged index still has live SQLite connections"
+            );
+            ensure!(
+                registry.live.keys().all(|(named, _, _)| named != &path),
+                "storage_busy: prior index incarnation still has live SQLite connections"
+            );
+            let files = registry
+                .by_path
+                .get(&staged.path)
+                .context("unsafe_index: staged witness missing")?;
+            ensure!(
+                files.len() == 1,
+                "unsafe_index: unexpected staged witness count"
+            );
+            std::fs::rename(&staged.path, &path)?;
+            let files = registry
+                .by_path
+                .remove(&staged.path)
+                .expect("verified staged witness");
+            registry
+                .by_path
+                .entry(path.clone())
+                .or_default()
+                .extend(files);
+        }
         staged.published = true;
         std::fs::File::open(self.roots.index_dir(&self.identity))?.sync_all()?;
         Ok(())
@@ -12373,5 +12641,71 @@ mod live_sqlite_witness_tests {
             witness.verify().unwrap();
             drop(witness);
         });
+    }
+}
+
+#[cfg(test)]
+mod sqlite_deleted_witness_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn fixed_capacity_fails_before_opening_another_sqlite_inode() {
+        if std::env::var_os("BALEYG_WITNESS_CAP_CHILD").is_none() {
+            let outcome = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("store::sqlite_deleted_witness_tests::fixed_capacity_fails_before_opening_another_sqlite_inode")
+                .env("BALEYG_WITNESS_CAP_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                outcome.status.success(),
+                "{}",
+                String::from_utf8_lossy(&outcome.stdout)
+            );
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("index.db");
+        {
+            let mut registry = sqlite_witnesses().lock().unwrap();
+            registry.count = MAX_RETAINED_SQLITE_WITNESSES;
+        }
+        let error = retained_sqlite_file(&path, true, true, false).unwrap_err();
+        assert!(error.to_string().contains("capacity reached"));
+        assert!(
+            !path.exists(),
+            "capacity refusal must precede file creation"
+        );
+    }
+
+    #[test]
+    fn exclusive_release_closes_only_deleted_index_after_all_sqlite_connections() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let guard = store
+            .roots
+            .index_use_exclusive_existing(&store.identity)
+            .unwrap();
+        let db = open_index(&path, false).unwrap();
+        let inode = std::fs::metadata(&path).unwrap();
+        let inode = (inode.dev(), inode.ino());
+        assert!(
+            release_deleted_sqlite_witness(&path, inode, &guard).is_err(),
+            "a named live index cannot be released"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            release_deleted_sqlite_witness(&path, inode, &guard).is_err(),
+            "a deleted inode with an open SQLite connection must remain witnessed"
+        );
+        drop(db);
+        release_deleted_sqlite_witness(&path, inode, &guard).unwrap();
+        let registry = sqlite_witnesses().lock().unwrap();
+        assert!(
+            !registry.by_path.contains_key(&path),
+            "deleted file descriptor must be closed"
+        );
     }
 }

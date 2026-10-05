@@ -160,14 +160,16 @@ impl Store {
     pub fn request_db_path(&self) -> std::path::PathBuf {
         self.roots.requests_db(&self.identity)
     }
-    fn request_connection(&self) -> Result<(UseGuard, Connection)> {
+    fn request_connection(&self) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
         // A replacement-root follower may accept before it owns the leader lock,
         // but it must never recreate a missing queue containing old-root ACKs.
         self.request_connection_for_root_loss(false, self.is_root_replaced())
     }
     /// Read an already-admitted queue without creating requests.db or its schema.
     /// A vanished queue we previously observed is not equivalent to a virgin Ready index.
-    fn existing_request_connection(&self) -> Result<Option<(UseGuard, Connection)>> {
+    fn existing_request_connection(
+        &self,
+    ) -> Result<Option<(UseGuard, super::ProtectedSqliteConnection)>> {
         match self.request_connection_for_root_loss(false, true) {
             Ok(pair) => Ok(Some(pair)),
             Err(error)
@@ -188,7 +190,7 @@ impl Store {
         &self,
         old_root: bool,
         existing_only: bool,
-    ) -> Result<(UseGuard, Connection)> {
+    ) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
         // Root-loss paths keep their existing queue admission barriers.
         #[cfg(test)]
         self.test_queue_before_shared_hook.run();
@@ -220,7 +222,7 @@ impl Store {
         // Only the local Arc is released. The process-wide check handle must
         // remain open while any SQLite connection may hold fcntl locks.
         drop(file);
-        let mut db = Connection::open_with_flags(
+        let mut db = super::protected_sqlite_open(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;

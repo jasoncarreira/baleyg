@@ -1018,6 +1018,9 @@ impl UseGuard {
         );
         self.verify()
     }
+    pub(crate) fn verify_exclusive_path(&self, path: &Path) -> Result<()> {
+        self.belongs_to(path, true)
+    }
     fn downgrade_to_shared(&mut self) -> Result<()> {
         ensure!(
             self.exclusive,
@@ -1795,6 +1798,33 @@ impl std::fmt::Display for RecordIssue {
 }
 impl std::error::Error for RecordIssue {}
 
+fn readonly_index_db(path: &Path) -> Result<super::ProtectedSqliteConnection> {
+    use rusqlite::OpenFlags;
+    let file = super::retained_sqlite_file(path, false, false, false)?;
+    private_file(path, &file)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = path.with_file_name(format!(
+            "{}{}",
+            path.file_name().unwrap().to_string_lossy(),
+            suffix
+        ));
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => return Err(RecordIssue::RecoverySidecar.into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let db = super::protected_sqlite_open(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    private_file(path, &file)?;
+    db.busy_timeout(Duration::ZERO)?;
+    db.pragma_update(None, "query_only", "ON")?;
+    let journal: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+    ensure!(journal == "delete", "incompatible database journal mode");
+    Ok(db)
+}
 fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
     use rusqlite::{Connection, OpenFlags};
     let file = open_file_readonly(path)?;
@@ -1892,7 +1922,7 @@ fn inspect_index_with_open_hook(
     before_snapshot: impl FnOnce(&rusqlite::Connection) -> Result<()>,
 ) -> Result<(&'static str, &'static str)> {
     private_dir(dir)?;
-    let mut connection = readonly_db(&dir.join("index.db"))?;
+    let mut connection = readonly_index_db(&dir.join("index.db"))?;
     before_snapshot(&connection)?;
     let tx = connection.transaction()?;
     let db = &tx;
