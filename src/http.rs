@@ -152,6 +152,8 @@ pub struct DaemonState {
     test_queue_after_stream: crate::store::TestOneShotHook,
     #[cfg(test)]
     test_queue_after_pending_snapshot: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_after_takeover_drain: crate::store::TestOneShotHook,
     packets: Mutex<PacketCache>,
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
@@ -300,6 +302,8 @@ pub fn new_with_dependency_options(
         test_queue_after_stream: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_after_pending_snapshot: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_after_takeover_drain: crate::store::TestOneShotHook::default(),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -663,6 +667,10 @@ impl DaemonState {
                         }
                         return Err(error);
                     }
+                    // Reconciliation is complete, so this verified leader may now
+                    // serve. Retain it before drain commits a terminal ACK; a
+                    // later drain error may still release it for safe reclamation.
+                    *self.serving_session.lock().unwrap() = Some(session.clone());
                     let processed = crate::index_coordinator::drain_requests_observed(
                         &self.store,
                         &session,
@@ -670,23 +678,40 @@ impl DaemonState {
                             self.job_progress.lock().unwrap().insert(id.to_owned(), p);
                         },
                     )?;
+                    #[cfg(test)]
+                    self.test_queue_after_takeover_drain.run();
                     if processed > 0 {
                         *self.packets.lock().unwrap() = PacketCache::default();
                         self.start_dependency_index();
                     }
                     Ok(processed)
                 })();
+                let recorded_completion = if outcome.is_ok() {
+                    Ok(false)
+                } else {
+                    self.store.has_recorded_completion(&session)
+                };
                 if outcome.is_ok()
-                    || (self.store.has_recorded_completion(&session)?
+                    || (recorded_completion.as_ref().is_ok_and(|recorded| *recorded)
                         && outcome
                             .as_ref()
                             .is_err_and(crate::index_coordinator::retryable_cli_completion_error))
                 {
                     // A terminal queue write may have committed ambiguously.
-                    // Keep this exact leader for cached-result reconciliation;
-                    // otherwise release it so the next incarnation can reclaim.
+                    // Keep this exact leader for cached-result reconciliation.
                     *self.serving_session.lock().unwrap() = Some(session);
+                } else {
+                    // The early retention above must not keep a failed drain's
+                    // owner. A successor may reclaim any unfinished running head.
+                    let mut owner = self.serving_session.lock().unwrap();
+                    if owner
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &session))
+                    {
+                        *owner = None;
+                    }
                 }
+                recorded_completion?;
                 outcome.map(|_| ())
             }
             Err(error) if format!("{error:#}").contains("storage_busy") => Ok(()),
@@ -3342,6 +3367,55 @@ mod live_tests {
 mod serving_holder_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn takeover_retains_reconciled_owner_before_done_becomes_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root);
+        let state = new(
+            store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(state.retained_serving_session().is_err());
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        state.test_queue_after_takeover_drain.set(move || {
+            // The terminal row is committed, but queue_tick has not returned.
+            done_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let worker = state.clone();
+        let tick = std::thread::spawn(move || worker.queue_tick());
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("takeover did not commit the accepted head");
+        let observed_row = store.request_by_id(&accepted.id);
+        let observed_status = store.status();
+        let observed_leader = state
+            .retained_serving_session()
+            .is_ok_and(|s| s.is_leader());
+        // Release and join even if an observed value is wrong. The old ordering
+        // fails below without stranding the worker on this test's channel.
+        let release_result = release_tx.send(());
+        let tick_result = tick.join();
+        release_result.unwrap();
+        tick_result.unwrap().unwrap();
+        let row = observed_row.unwrap().unwrap();
+        assert_eq!(row.state, "done");
+        assert_eq!(observed_status.unwrap().revision, row.revision.unwrap());
+        assert!(
+            observed_leader,
+            "a committed done row must not precede retention of its reconciled owner"
+        );
+    }
 
     #[tokio::test]
     async fn verified_holder_needs_no_index_open_and_lost_holder_triggers_takeover() {
