@@ -557,9 +557,31 @@ impl Capture {
                 "input inventory drift: {}",
                 path.display()
             );
+            // Relevant config, manifest, ignore and toolchain bytes can change
+            // while a filesystem reports an unchanged stat. Do not infer their
+            // equality from timestamps at the publication cutoff.
+            if let Some(state) = expected {
+                let now = regular_read(path, self.input_cap(path), state, cancel, None)?;
+                ensure!(
+                    self.input_bytes.get(path).and_then(Option::as_deref) == Some(now.as_slice()),
+                    "input contents drift: {}",
+                    path.display()
+                );
+            }
         }
         check(cancel)?;
         Ok(())
+    }
+    fn input_cap(&self, path: &Path) -> u64 {
+        if path == self.executable_path {
+            512 * 1024 * 1024
+        } else if self.reconcile_options.scip_path.as_deref() == path.to_str()
+            || self.reconcile_options.manifest_path.as_deref() == path.to_str()
+        {
+            256 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024
+        }
     }
     pub fn bytes(&self, path: &Path) -> Option<&[u8]> {
         self.input_bytes.get(path).and_then(|b| b.as_deref())

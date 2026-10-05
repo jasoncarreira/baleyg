@@ -1716,3 +1716,102 @@ fn optional_executable_alias_keeps_authenticated_native_role_without_editing_bin
         }
     );
 }
+
+#[test]
+fn watcher_coalesces_renames_and_retains_signals_until_verified_ack() {
+    use baleyg::watch::WatchSignals;
+    use notify::{
+        Event, EventKind,
+        event::{ModifyKind, RenameMode},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut watcher = WatchSignals::new(root.path().to_owned());
+    let takeover = watcher.drain();
+    assert!(takeover.full);
+    if !watcher.watching() {
+        assert!(watcher.degraded());
+        return; // Platform has no watcher: mandatory full scans remain active.
+    }
+    assert!(watcher.acknowledge(&takeover));
+    let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+        .add_path(root.path().join("old.js"))
+        .add_path(root.path().join("new.js"));
+    watcher.observe_event(&rename);
+    let batch = watcher.drain();
+    assert!(batch.paths.contains(std::path::Path::new("old.js")));
+    assert!(batch.paths.contains(std::path::Path::new("new.js")));
+    watcher.observe_event(&Event::new(EventKind::Any));
+    assert!(
+        !watcher.acknowledge(&batch),
+        "a stale capture cannot clear a newer event"
+    );
+    let pending = watcher.drain();
+    assert!(pending.full);
+    assert!(watcher.acknowledge(&pending));
+    assert!(!watcher.drain().full);
+}
+
+#[test]
+fn watcher_promotes_ignore_unknown_and_bulk_changes_to_full_inventory() {
+    use baleyg::watch::WatchSignals;
+    use notify::{Event, EventKind, event::ModifyKind};
+    let root = tempfile::tempdir().unwrap();
+    let mut watcher = WatchSignals::new(root.path().to_owned());
+    if !watcher.watching() {
+        return;
+    }
+    let first = watcher.drain();
+    assert!(watcher.acknowledge(&first));
+    watcher.observe_event(
+        &Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(root.path().join("nested/.ignore")),
+    );
+    assert!(watcher.drain().full);
+    let first = watcher.drain();
+    assert!(watcher.acknowledge(&first));
+    for n in 0..257 {
+        watcher.observe_event(
+            &Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(root.path().join(format!("src/{n}.js"))),
+        );
+    }
+    assert!(watcher.drain().full);
+}
+
+#[test]
+fn explicit_unchanged_capture_freshly_hashes_every_source() {
+    use baleyg::{
+        capture::Capture,
+        indexer::{CapturedChange, measure_captured_change},
+    };
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "one.js", "f();");
+    write(root.path(), "two.rs", "fn f() {}\n");
+    let options = IndexOptions::new(root.path().to_owned());
+    let first = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
+    let second = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
+    assert_eq!(
+        measure_captured_change(&first, &second),
+        CapturedChange::Unchanged
+    );
+    for operations in second.source_operations.values() {
+        assert_eq!(operations.hashes, 1);
+        assert_eq!(operations.complete_reads, 1);
+    }
+}
+
+#[test]
+fn watcher_registration_failure_keeps_full_inventory_active() {
+    use baleyg::watch::WatchSignals;
+    let root = tempfile::tempdir().unwrap();
+    let mut watcher = WatchSignals::new(root.path().join("missing-root"));
+    assert!(watcher.degraded());
+    assert!(!watcher.watching());
+    let batch = watcher.drain();
+    assert!(batch.full);
+    assert!(watcher.acknowledge(&batch));
+    assert!(
+        watcher.drain().full,
+        "degraded scans cannot rely on missing events"
+    );
+}

@@ -28,6 +28,7 @@ pub mod native_ids;
 pub mod navigation;
 mod rust_sources;
 pub mod store;
+pub mod watch;
 
 pub mod jev;
 pub mod live_jev;
