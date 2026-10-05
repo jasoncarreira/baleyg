@@ -334,7 +334,10 @@ fn cli_accepted_during_held_exceptional_owner_waits_until_recreation_completes()
         .unwrap();
     cli.join().unwrap();
     assert_eq!(old.request_by_id(&ack.id).unwrap().unwrap().state, "done");
-    assert_eq!(pin.index_revision, 1, "recreated generation first pin");
+    assert_eq!(
+        pin.index_revision, 2,
+        "recreation and explicit claim need separate publications"
+    );
 }
 
 #[test]
@@ -362,7 +365,7 @@ fn request_rejects_symlink_to_captured_workspace() {
 }
 
 #[test]
-fn first_cli_takeover_capture_satisfies_fifo_head_once() {
+fn first_cli_takeover_reconciles_then_claims_fifo_head() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function seed() {}\n").unwrap();
@@ -371,7 +374,10 @@ fn first_cli_takeover_capture_satisfies_fifo_head_once() {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (pin, session) =
         baleyg::index_coordinator::enqueue_and_wait(&store, &options, &cancel).unwrap();
-    assert_eq!(pin.index_revision, 1);
+    assert_eq!(
+        pin.index_revision, 2,
+        "takeover and explicit claim need separate publications"
+    );
     assert!(session.is_leader());
     assert_eq!(store.status().unwrap().revision, pin);
     let head = store.current_request().unwrap().unwrap();
@@ -923,4 +929,406 @@ fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
     );
     assert!(!queue.exists());
     assert_eq!(fs::read(&index).unwrap(), index_before);
+}
+
+#[test]
+fn claimed_unchanged_fifo_publishes_fresh_manifest_without_reextracting() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (baseline, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |id, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push((id.to_owned(), p.phase));
+            }
+        })
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec![
+            (first.id.clone(), "mode:unchanged".into()),
+            (second.id.clone(), "mode:unchanged".into()),
+        ],
+        "both claimed requests must take the guarded unchanged path"
+    );
+    let a = store.request_by_id(&first.id).unwrap().unwrap();
+    let b = store.request_by_id(&second.id).unwrap().unwrap();
+    assert_eq!((a.state.as_str(), b.state.as_str()), ("done", "done"));
+    assert_eq!(
+        a.revision.unwrap().index_revision,
+        baseline.index_revision + 1
+    );
+    assert_eq!(
+        b.revision.unwrap().index_revision,
+        baseline.index_revision + 2
+    );
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    let manifest_count: i64 = db
+        .query_row("SELECT count(*) FROM revision_documents", [], |r| r.get(0))
+        .unwrap();
+    let document_count: i64 = db
+        .query_row("SELECT count(*) FROM document_versions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(manifest_count, 3);
+    assert_eq!(
+        document_count, 1,
+        "unchanged claimed work must reuse immutable measured facts"
+    );
+}
+
+#[test]
+fn changed_claimed_source_uses_native_fallback_not_unchanged() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let request = store.enqueue_request(&options, None).unwrap();
+    fs::write(workspace.path().join("a.js"), "function b() {}\n").unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |_, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push(p.phase);
+            }
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec!["mode:full"],
+        "declaration change is not #67 local"
+    );
+    assert_eq!(
+        store.request_by_id(&request.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+#[test]
+fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
+    use baleyg::index_coordinator::{drain_requests, reconcile_workspace};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (head, leader) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let request = store.enqueue_request(&options, None).unwrap();
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    db.execute(
+        "UPDATE document_versions SET source_bytes=?1 WHERE path='a.js'",
+        [b"function b() {}\n".as_slice()],
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(drain_requests(&store, &leader).unwrap(), 1);
+    let row = store.request_by_id(&request.id).unwrap().unwrap();
+    assert_eq!(row.state, "failed", "guard failure must not ACK done");
+    assert!(row.revision.is_none());
+    assert_eq!(
+        store.index_baseline().unwrap(),
+        head,
+        "selected pair must remain unchanged"
+    );
+}
+
+#[test]
+fn changed_capture_input_and_options_take_full_claimed_fallback() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    fs::write(workspace.path().join(".gitignore"), "absent.js\n").unwrap();
+    let input_request = store.enqueue_request(&options, None).unwrap();
+    let mut other_options = options.clone();
+    other_options.max_file_bytes = 1024;
+    let option_request = store.enqueue_request(&other_options, None).unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |id, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push((id.to_owned(), p.phase));
+            }
+        })
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec![
+            (input_request.id.clone(), "mode:full".into()),
+            (option_request.id.clone(), "mode:full".into()),
+        ],
+        "new ignore input and changed options cannot reuse selected facts via unchanged path"
+    );
+    for request in [input_request, option_request] {
+        assert_eq!(
+            store.request_by_id(&request.id).unwrap().unwrap().state,
+            "done"
+        );
+    }
+}
+
+#[test]
+fn executable_drift_claim_child() {
+    let Ok(state) = std::env::var("BALEYG_DRIFT_CLAIM_STATE") else {
+        return;
+    };
+    use baleyg::index_coordinator::{drain_requests_observed_with_native, reconcile_workspace};
+    use baleyg::native_evidence::FullNativeStage;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let workspace =
+        std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_WORKSPACE").unwrap());
+    let proof = std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_PROOF").unwrap());
+    let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
+    let options = IndexOptions::new(workspace);
+    let (old, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    println!("DRIFT_BASELINE_READY");
+    std::io::stdout().flush().unwrap();
+    let mut signal = [0u8; 1];
+    std::io::stdin().read_exact(&mut signal).unwrap();
+    assert_eq!(signal[0], b'!');
+    let request = store.enqueue_request(&options, None).unwrap();
+    let inode_before =
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.request_db_path()).unwrap());
+    let modes = Mutex::new(Vec::new());
+    let native_events = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed_with_native(
+            &store,
+            &owner,
+            |_, p| {
+                if p.phase.starts_with("mode:") {
+                    modes.lock().unwrap().push(p.phase);
+                }
+            },
+            |id, key, stage| {
+                native_events.lock().unwrap().push((
+                    id.to_owned(),
+                    key.path.clone(),
+                    match stage {
+                        FullNativeStage::Measured => "measured",
+                        FullNativeStage::Validated => "validated",
+                    },
+                ));
+            }
+        )
+        .unwrap(),
+        1
+    );
+    let done = store.request_by_id(&request.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    let fresh = done.revision.unwrap();
+    assert_eq!(store.status().unwrap().revision, fresh);
+    assert_eq!(fresh.index_generation, old.index_generation);
+    assert_eq!(fresh.index_revision, old.index_revision + 1);
+    for path in ["a.js", "b.js"] {
+        assert!(
+            store.source_at(path, Some(old)).unwrap().is_some(),
+            "both old pinned sources stay readable"
+        );
+        assert!(
+            store.source_at(path, Some(fresh)).unwrap().is_some(),
+            "full measurement must select both fresh sources"
+        );
+    }
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    let selected: (String, String) = db
+        .query_row(
+            "SELECT producer_sha,binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                fresh.index_generation, fresh.index_revision
+            )],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let manifests: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                fresh.index_generation, fresh.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let old_manifests: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                old.index_generation, old.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((manifests, old_manifests), (2, 2));
+    let inode_after =
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.request_db_path()).unwrap());
+    assert_eq!(
+        inode_after, inode_before,
+        "requests.db must not be recreated"
+    );
+    let result = serde_json::json!({"modes":modes.into_inner().unwrap(),"producerSha":selected.0,
+        "bindingSha":selected.1,"generation":fresh.index_generation.to_string(),
+        "revision":fresh.index_revision,"requestId":request.id,"queueInode":inode_after,
+        "nativeEvents":native_events.into_inner().unwrap()});
+    fs::write(proof, serde_json::to_vec(&result).unwrap()).unwrap();
+}
+
+fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let padding = "x".repeat(145_000);
+    let local = |value| {
+        format!(
+            "function local() {{ return {value}; /*{padding}*/ }}\nfunction checked() {{ const local=1, other=2; return local+other; }}\n"
+        )
+    };
+    fs::write(workspace.path().join("a.js"), local("1")).unwrap();
+    fs::write(
+        workspace.path().join("b.js"),
+        "function stable() { return 3; }\n",
+    )
+    .unwrap();
+    let binary = state.path().join("native-drift-requests");
+    fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    let proof = state.path().join("drift-proof.json");
+    let mut child = Command::new(&binary)
+        .arg("--exact")
+        .arg("executable_drift_claim_child")
+        .arg("--nocapture")
+        .env("BALEYG_DRIFT_CLAIM_STATE", state.path())
+        .env("BALEYG_DRIFT_CLAIM_WORKSPACE", workspace.path())
+        .env("BALEYG_DRIFT_CLAIM_PROOF", &proof)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            stdout.read_line(&mut line).unwrap() > 0,
+            "child exited before baseline ready"
+        );
+        if line.contains("DRIFT_BASELINE_READY") {
+            break;
+        }
+    }
+    let executing_hash = if drift {
+        // Replace the binary pathname atomically while the old inode executes.
+        // The next normal claimed capture hashes the changed current_exe pathname.
+        let replacement = state.path().join("native-drift-replacement");
+        fs::copy(&binary, &replacement).unwrap();
+        let mut bytes = fs::OpenOptions::new()
+            .append(true)
+            .open(&replacement)
+            .unwrap();
+        bytes.write_all(b"BALEYG-TEST-PRODUCER-DRIFT-V1").unwrap();
+        bytes.sync_all().unwrap();
+        drop(bytes);
+        fs::rename(&replacement, &binary).unwrap();
+        hex::encode(Sha256::digest(fs::read(&binary).unwrap()))
+    } else {
+        hex::encode(Sha256::digest(fs::read(&binary).unwrap()))
+    };
+    if body_edit {
+        fs::write(workspace.path().join("a.js"), local("2")).unwrap();
+    }
+    child.stdin.take().unwrap().write_all(b"!").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "drift child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(&proof).unwrap()).unwrap();
+    assert_eq!(
+        result["modes"],
+        serde_json::json!([if drift { "mode:full" } else { "mode:local" }]),
+        "drift must force full extraction; the same body edit without drift is proved local"
+    );
+    let expected_events = if drift {
+        serde_json::json!([
+            [result["requestId"], "a.js", "measured"],
+            [result["requestId"], "b.js", "measured"],
+            [result["requestId"], "a.js", "validated"],
+            [result["requestId"], "b.js", "validated"],
+        ])
+    } else {
+        serde_json::json!([])
+    };
+    assert_eq!(
+        result["nativeEvents"], expected_events,
+        "each admitted source must cross the actual extract_known boundary and successful independent full validation"
+    );
+    assert_eq!(
+        result["producerSha"], executing_hash,
+        "selected binding must record the new executable hash"
+    );
+    assert_eq!(result["bindingSha"].as_str().unwrap().len(), 64);
+    assert_eq!(result["revision"], 2);
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let row = store
+        .request_by_id(result["requestId"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "done");
+    assert_eq!(row.revision.unwrap().index_revision, 2);
+    assert_eq!(
+        row.revision.unwrap().index_generation.to_string(),
+        result["generation"]
+    );
+}
+
+#[test]
+fn unchanged_explicit_claim_with_real_executable_drift_remeasures_every_document() {
+    asserted_claim_under_real_executable_drift(false, true);
+}
+
+#[test]
+fn body_edit_explicit_claim_with_real_executable_drift_cannot_use_local_reuse() {
+    asserted_claim_under_real_executable_drift(true, true);
+}
+
+#[test]
+fn same_body_edit_without_executable_drift_is_proven_local_control() {
+    asserted_claim_under_real_executable_drift(true, false);
 }

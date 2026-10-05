@@ -454,7 +454,6 @@ impl DaemonState {
             return Ok(());
         }
         if self.store.is_recreate_pending() && (pending_local || durable_pending) {
-            let head_before_capture = self.store.earliest_unfinished_request()?.map(|row| row.id);
             // The native stream excludes the tick while the old owner is removed.
             // No retained SH guard may enter the nonblocking EX attempt.
             drop(self.serving_session.lock().unwrap().take());
@@ -462,16 +461,9 @@ impl DaemonState {
                 .store
                 .recreate_pending_leader_session(&self.options, &Arc::new(AtomicBool::new(false)))
             {
-                Ok((pin, session)) => {
+                Ok((_, session)) => {
                     self.store.fail_changed_root_requests(&session)?;
-                    *self.serving_session.lock().unwrap() = Some(session.clone());
-                    crate::index_coordinator::finish_reconciled_head(
-                        &self.store,
-                        &session,
-                        &self.options,
-                        pin,
-                        head_before_capture.as_deref(),
-                    )?;
+                    *self.serving_session.lock().unwrap() = Some(session);
                 }
                 Err(error)
                     if error.chain().any(|cause| {
@@ -3521,6 +3513,8 @@ mod serving_holder_tests {
             |_| {},
         )
         .unwrap();
+        let mut options = options;
+        options.max_file_bytes = 1024;
         let state = new(
             store.clone(),
             options.clone(),
@@ -3817,8 +3811,8 @@ mod exceptional_recovery_tests {
         )
         .unwrap();
         assert_eq!(
-            cli_pin.index_revision, 1,
-            "CLI must repair corrupt index to fresh r1"
+            cli_pin.index_revision, 2,
+            "CLI must repair at r1 then publish its claimed r2"
         );
         assert_eq!(cli_store.current_request().unwrap().unwrap().state, "done");
         assert!(
@@ -3980,8 +3974,8 @@ mod exceptional_recovery_tests {
             (browser_done.state.as_str(), cli_done.state.as_str()),
             ("done", "done")
         );
-        assert_eq!(browser_done.revision.unwrap().index_revision, 1);
-        assert_eq!(cli_done.revision.unwrap().index_revision, 2);
+        assert_eq!(browser_done.revision.unwrap().index_revision, 2);
+        assert_eq!(cli_done.revision.unwrap().index_revision, 3);
         assert_eq!(cli_done.revision.unwrap(), cli_pin);
     }
 
@@ -4003,8 +3997,8 @@ mod exceptional_recovery_tests {
         assert_eq!(row.revision.unwrap(), store.status().unwrap().revision);
         assert_eq!(
             row.revision.unwrap().index_revision,
-            1,
-            "exceptional generation begins at the first fully recaptured pin"
+            2,
+            "recreation reconciles at r1 before claimed publication at r2"
         );
         assert!(state.retained_serving_session().unwrap().is_leader());
         assert!(roots.leader(&identity).is_err(), "new owner remains held");
@@ -4024,8 +4018,8 @@ mod exceptional_recovery_tests {
         let q2 = f.store.request_by_id(&f.q2.id).unwrap().unwrap();
         let q1 = f.store.request_by_id(&f.q1.id).unwrap().unwrap();
         assert_eq!((q2.state.as_str(), q1.state.as_str()), ("done", "done"));
-        assert_eq!(q2.revision.unwrap().index_revision, 1);
-        assert_eq!(q1.revision.unwrap().index_revision, 2);
+        assert_eq!(q2.revision.unwrap().index_revision, 2);
+        assert_eq!(q1.revision.unwrap().index_revision, 3);
         assert_eq!(
             q2.revision.unwrap().index_generation,
             q1.revision.unwrap().index_generation
@@ -4161,7 +4155,7 @@ mod exceptional_recovery_tests {
         .unwrap();
         let done = store.request_by_id(&request.id).unwrap().unwrap();
         assert_eq!(done.state, "done");
-        assert_eq!(done.revision.unwrap().index_revision, 1);
+        assert_eq!(done.revision.unwrap().index_revision, 2);
         assert_ne!(
             done.revision.unwrap().index_generation,
             prior.index_generation
@@ -4540,11 +4534,11 @@ mod exceptional_recovery_tests {
         let first_pin = first.revision.unwrap();
         let second_pin = second.revision.unwrap();
         assert_eq!(
-            first_pin.index_revision, 1,
-            "recovery full reconcile satisfies first head"
+            first_pin.index_revision, 2,
+            "recovery reconciles at r1 before first FIFO claim publishes r2"
         );
         assert_eq!(
-            second_pin.index_revision, 2,
+            second_pin.index_revision, 3,
             "second request publishes in FIFO order"
         );
         assert_eq!(

@@ -671,7 +671,7 @@ async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_
     assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
     let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
     assert_eq!(done["state"], "done", "{done}");
-    assert_eq!(done["revision"]["indexRevision"], 1);
+    assert_eq!(done["revision"]["indexRevision"], 2);
     assert_ne!(
         done["revision"]["indexGeneration"],
         json!(old)["indexGeneration"]
@@ -752,8 +752,8 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
     let done = finished_index_job(&app, id).await;
     assert_eq!(done["state"], "done", "{done}");
     assert_eq!(
-        done["revision"]["indexRevision"], 1,
-        "no duplicate publication"
+        done["revision"]["indexRevision"], 2,
+        "recreation and claimed request publish exactly once each"
     );
     assert_ne!(
         done["revision"]["indexGeneration"],
@@ -1040,4 +1040,53 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
         assert_eq!(attached["indexRevision"], head.index_revision);
     }
     assert_eq!(store.status().unwrap().revision, head);
+}
+
+#[tokio::test]
+async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
+    let (dir, store, state, app) = setup();
+    std::fs::write(
+        dir.path().join("workspace/a.js"),
+        "function unchanged() {}\n",
+    )
+    .unwrap();
+    let owner = state.retained_serving_session().unwrap();
+    let options = IndexOptions::new(dir.path().join("workspace"));
+    let first =
+        baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(&store, None, owner)
+            .unwrap()
+            .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+    let (code, queued) = call(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{queued}");
+    let id = queued["id"].as_str().unwrap();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, row) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            if !row["finishedAt"].is_null() {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(completed["state"], "done", "{completed}");
+    assert_eq!(
+        completed["revision"]["indexRevision"],
+        first.index_revision + 1
+    );
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    let manifests: i64 = db
+        .query_row("SELECT count(*) FROM revision_documents", [], |r| r.get(0))
+        .unwrap();
+    let immutable: i64 = db
+        .query_row("SELECT count(*) FROM document_versions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        (manifests, immutable),
+        (2, 1),
+        "browser claim must publish its own revision without extracting again"
+    );
 }
