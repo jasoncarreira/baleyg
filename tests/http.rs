@@ -848,3 +848,55 @@ async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "revision_conflict");
 }
+
+#[tokio::test]
+async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
+    let (dir, store, state, app) = setup();
+    let workspace = dir.path().join("workspace");
+    std::fs::write(workspace.join("a.js"), "function idle() {}\n").unwrap();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session = state.retained_serving_session().unwrap();
+    let publish = |expected| {
+        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                expected,
+                &cancel,
+            )
+            .unwrap()
+    };
+    let old = publish(store.index_baseline().unwrap());
+    let head = publish(old);
+    let pinned = format!(
+        "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+        old.index_generation, old.index_revision
+    );
+    store.set_retention_clock_for_tests(1_899, 899);
+    state.force_retention_idle_tick_for_tests().unwrap();
+    assert_eq!(
+        call(&app, "GET", &pinned, Value::Null).await.0,
+        StatusCode::OK
+    );
+    store.set_retention_clock_for_tests(1_900, 900);
+    state.force_retention_idle_tick_for_tests().unwrap();
+    let (status, body) = call(&app, "GET", &pinned, Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "pin_expired");
+    assert_eq!(
+        store.status().unwrap().revision,
+        head,
+        "idle maintenance must not publish"
+    );
+    assert!(!store.graph_at(Some(head)).unwrap().files.is_empty());
+}

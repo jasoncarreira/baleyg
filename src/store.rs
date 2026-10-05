@@ -39,6 +39,26 @@ impl TestOneShotHook {
     }
 }
 
+#[derive(Debug)]
+struct RetentionClock {
+    origin_wall: i64,
+    origin_mono: u64,
+    started: Instant,
+    injected: Option<(i64, u64)>,
+}
+impl RetentionClock {
+    fn sample(&self) -> Result<(i64, u64)> {
+        match self.injected {
+            Some(pair) => Ok(pair),
+            None => Ok((
+                publication_second()?,
+                self.origin_mono
+                    .saturating_add(self.started.elapsed().as_secs()),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -50,7 +70,7 @@ pub struct Store {
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
     request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
     writer_counters: Arc<Mutex<Option<WriterCounters>>>,
-    retention_clock: Arc<Mutex<(i64, Instant)>>,
+    retention_clock: Arc<Mutex<RetentionClock>>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -3659,7 +3679,12 @@ impl Store {
             pending_request_completion: Arc::new(Mutex::new(None)),
             request_file_witness: Arc::new(Mutex::new(None)),
             writer_counters: Arc::new(Mutex::new(None)),
-            retention_clock: Arc::new(Mutex::new((publication_second()?, Instant::now()))),
+            retention_clock: Arc::new(Mutex::new(RetentionClock {
+                origin_wall: publication_second()?,
+                origin_mono: 0,
+                started: Instant::now(),
+                injected: None,
+            })),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
@@ -4258,7 +4283,7 @@ impl Store {
             "incompatible_index: cache changed after admission"
         );
         if compatible {
-            install_supersessions(&tx, publication_second()?)?;
+            install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
             storage_result(tx.execute(
@@ -5790,7 +5815,7 @@ impl Store {
             "INSERT INTO revision_producer_bindings VALUES(?1,?2,?3)",
             params![revision_key, bound_hash, binding_sha],
         )?;
-        let publication_time = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let publication_time = self.retention_time()?;
         ensure!(
             publication_time.as_secs() <= 9_007_199_254_740_991,
             "invalid_supersession_time"
@@ -6767,7 +6792,7 @@ impl Store {
                 tx.execute_batch(SUPERSESSION_SCHEMA_V8)?;
             }
         } else {
-            install_supersessions(&tx, publication_second()?)?;
+            install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
         }
         let binding_extension = has_revision_producer_bindings(&tx)?;
         if rebaseline && binding_extension {
@@ -6930,7 +6955,7 @@ impl Store {
             }
         }
         immutable.finish(&tx).map_err(classify_immutable)?;
-        let publication_time = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let publication_time = self.retention_time()?;
         ensure!(
             publication_time.as_secs() <= 9_007_199_254_740_991,
             "invalid_supersession_time"
@@ -7069,6 +7094,27 @@ impl Store {
         })
     }
 
+    /// Set a deterministic UTC and monotonic clock for an isolated test store.
+    /// The instant and all subsequent publications use this same source.
+    #[doc(hidden)]
+    pub fn set_retention_clock_for_tests(&self, wall: i64, monotonic: u64) {
+        let mut clock = self.retention_clock.lock().unwrap();
+        if clock.injected.is_none() {
+            clock.origin_wall = wall;
+            clock.origin_mono = monotonic;
+        }
+        clock.injected = Some((wall, monotonic));
+    }
+
+    fn retention_time(&self) -> Result<Duration> {
+        let (wall, _) = self.retention_clock.lock().unwrap().sample()?;
+        ensure!(
+            (0..=9_007_199_254_740_991).contains(&wall),
+            "invalid_supersession_time"
+        );
+        Ok(Duration::from_secs(wall as u64))
+    }
+
     /// Only the verified owner may expire pins. An in-process forward clock jump
     /// cannot shorten grace until monotonic time corroborates it; after restart
     /// the new process trusts the persisted UTC timestamp.
@@ -7076,16 +7122,14 @@ impl Store {
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         leader.verify()?;
         self.identity.verify()?;
-        let wall = publication_second()?;
-        let mut clock = self.retention_clock.lock().unwrap();
-        let elapsed = clock.1.elapsed().as_secs();
-        if !retention_clock_plausible(clock.0, wall, elapsed) {
-            return Ok(());
-        }
-        // Keep the original anchor during a backward step. It cannot shorten grace.
-        if wall >= clock.0 {
-            *clock = (wall, Instant::now());
-        }
+        let clock = self.retention_clock.lock().unwrap();
+        let (wall, mono) = clock.sample()?;
+        ensure!(
+            (0..=9_007_199_254_740_991).contains(&wall),
+            "invalid_supersession_time"
+        );
+        let origin = clock.origin_wall;
+        let elapsed = mono.saturating_sub(clock.origin_mono);
         drop(clock);
         let due = self.with_evidence(|db| {
             let head = self.read_revision(db, None)?.pin;
@@ -7096,6 +7140,9 @@ impl Store {
                 |r| r.get(0),
             )?;
             let now = wall.max(latest.unwrap_or(wall));
+            if !retention_clock_plausible(origin, now, elapsed) {
+                return Ok(None);
+            }
             let mut stmt = db.prepare(
                 "SELECT r.published_index_revision,s.superseded_at FROM native_revision_supersessions s
                  JOIN native_revisions r ON r.id=s.revision_id
@@ -7108,12 +7155,15 @@ impl Store {
                 [format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             )?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows.into_iter().filter(|(_, stamp)| retention_due(now, *stamp))
+            Ok(Some(rows.into_iter().filter(|(_, stamp)| retention_due(now, *stamp))
                 .map(|(revision, _)| IndexPin {
                     index_generation: head.index_generation,
                     index_revision: revision as u64,
-                }).collect::<Vec<_>>())
+                }).collect::<Vec<_>>()))
         })?;
+        let Some(due) = due else {
+            return Ok(());
+        };
         for pin in &due {
             self.release_revision(*pin, leader)?;
         }

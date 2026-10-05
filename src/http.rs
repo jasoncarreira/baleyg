@@ -352,6 +352,14 @@ impl DaemonState {
             }
         });
     }
+    /// Exercise the production queue tick at the idle maintenance deadline in
+    /// integration tests, without waiting for wall-clock time.
+    #[doc(hidden)]
+    pub fn force_retention_idle_tick_for_tests(self: &Arc<Self>) -> anyhow::Result<()> {
+        *self.retention_last_run.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        self.queue_tick()
+    }
+
     fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
         #[cfg(test)]
         self.test_queue_before_stream.run();
