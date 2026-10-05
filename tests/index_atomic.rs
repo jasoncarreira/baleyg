@@ -734,7 +734,7 @@ fn sqlite_snapshot(
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert!(
-        matches!(tables.len(), 28 | 29 | 30 | 31),
+        matches!(tables.len(), 28..=31),
         "compare exact legacy or extended v8 shape"
     );
     if tables.contains(&"native_binding_epoch".to_string()) {

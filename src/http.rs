@@ -4770,7 +4770,7 @@ mod normal_post_capture_cancellation_tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(
-            matches!(tables.len(), 28 | 29 | 30 | 31),
+            matches!(tables.len(), 28..=31),
             "compare the complete legacy or extended v8 evidence inventory"
         );
         let mut expected = vec![
