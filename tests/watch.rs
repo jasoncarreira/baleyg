@@ -350,7 +350,8 @@ async fn cli_daemon_edit_during_cli_leadership_then_handoff_matches_cold_full() 
         "finite CLI child must hold EX before competing ingress"
     );
     let request_db = request_db_under(&home).unwrap();
-    let queued_rows = || -> Vec<(i64, String, String, Option<String>, Option<i64>)> {
+    type DurableQueuedRow = (i64, String, String, Option<String>, Option<i64>);
+    let queued_rows = || -> Vec<DurableQueuedRow> {
         let db = rusqlite::Connection::open_with_flags(
             &request_db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -446,18 +447,17 @@ async fn cli_daemon_edit_during_cli_leadership_then_handoff_matches_cold_full() 
     let deadline = Instant::now() + Duration::from_secs(12);
     let contender_row = loop {
         let rows = queued_rows();
-        if let Some(browser) = rows.iter().find(|row| row.1 == browser_id) {
-            if let Some(contender_row) = rows
+        if let Some(browser) = rows.iter().find(|row| row.1 == browser_id)
+            && let Some(contender_row) = rows
                 .iter()
                 .find(|row| row.0 > browser.0 && row.1 != first_row.1 && row.2 == "queued")
-            {
-                assert!(first_row.0 < browser.0 && browser.0 < contender_row.0);
-                assert_eq!(
-                    first_row.2, "queued",
-                    "first owner must still be before FIFO claim"
-                );
-                break contender_row.clone();
-            }
+        {
+            assert!(first_row.0 < browser.0 && browser.0 < contender_row.0);
+            assert_eq!(
+                first_row.2, "queued",
+                "first owner must still be before FIFO claim"
+            );
+            break contender_row.clone();
         }
         assert!(
             Instant::now() < deadline,
