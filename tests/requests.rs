@@ -1100,7 +1100,8 @@ fn executable_drift_claim_child() {
     let Ok(state) = std::env::var("BALEYG_DRIFT_CLAIM_STATE") else {
         return;
     };
-    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use baleyg::index_coordinator::{drain_requests_observed_with_native, reconcile_workspace};
+    use baleyg::native_evidence::FullNativeStage;
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     let workspace =
@@ -1119,12 +1120,27 @@ fn executable_drift_claim_child() {
     let inode_before =
         std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.request_db_path()).unwrap());
     let modes = Mutex::new(Vec::new());
+    let native_events = Mutex::new(Vec::new());
     assert_eq!(
-        drain_requests_observed(&store, &owner, |_, p| {
-            if p.phase.starts_with("mode:") {
-                modes.lock().unwrap().push(p.phase);
+        drain_requests_observed_with_native(
+            &store,
+            &owner,
+            |_, p| {
+                if p.phase.starts_with("mode:") {
+                    modes.lock().unwrap().push(p.phase);
+                }
+            },
+            |id, key, stage| {
+                native_events.lock().unwrap().push((
+                    id.to_owned(),
+                    key.path.clone(),
+                    match stage {
+                        FullNativeStage::Measured => "measured",
+                        FullNativeStage::Validated => "validated",
+                    },
+                ));
             }
-        })
+        )
         .unwrap(),
         1
     );
@@ -1185,7 +1201,8 @@ fn executable_drift_claim_child() {
     );
     let result = serde_json::json!({"modes":modes.into_inner().unwrap(),"producerSha":selected.0,
         "bindingSha":selected.1,"generation":fresh.index_generation.to_string(),
-        "revision":fresh.index_revision,"requestId":request.id,"queueInode":inode_after});
+        "revision":fresh.index_revision,"requestId":request.id,"queueInode":inode_after,
+        "nativeEvents":native_events.into_inner().unwrap()});
     fs::write(proof, serde_json::to_vec(&result).unwrap()).unwrap();
 }
 
@@ -1267,6 +1284,20 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
         result["modes"],
         serde_json::json!([if drift { "mode:full" } else { "mode:local" }]),
         "drift must force full extraction; the same body edit without drift is proved local"
+    );
+    let expected_events = if drift {
+        serde_json::json!([
+            [result["requestId"], "a.js", "measured"],
+            [result["requestId"], "b.js", "measured"],
+            [result["requestId"], "a.js", "validated"],
+            [result["requestId"], "b.js", "validated"],
+        ])
+    } else {
+        serde_json::json!([])
+    };
+    assert_eq!(
+        result["nativeEvents"], expected_events,
+        "each admitted source must cross the actual extract_known boundary and successful independent full validation"
     );
     assert_eq!(
         result["producerSha"], executing_hash,

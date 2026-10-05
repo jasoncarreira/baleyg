@@ -112,7 +112,7 @@ impl IndexJobCoordinator {
         progress: impl Fn(IndexProgress) + Sync,
         observe: impl FnOnce(&Capture),
     ) -> Result<IndexPin> {
-        self.run_with_capture(options, cancel, progress, observe, false)
+        self.run_with_capture(options, cancel, progress, observe, false, |_, _| {})
     }
 
     /// A fresh, guarded unchanged capture may reuse selected native versions
@@ -123,7 +123,7 @@ impl IndexJobCoordinator {
         cancel: &CancelFlag,
         progress: impl Fn(IndexProgress) + Sync,
     ) -> Result<IndexPin> {
-        self.run_with_capture(options, cancel, progress, |_| {}, true)
+        self.run_with_capture(options, cancel, progress, |_| {}, true, |_, _| {})
     }
 
     fn run_with_capture(
@@ -133,6 +133,10 @@ impl IndexJobCoordinator {
         progress: impl Fn(IndexProgress) + Sync,
         observe: impl FnOnce(&Capture),
         unchanged_fast: bool,
+        native_observe: impl Fn(
+            &crate::native_evidence::DocumentKey,
+            crate::native_evidence::FullNativeStage,
+        ),
     ) -> Result<IndexPin> {
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         let mut phase_start = std::time::Instant::now();
@@ -218,8 +222,13 @@ impl IndexJobCoordinator {
             completed: 0,
             total: 1,
         });
-        let native =
-            crate::native_evidence::from_capture(&capture, &root, self.store.root_id(), cancel)?;
+        let native = crate::native_evidence::from_capture_observed(
+            &capture,
+            &root,
+            self.store.root_id(),
+            cancel,
+            native_observe,
+        )?;
         report("measure", phase_start.elapsed());
         phase_start = std::time::Instant::now();
         let graph = indexer::project_native(options, &capture, &native, cancel, &progress)?;
@@ -277,11 +286,27 @@ pub fn drain_requests_observed(
     session: &Arc<LeaderSession>,
     progress: impl Fn(&str, IndexProgress) + Sync,
 ) -> Result<usize> {
+    drain_requests_observed_with_native(store, session, progress, |_, _, _| {})
+}
+
+/// Observe actual full-native extraction and completed validation for each
+/// claimed request. The callback is scoped to this drain and retains no state.
+pub fn drain_requests_observed_with_native(
+    store: &Store,
+    session: &Arc<LeaderSession>,
+    progress: impl Fn(&str, IndexProgress) + Sync,
+    native_observe: impl Fn(
+        &str,
+        &crate::native_evidence::DocumentKey,
+        crate::native_evidence::FullNativeStage,
+    ) + Sync,
+) -> Result<usize> {
     drain_requests_observed_with_cancel(
         store,
         session,
         &Arc::new(std::sync::atomic::AtomicBool::new(false)),
         progress,
+        native_observe,
     )
 }
 
@@ -290,6 +315,11 @@ fn drain_requests_observed_with_cancel(
     session: &Arc<LeaderSession>,
     cancel: &CancelFlag,
     progress: impl Fn(&str, IndexProgress) + Sync,
+    native_observe: impl Fn(
+        &str,
+        &crate::native_evidence::DocumentKey,
+        crate::native_evidence::FullNativeStage,
+    ) + Sync,
 ) -> Result<usize> {
     if store.root_path_replaced()? {
         store.fail_changed_root_requests(session)?;
@@ -332,6 +362,7 @@ fn drain_requests_observed_with_cancel(
                 |p| progress(&request.id, p),
                 |_| {},
                 true,
+                |key, stage| native_observe(&request.id, key, stage),
             )
         })();
         #[cfg(test)]
@@ -605,9 +636,13 @@ pub fn enqueue_and_wait_observed(
         }
         if let Some(session) = &held {
             loop {
-                match drain_requests_observed_with_cancel(store, session, cancel, |_, phase| {
-                    progress(phase)
-                }) {
+                match drain_requests_observed_with_cancel(
+                    store,
+                    session,
+                    cancel,
+                    |_, phase| progress(phase),
+                    |_, _, _| {},
+                ) {
                     Ok(_) => break,
                     Err(error) => {
                         if crate::store::nonterminal_storage_busy(&error)

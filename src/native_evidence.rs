@@ -506,8 +506,32 @@ pub fn from_capture(
     root_id: &str,
     cancel: &CancelFlag,
 ) -> Result<Artifact> {
-    let artifact = build_native(capture, root, root_id)?;
+    from_capture_observed(capture, root, root_id, cancel, |_, _| {})
+}
+
+/// Call-scoped evidence from the full native pipeline. `Measured` fires only
+/// after extraction of that captured document; `Validated` fires only after
+/// the independent full-bundle rebuild and comparison have succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullNativeStage {
+    Measured,
+    Validated,
+}
+
+pub(crate) fn from_capture_observed(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    cancel: &CancelFlag,
+    observe: impl Fn(&DocumentKey, FullNativeStage),
+) -> Result<Artifact> {
+    let artifact = build_native_observed(capture, root, root_id, &|key| {
+        observe(key, FullNativeStage::Measured);
+    })?;
     artifact.validate(capture, root, root_id, cancel)?;
+    for document in &artifact.revision.documents {
+        observe(&document.key, FullNativeStage::Validated);
+    }
     Ok(artifact)
 }
 
@@ -625,6 +649,15 @@ fn build_native_header<'a>(
 }
 
 fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
+    build_native_observed(capture, root, root_id, &|_| {})
+}
+
+fn build_native_observed(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    on_extract: &impl Fn(&DocumentKey),
+) -> Result<Artifact> {
     let (mut artifact, files) = build_native_header(capture, root, root_id)?;
     let mut ids = IdentityRegistry::default();
     for (index, f) in files.into_iter().enumerate() {
@@ -633,6 +666,7 @@ fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifac
         // revision header once per file.
         let document = artifact.revision.documents[index].clone();
         extract_known(&mut artifact, f, &document, &mut ids)?;
+        on_extract(&document.key);
     }
     Ok(artifact)
 }
