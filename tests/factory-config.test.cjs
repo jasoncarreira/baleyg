@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } = require("node:fs");
+const { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { delimiter, join } = require("node:path");
 const { spawnSync } = require("node:child_process");
@@ -73,6 +73,40 @@ test("factory config uses the closed supported schema", () => {
   assert.equal(config.max_retries, 5);
 });
 
+test("verify setup refuses a cache inside the checkout before installing packages", () => {
+  const forbidden = join(ROOT, ".verify-cache-probe");
+  assert.equal(existsSync(forbidden), false);
+  const result = spawnSync(process.execPath, [join(ROOT, "tools/verify-env.mjs")], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: { ...process.env, BALEYG_RUN_CACHE: forbidden },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /BALEYG_RUN_CACHE must be outside the checkout/);
+  assert.equal(existsSync(forbidden), false);
+});
+
+test("verify setup rejects symlinked and writable external caches", () => {
+  const temp = mkdtempSync(join(tmpdir(), "baleyg-verify-policy-"));
+  const link = join(temp, "checkout-link");
+  symlinkSync(ROOT, link, "dir");
+  try {
+    for (const cache of [link, temp]) {
+      if (cache === temp) chmodSync(temp, 0o777);
+      const result = spawnSync(process.execPath, [join(ROOT, "tools/verify-env.mjs")], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: { ...process.env, BALEYG_RUN_CACHE: cache },
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, cache === link ? /outside the checkout/ : /group- or world-writable/);
+    }
+  } finally {
+    chmodSync(temp, 0o700);
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test("resolver accepts only canonical Baleyg issue references", () => {
   const config = loadConfig();
   const fakeDir = makeFakeGh();
@@ -135,6 +169,11 @@ line="\${0##*/}"
 for arg in "$@"; do line="$line$(printf '\\t')$arg"; done
 # One append per call keeps lines whole when lanes run concurrently.
 printf '%s\\n' "$line" >> "$FAKE_VERIFY_LOG"
+if [ "$1" = tools/verify-env.mjs ]; then
+  if [ "\${FAKE_VERIFY_FAIL_SETUP:-0}" = 1 ]; then exit 31; fi
+  printf '%s\n' "$FAKE_BROWSER_ROOT"
+  exit 0
+fi
 if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
 `;
@@ -152,6 +191,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
           ...process.env,
           PATH: `${fakeDir}${delimiter}${process.env.PATH ?? ""}`,
           FAKE_VERIFY_LOG: log,
+          FAKE_BROWSER_ROOT: join(fakeDir, "browser-cache"),
           ...extraEnv,
         },
       });
@@ -160,6 +200,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     }
     // Lanes run concurrently; commands within a lane keep this order.
     const lanes = {
+      setup: [["node", "tools/verify-env.mjs"]],
       rust: [
         ["cargo", "fmt", "--all", "--", "--check"],
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
@@ -179,11 +220,16 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     function assertRan(commands, expected) {
       const key = (command) => JSON.stringify(command);
       assert.deepEqual(commands.map(key).sort(), Object.values(expected).flat().map(key).sort());
+      assert.deepEqual(commands[0], lanes.setup[0], "bootstrap must finish before parallel lanes");
       for (const lane of Object.values(expected)) {
         const own = new Set(lane.map(key));
         assert.deepEqual(commands.filter((command) => own.has(key(command))), lane);
       }
     }
+    const setupFailure = runVerify({ FAKE_VERIFY_FAIL_SETUP: "1" });
+    assert.equal(setupFailure.result.status, 31);
+    assert.deepEqual(setupFailure.commands, lanes.setup, "failed setup must not start other lanes");
+    rmSync(log);
     const success = runVerify();
     assert.equal(success.result.status, 0, success.result.stderr);
     assertRan(success.commands, lanes);
