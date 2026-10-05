@@ -25,6 +25,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{BTreeMap, VecDeque},
     net::SocketAddr,
@@ -32,7 +34,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 
@@ -44,7 +46,8 @@ pub struct IndexJob {
     pub progress: IndexProgress,
     pub revision: Option<IndexPin>,
     pub error: Option<Value>,
-    pub started_at: String,
+    pub submitted_at: String,
+    pub started_at: Option<String>,
     pub finished_at: Option<String>,
 }
 struct Jobs {
@@ -130,18 +133,35 @@ pub struct DaemonState {
     outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
-    normal_index_worker_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
-    normal_index_post_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
+    queue_tick_started: AtomicBool,
+    #[cfg(test)]
+    queue_takeover_attempts: AtomicUsize,
+    #[cfg(test)]
+    test_pending_read_failures: AtomicUsize,
+    pending_requests: Mutex<Vec<String>>,
+    job_progress: Mutex<BTreeMap<String, IndexProgress>>,
+    native_stream: Mutex<()>,
+    recovery_retry_after: Mutex<Option<Instant>>,
+    #[cfg(test)]
+    test_queue_before_stream: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_after_stream: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_after_pending_snapshot: crate::store::TestOneShotHook,
     packets: Mutex<PacketCache>,
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
 }
+/// Diagnostic logging must never kill the durable queue worker if the
+/// launching parent closed its stderr pipe after the server banner.
+fn best_effort_queue_stderr(mut output: impl std::io::Write, args: std::fmt::Arguments<'_>) {
+    let _ = output.write_fmt(args);
+}
+
 pub fn new(
     store: Store,
     index_options: IndexOptions,
@@ -258,10 +278,6 @@ pub fn new_with_dependency_options(
         outer_fence_hook: Mutex::new(None),
         #[cfg(test)]
         preview_finish_hook: Mutex::new(None),
-        #[cfg(test)]
-        normal_index_worker_hook: Mutex::new(None),
-        #[cfg(test)]
-        normal_index_post_capture_hook: Mutex::new(None),
         dependency_options: catalog_options,
         token,
         hosts,
@@ -269,6 +285,21 @@ pub fn new_with_dependency_options(
         provider: jev,
         acp,
         packets: Mutex::new(PacketCache::default()),
+        queue_tick_started: AtomicBool::new(false),
+        #[cfg(test)]
+        queue_takeover_attempts: AtomicUsize::new(0),
+        #[cfg(test)]
+        test_pending_read_failures: AtomicUsize::new(0),
+        pending_requests: Mutex::new(Vec::new()),
+        job_progress: Mutex::new(BTreeMap::new()),
+        native_stream: Mutex::new(()),
+        recovery_retry_after: Mutex::new(None),
+        #[cfg(test)]
+        test_queue_before_stream: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_after_stream: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_after_pending_snapshot: crate::store::TestOneShotHook::default(),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -277,8 +308,390 @@ pub fn new_with_dependency_options(
     }))
 }
 impl DaemonState {
-    pub fn retain_serving_session(&self, session: Arc<crate::store::topology::LeaderSession>) {
+    pub fn retain_serving_session(
+        self: &Arc<Self>,
+        session: Arc<crate::store::topology::LeaderSession>,
+    ) {
         *self.serving_session.lock().unwrap() = Some(session);
+        self.start_queue_tick();
+    }
+    /// A leader checks only the queue at idle. Follower retries require an accepted local ID.
+    fn start_queue_tick(self: &Arc<Self>) {
+        // A synchronous fixture may retain an owner without starting a daemon runtime.
+        // Do not consume the start flag until a Tokio executor can own the tick.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        if self.queue_tick_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                let worker = state.clone();
+                let result = tokio::task::spawn_blocking(move || worker.queue_tick()).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => best_effort_queue_stderr(
+                        std::io::stderr(),
+                        format_args!("queue tick failed: {error:#}\n"),
+                    ),
+                    Err(error) => best_effort_queue_stderr(
+                        std::io::stderr(),
+                        format_args!("queue tick worker failed: {error:#}\n"),
+                    ),
+                }
+            }
+        });
+    }
+    fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.test_queue_before_stream.run();
+        let _stream = self.native_stream.lock().unwrap();
+        #[cfg(test)]
+        self.test_queue_after_stream.run();
+        // A real exceptional storage error must not recapture/log every 20 ms.
+        // Root replacement is never delayed by that advisory retry deadline.
+        if !self.store.is_root_replaced()
+            && !self.store.root_path_replaced()?
+            && self
+                .recovery_retry_after
+                .lock()
+                .unwrap()
+                .is_some_and(|retry| Instant::now() < retry)
+        {
+            return Ok(());
+        }
+        let mut pending = self.pending_requests.lock().unwrap();
+        pending.retain(|id| {
+            #[cfg(test)]
+            if self
+                .test_pending_read_failures
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count > 0).then(|| count - 1)
+                })
+                .is_ok()
+            {
+                // Model a transient requests.db read failure without changing a live
+                // queue file or the protected index controls.
+                return true;
+            }
+            match self.store.request_by_id(id) {
+                Ok(Some(row)) => row.finished_at.is_none(),
+                // A failed or inconclusive read cannot erase the only request-driven
+                // follower retry trigger. Only an observed terminal removes this ID.
+                Ok(None) | Err(_) => true,
+            }
+        });
+        let pending_local = !pending.is_empty();
+        drop(pending);
+        #[cfg(test)]
+        self.test_queue_after_pending_snapshot.run();
+        // A CLI process or a previous daemon has no ID in this daemon's local
+        // pending vector. Its durable FIFO row must still drive exceptional
+        // recovery; the existing-only read leaves a virgin Ready queue absent.
+        let durable_pending = !pending_local
+            && !self.store.is_root_replaced()
+            && self.store.earliest_unfinished_request()?.is_some();
+        let mut externally_repaired = false;
+        if self.store.is_recreate_pending() && !self.store.is_root_replaced() {
+            // Another verified process may have replaced the corrupt index.
+            // Never reuse our stale EX recreation authority in that case: the
+            // strict existing-only read authenticates the same root/new pin
+            // before this daemon's shared disposition is switched to Ready.
+            match self.store.observe_external_ready_recovery() {
+                Ok(Some(_)) => {
+                    *self.recovery_retry_after.lock().unwrap() = None;
+                    externally_repaired = true;
+                }
+                Ok(None) if !pending_local && !durable_pending => {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(500));
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::store::topology::StorageBusy>()
+                            .is_some()
+                    }) =>
+                {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(250));
+                    return Ok(());
+                }
+                Err(error) => {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(500));
+                    return Err(error);
+                }
+            }
+        }
+        if self.store.is_recreate_pending()
+            && !pending_local
+            && !durable_pending
+            && !self.store.is_root_replaced()
+        {
+            // Admission may follow an empty snapshot; RootReplaced still has
+            // to fail old-root durable requests below.
+            return Ok(());
+        }
+        if self.store.is_recreate_pending() && (pending_local || durable_pending) {
+            let head_before_capture = self.store.earliest_unfinished_request()?.map(|row| row.id);
+            // The native stream excludes the tick while the old owner is removed.
+            // No retained SH guard may enter the nonblocking EX attempt.
+            drop(self.serving_session.lock().unwrap().take());
+            match self
+                .store
+                .recreate_pending_leader_session(&self.options, &Arc::new(AtomicBool::new(false)))
+            {
+                Ok((pin, session)) => {
+                    self.store.fail_changed_root_requests(&session)?;
+                    *self.serving_session.lock().unwrap() = Some(session.clone());
+                    crate::index_coordinator::finish_reconciled_head(
+                        &self.store,
+                        &session,
+                        &self.options,
+                        pin,
+                        head_before_capture.as_deref(),
+                    )?;
+                }
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::store::topology::StorageBusy>()
+                            .is_some()
+                    }) =>
+                {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(250));
+                    return Ok(());
+                }
+                Err(error) => {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(500));
+                    return Err(error);
+                }
+            }
+        }
+        let retained = self.serving_session.lock().unwrap().clone();
+        if self.store.root_path_replaced()? {
+            if let Some(ref session) = retained
+                && session.is_leader()
+            {
+                self.store.fail_changed_root_requests(session)?;
+            }
+            *self.serving_session.lock().unwrap() = None;
+            return Ok(());
+        }
+        if let Some(ref session) = retained
+            && session.is_leader()
+            && session.verify().is_ok()
+        {
+            let processed = match crate::index_coordinator::drain_requests_observed(
+                &self.store,
+                session,
+                |id, p| {
+                    self.job_progress.lock().unwrap().insert(id.to_owned(), p);
+                },
+            ) {
+                Ok(processed) => processed,
+                Err(error) => {
+                    // A cached terminal result must be resolved by this same
+                    // incarnation. Otherwise release the failed leader so a
+                    // successor can reclaim an unfinished running head.
+                    if !self.store.has_recorded_completion(session)?
+                        || !crate::index_coordinator::retryable_cli_completion_error(&error)
+                    {
+                        *self.serving_session.lock().unwrap() = None;
+                    }
+                    return Err(error);
+                }
+            };
+            if processed > 0 {
+                *self.packets.lock().unwrap() = PacketCache::default();
+                self.start_dependency_index();
+            }
+            // A verified drain normally consumes every FIFO head. If one is
+            // still queued, the guarded publish-BUSY path deferred it. Avoid
+            // recapturing the workspace every 20 ms under sustained readers.
+            if self
+                .store
+                .earliest_unfinished_request()
+                .is_ok_and(|head| head.is_some_and(|request| request.state == "queued"))
+            {
+                *self.recovery_retry_after.lock().unwrap() =
+                    Some(Instant::now() + Duration::from_millis(250));
+            }
+            return Ok(());
+        }
+        if !pending_local && !durable_pending {
+            if externally_repaired
+                || retained
+                    .as_ref()
+                    .is_some_and(|session| !session.is_leader() && session.verify().is_err())
+            {
+                // Public Status is fenced by a held leader incarnation. With
+                // no accepted work, a surviving external owner permits a
+                // verified follower with no publication; otherwise our new
+                // leader must finish normal reconciliation before Status opens.
+                drop(self.serving_session.lock().unwrap().take());
+                match self.store.leader_session() {
+                    Ok(session) => {
+                        self.store.fail_changed_root_requests(&session)?;
+                        let coordinator =
+                            crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+                                &self.store,
+                                None,
+                                session.clone(),
+                            )?;
+                        coordinator.run(
+                            &self.options,
+                            &Arc::new(AtomicBool::new(false)),
+                            |_| {},
+                        )?;
+                        *self.serving_session.lock().unwrap() = Some(session);
+                    }
+                    Err(error)
+                        if error.to_string().starts_with("storage_busy: ")
+                            || error.chain().any(|cause| {
+                                cause
+                                    .downcast_ref::<crate::store::topology::StorageBusy>()
+                                    .is_some()
+                            }) =>
+                    {
+                        // topology's leader.lock contention currently uses a
+                        // concrete `storage_busy: <lock path>` error; follower
+                        // construction independently verifies that live owner.
+                        let follower = self.store.follower_session()?;
+                        *self.serving_session.lock().unwrap() = Some(follower);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(());
+        }
+        // A retained follower verifies both the held leader flock and incarnation
+        // without opening index.db. Retry acquisition only after that proof fails.
+        if let Some(ref session) = retained
+            && !session.is_leader()
+            && session.verify().is_ok()
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.queue_takeover_attempts.fetch_add(1, Ordering::AcqRel);
+        match self.store.leader_session() {
+            Ok(session) => {
+                let outcome = (|| {
+                    self.store.fail_changed_root_requests(&session)?;
+                    // The verified takeover capture must use the FIFO head's
+                    // persisted inputs. This daemon's defaults may belong to a
+                    // different client and must never fail the head's ACK.
+                    let head_before = self.store.earliest_unfinished_request()?;
+                    let head_options = head_before.as_ref().and_then(|head| {
+                        head.options(std::path::Path::new(self.store.workspace_root()))
+                            .ok()
+                    });
+                    let takeover_options = head_options.as_ref().unwrap_or(&self.options);
+                    let coordinator =
+                        crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+                            &self.store,
+                            None,
+                            session.clone(),
+                        )?;
+                    let before = self.store.index_baseline()?;
+                    if let Err(error) =
+                        coordinator.run(takeover_options, &Arc::new(AtomicBool::new(false)), |_| {})
+                    {
+                        // This follower has acquired and verified leadership, but
+                        // capture failed before any queue claim. Match the leader's
+                        // terminal failure path only if publication did not commit.
+                        // A lost fence or changed root must never fail another row.
+                        self.store.verify_leader_session(&session)?;
+                        self.store.fail_changed_root_requests(&session)?;
+                        if self.store.index_baseline()? != before {
+                            // A possibly committed publication is never
+                            // guessed from a transient error. Reconcile it
+                            // under a fresh verified owner before any claim.
+                            return Err(error);
+                        }
+                        let current_head = self.store.earliest_unfinished_request()?;
+                        if crate::store::transient_storage_contention(&error) {
+                            // The rollback-journal COMMIT was busy before the
+                            // head was claimed. It remains the same durable
+                            // FIFO row; the next tick resumes with this
+                            // verified owner after a bounded reader backoff.
+                            *self.recovery_retry_after.lock().unwrap() =
+                                Some(Instant::now() + Duration::from_millis(250));
+                            return Ok(0);
+                        }
+                        if crate::store::nonterminal_storage_busy(&error) {
+                            return Err(error);
+                        }
+                        // Do not claim/fail a row admitted after the capture,
+                        // or an earlier row whose options could not be read.
+                        if head_options.is_none()
+                            || current_head.as_ref().map(|row| &row.id)
+                                != head_before.as_ref().map(|row| &row.id)
+                        {
+                            return Err(error);
+                        }
+                        if let Some(claimed) = self.store.claim_request(&session)? {
+                            if Some(&claimed.id) != head_before.as_ref().map(|row| &row.id) {
+                                // Raced a newer ACK after the protected head
+                                // check. Leave it running for a new leader.
+                                return Err(error);
+                            }
+                            best_effort_queue_stderr(
+                                std::io::stderr(),
+                                format_args!(
+                                    "queue takeover failed for accepted {}: {error:#}\n",
+                                    claimed.id
+                                ),
+                            );
+                            self.store
+                                .record_and_finish_request(&session, &claimed, Err(error))?;
+                            return Ok(1);
+                        }
+                        return Err(error);
+                    }
+                    let processed = crate::index_coordinator::drain_requests_observed(
+                        &self.store,
+                        &session,
+                        |id, p| {
+                            self.job_progress.lock().unwrap().insert(id.to_owned(), p);
+                        },
+                    )?;
+                    if processed > 0 {
+                        *self.packets.lock().unwrap() = PacketCache::default();
+                        self.start_dependency_index();
+                    }
+                    Ok(processed)
+                })();
+                if outcome.is_ok()
+                    || (self.store.has_recorded_completion(&session)?
+                        && outcome
+                            .as_ref()
+                            .is_err_and(crate::index_coordinator::retryable_cli_completion_error))
+                {
+                    // A terminal queue write may have committed ambiguously.
+                    // Keep this exact leader for cached-result reconciliation;
+                    // otherwise release it so the next incarnation can reclaim.
+                    *self.serving_session.lock().unwrap() = Some(session);
+                }
+                outcome.map(|_| ())
+            }
+            Err(error) if format!("{error:#}").contains("storage_busy") => Ok(()),
+            Err(error) => Err(error),
+        }
     }
     pub fn retained_serving_session(
         &self,
@@ -417,6 +830,7 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
     )
         .into_response()
 }
+#[derive(Debug)]
 struct ApiError(StatusCode, &'static str, &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -425,6 +839,13 @@ impl IntoResponse for ApiError {
 }
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // IOERR is broken SQLite locking/storage, not ordinary BUSY. Even an
+        // outer storage_busy context must never mask an IOERR_RDLOCK as 409.
+        if e.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+            matches!(error, rusqlite::Error::SqliteFailure(info, _) if info.code == rusqlite::ErrorCode::SystemIoFailure)
+        })) {
+            return Self(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "Operation failed");
+        }
         if e.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
             matches!(error, rusqlite::Error::SqliteFailure(info, _) if matches!(info.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
         })) {
@@ -438,67 +859,77 @@ impl From<anyhow::Error> for ApiError {
             )
         } else if let Some(invalid) = e.downcast_ref::<crate::class_diagram::InvalidRequest>() {
             Self(StatusCode::BAD_REQUEST, "invalid_class_request", invalid.0)
-        } else if e.to_string().starts_with("revision conflict") {
+        } else if e
+            .chain()
+            .any(|cause| cause.to_string().starts_with("revision conflict"))
+        {
             Self(
                 StatusCode::CONFLICT,
                 "revision_conflict",
                 "The index revision changed",
             )
-        } else if matches!(
-            e.to_string().as_str(),
-            "saved view target replacement is not allowed"
-                | "saved annotation target replacement is not allowed"
-                | "native declaration target missing"
-        ) {
+        } else if e.chain().any(|cause| {
+            matches!(
+                cause.to_string().as_str(),
+                "saved view target replacement is not allowed"
+                    | "saved annotation target replacement is not allowed"
+                    | "native declaration target missing"
+            )
+        }) {
             invalid()
         } else {
-            let text = e.to_string();
-            for (prefix, status, code) in [
-                ("root_changed", StatusCode::CONFLICT, "root_changed"),
-                (
-                    "root_key_collision",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "root_key_collision",
-                ),
-                (
-                    "workspace_id_changed",
-                    StatusCode::CONFLICT,
-                    "workspace_id_changed",
-                ),
-                ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
-                (
-                    "index_not_ready",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "index_not_ready",
-                ),
-                (
-                    "incompatible_index",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "incompatible_index",
-                ),
-                (
-                    "incompatible_record",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "incompatible_record",
-                ),
-                (
-                    "incomplete_record",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "incomplete_record",
-                ),
-                (
-                    "recovery_required",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "recovery_required",
-                ),
-                (
-                    "unsafe_index",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "unsafe_index",
-                ),
-            ] {
-                if text.starts_with(prefix) {
-                    return Self(status, code, "Storage is unavailable");
+            // Context must not hide an exact allowlisted refusal from the
+            // public API. An IOERR_RDLOCK is NOT busy/locked and still maps
+            // to 500; never mask broken SQLite locking as retryable work.
+            for cause in e.chain() {
+                let text = cause.to_string();
+                for (prefix, status, code) in [
+                    ("root_changed", StatusCode::CONFLICT, "root_changed"),
+                    (
+                        "root_key_collision",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "root_key_collision",
+                    ),
+                    (
+                        "workspace_id_changed",
+                        StatusCode::CONFLICT,
+                        "workspace_id_changed",
+                    ),
+                    ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
+                    (
+                        "index_not_ready",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "index_not_ready",
+                    ),
+                    (
+                        "incompatible_index",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "incompatible_index",
+                    ),
+                    (
+                        "incompatible_record",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "incompatible_record",
+                    ),
+                    (
+                        "incomplete_record",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "incomplete_record",
+                    ),
+                    (
+                        "recovery_required",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "recovery_required",
+                    ),
+                    (
+                        "unsafe_index",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "unsafe_index",
+                    ),
+                ] {
+                    if text.starts_with(prefix) {
+                        return Self(status, code, "Storage is unavailable");
+                    }
                 }
             }
             Self(
@@ -1445,6 +1876,23 @@ fn now() -> String {
         .as_millis()
         .to_string()
 }
+impl From<crate::store::requests::Request> for IndexJob {
+    fn from(row: crate::store::requests::Request) -> Self {
+        let error = row
+            .error_code
+            .map(|code| json!({"code":code,"message":"Index job failed"}));
+        Self {
+            id: row.id,
+            state: row.state,
+            progress: IndexProgress::default(),
+            revision: row.revision,
+            error,
+            submitted_at: row.submitted_at,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+        }
+    }
+}
 async fn start_index(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -1458,131 +1906,30 @@ async fn start_index(
         }
         serde_json::from_value(value).map_err(|_| invalid())?
     };
-    let requested = request.expected_revision;
-    if s.store.is_recreate_pending() {
-        if requested.is_some() {
-            return Err(ApiError::from(anyhow::anyhow!(
-                "revision conflict: exceptional recovery has no decodable prior pin"
-            )));
-        }
-        return start_exceptional_index(s);
+    if s.store.is_recreate_pending() && request.expected_revision.is_some() {
+        return Err(ApiError::from(anyhow::anyhow!(
+            "revision conflict: exceptional recovery has no decodable prior pin"
+        )));
     }
-    {
-        let jobs = s.jobs.lock().unwrap();
-        if jobs
-            .current
-            .as_ref()
-            .and_then(|id| jobs.jobs.get(id))
-            .is_some_and(|j| j.finished_at.is_none())
-        {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "job_active",
-                "An index job is already active",
-            ));
-        }
-    }
-    let retained = s.serving_session.lock().unwrap().clone().ok_or(ApiError(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "index_not_ready",
-        "No verified daemon serving session",
-    ))?;
-    let coordinator = db(s.clone(), move |store| {
-        crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
-            store, requested, retained,
-        )
+    let options = s.options.clone();
+    let row = db(s.clone(), move |store| {
+        store.enqueue_request(&options, request.expected_revision)
     })
     .await?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let job = IndexJob {
-        id: uuid::Uuid::new_v4().to_string(),
-        state: "running".into(),
-        progress: IndexProgress::default(),
-        revision: None,
-        error: None,
-        started_at: now(),
-        finished_at: None,
-    };
-    {
-        let mut jobs = s.jobs.lock().unwrap();
-        if jobs
-            .current
-            .as_ref()
-            .and_then(|id| jobs.jobs.get(id))
-            .is_some_and(|j| j.finished_at.is_none())
-        {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "job_active",
-                "An index job is already active",
-            ));
-        }
-        // An ordinary coordinator prepared before a concurrent corruption must
-        // never reserve a stale owner after an exceptional job has taken its slot.
-        if s.store.is_recreate_pending() {
-            return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "recovery_required",
-                "Explicit index recovery now required",
-            ));
-        }
-        if jobs.jobs.len() >= 100 {
-            let old = jobs
-                .jobs
-                .iter()
-                .min_by_key(|(_, j)| &j.started_at)
-                .map(|(id, _)| id.clone());
-            if let Some(id) = old {
-                jobs.jobs.remove(&id);
-            }
-        }
-        jobs.current = Some(job.id.clone());
-        jobs.cancel = cancel.clone();
-        jobs.jobs.insert(job.id.clone(), job.clone());
-    }
-    let id = job.id.clone();
-    tokio::spawn(async move {
-        let worker = s.clone();
-        let worker_id = id.clone();
-        let worker_cancel = cancel.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            if let Some(hook) = worker.normal_index_worker_hook.lock().unwrap().clone() {
-                hook();
-            }
-            let progress = |p| {
-                if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
-                    j.progress = p;
-                }
-            };
-            #[cfg(test)]
-            let result =
-                coordinator.run_observed(&worker.options, &worker_cancel, progress, |_| {
-                    let hook = worker
-                        .normal_index_post_capture_hook
-                        .lock()
-                        .unwrap()
-                        .clone();
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                });
-            #[cfg(not(test))]
-            let result = coordinator.run(&worker.options, &worker_cancel, progress);
-            result
-        })
-        .await;
-        let outcome = match result {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("index worker failed")),
-        };
-        finish_index_job(&s, &id, outcome, &cancel);
-    });
+    let job = IndexJob::from(row);
+    // A later durable admission supersedes the legacy exceptional display slot.
+    s.jobs.lock().unwrap().current = None;
+    s.pending_requests.lock().unwrap().push(job.id.clone());
+    // A newly durable browser ACK starts its own attempt immediately, even if
+    // an earlier exceptional storage probe was backed off.
+    *s.recovery_retry_after.lock().unwrap() = None;
+    s.start_queue_tick();
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 // Exceptional recovery has no decodable prior pin. Reserve the only job and detach
 // any old daemon owner atomically, then drop that owner before the worker tries EX.
 // An unrelated protected reader remains in control of BUSY; no retry is implicit.
+#[allow(dead_code)]
 fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let job = IndexJob {
@@ -1591,7 +1938,8 @@ fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<Inde
         progress: IndexProgress::default(),
         revision: None,
         error: None,
-        started_at: now(),
+        submitted_at: now(),
+        started_at: Some(now()),
         finished_at: None,
     };
     let old_owner = {
@@ -1617,16 +1965,6 @@ fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<Inde
         }
         // All admission paths touching both locks use jobs -> serving_session.
         let old_owner = s.serving_session.lock().unwrap().take();
-        if jobs.jobs.len() >= 100 {
-            let old = jobs
-                .jobs
-                .iter()
-                .min_by_key(|(_, j)| &j.started_at)
-                .map(|(id, _)| id.clone());
-            if let Some(id) = old {
-                jobs.jobs.remove(&id);
-            }
-        }
         jobs.current = Some(job.id.clone());
         jobs.cancel = cancel.clone();
         jobs.jobs.insert(job.id.clone(), job.clone());
@@ -1663,6 +2001,7 @@ fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<Inde
 // A successful worker keeps its leader guard inside the returned Arc even across
 // spawn_blocking handoff. Validation and any test barrier run while that Arc lives.
 // Install it before completing the job; never publish a success without an owner.
+#[allow(dead_code)]
 fn finish_exceptional_index_job(
     s: &Arc<DaemonState>,
     id: &str,
@@ -1699,12 +2038,13 @@ fn finish_exceptional_index_job(
             // verified owner and report the committed revision as completed.
             *serving = Some(session);
             job.revision = Some(pin);
-            job.state = "completed".into();
+            job.state = "done".into();
             true
         }
         Err(error) if cancel.load(Ordering::Acquire) => {
             let _ = error;
-            job.state = "cancelled".into();
+            job.state = "failed".into();
+            job.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
             false
         }
         Err(error) => {
@@ -1727,11 +2067,13 @@ fn finish_exceptional_index_job(
     if published {
         *s.packets.lock().unwrap() = PacketCache::default();
         s.start_dependency_index();
+        s.start_queue_tick();
     }
 }
 
 // A failed publication cannot release cached packet ownership. Only a committed
 // revision transition clears packets; old barriers still block their public reads.
+#[allow(dead_code)]
 fn finish_index_job(
     s: &Arc<DaemonState>,
     id: &str,
@@ -1767,43 +2109,83 @@ fn finish_index_job(
         s.start_dependency_index();
     }
 }
-async fn current_job(State(s): State<Arc<DaemonState>>) -> Json<Option<IndexJob>> {
-    let jobs = s.jobs.lock().unwrap();
-    Json(
+// The exceptional index-only recovery worker predates requests.db. Until the
+// root/recovery slice moves it into the queue, its current ID remains readable
+// through the authenticated routes; ordinary jobs always use durable rows.
+async fn current_job(
+    State(s): State<Arc<DaemonState>>,
+) -> Result<Json<Option<IndexJob>>, ApiError> {
+    let legacy = {
+        let jobs = s.jobs.lock().unwrap();
         jobs.current
             .as_ref()
             .and_then(|id| jobs.jobs.get(id))
-            .cloned(),
-    )
+            .cloned()
+    };
+    if legacy.is_some() {
+        db(s, |store| store.verify_root()).await?;
+        return Ok(Json(legacy));
+    }
+    let row = db(s.clone(), |store| store.current_request()).await?;
+    Ok(Json(row.map(|row| {
+        let mut job = IndexJob::from(row);
+        if job.finished_at.is_none()
+            && let Some(progress) = s.job_progress.lock().unwrap().get(&job.id)
+        {
+            job.progress = progress.clone();
+        }
+        job
+    })))
 }
 async fn job(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
 ) -> Result<Json<IndexJob>, ApiError> {
-    Ok(Json(
-        s.jobs
-            .lock()
-            .unwrap()
-            .jobs
-            .get(&id)
-            .cloned()
-            .ok_or_else(missing)?,
-    ))
+    let legacy = s.jobs.lock().unwrap().jobs.get(&id).cloned();
+    if let Some(legacy) = legacy {
+        db(s, |store| store.verify_root()).await?;
+        return Ok(Json(legacy));
+    }
+    let row = db(s.clone(), move |store| store.request_by_id(&id))
+        .await?
+        .ok_or_else(missing)?;
+    let mut job = IndexJob::from(row);
+    if job.finished_at.is_none()
+        && let Some(progress) = s.job_progress.lock().unwrap().get(&job.id)
+    {
+        job.progress = progress.clone();
+    }
+    Ok(Json(job))
 }
 async fn cancel_job(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
 ) -> Result<Json<IndexJob>, ApiError> {
-    let mut jobs = s.jobs.lock().unwrap();
-    let active = jobs.current.as_ref() == Some(&id);
-    if active {
-        jobs.cancel.store(true, Ordering::Release)
+    let legacy = s.jobs.lock().unwrap().jobs.get(&id).cloned();
+    if let Some(legacy) = legacy {
+        db(s, |store| store.verify_root()).await?;
+        if legacy.finished_at.is_some() {
+            return Ok(Json(legacy));
+        }
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "request_not_cancellable",
+            "Accepted requests cannot be cancelled",
+        ));
     }
-    let j = jobs.jobs.get_mut(&id).ok_or_else(missing)?;
-    if active && j.finished_at.is_none() {
-        j.state = "cancelling".into()
+    let row = db(s.clone(), move |store| store.request_by_id(&id))
+        .await?
+        .ok_or_else(missing)?;
+    if row.finished_at.is_none() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "request_not_cancellable",
+            "Accepted requests cannot be cancelled",
+        ));
     }
-    Ok(Json(j.clone()))
+    // Terminal responses are immutable durable rows. Do not mix in late
+    // process-local progress when cancel is read after the initial GET.
+    Ok(Json(IndexJob::from(row)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2416,6 +2798,112 @@ mod live_tests {
         assert_eq!(question_error(busy.into()).1, "storage_busy");
     }
 
+    #[test]
+    fn api_error_walks_context_but_never_masks_sqlite_ioerr_rdlock() {
+        let busy =
+            anyhow::anyhow!("storage_busy: SQLite lock contention").context("durable enqueue");
+        let mapped = ApiError::from(busy);
+        assert_eq!((mapped.0, mapped.1), (StatusCode::CONFLICT, "storage_busy"));
+        let root = anyhow::anyhow!("root_changed: pathname replaced").context("durable enqueue");
+        let mapped = ApiError::from(root);
+        assert_eq!((mapped.0, mapped.1), (StatusCode::CONFLICT, "root_changed"));
+        let ioerr = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR_RDLOCK),
+            None,
+        );
+        let mapped = ApiError::from(
+            anyhow::Error::new(ioerr).context("storage_busy: wrapped database I/O failure"),
+        );
+        assert_eq!(
+            (mapped.0, mapped.1),
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        );
+    }
+
+    #[test]
+    fn preview_fence_failure_restores_evicted_and_same_id_packets() {
+        let revision = IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: 1,
+        };
+        let packet = QuestionPacket {
+            packet_id: "original".into(),
+            revision,
+            request: QuestionRequest {
+                seed: "seed".into(),
+                question: "what?".into(),
+                expected_revision: revision,
+                evidence_depth: 0,
+                max_visible: 1,
+                allow_deeper_display: false,
+                focus_terms: vec![],
+            },
+            context: ViewResult {
+                revision,
+                query: ViewQuery {
+                    seed: "seed".into(),
+                    depth: 0,
+                    max_nodes: 1,
+                    max_calls: 1,
+                    include_callbacks: false,
+                    exclude_paths: vec![],
+                },
+                nodes: vec![],
+                calls: vec![],
+                regions: vec![],
+                truncated: false,
+                omitted_nodes: 0,
+                warnings: vec![],
+            },
+            source_files: vec![],
+            warnings: vec![],
+        };
+        let mut cache = PacketCache::default();
+        for i in 0..MAX_PACKETS {
+            let mut item = packet.clone();
+            item.packet_id = format!("packet-{i}");
+            cache.remember(Arc::new(item), MAX_PACKET_BYTES);
+        }
+        let original: Vec<_> = cache
+            .packets
+            .iter()
+            .map(|(p, bytes)| (p.clone(), *bytes))
+            .collect();
+        let original_bytes = cache.bytes;
+        let mut incoming = packet.clone();
+        incoming.packet_id = "new".into();
+        let failed = cache.remember_fenced(Arc::new(incoming), MAX_PACKET_BYTES, || {
+            anyhow::bail!("index_not_ready: incarnation lost")
+        });
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .starts_with("index_not_ready")
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+        let mut replacement = packet;
+        replacement.packet_id = "packet-3".into();
+        assert!(
+            cache
+                .remember_fenced(Arc::new(replacement), MAX_PACKET_BYTES + 1, || {
+                    anyhow::bail!("root_changed: root replaced")
+                })
+                .is_err()
+        );
+        assert_eq!(cache.bytes, original_bytes);
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
+            assert!(Arc::ptr_eq(actual, before));
+            assert_eq!(size, expected);
+        }
+    }
+
     #[tokio::test]
     async fn preview_root_change_after_serialization_discards_packet() {
         let dir = tempfile::tempdir().unwrap();
@@ -2698,7 +3186,7 @@ mod live_tests {
             let db = rusqlite::Connection::open(db_path).unwrap();
             let mut bytes: Vec<u8> = db
                 .query_row(
-                    "SELECT source_bytes FROM native_documents WHERE path='a.js'",
+                    "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js'",
                     [],
                     |row| row.get(0),
                 )
@@ -2706,7 +3194,7 @@ mod live_tests {
             bytes[0] ^= 1;
             assert_eq!(
                 db.execute(
-                    "UPDATE native_documents SET source_bytes=?1 WHERE path='a.js'",
+                    "UPDATE document_versions SET source_bytes=?1 WHERE id=(SELECT m.document_version_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js')",
                     [bytes],
                 )
                 .unwrap(),
@@ -2851,6 +3339,368 @@ mod live_tests {
 }
 
 #[cfg(test)]
+mod serving_holder_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn verified_holder_needs_no_index_open_and_lost_holder_triggers_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let store = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root);
+        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &options.workspace_root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let state = new(
+            follower_store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let accepted = follower_store.enqueue_request(&options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(accepted.id.clone());
+        for _ in 0..3 {
+            state.queue_tick().unwrap();
+        }
+        assert_eq!(
+            state.queue_takeover_attempts.load(Ordering::Acquire),
+            0,
+            "verified follower must never reopen index.db to probe leadership"
+        );
+        assert_eq!(
+            follower_store
+                .request_by_id(&accepted.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+        drop(owner);
+        state.queue_tick().unwrap();
+        assert_eq!(state.queue_takeover_attempts.load(Ordering::Acquire), 1);
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        let completed = follower_store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(completed.state, "done");
+        assert!(completed.revision.unwrap().index_revision > old_pin.index_revision);
+    }
+    #[tokio::test]
+    async fn failed_pending_read_keeps_same_id_for_holder_loss_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let owner_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root);
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
+            &owner_store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &options.workspace_root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let state = new(
+            follower_store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let request = follower_store.enqueue_request(&options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(request.id.clone());
+        state.test_pending_read_failures.store(1, Ordering::Release);
+        state.queue_tick().unwrap();
+        assert_eq!(
+            *state.pending_requests.lock().unwrap(),
+            vec![request.id.clone()]
+        );
+        assert_eq!(
+            follower_store
+                .request_by_id(&request.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+        drop(owner);
+        state.queue_tick().unwrap();
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert_eq!(
+            follower_store
+                .request_by_id(&request.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "done"
+        );
+        assert_eq!(state.queue_takeover_attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn closed_stderr_pipe_cannot_stop_queue_diagnostics() {
+        struct ClosedPipe;
+        impl std::io::Write for ClosedPipe {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        best_effort_queue_stderr(
+            ClosedPipe,
+            format_args!("queue tick failed: storage_busy\n"),
+        );
+        best_effort_queue_stderr(
+            ClosedPipe,
+            format_args!("queue takeover failed for accepted ID\n"),
+        );
+        // Reaching here proves a broken diagnostic pipe cannot panic the
+        // timer thread or prevent its next accepted-work tick.
+    }
+
+    #[tokio::test]
+    async fn verified_leader_busy_requeue_gets_bounded_backoff_before_same_ack_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let state = new(
+            store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(owner);
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        store.fail_next_live_publish_commit_busy();
+        state.queue_tick().unwrap();
+        let deferred = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(
+            (deferred.seq, deferred.state.as_str()),
+            (accepted.seq, "queued")
+        );
+        assert!(deferred.finished_at.is_none() && deferred.error_code.is_none());
+        assert_eq!(store.index_baseline().unwrap(), old_pin);
+        assert!(
+            state
+                .recovery_retry_after
+                .lock()
+                .unwrap()
+                .is_some_and(|when| when > Instant::now())
+        );
+        state.queue_tick().unwrap();
+        assert_eq!(
+            store.request_by_id(&accepted.id).unwrap().unwrap().state,
+            "queued"
+        );
+        *state.recovery_retry_after.lock().unwrap() = None;
+        state.queue_tick().unwrap();
+        let done = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        assert_eq!(done.seq, accepted.seq);
+        assert_eq!(
+            done.revision.unwrap().index_revision,
+            old_pin.index_revision + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_publish_commit_busy_cannot_fail_accepted_takeover_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let original = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &original,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let state = new(
+            follower_store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let ack = follower_store.enqueue_request(&options, None).unwrap();
+        state.pending_requests.lock().unwrap().push(ack.id.clone());
+        let old_seq = ack.seq;
+        follower_store.fail_next_live_publish_commit_busy();
+        drop(owner);
+        let _ = state.queue_tick();
+        let after_busy = follower_store.request_by_id(&ack.id).unwrap().unwrap();
+        assert_eq!(after_busy.seq, old_seq);
+        assert!(
+            after_busy.finished_at.is_none() && after_busy.error_code.is_none(),
+            "verified takeover may not terminally fail an ACK for rollback-journal COMMIT BUSY"
+        );
+        assert_eq!(
+            follower_store.index_baseline().unwrap(),
+            old_pin,
+            "a pre-commit BUSY must not publish a partial pin"
+        );
+        // Advance only the advisory 250 ms reader-backoff, not the root,
+        // accepted row, leader session or original deadline.
+        *state.recovery_retry_after.lock().unwrap() = None;
+        state.queue_tick().unwrap();
+        let done = follower_store.request_by_id(&ack.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        assert_eq!(done.seq, old_seq);
+        assert_eq!(
+            done.revision.unwrap().index_revision,
+            old_pin.index_revision + 1
+        );
+        assert!(state.retained_serving_session().unwrap().is_leader());
+    }
+
+    #[tokio::test]
+    async fn follower_takeover_uses_claimed_clients_options_not_daemon_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let owner_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let own_options = IndexOptions::new(root.clone());
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
+            &owner_store,
+            &own_options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let mut bad_daemon_options = own_options.clone();
+        bad_daemon_options.scip_path = Some(root.clone()); // directory is an invalid optional input
+        let state = new(
+            follower_store.clone(),
+            bad_daemon_options,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let client = follower_store.enqueue_request(&own_options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(client.id.clone());
+        drop(owner);
+        state.queue_tick().unwrap();
+        let done = follower_store.request_by_id(&client.id).unwrap().unwrap();
+        assert_eq!(
+            done.state, "done",
+            "a client's valid inputs may not be failed by unrelated daemon defaults"
+        );
+        assert!(done.error_code.is_none() && done.revision.is_some());
+        assert!(state.retained_serving_session().unwrap().is_leader());
+    }
+
+    #[tokio::test]
+    async fn failed_follower_takeover_does_not_recapture_every_tick_forever() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("a.js");
+        fs::write(&source, "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let owner_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root);
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
+            &owner_store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &options.workspace_root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let state = new(
+            follower_store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let accepted = follower_store.enqueue_request(&options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(accepted.id.clone());
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            fs::read(&source).is_err(),
+            "fixture must fail real captured source reads"
+        );
+        drop(owner);
+        let _ = state.queue_tick();
+        let after_first = follower_store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(
+            after_first.state, "failed",
+            "verified takeover must terminally report index_failed, not leave queued"
+        );
+        assert_eq!(after_first.error_code.as_deref(), Some("index_failed"));
+        let first_attempts = state.queue_takeover_attempts.load(Ordering::Acquire);
+        for _ in 0..3 {
+            let _ = state.queue_tick();
+        }
+        assert_eq!(
+            state.queue_takeover_attempts.load(Ordering::Acquire),
+            first_attempts,
+            "terminal failure must stop repeated full-workspace takeovers"
+        );
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod exceptional_recovery_tests {
     use super::*;
     use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
@@ -2886,36 +3736,121 @@ mod exceptional_recovery_tests {
         (tmp, store, state, roots, identity)
     }
 
-    #[tokio::test]
-    async fn concurrent_posts_admit_one_exceptional_worker() {
-        // The current-thread executor cannot poll the spawned worker between
-        // these synchronous admissions. No timer or filesystem race is needed.
-        let (_tmp, _store, state, _roots, _identity) = fixture();
-        let (status, first) = start_exceptional_index(state.clone())
-            .unwrap_or_else(|error| panic!("unexpected admission: {} {}", error.1, error.2));
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let error = start_index(State(state.clone()), Bytes::from_static(b"{}"))
-            .await
-            .err()
+    #[test]
+    fn idle_daemon_follows_external_repair_then_reconciles_after_owner_exits() {
+        let (_tmp, daemon_store, state, roots, identity) = fixture();
+        let cli = Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
             .unwrap();
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        assert_eq!(error.1, "job_active");
-        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
-        let id = first.0.id;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
+        let (pin, owner) = crate::index_coordinator::enqueue_and_wait(
+            &cli,
+            &state.options,
+            &Arc::new(AtomicBool::new(false)),
+        )
         .unwrap();
+        let index = roots.index_db(&identity);
+        let before = std::fs::read(&index).unwrap();
+        assert!(daemon_store.is_recreate_pending());
+        *state.recovery_retry_after.lock().unwrap() = None;
+        state.queue_tick().unwrap();
+        assert!(!daemon_store.is_recreate_pending());
+        assert_eq!(daemon_store.status().unwrap().revision, pin);
+        assert!(
+            !state.retained_serving_session().unwrap().is_leader(),
+            "while CLI owner holds EX, daemon must follow without publication"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+        drop(owner);
+        state.queue_tick().unwrap();
+        assert!(
+            state.retained_serving_session().unwrap().is_leader(),
+            "after CLI owner exits, verified leader must reconcile before Status opens"
+        );
+        let after = daemon_store.status().unwrap().revision;
+        assert_eq!(after.index_generation, pin.index_generation);
+        assert!(after.index_revision > pin.index_revision);
+        assert!(roots.leader(&identity).is_err(), "daemon retains lock");
+        let after_bytes = std::fs::read(&index).unwrap();
+        assert_ne!(after_bytes, before);
+        state.queue_tick().unwrap();
+        assert_eq!(
+            daemon_store.status().unwrap().revision,
+            after,
+            "idle reacquisition must publish once, not on every timer tick"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), after_bytes);
     }
 
     #[tokio::test]
-    async fn ordinary_job_racing_a_new_pending_disposition_blocks_exceptional_post() {
+    async fn cli_repair_must_refresh_stale_daemon_before_driving_browser_ack() {
+        let (_tmp, daemon_store, state, roots, identity) = fixture();
+        let cli_store =
+            Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
+                .unwrap();
+        let (cli_pin, cli_owner) = crate::index_coordinator::enqueue_and_wait(
+            &cli_store,
+            &state.options,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(
+            cli_pin.index_revision, 1,
+            "CLI must repair corrupt index to fresh r1"
+        );
+        assert_eq!(cli_store.current_request().unwrap().unwrap().state, "done");
+        assert!(
+            daemon_store.is_recreate_pending(),
+            "daemon retained its stale corruption classification"
+        );
+        assert!(daemon_store.status().is_err());
+        drop(cli_owner);
+        let free = roots.leader(&identity).unwrap();
+        drop(free);
+        let (code, Json(browser)) = start_index(State(state.clone()), Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(code, StatusCode::ACCEPTED);
+        let ack = daemon_store.request_by_id(&browser.id).unwrap().unwrap();
+        assert_eq!(ack.state, "queued");
+        assert!(ack.seq > 1);
+        let tick_results = (0..4)
+            .map(|_| state.queue_tick().map_err(|error| format!("{error:#}")))
+            .collect::<Vec<_>>();
+        assert!(
+            tick_results.iter().all(Result::is_ok),
+            "stale daemon must not reclassify already repaired index on every 20 ms tick: {tick_results:?}"
+        );
+        let completed = daemon_store.request_by_id(&browser.id).unwrap().unwrap();
+        assert_eq!(
+            completed.state, "done",
+            "external CLI repair must not strand accepted browser work"
+        );
+        assert!(completed.revision.unwrap().index_revision > cli_pin.index_revision);
+        assert!(!daemon_store.is_recreate_pending());
+        assert_eq!(
+            daemon_store.status().unwrap().revision,
+            completed.revision.unwrap()
+        );
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(
+            roots.leader(&identity).is_err(),
+            "new daemon leader holds the root lock"
+        );
+    }
+
+    struct PausedRecoveryFixture {
+        _tmp: tempfile::TempDir,
+        store: Store,
+        state: Arc<DaemonState>,
+        roots: TopologyRoots,
+        identity: WorkspaceIdentity,
+        old_owner: Option<Arc<crate::store::topology::LeaderSession>>,
+        q2: crate::store::requests::Request,
+        q1: crate::store::requests::Request,
+        old_generation: uuid::Uuid,
+        index_path: std::path::PathBuf,
+    }
+
+    fn paused_recovery_fixture() -> PausedRecoveryFixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
@@ -2925,13 +3860,19 @@ mod exceptional_recovery_tests {
             tmp.path().join("state/data"),
         );
         let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let index = roots.index_db(&identity);
+        let index_path = roots.index_db(&identity);
+        let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (pin, old_owner) =
+            crate::index_coordinator::reconcile_workspace(&old, &options, &cancel, |_| {}).unwrap();
+        let q2 = old.enqueue_request(&options, None).unwrap();
+        assert_eq!(old.claim_request(&old_owner).unwrap().unwrap().id, q2.id);
+        let q1 = old.enqueue_request(&options, None).unwrap();
+        assert!(q2.seq < q1.seq);
+        std::fs::write(&index_path, b"bad sqlite index header").unwrap();
         let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
-        let options = IndexOptions::new(root);
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let (_, owner) =
-            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
-                .unwrap();
+        assert!(store.is_recreate_pending());
         let state = new(
             store.clone(),
             options,
@@ -2939,48 +3880,720 @@ mod exceptional_recovery_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        state.retain_serving_session(owner);
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-        *state.normal_index_worker_hook.lock().unwrap() = Some(Arc::new(move || {
-            entered_tx.send(()).unwrap();
-            release_rx.lock().unwrap().recv().unwrap();
-        }));
-        let (status, normal) = start_index(State(state.clone()), Bytes::new())
+        PausedRecoveryFixture {
+            _tmp: tmp,
+            store,
+            state,
+            roots,
+            identity,
+            old_owner: Some(old_owner),
+            q2,
+            q1,
+            old_generation: pin.index_generation,
+            index_path,
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_q1_then_cli_q2_exceptional_fifo_survives_owner_contention() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let reader = roots.index_use_existing(&identity).unwrap();
+        let (status, Json(browser)) = start_index(State(state.clone()), Bytes::new())
             .await
-            .unwrap_or_else(|error| panic!("normal admission: {} {}", error.1, error.2));
+            .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
+        let q1 = store.request_by_id(&browser.id).unwrap().unwrap();
+        assert_eq!(q1.state, "queued");
+        let cli_store =
+            Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
+                .unwrap();
+        let options = state.options.clone();
+        let cli = tokio::task::spawn_blocking(move || {
+            crate::index_coordinator::enqueue_and_wait(
+                &cli_store,
+                &options,
+                &Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let q2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(row) = store.current_request().unwrap()
+                    && row.id != q1.id
+                {
+                    break row;
+                }
+                // This existing-only queue read takes SH; allow the writer
+                // admission/barrier a real turn even in busy verifier lanes.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("CLI failed to durably ACK while independent reader held");
+        assert!(
+            q2.seq > q1.seq,
+            "actual browser POST must precede CLI ACK in durable FIFO"
+        );
+        assert_eq!(q2.state, "queued");
+        assert_eq!(
+            store.request_by_id(&q1.id).unwrap().unwrap().state,
+            "queued"
+        );
+        drop(reader);
+        let cli_result = tokio::time::timeout(std::time::Duration::from_secs(15), cli)
+            .await
+            .expect("accepted CLI did not finish after reader release")
+            .unwrap();
+        let (cli_pin, _)=cli_result.unwrap_or_else(|error| {
+            let browser=store.request_by_id(&q1.id).unwrap().unwrap();
+            let cli_row=store.request_by_id(&q2.id).unwrap().unwrap();
+            panic!("accepted FIFO CLI failed: {error:#}; browser={}/{:?}; cli={}/{:?}; recovery_pending={}; serving_leader={}",
+                browser.state,browser.error_code,cli_row.state,cli_row.error_code,
+                store.is_recreate_pending(),state.retained_serving_session().is_ok_and(|s|s.is_leader()));
+        });
+        let browser_done = store.request_by_id(&q1.id).unwrap().unwrap();
+        let cli_done = store.request_by_id(&q2.id).unwrap().unwrap();
+        assert_eq!(
+            (browser_done.state.as_str(), cli_done.state.as_str()),
+            ("done", "done")
+        );
+        assert_eq!(browser_done.revision.unwrap().index_revision, 1);
+        assert_eq!(cli_done.revision.unwrap().index_revision, 2);
+        assert_eq!(cli_done.revision.unwrap(), cli_pin);
+    }
+
+    #[tokio::test]
+    async fn cli_accepted_exceptional_request_without_local_pending_id_must_be_driven() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let accepted = store.enqueue_request(&state.options, None).unwrap();
+        assert!(
+            state.pending_requests.lock().unwrap().is_empty(),
+            "a separate CLI process cannot populate daemon-local pending_requests"
+        );
+        let original_queue = std::fs::read(store.request_db_path()).unwrap();
+        state.queue_tick().unwrap();
+        let row = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(
+            row.state, "done",
+            "daemon must reconcile any durable queued CLI row, not only local POST ids"
+        );
+        assert_eq!(row.revision.unwrap(), store.status().unwrap().revision);
+        assert_eq!(
+            row.revision.unwrap().index_revision,
+            1,
+            "exceptional generation begins at the first fully recaptured pin"
+        );
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(roots.leader(&identity).is_err(), "new owner remains held");
+        assert_ne!(
+            std::fs::read(store.request_db_path()).unwrap(),
+            original_queue,
+            "accepted row needs a durable terminal transition"
+        );
+    }
+
+    fn assert_reclaimed_fifo(
+        f: &PausedRecoveryFixture,
+        old_incarnation: uuid::Uuid,
+        queue_inode: u64,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        let q2 = f.store.request_by_id(&f.q2.id).unwrap().unwrap();
+        let q1 = f.store.request_by_id(&f.q1.id).unwrap().unwrap();
+        assert_eq!((q2.state.as_str(), q1.state.as_str()), ("done", "done"));
+        assert_eq!(q2.revision.unwrap().index_revision, 1);
+        assert_eq!(q1.revision.unwrap().index_revision, 2);
+        assert_eq!(
+            q2.revision.unwrap().index_generation,
+            q1.revision.unwrap().index_generation
+        );
+        assert_ne!(q1.revision.unwrap().index_generation, f.old_generation);
+        assert_eq!(f.store.status().unwrap().revision, q1.revision.unwrap());
+        assert_eq!(
+            std::fs::metadata(f.store.request_db_path()).unwrap().ino(),
+            queue_inode,
+            "index-only recreation must not replace requests.db"
+        );
+        let session = f.state.retained_serving_session().unwrap();
+        f.store.verify_leader_session(&session).unwrap();
+        assert_ne!(session.incarnation(), old_incarnation);
+        assert!(f.roots.leader(&f.identity).is_err());
+    }
+
+    #[test]
+    fn independent_shared_reader_process() {
+        use std::io::{Read, Write};
+        let Some(path) = std::env::var_os("BALEYG_TEST_INDEX_USE_SH") else {
+            return;
+        };
+        let guard = crate::store::topology::UseGuard::acquire_existing(
+            std::path::Path::new(&path),
+            false,
+            false,
+        )
+        .unwrap();
+        println!("SH_READY");
+        std::io::stdout().flush().unwrap();
+        let mut signal = [0];
+        std::io::stdin().read_exact(&mut signal).unwrap();
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn idle_tick_cannot_drain_request_admitted_after_empty_pending_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            tmp.path().join("state/cache"),
+            tmp.path().join("state/data"),
+        );
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let index_path = roots.index_db(&identity);
+        let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let (prior, old_owner) = crate::index_coordinator::reconcile_workspace(
+            &old,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        std::fs::write(&index_path, b"bad sqlite index header").unwrap();
+        let corrupt_bytes = std::fs::read(&index_path).unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        assert!(store.is_recreate_pending());
+        let state = new(
+            store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        // Own the old serving SH without starting the periodic timer. Drive the
+        // exact empty-snapshot race with one explicitly paused tick instead.
+        *state.serving_session.lock().unwrap() = Some(old_owner);
+        let reader = roots.index_use_existing(&identity).unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        state.test_queue_after_pending_snapshot.set(move || {
+            let _ = entered_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        let worker = state.clone();
+        let idle_tick = tokio::task::spawn_blocking(move || worker.queue_tick());
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .expect("idle tick did not snapshot empty pending list")
+            .unwrap();
+        let request = store.enqueue_request(&options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(request.id.clone());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), idle_tick)
+            .await
+            .expect("idle tick did not leave the snapshot barrier")
+            .unwrap()
+            .unwrap();
+        let admitted = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(
+            admitted.state, "queued",
+            "old leader drained a recovery request"
+        );
+        assert!(admitted.finished_at.is_none());
+        assert!(
+            state.retained_serving_session().is_err(),
+            "durable post-snapshot ACK prompted EX attempt and released old holder; independent reader still fences recreation"
+        );
+        let worker = state.clone();
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || worker.queue_tick()),
         )
         .await
+        .expect("recovery tick did not attempt protected EX")
         .unwrap()
         .unwrap();
-        std::fs::write(&index, b"bad sqlite index header").unwrap();
-        assert!(store.status().is_err());
-        assert!(store.is_recreate_pending());
-        let second = start_index(State(state.clone()), Bytes::new())
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(second.0, StatusCode::CONFLICT);
-        assert_eq!(second.1, "job_active");
-        assert_eq!(state.jobs.lock().unwrap().jobs.len(), 1);
-        release_tx.send(()).unwrap();
-        let id = normal.0.id;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        assert!(state.retained_serving_session().is_err());
+        assert_eq!(std::fs::read(&index_path).unwrap(), corrupt_bytes);
+        let blocked = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(blocked.state, "queued");
+        assert!(blocked.finished_at.is_none());
+        drop(reader);
+        // Advance the advisory retry deadline without sleeping. The held SH
+        // had fenced EX; the durable row remains queued for this next tick.
+        *state.recovery_retry_after.lock().unwrap() = None;
+        let worker = state.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || worker.queue_tick()),
+        )
+        .await
+        .expect("accepted request did not retry after foreign reader release")
+        .unwrap()
+        .unwrap();
+        let done = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        assert_eq!(done.revision.unwrap().index_revision, 1);
+        assert_ne!(
+            done.revision.unwrap().index_generation,
+            prior.index_generation
+        );
+    }
+
+    #[tokio::test]
+    async fn timer_tick_with_independent_shared_reader_defers_without_changing_both_dbs() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::fs::MetadataExt;
+        use std::process::{Command, Stdio};
+        let mut fixture = paused_recovery_fixture();
+        let old_incarnation = fixture.old_owner.as_ref().unwrap().incarnation();
+        let queue_path = fixture.store.request_db_path();
+        let queue_inode = std::fs::metadata(&queue_path).unwrap().ino();
+        let queue_bytes = std::fs::read(&queue_path).unwrap();
+        let corrupt_index = std::fs::read(&fixture.index_path).unwrap();
+        let lock_path = fixture.roots.index_use_lock(&fixture.identity);
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "http::exceptional_recovery_tests::independent_shared_reader_process",
+                    "--nocapture",
+                ])
+                .env("BALEYG_TEST_INDEX_USE_SH", &lock_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let drain = tokio::task::spawn_blocking(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut ready = Some(ready_tx);
             loop {
-                if state.jobs.lock().unwrap().jobs[&id].finished_at.is_some() {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if line.contains("SH_READY")
+                    && let Some(sender) = ready.take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+            assert!(ready.is_none(), "reader exited before SH_READY");
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+            .await
+            .expect("independent SH reader did not start")
+            .unwrap();
+        let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+        let (release_select_tx, release_select_rx) = std::sync::mpsc::channel();
+        fixture.store.set_queue_select_hook(move || {
+            let _ = selected_tx.send(());
+            let _ = release_select_rx.recv();
+        });
+        fixture
+            .state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(fixture.q1.id.clone());
+        fixture
+            .state
+            .retain_serving_session(fixture.old_owner.take().unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(5), selected_rx)
+            .await
+            .expect("20-ms timer did not pause in protected SELECT")
+            .unwrap();
+        assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        release_select_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if fixture.state.retained_serving_session().is_err()
+                    && fixture.state.native_stream.try_lock().is_ok()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
+        .expect("tick did not defer after external SH prevented EX");
+        assert_eq!(
+            std::fs::read(&queue_path).unwrap(),
+            queue_bytes,
+            "corruption-only EX BUSY must not change queued/running rows"
+        );
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        assert!(
+            fixture
+                .state
+                .pending_requests
+                .lock()
+                .unwrap()
+                .contains(&fixture.q1.id)
+        );
+        let db = rusqlite::Connection::open(&queue_path).unwrap();
+        for (id, expected) in [(&fixture.q2.id, "running"), (&fixture.q1.id, "queued")] {
+            let (state, finished): (String, Option<String>) = db
+                .query_row(
+                    "SELECT state,finished_at FROM requests WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, expected);
+            assert!(finished.is_none());
+        }
+        drop(db);
+        child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+        let child_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independent SH reader did not exit after release");
+        assert!(
+            child_status.success(),
+            "independent SH reader exited unsuccessfully"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("child output drain did not finish")
+            .unwrap();
+        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if fixture
+                    .store
+                    .request_by_id(&fixture.q1.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                {
+                    break;
+                }
+                // Let the daemon's nonblocking EX acquire the use lock; a
+                // tight SH SQLite poll can starve it under all-target load.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let observed = fixture
+            .store
+            .request_by_id(&fixture.q1.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout_result.is_ok() && observed.finished_at.is_some(),
+            "same accepted Q1 ID did not retry after external SH release: row={}/{:?}, pending_recovery={}",
+            observed.state,
+            observed.error_code,
+            fixture.store.is_recreate_pending()
+        );
+        assert_reclaimed_fifo(&fixture, old_incarnation, queue_inode);
+    }
+
+    #[tokio::test]
+    async fn timer_tick_quiesces_protected_select_before_ex_and_fences_injected_tick() {
+        use std::os::unix::fs::MetadataExt;
+        let mut fixture = paused_recovery_fixture();
+        let old_incarnation = fixture.old_owner.as_ref().unwrap().incarnation();
+        let queue_path = fixture.store.request_db_path();
+        let queue_inode = std::fs::metadata(&queue_path).unwrap().ino();
+        let queue_bytes = std::fs::read(&queue_path).unwrap();
+        let corrupt_index = std::fs::read(&fixture.index_path).unwrap();
+        let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+        let (release_select_tx, release_select_rx) = std::sync::mpsc::channel();
+        fixture.store.set_queue_select_hook(move || {
+            let _ = selected_tx.send(());
+            let _ = release_select_rx.recv();
+        });
+        let (exclusive_tx, exclusive_rx) = tokio::sync::oneshot::channel();
+        let (release_ex_tx, release_ex_rx) = std::sync::mpsc::channel();
+        fixture.store.set_exclusive_recovery_hook(move || {
+            let _ = exclusive_tx.send(());
+            let _ = release_ex_rx.recv();
+        });
+        fixture
+            .state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(fixture.q1.id.clone());
+        fixture
+            .state
+            .retain_serving_session(fixture.old_owner.take().unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(5), selected_rx)
+            .await
+            .expect("20-ms timer did not reach protected SELECT")
+            .unwrap();
+        // This is the genuine daemon timer spawn_blocking worker, paused while
+        // its short-lived request connection and shared use guard are both open.
+        assert!(fixture.state.native_stream.try_lock().is_err());
+        assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        release_select_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), exclusive_rx)
+            .await
+            .expect("timer recovery did not acquire fresh EX")
+            .unwrap();
+        assert!(
+            fixture.state.retained_serving_session().is_err(),
+            "old Arc must be dropped before EX"
+        );
+        assert!(
+            fixture.state.native_stream.try_lock().is_err(),
+            "EX stays inside native stream"
+        );
+        assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        let (before_tx, before_rx) = tokio::sync::oneshot::channel();
+        let (after_tx, mut after_rx) = tokio::sync::oneshot::channel();
+        fixture.state.test_queue_before_stream.set(move || {
+            let _ = before_tx.send(());
+        });
+        fixture.state.test_queue_after_stream.set(move || {
+            let _ = after_tx.send(());
+        });
+        // The production 20-ms timer awaits its first worker; this SECOND call
+        // is deliberately injected on the SAME daemon to test the stream gate.
+        let state = fixture.state.clone();
+        let injected = tokio::task::spawn_blocking(move || state.queue_tick());
+        tokio::time::timeout(std::time::Duration::from_secs(5), before_rx)
+            .await
+            .expect("injected same-daemon tick did not reach stream")
+            .unwrap();
+        assert!(fixture.state.native_stream.try_lock().is_err());
+        assert!(
+            matches!(
+                after_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "injected tick must not open a queue handle while EX is held"
+        );
+        assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
+        assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        release_ex_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), after_rx)
+            .await
+            .expect("injected tick never passed stream after EX")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), injected)
+            .await
+            .expect("injected same-daemon tick did not finish")
+            .unwrap()
+            .unwrap();
+        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if fixture
+                    .store
+                    .request_by_id(&fixture.q1.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let observed = fixture
+            .store
+            .request_by_id(&fixture.q1.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout_result.is_ok() && observed.finished_at.is_some(),
+            "same queued ID never finished after EX: row={}/{:?}, pending_recovery={}",
+            observed.state,
+            observed.error_code,
+            fixture.store.is_recreate_pending()
+        );
+        assert_reclaimed_fifo(&fixture, old_incarnation, queue_inode);
+    }
+
+    #[tokio::test]
+    async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
+        use tower::ServiceExt;
+        let (_tmp, store, state, roots, identity) = fixture();
+        let app = router(state.clone());
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/index")
+                .header("host", "127.0.0.1:7331")
+                .header("origin", "http://127.0.0.1:7331")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let ack: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(ack["state"], "queued");
+            assert!(ack["startedAt"].is_null());
+            ids.push(ack["id"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(ids[0], ids[1]);
+        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert!(first.seq < second.seq);
+        assert!(
+            state.jobs.lock().unwrap().jobs.is_empty(),
+            "legacy job map must not own queued work"
+        );
+        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if store
+                    .request_by_id(&ids[0])
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                    && store
+                        .request_by_id(&ids[1])
+                        .unwrap()
+                        .unwrap()
+                        .finished_at
+                        .is_some()
+                {
+                    break;
+                }
+                // Each request_by_id takes a SQLite read. A tight yield-only
+                // loop can starve the daemon's nonblocking EX recovery while
+                // verifier lanes are busy. Observe at its 20 ms tick cadence.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let first_snapshot = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second_snapshot = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert!(
+            timeout_result.is_ok()
+                && first_snapshot.finished_at.is_some()
+                && second_snapshot.finished_at.is_some(),
+            "durable FIFO requests did not finish: first={}/{:?}, second={}/{:?}, pending_recovery={}",
+            first_snapshot.state,
+            first_snapshot.error_code,
+            second_snapshot.state,
+            second_snapshot.error_code,
+            store.is_recreate_pending()
+        );
+        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert_eq!(
+            (first.state.as_str(), second.state.as_str()),
+            ("done", "done")
+        );
+        let first_pin = first.revision.unwrap();
+        let second_pin = second.revision.unwrap();
+        assert_eq!(
+            first_pin.index_revision, 1,
+            "recovery full reconcile satisfies first head"
+        );
+        assert_eq!(
+            second_pin.index_revision, 2,
+            "second request publishes in FIFO order"
+        );
+        assert_eq!(
+            first_pin.index_generation, second_pin.index_generation,
+            "no second exceptional index replacement"
+        );
+        assert_eq!(store.status().unwrap().revision, second_pin);
+        let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let owner = state.retained_serving_session().unwrap();
+        store.verify_leader_session(&owner).unwrap();
+        assert!(
+            roots.leader(&identity).is_err(),
+            "one held leader fences both terminal writes"
+        );
+        assert!(state.jobs.lock().unwrap().jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multiple_posts_commit_fifo_while_other_process_holds_leader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let owner = store.leader_session().unwrap();
+        let state = new(
+            store.clone(),
+            IndexOptions::new(root),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
         .unwrap();
-        assert!(store.is_recreate_pending());
+        let (first_code, first) = start_index(State(state.clone()), Bytes::new())
+            .await
+            .unwrap();
+        let (second_code, second) = start_index(State(state.clone()), Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            (first_code, second_code),
+            (StatusCode::ACCEPTED, StatusCode::ACCEPTED)
+        );
+        assert_eq!(
+            (first.0.state.as_str(), second.0.state.as_str()),
+            ("queued", "queued")
+        );
+        let a = store.request_by_id(&first.0.id).unwrap().unwrap();
+        let b = store.request_by_id(&second.0.id).unwrap().unwrap();
+        assert!(a.seq < b.seq);
+        assert_eq!(store.current_request().unwrap().unwrap().id, b.id);
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if store
+                    .request_by_id(&second.0.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.request_by_id(&a.id).unwrap().unwrap().state, "done");
+        assert_eq!(store.request_by_id(&b.id).unwrap().unwrap().state, "done");
     }
 
     #[tokio::test]
@@ -3001,7 +4614,8 @@ mod exceptional_recovery_tests {
                     progress: IndexProgress::default(),
                     revision: None,
                     error: None,
-                    started_at: now(),
+                    submitted_at: now(),
+                    started_at: Some(now()),
                     finished_at: None,
                 },
             );
@@ -3023,7 +4637,7 @@ mod exceptional_recovery_tests {
             );
             assert_eq!(store.status().unwrap().revision, pin);
         });
-        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "completed");
+        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "done");
         assert_eq!(state.jobs.lock().unwrap().jobs[&id].revision, Some(pin));
         assert!(state.retained_serving_session().unwrap().is_leader());
         assert!(
@@ -3052,7 +4666,8 @@ mod exceptional_recovery_tests {
                     progress: IndexProgress::default(),
                     revision: None,
                     error: None,
-                    started_at: now(),
+                    submitted_at: now(),
+                    started_at: Some(now()),
                     finished_at: None,
                 },
             );
@@ -3064,7 +4679,7 @@ mod exceptional_recovery_tests {
         cancel.store(true, Ordering::Release);
         finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |_| {});
         let job = state.jobs.lock().unwrap().jobs[&id].clone();
-        assert_eq!(job.state, "completed");
+        assert_eq!(job.state, "done");
         assert_eq!(job.revision, Some(pin));
         assert!(state.retained_serving_session().unwrap().is_leader());
         assert_eq!(store.status().unwrap().revision, pin);
@@ -3094,7 +4709,8 @@ mod exceptional_recovery_tests {
                     progress: IndexProgress::default(),
                     revision: None,
                     error: None,
-                    started_at: now(),
+                    submitted_at: now(),
+                    started_at: Some(now()),
                     finished_at: None,
                 },
             );
@@ -3121,11 +4737,7 @@ mod normal_post_capture_cancellation_tests {
     use super::*;
     use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
     use rusqlite::{OpenFlags, types::Value as SqlValue};
-    use std::{
-        fs,
-        sync::{atomic::AtomicUsize, mpsc},
-        time::Duration,
-    };
+    use std::{fs, time::Duration};
     use tower::ServiceExt;
 
     #[derive(Debug, PartialEq)]
@@ -3150,27 +4762,68 @@ mod normal_post_capture_cancellation_tests {
             index_generation: uuid::Uuid::parse_str(&generation).unwrap(),
             index_revision: u64::try_from(revision).unwrap(),
         };
-        let mut tables = vec![
-            "files".to_owned(),
-            "nodes".to_owned(),
-            "calls".to_owned(),
-            "regions".to_owned(),
-            "class_catalog".to_owned(),
-            "classes".to_owned(),
-            "class_relations".to_owned(),
-        ];
-        let mut names = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'native_*' ORDER BY name")
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        tables.extend(
-            names
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap(),
+        assert!(
+            matches!(tables.len(), 28 | 30),
+            "compare the complete legacy or extended v8 evidence inventory"
         );
-        drop(names);
-        assert!(tables.iter().any(|table| table == "native_documents"));
+        let mut expected = vec![
+            "class_projections",
+            "class_relations",
+            "classes",
+            "document_versions",
+            "graph_calls",
+            "graph_nodes",
+            "graph_projections",
+            "graph_regions",
+            "native_producer_inputs",
+            "native_producer_languages",
+            "native_producers",
+            "native_revisions",
+            "native_source_set_dependencies",
+            "native_source_set_languages",
+            "native_source_sets",
+            "native_version_ancestor_signature_types",
+            "native_version_call_regions",
+            "native_version_calls",
+            "native_version_control_regions",
+            "native_version_coverage_roles",
+            "native_version_declaration_ancestors",
+            "native_version_declarations",
+            "native_version_header_items",
+            "native_version_headers",
+            "native_version_own_signature_types",
+            "native_version_parameters",
+            "revision_capture_inputs",
+            "revision_documents",
+        ];
+        if tables.len() == 30 {
+            expected.extend(["native_binding_epoch", "revision_producer_bindings"]);
+            expected.sort_unstable();
+        }
+        assert_eq!(
+            tables.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected,
+            "exact v8 table names: complete legacy 28 or paired producer-binding 30"
+        );
+        for required in [
+            "document_versions",
+            "revision_documents",
+            "graph_nodes",
+            "native_version_declarations",
+            "class_projections",
+        ] {
+            assert!(
+                tables.iter().any(|table| table == required),
+                "missing {required}"
+            );
+        }
         let mut rows = BTreeMap::new();
         for table in tables {
             assert!(
@@ -3223,42 +4876,14 @@ mod normal_post_capture_cancellation_tests {
         )
     }
 
-    // A panicking test must cancel and release its blocked spawn_blocking worker.
-    struct ReleaseOnDrop {
-        state: Arc<DaemonState>,
-        sender: Option<mpsc::Sender<()>>,
-    }
-    impl ReleaseOnDrop {
-        fn release(&mut self) {
-            self.sender.as_ref().unwrap().send(()).unwrap();
-            self.sender.take();
-        }
-    }
-    impl Drop for ReleaseOnDrop {
-        fn drop(&mut self) {
-            if let Some(sender) = self.sender.take() {
-                let jobs = self
-                    .state
-                    .jobs
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                jobs.cancel.store(true, Ordering::Release);
-                drop(jobs);
-                let _ = sender.send(());
-            }
-        }
-    }
-
     #[tokio::test]
-    async fn normal_job_cancelled_after_capture_keeps_protected_pair_and_packet() {
+    async fn accepted_job_cannot_be_cancelled_and_full_pair_changes_only_after_leader_drains() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
-        let source = root.join("one.js");
         fs::write(
-            &source,
-            "function seed() { sink(); } function sink() {}
-",
+            root.join("one.js"),
+            "function seed() { old_step(); } function old_step() {}\n",
         )
         .unwrap();
         let state_root = tmp.path().join("state");
@@ -3268,14 +4893,20 @@ mod normal_post_capture_cancellation_tests {
         let index = roots.index_db(&identity);
         let store = Store::open_for_tests(&state_root, &root).unwrap();
         let options = IndexOptions::new(root.clone());
-        let initial_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let (old_pin, serving) = crate::index_coordinator::reconcile_workspace(
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
             &store,
             &options,
-            &initial_cancel,
+            &Arc::new(AtomicBool::new(false)),
             |_| {},
         )
         .unwrap();
+        let before = pair_snapshot(&index);
+        fs::write(
+            root.join("one.js"),
+            "function seed() { fresh(); } function fresh() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("two.js"), "function extra() {}\n").unwrap();
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let state = new(
             store.clone(),
@@ -3284,242 +4915,50 @@ mod normal_post_capture_cancellation_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        state.retain_serving_session(serving);
         let app = router(state.clone());
-        let before = pair_snapshot(&index);
-        assert_eq!(before.pin, old_pin);
-        assert!(!before.rows["nodes"].is_empty());
-        assert!(!before.rows["native_documents"].is_empty());
-        let seed = store
-            .symbols_at("seed", 10)
-            .unwrap()
-            .1
-            .into_iter()
-            .find(|symbol| symbol.name == "seed")
-            .unwrap()
-            .id;
-        let (status, preview) = api(
-            &app,
-            token,
-            "POST",
-            "/api/questions/preview",
-            Some(json!({"seed":seed,"question":"what happens?","expectedRevision":old_pin})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{preview}");
-        let packet_id = preview["packet"]["packetId"].as_str().unwrap().to_owned();
-        let packet_path = format!("/api/questions/{packet_id}/jev-request");
-        let source_path = format!(
-            "/api/source?path=one.js&indexGeneration={}&indexRevision={}",
-            old_pin.index_generation, old_pin.index_revision
-        );
-        assert_eq!(
-            api(&app, token, "GET", &source_path, None).await.0,
-            StatusCode::OK
-        );
-        assert_eq!(
-            api(&app, token, "GET", &packet_path, None).await.0,
-            StatusCode::OK
-        );
-        assert!(
-            state
-                .packets
-                .lock()
-                .unwrap()
-                .packets
-                .iter()
-                .any(|(packet, _)| packet.packet_id == packet_id)
-        );
-        fs::write(
-            &source,
-            "function seed() { fresh(); } function fresh() {}
-",
-        )
-        .unwrap();
-        fs::write(
-            root.join("two.js"),
-            "function extra() {}
-",
-        )
-        .unwrap();
-
-        let (captured_tx, captured_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-        let hook_calls = Arc::new(AtomicUsize::new(0));
-        let calls = hook_calls.clone();
-        let mut release = ReleaseOnDrop {
-            state: state.clone(),
-            sender: Some(release_tx),
-        };
-        *state.normal_index_post_capture_hook.lock().unwrap() = Some(Arc::new(move || {
-            calls.fetch_add(1, Ordering::AcqRel);
-            captured_tx.send(()).unwrap();
-            release_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(30))
-                .unwrap();
-        }));
-        let (status, accepted) = start_index(
-            State(state.clone()),
-            Bytes::from(json!({"expectedRevision":old_pin}).to_string()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("normal admission: {} {}", error.1, error.2));
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let id = accepted.0.id;
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            tokio::task::spawn_blocking(move || captured_rx.recv_timeout(Duration::from_secs(12))),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-        let during = state.jobs.lock().unwrap().jobs[&id].clone();
-        assert_eq!(during.progress.phase, "complete");
-        assert_eq!((during.progress.completed, during.progress.total), (2, 2));
-        assert!(during.finished_at.is_none());
-        assert!(during.revision.is_none());
+        let (code, accepted) = api(&app, token, "POST", "/api/index", Some(json!({}))).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{accepted}");
+        assert_eq!(accepted["state"], "queued");
+        let id = accepted["id"].as_str().unwrap();
+        let (code, rejected) =
+            api(&app, token, "POST", &format!("/api/jobs/{id}/cancel"), None).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "request_not_cancellable");
         assert_eq!(pair_snapshot(&index), before);
-        let cancelling = cancel_job(State(state.clone()), Path(id.clone()))
-            .await
-            .unwrap_or_else(|error| panic!("cancel job: {} {}", error.1, error.2))
-            .0;
-        assert_eq!(cancelling.state, "cancelling");
-        release.release();
-        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let finished = {
-                    let jobs = state.jobs.lock().unwrap();
-                    let job = jobs.jobs[&id].clone();
-                    job.finished_at.is_some().then_some(job)
-                };
-                if let Some(job) = finished {
-                    break job;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(terminal.state, "cancelled");
-        assert!(terminal.revision.is_none());
-        assert_eq!(terminal.progress.phase, "complete");
-        assert_eq!(
-            (terminal.progress.completed, terminal.progress.total),
-            (2, 2)
-        );
-        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
-        assert_eq!(pair_snapshot(&index), before);
-        for path in ["/api/status", &source_path, &packet_path] {
-            let (status, response) = api(&app, token, "GET", path, None).await;
-            assert_eq!(
-                status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{path}: {response}"
-            );
-            assert_eq!(
-                response["error"]["code"], "index_not_ready",
-                "{path}: {response}"
-            );
-        }
-        assert!(
-            state
-                .packets
-                .lock()
-                .unwrap()
-                .packets
-                .iter()
-                .any(|(packet, _)| packet.packet_id == packet_id)
-        );
-        assert!(
-            state
-                .normal_index_post_capture_hook
-                .lock()
-                .unwrap()
-                .take()
-                .is_some()
-        );
-        assert!(
-            state
-                .normal_index_post_capture_hook
-                .lock()
-                .unwrap()
-                .is_none()
-        );
-
-        let (status, retry) = start_index(
-            State(state.clone()),
-            Bytes::from(json!({"expectedRevision":old_pin}).to_string()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("index retry: {} {}", error.1, error.2));
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let retry_id = retry.0.id;
+        assert_eq!(store.request_by_id(id).unwrap().unwrap().state, "queued");
+        drop(owner);
         let completed = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let finished = {
-                    let jobs = state.jobs.lock().unwrap();
-                    let job = jobs.jobs[&retry_id].clone();
-                    job.finished_at.is_some().then_some(job)
-                };
-                if let Some(job) = finished {
-                    break job;
+                let (code, row) = api(&app, token, "GET", &format!("/api/jobs/{id}"), None).await;
+                assert_eq!(code, StatusCode::OK, "{row}");
+                if !row["finishedAt"].is_null() {
+                    break row;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(completed.state, "completed");
-        let next = completed.revision.unwrap();
-        assert_eq!(next.index_generation, old_pin.index_generation);
-        assert_eq!(next.index_revision, old_pin.index_revision + 1);
-        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+        assert_eq!(completed["state"], "done", "{completed}");
         let after = pair_snapshot(&index);
-        assert_eq!(after.pin, next);
-        assert_ne!(after.rows["files"], before.rows["files"]);
+        assert!(after.pin.index_revision > before.pin.index_revision);
         assert_ne!(
-            after.rows["native_documents"],
-            before.rows["native_documents"]
+            after.rows["revision_documents"],
+            before.rows["revision_documents"]
         );
-        assert!(after.rows["files"].iter().any(|row| row.contains("two.js")));
+        assert_ne!(
+            after.rows["document_versions"],
+            before.rows["document_versions"]
+        );
         assert!(
-            after.rows["native_documents"]
+            after.rows["document_versions"]
                 .iter()
                 .any(|row| row.contains("two.js"))
         );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if state.packets.lock().unwrap().packets.is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("successful worker must clear cached packets");
-        assert!(state.packets.lock().unwrap().packets.is_empty());
-        let (status, stale) = api(&app, token, "GET", &source_path, None).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{stale}");
-        assert_eq!(stale["error"]["code"], "revision_conflict");
-        let updated_source = format!(
-            "/api/source?path=one.js&indexGeneration={}&indexRevision={}",
-            next.index_generation, next.index_revision
+        assert_eq!(
+            after.pin,
+            serde_json::from_value(completed["revision"].clone()).unwrap()
         );
-        let (status, source_response) = api(&app, token, "GET", &updated_source, None).await;
-        assert_eq!(status, StatusCode::OK, "{source_response}");
-        assert!(
-            source_response["file"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("fresh")
-        );
-        let (status, old_packet) = api(&app, token, "GET", &packet_path, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{old_packet}");
-        assert_eq!(old_packet["error"]["code"], "not_found");
     }
 }
 
@@ -3598,6 +5037,7 @@ mod dependency_lifecycle_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
+        let held_session = session.clone();
         state.retain_serving_session(session);
         {
             let mut deps = state.dependencies.lock().unwrap();
@@ -3627,16 +5067,16 @@ mod dependency_lifecycle_tests {
         assert!(refused.get("workspaceRevision").is_none());
         assert!(refused.get("catalogId").is_none());
         *state.dependency_capture_hook.lock().unwrap() = None;
-        let incarnation = state
-            .retained_serving_session()
-            .unwrap()
-            .leader_guard()
-            .unwrap()
-            .incarnation;
+        // The timer may correctly discard its unverified holder while the
+        // intentional lock-incarnation tamper is present. Keep the fixture's
+        // independent flock handle to restore that precise incarnation.
+        let incarnation = held_session.leader_guard().unwrap().incarnation;
         let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(incarnation.to_string().as_bytes()).unwrap();
         file.sync_all().unwrap();
+        held_session.verify().unwrap();
+        state.retain_serving_session(held_session.clone());
         let mismatched = IndexPin {
             index_revision: pin.index_revision + 1,
             ..pin
@@ -3701,16 +5141,15 @@ mod dependency_lifecycle_tests {
         assert!(browse.get("revision").is_none());
         assert!(browse.get("files").is_none());
         *state.outer_fence_hook.lock().unwrap() = None;
-        let incarnation = state
-            .retained_serving_session()
-            .unwrap()
-            .leader_guard()
-            .unwrap()
-            .incarnation;
+        // The second intentional incarnation tamper may also be observed by
+        // the timer. Restore from the independently held, exact old owner.
+        let incarnation = held_session.leader_guard().unwrap().incarnation;
         let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(incarnation.to_string().as_bytes()).unwrap();
         file.sync_all().unwrap();
+        held_session.verify().unwrap();
+        state.retain_serving_session(held_session);
     }
     #[test]
     fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {
@@ -3810,254 +5249,5 @@ mod dependency_lifecycle_tests {
         let generation = state.dependencies.lock().unwrap().generation;
         state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
         assert!(state.catalog_snapshot(pin1).is_none());
-    }
-}
-
-#[cfg(test)]
-mod rebaseline_packet_cache_tests {
-    use super::*;
-    use crate::indexer::index_workspace_bundle;
-    use std::{fs, sync::atomic::AtomicBool};
-
-    #[test]
-    fn preview_fence_failure_restores_evicted_and_same_id_packets() {
-        let revision = IndexPin {
-            index_generation: uuid::Uuid::new_v4(),
-            index_revision: 1,
-        };
-        let packet = QuestionPacket {
-            packet_id: "original".into(),
-            revision,
-            request: QuestionRequest {
-                seed: "seed".into(),
-                question: "what?".into(),
-                expected_revision: revision,
-                evidence_depth: 0,
-                max_visible: 1,
-                allow_deeper_display: false,
-                focus_terms: vec![],
-            },
-            context: ViewResult {
-                revision,
-                query: ViewQuery {
-                    seed: "seed".into(),
-                    depth: 0,
-                    max_nodes: 1,
-                    max_calls: 1,
-                    include_callbacks: false,
-                    exclude_paths: vec![],
-                },
-                nodes: vec![],
-                calls: vec![],
-                regions: vec![],
-                truncated: false,
-                omitted_nodes: 0,
-                warnings: vec![],
-            },
-            source_files: vec![],
-            warnings: vec![],
-        };
-        let mut cache = PacketCache::default();
-        for i in 0..MAX_PACKETS {
-            let mut item = packet.clone();
-            item.packet_id = format!("packet-{i}");
-            cache.remember(Arc::new(item), MAX_PACKET_BYTES);
-        }
-        let original: Vec<_> = cache
-            .packets
-            .iter()
-            .map(|(p, bytes)| (p.clone(), *bytes))
-            .collect();
-        let original_bytes = cache.bytes;
-        let mut incoming = packet.clone();
-        incoming.packet_id = "new".into();
-        let failed = cache.remember_fenced(Arc::new(incoming), MAX_PACKET_BYTES, || {
-            anyhow::bail!("index_not_ready: incarnation lost")
-        });
-        assert!(
-            failed
-                .unwrap_err()
-                .to_string()
-                .starts_with("index_not_ready")
-        );
-        assert_eq!(cache.bytes, original_bytes);
-        assert_eq!(cache.packets.len(), MAX_PACKETS);
-        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
-            assert!(Arc::ptr_eq(actual, before));
-            assert_eq!(size, expected);
-        }
-        let mut replacement = packet;
-        replacement.packet_id = "packet-3".into();
-        assert!(
-            cache
-                .remember_fenced(
-                    Arc::new(replacement),
-                    MAX_PACKET_BYTES + 1,
-                    || anyhow::bail!("root_changed: root replaced")
-                )
-                .is_err()
-        );
-        assert_eq!(cache.bytes, original_bytes);
-        assert_eq!(cache.packets.len(), MAX_PACKETS);
-        for ((actual, size), (before, expected)) in cache.packets.iter().zip(&original) {
-            assert!(Arc::ptr_eq(actual, before));
-            assert_eq!(size, expected);
-        }
-    }
-
-    #[test]
-    fn failed_known_old_commit_keeps_private_packet_cache_success_clears_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        fs::create_dir(&workspace).unwrap();
-        fs::write(workspace.join("one.js"), "function go() { measured(); }\n").unwrap();
-        let options = IndexOptions::new(workspace.clone());
-        let ready = Arc::new(AtomicBool::new(false));
-        let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
-        let (graph, native, capture) =
-            index_workspace_bundle(&options, store.root_id(), &ready, |_| {}).unwrap();
-        let old = store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                &store.leader().unwrap(),
-                store.index_baseline().unwrap(),
-                &ready,
-            )
-            .unwrap();
-        let db_path = fs::read_dir(temp.path().join("state/cache/indexes"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.is_dir())
-            .unwrap()
-            .join("index.db");
-        let db = rusqlite::Connection::open(&db_path).unwrap();
-        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        let tables = {
-            let mut stmt = db
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'",
-                )
-                .unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        for table in tables {
-            db.execute(&format!("DROP TABLE \"{table}\""), []).unwrap();
-        }
-        for index in ["nodes_path", "calls_path", "regions_path"] {
-            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-        }
-        db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-            [],
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
-        drop(db);
-        let old_bytes = fs::read(&db_path).unwrap();
-        let state = new(
-            store.clone(),
-            options,
-            "0123456789abcdef".repeat(4),
-            "127.0.0.1:7332".parse().unwrap(),
-        )
-        .unwrap();
-        let seed = graph
-            .nodes
-            .iter()
-            .find(|n| n.name == "go")
-            .unwrap()
-            .id
-            .clone();
-        let packet = Arc::new(QuestionPacket {
-            packet_id: "cached-before-old".into(),
-            revision: old,
-            request: QuestionRequest {
-                seed: seed.clone(),
-                question: "what?".into(),
-                expected_revision: old,
-                evidence_depth: 0,
-                max_visible: 1,
-                allow_deeper_display: false,
-                focus_terms: vec![],
-            },
-            context: ViewResult {
-                revision: old,
-                query: ViewQuery {
-                    seed,
-                    depth: 0,
-                    max_nodes: 1,
-                    max_calls: 1,
-                    include_callbacks: false,
-                    exclude_paths: vec![],
-                },
-                nodes: vec![],
-                calls: vec![],
-                regions: vec![],
-                truncated: false,
-                omitted_nodes: 0,
-                warnings: vec![],
-            },
-            source_files: vec![],
-            warnings: vec![],
-        });
-        state.packets.lock().unwrap().remember(packet, 128);
-        let register = |id: &str| {
-            state.jobs.lock().unwrap().jobs.insert(
-                id.into(),
-                IndexJob {
-                    id: id.into(),
-                    state: "running".into(),
-                    progress: IndexProgress::default(),
-                    revision: None,
-                    error: None,
-                    started_at: now(),
-                    finished_at: None,
-                },
-            )
-        };
-        register("failed");
-        let cancelled = Arc::new(AtomicBool::new(true));
-        let error = store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                &store.leader().unwrap(),
-                old,
-                &cancelled,
-            )
-            .unwrap_err();
-        finish_index_job(&state, "failed", Err(error), &cancelled);
-        assert_eq!(state.jobs.lock().unwrap().jobs["failed"].state, "cancelled");
-        assert_eq!(state.packets.lock().unwrap().packets.len(), 1);
-        assert_eq!(state.packets.lock().unwrap().bytes, 128);
-        assert_eq!(fs::read(&db_path).unwrap(), old_bytes);
-        assert!(
-            store
-                .status()
-                .unwrap_err()
-                .to_string()
-                .contains("index_not_ready")
-        );
-        register("committed");
-        let revision = store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                &store.leader().unwrap(),
-                old,
-                &ready,
-            )
-            .unwrap();
-        finish_index_job(&state, "committed", Ok(revision), &ready);
-        assert_ne!(revision.index_generation, old.index_generation);
-        assert_eq!(state.packets.lock().unwrap().packets.len(), 0);
-        assert_eq!(state.packets.lock().unwrap().bytes, 0);
     }
 }

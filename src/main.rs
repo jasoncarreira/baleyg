@@ -18,6 +18,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 #[derive(Parser)]
@@ -335,7 +336,15 @@ async fn main() -> Result<()> {
             eprintln!("Forgot record {}", args.record_id);
         }
         Command::Index(args) => {
+            let diagnostics = std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() == Ok("1");
+            let command_start = Instant::now();
             let (store, options, _) = args.resolve()?;
+            if diagnostics {
+                eprintln!(
+                    "index-phase outside_setup_ms={:.3}",
+                    command_start.elapsed().as_secs_f64() * 1e3
+                );
+            }
             let worker_store = store.clone();
             let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
@@ -343,24 +352,49 @@ async fn main() -> Result<()> {
                 shutdown_signal().await;
                 flag.store(true, Ordering::Release);
             });
+            let queue_start = Instant::now();
             let work = tokio::task::spawn_blocking(move || {
-                baleyg::index_coordinator::reconcile_workspace(
+                baleyg::index_coordinator::enqueue_and_wait_observed(
                     &worker_store,
                     &options,
                     &cancel,
-                    |p| {
-                        if p.completed == p.total {
-                            eprintln!("{}: {}/{}", p.phase, p.completed, p.total);
+                    |phase| {
+                        if diagnostics {
+                            if let Some(name) = phase.phase.strip_prefix("timing:") {
+                                eprintln!(
+                                    "index-phase {name}_ms={:.3}",
+                                    phase.completed as f64 / 1e3
+                                );
+                            } else if let Some(mode) = phase.phase.strip_prefix("mode:") {
+                                eprintln!("index-mode {mode}");
+                            }
                         }
                     },
                 )
             })
             .await
             .context("index worker panicked")?;
+            if diagnostics {
+                eprintln!(
+                    "index-phase queue_and_jobs_ms={:.3}",
+                    queue_start.elapsed().as_secs_f64() * 1e3
+                );
+            }
             signal.abort();
             let (revision, session) = work?;
+            if diagnostics && let Some(diagnostic) = store.last_writer_diagnostic() {
+                eprintln!("{diagnostic}");
+            }
+            let status_start = Instant::now();
             let output = serde_json::json!({"publishedRevision":revision,"status":store.status()?});
             write_session_json(&output, &session, std::io::stdout().lock())?;
+            if diagnostics {
+                eprintln!(
+                    "index-phase outside_status_output_ms={:.3} total_ms={:.3}",
+                    status_start.elapsed().as_secs_f64() * 1e3,
+                    command_start.elapsed().as_secs_f64() * 1e3
+                );
+            }
         }
         Command::Serve(args) => {
             ensure!(
@@ -493,11 +527,13 @@ async fn main() -> Result<()> {
                 .context("serve daemon")?;
         }
         Command::Status(args) => {
-            let store = args.store()?;
-            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let session =
-                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
-            write_session_json(&store.status()?, &session, std::io::stdout().lock())?;
+            let (roots, identity) = args.resolve_unattached()?;
+            let status = baleyg::store::Store::status_existing_readonly(roots, identity)?;
+            use std::io::Write;
+            let mut output = std::io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &status)?;
+            output.write_all(b"\n")?;
+            output.flush()?;
         }
         Command::Symbols(args) => {
             ensure!((1..=150).contains(&args.limit), "limit must be 1..150");

@@ -480,7 +480,7 @@ async fn successful_workspace_index_automatically_rebuilds_catalog() {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let (_, job) = request(&fixture.app, "GET", "/api/jobs/current", "").await;
-            if job["state"] == "completed" {
+            if job["state"] == "done" {
                 break;
             }
             assert_ne!(job["state"], "failed", "{job}");

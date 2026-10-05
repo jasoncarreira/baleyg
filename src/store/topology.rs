@@ -60,6 +60,14 @@ fn private_file(path: &Path, file: &File) -> Result<()> {
     );
     Ok(())
 }
+fn open_file_readonly(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    private_file(path, &file)?;
+    Ok(file)
+}
 fn open_file(path: &Path, create: bool) -> Result<File> {
     let mut o = OpenOptions::new();
     o.read(true)
@@ -133,6 +141,9 @@ impl TopologyRoots {
     pub fn index_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.index_dir(identity).join("index.db")
     }
+    pub fn requests_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
+        self.index_dir(identity).join("requests.db")
+    }
     pub fn leader_lock(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.index_dir(identity).join("leader.lock")
     }
@@ -172,6 +183,33 @@ impl TopologyRoots {
         UseGuard::acquire(&self.index_use_lock(identity), false, false)
     }
     pub fn index_use_existing(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
+        self.index_use_existing_with_wait(identity, false)
+    }
+    /// Status may hold the existing shared use lock, but must never wait for a
+    /// writer or create an index/lock pathname merely to report current state.
+    pub fn index_use_existing_readonly(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
+        identity.verify_readonly()?;
+        self.reject_root_overlap(identity)?;
+        for path in [
+            &self.cache,
+            &self.cache.join("indexes"),
+            &self.index_dir(identity),
+        ] {
+            private_dir(path)?;
+        }
+        UseGuard::acquire_existing_readonly(&self.index_use_lock(identity)).map_err(|error| {
+            if error.is::<StorageBusy>() {
+                error
+            } else {
+                error.context("incompatible_index: missing or unsafe use lock")
+            }
+        })
+    }
+    fn index_use_existing_with_wait(
+        &self,
+        identity: &WorkspaceIdentity,
+        nonblocking: bool,
+    ) -> Result<UseGuard> {
         identity.verify()?;
         self.reject_root_overlap(identity)?;
         for path in [
@@ -181,8 +219,23 @@ impl TopologyRoots {
         ] {
             private_dir(path)?;
         }
-        UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
+        UseGuard::acquire_existing(&self.index_use_lock(identity), false, nonblocking)
             .context("incompatible_index: missing or unsafe use lock")
+    }
+    /// Root-loss queue transitions still require the existing protected index directory.
+    /// They cannot use the root pathname, which now names a different inode or is absent.
+    pub(crate) fn index_use_existing_without_root(
+        &self,
+        identity: &WorkspaceIdentity,
+    ) -> Result<UseGuard> {
+        for path in [
+            &self.cache,
+            &self.cache.join("indexes"),
+            &self.index_dir(identity),
+        ] {
+            private_dir(path)?;
+        }
+        UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
     }
     /// Exceptional index replacement starts only after every protected handle closes.
     /// Never create or upgrade a use lock while attempting exclusive admission.
@@ -505,6 +558,31 @@ impl WorkspaceIdentity {
     pub fn attach_marker(self) -> Result<Self> {
         self.attach_marker_with_hook(&mut |_| Ok(()))
     }
+    /// Status observes an existing Git workspace identity without creating or
+    /// fsyncing the marker. A missing marker means no published workspace.
+    pub fn attach_existing_marker_readonly(mut self) -> Result<Self> {
+        if let Some(git) = &self.git_dir {
+            ensure!(
+                metadata(git)?.uid() == owner() && metadata(git)?.is_dir(),
+                "unsafe Git directory"
+            );
+            let path = git.join("baleyg/workspace-id");
+            let marker = read_marker_readonly(&path).map_err(|error| {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                {
+                    anyhow::anyhow!("index_not_ready: no published workspace identity")
+                } else {
+                    error
+                }
+            })?;
+            self.record_id = marker.to_string();
+            self.marker = Some(marker);
+        }
+        self.verify_readonly()?;
+        Ok(self)
+    }
     fn attach_marker_with_hook(
         mut self,
         hook: &mut impl FnMut(MarkerStage) -> Result<()>,
@@ -530,7 +608,47 @@ impl WorkspaceIdentity {
         self.verify()?;
         Ok(self)
     }
+    /// Only a proven pathname loss authorizes old-root queue failure. A changed
+    /// workspace marker or an unreadable pathname is not proof of replacement.
+    pub(crate) fn root_path_replaced(&self) -> Result<bool> {
+        let held = self.root_handle.metadata()?;
+        ensure!(
+            (held.dev(), held.ino()) == (self.device, self.inode),
+            "root_changed: captured handle identity changed"
+        );
+        self.root_path_replaced_from(fs::symlink_metadata(&self.root))
+    }
+    fn root_path_replaced_from(&self, named: std::io::Result<fs::Metadata>) -> Result<bool> {
+        match named {
+            Ok(m) => Ok(!m.is_dir()
+                || m.file_type().is_symlink()
+                || (m.dev(), m.ino()) != (self.device, self.inode)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
     pub fn verify(&self) -> Result<()> {
+        self.verify_with_marker(false)
+    }
+    /// Recheck the same open root and marker without discovering or creating a
+    /// different identity when another owner repaired a pending derived index.
+    pub(crate) fn verified_clone(&self) -> Result<Self> {
+        self.verify()?;
+        Ok(Self {
+            root: self.root.clone(),
+            root_key: self.root_key.clone(),
+            record_id: self.record_id.clone(),
+            device: self.device,
+            inode: self.inode,
+            git_dir: self.git_dir.clone(),
+            marker: self.marker,
+            root_handle: self.root_handle.try_clone()?,
+        })
+    }
+    pub fn verify_readonly(&self) -> Result<()> {
+        self.verify_with_marker(true)
+    }
+    fn verify_with_marker(&self, readonly: bool) -> Result<()> {
         let m = fs::symlink_metadata(&self.root).context("root_changed")?;
         let handle = self.root_handle.metadata()?;
         ensure!(
@@ -545,10 +663,12 @@ impl WorkspaceIdentity {
                 resolve_git_dir(&self.root)?.as_deref() == Some(git),
                 "workspace_id_changed"
             );
-            ensure!(
-                Some(read_marker(&git.join("baleyg/workspace-id"))?) == self.marker,
-                "workspace_id_changed"
-            );
+            let marker = if readonly {
+                read_marker_readonly(&git.join("baleyg/workspace-id"))?
+            } else {
+                read_marker(&git.join("baleyg/workspace-id"))?
+            };
+            ensure!(Some(marker) == self.marker, "workspace_id_changed");
         }
         Ok(())
     }
@@ -669,6 +789,12 @@ fn classify_marker_file(path: &Path, f: File) -> Result<MarkerRead> {
     );
     Ok(MarkerRead::Valid(id, f))
 }
+fn read_marker_readonly(path: &Path) -> Result<Uuid> {
+    match classify_marker_file(path, open_file_readonly(path)?)? {
+        MarkerRead::Valid(id, _) => Ok(id),
+        MarkerRead::Short(_) => bail!("invalid workspace-id marker"),
+    }
+}
 fn read_marker(path: &Path) -> Result<Uuid> {
     match read_marker_file(path)? {
         MarkerRead::Valid(id, _) => Ok(id),
@@ -782,7 +908,7 @@ fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Re
     }
 }
 #[derive(Debug)]
-struct StorageBusy;
+pub(crate) struct StorageBusy;
 impl std::fmt::Display for StorageBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("storage_busy")
@@ -807,7 +933,7 @@ impl UseGuard {
         nonblocking: bool,
         after_open: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
-        Self::acquire_mode(path, exclusive, nonblocking, true, after_open)
+        Self::acquire_mode(path, exclusive, nonblocking, true, false, after_open)
     }
     pub fn acquire_existing_with_hook(
         path: &Path,
@@ -815,16 +941,23 @@ impl UseGuard {
         nonblocking: bool,
         after_open: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
-        Self::acquire_mode(path, exclusive, nonblocking, false, after_open)
+        Self::acquire_mode(path, exclusive, nonblocking, false, false, after_open)
     }
     pub fn acquire_existing(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Self> {
         Self::acquire_existing_with_hook(path, exclusive, nonblocking, || Ok(()))
+    }
+    pub fn acquire_existing_readonly(path: &Path) -> Result<Self> {
+        Self::acquire_mode(path, false, true, false, true, || Ok(()))
+    }
+    pub fn acquire_existing_readonly_exclusive(path: &Path) -> Result<Self> {
+        Self::acquire_mode(path, true, true, false, true, || Ok(()))
     }
     fn acquire_mode(
         path: &Path,
         exclusive: bool,
         nonblocking: bool,
         create: bool,
+        readonly: bool,
         after_open: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
         let flags = (if exclusive {
@@ -833,8 +966,16 @@ impl UseGuard {
             libc::LOCK_SH
         }) | (if nonblocking { libc::LOCK_NB } else { 0 });
         let mut hook = Some(after_open);
+        ensure!(
+            !readonly || !create,
+            "read-only use lock cannot create a pathname"
+        );
         for _ in 0..20 {
-            let file = open_file(path, create)?;
+            let file = if readonly {
+                open_file_readonly(path)?
+            } else {
+                open_file(path, create)?
+            };
             if let Some(after_open) = hook.take() {
                 after_open()?;
             }
@@ -921,6 +1062,15 @@ fn read_incarnation(file: &File) -> Result<Uuid> {
 }
 
 impl LeaderGuard {
+    pub(crate) fn belongs_to_after_root_loss(
+        &self,
+        leader_path: &Path,
+        use_path: &Path,
+    ) -> Result<()> {
+        ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
+        self.use_guard.belongs_to(use_path, false)?;
+        self.verify()
+    }
     pub fn belongs_to(&self, leader_path: &Path) -> Result<()> {
         ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
         self.verify()
@@ -1016,6 +1166,32 @@ impl LeaderSession {
             }
             Self::Follower(guard) => guard.verify(guard.incarnation),
         }
+    }
+    pub(crate) fn verify_after_root_loss(
+        &self,
+        identity: &WorkspaceIdentity,
+        leader_path: &Path,
+        use_path: &Path,
+    ) -> Result<()> {
+        let Self::Leader {
+            guard,
+            identity: held,
+        } = self
+        else {
+            bail!("storage_busy: follower cannot fail old-root requests");
+        };
+        ensure!(
+            held.root == identity.root
+                && held.root_key == identity.root_key
+                && held.device == identity.device
+                && held.inode == identity.inode,
+            "storage_busy: leader belongs to another root"
+        );
+        ensure!(
+            identity.verify().is_err(),
+            "root_changed: old-root transition requires root loss"
+        );
+        guard.belongs_to_after_root_loss(leader_path, use_path)
     }
     pub fn belongs_to(&self, identity: &WorkspaceIdentity, leader_path: &Path) -> Result<()> {
         let Self::Leader {
@@ -1497,6 +1673,9 @@ impl<'a> DurableRecords<'a> {
 }
 
 /// The report is a read-only snapshot; it never creates a use lock or a database.
+/// `eligible` never deletes a derived index. Future #16 automatic GC needs a
+/// separate guarded public contract: verified exclusive use lock, exact shape,
+/// typed root/age, hot-journal/live refusal, and retained-pin/record safety.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GcReport {
@@ -1618,7 +1797,7 @@ impl std::error::Error for RecordIssue {}
 
 fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
     use rusqlite::{Connection, OpenFlags};
-    let file = open_file(path, false)?;
+    let file = open_file_readonly(path)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let sidecar = path.with_file_name(format!(
             "{}{suffix}",
@@ -1641,6 +1820,68 @@ fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
     ensure!(journal == "delete", "incompatible database journal mode");
     Ok(db)
 }
+/// Exact historical sqlite_master inventories made by released v4–v7 and
+/// pre-delta v8 writers. The digest includes table/index DDL and SQLite's
+/// autoindexes; a copied metadata row inside an invented schema is NOT proof.
+/// These allowlisted entries only permit read-only GC eligibility reporting.
+fn historical_index_extractor(
+    db: &rusqlite::Connection,
+    version: i64,
+) -> Result<Option<&'static str>> {
+    let objects: Vec<(String, String, String, Option<String>)> = db
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut digest = Sha256::new();
+    digest.update(b"baleyg.gc.legacy-shape.v1\0");
+    digest.update(serde_json::to_vec(&objects)?);
+    let shape = hex::encode(digest.finalize());
+    let marker = match version {
+        4 if shape == "671fb1bc8f8afdabc2c0cd3fdfa48f9ca4c0dae19e4b120a029531ab263a7f97" => {
+            "native-v1"
+        }
+        5 if shape == "671fb1bc8f8afdabc2c0cd3fdfa48f9ca4c0dae19e4b120a029531ab263a7f97" => {
+            "native-no-lexical-v1"
+        }
+        6 if matches!(
+            shape.as_str(),
+            "7157d498af3664202afd5cf22611504c6c3c13c7680df9bd95edca9bcffa744f"
+                | "3d8f85da1147c24af05d0cc1edf5eb3f8dbc57147a8fe5fb34c3dc77b522782e"
+        ) =>
+        {
+            "native-paired-v1"
+        }
+        7 if shape == "0f9d35effec7cc42016ba8c5965155558ab4c9d7f80a710474932b6f13499964" => {
+            "native-paired-v1"
+        }
+        8 if shape == "67f6d823fce6f306b35eab660421fe57d8bfee2385a223c3faa5c062355e4a2d" => {
+            "native-v4"
+        }
+        8 if matches!(
+            shape.as_str(),
+            "8f41ecd1ea2829e56ad78acea951664542df43dba59cda8db846d68cdf7bb9b9"
+                | "58d077101fce7bfbe41f5fdf048df947d1964415f3d7f84af8346d2d02201d2d"
+        ) =>
+        {
+            "native-v4-class-compose-v1"
+        }
+        // Today's v8 becomes an allowlisted obsolete shape if the extractor
+        // changes later. Both no-binding and producer-binding layouts exist.
+        8 if matches!(
+            shape.as_str(),
+            "9d455d7d5871944959a4499a7b50a4fb77ddb0e016187bbfdf71f64603568219"
+                | "1462227f6bdd63bf305a3ba6710c2829488e509858e49fc070d125433403a712"
+        ) =>
+        {
+            "native-v4-delta-v1"
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(marker))
+}
+
 fn inspect_index(dir: &Path, key: &str, now_secs: i64) -> Result<(&'static str, &'static str)> {
     inspect_index_with_open_hook(dir, key, now_secs, |_| Ok(()))
 }
@@ -1656,21 +1897,24 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(matches!(version, 4..=7), "incompatible index schema");
-    // GC may classify only the two exact cache formats this binary knows.
-    // The same structural and extractor-marker check applies before it can
-    // declare an index eligible for deletion or report it as recently opened.
-    super::validate_cache_shape(db)?;
+    let historical_marker = if version == 8 && super::validate_cache_shape(db).is_ok() {
+        None // The current v8 shape is checked by the normal production guard.
+    } else if (4..=8).contains(&version) {
+        match historical_index_extractor(db, version)? {
+            Some(marker) => Some(marker),
+            None => return Ok(("unknown", "unknown_index_shape")),
+        }
+    } else {
+        return Ok(("unknown", "unknown_index_schema"));
+    };
     let count: i64 = db.query_row("SELECT count(*) FROM index_metadata", [], |r| r.get(0))?;
     ensure!(count == 1, "incompatible index metadata cardinality");
     let (schema, extractor, spelling, dev, ino, age): (i64, String, String, String, String, rusqlite::types::Value) = db.query_row(
         "SELECT schema_version,extractor_version,root_spelling,root_device,root_inode,last_opened_at FROM index_metadata WHERE singleton=1", [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
     ensure!(
-        ((version == 4 && schema == 4 && extractor == "native-v1")
-            || (version == 5 && schema == 5 && extractor == "native-no-lexical-v1")
-            || (version == 6 && schema == 6 && extractor == "native-paired-v1")
-            || (version == 7 && schema == 7 && extractor == "native-paired-v1"))
+        schema == version
+            && extractor == historical_marker.unwrap_or(super::EXTRACTOR_VERSION)
             && Path::new(&spelling).is_absolute()
             && hex::encode(Sha256::digest(spelling.as_bytes())) == key,
         "incompatible index identity"
@@ -1888,7 +2132,7 @@ impl TopologyRoots {
                     continue;
                 }
                 let lock = parent.join(format!("{name}.lock"));
-                let (status, reason) = match UseGuard::acquire_existing(&lock, true, true) {
+                let (status, reason) = match UseGuard::acquire_existing_readonly_exclusive(&lock) {
                     Err(e) if e.is::<StorageBusy>() => ("busy", "use_lock_busy"),
                     Err(_) => ("unknown", "unsafe_use_lock"),
                     Ok(guard) => {
@@ -1923,7 +2167,7 @@ impl TopologyRoots {
                 // Report one safely named record at a time. Never create a missing use
                 // lock or expose error text containing local paths or SQLite details.
                 let lock = parent.join(format!("{name}.lock"));
-                let report = match UseGuard::acquire_existing(&lock, true, true) {
+                let report = match UseGuard::acquire_existing_readonly_exclusive(&lock) {
                     Err(e) if e.is::<StorageBusy>() => {
                         GcRecordReport::unavailable(name, "busy", "use_lock_busy")
                     }
@@ -2009,6 +2253,7 @@ mod gc_schema_race_tests {
     use std::{
         cell::RefCell,
         fs,
+        os::unix::fs::PermissionsExt,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -2043,12 +2288,8 @@ mod gc_schema_race_tests {
                 Ok(())
             },
         )
-        .unwrap_err();
-        assert!(
-            refused
-                .to_string()
-                .contains("incompatible_index: unknown cache object")
-        );
+        .unwrap();
+        assert_eq!(refused, ("unknown", "unknown_index_shape"));
         let ddl_bytes = after_external.into_inner().unwrap();
         assert_eq!(
             fs::read(&path).unwrap(),
@@ -2059,7 +2300,7 @@ mod gc_schema_race_tests {
         assert_eq!(derived.len(), 1);
         assert_eq!(
             (derived[0].status, derived[0].reason),
-            ("unknown", "metadata_unreadable")
+            ("unknown", "unknown_index_shape")
         );
         assert_eq!(
             fs::read(&path).unwrap(),
@@ -2073,8 +2314,8 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                5,
-                "native-no-lexical-v1",
+                8,
+                "native-v4-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
             )
@@ -2085,6 +2326,281 @@ mod gc_schema_race_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("incompatible_index")
+        );
+    }
+
+    #[test]
+    fn historical_index_orphans_report_only_when_exact_shape_and_root_prove_eligibility() {
+        // SQL copied verbatim from the named historical writers. Keep these
+        // fixtures and their sqlite_master digests paired with the allowlist.
+        let cases: &[(i64, &str, &str)] = &[
+            (
+                4,
+                "native-v1",
+                include_str!("../../tests/fixtures/gc-legacy/v4-v5.sql"),
+            ),
+            (
+                5,
+                "native-no-lexical-v1",
+                include_str!("../../tests/fixtures/gc-legacy/v4-v5.sql"),
+            ),
+            (
+                6,
+                "native-paired-v1",
+                include_str!("../../tests/fixtures/gc-legacy/v6-original.sql"),
+            ),
+            (
+                6,
+                "native-paired-v1",
+                include_str!("../../tests/fixtures/gc-legacy/v6-late.sql"),
+            ),
+            (
+                7,
+                "native-paired-v1",
+                include_str!("../../tests/fixtures/gc-legacy/v7.sql"),
+            ),
+            (
+                8,
+                "native-v4",
+                include_str!("../../tests/fixtures/gc-legacy/v8-native-v4.sql"),
+            ),
+            (
+                8,
+                "native-v4-class-compose-v1",
+                include_str!("../../tests/fixtures/gc-legacy/v8-native-class.sql"),
+            ),
+            (
+                8,
+                "native-v4-class-compose-v1",
+                include_str!("../../tests/fixtures/gc-legacy/v8-native-class-late.sql"),
+            ),
+            (
+                8,
+                "native-v4-delta-v1",
+                include_str!("../../tests/fixtures/gc-legacy/v8-current.sql"),
+            ),
+        ];
+        let now = 1_800_000_000_i64;
+        for &(version, marker, ddl) in cases {
+            let state = tempfile::tempdir().unwrap();
+            let work = tempfile::tempdir().unwrap();
+            let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+            let roots = TopologyRoots::isolated_for_tests(
+                state.path().join("cache"),
+                state.path().join("data"),
+            );
+            let store = crate::store::Store::open_for_tests(state.path(), work.path()).unwrap();
+            drop(store);
+            let dir = roots.index_dir(&identity);
+            let path = roots.index_db(&identity);
+            fs::remove_file(&path).unwrap();
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(ddl).unwrap();
+            db.pragma_update(None, "user_version", version).unwrap();
+            db.execute(
+                "INSERT INTO index_metadata(singleton,schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics) VALUES (1,?1,?2,?3,?4,?5,'oldgen',1,?6,'','{}','[]')",
+                rusqlite::params![version,marker,identity.root.to_str().unwrap(),identity.device.to_string(),identity.inode.to_string(),now-31*24*60*60],
+            ).unwrap();
+            drop(db);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::read(&path).unwrap();
+            assert_eq!(
+                inspect_index(&dir, &identity.root_key, now).unwrap(),
+                ("eligible", "age_30_days"),
+                "v{version}/{marker} known schema not reported"
+            );
+            let report = roots.gc_report_at(now).unwrap();
+            assert_eq!(report.derived.len(), 1);
+            assert_eq!(
+                (report.derived[0].status, report.derived[0].reason),
+                ("eligible", "age_30_days")
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "gc --report wrote v{version} index"
+            );
+            assert!(path.exists(), "gc --report deleted v{version} index");
+            if version == 4 {
+                let held = UseGuard::acquire_existing(&roots.index_use_lock(&identity), true, true)
+                    .unwrap();
+                assert_ne!(
+                    roots.gc_report_at(now).unwrap().derived[0].status,
+                    "eligible",
+                    "active lock must not yield cleanup eligibility"
+                );
+                drop(held);
+                let journal = path.with_file_name("index.db-journal");
+                fs::write(&journal, b"hot-journal-sentinel").unwrap();
+                assert_eq!(
+                    roots.gc_report_at(now).unwrap().derived[0].status,
+                    "unknown",
+                    "journal must not yield cleanup eligibility"
+                );
+                assert_eq!(fs::read(&journal).unwrap(), b"hot-journal-sentinel");
+                fs::remove_file(journal).unwrap();
+                let db = rusqlite::Connection::open(&path).unwrap();
+                db.execute_batch("CREATE VIEW fake_gc_marker AS SELECT 1 AS admitted")
+                    .unwrap();
+                drop(db);
+                assert_eq!(
+                    roots.gc_report_at(now).unwrap().derived[0].status,
+                    "unknown",
+                    "spoofed extra object must not match old schema"
+                );
+                let db = rusqlite::Connection::open(&path).unwrap();
+                db.execute_batch("DROP VIEW fake_gc_marker").unwrap();
+                drop(db);
+            }
+
+            assert_eq!(
+                inspect_index(&dir, &identity.root_key, now - 31 * 24 * 60 * 60).unwrap(),
+                ("unknown", "recent_open"),
+                "v{version} recent index must not be eligible"
+            );
+            // Ill-typed root identity must not be called a proven orphan.
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute("UPDATE index_metadata SET root_inode='not-an-inode'", [])
+                .unwrap();
+            drop(db);
+            assert!(inspect_index(&dir, &identity.root_key, now).is_err());
+            assert_eq!(
+                roots.gc_report_at(now).unwrap().derived[0].status,
+                "unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn obsolete_orphan_schema_reports_unknown_without_upgrading_or_deleting() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let store = crate::store::Store::open_for_tests(state.path(), work.path()).unwrap();
+        drop(store);
+        let path = roots.index_db(&identity);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 7_i64).unwrap();
+        drop(db);
+        let before = fs::read(&path).unwrap();
+        let report = roots.gc_report_at(1_800_000_000).unwrap();
+        assert_eq!(report.derived.len(), 1);
+        assert_eq!(
+            (report.derived[0].status, report.derived[0].reason),
+            ("unknown", "unknown_index_shape")
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(path.exists(), "GC must not remove an obsolete orphan");
+    }
+
+    #[test]
+    fn stale_v8_extractor_marker_is_refused_without_gc_writes_or_deletion() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let store = crate::store::Store::open_for_tests(state.path(), work.path()).unwrap();
+        let pin = store.index_baseline().unwrap();
+        let dir = roots.index_dir(&identity);
+        let path = roots.index_db(&identity);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(
+            inspect_index(&dir, &identity.root_key, now).unwrap(),
+            ("unknown", "recent_open"),
+            "genuine current-v8 cache must pass GC admission"
+        );
+
+        let attacker = rusqlite::Connection::open(&path).unwrap();
+        attacker
+            .execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET extractor_version='native-v4' WHERE singleton=1")
+            .unwrap();
+        assert_eq!(attacker.changes(), 1);
+        let (schema, marker, generation, revision): (i64, String, String, i64) = attacker
+            .query_row(
+                "SELECT schema_version,extractor_version,index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (schema, marker.as_str(), generation, revision),
+            (
+                8,
+                "native-v4",
+                pin.index_generation.to_string(),
+                pin.index_revision as i64
+            )
+        );
+        drop(attacker);
+
+        let footprint = || {
+            [
+                path.clone(),
+                dir.join("index.db-wal"),
+                dir.join("index.db-shm"),
+                dir.join("index.db-journal"),
+            ]
+            .map(|p| {
+                let bytes = if p.try_exists().unwrap() {
+                    Some(fs::read(&p).unwrap())
+                } else {
+                    None
+                };
+                (p, bytes)
+            })
+        };
+        let attacked_bytes = footprint();
+        assert!(attacked_bytes[0].1.is_some());
+        assert!(attacked_bytes[1..].iter().all(|(_, bytes)| bytes.is_none()));
+        let refused = inspect_index(&dir, &identity.root_key, now).unwrap_err();
+        assert!(
+            refused.to_string().contains("incompatible index identity"),
+            "{refused:#}"
+        );
+        assert_eq!(
+            footprint(),
+            attacked_bytes,
+            "inspection must not write DB or sidecars"
+        );
+        let derived = roots.gc_report_at(now).unwrap().derived;
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].root_key, identity.root_key);
+        assert_eq!(
+            (derived[0].status, derived[0].reason),
+            ("unknown", "metadata_unreadable")
+        );
+        assert!(dir.exists(), "GC report must not delete rejected index");
+        assert_eq!(
+            footprint(),
+            attacked_bytes,
+            "GC report must not write DB or sidecars"
+        );
+    }
+
+    #[test]
+    fn root_loss_requires_proven_pathname_change_not_arbitrary_io_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap();
+        assert!(!identity.root_path_replaced().unwrap());
+        let denied = identity.root_path_replaced_from(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected metadata refusal",
+        )));
+        assert_eq!(denied.unwrap_err().to_string(), "injected metadata refusal");
+        assert!(
+            identity
+                .root_path_replaced_from(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
+                .unwrap()
         );
     }
 }

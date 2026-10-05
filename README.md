@@ -36,6 +36,14 @@ Jev and ACP ledgers also require explicit external paths when enabled. No old st
 automatically. Indexing never runs package scripts, installs source dependencies, or edits source.
 See [local topology](docs/local-topology.md#storage).
 
+`baleyg gc --report` only inventories derived-index and saved-record candidates. A historical
+index marked `eligible` is **not deleted**. Baleyg has no derived-index deletion command or
+automatic deletion path today. Future [#16](https://github.com/jasoncarreira/baleyg/issues/16)
+automatic GC needs a separate guarded public contract: authenticate the exact historical schema,
+root identity and age; hold a verified exclusive use lock; refuse live, hot-journal, unknown or
+busy data; and protect retained pins and durable saved records. Reporting eligibility alone must
+never trigger removal.
+
 ## What works
 
 - Native tree-sitter JavaScript (`.js`, `.mjs`, `.cjs`), Rust (`.rs`), Java (`.java`) and Python (`.py`) extraction.

@@ -517,148 +517,6 @@ async fn packet_operation_pair_matrix() {
     );
 }
 
-#[tokio::test]
-async fn legacy_reindex_invalidates_cached_question_exports_and_rebuilds_terminal_packet() {
-    let (temp, _store, _graph, state, app, request, session) = setup(0);
-    let (status, old) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{old}");
-    let old_pin = old["packet"]["revision"].clone();
-    let (status, old_export) = call(&app, "GET", &path(&old, "jev-request"), Value::Null).await;
-    assert_eq!(status, StatusCode::OK, "{old_export}");
-    let index_root = temp.path().join("state/cache/indexes");
-    let db_path = std::fs::read_dir(index_root)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap()
-        .join("index.db");
-    {
-        let db = rusqlite::Connection::open(db_path).unwrap();
-        db.pragma_update(None, "foreign_keys", false).unwrap();
-        let native_tables = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        for table in native_tables {
-            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
-        }
-        for index in ["nodes_path", "calls_path", "regions_path"] {
-            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-        }
-        db.execute_batch(
-            "DROP TABLE capture_inputs;
-             ALTER TABLE files DROP COLUMN capture_stat;
-             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
-             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
-        )
-        .unwrap();
-        db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-            [],
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
-        db.execute("UPDATE calls SET payload=json_set(payload,'$.target','lexical-guess','$.resolution','internal')", []).unwrap();
-    }
-    for (method, action, body) in [
-        ("GET", "jev-request", Value::Null),
-        ("POST", "selection", old["selection"].clone()),
-        ("POST", "jev-response", response(&old_export)),
-    ] {
-        let (status, result) = call(&app, method, &path(&old, action), body).await;
-        assert_eq!(
-            status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{action}: {result}"
-        );
-        assert_eq!(result["error"]["code"], "index_not_ready");
-        assert!(!result.to_string().contains("lexical-guess"));
-    }
-    state.retain_serving_session(session.clone());
-    let (status, job) = call(
-        &app,
-        "POST",
-        "/api/index",
-        json!({"expectedRevision":old_pin}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
-    let id = job["id"].as_str().unwrap();
-    let done = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let (_, current) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
-            if !current["finishedAt"].is_null() {
-                break current;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(done["state"], "completed", "{done}");
-    let (status, ready) = call(&app, "GET", "/api/status", Value::Null).await;
-    assert_eq!(status, StatusCode::OK, "{ready}");
-    assert_eq!(ready["evidenceFormat"], "terminal-native-graph-v1");
-    assert_ne!(
-        ready["revision"]["indexGeneration"],
-        old_pin["indexGeneration"]
-    );
-    for (method, action, body) in [
-        ("GET", "jev-request", Value::Null),
-        ("POST", "selection", old["selection"].clone()),
-        ("POST", "jev-response", response(&old_export)),
-    ] {
-        let (status, result) = call(&app, method, &path(&old, action), body).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{action}: {result}");
-    }
-    let (status, stale) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
-    let mut fresh_request = request;
-    fresh_request["expectedRevision"] = ready["revision"].clone();
-    let (status, fresh) = call(&app, "POST", "/api/questions/preview", fresh_request).await;
-    assert_eq!(status, StatusCode::OK, "{fresh}");
-    assert_eq!(fresh["packet"]["revision"], ready["revision"]);
-    assert!(!fresh.to_string().contains("lexical-guess"));
-    assert!(
-        fresh["packet"]["context"]["calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|call| call.get("target").is_none())
-    );
-    let (status, export) = call(&app, "GET", &path(&fresh, "jev-request"), Value::Null).await;
-    assert_eq!(status, StatusCode::OK, "{export}");
-    assert!(!export.to_string().contains("lexical-guess"));
-    let (status, imported) = call(
-        &app,
-        "POST",
-        &path(&fresh, "jev-response"),
-        response(&export),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{imported}");
-    assert_eq!(imported["view"]["selectionSource"], "importedJev");
-    assert!(
-        imported["view"]["calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|call| call.get("target").is_none())
-    );
-    let (status, selected) = call(
-        &app,
-        "POST",
-        &path(&fresh, "selection"),
-        imported["selection"].clone(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{selected}");
-    assert_eq!(selected["view"]["selectionSource"], "manual");
-}
-
 fn publish_bundle(
     store: &baleyg::store::Store,
     graph: &baleyg::model::Graph,
@@ -706,7 +564,7 @@ async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
     let corrupt = |path: &str| {
         let mut bytes: Vec<u8> = db
             .query_row(
-                "SELECT source_bytes FROM native_documents WHERE path=?1",
+                "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.path=?1",
                 [path],
                 |row| row.get(0),
             )
@@ -714,7 +572,7 @@ async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
         bytes[0] ^= 1;
         assert_eq!(
             db.execute(
-                "UPDATE native_documents SET source_bytes=?1 WHERE path=?2",
+                "UPDATE document_versions SET source_bytes=?1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path=?2)",
                 rusqlite::params![bytes, path],
             )
             .unwrap(),
@@ -780,7 +638,7 @@ async fn cached_packet_refuses_changed_selected_graph_call_under_same_pin() {
     let db = rusqlite::Connection::open(db_path).unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE calls SET payload=json_set(payload,'$.calleeText','forged') WHERE id=?1",
+            "UPDATE graph_calls SET payload=json_set(payload,'$.calleeText','forged') WHERE id=?1 AND projection_id IN (SELECT m.graph_projection_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision)",
             [id],
         )
         .unwrap(),

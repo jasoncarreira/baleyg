@@ -1,0 +1,100 @@
+{
+  "binary_sha256": "426e9ebbcdad81fdc0407d321b7fcc957ea794d89aab47f3ee0d287b65dd1a4e",
+  "jobs": [
+    {
+      "elapsed_s": 0.3489,
+      "index_phases_ms": {},
+      "label": "serve-first-ready",
+      "phase_visibility": "Serve callback suppresses index-phase markers",
+      "readiness_output": "Baleyg: http://127.0.0.1:62682/\nState: <private-scratch>/private-home/Library/Caches/dev.odin.baleyg\nToken file: <private-scratch>/serve-token\nRefresh is explicit. No repository commands run.\nLive inference disabled. Offline preview/export/import only.\n"
+    },
+    {
+      "elapsed_s": 0.0087,
+      "index_modes": [],
+      "index_phases_ms": {},
+      "label": "unchanged-status",
+      "stderr_tail": "",
+      "stdout_json": {
+        "diagnostics": [],
+        "evidenceFormat": "terminal-native-graph-v1",
+        "indexedAt": "1791141269793",
+        "revision": {
+          "indexGeneration": "2fb19443-71ee-4b5b-9d43-4c8109a3d4dd",
+          "indexRevision": 2
+        },
+        "stats": {
+          "ambiguous": 0,
+          "calls": 557984,
+          "changedFiles": [],
+          "external": 0,
+          "files": 1000,
+          "internal": 0,
+          "parseErrorFiles": 0,
+          "regions": 160140,
+          "semanticState": "unavailable",
+          "symbols": 217249,
+          "unresolved": 557984
+        },
+        "workspaceRoot": "<private-scratch>/corpus"
+      }
+    }
+  ],
+  "private_home": "<private-scratch>/private-home",
+  "snapshots": [
+    {
+      "binding_sha": [
+        "426e9ebbcdad81fdc0407d321b7fcc957ea794d89aab47f3ee0d287b65dd1a4e",
+        "7b153551bb6e8828a68c2b3aa2abbfd37e6bfefaa75f3edbfbc2d53eaa97610d"
+      ],
+      "documents": 1000,
+      "generation": "2fb19443-71ee-4b5b-9d43-4c8109a3d4dd",
+      "headers": 1,
+      "label": "before-unchanged-serve",
+      "pin": "pin:v1:2fb19443-71ee-4b5b-9d43-4c8109a3d4dd:1",
+      "queue_sha256": "dd2ff3439afd5e3ef9a57d0fa389a8749903a61e7fa9da7604c08e7b10ff54cd",
+      "queue_tables": {
+        "queue_identity": 1,
+        "requests": 1
+      },
+      "revision": 1,
+      "selected_ids_sha256": "cbfee9eee37f284359b359754399fc63d619a78d1ca3d61cf7d533bf4c54e959"
+    },
+    {
+      "binding_sha": [
+        "426e9ebbcdad81fdc0407d321b7fcc957ea794d89aab47f3ee0d287b65dd1a4e",
+        "dacedbefa45e237d879e3a04a3ca4539093a5fb6bd73fd945e76030328a13bdb"
+      ],
+      "documents": 1000,
+      "generation": "2fb19443-71ee-4b5b-9d43-4c8109a3d4dd",
+      "headers": 2,
+      "label": "after-unchanged-serve",
+      "pin": "pin:v1:2fb19443-71ee-4b5b-9d43-4c8109a3d4dd:2",
+      "queue_sha256": "dd2ff3439afd5e3ef9a57d0fa389a8749903a61e7fa9da7604c08e7b10ff54cd",
+      "queue_tables": {
+        "queue_identity": 1,
+        "requests": 1
+      },
+      "revision": 2,
+      "selected_ids_sha256": "cbfee9eee37f284359b359754399fc63d619a78d1ca3d61cf7d533bf4c54e959"
+    },
+    {
+      "binding_sha": [
+        "426e9ebbcdad81fdc0407d321b7fcc957ea794d89aab47f3ee0d287b65dd1a4e",
+        "dacedbefa45e237d879e3a04a3ca4539093a5fb6bd73fd945e76030328a13bdb"
+      ],
+      "documents": 1000,
+      "generation": "2fb19443-71ee-4b5b-9d43-4c8109a3d4dd",
+      "headers": 2,
+      "label": "after-unchanged-status",
+      "pin": "pin:v1:2fb19443-71ee-4b5b-9d43-4c8109a3d4dd:2",
+      "queue_sha256": "dd2ff3439afd5e3ef9a57d0fa389a8749903a61e7fa9da7604c08e7b10ff54cd",
+      "queue_tables": {
+        "queue_identity": 1,
+        "requests": 1
+      },
+      "revision": 2,
+      "selected_ids_sha256": "cbfee9eee37f284359b359754399fc63d619a78d1ca3d61cf7d533bf4c54e959"
+    }
+  ],
+  "workspace": "<private-scratch>/corpus"
+}

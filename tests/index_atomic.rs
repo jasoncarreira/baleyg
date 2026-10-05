@@ -34,6 +34,63 @@ fn projection_fixture() -> (
         .unwrap();
     (state, workspace, store, pin, session)
 }
+#[test]
+fn v8_bootstrap_admits_only_empty_unpublished_evidence() {
+    let (state, workspace) = fixture();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    assert!(store.recorded_index_options().unwrap().is_none());
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready"),
+        "an empty bootstrap must not serve evidence"
+    );
+    let path = index_dir(state.path()).join("index.db");
+    drop(store);
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute(
+        "INSERT INTO native_source_sets(id,root_id) VALUES('forged-bootstrap','forged-root')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let reopened = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(
+        reopened
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index"),
+        "partial v8 bootstrap must fail closed"
+    );
+    assert!(
+        reopened
+            .recorded_index_options()
+            .expect_err("partial bootstrap cannot become an absent-option fallback")
+            .to_string()
+            .contains("partial v8 bootstrap")
+    );
+}
+
+#[test]
+fn published_v8_missing_reconcile_options_never_looks_like_a_bootstrap() {
+    let (state, _workspace, store, pin, _session) = projection_fixture();
+    assert_eq!(store.status().unwrap().revision, pin);
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    db.execute("UPDATE index_metadata SET reconcile_options=NULL", [])
+        .unwrap();
+    assert!(
+        store
+            .recorded_index_options()
+            .expect_err("published v8 cannot omit recorded options")
+            .to_string()
+            .contains("missing reconcile options")
+    );
+}
+
 fn index_dir(state: &Path) -> std::path::PathBuf {
     fs::read_dir(state.join("cache/indexes"))
         .unwrap()
@@ -197,6 +254,63 @@ fn preexisting_corrupt_index_is_not_reinitialized() {
 }
 
 #[test]
+fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recovery() {
+    use baleyg::{index_coordinator::reconcile_workspace, indexer::IndexOptions};
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    let (state, workspace, store, old_pin, session) = projection_fixture();
+    drop(session);
+    drop(store);
+    let dir = index_dir(state.path());
+    let index = dir.join("index.db");
+    let file = fs::OpenOptions::new().write(true).open(&index).unwrap();
+    file.set_len(128).unwrap();
+    drop(file);
+    let old_bytes = fs::read(&index).unwrap();
+    assert_eq!(&old_bytes[..16], b"SQLite format 3\0");
+    assert!(old_bytes.len() > 20);
+    let old_inode = fs::metadata(&index).unwrap().ino();
+
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    assert!(
+        store.status().is_err(),
+        "a damaged published index must not be served"
+    );
+    assert!(
+        store.source_at("flow.js", Some(old_pin)).is_err(),
+        "a damaged source must not be served"
+    );
+    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&index).unwrap().ino(), old_inode);
+    assert!(staged_files(&dir).is_empty());
+
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let failure = reconcile_workspace(&store, &options, &cancelled, |_| {}).unwrap_err();
+    assert!(failure.to_string().contains("cancelled"), "{failure:#}");
+    assert!(store.status().is_err());
+    assert_eq!(fs::read(&index).unwrap(), old_bytes);
+    assert_eq!(fs::metadata(&index).unwrap().ino(), old_inode);
+    assert!(staged_files(&dir).is_empty());
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let (recovered, _session) = reconcile_workspace(&store, &options, &ready, |_| {}).unwrap();
+    assert_eq!(recovered.index_revision, 1);
+    assert_ne!(recovered.index_generation, old_pin.index_generation);
+    assert!(store.source_at("flow.js", Some(old_pin)).is_err());
+    assert!(
+        store
+            .source_at("flow.js", Some(recovered))
+            .unwrap()
+            .is_some()
+    );
+    assert!(staged_files(&dir).is_empty());
+}
+
+#[test]
 fn failed_capture_leaves_existing_index_revision_unchanged() {
     use baleyg::{
         indexer::{IndexOptions, index_workspace},
@@ -333,17 +447,15 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     let index = index_dir(state.path()).join("index.db");
     let persisted_source = || {
         let db = rusqlite::Connection::open(&index).unwrap();
-        let (payload, native_bytes, native_hash): (String, Vec<u8>, String) = db
+        let (native_bytes, native_hash): (Vec<u8>, String) = db
             .query_row(
-                "SELECT f.payload,d.source_bytes,d.content_hash FROM files f JOIN native_documents d ON d.path=f.path WHERE f.path='main.js'",
+                "SELECT v.source_bytes,v.content_hash FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.path='main.js'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         (
-            serde_json::from_str::<baleyg::model::SourceFile>(&payload)
-                .unwrap()
-                .text,
+            String::from_utf8(native_bytes.clone()).unwrap(),
             native_bytes,
             native_hash,
         )
@@ -459,7 +571,16 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         .unwrap();
     assert_eq!(next.index_generation, first.index_generation);
     assert_eq!(next.index_revision, first.index_revision + 1);
-    assert!(store.source_at("main.js", Some(first)).is_err());
+    assert_eq!(
+        store
+            .source_at("main.js", Some(first))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        original,
+        "retained P remains readable after Q publication"
+    );
     assert_eq!(
         store
             .source_at("main.js", Some(next))
@@ -510,19 +631,25 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     let files = db
-        .prepare("SELECT path FROM files ORDER BY path")
+        .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
         .unwrap()
-        .query_map([], |r| r.get::<_, String>(0))
+        .query_map(
+            [format!(
+                "pin:v1:{}:{}",
+                second.index_generation, second.index_revision
+            )],
+            |r| r.get::<_, String>(0),
+        )
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(files, vec!["two.js"]);
     let capture_stat: String = db
         .query_row(
-            "SELECT capture_stat FROM files WHERE path='two.js'",
+            "SELECT capture_stat FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path='two.js'",
             [],
             |r| r.get(0),
         )
@@ -533,7 +660,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
     let package: String = db
         .query_row(
-            "SELECT payload FROM capture_inputs WHERE input_key='config:package.json'",
+            "SELECT payload FROM revision_capture_inputs WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND input_key='config:package.json'",
             [],
             |r| r.get(0),
         )
@@ -544,7 +671,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
     let absent: i64 = db
         .query_row(
-            "SELECT count(*) FROM capture_inputs WHERE payload='{\"state\":\"absent\"}'",
+            "SELECT count(*) FROM revision_capture_inputs WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND payload='{\"state\":\"absent\"}'",
             [],
             |r| r.get(0),
         )
@@ -561,76 +688,110 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     );
 }
 
-#[test]
-fn schema_six_rebuild_is_same_file_with_fresh_generation_and_revision_one() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
-    use std::{
-        os::unix::fs::MetadataExt,
-        sync::{Arc, atomic::AtomicBool},
-    };
-    let (state, workspace) = fixture();
-    fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let options = IndexOptions::new(workspace.path().to_owned());
-    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
-    let session = job.session();
-    let current = job.run(&options, &cancel, |_| {}).unwrap();
-    let path = index_dir(state.path()).join("index.db");
-    let inode = fs::metadata(&path).unwrap().ino();
-    drop(store);
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch(
-        "DROP TABLE capture_inputs;
-        ALTER TABLE files DROP COLUMN capture_stat;
-        ALTER TABLE index_metadata DROP COLUMN reconcile_options;
-        ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
-    )
-    .unwrap();
-    db.execute("UPDATE index_metadata SET schema_version=6", [])
-        .unwrap();
-    db.pragma_update(None, "user_version", 6).unwrap();
-    drop(db);
-
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    assert_eq!(store.index_baseline().unwrap(), current);
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("index_not_ready")
-    );
-    let rebuilt = IndexJobCoordinator::prepare_with_session(&store, Some(current), session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    assert_ne!(rebuilt.index_generation, current.index_generation);
-    assert_eq!(rebuilt.index_revision, 1);
-    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    assert_eq!(store.status().unwrap().revision, rebuilt);
-}
-
-fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
+fn sqlite_snapshot(
+    path: &Path,
+    pin: baleyg::model::IndexPin,
+    normalize_current_publication: bool,
+) -> Vec<(String, Vec<Vec<String>>)> {
     use rusqlite::types::Value;
     let db = rusqlite::Connection::open(path).unwrap();
-    let tables = db
+    let (generation, published_revision, incarnation): (String, i64, String) = db
+        .query_row(
+            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(&generation).is_ok());
+    assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
+    assert_eq!(pin.index_generation.to_string(), generation);
+    if normalize_current_publication {
+        assert_eq!(pin.index_revision as i64, published_revision);
+    }
+    let revision_id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+    let (header_incarnation, header_revision): (String, i64) = db
+        .query_row(
+            "SELECT reconciled_incarnation,published_index_revision FROM native_revisions WHERE id=?1",
+            [&revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(header_revision, pin.index_revision as i64);
+    if normalize_current_publication {
+        assert_eq!(header_incarnation, incarnation);
+    }
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0, "all retained revision FKs must remain valid");
+    let tables: Vec<String> = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
+    assert!(
+        matches!(tables.len(), 28 | 30),
+        "compare exact legacy or extended v8 shape"
+    );
+    if tables.len() == 30 {
+        let (first, bound): (i64, i64) = db
+            .query_row(
+                "SELECT (SELECT first_revision FROM native_binding_epoch),
+                    (SELECT count(*) FROM revision_producer_bindings WHERE revision_id=?1)",
+                [&revision_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            bound,
+            i64::from(pin.index_revision as i64 >= first),
+            "new selected revision must have its own producer consistency binding"
+        );
+    }
     tables
         .into_iter()
+        // Generation-specific control provenance is checked via pinned reads,
+        // not compared to a cold oracle with a different generation UUID.
+        .filter(|table| !matches!(table.as_str(),
+            "native_binding_epoch" | "revision_producer_bindings"))
         .map(|table| {
-            let escaped = table.replace('"', "\"\"");
-            let mut statement = db.prepare(&format!("SELECT * FROM \"{escaped}\"")).unwrap();
+            // Select the complete revision projection, not all archived rows.
+            // Every table remains in the independent cold-source comparison.
+            let (where_clause, alias) = match table.as_str() {
+                "native_revisions" => ("id=?1", ""),
+                "revision_capture_inputs" | "revision_documents" => ("revision_id=?1", ""),
+                "native_source_sets" => ("id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
+                "native_source_set_languages" | "native_source_set_dependencies" =>
+                    ("source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
+                "native_producers" | "native_producer_languages" | "native_producer_inputs" =>
+                    ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)", "producer"),
+                "document_versions" => ("id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "graph_projections" => ("id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "graph_nodes" | "graph_calls" | "graph_regions" =>
+                    ("projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "class_projections" => ("id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                "classes" | "class_relations" =>
+                    ("projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                name if name.starts_with("native_version_") =>
+                    ("version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
+                _ => panic!("unhandled v8 evidence table: {table}"),
+            };
+            // Producer descriptor columns differ: only the parent table uses id/version.
+            let where_clause = if table == "native_producers" {
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)"
+            } else {
+                where_clause
+            };
+            let alias = if alias.is_empty() { "" } else { " selected" };
+            let sql = format!("SELECT * FROM \"{table}\"{alias} WHERE {where_clause}");
+            let mut statement = db.prepare(&sql).unwrap();
             let columns = statement.column_count();
             let mut rows = statement
-                .query_map([], |row| {
+                .query_map([&revision_id], |row| {
                     (0..columns)
                         .map(|column| match row.get::<_, Value>(column)? {
                             Value::Null => Ok("null".to_owned()),
@@ -644,10 +805,661 @@ fn sqlite_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
+            if table == "native_revisions" {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], format!("t:{revision_id}"));
+                assert_eq!(rows[0][8], format!("t:{header_incarnation}"));
+                assert_eq!(rows[0][14], format!("i:{}", pin.index_revision));
+                if normalize_current_publication {
+                    rows[0][0] = "t:<current-pin>".into();
+                    rows[0][8] = "t:<leader-incarnation>".into();
+                    rows[0][14] = "i:<current-revision>".into();
+                }
+            } else if matches!(table.as_str(), "revision_capture_inputs" | "revision_documents") {
+                for row in &mut rows {
+                    assert_eq!(row[0], format!("t:{revision_id}"));
+                    if normalize_current_publication {
+                        row[0] = "t:<current-pin>".into();
+                    }
+                }
+            }
             rows.sort();
             (table, rows)
         })
         .collect()
+}
+
+#[test]
+fn parse_error_retained_pin_matches_independent_cold_and_advisory_uses_exact_token() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+        native_evidence::DocumentKey,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let (state, workspace) = fixture();
+    let root = workspace.path();
+    let source = "function foo() { return 1; } function caller() { obj.foo(); obj.foo.bar(); }\n";
+    fs::write(root.join("calls.js"), source).unwrap();
+    fs::write(root.join("broken.js"), "function sound() {}\n").unwrap();
+    let options = IndexOptions::new(root.to_owned());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), root).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let before = job.run(&options, &cancel, |_| {}).unwrap();
+    let path = index_dir(state.path()).join("index.db");
+    let old_rows = sqlite_snapshot(&path, before, false);
+    let old_graph = store.graph_at(Some(before)).unwrap();
+
+    // The changed document has a genuine parser error. A new isolated index in
+    // this SAME workspace is the independent full-native oracle, never a copied F.
+    fs::write(root.join("broken.js"), "function broken( {\n").unwrap();
+    let parsed = IndexJobCoordinator::prepare_with_session(&store, Some(before), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(sqlite_snapshot(&path, before, false), old_rows);
+    assert_eq!(store.graph_at(Some(before)).unwrap(), old_graph);
+    let parsed_graph = store.graph_at(Some(parsed)).unwrap();
+    assert!(parsed_graph.stats.parse_error_files > 0);
+    let parsed_classes =
+        serde_json::to_value(store.classes_at(None, "", Some(parsed), 0, 100).unwrap()).unwrap();
+
+    // #22 advisory is only this same-pin native primitive, never a binding.
+    // Compare actual captured token bytes, then exact language/source-set key.
+    let key = DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "javascript".into(),
+        path: "calls.js".into(),
+    };
+    let selected = store.native_source_at(parsed, &key).unwrap().unwrap();
+    let captured = std::str::from_utf8(&selected.1).unwrap();
+    let coverage = store.native_coverage_at(parsed, &key).unwrap().unwrap();
+    let owners = store
+        .native_declarations_at(parsed, "javascript", "caller")
+        .unwrap();
+    assert_eq!(owners.len(), 1);
+    let calls = store.native_calls_at(parsed, &owners[0].syntax_id).unwrap();
+    let positive = calls
+        .iter()
+        .find(|call| &captured[call.range.start..call.range.end] == "obj.foo()")
+        .expect("positive captured call");
+    let token = positive
+        .callee_range
+        .as_ref()
+        .expect("exact identifier range");
+    assert_eq!(&captured[token.start..token.end], "foo");
+    assert_eq!(positive.spelling.as_deref(), Some("foo"));
+    let candidates = store
+        .native_declarations_at(parsed, "javascript", "foo")
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].document.source_set_id, key.source_set_id);
+    assert_eq!(candidates[0].document.language, key.language);
+    assert_eq!(positive.revision_id, coverage.revision_id);
+    assert_eq!(candidates[0].revision_id, coverage.revision_id);
+    assert!(positive.provenance_id.starts_with("native-proof:v1:"));
+    assert!(candidates[0].provenance_id.starts_with("native-proof:v1:"));
+
+    let compound = calls
+        .iter()
+        .find(|call| &captured[call.range.start..call.range.end] == "obj.foo.bar()")
+        .expect("compound captured call");
+    let compound_token = compound
+        .callee_range
+        .as_ref()
+        .expect("terminal identifier range");
+    assert_eq!(&captured[compound_token.start..compound_token.end], "bar");
+    assert_ne!(
+        &captured[compound_token.start..compound_token.end],
+        "obj.foo.bar"
+    );
+    assert!(
+        store
+            .native_declarations_at(parsed, "javascript", "bar")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .native_declarations_at(parsed, "javascript", "obj.foo.bar")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(compound.revision_id, coverage.revision_id);
+
+    // A fresh independent full build shares the captured workspace root but not
+    // state or stored native/class/graph projections. Taking its leader lock can
+    // retire the first store's public reader; collect those DTOs above first.
+    let cold_state = tempfile::tempdir().unwrap();
+    fs::set_permissions(cold_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let cold = Store::open_for_tests(cold_state.path(), root).unwrap();
+    let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+    let _cold_session = cold_job.session();
+    let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+    assert_eq!(
+        sqlite_snapshot(&path, parsed, true),
+        sqlite_snapshot(
+            &index_dir(cold_state.path()).join("index.db"),
+            cold_pin,
+            true
+        ),
+        "all 28 selected v8 evidence tables: source/hash, revision, coverage, provenance, IDs, ordered native children, graph, class/warnings/truncated"
+    );
+    assert_eq!(sqlite_snapshot(&path, before, false), old_rows);
+    assert_eq!(parsed_graph, cold.graph_at(Some(cold_pin)).unwrap());
+    let mut cold_classes =
+        serde_json::to_value(cold.classes_at(None, "", Some(cold_pin), 0, 100).unwrap()).unwrap();
+    let mut parsed_classes = parsed_classes;
+    assert_eq!(
+        parsed_classes["revision"]["indexRevision"],
+        parsed.index_revision
+    );
+    assert_eq!(
+        cold_classes["revision"]["indexRevision"],
+        cold_pin.index_revision
+    );
+    parsed_classes.as_object_mut().unwrap().remove("revision");
+    cold_classes.as_object_mut().unwrap().remove("revision");
+    assert_eq!(parsed_classes, cold_classes);
+    assert_eq!(
+        selected.1,
+        cold.native_source_at(cold_pin, &key).unwrap().unwrap().1
+    );
+    assert_eq!(
+        coverage,
+        cold.native_coverage_at(cold_pin, &key).unwrap().unwrap()
+    );
+    let cold_owner = cold
+        .native_declarations_at(cold_pin, "javascript", "caller")
+        .unwrap();
+    assert_eq!(owners, cold_owner);
+    assert_eq!(
+        calls,
+        cold.native_calls_at(cold_pin, &cold_owner[0].syntax_id)
+            .unwrap()
+    );
+    assert_eq!(
+        candidates,
+        cold.native_declarations_at(cold_pin, "javascript", "foo")
+            .unwrap()
+    );
+    assert!(
+        cold.native_declarations_at(cold_pin, "javascript", "bar")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn new_producer_binding_refuses_unilateral_executable_header_and_binding_tamper() {
+    for (label, sql) in [
+        (
+            "executable capture",
+            "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash',printf('%064d',0)) WHERE input_key LIKE 'executable:%'",
+        ),
+        (
+            "selector capture",
+            "UPDATE revision_capture_inputs SET payload=(SELECT payload FROM revision_capture_inputs WHERE input_key LIKE 'executable:%' LIMIT 1) WHERE input_key='toolchain:rust-toolchain.toml'",
+        ),
+        (
+            "revision header",
+            "UPDATE native_revisions SET toolchain_hash=printf('%064d',0)",
+        ),
+        (
+            "binding digest",
+            "UPDATE revision_producer_bindings SET binding_sha=printf('%064d',0)",
+        ),
+        ("missing binding", "DELETE FROM revision_producer_bindings"),
+    ] {
+        let (state, _workspace, store, pin, _session) = projection_fixture();
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        assert_eq!(
+            db.execute(sql, []).unwrap(),
+            1,
+            "{label}: mutate exactly one valid row"
+        );
+        drop(db);
+        let err = store.graph_at(Some(pin)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("incompatible_index"),
+            "{label}: {err:#}"
+        );
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        let (generation, revision): (String, i64) = db
+            .query_row(
+                "SELECT index_generation,index_revision FROM index_metadata",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (generation, revision),
+            (pin.index_generation.to_string(), pin.index_revision as i64),
+            "{label}: refusal cannot rotate or publish a new generation"
+        );
+    }
+}
+
+#[test]
+fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    fs::write(
+        workspace.path().join("A.java"),
+        "class A { int method() { return 1; } }\n",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let session = store.leader_session().unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let first = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let legacy_source = store.source_at("A.java", Some(first)).unwrap().unwrap().1;
+    let _queued = store.enqueue_request(&options, None).unwrap();
+    let db_path = index_dir(state.path()).join("index.db");
+    let queue_path = index_dir(state.path()).join("requests.db");
+    let queue_before = fs::read(&queue_path).unwrap();
+    // Fixture models an index persisted by the shipped v8 code before this
+    // additive extension. No evidence, generation, source or queue is rebuilt.
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("DROP TABLE revision_producer_bindings; DROP TABLE native_binding_epoch;")
+        .unwrap();
+    drop(db);
+    assert_eq!(
+        store.source_at("A.java", Some(first)).unwrap().unwrap().1,
+        legacy_source
+    );
+    let generation = first.index_generation;
+    fs::write(
+        workspace.path().join("A.java"),
+        "class A { int method() { return 2; } }\n",
+    )
+    .unwrap();
+    let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(second.index_generation, generation);
+    assert_eq!(second.index_revision, first.index_revision + 1);
+    assert_eq!(
+        store.source_at("A.java", Some(first)).unwrap().unwrap().1,
+        legacy_source
+    );
+    assert!(
+        store
+            .source_at("A.java", Some(second))
+            .unwrap()
+            .unwrap()
+            .1
+            .text
+            .contains("return 2")
+    );
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    let (bound, epoch): (i64, i64) = db
+        .query_row(
+            "SELECT (SELECT count(*) FROM revision_producer_bindings),
+                (SELECT first_revision FROM native_binding_epoch)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((bound, epoch), (1, second.index_revision as i64));
+    assert_eq!(
+        fs::read(queue_path).unwrap(),
+        queue_before,
+        "producer binding upgrade must not touch durable requests.db"
+    );
+    // Legacy selected pins still reject a one-sided captured executable SHA
+    // forgery by comparing it with their immutable generation-origin marker.
+    let old_key = format!("pin:v1:{}:{}", first.index_generation, first.index_revision);
+    assert_eq!(db.execute(
+        "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash',printf('%064d',0))
+         WHERE revision_id=?1 AND input_key LIKE 'executable:%'", [&old_key]).unwrap(),1);
+    drop(db);
+    let err = store.source_at("A.java", Some(first)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("incompatible_index"),
+        "legacy pin: {err:#}"
+    );
+}
+
+#[test]
+fn document_local_delta_and_cross_file_fallback_match_independent_cold_publications() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let padding = "x".repeat(145_000);
+    let js = |value: &str, name: &str| {
+        format!(
+            "function {name}() {{ return {value}; /*{padding}*/ }}\nfunction checked() {{ const local=1, other=2; return local+other; }}\n"
+        )
+    };
+    for (name, source) in [
+        ("local.js", js("1", "local")),
+        (
+            "A.java",
+            format!(
+                "class A {{ int run() {{ return 1; /*{padding}*/ }} int checked() {{ int local=1, other=2; return local+other; }} }}\n"
+            ),
+        ),
+        (
+            "run.py",
+            format!(
+                "class A:\n    def run(self):\n        return 1\n        # {padding}\n    def checked(self):\n        local=1; other=2\n        return local+other\n"
+            ),
+        ),
+        (
+            "run.rs",
+            format!(
+                "fn run()->i32 {{ return 1; /*{padding}*/ }}\nfn checked()->i32 {{ let local=1; let other=2; return local+other; }}\n"
+            ),
+        ),
+    ] {
+        assert!(source.len() > 50_000);
+        fs::write(workspace.path().join(name), source).unwrap();
+    }
+    assert!(
+        fs::read_dir(workspace.path())
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum::<u64>()
+            > 500_000
+    );
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
+    let old_source = store.source_at("local.js", Some(first)).unwrap().unwrap().1;
+    let old_graph = serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap();
+    let old_classes = serde_json::to_value(
+        store
+            .classes_at(Some("A.java"), "", Some(first), 0, 100)
+            .unwrap(),
+    )
+    .unwrap();
+    let old_declarations = serde_json::to_value(
+        store
+            .native_declarations_at(first, "javascript", "local")
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(workspace.path().join("local.js"), js("2", "local")).unwrap();
+    let local_phases = std::sync::Mutex::new(Vec::new());
+    let local = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |progress| {
+            local_phases.lock().unwrap().push(progress.phase)
+        })
+        .unwrap_or_else(|error| panic!("local publication: {error:#}"));
+    let local_phases = local_phases.into_inner().unwrap();
+    assert!(
+        local_phases.iter().any(|phase| phase == "mode:local"),
+        "a successful local edit must take the measured local branch: {local_phases:?}"
+    );
+    assert_eq!(
+        store.source_at("local.js", Some(first)).unwrap().unwrap().1,
+        old_source
+    );
+    assert_eq!(
+        serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap(),
+        old_graph
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .classes_at(Some("A.java"), "", Some(first), 0, 100)
+                .unwrap()
+        )
+        .unwrap(),
+        old_classes
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .native_declarations_at(first, "javascript", "local")
+                .unwrap()
+        )
+        .unwrap(),
+        old_declarations
+    );
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    for path in ["A.java", "run.py", "run.rs"] {
+        let version = |pin: baleyg::model::IndexPin| -> String {
+            db.query_row(
+            "SELECT document_version_id FROM revision_documents WHERE revision_id=?1 AND path=?2",
+            rusqlite::params![format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision),path],|r|r.get(0)).unwrap()
+        };
+        assert_eq!(
+            version(first),
+            version(local),
+            "{path}: unchanged native version must be reused"
+        );
+    }
+    drop(db);
+    let compare_cold = |pin| {
+        let fresh_state = tempfile::tempdir().unwrap();
+        fs::set_permissions(fresh_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let cold = Store::open_for_tests(fresh_state.path(), workspace.path()).unwrap();
+        let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+        let _cold_session = cold_job.session();
+        let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+        assert_eq!(
+            sqlite_snapshot(&index_dir(state.path()).join("index.db"), pin, true),
+            sqlite_snapshot(
+                &index_dir(fresh_state.path()).join("index.db"),
+                cold_pin,
+                true
+            )
+        );
+        assert_eq!(
+            store.graph_at(Some(pin)).unwrap().nodes,
+            cold.graph().unwrap().nodes
+        );
+    };
+    compare_cold(local);
+    let mut latest = local;
+    for path in ["A.java", "run.py", "run.rs", "local.js"] {
+        let source = fs::read_to_string(workspace.path().join(path)).unwrap();
+        let edited =
+            source
+                .replacen("return 1", "return 10000", 1)
+                .replacen("return 2", "return 10000", 1);
+        assert_ne!(source, edited, "{path}: real length-changing body edit");
+        fs::write(workspace.path().join(path), edited).unwrap();
+        let phases = std::sync::Mutex::new(Vec::new());
+        let next = IndexJobCoordinator::prepare_with_session(&store, Some(latest), session.clone())
+            .unwrap()
+            .run(&options, &cancel, |progress| {
+                phases.lock().unwrap().push(progress.phase)
+            })
+            .unwrap_or_else(|error| panic!("{path}: local length edit: {error:#}"));
+        let phases = phases.into_inner().unwrap();
+        assert!(
+            phases.contains(&"mode:local".to_owned()),
+            "{path}: a method/function-body edit must stay local: {phases:?}"
+        );
+        compare_cold(next);
+        latest = next;
+    }
+    // Locally bound return identifiers are nonnumeric body edits. The complete
+    // persisted graph, references, native facts, classes and F must equal an
+    // independent same-root FULL cold publication for every changed language.
+    for path in ["A.java", "run.py", "run.rs", "local.js"] {
+        let source = fs::read_to_string(workspace.path().join(path)).unwrap();
+        let edited = source.replacen("return local+other", "return other+other", 1);
+        assert_ne!(source, edited, "{path}: real nonnumeric body edit");
+        fs::write(workspace.path().join(path), edited).unwrap();
+        let phases = std::sync::Mutex::new(Vec::new());
+        let next = IndexJobCoordinator::prepare_with_session(&store, Some(latest), session.clone())
+            .unwrap()
+            .run(&options, &cancel, |progress| {
+                phases.lock().unwrap().push(progress.phase)
+            })
+            .unwrap_or_else(|error| panic!("{path}: local nonnumeric edit: {error:#}"));
+        let phases = phases.into_inner().unwrap();
+        assert!(
+            phases.contains(&"mode:local".to_owned()),
+            "{path}: a local-binding return edit must stay local: {phases:?}"
+        );
+        compare_cold(next);
+        latest = next;
+    }
+    fs::write(workspace.path().join("local.js"), js("2", "renamed")).unwrap();
+    let fallback = IndexJobCoordinator::prepare_with_session(&store, Some(latest), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(
+        store.source_at("local.js", Some(first)).unwrap().unwrap().1,
+        old_source
+    );
+    assert_eq!(
+        serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap(),
+        old_graph
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .classes_at(Some("A.java"), "", Some(first), 0, 100)
+                .unwrap()
+        )
+        .unwrap(),
+        old_classes
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .native_declarations_at(first, "javascript", "local")
+                .unwrap()
+        )
+        .unwrap(),
+        old_declarations
+    );
+    compare_cold(fallback);
+}
+
+#[test]
+fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    for (family, mutation) in [
+        (
+            "native",
+            "UPDATE native_version_declarations SET name='forged' WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND name='A'",
+        ),
+        (
+            "graph",
+            "UPDATE graph_nodes SET payload=json_set(payload,'$.name','forged') WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
+        ),
+        (
+            "class",
+            "UPDATE classes SET payload=json_set(payload,'$.qualifiedName','forged') WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM classes WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
+        ),
+        (
+            "file-extraction",
+            "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1)",
+        ),
+        (
+            "source-set",
+            "UPDATE revision_documents SET source_set_id='forged-source-set' WHERE path='A.java'",
+        ),
+    ] {
+        let (state, workspace) = fixture();
+        fs::write(
+            workspace.path().join("local.js"),
+            "function local() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("A.java"),
+            "class A { int run() { return 1; } }\n",
+        )
+        .unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = job.session();
+        let first = job.run(&options, &cancel, |_| {}).unwrap();
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        if family == "source-set" {
+            // This adversarial row violates the composite document-version FK;
+            // all existing graph/native/class forgeries above remain FK-valid.
+            db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        }
+        assert_eq!(
+            db.execute(mutation, []).unwrap(),
+            1,
+            "{family}: corrupt one real row"
+        );
+        drop(db);
+        fs::write(
+            workspace.path().join("local.js"),
+            "function local() { return 2; }\n",
+        )
+        .unwrap();
+        let publication =
+            IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+                .unwrap()
+                .run(&options, &cancel, |_| {});
+        match publication {
+            Ok(second) => {
+                assert_eq!(
+                    second.index_revision,
+                    first.index_revision + 1,
+                    "{family}: only complete publications advance the pin"
+                );
+                let selected = match family {
+                    "native" => store
+                        .native_declarations_at(second, "java", "A")
+                        .map(|_| ())
+                        .unwrap_err(),
+                    "graph" => store.graph_at(Some(second)).map(|_| ()).unwrap_err(),
+                    "class" | "file-extraction" => store
+                        .classes_at(Some("A.java"), "", Some(second), 0, 10)
+                        .map(|_| ())
+                        .unwrap_err(),
+                    "source-set" => panic!("source-set mismatch must fail before commit"),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    selected.to_string().contains("incompatible_index"),
+                    "{family}: selected-read attestation must refuse forgery: {selected:#}"
+                );
+            }
+            Err(failure) => {
+                assert!(
+                    failure.to_string().contains("incompatible_index"),
+                    "{family}: {failure:#}"
+                );
+                let db =
+                    rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+                let revision: i64 = db
+                    .query_row("SELECT index_revision FROM index_metadata", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    revision, first.index_revision as i64,
+                    "{family}: precommit refusal leaves complete old pin"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -662,6 +1474,10 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         ("delete.js", "function deleted() {}\n"),
         ("rename-old.js", "function renamed() {}\n"),
         ("ignored.js", "function admittedAfterRuleChange() {}\n"),
+        (
+            "Witness.java",
+            "class Witness { void retained() { measured(); } }\n",
+        ),
     ] {
         fs::write(workspace.path().join(name), source).unwrap();
     }
@@ -674,10 +1490,29 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(workspace.path().to_owned());
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let first = IndexJobCoordinator::prepare(&store, None)
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
+    let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let leader_session = first_job.session();
+    let first = first_job.run(&options, &cancel, |_| {}).unwrap();
+    let reconciled_path = index_dir(state.path()).join("index.db");
+    let retained_first = sqlite_snapshot(&reconciled_path, first, false);
+    for table in [
+        "document_versions",
+        "graph_projections",
+        "class_projections",
+        "native_version_declarations",
+        "graph_nodes",
+        "classes",
+    ] {
+        assert!(
+            !retained_first
+                .iter()
+                .find(|(name, _)| name == table)
+                .unwrap()
+                .1
+                .is_empty(),
+            "{table} fixture must be nonempty"
+        );
+    }
 
     fs::write(
         workspace.path().join("keep.js"),
@@ -697,23 +1532,87 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
         "{\"name\":\"after!\"}\n",
     )
     .unwrap();
-    IndexJobCoordinator::prepare(&store, Some(first))
-        .unwrap()
-        .run(&options, &cancel, |_| {})
+    let second =
+        IndexJobCoordinator::prepare_with_session(&store, Some(first), leader_session.clone())
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+    assert_eq!(second.index_generation, first.index_generation);
+    assert_eq!(second.index_revision, first.index_revision + 1);
+    assert_eq!(store.status().unwrap().revision, second);
+    assert_eq!(
+        sqlite_snapshot(&reconciled_path, first, false),
+        retained_first,
+        "r1 full evidence must remain immutable after r2"
+    );
+    let r2 = sqlite_snapshot(&reconciled_path, second, true);
+    let paths = |snapshot: &Vec<(String, Vec<Vec<String>>)>| -> std::collections::BTreeSet<String> {
+        snapshot
+            .iter()
+            .find(|(table, _)| table == "revision_documents")
+            .unwrap()
+            .1
+            .iter()
+            .map(|row| row[3].clone())
+            .collect()
+    };
+    let first_paths = paths(&retained_first);
+    let second_paths = paths(&r2);
+    assert!(first_paths.contains("t:delete.js") && first_paths.contains("t:rename-old.js"));
+    assert!(
+        second_paths.contains("t:added.rs")
+            && second_paths.contains("t:rename-new.js")
+            && second_paths.contains("t:ignored.js")
+            && !second_paths.contains("t:delete.js")
+            && !second_paths.contains("t:rename-old.js")
+    );
+    let db = rusqlite::Connection::open(&reconciled_path).unwrap();
+    let headers: i64 = db
+        .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
         .unwrap();
+    assert_eq!(headers, 2, "r1 and r2 headers survive");
+    for pin in [first, second] {
+        let id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        for table in ["revision_documents", "revision_capture_inputs"] {
+            let count: i64 = db
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE revision_id=?1"),
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(count > 0, "{table}: complete {id} evidence must remain");
+        }
+    }
+    assert_eq!(
+        store
+            .source_at("delete.js", Some(first))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function deleted() {}\n"
+    );
+    assert!(
+        store
+            .source_at("delete.js", Some(second))
+            .unwrap()
+            .is_none()
+    );
+    drop(db);
 
     let fresh_state = tempfile::tempdir().unwrap();
     fs::set_permissions(fresh_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let fresh = Store::open_for_tests(fresh_state.path(), workspace.path()).unwrap();
-    IndexJobCoordinator::prepare(&fresh, None)
+    let cold_pin = IndexJobCoordinator::prepare(&fresh, None)
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
-    let reconciled_path = index_dir(state.path()).join("index.db");
     let fresh_path = index_dir(fresh_state.path()).join("index.db");
     assert_eq!(
-        sqlite_snapshot(&reconciled_path),
-        sqlite_snapshot(&fresh_path)
+        r2,
+        sqlite_snapshot(&fresh_path, cold_pin, true),
+        "current r2 must equal a full independent cold build, including every selected v8 table"
     );
     let metadata = |path: &Path| {
         let db = rusqlite::Connection::open(path).unwrap();
@@ -757,7 +1656,7 @@ fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
         let db = rusqlite::Connection::open(&path).unwrap();
         let payload: String = db
             .query_row(
-                "SELECT capture_stat FROM files WHERE path='same.js'",
+                "SELECT capture_stat FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path='same.js'",
                 [],
                 |row| row.get(0),
             )
@@ -840,11 +1739,16 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     drop(store);
 
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='obsolete-extractor'",
-        [],
-    )
-    .unwrap();
+    assert!(
+        db.execute(
+            "UPDATE index_metadata SET extractor_version='obsolete-extractor'",
+            []
+        )
+        .is_err(),
+        "v8 metadata must physically forbid unsupported extractor markers"
+    );
+    db.execute("UPDATE index_metadata SET stats='not-json'", [])
+        .unwrap();
     drop(db);
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     assert!(
@@ -865,7 +1769,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
 
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE files SET payload='not-json' WHERE path='one.js'",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
         [],
     )
     .unwrap();
@@ -920,11 +1824,11 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     assert!(failure.to_string().contains("cancelled"));
     let db = rusqlite::Connection::open(&path).unwrap();
     let malformed: String = db
-        .query_row("SELECT payload FROM files WHERE path='one.js'", [], |row| {
+        .query_row("SELECT hex(source_bytes) FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(malformed, "not-json");
+    assert_eq!(malformed, "FF");
     drop(db);
     assert!(store.status().is_err());
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
@@ -945,14 +1849,14 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let db = rusqlite::Connection::open(&path).unwrap();
     let (syntax_id, lookup_key): (String, String) = db
         .query_row(
-            "SELECT syntax_id,lookup_key FROM native_declarations WHERE lookup_key IS NOT NULL AND language='javascript' ORDER BY syntax_id LIMIT 1",
+            "SELECT d.syntax_id,d.lookup_key FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id WHERE d.lookup_key IS NOT NULL AND v.language='javascript' ORDER BY d.syntax_id LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE native_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=?1",
+            "UPDATE native_version_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=?1",
             [&syntax_id],
         )
         .unwrap(),
@@ -979,7 +1883,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let db = rusqlite::Connection::open(&path).unwrap();
     let stored_type: String = db
         .query_row(
-            "SELECT typeof(key_ordinal) FROM native_declarations WHERE syntax_id=?1",
+            "SELECT typeof(key_ordinal) FROM native_version_declarations WHERE syntax_id=?1",
             [&syntax_id],
             |row| row.get(0),
         )
@@ -1127,18 +2031,24 @@ fn exceptional_format_is_typed_deferred_refusal_without_file_mutation() {
 }
 
 #[test]
-fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_state() {
+fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state() {
     use baleyg::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
     use std::sync::{Arc, atomic::AtomicBool};
     for mutation in [
-        "DELETE FROM capture_inputs WHERE input_key='config:package.json'",
-        "INSERT INTO capture_inputs(input_key,payload) VALUES('unknown:slot','{\"state\":\"absent\"}')",
+        "DELETE FROM revision_capture_inputs WHERE input_key='config:package.json'",
+        "INSERT INTO revision_capture_inputs(revision_id,input_key,payload) SELECT id,'unknown:slot','{\"state\":\"absent\"}' FROM native_revisions WHERE published_index_revision=(SELECT index_revision FROM index_metadata)",
         "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',2)",
+        "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash','invalid-digest') WHERE input_key='config:package.json'",
     ] {
         let (state, workspace) = fixture();
         fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
+        fs::write(
+            workspace.path().join("package.json"),
+            b"{\"name\":\"capture-fixture\"}",
+        )
+        .unwrap();
         let scip = workspace.path().join("labels.scip");
         let manifest = workspace.path().join("labels.json");
         fs::write(&scip, b"captured presentation bytes").unwrap();
@@ -1155,6 +2065,10 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         drop(store);
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(mutation).unwrap();
+        assert!(
+            db.changes() == 1,
+            "inventory mutation must touch exactly one row: {mutation}"
+        );
         drop(db);
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
         assert!(
@@ -1171,7 +2085,7 @@ fn schema_seven_inventory_validation_rejects_missing_unknown_and_unsupported_sta
         assert_eq!(store.status().unwrap().revision, repaired);
         let db = rusqlite::Connection::open(&path).unwrap();
         let keys = db
-            .prepare("SELECT input_key FROM capture_inputs ORDER BY input_key")
+            .prepare("SELECT input_key FROM revision_capture_inputs ORDER BY input_key")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
@@ -1191,7 +2105,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
-        "UPDATE files SET payload='not-json' WHERE path='flow.js'",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
     )
     .unwrap();
@@ -1213,7 +2127,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
-        "UPDATE nodes SET payload='not-json' WHERE path='flow.js'",
+        "UPDATE graph_nodes SET payload='not-json' WHERE path='flow.js'",
         [],
     )
     .unwrap();
@@ -1236,7 +2150,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         let clone = store.clone();
         let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
         db.execute(
-            "UPDATE nodes SET payload=?1 WHERE path='flow.js'",
+            "UPDATE graph_nodes SET payload=?1 WHERE path='flow.js'",
             [payload],
         )
         .unwrap();
@@ -1254,16 +2168,26 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         );
     }
 
-    // A valid selected file JSON value with a non-string language is a typed
-    // SQLite extraction conversion, not a generic SQLITE_ERROR.
+    // The selected source's bytes remain the same, but storing them as TEXT
+    // instead of BLOB must produce a typed conversion refusal. No FK or CHECK
+    // is disabled: the source hash and declared byte length still match.
     let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    db.execute(
-        "UPDATE files SET payload=json_set(payload,'$.language',7) WHERE path='flow.js'",
+    assert_eq!(
+        db.execute(
+            "UPDATE document_versions SET source_bytes=CAST(source_bytes AS TEXT) WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+            [],
+        )
+        .unwrap(),
+        1
+    );
+    let storage_class: String = db.query_row(
+        "SELECT typeof(source_bytes) FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
-    )
-    .unwrap();
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(storage_class, "text");
     let error = store.files_at(Some(pin), 0, 10).unwrap_err();
     assert!(
         error.to_string().contains("incompatible_index"),
@@ -1282,7 +2206,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
-        "UPDATE nodes SET payload='not-json' WHERE path='flow.js'",
+        "UPDATE graph_nodes SET payload='not-json' WHERE path='flow.js'",
         [],
     )
     .unwrap();
@@ -1344,7 +2268,7 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
     let inode = fs::metadata(&path).unwrap().ino();
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE files SET payload='not-json' WHERE path='flow.js'",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
         [],
     )
     .unwrap();
@@ -1405,121 +2329,6 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
     assert_eq!(
         store.files_at(Some(recovered), 0, 10).unwrap()["items"][0]["path"],
         "flow.js"
-    );
-}
-
-#[test]
-fn metadata_schema_marker_mismatch_rebuilds_with_valid_pin_same_inode() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
-    use std::{
-        os::unix::fs::MetadataExt,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-    };
-
-    let (state, workspace, initial, old, session) = projection_fixture();
-    let path = index_dir(state.path()).join("index.db");
-    let inode = fs::metadata(&path).unwrap().ino();
-    drop(initial);
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE index_metadata SET schema_version=6", [])
-        .unwrap();
-    drop(db);
-
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let clone = store.clone();
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-    assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-    assert_eq!(store.index_baseline().unwrap(), old);
-
-    let stale =
-        IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone()).unwrap();
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='changed-after-admission'",
-        [],
-    )
-    .unwrap();
-    drop(db);
-    let error = stale
-        .run(
-            &IndexOptions::new(workspace.path().to_owned()),
-            &Arc::new(AtomicBool::new(false)),
-            |_| {},
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("revision conflict"), "{error:#}");
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
-        "UPDATE index_metadata SET extractor_version='native-paired-v1'",
-        [],
-    )
-    .unwrap();
-    drop(db);
-
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
-    let error = IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
-        .unwrap()
-        .run(
-            &IndexOptions::new(workspace.path().to_owned()),
-            &cancel,
-            |_| {},
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("cancelled"), "{error:#}");
-    let db = rusqlite::Connection::open(&path).unwrap();
-    assert_eq!(
-        db.query_row("SELECT schema_version FROM index_metadata", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        6
-    );
-    drop(db);
-    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-
-    cancel.store(false, Ordering::Release);
-    let recovered = IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
-        .unwrap()
-        .run(
-            &IndexOptions::new(workspace.path().to_owned()),
-            &cancel,
-            |_| {},
-        )
-        .unwrap();
-    assert_eq!(recovered.index_revision, 1);
-    assert_ne!(recovered.index_generation, old.index_generation);
-    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
-    assert_eq!(store.status().unwrap().revision, recovered);
-    assert_eq!(clone.status().unwrap().revision, recovered);
-    assert!(
-        IndexJobCoordinator::prepare_with_session(&store, Some(old), session.clone())
-            .err()
-            .expect("old pin must conflict")
-            .to_string()
-            .contains("revision conflict")
     );
 }
 
@@ -1854,7 +2663,7 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
+        "UPDATE revision_capture_inputs SET payload='not-json' WHERE input_key='root:.'",
         [],
     )
     .unwrap();
@@ -1881,7 +2690,7 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
     let path = index_dir(state.path()).join("index.db");
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE capture_inputs SET input_key='unexpected:role' WHERE input_key='root:.'",
+        "UPDATE revision_capture_inputs SET input_key='unexpected:role' WHERE input_key='root:.'",
         [],
     )
     .unwrap();
@@ -2056,7 +2865,7 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
     for sql in [
         "UPDATE index_metadata SET stats='not-json'",
         "UPDATE index_metadata SET index_revision=CAST(1.5 AS REAL)",
-        "UPDATE capture_inputs SET payload='not-json' WHERE input_key='root:.'",
+        "UPDATE revision_capture_inputs SET payload='not-json' WHERE input_key='root:.'",
     ] {
         let (state, _workspace, store, pin, _session) = projection_fixture();
         let clone = store.clone();
@@ -2076,6 +2885,772 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
                 .to_string()
                 .contains("incompatible_index"),
             "{sql}"
+        );
+    }
+}
+
+#[test]
+fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinates() {
+    use baleyg::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{CancelFlag, SymbolKind},
+    };
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let java = "/*é*/ class A {}\n";
+    let python = "class P: pass\n";
+    fs::write(workspace.path().join("A.java"), java).unwrap();
+    fs::write(workspace.path().join("a.py"), python).unwrap();
+    fs::write(workspace.path().join("a.js"), "class J {}\n").unwrap();
+    fs::write(workspace.path().join("a.rs"), "struct R {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let scip = state.path().join("labels.scip");
+    let manifest = state.path().join("labels.json");
+    let mut options = IndexOptions::new(workspace.path().to_owned());
+    options.scip_path = Some(scip.clone());
+    options.manifest_path = Some(manifest.clone());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let occurrences = |version: &str| {
+        let mut index = scip::types::Index::new();
+        for (path, range, name) in [
+            ("A.java", vec![0, 12, 13], "A"), // default UTF-16; UTF-8 byte columns are 13..14.
+            ("a.py", vec![0, 6, 7], "P"),
+            ("a.js", vec![0, 6, 7], "J"),
+            ("a.rs", vec![0, 7, 8], "R"),
+        ] {
+            let mut doc = scip::types::Document::new();
+            doc.relative_path = path.into();
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = range;
+            occurrence.symbol_roles = 1;
+            occurrence.symbol = format!("scip {version} {name}");
+            doc.occurrences.push(occurrence);
+            index.documents.push(doc);
+        }
+        index
+    };
+    let correct_hashes = serde_json::json!({
+        "A.java":hex::encode(Sha256::digest(java.as_bytes())),
+        "a.py":hex::encode(Sha256::digest(python.as_bytes())),
+        "a.js":hex::encode(Sha256::digest(b"class J {}\n")),
+        "a.rs":hex::encode(Sha256::digest(b"struct R {}\n")),
+    });
+    let run = |index: &scip::types::Index, hashes: &serde_json::Value| {
+        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
+        fs::write(&manifest, serde_json::to_vec(hashes).unwrap()).unwrap();
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
+    };
+    let valid = occurrences("valid");
+    let (baseline, base_native, _) = run(&valid, &correct_hashes);
+    let node = |graph: &baleyg::model::Graph, path: &str, name: &str| {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.path == path && n.name == name && n.kind == SymbolKind::Class)
+            .unwrap()
+            .clone()
+    };
+    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
+        assert_eq!(
+            node(&baseline, path, name).display_label.as_deref(),
+            Some(format!("scip valid {name}").as_str())
+        );
+    }
+    assert!(
+        baseline
+            .nodes
+            .iter()
+            .filter(|n| n.path == "a.rs")
+            .all(|n| n.display_label.is_none())
+    );
+    let baseline_ids: Vec<_> = baseline
+        .nodes
+        .iter()
+        .map(|n| (&n.id, &n.provenance))
+        .collect();
+    for scenario in [
+        "stale-manifest",
+        "missing-manifest",
+        "wrong-range",
+        "wrong-name",
+        "reference-role",
+        "duplicate",
+        "ambiguous-range",
+        "unicode-byte-column",
+    ] {
+        let mut index = valid.clone();
+        let mut hashes = correct_hashes.clone();
+        let java_doc = index
+            .documents
+            .iter_mut()
+            .find(|d| d.relative_path == "A.java")
+            .unwrap();
+        match scenario {
+            "stale-manifest" => hashes["A.java"] = serde_json::json!("deadbeef"),
+            "missing-manifest" => {
+                hashes.as_object_mut().unwrap().remove("A.java");
+            }
+            "wrong-range" => java_doc.occurrences[0].range = vec![0, 5, 6],
+            "wrong-name" => java_doc.occurrences[0].symbol = "scip wrong Q".into(),
+            "reference-role" => java_doc.occurrences[0].symbol_roles = 0,
+            "duplicate" => java_doc.occurrences.push(java_doc.occurrences[0].clone()),
+            "ambiguous-range" => {
+                // A second, same-coordinate presentation cannot choose a label.
+                let mut other = java_doc.occurrences[0].clone();
+                other.symbol = "scip second A".into();
+                java_doc.occurrences.push(other);
+            }
+            "unicode-byte-column" => java_doc.occurrences[0].range = vec![0, 13, 14],
+            _ => unreachable!(),
+        }
+        let (graph, native, _) = run(&index, &hashes);
+        assert_eq!(
+            node(&graph, "A.java", "A").display_label,
+            None,
+            "{scenario}"
+        );
+        assert_eq!(
+            node(&graph, "a.py", "P").display_label,
+            node(&baseline, "a.py", "P").display_label
+        );
+        assert_eq!(
+            node(&graph, "a.js", "J").display_label,
+            node(&baseline, "a.js", "J").display_label
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter(|n| n.path == "a.rs")
+                .all(|n| n.display_label.is_none())
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .map(|n| (&n.id, &n.provenance))
+                .collect::<Vec<_>>(),
+            baseline_ids,
+            "native IDs and provenance must not change with SCIP presentation: {scenario}"
+        );
+        assert_eq!(native.producer, base_native.producer);
+        assert_eq!(
+            native
+                .declarations
+                .iter()
+                .map(|d| &d.syntax_id)
+                .collect::<Vec<_>>(),
+            base_native
+                .declarations
+                .iter()
+                .map(|d| &d.syntax_id)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinned_revisions() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator,
+        indexer::IndexOptions,
+        model::{CancelFlag, IndexPin, SymbolKind},
+    };
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let java = "class A {}\n";
+    fs::write(workspace.path().join("A.java"), java).unwrap();
+    let scip = state.path().join("labels.scip");
+    let manifest = state.path().join("labels.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "A.java":hex::encode(Sha256::digest(java.as_bytes()))
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut options = IndexOptions::new(workspace.path().to_owned());
+    options.scip_path = Some(scip.clone());
+    options.manifest_path = Some(manifest);
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let write_label = |label: &str, cutoff: bool| {
+        let mut index = scip::types::Index::new();
+        let mut document = scip::types::Document::new();
+        document.relative_path = "A.java".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 6, 7];
+        occurrence.symbol_roles = 1;
+        occurrence.symbol = format!("scip {label} A");
+        document.occurrences.push(occurrence);
+        index.documents.push(document);
+        if cutoff {
+            for ordinal in 0..1000 {
+                let mut extra = scip::types::Document::new();
+                extra.relative_path = format!("extra-{ordinal}.java");
+                index.documents.push(extra);
+            }
+        }
+        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
+    };
+    let label = |pin: IndexPin| {
+        store
+            .graph_at(Some(pin))
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|n| n.path == "A.java" && n.kind == SymbolKind::Class)
+            .unwrap()
+    };
+    let ids = |pin: IndexPin| {
+        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+        db.query_row("SELECT document_version_id,graph_projection_id,class_projection_id FROM revision_documents WHERE revision_id=?1 AND path='A.java'",
+            [format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision)],
+            |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap()
+    };
+    write_label("one", false);
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
+    write_label("two", false);
+    let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(label(first).display_label.as_deref(), Some("scip one A"));
+    assert_eq!(label(second).display_label.as_deref(), Some("scip two A"));
+    assert_eq!(label(first).id, label(second).id);
+    assert_eq!(label(first).provenance, label(second).provenance);
+    let (native_first, graph_first, class_first) = ids(first);
+    let (native_second, graph_second, class_second) = ids(second);
+    assert_eq!(
+        native_first, native_second,
+        "same captured source reuses native version"
+    );
+    assert_ne!(graph_first, graph_second, "label is graph presentation");
+    assert_ne!(
+        class_first, class_second,
+        "class projection follows graph label"
+    );
+    write_label("cutoff", true);
+    let third = IndexJobCoordinator::prepare_with_session(&store, Some(second), session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(
+        label(third).display_label,
+        None,
+        "over-1000 SCIP docs refuse all labels"
+    );
+    assert_eq!(
+        ids(third).0,
+        native_first,
+        "presentation cutoff never alters native version"
+    );
+    assert_eq!(
+        label(second).display_label.as_deref(),
+        Some("scip two A"),
+        "old pin keeps label"
+    );
+}
+
+#[test]
+fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_labels() {
+    use baleyg::{
+        classes::{Catalog, FileExtraction, Limits},
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{CancelFlag, Graph, SymbolKind},
+    };
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let (state, workspace) = fixture();
+    let sources = [
+        ("A.java", "/*é*/ class A {}\n"),
+        ("a.py", "class P: pass\n"),
+        ("a.js", "class J {}\n"),
+        ("a.rs", "struct R {}\n"),
+    ];
+    for (path, text) in sources {
+        fs::write(workspace.path().join(path), text).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let session = store.leader_session().unwrap();
+    let scip = state.path().join("cutoff.scip");
+    let manifest = state.path().join("cutoff.json");
+    let mut options = IndexOptions::new(workspace.path().to_owned());
+    options.scip_path = Some(scip.clone());
+    options.manifest_path = Some(manifest.clone());
+    let hashes: serde_json::Map<String, serde_json::Value> = sources
+        .iter()
+        .map(|(path, text)| {
+            (
+                (*path).to_owned(),
+                serde_json::json!(hex::encode(Sha256::digest(text.as_bytes()))),
+            )
+        })
+        .collect();
+    fs::write(&manifest, serde_json::to_vec(&hashes).unwrap()).unwrap();
+    let mut index = scip::types::Index::new();
+    for (path, range, name) in [
+        ("A.java", vec![0, 12, 13], "A"),
+        ("a.py", vec![0, 6, 7], "P"),
+        ("a.js", vec![0, 6, 7], "J"),
+        ("a.rs", vec![0, 7, 8], "R"),
+    ] {
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = path.into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = range;
+        occurrence.symbol_roles = 1;
+        occurrence.symbol = format!("scip cutoff {name}");
+        doc.occurrences.push(occurrence);
+        index.documents.push(doc);
+    }
+    for n in 0..996 {
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = format!("absent{n:04}.java");
+        index.documents.push(doc);
+    }
+    assert_eq!(index.documents.len(), 1_000);
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let run = |index: &scip::types::Index| {
+        let bytes = index.write_to_bytes().unwrap();
+        assert!(
+            bytes.len() < 128 * 1024,
+            "tiny captured SCIP fixture must stay bounded"
+        );
+        fs::write(&scip, bytes).unwrap();
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
+    };
+    let (positive, positive_native, positive_capture) = run(&index);
+    fn node<'a>(graph: &'a Graph, path: &str, name: &str) -> &'a baleyg::model::Symbol {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.path == path && n.name == name && n.kind == SymbolKind::Class)
+            .unwrap()
+    }
+    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
+        assert_eq!(
+            node(&positive, path, name).display_label.as_deref(),
+            Some(format!("scip cutoff {name}").as_str())
+        );
+    }
+    assert!(
+        positive
+            .nodes
+            .iter()
+            .filter(|n| n.path == "a.rs")
+            .all(|n| n.display_label.is_none())
+    );
+    let extract = |graph: &Graph, capture: &baleyg::capture::Capture| {
+        let files: Vec<_> = capture
+            .files
+            .iter()
+            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+            .map(|f| {
+                FileExtraction::extract_file(f, &graph.nodes, &cancel, Limits::default()).unwrap()
+            })
+            .collect();
+        let catalog = Catalog::compose(
+            &files,
+            capture.files.len(),
+            graph.nodes.len(),
+            Limits::default(),
+        )
+        .unwrap();
+        (files, catalog)
+    };
+    let (positive_f, positive_classes) = extract(&positive, &positive_capture);
+    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
+        assert_eq!(
+            positive_classes
+                .classes
+                .iter()
+                .find(|c| c.symbol.path == path && c.symbol.name == name)
+                .unwrap()
+                .symbol
+                .display_label
+                .as_deref(),
+            Some(format!("scip cutoff {name}").as_str())
+        );
+    }
+    let first_pin = store
+        .publish_native(
+            &positive,
+            &positive_capture,
+            &positive_native,
+            session.leader_guard().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(first_pin.index_revision, 1);
+
+    let mut extra = scip::types::Document::new();
+    extra.relative_path = "absent0996.java".into();
+    index.documents.push(extra);
+    assert_eq!(index.documents.len(), 1_001);
+    let (cutoff, cutoff_native, cutoff_capture) = run(&index);
+    assert_eq!(positive_capture.files, cutoff_capture.files);
+    assert_eq!(
+        positive_capture.hashes.get("A.java"),
+        cutoff_capture.hashes.get("A.java")
+    );
+    assert_eq!(positive_native.producer, cutoff_native.producer);
+    assert_eq!(
+        positive_native
+            .declarations
+            .iter()
+            .map(|d| &d.syntax_id)
+            .collect::<Vec<_>>(),
+        cutoff_native
+            .declarations
+            .iter()
+            .map(|d| &d.syntax_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        positive
+            .nodes
+            .iter()
+            .map(|n| (&n.id, &n.provenance))
+            .collect::<Vec<_>>(),
+        cutoff
+            .nodes
+            .iter()
+            .map(|n| (&n.id, &n.provenance))
+            .collect::<Vec<_>>()
+    );
+    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
+        assert_eq!(
+            node(&cutoff, path, name).display_label,
+            None,
+            "global 1001-document cutoff: {path}"
+        );
+    }
+    assert!(
+        cutoff
+            .nodes
+            .iter()
+            .filter(|n| n.path == "a.rs")
+            .all(|n| n.display_label.is_none())
+    );
+    let mut without_labels = positive.nodes.clone();
+    for n in &mut without_labels {
+        n.display_label = None;
+    }
+    assert_eq!(
+        without_labels, cutoff.nodes,
+        "SCIP only changes optional graph presentation"
+    );
+    let (cutoff_f, cutoff_classes) = extract(&cutoff, &cutoff_capture);
+    assert_eq!(positive_f.len(), cutoff_f.len());
+    let mut unlabelled_f = positive_f.clone();
+    for f in &mut unlabelled_f {
+        for class in &mut f.classes {
+            class.symbol.display_label = None;
+        }
+    }
+    assert_eq!(
+        unlabelled_f, cutoff_f,
+        "F must retain native classes/relations without labels"
+    );
+    let mut unlabelled_classes = positive_classes.clone();
+    for class in &mut unlabelled_classes.classes {
+        class.symbol.display_label = None;
+    }
+    assert_eq!(
+        unlabelled_classes, cutoff_classes,
+        "composed classes must follow label cutoff only"
+    );
+    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
+        assert_eq!(
+            cutoff_classes
+                .classes
+                .iter()
+                .find(|c| c.symbol.path == path && c.symbol.name == name)
+                .unwrap()
+                .symbol
+                .display_label,
+            None
+        );
+    }
+    let second_pin = store
+        .publish_native(
+            &cutoff,
+            &cutoff_capture,
+            &cutoff_native,
+            session.leader_guard().unwrap(),
+            first_pin,
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(second_pin.index_revision, 2);
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    let current = format!(
+        "pin:v1:{}:{}",
+        second_pin.index_generation, second_pin.index_revision
+    );
+    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
+        let expected = node(&cutoff, path, name);
+        let graph_payload:String=db.query_row(
+            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON n.projection_id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2 AND n.id=?3",
+            rusqlite::params![current,path,expected.id],|r|r.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<baleyg::model::Symbol>(&graph_payload).unwrap(),
+            *expected
+        );
+        assert!(expected.display_label.is_none());
+    }
+    for f in &cutoff_f {
+        let (state,payload):(String,String)=db.query_row(
+            "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.graph_projection_id=g.id WHERE m.revision_id=?1 AND m.path=?2",
+            rusqlite::params![current,f.path],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(state, "ready");
+        assert_eq!(
+            serde_json::from_str::<FileExtraction>(&payload).unwrap(),
+            *f
+        );
+    }
+    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
+        let expected = cutoff_classes
+            .classes
+            .iter()
+            .find(|c| c.symbol.path == path && c.symbol.name == name)
+            .unwrap();
+        let payload:String=db.query_row(
+            "SELECT c.payload FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 AND m.path=?2 AND c.id=?3",
+            rusqlite::params![current,path,expected.symbol.id],|r|r.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<baleyg::classes::ClassDefinition>(&payload).unwrap(),
+            *expected
+        );
+        assert!(expected.symbol.display_label.is_none());
+    }
+}
+
+#[test]
+#[ignore = "pinned medium Cmedium0000 Java prefix insertion requires two cold indices; run explicitly"]
+fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retains_old_pin() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use sha2::{Digest, Sha256};
+    use std::{
+        process::Command,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let corpus = root.path().join("frozen-canonical-v1");
+    let generated = Command::new("node")
+        .arg("tools/synthetic-cohorts/generate.mjs")
+        .arg("--out")
+        .arg(&corpus)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "pinned generator: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
+        ),
+        "8b8deea8592cfd069a1500bcad9d634a8b4d343477e769b2f2aed0dd61bee046"
+    );
+    let workspace = corpus.join("medium");
+    let relative = "java/Cmedium0000.java";
+    let leaf = workspace.join(relative);
+    let old_bytes = fs::read(&leaf).unwrap();
+    let original = b"public static int f0(){return 70000;}";
+    let replacement = b"public static int f0(){return 170000;}";
+    assert_eq!(
+        old_bytes
+            .windows(original.len())
+            .filter(|window| *window == original)
+            .count(),
+        1
+    );
+    let state = tempfile::tempdir().unwrap();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let store = Store::open_for_tests(state.path(), &workspace).unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = first_job.session();
+    let old_pin = first_job.run(&options, &cancel, |_| {}).unwrap();
+    let old_source = store.source_at(relative, Some(old_pin)).unwrap().unwrap().1;
+    let old_graph = serde_json::to_value(store.graph_at(Some(old_pin)).unwrap()).unwrap();
+    let old_class = serde_json::to_value(
+        store
+            .classes_at(Some(relative), "", Some(old_pin), 0, 100)
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut edited = Vec::with_capacity(old_bytes.len() + 1);
+    let start = old_bytes
+        .windows(original.len())
+        .position(|window| window == original)
+        .unwrap();
+    edited.extend_from_slice(&old_bytes[..start]);
+    edited.extend_from_slice(replacement);
+    edited.extend_from_slice(&old_bytes[start + original.len()..]);
+    fs::write(&leaf, edited).unwrap();
+    let phases = std::sync::Mutex::new(Vec::new());
+    let local_pin =
+        IndexJobCoordinator::prepare_with_session(&store, Some(old_pin), session.clone())
+            .unwrap()
+            .run(&options, &cancel, |progress| {
+                phases.lock().unwrap().push(progress.phase)
+            })
+            .unwrap();
+    assert!(
+        phases
+            .into_inner()
+            .unwrap()
+            .iter()
+            .any(|phase| phase == "mode:local"),
+        "canonical one-byte numeric-prefix insertion must not silently choose FULL"
+    );
+    assert_eq!(
+        store.source_at(relative, Some(old_pin)).unwrap().unwrap().1,
+        old_source
+    );
+    assert_eq!(
+        serde_json::to_value(store.graph_at(Some(old_pin)).unwrap()).unwrap(),
+        old_graph
+    );
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .classes_at(Some(relative), "", Some(old_pin), 0, 100)
+                .unwrap()
+        )
+        .unwrap(),
+        old_class
+    );
+
+    let cold_state = tempfile::tempdir().unwrap();
+    fs::set_permissions(cold_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let cold = Store::open_for_tests(cold_state.path(), &workspace).unwrap();
+    let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+    let _cold_session = cold_job.session();
+    let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+    assert_eq!(
+        sqlite_snapshot(&index_dir(state.path()).join("index.db"), local_pin, true),
+        sqlite_snapshot(
+            &index_dir(cold_state.path()).join("index.db"),
+            cold_pin,
+            true
+        ),
+        "pinned medium selected native/graph/class/reference SQL must match independent same-root cold"
+    );
+    assert_eq!(
+        serde_json::to_value(store.graph_at(Some(local_pin)).unwrap()).unwrap(),
+        serde_json::to_value(cold.graph_at(Some(cold_pin)).unwrap()).unwrap()
+    );
+    let local_page = store
+        .classes_at(Some(relative), "", Some(local_pin), 0, 100)
+        .unwrap();
+    let cold_page = cold
+        .classes_at(Some(relative), "", Some(cold_pin), 0, 100)
+        .unwrap();
+    assert_eq!(local_page.revision, local_pin);
+    assert_eq!(cold_page.revision, cold_pin);
+    let mut local_page = serde_json::to_value(local_page).unwrap();
+    let mut cold_page = serde_json::to_value(cold_page).unwrap();
+    local_page.as_object_mut().unwrap().remove("revision");
+    cold_page.as_object_mut().unwrap().remove("revision");
+    assert_eq!(
+        local_page, cold_page,
+        "class page content must match the independent cold pin"
+    );
+    assert_eq!(
+        store.source_at(relative, Some(old_pin)).unwrap().unwrap().1,
+        old_source
+    );
+}
+
+#[test]
+fn exported_javascript_and_bare_rust_tail_local_match_independent_cold() {
+    use baleyg::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    for (path, before, after) in [
+        (
+            "f0.js",
+            "export function f0(){return 7000;}\n",
+            "export function f0(){return 17000;}\n",
+        ),
+        (
+            "f0.rs",
+            "pub fn f0()->i32{100}\n",
+            "pub fn f0()->i32{1100}\n",
+        ),
+    ] {
+        let (state, workspace) = fixture();
+        let leaf = workspace.path().join(path);
+        fs::write(&leaf, before).unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = job.session();
+        let old_pin = job.run(&options, &cancel, |_| {}).unwrap();
+        let old_source = store.source_at(path, Some(old_pin)).unwrap().unwrap().1;
+        let old_graph = serde_json::to_value(store.graph_at(Some(old_pin)).unwrap()).unwrap();
+        fs::write(&leaf, after).unwrap();
+        let phases = std::sync::Mutex::new(Vec::new());
+        let local_pin =
+            IndexJobCoordinator::prepare_with_session(&store, Some(old_pin), session.clone())
+                .unwrap()
+                .run(&options, &cancel, |progress| {
+                    phases.lock().unwrap().push(progress.phase)
+                })
+                .unwrap();
+        assert!(
+            phases
+                .into_inner()
+                .unwrap()
+                .iter()
+                .any(|phase| phase == "mode:local"),
+            "{path}: body-only exported/tail literal must be locally proved"
+        );
+        assert_eq!(
+            store.source_at(path, Some(old_pin)).unwrap().unwrap().1,
+            old_source
+        );
+        assert_eq!(
+            serde_json::to_value(store.graph_at(Some(old_pin)).unwrap()).unwrap(),
+            old_graph
+        );
+        let cold_state = tempfile::tempdir().unwrap();
+        fs::set_permissions(cold_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let cold = Store::open_for_tests(cold_state.path(), workspace.path()).unwrap();
+        let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
+        let _cold_session = cold_job.session();
+        let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
+        assert_eq!(
+            sqlite_snapshot(&index_dir(state.path()).join("index.db"), local_pin, true),
+            sqlite_snapshot(
+                &index_dir(cold_state.path()).join("index.db"),
+                cold_pin,
+                true
+            ),
+            "{path}: native/graph/class/reference selected facts must equal same-root cold"
         );
     }
 }

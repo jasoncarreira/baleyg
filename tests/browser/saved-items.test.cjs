@@ -1,7 +1,7 @@
 "use strict";
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { existsSync, chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } = require("node:fs");
+const { existsSync, chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { basename, join, resolve, sep } = require("node:path");
 const { spawn } = require("node:child_process");
@@ -18,7 +18,7 @@ assert.ok(chromiumPath.startsWith(`${resolve(browserRoot)}${sep}`), "Chromium mu
 const ROOT = resolve(__dirname, "../..");
 const SOURCE_P = "fn seed(value: i32) -> i32 { old_step(value) }\nfn old_step(value: i32) -> i32 { value + 1 }\nfn other() -> i32 { 0 }\n";
 const SOURCE_Q = "fn seed(value: i64) -> i64 { new_step(value) }\nfn new_step(value: i64) -> i64 { value + 2 }\nfn other() -> i32 { 0 }\n";
-let binary;
+let binary, suiteBinaryDir;
 
 const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms));
 function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = {}) {
@@ -48,9 +48,16 @@ test.before(async () => {
   const target = JSON.parse(metadata.stdout).target_directory;
   assert.equal(typeof target, "string");
   await run("cargo", ["build", "--locked", "--bin", "baleyg"], {timeout:900000});
-  binary = join(target, "debug", process.platform === "win32" ? "baleyg.exe" : "baleyg");
-  assert.ok(existsSync(binary), `built Baleyg binary is unavailable at ${binary}`);
+  const built = join(target, "debug", process.platform === "win32" ? "baleyg.exe" : "baleyg");
+  assert.ok(existsSync(built), `built Baleyg binary is unavailable at ${built}`);
+  // tools/verify runs Cargo tests and browser acceptance concurrently. Cargo may
+  // replace its target executable between these two real-browser scenarios.
+  suiteBinaryDir = mkdtempSync(join(tmpdir(), "baleyg-saved-binary-"));
+  binary = join(suiteBinaryDir, basename(built));
+  copyFileSync(built, binary);
+  assert.ok(existsSync(binary), `fixed suite binary is unavailable at ${binary}`);
 }, {timeout:960000});
+test.after(() => { if (suiteBinaryDir) rmSync(suiteBinaryDir, {recursive:true, force:true}); });
 
 function isolatedEnv(paths) {
   const env = {...process.env,
@@ -132,7 +139,7 @@ async function indexThroughApi(base, token, expected) {
   while(Date.now()<deadline){
     const job=await api(base,token,"GET",`/api/jobs/${encodeURIComponent(accepted.data.id)}`);
     assert.equal(job.status,200,JSON.stringify(job.data));
-    if(job.data.finishedAt!==null){assert.equal(job.data.state,"completed",JSON.stringify(job.data));return job.data.revision;}
+    if(job.data.finishedAt!==null){assert.equal(job.data.state,"done",JSON.stringify(job.data));return job.data.revision;}
     await delay(25);
   }
   throw new Error("index job did not complete within 20 seconds");
@@ -256,7 +263,10 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname==="/api/query"&&new URL(request.url()).searchParams.has("indexGeneration"));
   const staleResponsePromise=page.waitForResponse(response=>response.request().method()==="POST"&&new URL(response.url()).pathname==="/api/query"&&new URL(response.url()).searchParams.has("indexGeneration"));
   await staleRow.getByRole("button",{name:"Load",exact:true}).click();const staleRequest=await staleRequestPromise,staleResponse=await staleResponsePromise;
-  assertPinnedUrl(staleRequest.url(),P);assert.equal(staleRequest.postDataJSON().seed,seed);assert.equal(staleResponse.status(),409);await delay(800);
+  assertPinnedUrl(staleRequest.url(),P);assert.equal(staleRequest.postDataJSON().seed,seed);assert.equal(staleResponse.status(),200);
+  const staleData=await staleResponse.json();assert.deepEqual(staleData.revision,P);assert.notDeepEqual(staleData.revision,Q);
+  assert.ok(staleData.calls.some(call=>call.calleeText==="old_step"),JSON.stringify(staleData));
+  assert.doesNotMatch(JSON.stringify(staleData),/new_step/);await delay(800);
   assert.equal(requests.filter(request=>new URL(request.url).pathname==="/api/query").length,baseline+1,"stale replay must not retry");
   assert.doesNotMatch(await page.locator("#calls").textContent(),/new_step/);
 

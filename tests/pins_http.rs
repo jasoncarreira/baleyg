@@ -329,17 +329,30 @@ async fn index_admission_and_publication_pair() {
         index_generation: uuid::Uuid::new_v4(),
         index_revision: pin.index_revision,
     };
-    assert_eq!(
-        call(
-            &app,
-            "POST",
-            "/api/index",
-            json!({"expectedRevision":conflict})
-        )
-        .await
-        .0,
-        409
-    );
+    let (code, stale_job) = call(
+        &app,
+        "POST",
+        "/api/index",
+        json!({"expectedRevision":conflict}),
+    )
+    .await;
+    assert_eq!(code, 202, "{stale_job}");
+    assert_eq!(stale_job["state"], "queued");
+    let stale_id = stale_job["id"].as_str().unwrap();
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (_, row) = call(&app, "GET", &format!("/api/jobs/{stale_id}"), Value::Null).await;
+            if !row["finishedAt"].is_null() {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], "revision_conflict");
+    assert_eq!(store.status().unwrap().revision, pin);
     let (code, job) = call(&app, "POST", "/api/index", json!({"expectedRevision":pin})).await;
     assert_eq!(code, 202, "{job}");
     assert!(job["revision"].is_null());
@@ -355,7 +368,7 @@ async fn index_admission_and_publication_pair() {
     })
     .await
     .unwrap();
-    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(completed["state"], "done", "{completed}");
     assert_eq!(
         completed["revision"],
         json!(store.status().unwrap().revision)
@@ -377,7 +390,7 @@ fn sqlite_journal_child() {
     // Uncommitted spill rows exercise rollback without corrupting the published pair.
     for i in 0..100 {
         db.execute(
-            "INSERT INTO files(path,hash,payload) VALUES(?1,'x',?2)",
+            "INSERT INTO revision_capture_inputs(revision_id,input_key,payload) SELECT id,?1,?2 FROM native_revisions ORDER BY published_index_revision DESC LIMIT 1",
             rusqlite::params![format!("spill-{i}"), "x".repeat(4096)],
         )
         .unwrap();
@@ -439,9 +452,22 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7],
         "SQLite did not flush a genuine hot journal"
     );
+    let hot_journal = std::fs::read(&journal).unwrap();
+    let retired = Arc::downgrade(&state);
     drop(leader);
     drop(app);
     drop(state);
+    // The queue ticker's in-flight blocking worker may still own the old state.
+    // Wait for actual owner release, never a guessed delay or a relaxed fence.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while retired.upgrade().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "old daemon owner leaked"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(std::fs::read(&journal).unwrap(), hot_journal);
     let unrelated =
         baleyg::store::topology::UseGuard::acquire_existing(&leader_path, true, true).unwrap();
     let state = http::new(

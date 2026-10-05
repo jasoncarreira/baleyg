@@ -2,6 +2,145 @@ use serde_json::Value;
 use std::{fs, process::Command};
 use tempfile::TempDir;
 
+/// Only fixed startup markers are retained. Never copy arbitrary daemon stderr,
+/// filesystem paths, source text or the bearer into a failure artifact.
+fn readiness_stderr_category(sample: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(sample);
+    if text.contains("bind daemon listener") {
+        "listener_bind_error"
+    } else if text.contains("Error:") {
+        "other_startup_error"
+    } else if text.contains("Evidence unavailable at startup:") {
+        "index_startup_unavailable"
+    } else if text.contains("Baleyg: http://") {
+        "server_banner_present"
+    } else {
+        "no_allowlisted_marker"
+    }
+}
+
+/// Opt-in failure-only report, outside the tracked worktree. Every value written
+/// here is a fixed category or bounded number, not untrusted process output.
+fn write_private_readiness_diagnostic(
+    dir: &std::path::Path,
+    child: &mut std::process::Child,
+    stderr_path: &std::path::Path,
+    address: std::net::SocketAddr,
+    healthz: &str,
+) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let meta = fs::symlink_metadata(dir)?;
+    if !dir.is_absolute()
+        || !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o777 != 0o700
+        || dir
+            .canonicalize()?
+            .starts_with(std::env::current_dir()?.canonicalize()?)
+    {
+        return Err(std::io::Error::other(
+            "unsafe readiness diagnostic directory",
+        ));
+    }
+    let child_state = match child.try_wait()? {
+        Some(status) => match status.code() {
+            Some(code) => format!("exited_code_{code}"),
+            None => {
+                use std::os::unix::process::ExitStatusExt;
+                format!("exited_signal_{}", status.signal().unwrap_or_default())
+            }
+        },
+        None => "alive_at_deadline".to_owned(),
+    };
+    let listener =
+        match std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(150))
+        {
+            Ok(_) => "tcp_accepts",
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => "tcp_refused",
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => "tcp_timeout",
+            Err(_) => "tcp_other_error",
+        };
+    let mut sample = Vec::new();
+    fs::File::open(stderr_path)?
+        .take(16_384)
+        .read_to_end(&mut sample)?;
+    let category = readiness_stderr_category(&sample);
+    let output = dir.join(format!(
+        "queue-api-readiness-{}-{}.log",
+        std::process::id(),
+        child.id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(output)?;
+    // The caller supplies `healthz` from a closed set of literals or HTTP status
+    // numbers. Do not accept arbitrary reqwest error text here.
+    writeln!(
+        file,
+        "child={child_state} healthz={healthz} listener={listener} stderr_category={category}"
+    )?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[test]
+fn readiness_stderr_category_never_copies_secret_or_temp_path() {
+    let poisoned = b"Error: bind daemon listener /private/tmp/secret Bearer 0123456789abcdef\n";
+    let category = readiness_stderr_category(poisoned);
+    assert_eq!(category, "listener_bind_error");
+    assert!(!category.contains("Bearer"));
+    assert!(!category.contains("/private"));
+    assert!(!category.contains("0123456789abcdef"));
+    let mixed = b"Baleyg: http://127.0.0.1:7331/\nEvidence unavailable at startup: /private/tmp/secret\nError: failed after banner; Bearer 0123456789abcdef\n";
+    let fatal = readiness_stderr_category(mixed);
+    assert_eq!(fatal, "other_startup_error");
+    assert!(!fatal.contains("Bearer"));
+    assert!(!fatal.contains("/private"));
+    assert!(!fatal.contains("0123456789abcdef"));
+}
+
+#[test]
+fn private_readiness_report_is_mode_600_bounded_and_never_copies_raw_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("private");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr_path = tmp.path().join("daemon-stderr");
+    let secret = "Bearer 0123456789abcdef /private/tmp/user-workspace source-data";
+    fs::write(
+        &stderr_path,
+        format!("Error: bind daemon listener {secret}\n"),
+    )
+    .unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    write_private_readiness_diagnostic(
+        &dir,
+        &mut child,
+        &stderr_path,
+        "127.0.0.1:9".parse().unwrap(),
+        "connect_error",
+    )
+    .unwrap();
+    let _ = child.wait();
+    let path = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let report = fs::read_to_string(&path).unwrap();
+    assert!(report.len() < 256);
+    assert!(report.contains("stderr_category=listener_bind_error"));
+    assert!(!report.contains(secret));
+    assert!(!report.contains("Bearer"));
+    assert!(!report.contains("/private/tmp"));
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 fn isolated_command(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
@@ -18,6 +157,485 @@ fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Comman
         c.arg("--token-file").arg(state.join("token"));
     }
     c
+}
+
+#[test]
+fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_not() {
+    use std::{os::unix::fs::MetadataExt, time::Duration};
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn serve(root: &std::path::Path, home: &std::path::Path, log: &std::path::Path) -> Server {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let child = command(root, home, "serve")
+            .arg("--bind")
+            .arg(address.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(fs::File::create(log).unwrap()))
+            .spawn()
+            .unwrap();
+        let mut server = Server(child);
+        for _ in 0..150 {
+            if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
+                return server;
+            }
+            if let Some(status) = server.0.try_wait().unwrap() {
+                panic!(
+                    "Serve exited {status}: {}",
+                    fs::read_to_string(log).unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("Serve not ready: {}", fs::read_to_string(log).unwrap());
+    }
+    fn pin_and_ids(db: &rusqlite::Connection) -> (i64, Vec<(i64, String, String, String)>) {
+        let rev = db
+            .query_row("SELECT index_revision FROM index_metadata", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut statement = db.prepare(
+            "SELECT h.published_index_revision,m.document_version_id,m.graph_projection_id,m.class_projection_id
+             FROM revision_documents m JOIN native_revisions h ON h.id=m.revision_id
+             ORDER BY h.published_index_revision,m.path",
+        ).unwrap();
+        let ids = statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        (rev, ids)
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    let file = root.join("a.js");
+    fs::write(&file, "function seed() { return 42; }\n").unwrap();
+    let first = command(&root, &home, "index").output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let dbpath = real_index_db(&home);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    let (r1, old_ids) = pin_and_ids(&db);
+    assert_eq!(r1, 1);
+    let immutable = [
+        "document_versions",
+        "graph_projections",
+        "class_projections",
+        "graph_nodes",
+        "graph_calls",
+        "graph_regions",
+        "classes",
+        "class_relations",
+        "native_version_declarations",
+        "native_version_calls",
+    ];
+    let old_counts: Vec<i64> = immutable
+        .iter()
+        .map(|table| {
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        })
+        .collect();
+    let queue = dbpath.with_file_name("requests.db");
+    let queue_before = fs::read(&queue).unwrap();
+    drop(db);
+
+    let first_log = temp.path().join("serve-unchanged.log");
+    let leader = serve(&root, &home, &first_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    let (r2, ids) = pin_and_ids(&db);
+    assert_eq!(r2, 2, "new header+manifest pin required");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        (&ids[0].1, &ids[0].2, &ids[0].3),
+        (&ids[1].1, &ids[1].2, &ids[1].3)
+    );
+    for (table, count) in immutable.iter().zip(old_counts.iter()) {
+        let after: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, *count,
+            "{table} gained immutable rows on unchanged Serve"
+        );
+    }
+    assert_eq!(fs::read(&queue).unwrap(), queue_before);
+    assert!(
+        !fs::read_to_string(&first_log)
+            .unwrap()
+            .contains("Evidence unavailable")
+    );
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["revision"]["indexRevision"],
+        2
+    );
+    drop(db);
+    drop(leader);
+
+    let old_stat = fs::metadata(&file).unwrap();
+    let old_bytes = fs::read(&file).unwrap();
+    fs::write(
+        &file,
+        String::from_utf8(old_bytes.clone())
+            .unwrap()
+            .replace("seed", "sued"),
+    )
+    .unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+    let timestamps = [
+        libc::timespec {
+            tv_sec: old_stat.atime(),
+            tv_nsec: old_stat.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: old_stat.mtime(),
+            tv_nsec: old_stat.mtime_nsec(),
+        },
+    ];
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), timestamps.as_ptr(), 0) },
+        0
+    );
+    assert_eq!(
+        fs::metadata(&file).unwrap().mtime_nsec(),
+        old_stat.mtime_nsec()
+    );
+    assert_eq!(fs::read(&file).unwrap().len(), old_bytes.len());
+    let changed_log = temp.path().join("serve-changed.log");
+    let changed = serve(&root, &home, &changed_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    let (r3, next_ids) = pin_and_ids(&db);
+    assert_eq!(r3, 3, "new bytes must FULL publish, never reuse old pin");
+    assert_eq!(next_ids.len(), 3);
+    assert_eq!(next_ids[0].1, next_ids[1].1);
+    assert_ne!(
+        next_ids[1].1, next_ids[2].1,
+        "same-length/mtime edit reused stale bytes"
+    );
+    assert_eq!(next_ids[0].1, old_ids[0].1, "retained old pin changed");
+    drop(db);
+    drop(changed);
+
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    let selected_id = &next_ids[2].1;
+    assert_eq!(
+        db.execute(
+            "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+            rusqlite::params![vec![b'x'; old_bytes.len()], selected_id]
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    let corrupt_log = temp.path().join("serve-corrupt.log");
+    let rejected = serve(&root, &home, &corrupt_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    assert_eq!(
+        pin_and_ids(&db),
+        (3, next_ids.clone()),
+        "corrupt selected source was republished"
+    );
+    let headers: i64 = db
+        .query_row("SELECT count(*) FROM native_revisions", [], |r| r.get(0))
+        .unwrap();
+    let bindings: i64 = db
+        .query_row("SELECT count(*) FROM revision_producer_bindings", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        (headers, bindings),
+        (3, 3),
+        "refused Serve installed partial metadata"
+    );
+    drop(db);
+    assert!(
+        fs::read_to_string(corrupt_log)
+            .unwrap()
+            .contains("Evidence unavailable at startup")
+    );
+    drop(rejected);
+
+    // A one-sided producer-binding rewrite must refuse before a new header.
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    db.execute(
+        "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+        rusqlite::params![fs::read(&file).unwrap(), selected_id],
+    )
+    .unwrap();
+    let head_key: String = db
+        .query_row(
+            "SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let old_binding: String = db
+        .query_row(
+            "SELECT binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [&head_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE revision_producer_bindings SET binding_sha=?1 WHERE revision_id=?2",
+        rusqlite::params!["0".repeat(64), head_key],
+    )
+    .unwrap();
+    drop(db);
+    let link_log = temp.path().join("serve-binding.log");
+    let rejected_binding = serve(&root, &home, &link_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    assert_eq!(
+        pin_and_ids(&db).0,
+        3,
+        "bad selected producer binding reused"
+    );
+    assert!(
+        fs::read_to_string(&link_log)
+            .unwrap()
+            .contains("Evidence unavailable at startup")
+    );
+    drop(rejected_binding);
+    db.execute(
+        "UPDATE revision_producer_bindings SET binding_sha=?1 WHERE revision_id=?2",
+        rusqlite::params![old_binding, head_key],
+    )
+    .unwrap();
+
+    // Source bytes alone cannot authorize a new header: the selected native
+    // extraction context must match the producer's DECLARED input inventory.
+    let old_context: String = db
+        .query_row(
+            "SELECT extraction_context FROM document_versions WHERE id=?1",
+            [selected_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE document_versions SET extraction_context=?1 WHERE id=?2",
+        rusqlite::params!["0".repeat(64), selected_id],
+    )
+    .unwrap();
+    drop(db);
+    let context_log = temp.path().join("serve-context.log");
+    let rejected_context = serve(&root, &home, &context_log);
+    let db = rusqlite::Connection::open(&dbpath).unwrap();
+    assert_eq!(
+        pin_and_ids(&db).0,
+        3,
+        "mismatched extraction inventory context reused"
+    );
+    assert!(
+        fs::read_to_string(&context_log)
+            .unwrap()
+            .contains("Evidence unavailable at startup")
+    );
+    drop(rejected_context);
+    db.execute(
+        "UPDATE document_versions SET extraction_context=?1 WHERE id=?2",
+        rusqlite::params![old_context, selected_id],
+    )
+    .unwrap();
+
+    // A valid-looking child-row rewrite is not trusted by selected readers.
+    // Under T00, Serve may reuse the previously validated immutable projection
+    // without a whole-workspace reparse; a selected read MUST still reject it.
+    let (node_id, old_payload): (String, String) = db
+        .query_row(
+            "SELECT id,payload FROM graph_nodes WHERE projection_id=?1 LIMIT 1",
+            [&next_ids[2].2],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut tampered: Value = serde_json::from_str(&old_payload).unwrap();
+    tampered["name"] = Value::String("forged-name".into());
+    db.execute(
+        "UPDATE graph_nodes SET payload=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&tampered).unwrap(), node_id],
+    )
+    .unwrap();
+    drop(db);
+    let child_log = temp.path().join("serve-child.log");
+    let child_server = serve(&root, &home, &child_log);
+    let selected = command(&root, &home, "symbols").output().unwrap();
+    assert!(
+        !selected.status.success(),
+        "selected graph child rewrite escaped attestation"
+    );
+    assert!(
+        selected.stdout.is_empty(),
+        "forged selected facts escaped on stdout"
+    );
+    drop(child_server);
+}
+
+#[test]
+fn status_only_observes_existing_index_and_refuses_busy_without_writes() {
+    use std::{collections::BTreeMap, os::fd::AsRawFd, path::Path};
+    fn snapshot(roots: &[&Path]) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        let mut result = BTreeMap::new();
+        let mut pending = roots
+            .iter()
+            .map(|root| root.to_path_buf())
+            .collect::<Vec<_>>();
+        while let Some(path) = pending.pop() {
+            if !path.exists() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                result.insert(path.clone(), None);
+                pending.extend(
+                    fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else {
+                result.insert(path.clone(), Some(fs::read(&path).unwrap()));
+            }
+        }
+        result
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}\n").unwrap();
+    let virgin = snapshot(&[&root, &home]);
+    let absent = command(&root, &home, "status").output().unwrap();
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&absent.stderr).contains("index_not_ready"));
+    assert_eq!(
+        snapshot(&[&root, &home]),
+        virgin,
+        "virgin Status created state"
+    );
+
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let pin =
+        serde_json::from_slice::<Value>(&indexed.stdout).unwrap()["publishedRevision"].clone();
+    let indexes = home.join(if cfg!(target_os = "macos") {
+        "Library/Caches/dev.odin.baleyg/indexes"
+    } else {
+        ".cache/baleyg/indexes"
+    });
+    let dir = fs::read_dir(&indexes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let use_lock = indexes.join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let index_db = dir.join("index.db");
+    let persisted = snapshot(&[&root, &home]);
+    for _ in 0..2 {
+        let observed = command(&root, &home, "status").output().unwrap();
+        assert!(
+            observed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&observed.stderr)
+        );
+        let observed: Value = serde_json::from_slice(&observed.stdout).unwrap();
+        assert_eq!(observed["revision"], pin);
+        assert_eq!(
+            snapshot(&[&root, &home]),
+            persisted,
+            "Status modified index, queue, marker, use lock or HOME"
+        );
+    }
+    let lock = fs::OpenOptions::new().read(true).open(&use_lock).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let busy = command(&root, &home, "status").output().unwrap();
+    assert!(!busy.status.success());
+    assert!(busy.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("storage_busy"));
+    assert_eq!(
+        snapshot(&[&root, &home]),
+        persisted,
+        "busy Status modified state"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(lock);
+
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = index_db.with_file_name(format!("index.db{suffix}"));
+        fs::write(&sidecar, b"a journal sentinel").unwrap();
+        let with_sidecar = snapshot(&[&root, &home]);
+        let busy = command(&root, &home, "status").output().unwrap();
+        assert!(!busy.status.success());
+        assert!(busy.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&busy.stderr).contains("storage_busy"));
+        assert_eq!(
+            snapshot(&[&root, &home]),
+            with_sidecar,
+            "Status modified SQLite sidecar"
+        );
+        fs::remove_file(&sidecar).unwrap();
+    }
+    assert_eq!(snapshot(&[&root, &home]), persisted);
+    // A replaced root with no marker cannot recreate it or access the old index.
+    let moved = temp.path().join("old-workspace");
+    fs::rename(&root, &moved).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    let replaced = snapshot(&[&root, &moved, &home]);
+    let old_root = command(&root, &home, "status").output().unwrap();
+    assert!(!old_root.status.success());
+    assert!(old_root.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&old_root.stderr).contains("index_not_ready"));
+    assert_eq!(snapshot(&[&root, &moved, &home]), replaced);
+    fs::remove_dir_all(&root).unwrap();
+    fs::rename(&moved, &root).unwrap();
+    assert_eq!(snapshot(&[&root, &home]), persisted);
+    // An obsolete index cannot be repaired or upgraded by Status.
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    db.pragma_update(None, "user_version", 7_u32).unwrap();
+    drop(db);
+    let obsolete_bytes = snapshot(&[&root, &home]);
+    let obsolete = command(&root, &home, "status").output().unwrap();
+    assert!(!obsolete.status.success());
+    assert!(obsolete.stdout.is_empty());
+    assert_eq!(snapshot(&[&root, &home]), obsolete_bytes);
+    // Corrupting or removing the Git marker cannot repair it via Status.
+    let marker = root.join(".git/baleyg/workspace-id");
+    fs::write(&marker, b"not-a-marker").unwrap();
+    let tampered = snapshot(&[&root, &home]);
+    let invalid = command(&root, &home, "status").output().unwrap();
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert_eq!(snapshot(&[&root, &home]), tampered);
 }
 
 fn write_optional_presentation(dir: &std::path::Path, label: &str, source_hash: &str) {
@@ -56,7 +674,17 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
             "{key} must be removed from the child environment"
         );
     }
-    let output = cmd.output().unwrap();
+    let absent = cmd.output().unwrap();
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert!(!home.exists(), "Status cannot bootstrap an index or HOME");
+    let indexed = command(&workspace, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let output = command(&workspace, &home, "status").output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -64,6 +692,7 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     );
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 0);
+    assert_eq!(status["revision"]["indexRevision"], 1);
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.odin.baleyg"
     } else {
@@ -125,7 +754,7 @@ function boundary() {}
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 1);
-    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert_eq!(status["revision"]["indexRevision"], 1);
     let exported = command(&root, &home, "export").output().unwrap();
     assert!(exported.status.success());
     let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
@@ -149,7 +778,7 @@ function boundary() {}
         3_145_728
     );
     assert_eq!(
-        revision, 3,
+        revision, 2,
         "export must perform exactly one recorded-option takeover"
     );
 
@@ -239,7 +868,7 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&status.stderr)
     );
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert_eq!(status["revision"]["indexRevision"], 1);
     assert_eq!(
         status["revision"]["indexGeneration"],
         initial["publishedRevision"]["indexGeneration"]
@@ -324,16 +953,14 @@ fn standalone_takeover_keeps_configured_missing_presentation_absent() {
 #[tokio::test]
 async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_takeover() {
     use sha2::{Digest, Sha256};
-    use std::{
-        io::{BufRead, BufReader},
-        os::unix::fs::PermissionsExt,
-        process::Stdio,
-    };
-    struct Server(std::process::Child);
+    use std::{os::unix::fs::PermissionsExt, process::Stdio};
+    struct Server(Option<std::process::Child>);
     impl Drop for Server {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
     let temp = TempDir::new().unwrap();
@@ -358,7 +985,12 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let mut child = isolated_command(&home)
+    // Keep the daemon's stderr open through readiness and shutdown. Reading
+    // only the first banner line from a pipe closed its reader while later
+    // workers still wrote diagnostics on Linux CI.
+    let stderr_path = temp.path().join("serve-ingress-stderr.log");
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
+    let child = isolated_command(&home)
         .arg("serve")
         .arg("--workspace")
         .arg(&root)
@@ -372,36 +1004,94 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         .arg("manifest.json")
         .current_dir(&first_cwd)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let server = Server(child);
-    let startup = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::task::spawn_blocking(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut text = String::new();
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 {
-                    return Err(text);
+    let mut server = Server(Some(child));
+    let startup = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let log = fs::read(&stderr_path).unwrap();
+            if log
+                .windows(b"Baleyg:".len())
+                .any(|window| window == b"Baleyg:")
+            {
+                break log;
+            }
+            if let Some(exit) = server.0.as_mut().unwrap().try_wait().unwrap() {
+                panic!(
+                    "daemon exited before banner: {exit}; category={}",
+                    readiness_stderr_category(&log)
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon startup timed out");
+    assert!(
+        !String::from_utf8_lossy(&startup).contains("Evidence unavailable at startup"),
+        "unexpected startup evidence: {}",
+        readiness_stderr_category(&startup)
+    );
+    // The banner precedes axum polling its SIGTERM handler; a successful
+    // response, not a logged banner, proves the listener is actually ready.
+    let mut last_health = String::from("no_response");
+    let mut ready = false;
+    let health = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            match reqwest::get(format!("http://127.0.0.1:{port}/healthz")).await {
+                Ok(response) if response.status().is_success() => {
+                    ready = true;
+                    break;
                 }
-                text.push_str(&line);
-                if line.contains("Baleyg:") {
-                    return Ok(text);
+                Ok(response) => last_health = format!("http_status_{}", response.status().as_u16()),
+                Err(error) => {
+                    last_health = if error.is_connect() {
+                        "connection_error".into()
+                    } else if error.is_timeout() {
+                        "request_timeout".into()
+                    } else {
+                        "other_request_error".into()
+                    }
                 }
             }
-        }),
-    )
-    .await
-    .expect("daemon startup timed out")
-    .unwrap()
-    .unwrap_or_else(|text| panic!("daemon exited before binding: {text}"));
+            if server.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     assert!(
-        !startup.contains("Evidence unavailable at startup"),
-        "{startup}"
+        health.is_ok() && ready,
+        "daemon health endpoint did not become ready: child={:?}, last_health={}, stderr_category={}",
+        server.0.as_mut().unwrap().try_wait().unwrap(),
+        last_health,
+        readiness_stderr_category(&fs::read(&stderr_path).unwrap())
     );
+    // The banner precedes an asynchronous queue tick. SIGKILL can interrupt
+    // requests.db creation before its schema transaction commits; that partial
+    // queue must remain incompatible. Model a clean cross-CWD takeover instead:
+    // SIGTERM lets the daemon finish in-flight blocking work before it exits.
+    let pid = server.0.as_ref().unwrap().id();
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(status) = server.0.as_mut().unwrap().try_wait().unwrap() {
+            // Reaped children must not be killed again by the cleanup guard.
+            let _ = server.0.take();
+            assert!(
+                status.success(),
+                "daemon failed graceful shutdown: {status}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon did not stop gracefully before cross-CWD takeover"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     drop(server);
     let export = command(&root, &home, "export")
         .current_dir(&second_cwd)
@@ -515,7 +1205,7 @@ fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
         let new_key = format!("presentation-{role}:{name}");
         assert_eq!(
             db.execute(
-                "UPDATE capture_inputs SET input_key=?1 WHERE input_key=?2",
+                "UPDATE revision_capture_inputs SET input_key=?1 WHERE input_key=?2",
                 rusqlite::params![new_key, old_key],
             )
             .unwrap(),
@@ -1065,14 +1755,10 @@ fn fixed_locations_and_removed_flag() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let initial = command(&root, &home, "status").output().unwrap();
-    assert!(
-        initial.status.success(),
-        "{}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
-    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
-    assert_eq!(initial["revision"]["indexRevision"], 1);
+    let absent = command(&root, &home, "status").output().unwrap();
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert!(!home.exists(), "Status must not create fixed locations");
     let status = command(&root, &home, "index").output().unwrap();
     assert!(
         status.status.success(),
@@ -1081,11 +1767,7 @@ fn fixed_locations_and_removed_flag() {
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
     let first = &first["status"];
-    assert_eq!(first["revision"]["indexRevision"], 2);
-    assert_eq!(
-        first["revision"]["indexGeneration"],
-        initial["revision"]["indexGeneration"]
-    );
+    assert_eq!(first["revision"]["indexRevision"], 1);
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -1116,8 +1798,64 @@ fn fixed_locations_and_removed_flag() {
         final_status["revision"]["indexGeneration"],
         first["revision"]["indexGeneration"]
     );
-    assert_eq!(final_status["revision"]["indexRevision"], 3);
+    assert_eq!(final_status["revision"]["indexRevision"], 1);
 }
+#[test]
+fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function seed() {}\n").unwrap();
+    let quiet = command(&root, &home, "index")
+        .env_remove("BALEYG_INDEX_DIAGNOSTICS")
+        .output()
+        .unwrap();
+    assert!(
+        quiet.status.success(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    for marker in ["index-phase ", "index-mode ", "index-writer "] {
+        assert!(
+            !quiet_stderr.contains(marker),
+            "default CLI emitted {marker}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&quiet.stdout).unwrap()["publishedRevision"]["indexRevision"],
+        1
+    );
+    let diagnostic = command(&root, &home, "index")
+        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        diagnostic.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diagnostic.stderr)
+    );
+    let diagnostic_stderr = String::from_utf8_lossy(&diagnostic.stderr);
+    for marker in [
+        "index-mode full",
+        "index-writer ",
+        "index-phase capture_ms=",
+        "index-phase publish_ms=",
+        "index-phase outside_status_output_ms=",
+    ] {
+        assert_eq!(
+            diagnostic_stderr.matches(marker).count(),
+            1,
+            "opt-in telemetry missing or duplicated {marker}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&diagnostic.stdout).unwrap()["publishedRevision"]["indexRevision"],
+        2
+    );
+}
+
 #[test]
 fn index_forwards_pair_and_reports_pair() {
     let temp = TempDir::new().unwrap();
@@ -1125,16 +1863,65 @@ fn index_forwards_pair_and_reports_pair() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let initial = command(&root, &home, "status").output().unwrap();
-    assert!(initial.status.success());
-    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
-    let result = command(&root, &home, "index").output().unwrap();
+    let absent = command(&root, &home, "status").output().unwrap();
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    assert!(!home.exists(), "Status may not create an index");
+    let result = command(&root, &home, "index")
+        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .output()
+        .unwrap();
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
     let published: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let timings = String::from_utf8_lossy(&result.stderr);
+    for phase in [
+        "outside_setup",
+        "capture",
+        "measure",
+        "compose",
+        "attest",
+        "publish",
+        "queue_and_jobs",
+        "outside_status_output",
+    ] {
+        let prefix = format!("index-phase {phase}_ms=");
+        assert!(
+            timings.lines().any(|line| line.starts_with(&prefix)
+                && line[prefix.len()..]
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|ms| ms.parse::<f64>().is_ok_and(|value| value >= 0.0))),
+            "missing release CLI phase {phase}: {timings}"
+        );
+    }
+    let writer = timings
+        .lines()
+        .find(|line| line.starts_with("index-writer "))
+        .expect("release CLI must report the committed writer counters");
+    let values: std::collections::HashMap<_, _> = writer
+        .split_whitespace()
+        .skip(1)
+        .map(|field| {
+            let (name, value) = field.split_once('=').unwrap();
+            (name, value.parse::<u64>().unwrap())
+        })
+        .collect();
+    for suffix in ["rows", "bind_bytes"] {
+        assert_eq!(
+            values[&*format!("total_{suffix}")],
+            ["manifest", "native", "graph", "class"]
+                .iter()
+                .map(|name| values[&*format!("{name}_{suffix}")])
+                .sum::<u64>(),
+            "{suffix}: postcommit family accounting"
+        );
+    }
+    assert_eq!(values["reused_occurrence_reads"], 0);
+    assert!(timings.lines().any(|line| line == "index-mode full"));
     assert_eq!(
         published["status"]["revision"],
         published["publishedRevision"]
@@ -1143,10 +1930,16 @@ fn index_forwards_pair_and_reports_pair() {
         published["status"]["evidenceFormat"],
         "terminal-native-graph-v1"
     );
-    assert_eq!(published["publishedRevision"]["indexRevision"], 2);
+    assert_eq!(published["publishedRevision"]["indexRevision"], 1);
     assert_eq!(
-        published["publishedRevision"]["indexGeneration"],
-        initial["revision"]["indexGeneration"]
+        uuid::Uuid::parse_str(
+            published["publishedRevision"]["indexGeneration"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap()
+        .get_version_num(),
+        4
     );
 }
 #[test]
@@ -1200,14 +1993,14 @@ fn current_commands_pair_matrix() {
         status["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert_eq!(status["revision"]["indexRevision"], 1);
     let symbols: Value =
         serde_json::from_slice(&command(&root, &home, "symbols").output().unwrap().stdout).unwrap();
     assert_eq!(
         symbols["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(symbols["revision"]["indexRevision"], 3);
+    assert_eq!(symbols["revision"]["indexRevision"], 2);
     let seed = symbols["items"]
         .as_array()
         .unwrap()
@@ -1226,7 +2019,7 @@ fn current_commands_pair_matrix() {
     )
     .unwrap();
     assert_eq!(query["revision"]["indexGeneration"], pin["indexGeneration"]);
-    assert_eq!(query["revision"]["indexRevision"], 4);
+    assert_eq!(query["revision"]["indexRevision"], 3);
     let exported: Value =
         serde_json::from_slice(&command(&root, &home, "export").output().unwrap().stdout).unwrap();
     assert_eq!(exported["files"].as_array().unwrap().len(), 1);
@@ -1236,7 +2029,7 @@ fn current_commands_pair_matrix() {
         status["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(status["revision"]["indexRevision"], 6);
+    assert_eq!(status["revision"]["indexRevision"], 4);
 }
 
 #[test]
@@ -1500,209 +2293,6 @@ fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
     assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
 }
 
-#[test]
-fn cli_known_old_snapshot_is_unreadable_until_explicit_index_rotates_generation() {
-    let temp = TempDir::new().unwrap();
-    let root = temp.path().join("source");
-    let home = temp.path().join("home");
-    fs::create_dir(&root).unwrap();
-    fs::write(root.join("a.js"), "function go() { foo(); }").unwrap();
-    let first = command(&root, &home, "index").output().unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
-    let old_pin = first["status"]["revision"].clone();
-    let symbols = command(&root, &home, "symbols")
-        .arg("--search")
-        .arg("go")
-        .output()
-        .unwrap();
-    assert!(symbols.status.success());
-    let symbols: Value = serde_json::from_slice(&symbols.stdout).unwrap();
-    let valid_seed = symbols["items"][0]["id"].as_str().unwrap().to_owned();
-    let cached = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
-    } else {
-        home.join(".cache/baleyg/indexes")
-    };
-    let path = fs::read_dir(cached)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap()
-        .join("index.db");
-    {
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.pragma_update(None, "foreign_keys", false).unwrap();
-        let native_tables = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%'")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        for table in native_tables {
-            db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
-        }
-        for index in ["nodes_path", "calls_path", "regions_path"] {
-            db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
-        }
-        db.execute_batch(
-            "DROP TABLE capture_inputs;
-             ALTER TABLE files DROP COLUMN capture_stat;
-             ALTER TABLE index_metadata DROP COLUMN reconcile_options;
-             ALTER TABLE index_metadata DROP COLUMN reconciled_incarnation;",
-        )
-        .unwrap();
-        db.execute(
-            "UPDATE index_metadata SET schema_version=4,extractor_version='native-v1'",
-            [],
-        )
-        .unwrap();
-        db.pragma_update(None, "user_version", 4).unwrap();
-        db.execute("UPDATE calls SET payload=json_set(payload,'$.target','lexical-guess','$.resolution','internal')",[]).unwrap();
-    }
-    let mut rebuilt_generation = None;
-    for (ordinal, sub) in ["status", "symbols", "query", "export"]
-        .into_iter()
-        .enumerate()
-    {
-        let mut cmd = command(&root, &home, sub);
-        if sub == "query" {
-            cmd.arg("--seed").arg(&valid_seed);
-        }
-        let export_path = temp.path().join("rebuilt-export.json");
-        if sub == "export" {
-            cmd.arg("--output").arg(&export_path);
-        }
-        let result = cmd.output().unwrap();
-        assert!(
-            result.status.success(),
-            "{sub}: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let db = rusqlite::Connection::open(&path).unwrap();
-        let (generation, revision): (String, i64) = db
-            .query_row(
-                "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_ne!(generation, old_pin["indexGeneration"].as_str().unwrap());
-        if let Some(expected) = rebuilt_generation.as_ref() {
-            assert_eq!(&generation, expected);
-        } else {
-            rebuilt_generation = Some(generation.clone());
-        }
-        assert_eq!(revision, i64::try_from(ordinal + 1).unwrap());
-        let visible = format!(
-            "{}{}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert!(!visible.contains("lexical-guess"));
-        if sub == "export" {
-            assert!(export_path.exists());
-            assert!(
-                !String::from_utf8_lossy(&fs::read(&export_path).unwrap())
-                    .contains("lexical-guess")
-            );
-        }
-    }
-    // Real CLI exploit regression: an exact legacy4 DB with an extra trigger
-    // cannot rebaseline into a forged schema5 publication or write anything.
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch(
-        "CREATE TRIGGER forged_call AFTER INSERT ON calls BEGIN
-        UPDATE calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED')
-        WHERE id=NEW.id; END;",
-    )
-    .unwrap();
-    drop(db);
-    let dangerous_bytes = fs::read(&path).unwrap();
-    let rejected = command(&root, &home, "index").output().unwrap();
-    assert!(!rejected.status.success());
-    let message = String::from_utf8_lossy(&rejected.stderr);
-    assert!(message.contains("incompatible_index"), "{message}");
-    assert_eq!(fs::read(&path).unwrap(), dangerous_bytes);
-    let blocked_export = command(&root, &home, "export").output().unwrap();
-    assert!(!blocked_export.status.success());
-    assert!(!String::from_utf8_lossy(&blocked_export.stdout).contains("FORGED-NOT-MEASURED"));
-    let db = rusqlite::Connection::open(&path).unwrap();
-    let forged: i64 = db
-        .query_row(
-            "SELECT count(*) FROM calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(forged, 0, "unknown trigger executed despite refusal");
-    db.execute_batch("DROP TRIGGER forged_call").unwrap();
-    drop(db);
-    let next = command(&root, &home, "index").output().unwrap();
-    assert!(
-        next.status.success(),
-        "{}",
-        String::from_utf8_lossy(&next.stderr)
-    );
-    let next: Value = serde_json::from_slice(&next.stdout).unwrap();
-    assert_ne!(
-        next["status"]["revision"]["indexGeneration"],
-        old_pin["indexGeneration"]
-    );
-    assert_eq!(next["status"]["evidenceFormat"], "terminal-native-graph-v1");
-    let status = command(&root, &home, "status").output().unwrap();
-    assert!(status.status.success());
-    let ready: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(
-        ready["revision"]["indexGeneration"],
-        next["status"]["revision"]["indexGeneration"]
-    );
-    assert_eq!(
-        ready["revision"]["indexRevision"].as_u64().unwrap(),
-        next["status"]["revision"]["indexRevision"]
-            .as_u64()
-            .unwrap()
-            + 1
-    );
-    let queried = command(&root, &home, "query")
-        .arg("--seed")
-        .arg(&valid_seed)
-        .output()
-        .unwrap();
-    assert!(
-        queried.status.success(),
-        "{}",
-        String::from_utf8_lossy(&queried.stderr)
-    );
-    let view: Value = serde_json::from_slice(&queried.stdout).unwrap();
-    assert_eq!(
-        view["revision"]["indexGeneration"],
-        ready["revision"]["indexGeneration"]
-    );
-    assert_eq!(
-        view["revision"]["indexRevision"].as_u64().unwrap(),
-        ready["revision"]["indexRevision"].as_u64().unwrap() + 1
-    );
-    assert!(
-        view["calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|call| call.get("target").is_none())
-    );
-    assert!(!view.to_string().contains("lexical-guess"));
-    let exported = command(&root, &home, "export").output().unwrap();
-    assert!(exported.status.success());
-    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
-    assert_eq!(graph["files"][0]["text"], "function go() { foo(); }");
-    assert!(!graph.to_string().contains("lexical-guess"));
-}
-
 // Read the normalized publication, including every native row, from the real daemon's database.
 fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
     fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1729,16 +2319,42 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap();
+    let (generation, revision_number, incarnation): (String, i64, String) = db
+        .query_row(
+            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(&generation).is_ok());
+    assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
+    let pin_id = format!("pin:v1:{generation}:{revision_number}");
+    let (header_pin, header_incarnation, header_revision): (String, String, i64) = db
+        .query_row(
+            "SELECT id,reconciled_incarnation,published_index_revision FROM native_revisions WHERE id=?1",
+            [&pin_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(header_pin, pin_id);
+    assert_eq!(header_incarnation, incarnation);
+    assert_eq!(header_revision, revision_number);
+    let violations: i64 = db
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
     let revision: (String, String, String, String, String) = db.query_row(
-        "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions", [],
+        "SELECT id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1", [&pin_id],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
     ).unwrap();
     let mut documents = Vec::new();
     let mut stmt = db.prepare(
-        "SELECT source_set_id,language,path,revision_id,content_hash,byte_length,source_bytes FROM native_documents ORDER BY path"
+        "SELECT v.source_set_id,v.language,m.path,m.revision_id,v.content_hash,v.byte_length,v.source_bytes FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id WHERE m.revision_id=?1 ORDER BY m.path"
     ).unwrap();
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([&pin_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1755,16 +2371,76 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
         documents.push(serde_json::json!({"sourceSetId":set,"language":language,"path":path,
             "revisionId":revision,"contentHash":hash,"byteLength":length,"bytesHex":hex::encode(bytes)}));
     }
+    let new_binding_count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_producer_bindings WHERE revision_id=?1",
+            [&pin_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        new_binding_count, 1,
+        "each new published revision has an executable binding"
+    );
     let mut all_rows = serde_json::Map::new();
-    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'native_%' ORDER BY name").unwrap();
+    // Generation-specific binding control is checked separately; compare the
+    // actual native/graph/class evidence across independent CLI/daemon roots.
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name!='native_binding_epoch' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
     for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
         let name = name.unwrap();
+        let (predicate, alias) = match name.as_str() {
+            "native_revisions" => ("id=?1", ""),
+            "revision_capture_inputs" | "revision_documents" => ("revision_id=?1", ""),
+            "native_source_sets" => (
+                "id=(SELECT source_set_id FROM native_revisions WHERE id=?1)",
+                "",
+            ),
+            "native_source_set_languages" | "native_source_set_dependencies" => (
+                "source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?1)",
+                "",
+            ),
+            "native_producers" => (
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)",
+                " selected",
+            ),
+            "native_producer_languages" | "native_producer_inputs" => (
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)",
+                " selected",
+            ),
+            "document_versions" => (
+                "id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "graph_projections" => (
+                "id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "graph_nodes" | "graph_calls" | "graph_regions" => (
+                "projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "class_projections" => (
+                "id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            "classes" | "class_relations" => (
+                "projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            table if table.starts_with("native_version_") => (
+                "version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
+                "",
+            ),
+            _ => panic!("unexpected v8 evidence table: {name}"),
+        };
         let mut table = db
-            .prepare(&format!("SELECT * FROM {name} ORDER BY rowid"))
+            .prepare(&format!(
+                "SELECT * FROM \"{name}\"{alias} WHERE {predicate} ORDER BY rowid"
+            ))
             .unwrap();
         let columns = table.column_count();
         let records = table
-            .query_map([], |row| {
+            .query_map([&pin_id], |row| {
                 let mut cells = Vec::new();
                 for i in 0..columns {
                     let cell = match row.get_ref(i)? {
@@ -1783,10 +2459,54 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             .unwrap();
         all_rows.insert(name, serde_json::json!(records));
     }
+    assert_eq!(
+        all_rows.len(),
+        28,
+        "retain every v8 evidence table in raw snapshot"
+    );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
             "configHash":revision.3,"dependencyHash":revision.4},
         "documents":documents,"allRows":all_rows})
+}
+
+// Only successful same-byte reindex may ignore per-publication pin cells.
+// All failed/no-op comparisons must keep real_native_snapshot entirely raw.
+fn same_bytes_evidence(snapshot: &Value) -> Value {
+    let pin = snapshot["revision"]["id"].as_str().unwrap().to_owned();
+    let header = snapshot["allRows"]["native_revisions"].as_array().unwrap();
+    assert_eq!(header.len(), 1);
+    let header = header[0].as_array().unwrap();
+    assert_eq!(header[0], pin);
+    assert!(uuid::Uuid::parse_str(header[8].as_str().unwrap()).is_ok());
+    assert!(header[14].as_i64().is_some_and(|revision| revision > 0));
+    for table in ["revision_capture_inputs", "revision_documents"] {
+        for row in snapshot["allRows"][table].as_array().unwrap() {
+            assert_eq!(row[0], pin, "{table} must reference the admitted pin");
+        }
+    }
+    for doc in snapshot["documents"].as_array().unwrap() {
+        assert_eq!(doc["revisionId"], pin);
+    }
+    let mut evidence = snapshot.clone();
+    evidence["revision"]["id"] = serde_json::json!("<current-pin>");
+    for doc in evidence["documents"].as_array_mut().unwrap() {
+        doc["revisionId"] = serde_json::json!("<current-pin>");
+    }
+    let header = evidence["allRows"]["native_revisions"]
+        .as_array_mut()
+        .unwrap()[0]
+        .as_array_mut()
+        .unwrap();
+    header[0] = serde_json::json!("<current-pin>");
+    header[8] = serde_json::json!("<leader-incarnation>");
+    header[14] = serde_json::json!("<current-revision>");
+    for table in ["revision_capture_inputs", "revision_documents"] {
+        for row in evidence["allRows"][table].as_array_mut().unwrap() {
+            row[0] = serde_json::json!("<current-pin>");
+        }
+    }
+    evidence
 }
 
 fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
@@ -1929,7 +2649,7 @@ async fn real_index_job(
     })
     .await
     .expect("saved-item index job");
-    assert_eq!(completed["state"], "completed", "{completed}");
+    assert_eq!(completed["state"], "done", "{completed}");
     completed["revision"].clone()
 }
 
@@ -2034,6 +2754,37 @@ fn decoded_jev_rows(export: &Value, table: &str) -> Vec<Value> {
         .collect()
 }
 
+fn assert_native_version_witness(native: &Value, version_id: &Value, path: &str, language: &str) {
+    let versions: Vec<_> = native["allRows"]["document_versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[0] == *version_id)
+        .collect();
+    assert_eq!(
+        versions.len(),
+        1,
+        "one authenticated document version for {path}"
+    );
+    assert_eq!(versions[0][1], native["sourceSet"]["id"]);
+    assert_eq!(versions[0][2], language);
+    assert_eq!(versions[0][3], path);
+    let manifests: Vec<_> = native["allRows"]["revision_documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[4] == *version_id && row[3] == path)
+        .collect();
+    assert_eq!(
+        manifests.len(),
+        1,
+        "one admitted revision document for {path}"
+    );
+    assert_eq!(manifests[0][0], native["revision"]["id"]);
+    assert_eq!(manifests[0][1], native["sourceSet"]["id"]);
+    assert_eq!(manifests[0][2], language);
+}
+
 fn assert_fixture_declaration(
     native: &Value,
     symbol: &Value,
@@ -2043,36 +2794,36 @@ fn assert_fixture_declaration(
     owner: Option<&str>,
     source: &str,
 ) {
-    let matching: Vec<_> = native["allRows"]["native_declarations"]
+    let matching: Vec<_> = native["allRows"]["native_version_declarations"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|row| row[0] == symbol["id"])
+        .filter(|row| row[1] == symbol["id"])
         .collect();
     assert_eq!(matching.len(), 1, "one native declaration for {name}");
     let row = matching[0];
     assert_eq!(symbol["name"], name);
     assert_eq!(symbol["path"], path);
     assert_eq!(symbol["parent"], serde_json::json!(owner));
+    let documents: Vec<_> = native["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|doc| doc["path"] == path)
+        .collect();
+    assert_eq!(documents.len(), 1, "one captured source for {path}");
+    let language = documents[0]["language"].as_str().unwrap();
+    assert_native_version_witness(native, &row[0], path, language);
+    assert_eq!(row[2], serde_json::json!(owner), "{name}: native owner");
+    assert_eq!(row[3], kind, "{name}: native declaration kind");
+    assert_eq!(row[4], name, "{name}: native measured name");
     assert_eq!(
-        row[1], native["sourceSet"]["id"],
-        "{name}: native declaration source set"
-    );
-    assert_eq!(row[3], path, "{name}: native document path");
-    assert_eq!(
-        row[4], native["revision"]["id"],
-        "{name}: native declaration revision"
-    );
-    assert_eq!(row[5], serde_json::json!(owner), "{name}: native owner");
-    assert_eq!(row[6], kind, "{name}: native declaration kind");
-    assert_eq!(row[7], name, "{name}: native measured name");
-    assert_eq!(
-        row[13], symbol["range"]["startByte"],
+        row[10], symbol["range"]["startByte"],
         "{name}: native start"
     );
-    assert_eq!(row[14], symbol["range"]["endByte"], "{name}: native end");
-    let start = row[13].as_u64().unwrap() as usize;
-    let end = row[14].as_u64().unwrap() as usize;
+    assert_eq!(row[11], symbol["range"]["endByte"], "{name}: native end");
+    let start = row[10].as_u64().unwrap() as usize;
+    let end = row[11].as_u64().unwrap() as usize;
     assert!(
         source
             .get(start..end)
@@ -2286,7 +3037,7 @@ def sink():
             .await
             .unwrap();
         assert_eq!(follower_http_status["revision"], post_start_pin, "{name}");
-        let refused = client
+        let follower_accepted = client
             .post(format!("{follower_url}/api/index"))
             .header("Origin", &follower_url)
             .bearer_auth(TOKEN)
@@ -2294,14 +3045,42 @@ def sink():
             .send()
             .await
             .unwrap();
-        assert_eq!(refused.status(), 409, "{name}");
-        assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
+        assert_eq!(follower_accepted.status(), 202, "{name}");
+        let follower_accepted: Value = follower_accepted.json().await.unwrap();
+        assert_eq!(follower_accepted["state"], "queued", "{name}");
+        assert!(follower_accepted["startedAt"].is_null(), "{name}");
+        let follower_id = follower_accepted["id"].as_str().unwrap();
+        let follower_done = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let job: Value = client
+                    .get(format!("{follower_url}/api/jobs/{follower_id}"))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !job["finishedAt"].is_null() {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(follower_done["state"], "done", "{name}: {follower_done}");
+        let follower_pin = follower_done["revision"].clone();
+        assert_eq!(
+            follower_pin["indexRevision"],
+            post_start_pin["indexRevision"].as_u64().unwrap() + 1
+        );
         assert!(follower_server.0.try_wait().unwrap().is_none());
         let request = || {
             client
                 .post(format!("{url}/api/index"))
                 .header("Origin", &url)
-                .json(&serde_json::json!({"expectedRevision":post_start_pin.clone()}))
+                .json(&serde_json::json!({"expectedRevision":follower_pin.clone()}))
         };
         let denied = request().bearer_auth("incorrect").send().await.unwrap();
         assert_eq!(denied.status(), 401, "{name}");
@@ -2323,9 +3102,9 @@ def sink():
             .json()
             .await
             .unwrap();
-        assert!(
-            current.is_null(),
-            "{name}: rejected auth/origin must not start work"
+        assert_eq!(
+            current["id"], follower_id,
+            "{name}: rejected auth/origin must not add work"
         );
         let accepted = request().bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(accepted.status(), 202, "{name}");
@@ -2350,7 +3129,7 @@ def sink():
         })
         .await
         .unwrap();
-        assert_eq!(completed["state"], "completed", "{name}: {completed}");
+        assert_eq!(completed["state"], "done", "{name}: {completed}");
         let pin = completed["revision"].clone();
         assert_eq!(
             pin["indexGeneration"], post_start_pin["indexGeneration"],
@@ -2358,7 +3137,7 @@ def sink():
         );
         assert_eq!(
             pin["indexRevision"].as_u64().unwrap(),
-            post_start_pin["indexRevision"].as_u64().unwrap() + 1,
+            follower_pin["indexRevision"].as_u64().unwrap() + 1,
             "{name}"
         );
         let status: Value = client
@@ -2379,9 +3158,39 @@ def sink():
         use sha2::{Digest, Sha256};
         let native_after = real_native_snapshot(&home);
         let graph_after = real_export(&root, &home);
+        let before_header = &native_before["allRows"]["native_revisions"][0];
+        let leader_header = &native_as_leader["allRows"]["native_revisions"][0];
+        let after_header = &native_after["allRows"]["native_revisions"][0];
+        assert_ne!(
+            before_header[0], after_header[0],
+            "{name}: publication pin rotates"
+        );
+        assert_ne!(
+            before_header[8], after_header[8],
+            "{name}: daemon takeover rotates leader"
+        );
         assert_eq!(
-            native_after, native_before,
-            "{name}: complete normalized native rows must be stable"
+            leader_header[8], after_header[8],
+            "{name}: active leader remains stable"
+        );
+        assert_ne!(
+            before_header[14], after_header[14],
+            "{name}: revision advances"
+        );
+        assert_eq!(after_header[14], pin["indexRevision"], "{name}");
+        assert_eq!(
+            after_header[0],
+            format!(
+                "pin:v1:{}:{}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            ),
+            "{name}: header pin must match public status"
+        );
+        assert_eq!(
+            same_bytes_evidence(&native_after),
+            same_bytes_evidence(&native_before),
+            "{name}: all 28 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,
@@ -2598,7 +3407,9 @@ def sink():
                 "{name}: sequence selected wrong seed"
             );
             let graph_calls = graph_after["calls"].as_array().unwrap();
-            let native_calls = native_after["allRows"]["native_calls"].as_array().unwrap();
+            let native_calls = native_after["allRows"]["native_version_calls"]
+                .as_array()
+                .unwrap();
             assert_eq!(
                 graph_calls.len(),
                 1,
@@ -2619,24 +3430,15 @@ def sink():
             assert_eq!(call["calleeText"], "sink", "{name}: measured call spelling");
             assert_eq!(call["range"]["startByte"], expected_start, "{name}");
             assert_eq!(call["range"]["endByte"], expected_end, "{name}");
+            assert_native_version_witness(&native_after, &native_call[0], file, name);
             assert_eq!(
-                native_call[0], call["id"],
+                native_call[1], call["id"],
                 "{name}: same measured native call ID"
             );
-            assert_eq!(native_call[1], seed, "{name}: native call owner");
-            assert_eq!(
-                native_call[3], native_after["sourceSet"]["id"],
-                "{name}: call source set"
-            );
-            assert_eq!(
-                native_call[6], native_after["revision"]["id"],
-                "{name}: call revision"
-            );
-            assert_eq!(native_call[4], name, "{name}: native language");
-            assert_eq!(native_call[5], file, "{name}: native call path");
-            assert_eq!(native_call[7], expected_start, "{name}: native start byte");
-            assert_eq!(native_call[8], expected_end, "{name}: native end byte");
-            assert_eq!(native_call[11], "sink", "{name}: native callee spelling");
+            assert_eq!(native_call[2], seed, "{name}: native call owner");
+            assert_eq!(native_call[4], expected_start, "{name}: native start byte");
+            assert_eq!(native_call[5], expected_end, "{name}: native end byte");
+            assert_eq!(native_call[8], "sink", "{name}: native callee spelling");
             fn measured_steps(
                 steps: &[Value],
                 file: &str,
@@ -2667,7 +3469,7 @@ def sink():
                         assert_eq!(step["path"], call["path"]);
                         assert_eq!(step["range"], call["range"]);
                         assert!(
-                            native.iter().any(|row| row[0] == id),
+                            native.iter().any(|row| row[1] == id),
                             "native call ID absent: {id}"
                         );
                         seen.push(id.to_owned());
@@ -2883,16 +3685,58 @@ def sink():
         let stale = request().bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(
             stale.status(),
-            409,
-            "{name}: stale entire pair refused before work"
+            202,
+            "{name}: stale request durably accepted"
         );
-        assert_eq!(real_native_snapshot(&home), native_before, "{name}");
+        let stale: Value = stale.json().await.unwrap();
+        assert_eq!(
+            stale["state"], "queued",
+            "{name}: accepted before claim-time CAS"
+        );
+        let stale_id = stale["id"].as_str().unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let row: Value = client
+                    .get(format!("{url}/api/jobs/{stale_id}"))
+                    .bearer_auth(TOKEN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !row["finishedAt"].is_null() {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(failed["state"], "failed", "{name}: {failed}");
+        assert_eq!(failed["error"]["code"], "revision_conflict", "{name}");
+        // The successful same-byte reindex advanced publication identity. A
+        // stale request must leave that current, fully raw v8 pair untouched.
+        assert_eq!(real_native_snapshot(&home), native_after, "{name}");
+        let unchanged_status: Value = client
+            .get(format!("{url}/api/status"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged_status["revision"], pin,
+            "{name}: current pin changed"
+        );
         drop(server);
     }
 }
 
 #[tokio::test]
-async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached_packet() {
+async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_job() {
     use std::{os::unix::fs::PermissionsExt, time::Duration};
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     struct Server(std::process::Child);
@@ -2927,7 +3771,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let server = Server(
+    let stderr_path = tmp.path().join("daemon-stderr");
+    let mut server = Server(
         isolated_command(&home)
             .arg("serve")
             .arg("--workspace")
@@ -2938,7 +3783,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
             .arg(&token_file)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(
-                fs::File::create(tmp.path().join("daemon-stderr")).unwrap(),
+                fs::File::create(&stderr_path).unwrap(),
             ))
             .spawn()
             .unwrap(),
@@ -2948,21 +3793,43 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let mut last_healthz = "not_observed".to_owned();
+    let readiness = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if client
-                .get(format!("{url}/healthz"))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
-                break;
+            last_healthz = "request_in_flight".to_owned();
+            match client.get(format!("{url}/healthz")).send().await {
+                Ok(response) if response.status().is_success() => break,
+                Ok(response) => {
+                    last_healthz = format!("http_status_{}", response.status().as_u16())
+                }
+                Err(error) if error.is_timeout() => last_healthz = "request_timeout".to_owned(),
+                Err(error) if error.is_connect() => last_healthz = "connect_error".to_owned(),
+                Err(_) => last_healthz = "request_other_error".to_owned(),
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("real daemon readiness");
+    .await;
+    if readiness.is_err()
+        && let Some(dir) = std::env::var_os("BALEYG_PRIVATE_DIAGNOSTICS_DIR")
+    {
+        let diagnostic = write_private_readiness_diagnostic(
+            std::path::Path::new(&dir),
+            &mut server.0,
+            &stderr_path,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            &last_healthz,
+        );
+        eprintln!(
+            "private readiness diagnostic {}",
+            if diagnostic.is_ok() {
+                "recorded"
+            } else {
+                "unavailable"
+            }
+        );
+    }
+    readiness.expect("real daemon readiness");
     let (code, status) = real_api(
         &client,
         &url,
@@ -3056,7 +3923,10 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 202, "{accepted}");
     let id = accepted["id"].as_str().unwrap();
-    let terminal = tokio::time::timeout(Duration::from_secs(60), async {
+    // The externally held index writer keeps the complete capture from
+    // publishing. Busy is not a terminal failure: the SAME durable ACK must
+    // remain queued until that writer releases its lock.
+    let deferred = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let (code, job) = real_api(
                 &client,
@@ -3068,21 +3938,23 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
             )
             .await;
             assert_eq!(code, 200, "{job}");
-            if !job["finishedAt"].is_null() {
+            assert!(
+                job["finishedAt"].is_null(),
+                "busy cannot terminalize: {job}"
+            );
+            if job["state"] == "queued" && job["progress"]["phase"] == "timing:attest" {
                 break job;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("complete capture followed by publication contention");
-    assert_eq!(terminal["state"], "failed", "{terminal}");
-    assert_eq!(terminal["error"]["code"], "index_failed", "{terminal}");
-    assert!(terminal["revision"].is_null(), "{terminal}");
-    assert_eq!(terminal["progress"]["phase"], "complete", "{terminal}");
-    assert_eq!(terminal["progress"]["completed"], 81, "{terminal}");
-    assert_eq!(terminal["progress"]["total"], 81, "{terminal}");
-    drop(writer); // Always rolls back the external writer lock, including on panic.
+    .expect("complete capture must defer its original ACK on publication contention");
+    assert_eq!(deferred["id"], id);
+    assert!(deferred["revision"].is_null(), "{deferred}");
+    // The writer is still held. Neither the native pair nor the graph may
+    // change, and neither Status nor pinned source/packet may serve a false
+    // success from the failed publication attempt.
     let (generation, revision): (String, i64) = rusqlite::Connection::open(real_index_db(&home))
         .unwrap()
         .query_row(
@@ -3096,6 +3968,16 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         revision,
         i64::try_from(pin["indexRevision"].as_u64().unwrap()).unwrap()
     );
+    assert_eq!(
+        real_native_snapshot(&home),
+        native_before,
+        "all native rows remain unchanged before the writer releases"
+    );
+    assert_eq!(
+        real_export(&root, &home),
+        graph_before,
+        "all graph rows remain unchanged before the writer releases"
+    );
     let (code, current) = real_api(
         &client,
         &url,
@@ -3107,16 +3989,6 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 503, "{current}");
     assert_eq!(current["error"]["code"], "index_not_ready");
-    assert_eq!(
-        real_native_snapshot(&home),
-        native_before,
-        "all native rows remain unchanged"
-    );
-    assert_eq!(
-        real_export(&root, &home),
-        graph_before,
-        "all graph rows remain unchanged"
-    );
     let (code, source_after) = real_api(
         &client,
         &url,
@@ -3139,17 +4011,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 503, "{packet_after}");
     assert_eq!(packet_after["error"]["code"], "index_not_ready");
-    let (code, retry) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        "/api/index",
-        Some(serde_json::json!({"expectedRevision":pin})),
-    )
-    .await;
-    assert_eq!(code, 202, "{retry}");
-    let retry_id = retry["id"].as_str().unwrap();
+    drop(writer); // Rolls back the external writer lock; the same accepted ACK now retries.
     let completed = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let (code, job) = real_api(
@@ -3157,7 +4019,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
                 &url,
                 TOKEN,
                 reqwest::Method::GET,
-                &format!("/api/jobs/{retry_id}"),
+                &format!("/api/jobs/{id}"),
                 None,
             )
             .await;
@@ -3169,8 +4031,9 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         }
     })
     .await
-    .expect("later successful job");
-    assert_eq!(completed["state"], "completed", "{completed}");
+    .expect("the original accepted job must finish after the busy writer releases");
+    assert_eq!(completed["id"], id);
+    assert_eq!(completed["state"], "done", "{completed}");
     assert_eq!(
         completed["revision"]["indexGeneration"],
         pin["indexGeneration"]
@@ -3626,7 +4489,7 @@ async fn saved_items_real_index_matrix() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(index_version, 7, "derived index inspection is separate");
+    assert_eq!(index_version, 8, "derived index inspection is separate");
 
     let edited_view_body = serde_json::json!({
         "id":"real-view","title":"Edited","query":{"seed":seed}
@@ -3780,9 +4643,18 @@ async fn saved_items_real_index_matrix() {
         saved_pin_route("/api/views", &pin),
         saved_pin_route("/api/annotations", &pin),
     ] {
-        let (status, error) =
+        let (status, response) =
             real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
-        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{route}: {error}");
+        assert_eq!(status, reqwest::StatusCode::OK, "{route}: {response}");
+        let selected = if route.contains("/real-view") {
+            &response
+        } else {
+            &response[0]
+        };
+        assert_eq!(selected["indexGeneration"], pin["indexGeneration"]);
+        assert_eq!(selected["indexRevision"], pin["indexRevision"]);
+        assert_eq!(selected["attachment"]["result"]["status"], "attached");
+        assert_eq!(selected["attachment"]["result"]["targetId"], seed);
     }
     for (route, body) in [
         (
@@ -3816,11 +4688,8 @@ async fn saved_items_real_index_matrix() {
         Some(query.clone()),
     )
     .await;
-    assert_eq!(
-        status,
-        reqwest::StatusCode::CONFLICT,
-        "stale replay must not resolve the surviving ordinal in Q: {stale_query}"
-    );
+    assert_eq!(status, reqwest::StatusCode::OK, "{stale_query}");
+    assert_eq!(stale_query["revision"], pin, "retained query must select P");
     let (status, current_query) = real_api(
         &client,
         &url,
@@ -4019,4 +4888,113 @@ async fn saved_items_real_index_matrix() {
     assert!(raw_anchor(&stored_payload(&record_db, "views", "legacy-view")).is_none());
     assert!(raw_anchor(&stored_payload(&record_db, "annotations", "legacy-note")).is_none());
     drop(server);
+}
+
+#[test]
+fn optional_captured_scip_changes_presentation_without_native_identity_or_full_rewrite_breakage() {
+    use sha2::{Digest, Sha256};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let ingress = temp.path().join("ingress");
+    let other = temp.path().join("other");
+    for dir in [&root, &ingress, &other] {
+        fs::create_dir(dir).unwrap();
+    }
+    let source = "function f() {}\nf();\n";
+    fs::write(root.join("main.js"), source).unwrap();
+    let first = command(&root, &home, "index")
+        .current_dir(&ingress)
+        .arg("--scip")
+        .arg("index.scip")
+        .arg("--manifest")
+        .arg("manifest.json")
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_pin: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_pin["publishedRevision"]["indexRevision"], 1);
+    let original = command(&root, &home, "export")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(original.status.success());
+    let original: Value = serde_json::from_slice(&original.stdout).unwrap();
+    let first_symbol = original["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "f")
+        .unwrap();
+    let first_id = first_symbol["id"].clone();
+    assert!(first_symbol["displayLabel"].is_null());
+    let hash = hex::encode(Sha256::digest(source.as_bytes()));
+    write_optional_presentation(&ingress, "scip npm display 1 main.js/f().", &hash);
+    // An unrelated cwd never becomes the base of the recorded optional inputs.
+    write_optional_presentation(&other, "scip npm display 1 other().", "stale");
+    let changed = command(&root, &home, "export")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
+    let next = changed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "f")
+        .unwrap();
+    assert_eq!(next["id"], first_id);
+    assert_eq!(next["displayLabel"], "scip npm display 1 main.js/f().");
+    assert_eq!(
+        changed["files"][0]["text"].as_str().unwrap().as_bytes(),
+        source.as_bytes()
+    );
+    let status = command(&root, &home, "status")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    // Only writer commands publish: index r1, original export r2,
+    // changed export r3, read-only status r3, stale export r4, latest status r4.
+    assert_eq!(status["revision"]["indexRevision"], 3);
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        first_pin["publishedRevision"]["indexGeneration"]
+    );
+    write_optional_presentation(&ingress, "scip npm display 1 main.js/f().", "bad-hash");
+    let stale = command(&root, &home, "export")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(
+        stale.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    let symbol = stale["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "f")
+        .unwrap();
+    assert_eq!(symbol["id"], first_id);
+    assert!(symbol["displayLabel"].is_null());
+    let latest = command(&root, &home, "status")
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(latest.status.success());
+    let latest: Value = serde_json::from_slice(&latest.stdout).unwrap();
+    assert_eq!(latest["revision"]["indexRevision"], 4);
 }
