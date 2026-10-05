@@ -45,10 +45,10 @@ Durable per-reader pin leases were considered and rejected for now. Renewing a l
 
 ## Consequences
 
-- **Storage:** bounded by the head plus the last 15 minutes of publications, independent of how long a workspace has been in use. That keeps steady storage near a single revision.
+- **Storage:** Storage is bounded by the head plus publications in the last 15 minutes; #73’s one-retained-revision steady gate is a separate measurement boundary.
 - **Long agent sessions:** a session that holds a pin for more than 15 minutes after the next publication gets a typed conflict and must re-read at head. Agents and MCP clients treat that as normal.
 - **Unused workspaces** lose their index after 30 days unopened and pay a cold rebuild the next time they're opened (about 70 s medium, about 11 min large, extrapolated).
-- **No-op index requests** become fast, about 0.35 s on medium instead of a full re-measure.
+- **No-op index requests** are expected to become fast, about 0.35 s on medium instead of a full re-measure. That's an expectation based on #67's measured unchanged leader `serve` start, not a measured result for explicit requests.
 
 ## Implementation impact (#16)
 
