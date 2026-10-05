@@ -62,6 +62,10 @@ pub struct Store {
     test_queue_finish_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     test_queue_post_commit_failures: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    test_publish_commit_busy_once: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_publish_post_commit_busy_once: Arc<AtomicBool>,
 }
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,6 +811,33 @@ fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
     } else {
         SelectedIntegrity(format!("{error:#}")).into()
     }
+}
+
+/// Publication contention only. A cached-claim mismatch or unresolved
+/// completion also uses the `storage_busy` prefix, but is not a retryable
+/// SQLite/lock conflict and must never be silently requeued.
+pub(crate) fn transient_storage_contention(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        cause.downcast_ref::<topology::StorageBusy>().is_some()
+            || matches!(cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(info, _))
+                    if matches!(info.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+    }) {
+        return true;
+    }
+    matches!(
+        error.to_string().as_str(),
+        "storage_busy: SQLite lock contention"
+            | "storage_busy: index journal sidecar present"
+            | "storage_busy: requests.db initialization in progress"
+    )
+}
+
+/// A `storage_busy` error is never an accepted client's terminal failure,
+/// even if its subtype is an invariant error rather than retryable contention.
+pub(crate) fn nonterminal_storage_busy(error: &anyhow::Error) -> bool {
+    transient_storage_contention(error) || error.to_string().starts_with("storage_busy")
 }
 
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
@@ -3430,6 +3461,10 @@ impl Store {
             test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             test_queue_post_commit_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_publish_commit_busy_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_publish_post_commit_busy_once: Arc::new(AtomicBool::new(false)),
         })
     }
     /// Observe only an already-published index. In particular, this path may
@@ -3573,6 +3608,16 @@ impl Store {
             anyhow::bail!("root_changed: daemon recovery disposition advanced after observation");
         }
         Ok(Some(pin))
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_live_publish_commit_busy(&self) {
+        self.test_publish_commit_busy_once
+            .store(true, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_live_publish_post_commit_busy(&self) {
+        self.test_publish_post_commit_busy_once
+            .store(true, Ordering::Release);
     }
     pub fn open_for_tests(state: &Path, workspace: &Path) -> Result<Self> {
         let identity = topology::WorkspaceIdentity::discover(Some(workspace), workspace)?;
@@ -6721,7 +6766,27 @@ impl Store {
             stage.verify_path()?;
             leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
         }
+        #[cfg(test)]
+        if matches!(target, PublicationTarget::Live)
+            && self
+                .test_publish_commit_busy_once
+                .swap(false, Ordering::AcqRel)
+        {
+            // Deterministic pre-commit rollback-journal contention: the live
+            // transaction drops without publishing any part of this revision.
+            anyhow::bail!("storage_busy: SQLite lock contention");
+        }
         storage_result(tx.commit())?;
+        #[cfg(test)]
+        if matches!(target, PublicationTarget::Live)
+            && self
+                .test_publish_post_commit_busy_once
+                .swap(false, Ordering::AcqRel)
+        {
+            // Simulate an ambiguous post-COMMIT failure: the new pin is on
+            // disk, but the caller has no successful publication result.
+            anyhow::bail!("storage_busy: SQLite lock contention");
+        }
         *self.writer_counters.lock().unwrap() = Some(immutable.counters);
         match target {
             PublicationTarget::Live => {
@@ -11787,5 +11852,30 @@ mod accepted_cli_refresh_race_tests {
             before_queue,
             "queue must not be changed by rejected refresh"
         );
+    }
+}
+
+#[cfg(test)]
+mod busy_contention_classifier_tests {
+    use super::*;
+    #[test]
+    fn real_rollback_journal_sqlite_busy_is_transient_but_invariant_busy_is_not() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("contended.db");
+        let writer = Connection::open(&file).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE t (value INTEGER); BEGIN IMMEDIATE; INSERT INTO t VALUES (1)").unwrap();
+        let reader = Connection::open(&file).unwrap();
+        reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let sqlite = reader.execute("INSERT INTO t VALUES (2)", []).unwrap_err();
+        let wrapped = anyhow::Error::new(sqlite).context("publish commit");
+        assert!(super::transient_storage_contention(&wrapped));
+        assert!(super::nonterminal_storage_busy(&wrapped));
+        assert!(super::transient_storage_contention(&anyhow::anyhow!(
+            "storage_busy: SQLite lock contention"
+        )));
+        let invariant = anyhow::anyhow!("storage_busy: cached claim changed");
+        assert!(!super::transient_storage_contention(&invariant));
+        assert!(super::nonterminal_storage_busy(&invariant));
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 }

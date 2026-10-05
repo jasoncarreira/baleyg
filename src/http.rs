@@ -156,6 +156,12 @@ pub struct DaemonState {
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
 }
+/// Diagnostic logging must never kill the durable queue worker if the
+/// launching parent closed its stderr pipe after the server banner.
+fn best_effort_queue_stderr(mut output: impl std::io::Write, args: std::fmt::Arguments<'_>) {
+    let _ = output.write_fmt(args);
+}
+
 pub fn new(
     store: Store,
     index_options: IndexOptions,
@@ -332,8 +338,14 @@ impl DaemonState {
                 let result = tokio::task::spawn_blocking(move || worker.queue_tick()).await;
                 match result {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => eprintln!("queue tick failed: {error:#}"),
-                    Err(error) => eprintln!("queue tick worker failed: {error:#}"),
+                    Ok(Err(error)) => best_effort_queue_stderr(
+                        std::io::stderr(),
+                        format_args!("queue tick failed: {error:#}\n"),
+                    ),
+                    Err(error) => best_effort_queue_stderr(
+                        std::io::stderr(),
+                        format_args!("queue tick worker failed: {error:#}\n"),
+                    ),
                 }
             }
         });
@@ -483,10 +495,27 @@ impl DaemonState {
             && session.is_leader()
             && session.verify().is_ok()
         {
-            if crate::index_coordinator::drain_requests_observed(&self.store, session, |id, p| {
-                self.job_progress.lock().unwrap().insert(id.to_owned(), p);
-            })? > 0
-            {
+            let processed = match crate::index_coordinator::drain_requests_observed(
+                &self.store,
+                session,
+                |id, p| {
+                    self.job_progress.lock().unwrap().insert(id.to_owned(), p);
+                },
+            ) {
+                Ok(processed) => processed,
+                Err(error) => {
+                    // A cached terminal result must be resolved by this same
+                    // incarnation. Otherwise release the failed leader so a
+                    // successor can reclaim an unfinished running head.
+                    if !self.store.has_recorded_completion(session)?
+                        || !crate::index_coordinator::retryable_cli_completion_error(&error)
+                    {
+                        *self.serving_session.lock().unwrap() = None;
+                    }
+                    return Err(error);
+                }
+            };
+            if processed > 0 {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
             }
@@ -578,9 +607,24 @@ impl DaemonState {
                         self.store.verify_leader_session(&session)?;
                         self.store.fail_changed_root_requests(&session)?;
                         if self.store.index_baseline()? != before {
+                            // A possibly committed publication is never
+                            // guessed from a transient error. Reconcile it
+                            // under a fresh verified owner before any claim.
                             return Err(error);
                         }
                         let current_head = self.store.earliest_unfinished_request()?;
+                        if crate::store::transient_storage_contention(&error) {
+                            // The rollback-journal COMMIT was busy before the
+                            // head was claimed. It remains the same durable
+                            // FIFO row; the next tick resumes with this
+                            // verified owner after a bounded reader backoff.
+                            *self.recovery_retry_after.lock().unwrap() =
+                                Some(Instant::now() + Duration::from_millis(250));
+                            return Ok(0);
+                        }
+                        if crate::store::nonterminal_storage_busy(&error) {
+                            return Err(error);
+                        }
                         // Do not claim/fail a row admitted after the capture,
                         // or an earlier row whose options could not be read.
                         if head_options.is_none()
@@ -595,9 +639,12 @@ impl DaemonState {
                                 // check. Leave it running for a new leader.
                                 return Err(error);
                             }
-                            eprintln!(
-                                "queue takeover failed for accepted {}: {error:#}",
-                                claimed.id
+                            best_effort_queue_stderr(
+                                std::io::stderr(),
+                                format_args!(
+                                    "queue takeover failed for accepted {}: {error:#}\n",
+                                    claimed.id
+                                ),
                             );
                             self.store
                                 .record_and_finish_request(&session, &claimed, Err(error))?;
@@ -618,7 +665,15 @@ impl DaemonState {
                     }
                     Ok(processed)
                 })();
-                if outcome.is_ok() {
+                if outcome.is_ok()
+                    || (self.store.has_recorded_completion(&session)?
+                        && outcome
+                            .as_ref()
+                            .is_err_and(crate::index_coordinator::retryable_cli_completion_error))
+                {
+                    // A terminal queue write may have committed ambiguously.
+                    // Keep this exact leader for cached-result reconciliation;
+                    // otherwise release it so the next incarnation can reclaim.
                     *self.serving_session.lock().unwrap() = Some(session);
                 }
                 outcome.map(|_| ())
@@ -3354,6 +3409,86 @@ mod serving_holder_tests {
         assert_eq!(state.queue_takeover_attempts.load(Ordering::Acquire), 1);
     }
 
+    #[test]
+    fn closed_stderr_pipe_cannot_stop_queue_diagnostics() {
+        struct ClosedPipe;
+        impl std::io::Write for ClosedPipe {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        best_effort_queue_stderr(
+            ClosedPipe,
+            format_args!("queue tick failed: storage_busy\n"),
+        );
+        best_effort_queue_stderr(
+            ClosedPipe,
+            format_args!("queue takeover failed for accepted ID\n"),
+        );
+        // Reaching here proves a broken diagnostic pipe cannot panic the
+        // timer thread or prevent its next accepted-work tick.
+    }
+
+    #[tokio::test]
+    async fn transient_publish_commit_busy_cannot_fail_accepted_takeover_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let original = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &original,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let state = new(
+            follower_store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let ack = follower_store.enqueue_request(&options, None).unwrap();
+        state.pending_requests.lock().unwrap().push(ack.id.clone());
+        let old_seq = ack.seq;
+        follower_store.fail_next_live_publish_commit_busy();
+        drop(owner);
+        let _ = state.queue_tick();
+        let after_busy = follower_store.request_by_id(&ack.id).unwrap().unwrap();
+        assert_eq!(after_busy.seq, old_seq);
+        assert!(
+            after_busy.finished_at.is_none() && after_busy.error_code.is_none(),
+            "verified takeover may not terminally fail an ACK for rollback-journal COMMIT BUSY"
+        );
+        assert_eq!(
+            follower_store.index_baseline().unwrap(),
+            old_pin,
+            "a pre-commit BUSY must not publish a partial pin"
+        );
+        // Advance only the advisory 250 ms reader-backoff, not the root,
+        // accepted row, leader session or original deadline.
+        *state.recovery_retry_after.lock().unwrap() = None;
+        state.queue_tick().unwrap();
+        let done = follower_store.request_by_id(&ack.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        assert_eq!(done.seq, old_seq);
+        assert_eq!(
+            done.revision.unwrap().index_revision,
+            old_pin.index_revision + 1
+        );
+        assert!(state.retained_serving_session().unwrap().is_leader());
+    }
+
     #[tokio::test]
     async fn follower_takeover_uses_claimed_clients_options_not_daemon_defaults() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4796,6 +4931,7 @@ mod dependency_lifecycle_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
+        let held_session = session.clone();
         state.retain_serving_session(session);
         {
             let mut deps = state.dependencies.lock().unwrap();
@@ -4825,16 +4961,16 @@ mod dependency_lifecycle_tests {
         assert!(refused.get("workspaceRevision").is_none());
         assert!(refused.get("catalogId").is_none());
         *state.dependency_capture_hook.lock().unwrap() = None;
-        let incarnation = state
-            .retained_serving_session()
-            .unwrap()
-            .leader_guard()
-            .unwrap()
-            .incarnation;
+        // The timer may correctly discard its unverified holder while the
+        // intentional lock-incarnation tamper is present. Keep the fixture's
+        // independent flock handle to restore that precise incarnation.
+        let incarnation = held_session.leader_guard().unwrap().incarnation;
         let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(incarnation.to_string().as_bytes()).unwrap();
         file.sync_all().unwrap();
+        held_session.verify().unwrap();
+        state.retain_serving_session(held_session.clone());
         let mismatched = IndexPin {
             index_revision: pin.index_revision + 1,
             ..pin
@@ -4899,16 +5035,15 @@ mod dependency_lifecycle_tests {
         assert!(browse.get("revision").is_none());
         assert!(browse.get("files").is_none());
         *state.outer_fence_hook.lock().unwrap() = None;
-        let incarnation = state
-            .retained_serving_session()
-            .unwrap()
-            .leader_guard()
-            .unwrap()
-            .incarnation;
+        // The second intentional incarnation tamper may also be observed by
+        // the timer. Restore from the independently held, exact old owner.
+        let incarnation = held_session.leader_guard().unwrap().incarnation;
         let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(incarnation.to_string().as_bytes()).unwrap();
         file.sync_all().unwrap();
+        held_session.verify().unwrap();
+        state.retain_serving_session(held_session);
     }
     #[test]
     fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {

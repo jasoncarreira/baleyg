@@ -47,14 +47,15 @@ pub(crate) enum CompletionOutcome {
     Failed(&'static str),
 }
 impl CompletionOutcome {
-    fn from_result(result: Result<IndexPin>) -> Self {
-        match result {
+    fn from_result(result: Result<IndexPin>) -> Result<Self> {
+        Ok(match result {
             Ok(pin) => Self::Done(pin),
+            Err(error) if super::nonterminal_storage_busy(&error) => return Err(error),
             Err(error) if error.to_string().starts_with("revision conflict") => {
                 Self::Failed("revision_conflict")
             }
             Err(_) => Self::Failed("index_failed"),
-        }
+        })
     }
     fn matches_terminal(&self, row: &Request) -> bool {
         match self {
@@ -534,6 +535,76 @@ impl Store {
         tx.commit()?;
         Ok(Some(claimed))
     }
+    /// Resolve an operational publish BUSY before retrying an accepted claim.
+    /// The observed committed pin must still be the pre-attempt pin. If an
+    /// ambiguous COMMIT advanced it, leave the running row for a fresh verified
+    /// reconciliation rather than attaching a guessed result or republishing.
+    pub(crate) fn requeue_busy_claim(
+        &self,
+        session: &LeaderSession,
+        request: &Request,
+        before: Option<IndexPin>,
+    ) -> Result<()> {
+        self.verify_leader_session(session)?;
+        self.fail_changed_root_requests(session)?;
+        let current = self.recovery_index_baseline()?.pin();
+        let observed = self
+            .request_by_id(&request.id)?
+            .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted claim disappeared"))?;
+        self.verify_request_root(&Some(observed.clone()))?;
+        ensure!(
+            observed.id == request.id
+                && observed.seq == request.seq
+                && observed.root_device == request.root_device
+                && observed.root_inode == request.root_inode,
+            "storage_busy: accepted claim identity changed"
+        );
+        if observed.finished_at.is_some() {
+            if observed.state == "done" {
+                let completed = observed
+                    .revision
+                    .ok_or_else(|| anyhow::anyhow!("storage_busy: terminal pin is missing"))?;
+                ensure!(
+                    current.is_some_and(|pin| pin.index_generation == completed.index_generation
+                        && pin.index_revision >= completed.index_revision),
+                    "storage_busy: terminal pin is not retained by current publication"
+                );
+            }
+            // A terminal row is never requeued; caller observes it on reread.
+            return Ok(());
+        }
+        ensure!(
+            observed.state == "running"
+                && observed.claim_incarnation.as_deref()
+                    == Some(session.incarnation().to_string().as_str())
+                && request.claim_incarnation == observed.claim_incarnation,
+            "storage_busy: request claim changed during busy resolution"
+        );
+        ensure!(
+            current == before,
+            "storage_busy: publication changed across failed commit; leave running for verified recovery"
+        );
+        ensure!(
+            !self.has_recorded_completion(session)?,
+            "storage_busy: unresolved FIFO completion must not be requeued"
+        );
+        let (_use_guard, mut db) = self.request_connection()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.verify_leader_session(session)?;
+        self.verify_request_root(&Some(observed))?;
+        let changed=tx.execute(
+            "UPDATE requests SET state='queued',claim_incarnation=NULL,started_at=NULL WHERE seq=?1 AND id=?2 AND state='running' AND claim_incarnation=?3 AND root_device=?4 AND root_inode=?5",
+            params![request.seq,request.id,session.incarnation().to_string(),request.root_device,request.root_inode],
+        )?;
+        ensure!(
+            changed == 1,
+            "storage_busy: request claim changed before same-seq requeue"
+        );
+        self.verify_leader_session(session)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn record_and_finish_request(
         &self,
         session: &LeaderSession,
@@ -551,7 +622,7 @@ impl Store {
             ensure!(slot.is_none(), "storage_busy: unresolved FIFO completion");
             *slot = Some(PendingCompletion {
                 request: request.clone(),
-                outcome: CompletionOutcome::from_result(result),
+                outcome: CompletionOutcome::from_result(result)?,
                 incarnation: session.incarnation().to_string(),
             });
         }
@@ -643,7 +714,7 @@ impl Store {
         request: &Request,
         result: Result<IndexPin>,
     ) -> Result<()> {
-        self.finish_request_outcome(session, request, &CompletionOutcome::from_result(result))
+        self.finish_request_outcome(session, request, &CompletionOutcome::from_result(result)?)
     }
     fn finish_request_outcome(
         &self,
@@ -713,6 +784,18 @@ impl Store {
 mod stale_claim_tests {
     use super::*;
     #[test]
+    fn busy_result_can_never_become_terminal_index_failed() {
+        for reason in [
+            "storage_busy: SQLite lock contention",
+            "storage_busy: cached claim changed",
+        ] {
+            assert!(
+                CompletionOutcome::from_result(Err(anyhow::anyhow!(reason))).is_err(),
+                "neither transient busy nor invariant busy may mint terminal failure"
+            );
+        }
+    }
+    #[test]
     fn stale_claim_cannot_complete_a_row_after_new_leader_reclaims_it() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -740,6 +823,16 @@ mod stale_claim_tests {
         .unwrap();
         let new_claim = replacement.claim_request(&new_owner).unwrap().unwrap();
         assert_ne!(stale_claim.claim_incarnation, new_claim.claim_incarnation);
+        let stale_retry = replacement
+            .requeue_busy_claim(&new_owner, &stale_claim, Some(new_pin))
+            .unwrap_err();
+        assert!(
+            stale_retry.to_string().contains("claim changed"),
+            "{stale_retry:#}"
+        );
+        let still_new = replacement.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(still_new.state, "running");
+        assert_eq!(still_new.claim_incarnation, new_claim.claim_incarnation);
         let error = replacement
             .record_and_finish_request(&new_owner, &stale_claim, Ok(new_pin))
             .unwrap_err();

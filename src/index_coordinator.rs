@@ -297,15 +297,64 @@ fn drain_requests_observed_with_cancel(
         let Some(request) = store.claim_request(session)? else {
             break;
         };
+        #[cfg(test)]
+        let diagnostic_stage = std::cell::Cell::new("options");
+        // Capture the authenticated expected pin from the same publication
+        // admission. A BUSY COMMIT can be safely retried only if its terminal
+        // queue reread and current control pin still match this baseline.
+        let mut before_publish = None;
         let outcome = (|| {
             let options = request.options(std::path::Path::new(store.workspace_root()))?;
+            #[cfg(test)]
+            diagnostic_stage.set("prepare");
             let coordinator = IndexJobCoordinator::prepare_with_session(
                 store,
                 request.expected,
                 session.clone(),
             )?;
+            before_publish = Some(coordinator.expected.pin());
+            #[cfg(test)]
+            diagnostic_stage.set("run");
             coordinator.run(&options, cancel, |p| progress(&request.id, p))
         })();
+        #[cfg(test)]
+        if let Err(ref error) = outcome {
+            // Only allowlisted error classes reach CI; no raw source/path/token
+            // or generic error text is copied into public test output.
+            let text = format!("{error:#}");
+            let category = if text.contains("storage_busy") {
+                "storage_busy"
+            } else if text.contains("recovery_required") {
+                "recovery_required"
+            } else if text.contains("index_not_ready") {
+                "index_not_ready"
+            } else if text.contains("incompatible_index") {
+                "incompatible_index"
+            } else if text.contains("root_changed") {
+                "root_changed"
+            } else if text.contains("revision conflict") {
+                "revision_conflict"
+            } else if text.contains("database is locked") {
+                "sqlite_locked"
+            } else if text.contains("database disk image is malformed") {
+                "sqlite_corrupt"
+            } else if text.contains("unsafe or oversized") {
+                "unsafe_input"
+            } else if text.contains("source changed") {
+                "source_changed"
+            } else {
+                "other"
+            };
+            eprintln!(
+                "queue_failure stage={} category={} owner_leader={} claim_matches={} expected_pin={}",
+                diagnostic_stage.get(),
+                category,
+                session.is_leader(),
+                request.claim_incarnation.as_deref()
+                    == Some(session.incarnation().to_string().as_str()),
+                request.expected.is_some()
+            );
+        }
         // Ctrl-C stops this CLI waiter, not any accepted client's durable work.
         // The claim stays running under the old incarnation and the next
         // verified leader reclaims the FIFO head after full reconciliation.
@@ -315,6 +364,27 @@ fn drain_requests_observed_with_cancel(
             !cancel.load(Ordering::Acquire),
             "index wait interrupted; accepted request remains running for verified reclaim"
         );
+        if outcome
+            .as_ref()
+            .is_err_and(crate::store::transient_storage_contention)
+        {
+            // The failed COMMIT might be ambiguous. Authenticate both the
+            // durable terminal row and the current pin before returning the
+            // SAME seq to queued; a changed pin remains running for a fresh
+            // leader reconciliation, never an invented terminal ACK.
+            let before = match before_publish {
+                Some(pin) => pin,
+                None => store.recovery_index_baseline()?.pin(),
+            };
+            store.requeue_busy_claim(session, &request, before)?;
+            return Ok(completed);
+        }
+        if outcome
+            .as_ref()
+            .is_err_and(crate::store::nonterminal_storage_busy)
+        {
+            return outcome.map(|_| completed);
+        }
         // No unverified worker can mark a request terminal. On fencing loss leave it running
         // for the next incarnation to reclaim after its complete root reconciliation.
         store.record_and_finish_request(session, &request, outcome)?;
@@ -323,22 +393,14 @@ fn drain_requests_observed_with_cancel(
     Ok(completed)
 }
 
-fn retryable_cli_completion_error(error: &anyhow::Error) -> bool {
-    // Never treat invariant failures such as "storage_busy: cached claim changed"
-    // as retryable merely because their text shares a prefix with lock contention.
+pub(crate) fn retryable_cli_completion_error(error: &anyhow::Error) -> bool {
+    // Include storage_result's plain SQLite contention string, but never a
+    // cached-claim or leader/root invariant that also uses storage_busy.
     #[cfg(test)]
     if error.to_string() == "storage_busy: injected terminal write failure" {
         return true;
     }
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<crate::store::topology::StorageBusy>()
-            .is_some()
-            || matches!(cause.downcast_ref::<rusqlite::Error>(),
-                Some(rusqlite::Error::SqliteFailure(info, _))
-                    if matches!(info.code,
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
-    })
+    crate::store::transient_storage_contention(error)
 }
 
 /// The CLI is its own sole queue driver. A transient completion failure must be
@@ -678,6 +740,133 @@ mod tests {
             )
             .collect();
         (files, ops)
+    }
+
+    #[test]
+    fn publish_commit_busy_once_must_keep_accepted_fifo_head_and_finish_same_seq() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, old_owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        drop(old_owner);
+        let browser = store.enqueue_request(&options, None).unwrap();
+        let cli = store.enqueue_request(&options, None).unwrap();
+        assert!(browser.seq < cli.seq);
+        let (base, leader) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let injection = AtomicBool::new(false);
+        assert_eq!(
+            drain_requests_observed(&store, &leader, |id, phase| {
+                if id == cli.id
+                    && phase.phase == "timing:capture"
+                    && !injection.swap(true, Ordering::AcqRel)
+                {
+                    store.fail_next_live_publish_commit_busy();
+                }
+            })
+            .unwrap(),
+            1
+        );
+        assert!(
+            injection.load(Ordering::Acquire),
+            "inject once at Q2's real commit boundary"
+        );
+        let a = store.request_by_id(&browser.id).unwrap().unwrap();
+        let b = store.request_by_id(&cli.id).unwrap().unwrap();
+        assert_eq!(a.state, "done");
+        assert_eq!(
+            b.seq, cli.seq,
+            "accepted CLI ACK cannot be deleted/re-admitted under a new seq"
+        );
+        assert_eq!(
+            b.state, "queued",
+            "pre-commit storage_busy must return same-seq accepted ACK to queued, not index_failed"
+        );
+        assert!(b.finished_at.is_none() && b.error_code.is_none() && b.revision.is_none());
+        assert_eq!(
+            store.index_baseline().unwrap().index_revision,
+            base.index_revision + 1,
+            "failed commit must leave only the prior Q1 publication"
+        );
+        assert_eq!(
+            drain_requests(&store, &leader).unwrap(),
+            1,
+            "same verified leader may reclaim requeued Q2 on next bounded tick"
+        );
+        let b = store.request_by_id(&cli.id).unwrap().unwrap();
+        assert_eq!(
+            b.state, "done",
+            "retry must finish the original accepted same-seq Q2"
+        );
+        assert!(b.error_code.is_none());
+        assert_eq!(a.revision.unwrap().index_generation, base.index_generation);
+        assert_eq!(a.revision.unwrap().index_revision, base.index_revision + 1);
+        assert_eq!(
+            b.revision.unwrap().index_revision,
+            a.revision.unwrap().index_revision + 1,
+            "failed commit cannot leave a partially published revision"
+        );
+        assert_eq!(store.status().unwrap().revision, b.revision.unwrap());
+        assert!(leader.verify().is_ok());
+    }
+
+    #[test]
+    fn cached_completion_retry_only_accepts_real_lock_contention_not_claim_invariants() {
+        assert!(retryable_cli_completion_error(&anyhow::anyhow!(
+            "storage_busy: SQLite lock contention"
+        )));
+        assert!(!retryable_cli_completion_error(&anyhow::anyhow!(
+            "storage_busy: cached claim changed"
+        )));
+        assert!(!retryable_cli_completion_error(&anyhow::anyhow!(
+            "storage_busy: unresolved FIFO completion"
+        )));
+    }
+
+    #[test]
+    fn ambiguous_post_commit_busy_must_leave_running_for_verified_reconciliation() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, old) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        drop(old);
+        let ack = store.enqueue_request(&options, None).unwrap();
+        let (before, leader) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        store.fail_next_live_publish_post_commit_busy();
+        let error = drain_requests(&store, &leader).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("publication changed across failed commit"),
+            "{error:#}"
+        );
+        let row = store.request_by_id(&ack.id).unwrap().unwrap();
+        assert_eq!(
+            row.state, "running",
+            "unknown result must not be requeued or failed"
+        );
+        assert_eq!(row.seq, ack.seq);
+        assert!(row.error_code.is_none() && row.revision.is_none() && row.finished_at.is_none());
+        let committed = store.index_baseline().unwrap();
+        assert_eq!(committed.index_generation, before.index_generation);
+        assert_eq!(
+            committed.index_revision,
+            before.index_revision + 1,
+            "test seam committed selected pin before returning BUSY"
+        );
+        drop(leader);
+        let successor = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (_, new_owner) = reconcile_workspace(&successor, &options, &cancel, |_| {}).unwrap();
+        assert_eq!(drain_requests(&successor, &new_owner).unwrap(), 1);
+        let done = successor.request_by_id(&ack.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        assert_eq!(done.seq, ack.seq);
+        assert!(done.revision.unwrap().index_revision > committed.index_revision);
     }
 
     #[test]

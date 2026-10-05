@@ -3736,7 +3736,7 @@ def sink():
 }
 
 #[tokio::test]
-async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached_packet() {
+async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_job() {
     use std::{os::unix::fs::PermissionsExt, time::Duration};
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     struct Server(std::process::Child);
@@ -3923,7 +3923,10 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 202, "{accepted}");
     let id = accepted["id"].as_str().unwrap();
-    let terminal = tokio::time::timeout(Duration::from_secs(60), async {
+    // The externally held index writer keeps the complete capture from
+    // publishing. Busy is not a terminal failure: the SAME durable ACK must
+    // remain queued until that writer releases its lock.
+    let deferred = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let (code, job) = real_api(
                 &client,
@@ -3935,25 +3938,23 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
             )
             .await;
             assert_eq!(code, 200, "{job}");
-            if !job["finishedAt"].is_null() {
+            assert!(
+                job["finishedAt"].is_null(),
+                "busy cannot terminalize: {job}"
+            );
+            if job["state"] == "queued" && job["progress"]["phase"] == "timing:attest" {
                 break job;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("complete capture followed by publication contention");
-    assert_eq!(terminal["state"], "failed", "{terminal}");
-    assert_eq!(terminal["error"]["code"], "index_failed", "{terminal}");
-    assert!(terminal["revision"].is_null(), "{terminal}");
-    // Advisory progress is process-local while running; terminal rows use the
-    // stable default rather than race a late in-memory update into GET/cancel.
-    assert_eq!(
-        terminal["progress"],
-        serde_json::json!({"phase":"","completed":0,"total":0}),
-        "{terminal}"
-    );
-    drop(writer); // Always rolls back the external writer lock, including on panic.
+    .expect("complete capture must defer its original ACK on publication contention");
+    assert_eq!(deferred["id"], id);
+    assert!(deferred["revision"].is_null(), "{deferred}");
+    // The writer is still held. Neither the native pair nor the graph may
+    // change, and neither Status nor pinned source/packet may serve a false
+    // success from the failed publication attempt.
     let (generation, revision): (String, i64) = rusqlite::Connection::open(real_index_db(&home))
         .unwrap()
         .query_row(
@@ -3967,6 +3968,16 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         revision,
         i64::try_from(pin["indexRevision"].as_u64().unwrap()).unwrap()
     );
+    assert_eq!(
+        real_native_snapshot(&home),
+        native_before,
+        "all native rows remain unchanged before the writer releases"
+    );
+    assert_eq!(
+        real_export(&root, &home),
+        graph_before,
+        "all graph rows remain unchanged before the writer releases"
+    );
     let (code, current) = real_api(
         &client,
         &url,
@@ -3978,16 +3989,6 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 503, "{current}");
     assert_eq!(current["error"]["code"], "index_not_ready");
-    assert_eq!(
-        real_native_snapshot(&home),
-        native_before,
-        "all native rows remain unchanged"
-    );
-    assert_eq!(
-        real_export(&root, &home),
-        graph_before,
-        "all graph rows remain unchanged"
-    );
     let (code, source_after) = real_api(
         &client,
         &url,
@@ -4010,17 +4011,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
     .await;
     assert_eq!(code, 503, "{packet_after}");
     assert_eq!(packet_after["error"]["code"], "index_not_ready");
-    let (code, retry) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        "/api/index",
-        Some(serde_json::json!({"expectedRevision":pin})),
-    )
-    .await;
-    assert_eq!(code, 202, "{retry}");
-    let retry_id = retry["id"].as_str().unwrap();
+    drop(writer); // Rolls back the external writer lock; the same accepted ACK now retries.
     let completed = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let (code, job) = real_api(
@@ -4028,7 +4019,7 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
                 &url,
                 TOKEN,
                 reqwest::Method::GET,
-                &format!("/api/jobs/{retry_id}"),
+                &format!("/api/jobs/{id}"),
                 None,
             )
             .await;
@@ -4040,7 +4031,8 @@ async fn real_daemon_post_capture_failure_preserves_pair_source_graph_and_cached
         }
     })
     .await
-    .expect("later successful job");
+    .expect("the original accepted job must finish after the busy writer releases");
+    assert_eq!(completed["id"], id);
     assert_eq!(completed["state"], "done", "{completed}");
     assert_eq!(
         completed["revision"]["indexGeneration"],
