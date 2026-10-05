@@ -1,12 +1,12 @@
 # Decision 0006: revision retention, automatic index deletion and unchanged requests
 
-- **Status:** owner-approved 2026-10-05; ratified when this record merges. It adds revision retention to `../../local-topology.md`, confirms that document's existing automatic GC rule, and governs #16.
+- **Status:** proposed, pending explicit owner approval of the 15-minute supersession grace, no reader-renewed lease, and whole-index deletion invalidating its pins; ratified when this record merges. It adds revision retention to `../../local-topology.md`, confirms that document's existing automatic GC rule, and governs #16.
 - **Scope:** which published revisions stay readable, when a whole derived index may be deleted automatically, and how an explicit indexing request with no source change publishes. Pin identity (`{indexGeneration, indexRevision}`), #67's storage model and Decision 0005 are unchanged.
 - **Compatibility:** none needed (pre-release).
 
 ## Background
 
-#67 retains **every** revision of the active generation and ships the release and GC mechanism (`release_revision`, `collect_unreferenced`), but no policy. Each revision carries a full manifest, one row per document. With #16's watcher publishing on every save, retaining everything grows without bound. That's roughly 3 GB on the medium cohort and 30 GB on the large cohort for 30 days of an active workday, far above #73's ≤4 GiB steady budget.
+#67 retains **every** revision of the active generation and ships the release and GC mechanism (`release_revision`, `collect_unreferenced`), but no policy. Each revision carries a full manifest, one row per document. With #16's watcher publishing on every save, retaining everything grows without bound. Storage then grows with the number of publications times the number of documents, regardless of whether anyone still reads the old revisions.
 
 A derived index is a disposable cache: deleting it only costs a rebuild. An **old revision**, however, can't be rebuilt, because a rebuild indexes the source as it is now. Retention therefore exists only so that a reader working at a pin isn't interrupted mid-task by the next publication. It is not a history feature.
 
@@ -18,7 +18,7 @@ A derived index is a disposable cache: deleting it only costs a rebuild. An **ol
 - **Release:** once a non-head revision is past the 15-minute grace, the leader releases it and collects unreferenced document versions and projections. GC always runs **outside** the publication transaction, and never removes anything a retained revision references.
 - **Expired pin:** a pinned read or write at a released revision fails with a typed conflict (pin expired or released). It **never** silently moves to a newer revision. The client re-reads at head.
 - **Readers write nothing.** Retention needs no lease renewal or other reader-side writes, so the T06 rule that followers never write index or request state to read still holds.
-- **Saved views and notes** don't depend on old revisions. Loading one at an expired pin re-resolves at head through its durable anchors (#65). #97 shows when a result comes from an older revision than head.
+- **Saved views and notes.** Loading one at an expired pin **conflicts**, like any other pinned read. It never falls forward silently. The caller may then explicitly request head and reattach the item there through its durable anchors (#65). #97 shows when a result comes from an older revision than head.
 - **The grace is a policy constant.** Changing it later is an owner decision, not a format change.
 
 Durable per-reader pin leases were considered and rejected for now. Renewing a lease on every read would make readers write shared state, against T06. If longer-lived pins are needed later, a separate decision must define where leases are stored and why readers may write them.
@@ -31,7 +31,7 @@ Durable per-reader pin leases were considered and rejected for now. Renewing a l
   - a verified **exclusive, non-blocking** use lock;
   - skip anything live, busy, with a hot journal, unknown or unreadable.
 - **Never deleted automatically:** durable records, UUID markers, configured token and ledger trees, and legacy state.
-- **Pins:** deleting an eligible index invalidates every pin of its generation. Reopening the workspace creates a new generation, and old pins conflict.
+- **Pins:** deleting an eligible index invalidates every pin of its generation, including revisions that would otherwise be retained. The retention rule in §1 protects revisions **within a live index**; it doesn't keep an eligible index from being deleted. Reopening the workspace creates a new generation, and old pins conflict.
 - **Disk space:** the deleting process must not keep descriptors open on the deleted files, or the space isn't reclaimed. #16 must reconcile this with #67's retained SQLite check-handle cache.
 - `gc --report` stays read-only. Its "eligible" never authorizes deletion by itself.
 
@@ -41,11 +41,11 @@ Durable per-reader pin leases were considered and rejected for now. Renewing a l
   - It freshly hashes every admitted source.
   - It checks the same generation, the stored source bytes, the producer binding and executable, the extraction context, options, capture inputs and the projection links, with the CAS and `data_version` fences.
   - It publishes a new revision header and manifest, then acknowledges the request as done.
-- Any source change, changed option or input, or executable drift (Decision 0005) takes #67's local or full path instead.
+- A source change, or a changed option or input, takes #67's local or full path instead. Executable drift requires **full fresh measurement** (Decision 0005), never the local path.
 
 ## Consequences
 
-- **Storage:** bounded by the head plus the last 15 minutes of publications, independent of how long a workspace has been in use. That keeps steady storage near one revision, consistent with #73's measurement boundary.
+- **Storage:** bounded by the head plus the last 15 minutes of publications, independent of how long a workspace has been in use. That keeps steady storage near a single revision.
 - **Long agent sessions:** a session that holds a pin for more than 15 minutes after the next publication gets a typed conflict and must re-read at head. Agents and MCP clients treat that as normal.
 - **Unused workspaces** lose their index after 30 days unopened and pay a cold rebuild the next time they're opened (about 70 s medium, about 11 min large, extrapolated).
 - **No-op index requests** become fast, about 0.35 s on medium instead of a full re-measure.

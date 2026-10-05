@@ -41,7 +41,9 @@ index marked `eligible` is **not deleted**. Baleyg has no derived-index deletion
 automatic deletion path today. Future [#16](https://github.com/jasoncarreira/baleyg/issues/16)
 automatic GC needs a separate guarded public contract: authenticate the exact historical schema,
 root identity and age; hold a verified exclusive use lock; refuse live, hot-journal, unknown or
-busy data; and protect retained pins and durable saved records. Reporting eligibility alone must
+busy data; and never touch durable saved records. Deleting an eligible whole index invalidates
+its generation's pins ([Decision 0006](docs/semantic-evidence/decisions/0006-revision-retention-and-index-gc.md));
+retained revisions are protected only within a live index. Reporting eligibility alone must
 never trigger removal.
 
 ## What works
