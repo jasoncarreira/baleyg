@@ -1958,8 +1958,16 @@ async fn retained_class_page_and_diagram_are_byte_stable_after_full_rewrite() {
     store
         .release_revision(old, session.leader_guard().unwrap())
         .unwrap();
-    assert_eq!(
-        call(&app, "GET", &page_route, Value::Null).await.0,
-        StatusCode::CONFLICT
-    );
+    let (code, body) = call(&app, "GET", &page_route, Value::Null).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "pin_expired");
+    let (code, body) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        request_json(&old_request),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "pin_expired");
 }
