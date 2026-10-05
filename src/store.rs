@@ -188,6 +188,16 @@ struct PublicationPlan<'a> {
     target: PublicationTarget<'a>,
 }
 #[derive(Debug)]
+struct ForeignStagedIndex;
+impl std::fmt::Display for ForeignStagedIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "unsafe_index: failed stage pathname occupied by a foreign inode; witness retained",
+        )
+    }
+}
+impl std::error::Error for ForeignStagedIndex {}
+#[derive(Debug)]
 struct ExceptionalIndexFormat;
 impl std::fmt::Display for ExceptionalIndexFormat {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -767,12 +777,12 @@ fn release_deleted_sqlite_witness_kind(
         held.nlink() == 0,
         "unsafe_index: obsolete SQLite inode is still linked"
     );
-    ensure!(
-        named.as_ref().is_none_or(|file| failed_stage
-            && (file.dev(), file.ino()) != inode
-            && held.nlink() == 0),
-        "unsafe_index: SQLite pathname still exists"
-    );
+    if named.is_some() {
+        if failed_stage {
+            return Err(ForeignStagedIndex.into());
+        }
+        anyhow::bail!("unsafe_index: SQLite pathname occupied; obsolete witness retained");
+    }
     ensure!(
         Arc::strong_count(&files[position]) == 1,
         "storage_busy: deleted SQLite witness still borrowed"
@@ -3887,8 +3897,15 @@ impl Store {
             let leader = store.roots.leader(&store.identity)?;
             let initialized = store.initialize(&leader, before_publish);
             drop(leader);
-            if let Some(stage) = store.aborted_staged_index.lock().unwrap().take() {
-                store.cleanup_failed_staged_index(stage, None)?;
+            if let Some(stage) = store.aborted_staged_index.lock().unwrap().take()
+                && let Err(cleanup) = store.cleanup_failed_staged_index(stage, None)
+            {
+                return Err(match initialized {
+                    Err(original) => {
+                        cleanup.context(format!("{original}: failed stage cleanup refused"))
+                    }
+                    Ok(()) => cleanup,
+                });
             }
             initialized?;
         }
@@ -4154,15 +4171,13 @@ impl Store {
             None => acquired.as_ref().expect("verified exclusive guard"),
         };
         match std::fs::symlink_metadata(&path) {
-            Ok(named) if (named.dev(), named.ino()) == inode => {
-                staged.verify_path()?;
-            }
-            Ok(_) | Err(_) => {
-                ensure!(
-                    metadata.nlink() == 0,
-                    "unsafe_index: failed stage inode location not proved"
-                );
-            }
+            Ok(named) if (named.dev(), named.ino()) == inode => staged.verify_path()?,
+            Ok(_) => return Err(ForeignStagedIndex.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ensure!(
+                metadata.nlink() == 0,
+                "unsafe_index: failed stage inode location not proved"
+            ),
+            Err(error) => return Err(error.into()),
         }
         {
             let registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
@@ -4183,10 +4198,13 @@ impl Store {
                 files.len() == 1 && Arc::strong_count(&staged.file) == 2,
                 "storage_busy: failed stage witness still borrowed"
             );
-            if let Ok(named) = std::fs::symlink_metadata(&path)
-                && (named.dev(), named.ino()) == inode
-            {
-                std::fs::remove_file(&path)?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(named) if (named.dev(), named.ino()) == inode => {
+                    std::fs::remove_file(&path)?;
+                }
+                Ok(_) => return Err(ForeignStagedIndex.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
         drop(staged); // release only the stage's Arc, never a live SQLite fd
@@ -13050,5 +13068,66 @@ mod sqlite_deleted_witness_tests {
             mounted_device,
             "test image remained mounted after successful detach"
         );
+    }
+    #[test]
+    fn foreign_replacement_stage_refuses_release_and_preserves_foreign_inode() {
+        if std::env::var_os("BALEYG_FOREIGN_STAGE_CHILD").is_none() {
+            let outcome = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("store::sqlite_deleted_witness_tests::foreign_replacement_stage_refuses_release_and_preserves_foreign_inode")
+                .env("BALEYG_FOREIGN_STAGE_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                outcome.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&outcome.stdout),
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let exclusive = store
+            .roots
+            .index_use_exclusive_existing(&store.identity)
+            .unwrap();
+        let leader = store
+            .roots
+            .leader_under_exclusive(&store.identity, exclusive)
+            .unwrap();
+        let stage = store.create_staged_index(&leader, true).unwrap();
+        let path = stage.path.clone();
+        let held = stage.file.metadata().unwrap();
+        let obsolete = (held.dev(), held.ino());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"foreign stage cannot be removed").unwrap();
+        let foreign = std::fs::symlink_metadata(&path).unwrap();
+        assert_ne!((foreign.dev(), foreign.ino()), obsolete);
+        let error = store
+            .cleanup_failed_staged_index(stage, Some(&leader))
+            .unwrap_err();
+        assert!(error.is::<ForeignStagedIndex>(), "wrong failure: {error:#}");
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!((foreign.dev(), foreign.ino()), (after.dev(), after.ino()));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"foreign stage cannot be removed"
+        );
+        let guard = leader
+            .exclusive_use_guard(&store.roots.index_use_lock(&store.identity))
+            .unwrap();
+        let error = release_deleted_sqlite_witness_kind(&path, obsolete, guard, true).unwrap_err();
+        assert!(
+            error.is::<ForeignStagedIndex>(),
+            "direct release did not fail closed: {error:#}"
+        );
+        let registry = sqlite_witnesses().lock().unwrap();
+        let files = registry.by_path.get(&path).unwrap();
+        assert_eq!(files.len(), 1, "obsolete witness must remain cache-owned");
+        let retained = files[0].metadata().unwrap();
+        assert_eq!((retained.dev(), retained.ino()), obsolete);
+        assert_eq!(Arc::strong_count(&files[0]), 1);
+        assert_eq!(registry.live.get(&(path, obsolete.0, obsolete.1)), None);
     }
 }
