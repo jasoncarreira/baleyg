@@ -1716,3 +1716,271 @@ fn optional_executable_alias_keeps_authenticated_native_role_without_editing_bin
         }
     );
 }
+
+#[test]
+fn watcher_coalesces_renames_and_retains_signals_until_verified_ack() {
+    use baleyg::watch::WatchSignals;
+    use notify::{
+        Event, EventKind,
+        event::{ModifyKind, RenameMode},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+    let takeover = watcher.drain();
+    assert!(takeover.full);
+    if !watcher.watching() {
+        assert!(watcher.degraded());
+        return; // Platform has no watcher: mandatory full scans remain active.
+    }
+    assert!(watcher.acknowledge(&takeover));
+    let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+        .add_path(root.path().join("old.js"))
+        .add_path(root.path().join("new.js"));
+    watcher.observe_event(&rename);
+    let batch = watcher.drain();
+    assert!(batch.paths.contains(std::path::Path::new("old.js")));
+    assert!(batch.paths.contains(std::path::Path::new("new.js")));
+    watcher.observe_event(&Event::new(EventKind::Any));
+    assert!(
+        !watcher.acknowledge(&batch),
+        "a stale capture cannot clear a newer event"
+    );
+    let pending = watcher.drain();
+    assert!(pending.full);
+    assert!(watcher.acknowledge(&pending));
+    assert!(!watcher.drain().full);
+}
+
+#[test]
+fn watcher_promotes_ignore_unknown_and_bulk_changes_to_full_inventory() {
+    use baleyg::watch::WatchSignals;
+    use notify::{Event, EventKind, event::ModifyKind};
+    let root = tempfile::tempdir().unwrap();
+    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+    if !watcher.watching() {
+        return;
+    }
+    let first = watcher.drain();
+    assert!(watcher.acknowledge(&first));
+    watcher.observe_event(
+        &Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(root.path().join("nested/.ignore")),
+    );
+    assert!(watcher.drain().full);
+    let first = watcher.drain();
+    assert!(watcher.acknowledge(&first));
+    for n in 0..257 {
+        watcher.observe_event(
+            &Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(root.path().join(format!("src/{n}.js"))),
+        );
+    }
+    assert!(watcher.drain().full);
+}
+
+#[test]
+fn explicit_unchanged_capture_freshly_hashes_every_source() {
+    use baleyg::{
+        capture::Capture,
+        indexer::{CapturedChange, measure_captured_change},
+    };
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "one.js", "f();");
+    write(root.path(), "two.rs", "fn f() {}\n");
+    let options = IndexOptions::new(root.path().to_owned());
+    let first = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
+    let second = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
+    assert_eq!(
+        measure_captured_change(&first, &second),
+        CapturedChange::Unchanged
+    );
+    for operations in second.source_operations.values() {
+        assert_eq!(operations.hashes, 1);
+        assert_eq!(operations.complete_reads, 1);
+    }
+}
+
+#[test]
+fn watcher_registration_failure_keeps_full_inventory_active() {
+    use baleyg::watch::WatchSignals;
+    let root = tempfile::tempdir().unwrap();
+    let mut watcher = WatchSignals::new(root.path().join("missing-root"), None, None);
+    assert!(watcher.degraded());
+    assert!(!watcher.watching());
+    let batch = watcher.drain();
+    assert!(batch.full);
+    assert!(watcher.acknowledge(&batch));
+    assert!(
+        watcher.drain().full,
+        "degraded scans cannot rely on missing events"
+    );
+}
+
+#[test]
+fn watcher_callback_filters_capture_read_access_without_rediscovering_work() {
+    use baleyg::watch::WatchSignals;
+    use notify::{
+        Event, EventKind,
+        event::{AccessKind, AccessMode},
+    };
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "source.js", "f();");
+    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+    if !watcher.watching() {
+        return;
+    }
+    let initial = watcher.drain();
+    assert!(watcher.acknowledge(&initial));
+    let before = watcher.drain();
+    let _captured_bytes = fs::read(root.path().join("source.js")).unwrap();
+    for kind in [
+        EventKind::Access(AccessKind::Open(AccessMode::Any)),
+        EventKind::Access(AccessKind::Open(AccessMode::Read)),
+        EventKind::Access(AccessKind::Read),
+        EventKind::Access(AccessKind::Close(AccessMode::Read)),
+    ] {
+        // Uses exactly the same bounded ingress as the installed notify callback.
+        watcher.submit_event(Ok(Event::new(kind).add_path(root.path().join("source.js"))));
+    }
+    let after = watcher.drain();
+    assert_eq!(after, before);
+    assert!(!after.full);
+    assert!(watcher.next_deadline().is_none());
+    assert!(watcher.acknowledge(&after));
+    watcher.submit_event(Ok(Event::new(EventKind::Access(AccessKind::Close(
+        AccessMode::Write,
+    )))
+    .add_path(root.path().join("source.js"))));
+    assert!(watcher.drain().full || !watcher.drain().paths.is_empty());
+}
+
+#[test]
+fn watcher_bounded_callback_overflow_and_runtime_error_force_full() {
+    use baleyg::watch::WatchSignals;
+    use notify::{Event, EventKind, event::ModifyKind};
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "source.js", "f();");
+    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+    if !watcher.watching() {
+        return;
+    }
+    let initial = watcher.drain();
+    assert!(watcher.acknowledge(&initial));
+    for _ in 0..257 {
+        watcher
+            .submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(root.path().join("source.js"))));
+    }
+    let overflow = watcher.drain();
+    assert!(overflow.full, "dropped callback requires full inventory");
+    assert!(watcher.acknowledge(&overflow));
+    watcher.submit_event(Err(notify::Error::generic("backend lost events")));
+    let failed = watcher.drain();
+    assert!(failed.full);
+    assert!(watcher.degraded());
+    assert!(watcher.acknowledge(&failed));
+    assert!(watcher.drain().full);
+}
+
+#[test]
+fn watcher_has_quiet_and_absolute_deadlines_without_blocking_drain() {
+    use baleyg::watch::WatchSignals;
+    use notify::{Event, EventKind, event::ModifyKind};
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "source.js", "f();");
+    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+    if !watcher.watching() {
+        return;
+    }
+    let initial = watcher.drain();
+    assert!(watcher.acknowledge(&initial));
+    let start = Instant::now();
+    for _ in 0..257 {
+        watcher.observe_event(
+            &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join("source.js")),
+        );
+    }
+    let batch = watcher.drain();
+    assert!(!batch.full);
+    let deadline = watcher.next_deadline().unwrap();
+    assert!(deadline <= start + Duration::from_millis(250));
+    assert!(!watcher.batch_ready_at(deadline - Duration::from_nanos(1)));
+    assert!(watcher.batch_ready_at(deadline));
+}
+
+#[test]
+fn optional_input_and_symlink_suffix_force_full_reconcile() {
+    use baleyg::watch::WatchSignals;
+    use notify::{Event, EventKind, event::ModifyKind};
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("ignored")).unwrap();
+    write(root.path(), "ignored/.ignore", "presentation.js\n");
+    write(root.path(), "ignored/presentation.js", "{ }\n");
+    let optional = root.path().join("ignored/presentation.js");
+    let mut watcher = WatchSignals::new(root.path().to_owned(), Some(optional.clone()), None);
+    if !watcher.watching() {
+        return;
+    }
+    let initial = watcher.drain();
+    assert!(watcher.acknowledge(&initial));
+    watcher.observe_event(&Event::new(EventKind::Modify(ModifyKind::Any)).add_path(optional));
+    let batch = watcher.drain();
+    assert!(
+        batch.full,
+        "ignored optional input is not a source-only change"
+    );
+    assert!(watcher.acknowledge(&batch));
+    std::os::unix::fs::symlink(
+        root.path().join("ignored/presentation.js"),
+        root.path().join("alias.js"),
+    )
+    .unwrap();
+    watcher.observe_event(
+        &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join("alias.js")),
+    );
+    assert!(
+        watcher.drain().full,
+        "symlink suffix is not proof of regular source"
+    );
+}
+
+#[test]
+fn failed_capture_does_not_ack_relevant_input_cutoff_or_absent_input() {
+    use baleyg::{capture::Capture, watch::WatchSignals};
+    use notify::{Event, EventKind, event::ModifyKind};
+    for absent_at_admission in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "source.js", "f();");
+        if !absent_at_admission {
+            write(root.path(), "Cargo.toml", "abc");
+        }
+        let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+        let initial = watcher.drain();
+        assert!(watcher.acknowledge(&initial));
+        let capture = Capture::admit(
+            &IndexOptions::new(root.path().to_owned()),
+            &cancel(),
+            &|_| {},
+        )
+        .unwrap();
+        if absent_at_admission {
+            write(root.path(), "Cargo.toml", "abc");
+        } else {
+            write(root.path(), "Cargo.toml", "xyz");
+        }
+        watcher.observe_event(
+            &Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(root.path().join("Cargo.toml")),
+        );
+        let dirty = watcher.drain();
+        assert!(dirty.full);
+        let error = capture.verify(&cancel()).unwrap_err();
+        assert!(error.to_string().contains("drift"), "{error:#}");
+        // No publication happened; the leader must not call acknowledge.
+        let pending = watcher.drain();
+        assert!(pending.full);
+        assert!(pending.generation >= dirty.generation);
+        assert!(pending.paths.contains(Path::new("Cargo.toml")));
+    }
+}
