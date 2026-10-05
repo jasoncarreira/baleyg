@@ -1094,3 +1094,210 @@ fn changed_capture_input_and_options_take_full_claimed_fallback() {
         );
     }
 }
+
+#[test]
+fn executable_drift_claim_child() {
+    let Ok(state) = std::env::var("BALEYG_DRIFT_CLAIM_STATE") else {
+        return;
+    };
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let workspace =
+        std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_WORKSPACE").unwrap());
+    let proof = std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_PROOF").unwrap());
+    let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
+    let options = IndexOptions::new(workspace);
+    let (old, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    println!("DRIFT_BASELINE_READY");
+    std::io::stdout().flush().unwrap();
+    let mut signal = [0u8; 1];
+    std::io::stdin().read_exact(&mut signal).unwrap();
+    assert_eq!(signal[0], b'!');
+    let request = store.enqueue_request(&options, None).unwrap();
+    let inode_before =
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.request_db_path()).unwrap());
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |_, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push(p.phase);
+            }
+        })
+        .unwrap(),
+        1
+    );
+    let done = store.request_by_id(&request.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    let fresh = done.revision.unwrap();
+    assert_eq!(store.status().unwrap().revision, fresh);
+    assert_eq!(fresh.index_generation, old.index_generation);
+    assert_eq!(fresh.index_revision, old.index_revision + 1);
+    for path in ["a.js", "b.js"] {
+        assert!(
+            store.source_at(path, Some(old)).unwrap().is_some(),
+            "both old pinned sources stay readable"
+        );
+        assert!(
+            store.source_at(path, Some(fresh)).unwrap().is_some(),
+            "full measurement must select both fresh sources"
+        );
+    }
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    let selected: (String, String) = db
+        .query_row(
+            "SELECT producer_sha,binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                fresh.index_generation, fresh.index_revision
+            )],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let manifests: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                fresh.index_generation, fresh.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let old_manifests: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                old.index_generation, old.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((manifests, old_manifests), (2, 2));
+    let inode_after =
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.request_db_path()).unwrap());
+    assert_eq!(
+        inode_after, inode_before,
+        "requests.db must not be recreated"
+    );
+    let result = serde_json::json!({"modes":modes.into_inner().unwrap(),"producerSha":selected.0,
+        "bindingSha":selected.1,"generation":fresh.index_generation.to_string(),
+        "revision":fresh.index_revision,"requestId":request.id,"queueInode":inode_after});
+    fs::write(proof, serde_json::to_vec(&result).unwrap()).unwrap();
+}
+
+fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let padding = "x".repeat(145_000);
+    let local = |value| {
+        format!(
+            "function local() {{ return {value}; /*{padding}*/ }}\nfunction checked() {{ const local=1, other=2; return local+other; }}\n"
+        )
+    };
+    fs::write(workspace.path().join("a.js"), local("1")).unwrap();
+    fs::write(
+        workspace.path().join("b.js"),
+        "function stable() { return 3; }\n",
+    )
+    .unwrap();
+    let binary = state.path().join("native-drift-requests");
+    fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    let proof = state.path().join("drift-proof.json");
+    let mut child = Command::new(&binary)
+        .arg("--exact")
+        .arg("executable_drift_claim_child")
+        .arg("--nocapture")
+        .env("BALEYG_DRIFT_CLAIM_STATE", state.path())
+        .env("BALEYG_DRIFT_CLAIM_WORKSPACE", workspace.path())
+        .env("BALEYG_DRIFT_CLAIM_PROOF", &proof)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            stdout.read_line(&mut line).unwrap() > 0,
+            "child exited before baseline ready"
+        );
+        if line.contains("DRIFT_BASELINE_READY") {
+            break;
+        }
+    }
+    let executing_hash = if drift {
+        // Replace the binary pathname atomically while the old inode executes.
+        // The next normal claimed capture hashes the changed current_exe pathname.
+        let replacement = state.path().join("native-drift-replacement");
+        fs::copy(&binary, &replacement).unwrap();
+        let mut bytes = fs::OpenOptions::new()
+            .append(true)
+            .open(&replacement)
+            .unwrap();
+        bytes.write_all(b"BALEYG-TEST-PRODUCER-DRIFT-V1").unwrap();
+        bytes.sync_all().unwrap();
+        drop(bytes);
+        fs::rename(&replacement, &binary).unwrap();
+        hex::encode(Sha256::digest(fs::read(&binary).unwrap()))
+    } else {
+        hex::encode(Sha256::digest(fs::read(&binary).unwrap()))
+    };
+    if body_edit {
+        fs::write(workspace.path().join("a.js"), local("2")).unwrap();
+    }
+    child.stdin.take().unwrap().write_all(b"!").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "drift child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(&proof).unwrap()).unwrap();
+    assert_eq!(
+        result["modes"],
+        serde_json::json!([if drift { "mode:full" } else { "mode:local" }]),
+        "drift must force full extraction; the same body edit without drift is proved local"
+    );
+    assert_eq!(
+        result["producerSha"], executing_hash,
+        "selected binding must record the new executable hash"
+    );
+    assert_eq!(result["bindingSha"].as_str().unwrap().len(), 64);
+    assert_eq!(result["revision"], 2);
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let row = store
+        .request_by_id(result["requestId"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "done");
+    assert_eq!(row.revision.unwrap().index_revision, 2);
+    assert_eq!(
+        row.revision.unwrap().index_generation.to_string(),
+        result["generation"]
+    );
+}
+
+#[test]
+fn unchanged_explicit_claim_with_real_executable_drift_remeasures_every_document() {
+    asserted_claim_under_real_executable_drift(false, true);
+}
+
+#[test]
+fn body_edit_explicit_claim_with_real_executable_drift_cannot_use_local_reuse() {
+    asserted_claim_under_real_executable_drift(true, true);
+}
+
+#[test]
+fn same_body_edit_without_executable_drift_is_proven_local_control() {
+    asserted_claim_under_real_executable_drift(true, false);
+}

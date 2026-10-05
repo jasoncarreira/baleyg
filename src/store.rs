@@ -5863,6 +5863,16 @@ impl Store {
             let selected = ReadRevision::current(db)?;
             ensure!(expected.pin() == Some(selected.pin),
                 "revision conflict: local source snapshot changed");
+            // Decision 0005: even a proved single-body edit cannot reuse
+            // unchanged documents when the executing native producer drifts.
+            // Compare the attested selected binding before any local measurement
+            // or selected-manifest reuse; the caller then takes the full path.
+            let current_executable = std::env::current_exe()?;
+            let executing_hash = capture.executable_digest(&current_executable)
+                .context("native_evidence_required: executable was not hashed at admission")?;
+            if selected_producer_hash(db, &selected)? != executing_hash {
+                return Ok(None);
+            }
             // The selected head is a prior validated publication. Do not decode
             // its unchanged fact/projection rows; selected reads still attest
             // them, and the current captured source bytes are checked below.
