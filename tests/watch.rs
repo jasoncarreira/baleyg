@@ -53,6 +53,49 @@ fn cli(root: &std::path::Path, home: &std::path::Path, command: &str) -> std::pr
     child
 }
 
+#[test]
+fn finite_cli_owner_child() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let Ok(root) = std::env::var("BALEYG_TEST_FINITE_CLI_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let socket = std::env::var("BALEYG_TEST_FINITE_CLI_SOCKET").unwrap();
+    let roots = baleyg::store::topology::TopologyRoots::production().unwrap();
+    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+        Some(&root),
+        &std::env::current_dir().unwrap(),
+    )
+    .unwrap();
+    roots.reject_root_overlap(&identity).unwrap();
+    let store = Store::open(roots, identity).unwrap();
+    let options = IndexOptions::new(root);
+    let channel = std::sync::Mutex::new(UnixStream::connect(socket).unwrap());
+    let paused = AtomicBool::new(false);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_, held_session) =
+        index_coordinator::enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
+            if phase.phase == "timing:publish"
+                && !paused.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                let mut channel = channel.lock().unwrap();
+                channel.write_all(b"P").unwrap();
+                let mut release = [0];
+                channel.read_exact(&mut release).unwrap();
+                assert_eq!(release, *b"G");
+            }
+        })
+        .unwrap();
+    assert!(held_session.is_leader());
+    let mut channel = channel.lock().unwrap();
+    channel.write_all(b"R").unwrap();
+    let mut release = [0];
+    channel.read_exact(&mut release).unwrap();
+    assert_eq!(release, *b"D");
+    drop(held_session);
+}
+
 struct Server(std::process::Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -110,22 +153,75 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
     assert!(ready, "daemon did not bind");
     let first = cli(&root, &home, "status").output().unwrap();
     assert!(first.status.success(), "first selected status unavailable");
+    let old: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let marker = fs::read(leader_lock_under(&home).unwrap()).unwrap();
     server.0.kill().unwrap();
     server.0.wait().unwrap();
     fs::write(root.join("a.js"), "function after() {}\n").unwrap();
-    let takeover = cli(&root, &home, "index").output().unwrap();
+    // A second REAL daemon, without a FIFO request, must reconcile the lost
+    // edit before it binds its serving port. An explicit CLI index follows only
+    // after the selected source is proved to be the successor's capture.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let successor_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let successor_process = cli(&root, &home, "serve")
+        .arg("--bind")
+        .arg(successor_addr.to_string())
+        .arg("--token-file")
+        .arg(&token)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut successor = Server(successor_process);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while std::net::TcpStream::connect_timeout(&successor_addr, Duration::from_millis(50)).is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "successor daemon did not serve after takeover"
+        );
+        assert!(
+            successor.0.try_wait().unwrap().is_none(),
+            "successor daemon exited"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let selected = cli(&root, &home, "status").output().unwrap();
     assert!(
-        takeover.status.success(),
-        "successor did not reconcile missed edit"
+        selected.status.success(),
+        "successor selected status unavailable"
     );
-    let result: serde_json::Value = serde_json::from_slice(&takeover.stdout).unwrap();
+    let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(
+        selected["revision"]["indexGeneration"],
+        old["revision"]["indexGeneration"]
+    );
     assert!(
-        result["publishedRevision"]["indexRevision"]
+        selected["revision"]["indexRevision"].as_u64().unwrap()
+            > old["revision"]["indexRevision"].as_u64().unwrap(),
+        "mandatory takeover must publish before any explicit request"
+    );
+    assert_ne!(fs::read(leader_lock_under(&home).unwrap()).unwrap(), marker);
+    let exported = cli(&root, &home, "export").output().unwrap();
+    assert!(
+        exported.status.success(),
+        "successor selected export unavailable"
+    );
+    let exported: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert_eq!(exported["files"][0]["text"], "function after() {}\n");
+    let explicit = cli(&root, &home, "index").output().unwrap();
+    assert!(
+        explicit.status.success(),
+        "explicit request after mandatory takeover failed"
+    );
+    let explicit: serde_json::Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert!(
+        explicit["publishedRevision"]["indexRevision"]
             .as_u64()
             .unwrap()
-            >= 2
+            > selected["revision"]["indexRevision"].as_u64().unwrap()
     );
-    assert_eq!(result["publishedRevision"], result["status"]["revision"]);
 }
 
 fn leader_lock_under(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -137,6 +233,21 @@ fn leader_lock_under(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         }
         if path.is_dir()
             && let Some(found) = leader_lock_under(&path)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn request_db_under(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| name == "requests.db") {
+            return Some(path);
+        }
+        if path.is_dir()
+            && let Some(found) = request_db_under(&path)
         {
             return Some(found);
         }
@@ -161,55 +272,113 @@ async fn cli_daemon_edit_during_cli_leadership_then_handoff_matches_cold_full() 
         )
         .unwrap();
     }
-    let cli_log = temp.path().join("cli-stderr");
-    let cli_child = cli(&root, &home, "index")
-        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+    // An initial CLI builds the predecessor head. The child below drives the
+    // SAME production finite CLI coordinator, but IPC freezes it after its
+    // mandatory takeover publication and before claiming its first FIFO row.
+    assert!(
+        cli(&root, &home, "index")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::write(
+        root.join("source0.js"),
+        "function edited() { return 999; }\n",
+    )
+    .unwrap();
+    let socket_path = temp.path().join("finite-cli.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("finite_cli_owner_child")
+        .env("HOME", &home)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env("BALEYG_TEST_FINITE_CLI_ROOT", &root)
+        .env("BALEYG_TEST_FINITE_CLI_SOCKET", &socket_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(
-            fs::File::create(&cli_log).unwrap(),
-        ))
+        .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let mut cli_owner = Server(cli_child);
+    let mut cli_owner = Server(child);
+    listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(12);
-    let mut held = false;
-    while Instant::now() < deadline {
-        if let Some(path) = leader_lock_under(&home) {
-            let file = fs::OpenOptions::new().read(true).open(path).unwrap();
-            let locked =
-                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
-            if !locked {
-                unsafe {
-                    libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-                }
+    let (mut channel, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "finite CLI child did not connect"
+                );
+                assert!(
+                    cli_owner.0.try_wait().unwrap().is_none(),
+                    "finite CLI child exited before connect"
+                );
+                std::thread::sleep(Duration::from_millis(10));
             }
-            if locked
-                && fs::read_to_string(&cli_log)
-                    .unwrap()
-                    .contains("index-phase publish_ms=")
-            {
-                unsafe {
-                    libc::kill(cli_owner.0.id() as i32, libc::SIGSTOP);
-                }
-                held = true;
-                break;
-            }
+            Err(error) => panic!("finite CLI child socket failed: {error}"),
         }
-        assert!(
-            cli_owner.0.try_wait().unwrap().is_none(),
-            "CLI left before leader proof"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(held, "CLI leader lock never observed");
+    };
+    channel.set_nonblocking(false).unwrap();
+    channel
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    channel
+        .set_write_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut milestone = [0];
+    use std::io::{Read, Write};
+    channel.read_exact(&mut milestone).unwrap();
+    assert_eq!(
+        milestone, *b"P",
+        "first finite CLI publication must precede FIFO claim"
+    );
+    assert!(cli_owner.0.try_wait().unwrap().is_none());
     let leader_lock = leader_lock_under(&home).unwrap();
     let cli_incarnation = fs::read(&leader_lock).unwrap();
-    assert_eq!(
-        cli_incarnation.len(),
-        36,
-        "CLI must sync its leader incarnation before follower starts"
-    );
+    assert_eq!(cli_incarnation.len(), 36, "synced leader marker missing");
     uuid::Uuid::parse_str(std::str::from_utf8(&cli_incarnation).unwrap()).unwrap();
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .open(&leader_lock)
+        .unwrap();
+    assert_ne!(
+        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "finite CLI child must hold EX before competing ingress"
+    );
+    let request_db = request_db_under(&home).unwrap();
+    let queued_rows = || -> Vec<(i64, String, String, Option<String>, Option<i64>)> {
+        let db = rusqlite::Connection::open_with_flags(
+            &request_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut query = db
+            .prepare(
+                "SELECT seq,id,state,result_generation,result_revision FROM requests ORDER BY seq",
+            )
+            .unwrap();
+        query
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let first_row = queued_rows()
+        .into_iter()
+        .find(|row| row.2 == "queued")
+        .unwrap();
     let token = home.join("token");
     fs::write(&token, TOKEN).unwrap();
     fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
@@ -250,11 +419,6 @@ async fn cli_daemon_edit_during_cli_leadership_then_handoff_matches_cold_full() 
         ready,
         "follower daemon did not bind while CLI held leadership"
     );
-    fs::write(
-        root.join("source0.js"),
-        "function edited() { return 999; }\n",
-    )
-    .unwrap();
     let accepted = client
         .post(format!("{url}/api/index"))
         .header("Origin", &url)
@@ -270,14 +434,54 @@ async fn cli_daemon_edit_during_cli_leadership_then_handoff_matches_cold_full() 
     );
     let job: serde_json::Value = accepted.json().await.unwrap();
     assert_eq!(job["state"], "queued");
-    unsafe {
-        libc::kill(cli_owner.0.id() as i32, libc::SIGCONT);
-    }
+    // The second process is the actual `baleyg index` CLI. Both foreign rows
+    // must exist DURABLY before the first owner reaches its finite cutoff.
+    let contender_process = cli(&root, &home, "index")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut contender = Server(contender_process);
+    let browser_id = job["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let contender_row = loop {
+        let rows = queued_rows();
+        if let Some(browser) = rows.iter().find(|row| row.1 == browser_id) {
+            if let Some(contender_row) = rows
+                .iter()
+                .find(|row| row.0 > browser.0 && row.1 != first_row.1 && row.2 == "queued")
+            {
+                assert!(first_row.0 < browser.0 && browser.0 < contender_row.0);
+                assert_eq!(
+                    first_row.2, "queued",
+                    "first owner must still be before FIFO claim"
+                );
+                break contender_row.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second CLI row was not durably admitted"
+        );
+        assert!(
+            contender.0.try_wait().unwrap().is_none(),
+            "contender exited before FIFO admission"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(fs::read(&leader_lock).unwrap(), cli_incarnation);
+    channel.write_all(b"G").unwrap();
+    channel.read_exact(&mut milestone).unwrap();
+    assert_eq!(
+        milestone, *b"R",
+        "first CLI did not finish its bounded FIFO drain"
+    );
+    // The finite owner has returned but its RAII session remains held via IPC.
+    // Neither the daemon nor the second CLI can take over to fake these ACKs.
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut done_under_cli_lock = false;
-    while Instant::now() < deadline {
+    let browser_pin = loop {
         let state: serde_json::Value = client
-            .get(format!("{url}/api/jobs/{}", job["id"].as_str().unwrap()))
+            .get(format!("{url}/api/jobs/{browser_id}"))
             .bearer_auth(TOKEN)
             .send()
             .await
@@ -286,37 +490,85 @@ async fn cli_daemon_edit_during_cli_leadership_then_handoff_matches_cold_full() 
             .await
             .unwrap();
         if state["state"] == "done" {
-            let cli_alive = cli_owner.0.try_wait().unwrap().is_none();
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .open(&leader_lock)
-                .unwrap();
-            let leader_ex =
-                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
-            if !leader_ex {
-                unsafe {
-                    libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-                }
-            }
-            done_under_cli_lock =
-                cli_alive && leader_ex && fs::read(&leader_lock).unwrap() == cli_incarnation;
-            break;
+            break state["revision"].clone();
         }
         assert_ne!(state["state"], "failed", "queued browser row failed");
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            Instant::now() < deadline,
+            "browser row was not drained by finite owner"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let second_status = loop {
+        if let Some(status) = contender.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second CLI did not finish under finite leader"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        second_status.success(),
+        "independent CLI failed despite accepted FIFO row"
+    );
+    let mut second_stdout = Vec::new();
+    contender
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut second_stdout)
+        .unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&second_stdout).unwrap();
+    let rows = queued_rows();
+    let browser_row = rows.iter().find(|row| row.1 == browser_id).unwrap();
+    let second_row = rows.iter().find(|row| row.1 == contender_row.1).unwrap();
+    assert_eq!(browser_row.2, "done");
+    assert_eq!(second_row.2, "done");
+    assert_eq!(
+        browser_pin["indexGeneration"],
+        browser_row.3.as_ref().unwrap().as_str()
+    );
+    assert_eq!(browser_pin["indexRevision"], browser_row.4.unwrap());
+    assert_eq!(
+        second["publishedRevision"]["indexGeneration"],
+        second_row.3.as_ref().unwrap().as_str()
+    );
+    assert_eq!(
+        second["publishedRevision"]["indexRevision"],
+        second_row.4.unwrap()
+    );
+    assert!(browser_row.4.unwrap() < second_row.4.unwrap());
+    assert!(
+        cli_owner.0.try_wait().unwrap().is_none(),
+        "first owner exited before competitor ACK"
+    );
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(&leader_lock)
+        .unwrap();
+    let still_ex = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
+    if !still_ex {
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
     assert!(
-        done_under_cli_lock,
-        "browser row must finish while real CLI process still owns EX"
+        still_ex && fs::read(&leader_lock).unwrap() == cli_incarnation,
+        "browser and CLI ACKs must precede first owner EX/incarnation release"
     );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && cli_owner.0.try_wait().unwrap().is_none() {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+    channel.write_all(b"D").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while cli_owner.0.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "first CLI owner did not exit after release"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(
-        cli_owner.0.try_wait().unwrap().unwrap().success(),
-        "finite CLI must exit"
-    );
     let deadline = Instant::now() + Duration::from_secs(30);
     let after = loop {
         let response = client

@@ -692,7 +692,10 @@ pub fn enqueue_and_wait_observed(
                         // release fence. Later edits remain discoverable by takeover.
                         if let Some(work) = leader_work.as_mut() {
                             let cutoff = store.current_request()?.map(|row| row.seq);
-                            work.reconcile_due(store, &session, options, cancel, true)?;
+                            let selected_options = store
+                                .recorded_index_options()?
+                                .unwrap_or_else(|| options.clone());
+                            work.reconcile_due(store, &session, &selected_options, cancel, true)?;
                             if let Some(cutoff) = cutoff {
                                 drain_requests_observed_with_cancel(
                                     store,
@@ -706,7 +709,10 @@ pub fn enqueue_and_wait_observed(
                             }
                             // A bounded second cutoff accounts for signals raised
                             // while the accepted pre-cutoff FIFO rows were drained.
-                            work.reconcile_due(store, &session, options, cancel, true)?;
+                            let selected_options = store
+                                .recorded_index_options()?
+                                .unwrap_or_else(|| options.clone());
+                            work.reconcile_due(store, &session, &selected_options, cancel, true)?;
                         }
                     }
                     let pin = row.revision.expect("done request has revision");
@@ -815,7 +821,10 @@ pub fn enqueue_and_wait_observed(
                 ) {
                     Ok(_) => {
                         if let Some(work) = leader_work.as_mut() {
-                            work.reconcile_due(store, session, options, cancel, false)?;
+                            let selected_options = store
+                                .recorded_index_options()?
+                                .unwrap_or_else(|| options.clone());
+                            work.reconcile_due(store, session, &selected_options, cancel, false)?;
                         }
                         break;
                     }
@@ -897,6 +906,144 @@ mod tests {
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+
+    #[test]
+    fn takeover_marker_refuses_old_read_then_reconciles_before_fifo_claim() {
+        use crate::store::topology::IndexNotReady;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function old() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (old_pin, owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let identity = crate::store::topology::WorkspaceIdentity::discover(
+            Some(workspace.path()),
+            workspace.path(),
+        )
+        .unwrap();
+        let roots = crate::store::topology::TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let lock_path = roots.leader_lock(&identity);
+        let predecessor_marker = fs::read(&lock_path).unwrap();
+        drop(owner);
+        fs::write(workspace.path().join("a.js"), "function new() {}\n").unwrap();
+        let first_capture = AtomicBool::new(false);
+        let first_publish = AtomicBool::new(false);
+        let takeover_pin = std::sync::Mutex::new(None);
+        let (explicit_pin, owner) = enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
+            if phase.phase == "timing:capture" && !first_capture.swap(true, Ordering::AcqRel) {
+                assert_eq!(store.current_request().unwrap().unwrap().state, "queued");
+                use std::os::fd::AsRawFd;
+                let successor_marker = fs::read(&lock_path).unwrap();
+                assert_ne!(predecessor_marker, successor_marker);
+                assert_eq!(successor_marker.len(), 36);
+                uuid::Uuid::parse_str(std::str::from_utf8(&successor_marker).unwrap()).unwrap();
+                let probe = fs::OpenOptions::new().read(true).open(&lock_path).unwrap();
+                assert_ne!(
+                    unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                let follower = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+                let error = match follower.evidence_response() {
+                    Ok(_) => panic!("predecessor evidence served after successor marker"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<IndexNotReady>().is_some()),
+                    "post-marker old selected read must refuse: {error:#}"
+                );
+            }
+            if phase.phase == "timing:publish" && !first_publish.swap(true, Ordering::AcqRel) {
+                assert_eq!(
+                    store.current_request().unwrap().unwrap().state,
+                    "queued",
+                    "takeover reconciliation cannot ACK the explicit row"
+                );
+                let selected = store.status().unwrap().revision;
+                assert!(selected.index_revision > old_pin.index_revision);
+                let read = store.evidence_response().unwrap();
+                assert_eq!(
+                    read.source_at("a.js", Some(selected))
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .text,
+                    "function new() {}\n"
+                );
+                read.finish(()).unwrap();
+                *takeover_pin.lock().unwrap() = Some(selected);
+            }
+        })
+        .unwrap();
+        assert!(owner.is_leader());
+        assert!(first_capture.load(Ordering::Acquire) && first_publish.load(Ordering::Acquire));
+        assert!(
+            explicit_pin.index_revision
+                > takeover_pin.into_inner().unwrap().unwrap().index_revision
+        );
+        assert_eq!(
+            store.current_request().unwrap().unwrap().revision,
+            Some(explicit_pin)
+        );
+    }
+
+    #[test]
+    fn cli_final_inventory_keeps_foreign_fifo_head_options_and_both_ack_pins() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let initiating = IndexOptions::new(workspace.path().to_owned());
+        let mut foreign = initiating.clone();
+        foreign.manifest_path = Some(workspace.path().join("absent-manifest.json"));
+        let inserted = std::sync::atomic::AtomicBool::new(false);
+        let foreign_id = std::sync::Mutex::new(None);
+        let initiating_id = std::sync::Mutex::new(None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (initiating_pin, leader) =
+            enqueue_and_wait_observed(&store, &initiating, &cancel, |phase| {
+                if phase.phase == "timing:capture" && !inserted.swap(true, Ordering::AcqRel) {
+                    *initiating_id.lock().unwrap() =
+                        Some(store.current_request().unwrap().unwrap().id);
+                    *foreign_id.lock().unwrap() =
+                        Some(store.enqueue_request(&foreign, None).unwrap().id);
+                }
+            })
+            .unwrap();
+        assert!(leader.is_leader());
+        let foreign_id = foreign_id.into_inner().unwrap().unwrap();
+        let foreign_row = store.request_by_id(&foreign_id).unwrap().unwrap();
+        let initiating_id = initiating_id.into_inner().unwrap().unwrap();
+        let initiating_row = store.request_by_id(&initiating_id).unwrap().unwrap();
+        assert_eq!(initiating_row.state, "done");
+        assert_eq!(initiating_row.revision, Some(initiating_pin));
+        assert_eq!(foreign_row.state, "done");
+        assert_eq!(store.current_request().unwrap().unwrap().id, foreign_id);
+        let foreign_pin = foreign_row.revision.unwrap();
+        assert!(foreign_pin.index_revision > initiating_pin.index_revision);
+        assert_eq!(
+            store.status().unwrap().revision,
+            foreign_pin,
+            "final CLI inventory cannot revert the selected foreign options"
+        );
+        assert_eq!(
+            store
+                .recorded_index_options()
+                .unwrap()
+                .unwrap()
+                .manifest_path,
+            foreign.manifest_path
+        );
+        let response = store.evidence_response().unwrap();
+        response.validate_pin(initiating_pin).unwrap();
+        response.validate_pin(foreign_pin).unwrap();
+        response.finish(()).unwrap();
+    }
 
     #[test]
     fn takeover_watcher_switches_input_options_with_new_full_wake() {
