@@ -1,6 +1,6 @@
 # Decision 0006: revision retention, automatic index deletion and unchanged requests
 
-- **Status:** proposed, pending explicit owner approval of the 15-minute supersession grace, no reader-renewed lease, and whole-index deletion invalidating its pins; ratified when this record merges. It adds revision retention to `../../local-topology.md`, confirms that document's existing automatic GC rule, and governs #16.
+- **Status:** owner-approved 2026-10-05: the 15-minute supersession grace with no reader-renewed lease, guarded whole-index deletion invalidating that generation's pins, and the unchanged path for explicit requests. Ratified when this record merges. It adds revision retention to `../../local-topology.md`, confirms that document's existing automatic GC rule, and governs #16.
 - **Scope:** which published revisions stay readable, when a whole derived index may be deleted automatically, and how an explicit indexing request with no source change publishes. Pin identity (`{indexGeneration, indexRevision}`), #67's storage model and Decision 0005 are unchanged.
 - **Compatibility:** none needed (pre-release).
 
