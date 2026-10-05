@@ -496,16 +496,100 @@ fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
     }
     Ok(())
 }
+// On POSIX, closing ANY fd for a SQLite database inode discards every
+// fcntl lock held by this process for that inode, including another thread's
+// SQLite writer. A check handle is therefore process-lifetime, not scoped to
+// a read or a Store clone. One mutex serializes lookup/open/insert: a losing
+// concurrent opener must never close a duplicate live-inode handle either.
+// The fixed cap fails closed; never evict or close a live SQLite witness.
+const MAX_RETAINED_SQLITE_WITNESSES: usize = 4096;
+#[derive(Default)]
+struct RetainedSqliteWitnesses {
+    by_path: std::collections::HashMap<std::path::PathBuf, Vec<Arc<std::fs::File>>>,
+    count: usize,
+}
+static RETAINED_SQLITE_WITNESSES: std::sync::OnceLock<Mutex<RetainedSqliteWitnesses>> =
+    std::sync::OnceLock::new();
+fn sqlite_witnesses() -> &'static Mutex<RetainedSqliteWitnesses> {
+    RETAINED_SQLITE_WITNESSES.get_or_init(|| Mutex::new(RetainedSqliteWitnesses::default()))
+}
+
+fn retained_sqlite_file(
+    path: &Path,
+    writable: bool,
+    create: bool,
+    nonblocking: bool,
+) -> Result<Arc<std::fs::File>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut witnesses = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    // Always check the current pathname, not just a previously held inode.
+    // A replaced pathname gets another retained handle; the old one remains
+    // open until process exit because its SQLite connection may still be live.
+    if let Ok(named) = std::fs::symlink_metadata(path)
+        && named.is_file()
+        && !named.file_type().is_symlink()
+        && let Some(files) = witnesses.by_path.get(path)
+    {
+        for file in files {
+            if let Ok(held) = file.metadata()
+                && (held.dev(), held.ino()) == (named.dev(), named.ino())
+            {
+                return Ok(file.clone());
+            }
+        }
+    }
+    ensure!(
+        witnesses.count < MAX_RETAINED_SQLITE_WITNESSES,
+        "incompatible_index: verified SQLite file witness capacity reached"
+    );
+    let file = Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(writable)
+            .create(create)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | if nonblocking { libc::O_NONBLOCK } else { 0 })
+            .open(path)?,
+    );
+    witnesses
+        .by_path
+        .entry(path.to_owned())
+        .or_default()
+        .push(file.clone());
+    witnesses.count += 1;
+    Ok(file)
+}
+
+/// Stage creation is single-flight with the same cache. Check capacity
+/// BEFORE opening so no failure branch closes even a just-created SQLite fd.
+fn create_retained_staged_sqlite_file(path: &Path) -> Result<Arc<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut witnesses = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    ensure!(
+        witnesses.count < MAX_RETAINED_SQLITE_WITNESSES,
+        "incompatible_index: verified SQLite file witness capacity reached"
+    );
+    let file = Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?,
+    );
+    witnesses
+        .by_path
+        .entry(path.to_owned())
+        .or_default()
+        .push(file.clone());
+    witnesses.count += 1;
+    Ok(file)
+}
+
 fn verify_index_file(path: &Path) -> Result<()> {
-    use std::io::Read;
-    use std::os::unix::{
-        fs::{MetadataExt, OpenOptionsExt},
-        io::AsRawFd,
-    };
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let file = retained_sqlite_file(path, false, false, false)
         .context("incompatible_index: missing or unreadable database")?;
     let meta = file.metadata()?;
     let named = std::fs::symlink_metadata(path)?;
@@ -514,18 +598,24 @@ fn verify_index_file(path: &Path) -> Result<()> {
             && meta.uid() == unsafe { libc::geteuid() }
             && meta.mode() & 0o777 == 0o600
             && meta.nlink() == 1
+            && named.is_file()
+            && !named.file_type().is_symlink()
             && meta.dev() == named.dev()
             && meta.ino() == named.ino(),
         "unsafe_index: {}",
         path.display()
     );
+    // A shared retained File has no mutable seek cursor. Positional reads
+    // preserve exact SQLite-header validation without opening another fd.
     let mut header = [0u8; 20];
-    match file.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(ExceptionalIndexFormat.into());
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read_at(&mut header[filled..], filled as u64) {
+            Ok(0) => return Err(ExceptionalIndexFormat.into()),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => return Err(error.into()),
     }
     if &header[..16] != b"SQLite format 3\0" {
         return Err(ExceptionalIndexFormat.into());
@@ -536,7 +626,6 @@ fn verify_index_file(path: &Path) -> Result<()> {
         header[18] == 1 && header[19] == 1,
         "incompatible_index: unsupported SQLite journaling mode"
     );
-    let _ = file.as_raw_fd();
     Ok(())
 }
 // Treat dangling symlinks as existing, so a first open never replaces an unsafe path.
@@ -562,15 +651,11 @@ fn restore_index_journal(journal: &IndexFileWitness, backup: &Path, dir: &Path) 
 // A corrupt index can be witnessed without trusting its SQLite header or payload.
 struct IndexFileWitness {
     path: std::path::PathBuf,
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
 }
 impl IndexFileWitness {
     fn open(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
+        let file = retained_sqlite_file(path, false, false, true)?;
         let witness = Self {
             path: path.to_owned(),
             file,
@@ -602,7 +687,7 @@ impl IndexFileWitness {
 // The staged file is private to this attempt. On failure, only unlink our own inode.
 struct StagedIndex {
     path: std::path::PathBuf,
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
     published: bool,
 }
 impl StagedIndex {
@@ -3640,17 +3725,11 @@ impl Store {
     /// The returned guard unlinks only its own stage inode if it is not published.
     fn create_staged_index(&self, leader: &topology::LeaderGuard) -> Result<StagedIndex> {
         use rusqlite::OpenFlags;
-        use std::os::unix::fs::OpenOptionsExt;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
         let path = self.roots.index_db(&self.identity);
         let staged_path = path.with_file_name(format!("index.db.tmp-{}", uuid::Uuid::new_v4()));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&staged_path)?;
+        let file = create_retained_staged_sqlite_file(&staged_path)?;
         let staged = StagedIndex {
             path: staged_path,
             file,
@@ -11877,5 +11956,157 @@ mod busy_contention_classifier_tests {
         assert!(!super::transient_storage_contention(&invariant));
         assert!(super::nonterminal_storage_busy(&invariant));
         writer.execute_batch("ROLLBACK").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod live_sqlite_witness_tests {
+    use super::*;
+    use std::process::Command;
+
+    // A separate OS process must never get this writer lock until the first
+    // process commits. A successful child write is proof that a same-process
+    // independent check-handle close erased SQLite's POSIX fcntl locks.
+    #[test]
+    fn sqlite_lock_contender_child() {
+        let Some(path) = std::env::var_os("BALEYG_LIVE_SQLITE_LOCK_CHILD") else {
+            return;
+        };
+        let db = Connection::open(path).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        let update = match std::env::var("BALEYG_LIVE_SQLITE_LOCK_TABLE").as_deref() {
+            Ok("queue") => "UPDATE queue_identity SET root_key=root_key",
+            Ok("index") => "UPDATE index_metadata SET last_opened_at=last_opened_at",
+            _ => std::process::exit(19),
+        };
+        match db.execute_batch(&format!("BEGIN IMMEDIATE; {update}; COMMIT")) {
+            Err(rusqlite::Error::SqliteFailure(info, _))
+                if matches!(
+                    info.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) => {}
+            Ok(()) => std::process::exit(17),
+            Err(_) => std::process::exit(19),
+        }
+    }
+
+    fn contend(path: &Path) -> i32 {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("store::live_sqlite_witness_tests::sqlite_lock_contender_child")
+            .env("BALEYG_LIVE_SQLITE_LOCK_CHILD", path)
+            .env(
+                "BALEYG_LIVE_SQLITE_LOCK_TABLE",
+                if path.file_name().is_some_and(|name| name == "requests.db") {
+                    "queue"
+                } else {
+                    "index"
+                },
+            )
+            .output()
+            .unwrap()
+            .status
+            .code()
+            .unwrap()
+    }
+
+    fn index_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Store,
+        IndexPin,
+        Arc<topology::LeaderSession>,
+    ) {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.js"),
+            "function a() {}
+",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        (state, workspace, store, pin, owner)
+    }
+
+    #[test]
+    fn request_read_does_not_close_another_live_sqlite_writers_locks() {
+        let (_state, workspace, store, _, _owner) = index_fixture();
+        let ack = store
+            .enqueue_request(
+                &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+                None,
+            )
+            .unwrap();
+        let path = store.request_db_path();
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE; UPDATE requests SET submitted_at=submitted_at")
+            .unwrap();
+        let checked = store.clone();
+        let id = ack.id.clone();
+        std::thread::spawn(move || checked.request_by_id(&id).unwrap().unwrap())
+            .join()
+            .unwrap();
+        let child = contend(&path);
+        let committed = writer.execute_batch("COMMIT");
+        assert_eq!(
+            child, 0,
+            "a second process stole the requests.db writer lock (child exit {child}); first COMMIT: {committed:?}"
+        );
+        committed.unwrap();
+        let persisted = store.request_by_id(&ack.id).unwrap().unwrap();
+        assert_eq!(
+            (persisted.seq, persisted.state.as_str()),
+            (ack.seq, "queued"),
+            "previously accepted ACK must survive intact"
+        );
+    }
+
+    fn index_check_retains_writer_lock(check: impl FnOnce(&Path) + Send) {
+        let (_state, _workspace, store, pin, _owner) = index_fixture();
+        let path = store.roots.index_db(&store.identity);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE index_metadata SET last_opened_at=last_opened_at",
+            )
+            .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| check(&path)).join().unwrap();
+        });
+        let child = contend(&path);
+        let committed = writer.execute_batch("COMMIT");
+        assert_eq!(
+            child, 0,
+            "a second process stole the index.db writer lock (child exit {child}); first COMMIT: {committed:?}"
+        );
+        committed.unwrap();
+        assert_eq!(
+            store.status().unwrap().revision,
+            pin,
+            "selected retained publication pin must survive index check"
+        );
+    }
+
+    #[test]
+    fn verify_index_file_does_not_close_a_live_sqlite_writers_locks() {
+        index_check_retains_writer_lock(|path| verify_index_file(path).unwrap());
+    }
+
+    #[test]
+    fn index_file_witness_drop_does_not_close_a_live_sqlite_writers_locks() {
+        index_check_retains_writer_lock(|path| {
+            let witness = IndexFileWitness::open(path).unwrap();
+            witness.verify().unwrap();
+            drop(witness);
+        });
     }
 }

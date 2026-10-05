@@ -519,6 +519,17 @@ impl DaemonState {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
             }
+            // A verified drain normally consumes every FIFO head. If one is
+            // still queued, the guarded publish-BUSY path deferred it. Avoid
+            // recapturing the workspace every 20 ms under sustained readers.
+            if self
+                .store
+                .earliest_unfinished_request()
+                .is_ok_and(|head| head.is_some_and(|request| request.state == "queued"))
+            {
+                *self.recovery_retry_after.lock().unwrap() =
+                    Some(Instant::now() + Duration::from_millis(250));
+            }
             return Ok(());
         }
         if !pending_local && !durable_pending {
@@ -828,6 +839,13 @@ impl IntoResponse for ApiError {
 }
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // IOERR is broken SQLite locking/storage, not ordinary BUSY. Even an
+        // outer storage_busy context must never mask an IOERR_RDLOCK as 409.
+        if e.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+            matches!(error, rusqlite::Error::SqliteFailure(info, _) if info.code == rusqlite::ErrorCode::SystemIoFailure)
+        })) {
+            return Self(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "Operation failed");
+        }
         if e.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
             matches!(error, rusqlite::Error::SqliteFailure(info, _) if matches!(info.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
         })) {
@@ -841,67 +859,77 @@ impl From<anyhow::Error> for ApiError {
             )
         } else if let Some(invalid) = e.downcast_ref::<crate::class_diagram::InvalidRequest>() {
             Self(StatusCode::BAD_REQUEST, "invalid_class_request", invalid.0)
-        } else if e.to_string().starts_with("revision conflict") {
+        } else if e
+            .chain()
+            .any(|cause| cause.to_string().starts_with("revision conflict"))
+        {
             Self(
                 StatusCode::CONFLICT,
                 "revision_conflict",
                 "The index revision changed",
             )
-        } else if matches!(
-            e.to_string().as_str(),
-            "saved view target replacement is not allowed"
-                | "saved annotation target replacement is not allowed"
-                | "native declaration target missing"
-        ) {
+        } else if e.chain().any(|cause| {
+            matches!(
+                cause.to_string().as_str(),
+                "saved view target replacement is not allowed"
+                    | "saved annotation target replacement is not allowed"
+                    | "native declaration target missing"
+            )
+        }) {
             invalid()
         } else {
-            let text = e.to_string();
-            for (prefix, status, code) in [
-                ("root_changed", StatusCode::CONFLICT, "root_changed"),
-                (
-                    "root_key_collision",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "root_key_collision",
-                ),
-                (
-                    "workspace_id_changed",
-                    StatusCode::CONFLICT,
-                    "workspace_id_changed",
-                ),
-                ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
-                (
-                    "index_not_ready",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "index_not_ready",
-                ),
-                (
-                    "incompatible_index",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "incompatible_index",
-                ),
-                (
-                    "incompatible_record",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "incompatible_record",
-                ),
-                (
-                    "incomplete_record",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "incomplete_record",
-                ),
-                (
-                    "recovery_required",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "recovery_required",
-                ),
-                (
-                    "unsafe_index",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "unsafe_index",
-                ),
-            ] {
-                if text.starts_with(prefix) {
-                    return Self(status, code, "Storage is unavailable");
+            // Context must not hide an exact allowlisted refusal from the
+            // public API. An IOERR_RDLOCK is NOT busy/locked and still maps
+            // to 500; never mask broken SQLite locking as retryable work.
+            for cause in e.chain() {
+                let text = cause.to_string();
+                for (prefix, status, code) in [
+                    ("root_changed", StatusCode::CONFLICT, "root_changed"),
+                    (
+                        "root_key_collision",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "root_key_collision",
+                    ),
+                    (
+                        "workspace_id_changed",
+                        StatusCode::CONFLICT,
+                        "workspace_id_changed",
+                    ),
+                    ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
+                    (
+                        "index_not_ready",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "index_not_ready",
+                    ),
+                    (
+                        "incompatible_index",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "incompatible_index",
+                    ),
+                    (
+                        "incompatible_record",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "incompatible_record",
+                    ),
+                    (
+                        "incomplete_record",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "incomplete_record",
+                    ),
+                    (
+                        "recovery_required",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "recovery_required",
+                    ),
+                    (
+                        "unsafe_index",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "unsafe_index",
+                    ),
+                ] {
+                    if text.starts_with(prefix) {
+                        return Self(status, code, "Storage is unavailable");
+                    }
                 }
             }
             Self(
@@ -2771,6 +2799,28 @@ mod live_tests {
     }
 
     #[test]
+    fn api_error_walks_context_but_never_masks_sqlite_ioerr_rdlock() {
+        let busy =
+            anyhow::anyhow!("storage_busy: SQLite lock contention").context("durable enqueue");
+        let mapped = ApiError::from(busy);
+        assert_eq!((mapped.0, mapped.1), (StatusCode::CONFLICT, "storage_busy"));
+        let root = anyhow::anyhow!("root_changed: pathname replaced").context("durable enqueue");
+        let mapped = ApiError::from(root);
+        assert_eq!((mapped.0, mapped.1), (StatusCode::CONFLICT, "root_changed"));
+        let ioerr = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR_RDLOCK),
+            None,
+        );
+        let mapped = ApiError::from(
+            anyhow::Error::new(ioerr).context("storage_busy: wrapped database I/O failure"),
+        );
+        assert_eq!(
+            (mapped.0, mapped.1),
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        );
+    }
+
+    #[test]
     fn preview_fence_failure_restores_evicted_and_same_id_packets() {
         let revision = IndexPin {
             index_generation: uuid::Uuid::new_v4(),
@@ -3430,6 +3480,62 @@ mod serving_holder_tests {
         );
         // Reaching here proves a broken diagnostic pipe cannot panic the
         // timer thread or prevent its next accepted-work tick.
+    }
+
+    #[tokio::test]
+    async fn verified_leader_busy_requeue_gets_bounded_backoff_before_same_ack_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let state = new(
+            store.clone(),
+            options.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.retain_serving_session(owner);
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        store.fail_next_live_publish_commit_busy();
+        state.queue_tick().unwrap();
+        let deferred = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(
+            (deferred.seq, deferred.state.as_str()),
+            (accepted.seq, "queued")
+        );
+        assert!(deferred.finished_at.is_none() && deferred.error_code.is_none());
+        assert_eq!(store.index_baseline().unwrap(), old_pin);
+        assert!(
+            state
+                .recovery_retry_after
+                .lock()
+                .unwrap()
+                .is_some_and(|when| when > Instant::now())
+        );
+        state.queue_tick().unwrap();
+        assert_eq!(
+            store.request_by_id(&accepted.id).unwrap().unwrap().state,
+            "queued"
+        );
+        *state.recovery_retry_after.lock().unwrap() = None;
+        state.queue_tick().unwrap();
+        let done = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        assert_eq!(done.seq, accepted.seq);
+        assert_eq!(
+            done.revision.unwrap().index_revision,
+            old_pin.index_revision + 1
+        );
     }
 
     #[tokio::test]

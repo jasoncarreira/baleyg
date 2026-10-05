@@ -1,26 +1,26 @@
 {
-  "release_sha256": "a88086bdf6a1449b097f9d90a2d3118020c62962f9488134b58dcff0ea08d420",
+  "release_sha256": "fb8e651934a5784e4509e413f9f7142671c0366d5a975a8b76e2fa5dfc59b513",
   "frozen_runner_sha256": "bcda02f75be5cefcc7f8658965ab59ed05fce306c211a576e9619f2db3fe50a2",
   "mixed_runner_sha256": "1eee5ac38db8a7c1ea6694b841cc2caf3ab5a36dfb4193fe28cb24407f379600",
-  "source_freeze": "Claude round3 transient publish-COMMIT contention repair, exact same-seq accepted queue retry with authenticated unchanged pin, ambiguous post-commit safety, verified daemon retry/fences, non-panicking diagnostics and real-process original-ACK regression completed before Rust 1.99 full gates, unchanged verifier, release build and sequential frozen/mixed 80/80 AC8",
+  "source_freeze": "Claude round4 mandatory POSIX SQLite lock-retention repair across requests.db, verify_index_file, IndexFileWitness and staged index fd; cross-process red-to-green accepted queue/pin proof, typed IOERR500 and contextual refusal, leader BUSY backoff and explicit CLI ambiguous-ACK guidance completed before Rust 1.99 full gates, unchanged verifier, release build and sequential frozen/mixed 80/80 AC8",
   "canonical_manifest_sha256": "8b8deea8592cfd069a1500bcad9d634a8b4d343477e769b2f2aed0dd61bee046",
   "completed_cohorts": {
     "frozen": {
       "medium_samples": 20,
       "large_samples": 20,
-      "medium_p95_s": 0.7479,
-      "large_p95_s": 4.7221,
-      "raw_log_sha256": "66832a2de897f11a8b79a26d9f272050cd30c9e1eb6f3d65a4ed9db5b255365c"
+      "medium_p95_s": 0.75,
+      "large_p95_s": 4.6048,
+      "raw_log_sha256": "0a0b2d5aaa7f8efd73ee45ba6b45a6d97dc2a4633b9aefcdce75e770ff2b30a5"
     },
     "mixed_medium": {
       "samples": 20,
-      "p95_s": 0.7701,
-      "raw_log_sha256": "ce78955c047d30164af8962c062d4ec4688e98633e985010d8450d830febead7"
+      "p95_s": 0.7609,
+      "raw_log_sha256": "58c89f5419350fb64f12bb001f9b4cf9731dbf23ca5efa87be9784d1d1a952f3"
     },
     "mixed_large": {
       "samples": 20,
-      "p95_s": 4.7619,
-      "raw_log_sha256": "deb8b6d1af6a2ec524aeda6c78b7f8efc8ed10690a88e412e3d1710cb00cbf36"
+      "p95_s": 4.7122,
+      "raw_log_sha256": "b45677798954736dee903b4eca9e4462f810dbdf04777b55363cc2cc66a2a559"
     }
   },
   "prior_pre_hardening_release_sha256": "9ce891636bd9c38f93534159c1a96386170e837e2d0e75aeefc8ffb0741f9337",
@@ -32,5 +32,11 @@
     "mixed_medium": "c445ceb5aefc4be7f5756fd1555d2f7cc3aba7e37ec3503fb673b3ae8b8df9c1",
     "mixed_large": "b9dd05c6ddce7de90c7bff0508c972b0c4ebb48d7320583637814ecfdd4c7ca0"
   },
-  "source_fingerprint_sha256": "bde1a6981c6d8dc3c448a2966f2eb2617fbbf64efd236edfb552ee5a994e27c3"
+  "source_fingerprint_sha256": "83c8405137ab7864373a5de445bee950be418776b38607397843a38c6798fdc5",
+  "prior_round3_release_sha256": "a88086bdf6a1449b097f9d90a2d3118020c62962f9488134b58dcff0ea08d420",
+  "prior_round3_raw_log_sha256": {
+    "frozen": "66832a2de897f11a8b79a26d9f272050cd30c9e1eb6f3d65a4ed9db5b255365c",
+    "mixed_medium": "ce78955c047d30164af8962c062d4ec4688e98633e985010d8450d830febead7",
+    "mixed_large": "deb8b6d1af6a2ec524aeda6c78b7f8efc8ed10690a88e412e3d1710cb00cbf36"
+  }
 }

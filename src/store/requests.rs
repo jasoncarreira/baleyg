@@ -9,8 +9,8 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
-    fs::{self, OpenOptions},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    fs,
+    os::unix::fs::MetadataExt,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -205,13 +205,7 @@ impl Store {
         // open/create or SQLite journal recovery.
         let path = self.request_db_path();
         // The protected directory and file must remain private, regular and tied to the pathname.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(!existing_only)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
+        let file = super::retained_sqlite_file(&path, true, !existing_only, false)?;
         let metadata = file.metadata()?;
         let named = fs::symlink_metadata(&path)?;
         ensure!(
@@ -223,6 +217,8 @@ impl Store {
                 && (metadata.dev(), metadata.ino()) == (named.dev(), named.ino()),
             "unsafe requests.db"
         );
+        // Only the local Arc is released. The process-wide check handle must
+        // remain open while any SQLite connection may hold fcntl locks.
         drop(file);
         let mut db = Connection::open_with_flags(
             &path,

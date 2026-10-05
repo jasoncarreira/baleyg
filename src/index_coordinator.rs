@@ -659,7 +659,25 @@ pub fn enqueue_and_wait_observed(
                     progress(phase)
                 }) {
                     Ok(_) => break,
-                    Err(error) => retry_cli_recorded_completion(store, session, cancel, error)?,
+                    Err(error) => {
+                        if crate::store::nonterminal_storage_busy(&error)
+                            && !store.has_recorded_completion(session)?
+                        {
+                            // A COMMIT may have published before the BUSY was
+                            // reported. The durable row is left unfinished;
+                            // do not guess success or repeat under this owner.
+                            let disposition = store
+                                .request_by_id(&request.id)
+                                .ok()
+                                .flatten()
+                                .map_or("unavailable".to_owned(), |row| row.state);
+                            return Err(error).context(format!(
+                                "accepted request {} remains durable (state={disposition}) for the next verified leader after ambiguous publication; inspect its job status",
+                                request.id
+                            ));
+                        }
+                        retry_cli_recorded_completion(store, session, cancel, error)?;
+                    }
                 }
             }
         }
@@ -823,6 +841,58 @@ mod tests {
         assert!(!retryable_cli_completion_error(&anyhow::anyhow!(
             "storage_busy: unresolved FIFO completion"
         )));
+    }
+
+    #[test]
+    fn cli_ambiguous_busy_reports_durable_unfinished_ack_for_next_verified_leader() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, old) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        drop(old);
+        let earlier = store.enqueue_request(&options, None).unwrap();
+        let captures = std::sync::atomic::AtomicUsize::new(0);
+        let error = match enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
+            // First capture is leader takeover; inject into the accepted
+            // FIFO head Q1 while this CLI's own Q2 is durably queued behind it.
+            if phase.phase == "timing:capture" && captures.fetch_add(1, Ordering::AcqRel) == 1 {
+                store.fail_next_live_publish_post_commit_busy();
+            }
+        }) {
+            Ok(_) => panic!("ambiguous COMMIT must stop this CLI waiter"),
+            Err(error) => error,
+        };
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("next verified leader") && text.contains("remains durable"),
+            "{text}"
+        );
+        let head = store.request_by_id(&earlier.id).unwrap().unwrap();
+        let waiting = store.current_request().unwrap().unwrap();
+        assert!(waiting.seq > earlier.seq);
+        assert!(
+            (head.state == "running" && waiting.state == "queued")
+                || (head.state == "done" && waiting.state == "running"),
+            "a post-COMMIT ambiguity must leave exactly its own FIFO row running and all later ACKs queued"
+        );
+        assert!(head.error_code.is_none() && waiting.error_code.is_none());
+        assert!(waiting.finished_at.is_none());
+        let successor = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (_, owner) = reconcile_workspace(&successor, &options, &cancel, |_| {}).unwrap();
+        let processed = drain_requests(&successor, &owner).unwrap();
+        assert!((1..=2).contains(&processed));
+        assert_eq!(
+            successor.request_by_id(&head.id).unwrap().unwrap().state,
+            "done"
+        );
+        assert_eq!(
+            successor.request_by_id(&waiting.id).unwrap().unwrap().state,
+            "done"
+        );
+        drop(owner);
     }
 
     #[test]
