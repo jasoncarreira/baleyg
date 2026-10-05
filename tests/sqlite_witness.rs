@@ -11,17 +11,20 @@ fn sqlite_writer_child() {
     let db = Connection::open(path).unwrap();
     db.busy_timeout(Duration::ZERO).unwrap();
     let update = if std::env::var_os("BALEYG_WITNESS_QUEUE").is_some() {
-        "UPDATE queue_identity SET root_key=root_key"
+        "UPDATE requests SET submitted_at=submitted_at||'!' WHERE seq=1"
     } else {
-        "UPDATE index_metadata SET last_opened_at=last_opened_at"
+        "UPDATE index_metadata SET last_opened_at=last_opened_at+1"
     };
     match db.execute_batch(&format!("BEGIN IMMEDIATE; {update}; COMMIT")) {
         Err(rusqlite::Error::SqliteFailure(info, _))
             if matches!(
                 info.code,
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            ) => {}
-        Ok(()) => std::process::exit(17),
+            ) =>
+        {
+            std::process::exit(23)
+        }
+        Ok(()) => std::process::exit(29),
         Err(_) => std::process::exit(19),
     }
 }
@@ -55,13 +58,33 @@ fn live_index_writer_survives_transient_verification_and_status() {
         .execute_batch("BEGIN IMMEDIATE; UPDATE index_metadata SET last_opened_at=last_opened_at")
         .unwrap();
     let _ = store.status();
-    let code = contender(&index);
+    let before: i64 = writer
+        .query_row("SELECT last_opened_at FROM index_metadata", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let busy = contender(&index);
     let commit = writer.execute_batch("COMMIT");
     assert_eq!(
-        code, 0,
-        "another process stole live SQLite writer lock: {code}; commit: {commit:?}"
+        busy, 23,
+        "writer lock was not actually busy: child {busy}; commit: {commit:?}"
     );
     commit.unwrap();
+    assert_eq!(
+        contender(&index),
+        29,
+        "unlocked child did not execute a write"
+    );
+    let after: i64 = writer
+        .query_row("SELECT last_opened_at FROM index_metadata", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        after,
+        before + 1,
+        "child's committed update was not durable"
+    );
 }
 
 #[test]
@@ -81,13 +104,33 @@ fn live_request_writer_survives_queue_worker_reads() {
     std::thread::spawn(move || selected.request_by_id(&accepted.id).unwrap())
         .join()
         .unwrap();
-    let code = contender(&queue);
+    let before: String = writer
+        .query_row("SELECT submitted_at FROM requests WHERE seq=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let busy = contender(&queue);
     let commit = writer.execute_batch("COMMIT");
     assert_eq!(
-        code, 0,
-        "another process stole queue writer lock: {code}; commit: {commit:?}"
+        busy, 23,
+        "queue writer lock was not actually busy: child {busy}; commit: {commit:?}"
     );
     commit.unwrap();
+    assert_eq!(
+        contender(&queue),
+        29,
+        "unlocked queue child did not execute a write"
+    );
+    let after: String = writer
+        .query_row("SELECT submitted_at FROM requests WHERE seq=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        after,
+        format!("{before}!"),
+        "child's committed queue update was not durable"
+    );
 }
 
 // Run exceptional recreation in its own process so retained descriptors do not

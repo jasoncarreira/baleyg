@@ -1083,6 +1083,10 @@ impl LeaderGuard {
         self.use_guard.belongs_to(use_path, true)?;
         self.verify()
     }
+    pub(crate) fn exclusive_use_guard(&self, use_path: &Path) -> Result<&UseGuard> {
+        self.verify_exclusive_use(use_path)?;
+        Ok(&self.use_guard)
+    }
     /// Convert the same held use-lock descriptor after activation; keep leader flock.
     pub fn downgrade_use_to_shared(&mut self) -> Result<()> {
         self.verify()?;
