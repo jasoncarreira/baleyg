@@ -146,6 +146,7 @@ pub struct DaemonState {
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
     native_stream: Mutex<()>,
     recovery_retry_after: Mutex<Option<Instant>>,
+    retention_last_run: Mutex<Instant>,
     #[cfg(test)]
     test_queue_before_stream: crate::store::TestOneShotHook,
     #[cfg(test)]
@@ -294,6 +295,7 @@ pub fn new_with_dependency_options(
         job_progress: Mutex::new(BTreeMap::new()),
         native_stream: Mutex::new(()),
         recovery_retry_after: Mutex::new(None),
+        retention_last_run: Mutex::new(Instant::now()),
         #[cfg(test)]
         test_queue_before_stream: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
@@ -515,6 +517,10 @@ impl DaemonState {
                     return Err(error);
                 }
             };
+            if self.retention_last_run.lock().unwrap().elapsed() >= Duration::from_secs(60) {
+                self.store.maintain_revisions(session.leader_guard()?)?;
+                *self.retention_last_run.lock().unwrap() = Instant::now();
+            }
             if processed > 0 {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
@@ -859,6 +865,11 @@ impl From<anyhow::Error> for ApiError {
             )
         } else if let Some(invalid) = e.downcast_ref::<crate::class_diagram::InvalidRequest>() {
             Self(StatusCode::BAD_REQUEST, "invalid_class_request", invalid.0)
+        } else if e
+            .chain()
+            .any(|cause| cause.downcast_ref::<crate::store::PinExpired>().is_some())
+        {
+            Self(StatusCode::CONFLICT, "pin_expired", "The index pin expired")
         } else if e
             .chain()
             .any(|cause| cause.to_string().starts_with("revision conflict"))

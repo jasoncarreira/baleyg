@@ -1609,7 +1609,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
             .native_source_at(r1, &key)
             .unwrap_err()
             .to_string()
-            .contains("revision conflict")
+            .contains("pin_expired")
     );
     // Release is durable before collection: lose the owner/process now, then
     // reopen the index while r1's unreachable rows still await fenced GC.
@@ -1671,7 +1671,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
         cold.native_source_at(r1, &key)
             .unwrap_err()
             .to_string()
-            .contains("revision conflict")
+            .contains("pin_expired")
     );
     assert_eq!(cold.native_source_at(r2, &key).unwrap().unwrap(), source2);
     assert!(cold.native_source_at(r3, &key).unwrap().is_none());
@@ -2128,4 +2128,119 @@ fn supersession_backfill_omits_released_tombstones() {
         )]
     );
     assert_eq!(reopened.index_baseline().unwrap(), r3);
+}
+
+#[test]
+fn retention_boundary_preserves_younger_manifests_and_collects_only_unreferenced() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let r1 = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let original = store.source_at("flow.js", Some(r1)).unwrap().unwrap();
+    fs::write(
+        root.path().join("flow.js"),
+        "function changed() { newer(); }\n",
+    )
+    .unwrap();
+    let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
+    fs::write(
+        root.path().join("flow.js"),
+        "function latest() { newest(); }\n",
+    )
+    .unwrap();
+    let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
+    let retained = store.source_at("flow.js", Some(r2)).unwrap().unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = format!("pin:v1:{}:{}", r1.index_generation, r1.index_revision);
+    let key2 = format!("pin:v1:{}:{}", r2.index_generation, r2.index_revision);
+    db.execute(
+        "UPDATE native_revision_supersessions SET superseded_at=?1 WHERE revision_id=?2",
+        rusqlite::params![now - 895, key],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE native_revision_supersessions SET superseded_at=?1 WHERE revision_id=?2",
+        rusqlite::params![now - 895, key2],
+    )
+    .unwrap();
+    store.maintain_revisions(&leader).unwrap();
+    assert_eq!(
+        store.source_at("flow.js", Some(r1)).unwrap().unwrap(),
+        original
+    );
+    assert_eq!(
+        store.source_at("flow.js", Some(r2)).unwrap().unwrap(),
+        retained
+    );
+    // The latest committed supersession is still younger. Moving only the
+    // predecessor beyond the boundary must not release the other pin.
+    // Exact 899/900 semantics are tested against the production predicate.
+    db.execute(
+        "UPDATE native_revision_supersessions SET superseded_at=?1 WHERE revision_id=?2",
+        rusqlite::params![now - 905, key],
+    )
+    .unwrap();
+    store.maintain_revisions(&leader).unwrap();
+    let expired = store.source_at("flow.js", Some(r1)).unwrap_err();
+    assert!(
+        expired
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some(),
+        "{expired:#}"
+    );
+    assert_eq!(
+        store.source_at("flow.js", Some(r2)).unwrap().unwrap(),
+        retained
+    );
+    assert_eq!(store.status().unwrap().revision, r3);
+    assert!(store.source_at("flow.js", Some(r3)).unwrap().is_some());
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [key],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(
+        db.prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none()
+    );
+    let foreign = IndexPin {
+        index_generation: uuid::Uuid::new_v4(),
+        index_revision: r1.index_revision,
+    };
+    assert!(
+        store
+            .source_at("flow.js", Some(foreign))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_none()
+    );
 }

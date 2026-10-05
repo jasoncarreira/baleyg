@@ -795,3 +795,56 @@ async fn index_request_without_startup_session_takes_over_after_ack() {
     );
     assert!(state.retained_serving_session().unwrap().is_leader());
 }
+
+#[tokio::test]
+async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
+    let (dir, store, state, app) = setup();
+    let workspace = dir.path().join("workspace");
+    std::fs::write(workspace.join("a.js"), "function before() {}\n").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session = state.retained_serving_session().unwrap();
+    let publish = |expected| {
+        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                expected,
+                &cancel,
+            )
+            .unwrap()
+    };
+    let old = publish(store.index_baseline().unwrap());
+    std::fs::write(workspace.join("a.js"), "function after() {}\n").unwrap();
+    let head = publish(old);
+    store
+        .release_revision(old, session.leader_guard().unwrap())
+        .unwrap();
+    let path = |pin: IndexPin| {
+        format!(
+            "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+            pin.index_generation, pin.index_revision
+        )
+    };
+    let (status, body) = call(&app, "GET", &path(old), Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "pin_expired");
+    let (status, body) = call(&app, "GET", &path(head), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["file"]["text"], "function after() {}\n");
+    let foreign = IndexPin {
+        index_generation: uuid::Uuid::new_v4(),
+        index_revision: old.index_revision,
+    };
+    let (status, body) = call(&app, "GET", &path(foreign), Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "revision_conflict");
+}

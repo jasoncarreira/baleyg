@@ -14,7 +14,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
@@ -50,6 +50,7 @@ pub struct Store {
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
     request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
     writer_counters: Arc<Mutex<Option<WriterCounters>>>,
+    retention_clock: Arc<Mutex<(i64, Instant)>>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -192,6 +193,14 @@ impl std::fmt::Display for ObsoleteIndexFormat {
     }
 }
 impl std::error::Error for ObsoleteIndexFormat {}
+#[derive(Debug)]
+pub struct PinExpired;
+impl std::fmt::Display for PinExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("pin_expired: released native revision")
+    }
+}
+impl std::error::Error for PinExpired {}
 #[derive(Debug)]
 struct SelectedIntegrity(String);
 impl std::fmt::Display for SelectedIntegrity {
@@ -780,6 +789,36 @@ fn publication_second() -> Result<i64> {
         "invalid_supersession_time"
     );
     Ok(seconds as i64)
+}
+
+fn retention_due(now: i64, superseded_at: i64) -> bool {
+    now.saturating_sub(superseded_at) >= 900
+}
+
+fn retention_clock_plausible(start: i64, wall: i64, elapsed: u64) -> bool {
+    wall <= start
+        .saturating_add(i64::try_from(elapsed).unwrap_or(i64::MAX))
+        .saturating_add(5)
+}
+
+#[cfg(test)]
+mod retention_clock_tests {
+    use super::{retention_clock_plausible, retention_due};
+
+    #[test]
+    fn exact_grace_boundary_is_inclusive() {
+        assert!(!retention_due(1_899, 1_000));
+        assert!(retention_due(1_900, 1_000));
+        assert!(!retention_due(999, 1_000));
+    }
+
+    #[test]
+    fn forward_jump_waits_for_monotonic_elapsed_and_backward_step_is_allowed() {
+        assert!(retention_clock_plausible(1_000, 900, 0));
+        assert!(retention_clock_plausible(1_000, 1_005, 0));
+        assert!(!retention_clock_plausible(1_000, 1_006, 0));
+        assert!(retention_clock_plausible(1_000, 1_900, 895));
+    }
 }
 
 // Called only with the leader's immediate write transaction. Existing pins stay put.
@@ -3620,6 +3659,7 @@ impl Store {
             pending_request_completion: Arc::new(Mutex::new(None)),
             request_file_witness: Arc::new(Mutex::new(None)),
             writer_counters: Arc::new(Mutex::new(None)),
+            retention_clock: Arc::new(Mutex::new((publication_second()?, Instant::now()))),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
@@ -6997,14 +7037,20 @@ impl Store {
             "revision conflict: foreign or missing native pin"
         );
         let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
-        let exists: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM native_revisions r WHERE r.id=?1 AND r.published_index_revision=?2
-                AND NOT EXISTS (SELECT 1 FROM revision_capture_inputs i
-                    WHERE i.revision_id=r.id AND i.input_key='__released:v1'))",
-            params![key, pin.index_revision as i64],
-            |r| r.get(0),
-        )?;
-        ensure!(exists, "revision conflict: released or missing native pin");
+        let state: Option<bool> = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM revision_capture_inputs i
+                WHERE i.revision_id=r.id AND i.input_key='__released:v1')
+             FROM native_revisions r WHERE r.id=?1 AND r.published_index_revision=?2",
+                params![key, pin.index_revision as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match state {
+            Some(true) => return Err(PinExpired.into()),
+            None => anyhow::bail!("revision conflict: missing native pin"),
+            Some(false) => {}
+        }
         let selected = ReadRevision { pin, key };
         selected_producer_hash(db, &selected)
             .map_err(selected_integrity)
@@ -7021,6 +7067,58 @@ impl Store {
             let selected = self.read_revision(db, Some(pin))?;
             read(db, &selected).map_err(|error| self.report_selected_failure(error))
         })
+    }
+
+    /// Only the verified owner may expire pins. An in-process forward clock jump
+    /// cannot shorten grace until monotonic time corroborates it; after restart
+    /// the new process trusts the persisted UTC timestamp.
+    pub fn maintain_revisions(&self, leader: &topology::LeaderGuard) -> Result<()> {
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        leader.verify()?;
+        self.identity.verify()?;
+        let wall = publication_second()?;
+        let mut clock = self.retention_clock.lock().unwrap();
+        let elapsed = clock.1.elapsed().as_secs();
+        if !retention_clock_plausible(clock.0, wall, elapsed) {
+            return Ok(());
+        }
+        // Keep the original anchor during a backward step. It cannot shorten grace.
+        if wall >= clock.0 {
+            *clock = (wall, Instant::now());
+        }
+        drop(clock);
+        let due = self.with_evidence(|db| {
+            let head = self.read_revision(db, None)?.pin;
+            validate_supersessions(db)?;
+            let latest: Option<i64> = db.query_row(
+                "SELECT max(superseded_at) FROM native_revision_supersessions",
+                [],
+                |r| r.get(0),
+            )?;
+            let now = wall.max(latest.unwrap_or(wall));
+            let mut stmt = db.prepare(
+                "SELECT r.published_index_revision,s.superseded_at FROM native_revision_supersessions s
+                 JOIN native_revisions r ON r.id=s.revision_id
+                 WHERE r.id!=?1
+                   AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs c
+                     WHERE c.revision_id=r.id AND c.input_key='__released:v1')
+                 ORDER BY r.published_index_revision",
+            )?;
+            let rows = stmt.query_map(
+                [format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.into_iter().filter(|(_, stamp)| retention_due(now, *stamp))
+                .map(|(revision, _)| IndexPin {
+                    index_generation: head.index_generation,
+                    index_revision: revision as u64,
+                }).collect::<Vec<_>>())
+        })?;
+        for pin in &due {
+            self.release_revision(*pin, leader)?;
+        }
+        // Also reclaim rows left by a crash between release and collection.
+        self.collect_unreferenced(leader)
     }
 
     /// Remove one non-head manifest. Physical versions are collected separately;
