@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use directories::ProjectDirs;
 use sha2::{Digest, Sha256};
 use std::os::unix::{
-    fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt},
     io::AsRawFd,
 };
 use std::{
@@ -1055,13 +1055,58 @@ pub struct LeaderGuard {
     pub incarnation: Uuid,
 }
 fn read_incarnation(file: &File) -> Result<Uuid> {
-    let mut file = file.try_clone()?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.take(64).read_to_end(&mut bytes)?;
-    let value =
-        std::str::from_utf8(&bytes).context("index_not_ready: invalid leader incarnation")?;
+    // A cloned File shares its cursor with the held lock descriptor. Concurrent
+    // verifications must read the same inode without moving that shared cursor.
+    let mut bytes = [0u8; 64];
+    let mut len = 0;
+    while len < bytes.len() {
+        let count = file.read_at(&mut bytes[len..], len as u64)?;
+        if count == 0 {
+            break;
+        }
+        len += count;
+    }
+    let value = std::str::from_utf8(&bytes[..len])
+        .context("index_not_ready: invalid leader incarnation")?;
     Uuid::parse_str(value).context("index_not_ready: invalid leader incarnation")
+}
+
+#[cfg(test)]
+mod incarnation_tests {
+    use super::*;
+
+    #[test]
+    fn read_incarnation_preserves_cursor_and_rejects_extra_or_invalid_bytes() {
+        let mut file = tempfile::tempfile().unwrap();
+        let incarnation = Uuid::new_v4();
+        file.write_all(incarnation.to_string().as_bytes()).unwrap();
+        file.seek(SeekFrom::Start(7)).unwrap();
+        assert_eq!(read_incarnation(&file).unwrap(), incarnation);
+        assert_eq!(file.stream_position().unwrap(), 7);
+        assert_eq!(read_incarnation(&file).unwrap(), incarnation);
+        assert_eq!(file.stream_position().unwrap(), 7);
+
+        file.set_len(0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(format!("{incarnation}x").as_bytes())
+            .unwrap();
+        file.seek(SeekFrom::Start(7)).unwrap();
+        assert!(
+            read_incarnation(&file).is_err(),
+            "trailing bytes are invalid"
+        );
+        assert_eq!(file.stream_position().unwrap(), 7);
+
+        file.set_len(0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"not-a-uuid").unwrap();
+        file.seek(SeekFrom::Start(7)).unwrap();
+        assert!(
+            read_incarnation(&file).is_err(),
+            "malformed UUID is invalid"
+        );
+        assert_eq!(file.stream_position().unwrap(), 7);
+    }
 }
 
 impl LeaderGuard {
