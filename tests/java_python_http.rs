@@ -11,7 +11,10 @@ use baleyg::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::{Graph, SymbolKind},
-    store::{Store, topology::LeaderSession},
+    store::{
+        SqliteContention, Store,
+        topology::{IndexNotReady, LeaderSession},
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -274,6 +277,15 @@ async fn mixed_catalog_tree_and_lexical_parents_remain_language_neutral() {
 
 #[tokio::test]
 async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion() {
+    fn expected_commit_barrier(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause.downcast_ref::<IndexNotReady>().is_some()
+                || cause.downcast_ref::<SqliteContention>().is_some()
+                || matches!(cause.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(info, _))
+                        if matches!(info.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+        })
+    }
     let f = setup();
     for path in ["Worker.java", "worker.py"] {
         let seed = f
@@ -323,7 +335,50 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
                 "unresolved invocation must stay terminal"
             );
         }
+        // Observe the real watcher commit for THIS deletion before asserting
+        // historical reads. An in-flight same-generation publication may
+        // temporarily close public reads; it is never an HTTP success result.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let prior_head = loop {
+            match f.store.status() {
+                Ok(status) => break status.revision,
+                Err(error) if expected_commit_barrier(&error) => {}
+                Err(error) => panic!("unexpected selected-head error before deletion: {error:#}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "selected head did not become ready before deletion"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(prior_head.index_generation, f.pin.index_generation);
+        assert!(prior_head.index_revision >= f.pin.index_revision);
         std::fs::remove_file(f.workspace.join(path)).unwrap();
+        loop {
+            match f.store.status() {
+                Ok(status) => {
+                    let head = status.revision;
+                    assert_eq!(head.index_generation, prior_head.index_generation);
+                    if head.index_revision > prior_head.index_revision {
+                        match f.store.source_at(path, Some(head)) {
+                            Ok(None) => break,
+                            Ok(Some(_)) => {} // The selected head has not yet accounted for this deletion.
+                            Err(error) if expected_commit_barrier(&error) => {}
+                            Err(error) => {
+                                panic!("unexpected selected-source error after deletion: {error:#}")
+                            }
+                        }
+                    }
+                }
+                Err(error) if expected_commit_barrier(&error) => {}
+                Err(error) => panic!("unexpected selected-head error after deletion: {error:#}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher did not commit a new head without deleted source"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(call(&f.app, "POST", "/api/sequence", request).await, before);
         let (code, source) = call(
             &f.app,

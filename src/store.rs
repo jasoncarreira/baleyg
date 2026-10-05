@@ -1291,6 +1291,7 @@ fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
 fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
     if recovery_class(&error) != RecoveryClass::Hard
         || error.downcast_ref::<rusqlite::Error>().is_some()
+        || error.downcast_ref::<SqliteContention>().is_some()
         || error.downcast_ref::<std::io::Error>().is_some()
     {
         error
@@ -1305,6 +1306,7 @@ fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
 pub(crate) fn transient_storage_contention(error: &anyhow::Error) -> bool {
     if error.chain().any(|cause| {
         cause.downcast_ref::<topology::StorageBusy>().is_some()
+            || cause.downcast_ref::<SqliteContention>().is_some()
             || matches!(cause.downcast_ref::<rusqlite::Error>(),
                 Some(rusqlite::Error::SqliteFailure(info, _))
                     if matches!(info.code,
@@ -1326,6 +1328,19 @@ pub(crate) fn nonterminal_storage_busy(error: &anyhow::Error) -> bool {
     transient_storage_contention(error) || error.to_string().starts_with("storage_busy")
 }
 
+/// A transient SQLite writer-lock conflict, distinct from invariant-busy
+/// control errors. The private constructor admits only exact SQLite BUSY/LOCKED.
+#[derive(Debug)]
+pub struct SqliteContention(());
+
+impl std::fmt::Display for SqliteContention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("storage_busy: SQLite lock contention")
+    }
+}
+
+impl std::error::Error for SqliteContention {}
+
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     match result {
         Err(rusqlite::Error::SqliteFailure(info, _))
@@ -1339,11 +1354,59 @@ fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             ) =>
         {
-            anyhow::bail!("storage_busy: SQLite lock contention")
+            Err(SqliteContention(()).into())
         }
         other => Ok(other?),
     }
 }
+#[cfg(test)]
+mod sqlite_contention_type_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_writer_busy_is_typed_without_raw_sqlite_cause_or_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        let first = rusqlite::Connection::open(&path).unwrap();
+        first
+            .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+            .unwrap();
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+        first.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let busy = storage_result(second.execute_batch("BEGIN IMMEDIATE")).unwrap_err();
+        assert_eq!(busy.to_string(), "storage_busy: SQLite lock contention");
+        assert!(busy.downcast_ref::<SqliteContention>().is_some());
+        assert!(
+            !busy
+                .chain()
+                .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
+        );
+        assert!(transient_storage_contention(&busy));
+        let selected = selected_integrity(busy);
+        assert!(selected.downcast_ref::<SqliteContention>().is_some());
+        assert_eq!(recovery_class(&selected), RecoveryClass::Hard);
+        let contextual = selected.context("outer publication context");
+        assert!(transient_storage_contention(&contextual));
+        assert!(!transient_storage_contention(&anyhow::anyhow!(
+            "storage_busy: cached claim changed"
+        )));
+        first.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn ioerr_rdlock_does_not_convert_to_contention() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR_RDLOCK),
+            None,
+        );
+        let reported = storage_result::<()>(Err(error)).unwrap_err();
+        assert!(reported.downcast_ref::<rusqlite::Error>().is_some());
+        assert!(reported.downcast_ref::<SqliteContention>().is_none());
+        assert!(!transient_storage_contention(&reported));
+    }
+}
+
 fn json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
@@ -6029,6 +6092,121 @@ impl Store {
     /// equality: Capture::admit has freshly read and SHA-256 hashed every source,
     /// and selected_source_row_for authenticates the saved bytes of every reused
     /// version before any metadata-only writer transaction starts.
+    /// A leader's final full inventory may avoid a redundant publication only
+    /// when the freshly hashed capture is still exactly the selected head.
+    /// This read-only guard is not an explicit-request completion path.
+    pub(crate) fn selected_capture_unchanged(
+        &self,
+        capture: &crate::capture::Capture,
+        leader: &topology::LeaderGuard,
+        expected: &RecoveryBaseline,
+        cancel: &CancelFlag,
+    ) -> Result<bool> {
+        if !expected.compatible
+            || self.disposition() != RecoveryDisposition::Ready
+            || !expected.pin().is_some_and(|pin| pin.index_revision > 0)
+        {
+            return Ok(false);
+        }
+        check_cancel(cancel)?;
+        ensure!(
+            capture.source_operations.len() == capture.files.len()
+                && capture
+                    .source_operations
+                    .values()
+                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+            "native_evidence_required: final inventory must freshly read and hash every admitted source"
+        );
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        let db = self.cache_write()?;
+        let admitted_version: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        let selected = ReadRevision::current(&db)?;
+        ensure!(
+            expected.pin() == Some(selected.pin),
+            "revision conflict: final inventory selected head changed"
+        );
+        let baseline = self.recovery_baseline(&db)?;
+        ensure!(
+            baseline.compatible
+                && baseline.pin == Some(selected.pin)
+                && baseline.witness == expected.witness,
+            "revision conflict: final inventory baseline changed"
+        );
+        validate_paired_metadata(&db, &self.identity.record_id)?;
+        validate_reconcile_inventory(&db)?;
+        if !has_revision_producer_bindings(&db)? {
+            return Ok(false);
+        }
+        let executable = std::env::current_exe()?;
+        let executing_hash = capture
+            .executable_digest(&executable)
+            .context("native_evidence_required: final inventory executable not hashed")?;
+        if selected_producer_hash(&db, &selected)? != executing_hash {
+            return Ok(false);
+        }
+        let prior_options: String = db.query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if prior_options != json(capture.reconcile_options())? {
+            return Ok(false);
+        }
+        let comparison = compare_capture_snapshot(&db, capture)?;
+        if comparison.examined == 0 || comparison.changed() {
+            return Ok(false);
+        }
+        for source in &capture.files {
+            check_cancel(cancel)?;
+            let stored = self
+                .selected_source_row_for(&db, &source.path, &selected)?
+                .context("incompatible_index: selected final inventory source missing")?;
+            ensure!(
+                stored == *source,
+                "incompatible_index: selected final inventory source differs"
+            );
+            let linked: Option<(String, String, String, String, String)> = db.query_row(
+                "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
+                 FROM revision_documents m
+                 JOIN document_versions v ON v.id=m.document_version_id AND v.language=m.language AND v.path=m.path
+                 JOIN graph_projections g ON g.id=m.graph_projection_id AND g.document_version_id=m.document_version_id AND g.language=m.language
+                 JOIN class_projections c ON c.id=m.class_projection_id AND c.graph_projection_id=m.graph_projection_id
+                 WHERE m.revision_id=?1 AND m.path=?2",
+                 params![selected.key, source.path],
+                 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).optional()?;
+            let (graph, class, context, producer, version) = linked
+                .context("incompatible_index: selected final inventory projection missing")?;
+            ensure!(
+                graph == "ready"
+                    && class == "ready"
+                    && producer == crate::native_evidence::PRODUCER
+                    && version == crate::native_evidence::NATIVE_VERSION
+                    && context
+                        == crate::native_evidence::declared_selected_extraction_context(
+                            &producer,
+                            &version,
+                            &source.language
+                        )?,
+                "incompatible_index: selected final inventory producer or projection drift"
+            );
+        }
+        capture.verify(cancel)?;
+        leader.verify()?;
+        self.identity.verify()?;
+        let after: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        ensure!(
+            admitted_version == after
+                && self.recovery_baseline(&db)?.witness == expected.witness
+                && ReadRevision::current(&db)?.pin == selected.pin,
+            "revision conflict: final inventory changed at cutoff"
+        );
+        Ok(true)
+    }
+
     pub(crate) fn publish_unchanged_native_recovery(
         &self,
         capture: &crate::capture::Capture,

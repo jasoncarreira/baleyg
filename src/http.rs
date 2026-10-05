@@ -145,6 +145,12 @@ pub struct DaemonState {
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
     native_stream: Mutex<()>,
+    leader_work: Mutex<
+        Option<(
+            std::sync::Weak<crate::store::topology::LeaderSession>,
+            crate::index_coordinator::LeaderWork,
+        )>,
+    >,
     recovery_retry_after: Mutex<Option<Instant>>,
     retention_last_run: Mutex<Instant>,
     #[cfg(test)]
@@ -296,6 +302,7 @@ pub fn new_with_dependency_options(
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
         native_stream: Mutex::new(()),
+        leader_work: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
         retention_last_run: Mutex::new(Instant::now()),
         #[cfg(test)]
@@ -318,8 +325,20 @@ impl DaemonState {
         self: &Arc<Self>,
         session: Arc<crate::store::topology::LeaderSession>,
     ) {
-        *self.serving_session.lock().unwrap() = Some(session);
+        self.replace_serving_session(Some(session));
         self.start_queue_tick();
+    }
+    fn replace_serving_session(&self, next: Option<Arc<crate::store::topology::LeaderSession>>) {
+        let mut current = self.serving_session.lock().unwrap();
+        let changed = match (&*current, &next) {
+            (Some(old), Some(next)) => !Arc::ptr_eq(old, next),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            *self.leader_work.lock().unwrap() = None;
+        }
+        *current = next;
     }
     /// A leader checks only the queue at idle. Follower retries require an accepted local ID.
     fn start_queue_tick(self: &Arc<Self>) {
@@ -460,14 +479,14 @@ impl DaemonState {
         if self.store.is_recreate_pending() && (pending_local || durable_pending) {
             // The native stream excludes the tick while the old owner is removed.
             // No retained SH guard may enter the nonblocking EX attempt.
-            drop(self.serving_session.lock().unwrap().take());
+            self.replace_serving_session(None);
             match self
                 .store
                 .recreate_pending_leader_session(&self.options, &Arc::new(AtomicBool::new(false)))
             {
                 Ok((_, session)) => {
                     self.store.fail_changed_root_requests(&session)?;
-                    *self.serving_session.lock().unwrap() = Some(session);
+                    self.replace_serving_session(Some(session));
                 }
                 Err(error)
                     if error.chain().any(|cause| {
@@ -494,14 +513,14 @@ impl DaemonState {
             {
                 self.store.fail_changed_root_requests(session)?;
             }
-            *self.serving_session.lock().unwrap() = None;
+            self.replace_serving_session(None);
             return Ok(());
         }
         if let Some(ref session) = retained
             && session.is_leader()
             && session.verify().is_ok()
         {
-            let processed = match crate::index_coordinator::drain_requests_observed(
+            let processed = match crate::index_coordinator::drain_one_request_observed(
                 &self.store,
                 session,
                 |id, p| {
@@ -516,7 +535,7 @@ impl DaemonState {
                     if !self.store.has_recorded_completion(session)?
                         || !crate::index_coordinator::retryable_cli_completion_error(&error)
                     {
-                        *self.serving_session.lock().unwrap() = None;
+                        self.replace_serving_session(None);
                     }
                     return Err(error);
                 }
@@ -532,13 +551,50 @@ impl DaemonState {
             // A verified drain normally consumes every FIFO head. If one is
             // still queued, the guarded publish-BUSY path deferred it. Avoid
             // recapturing the workspace every 20 ms under sustained readers.
-            if self
-                .store
-                .earliest_unfinished_request()
-                .is_ok_and(|head| head.is_some_and(|request| request.state == "queued"))
+            if processed == 0
+                && self
+                    .store
+                    .earliest_unfinished_request()
+                    .is_ok_and(|head| head.is_some_and(|request| request.state == "queued"))
             {
                 *self.recovery_retry_after.lock().unwrap() =
                     Some(Instant::now() + Duration::from_millis(250));
+            }
+            if (processed > 0 || self.store.earliest_unfinished_request()?.is_none())
+                && !self.store.has_recorded_completion(session)?
+            {
+                // The idle watcher follows the selected head's persisted inputs.
+                // Daemon defaults cannot silently supersede a FIFO head's options.
+                let selected_options = self
+                    .store
+                    .recorded_index_options()?
+                    .unwrap_or_else(|| self.options.clone());
+                {
+                    let mut work = self.leader_work.lock().unwrap();
+                    if !work.as_ref().is_some_and(|(owner, _)| {
+                        owner
+                            .upgrade()
+                            .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                    }) {
+                        *work = Some((
+                            Arc::downgrade(session),
+                            crate::index_coordinator::LeaderWork::new(
+                                &self.store,
+                                session,
+                                &selected_options,
+                            )?,
+                        ));
+                    }
+                    if let Some((_, scheduler)) = work.as_mut() {
+                        scheduler.reconcile_due(
+                            &self.store,
+                            session,
+                            &selected_options,
+                            &Arc::new(AtomicBool::new(false)),
+                            false,
+                        )?;
+                    }
+                }
             }
             return Ok(());
         }
@@ -546,13 +602,13 @@ impl DaemonState {
             if externally_repaired
                 || retained
                     .as_ref()
-                    .is_some_and(|session| !session.is_leader() && session.verify().is_err())
+                    .is_some_and(|session| session.verify().is_err())
             {
                 // Public Status is fenced by a held leader incarnation. With
                 // no accepted work, a surviving external owner permits a
                 // verified follower with no publication; otherwise our new
                 // leader must finish normal reconciliation before Status opens.
-                drop(self.serving_session.lock().unwrap().take());
+                self.replace_serving_session(None);
                 match self.store.leader_session() {
                     Ok(session) => {
                         self.store.fail_changed_root_requests(&session)?;
@@ -567,7 +623,7 @@ impl DaemonState {
                             &Arc::new(AtomicBool::new(false)),
                             |_| {},
                         )?;
-                        *self.serving_session.lock().unwrap() = Some(session);
+                        self.replace_serving_session(Some(session));
                     }
                     Err(error)
                         if error.to_string().starts_with("storage_busy: ")
@@ -581,7 +637,7 @@ impl DaemonState {
                         // concrete `storage_busy: <lock path>` error; follower
                         // construction independently verifies that live owner.
                         let follower = self.store.follower_session()?;
-                        *self.serving_session.lock().unwrap() = Some(follower);
+                        self.replace_serving_session(Some(follower));
                     }
                     Err(error) => return Err(error),
                 }
@@ -676,8 +732,16 @@ impl DaemonState {
                     // Reconciliation is complete, so this verified leader may now
                     // serve. Retain it before drain commits a terminal ACK; a
                     // later drain error may still release it for safe reclamation.
-                    *self.serving_session.lock().unwrap() = Some(session.clone());
-                    let processed = crate::index_coordinator::drain_requests_observed(
+                    self.replace_serving_session(Some(session.clone()));
+                    *self.leader_work.lock().unwrap() = Some((
+                        Arc::downgrade(&session),
+                        crate::index_coordinator::LeaderWork::new(
+                            &self.store,
+                            &session,
+                            takeover_options,
+                        )?,
+                    ));
+                    let processed = crate::index_coordinator::drain_one_request_observed(
                         &self.store,
                         &session,
                         |id, p| {
@@ -705,7 +769,7 @@ impl DaemonState {
                 {
                     // A terminal queue write may have committed ambiguously.
                     // Keep this exact leader for cached-result reconciliation.
-                    *self.serving_session.lock().unwrap() = Some(session);
+                    self.replace_serving_session(Some(session));
                 } else {
                     // The early retention above must not keep a failed drain's
                     // owner. A successor may reclaim any unfinished running head.
@@ -714,6 +778,7 @@ impl DaemonState {
                         .as_ref()
                         .is_some_and(|current| Arc::ptr_eq(current, &session))
                     {
+                        *self.leader_work.lock().unwrap() = None;
                         *owner = None;
                     }
                 }
@@ -3190,7 +3255,7 @@ mod live_tests {
         )
         .unwrap();
         state.retain_serving_session(session.clone());
-        let app = router(state);
+        let app = router(state.clone());
         let request = |path: &str, body: Value| {
             axum::http::Request::builder()
                 .method("POST")
@@ -3241,10 +3306,19 @@ mod live_tests {
                 .unwrap(),
                 1
             );
-            assert_eq!(
-                store.status().unwrap().revision,
-                serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
-            );
+            // The background leader watcher may discover the corrupted selected
+            // bytes before this read; both a still-pinned status and a typed
+            // fail-closed index are valid. Neither may call the live provider.
+            match store.status() {
+                Ok(status) => assert_eq!(
+                    status.revision,
+                    serde_json::from_value(preview["packet"]["revision"].clone()).unwrap()
+                ),
+                Err(error) => assert!(
+                    format!("{error:#}").contains("incompatible_index"),
+                    "unexpected selected corruption classification: {error:#}"
+                ),
+            }
             let attempts = provider.budget().unwrap().attempts;
             let response = app.oneshot(request(&path, json!({}))).await.unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -3268,10 +3342,17 @@ mod live_tests {
                 |_| {},
             )
             .unwrap();
-            let expected = store.status().unwrap().revision;
             let publisher = store.clone();
             let owner = session.clone();
+            let stream_owner = state.clone();
             let publishing = tokio::task::spawn_blocking(move || {
+                // This synthetic writer bypasses the normal queue worker, so
+                // bind its expected-pin read and publish to the same native
+                // stream as the background watcher. The provider read remains
+                // blocked independently; a leaked SQLite read transaction
+                // still prevents this single publication within the timeout.
+                let _stream = stream_owner.native_stream.lock().unwrap();
+                let expected = publisher.status().unwrap().revision;
                 publisher.publish_native(
                     &updated,
                     &captured,
@@ -3383,6 +3464,61 @@ mod live_tests {
 mod serving_holder_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn takeover_head_manifest_options_survive_ack_and_idle_watcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let defaults = IndexOptions::new(root.clone());
+        let (_, old) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &defaults,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        drop(old);
+        let mut head = defaults.clone();
+        head.manifest_path = Some(root.join("optional-manifest.json"));
+        let queued = store.enqueue_request(&head, None).unwrap();
+        let state = new(
+            store.clone(),
+            defaults,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        state.queue_tick().unwrap();
+        let done = store.request_by_id(&queued.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        let pin = done.revision.unwrap();
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(
+            store
+                .recorded_index_options()
+                .unwrap()
+                .unwrap()
+                .manifest_path,
+            head.manifest_path
+        );
+        state.queue_tick().unwrap();
+        assert_eq!(
+            store.status().unwrap().revision,
+            pin,
+            "idle watcher must not silently switch to daemon defaults"
+        );
+        assert_eq!(
+            store
+                .recorded_index_options()
+                .unwrap()
+                .unwrap()
+                .manifest_path,
+            head.manifest_path
+        );
+    }
 
     #[test]
     fn takeover_retains_reconciled_owner_before_done_becomes_visible() {

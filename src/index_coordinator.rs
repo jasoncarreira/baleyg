@@ -254,6 +254,120 @@ impl IndexJobCoordinator {
     }
 }
 
+/// The elected owner alone drives the advisory watcher and the durable FIFO.
+/// This is an in-memory scheduler, not a second request queue.
+pub struct LeaderWork {
+    watch: crate::watch::WatchSignals,
+    last_inventory: std::time::Instant,
+    retry_after: Option<std::time::Instant>,
+    last_accounted_generation: Option<u64>,
+    options: IndexOptions,
+}
+
+impl LeaderWork {
+    /// Construct only after the synced incarnation and complete takeover reconcile.
+    pub fn new(
+        store: &Store,
+        session: &Arc<LeaderSession>,
+        options: &IndexOptions,
+    ) -> Result<Self> {
+        store.verify_leader_session(session)?;
+        let watch = crate::watch::WatchSignals::new(
+            options.workspace_root.clone(),
+            options.scip_path.clone(),
+            options.manifest_path.clone(),
+        );
+        Ok(Self {
+            watch,
+            last_inventory: std::time::Instant::now(),
+            retry_after: None,
+            last_accounted_generation: None,
+            options: options.clone(),
+        })
+    }
+
+    /// A full capture always checks root, leader and selected publication fences.
+    /// A failed capture keeps the dirty generation for a later signal or scan.
+    pub fn reconcile_due(
+        &mut self,
+        store: &Store,
+        session: &Arc<LeaderSession>,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        force: bool,
+    ) -> Result<bool> {
+        store.verify_leader_session(session)?;
+        // The takeover FIFO head may have different selected inputs from this
+        // daemon's defaults. Keep its watcher until a new watcher has registered
+        // for the new options; its full wake then closes the transition gap.
+        if self.options.workspace_root != options.workspace_root
+            || self.options.scip_path != options.scip_path
+            || self.options.manifest_path != options.manifest_path
+            || self.options.max_file_bytes != options.max_file_bytes
+        {
+            let next = crate::watch::WatchSignals::new(
+                options.workspace_root.clone(),
+                options.scip_path.clone(),
+                options.manifest_path.clone(),
+            );
+            self.watch = next;
+            self.options = options.clone();
+            self.last_accounted_generation = None;
+        }
+        let now = std::time::Instant::now();
+        let periodic =
+            now.duration_since(self.last_inventory) >= std::time::Duration::from_secs(60);
+        let batch = self.watch.drain();
+        if !force
+            && !periodic
+            && ((self.watch.degraded() && self.last_accounted_generation == Some(batch.generation))
+                || !self.watch.batch_ready_at(now)
+                || self.retry_after.is_some_and(|deadline| deadline > now))
+        {
+            return Ok(false);
+        }
+        // The first post-registration full inventory closes the takeover/watch gap.
+        // An identical selected capture needs no gratuitous new revision.
+        let outcome =
+            (|| {
+                let captured = Capture::admit(options, cancel, &|_| {})?;
+                let baseline = store.recovery_index_baseline()?;
+                if store.selected_capture_unchanged(
+                    &captured,
+                    session.leader_guard()?,
+                    &baseline,
+                    cancel,
+                )? {
+                    return Ok(());
+                }
+                IndexJobCoordinator::prepare_with_session(store, None, session.clone())?
+                    .run_serving(options, cancel, |_| {})?;
+                Ok(())
+            })();
+        match outcome {
+            Ok(_) => {
+                let accounted = self.watch.acknowledge(&batch);
+                if accounted {
+                    self.last_accounted_generation = Some(batch.generation);
+                } else {
+                    // A concurrent event is not part of this selected capture.
+                    // Keep it dirty for the next tick or successor full takeover.
+                    self.watch.require_full();
+                }
+                self.last_inventory = std::time::Instant::now();
+                self.retry_after = None;
+                Ok(accounted)
+            }
+            Err(error) => {
+                self.watch.require_full();
+                self.retry_after =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                Err(error)
+            }
+        }
+    }
+}
+
 /// One explicit index command returns the owner that published its one full capture.
 /// Exceptional recovery cannot take the live-baseline path or upgrade shared use.
 pub fn reconcile_workspace(
@@ -307,6 +421,26 @@ pub fn drain_requests_observed_with_native(
         &Arc::new(std::sync::atomic::AtomicBool::new(false)),
         progress,
         native_observe,
+        usize::MAX,
+        None,
+    )
+}
+
+/// Admit one FIFO row so the daemon can fairly interleave watcher inventory
+/// before the next accepted row without introducing another request queue.
+pub fn drain_one_request_observed(
+    store: &Store,
+    session: &Arc<LeaderSession>,
+    progress: impl Fn(&str, IndexProgress) + Sync,
+) -> Result<usize> {
+    drain_requests_observed_with_cancel(
+        store,
+        session,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        progress,
+        |_, _, _| {},
+        1,
+        None,
     )
 }
 
@@ -320,6 +454,8 @@ fn drain_requests_observed_with_cancel(
         &crate::native_evidence::DocumentKey,
         crate::native_evidence::FullNativeStage,
     ) + Sync,
+    max_completed: usize,
+    cutoff_seq: Option<i64>,
 ) -> Result<usize> {
     if store.root_path_replaced()? {
         store.fail_changed_root_requests(session)?;
@@ -335,6 +471,13 @@ fn drain_requests_observed_with_cancel(
             !cancel.load(Ordering::Acquire),
             "index wait interrupted; inspect the accepted request's durable state"
         );
+        if let Some(cutoff) = cutoff_seq
+            && store
+                .earliest_unfinished_request()?
+                .is_some_and(|row| row.seq > cutoff)
+        {
+            break;
+        }
         let Some(request) = store.claim_request(session)? else {
             break;
         };
@@ -437,6 +580,9 @@ fn drain_requests_observed_with_cancel(
         // for the next incarnation to reclaim after its complete root reconciliation.
         store.record_and_finish_request(session, &request, outcome)?;
         completed += 1;
+        if completed >= max_completed {
+            break;
+        }
     }
     Ok(completed)
 }
@@ -500,6 +646,7 @@ pub fn enqueue_and_wait_observed(
     let request = store.enqueue_request(options, None)?;
     let mut observed_store = store.clone();
     let mut held: Option<Arc<LeaderSession>> = None;
+    let mut leader_work: Option<LeaderWork> = None;
     loop {
         let store = &observed_store;
         if store.root_path_replaced()? {
@@ -540,13 +687,32 @@ pub fn enqueue_and_wait_observed(
                         },
                     };
                     session.verify()?;
+                    if session.is_leader() {
+                        // A finite owner finishes one bounded inventory/drain at its
+                        // release fence. Later edits remain discoverable by takeover.
+                        if let Some(work) = leader_work.as_mut() {
+                            let cutoff = store.current_request()?.map(|row| row.seq);
+                            work.reconcile_due(store, &session, options, cancel, true)?;
+                            if let Some(cutoff) = cutoff {
+                                drain_requests_observed_with_cancel(
+                                    store,
+                                    &session,
+                                    cancel,
+                                    |_, phase| progress(phase),
+                                    |_, _, _| {},
+                                    usize::MAX,
+                                    Some(cutoff),
+                                )?;
+                            }
+                            // A bounded second cutoff accounts for signals raised
+                            // while the accepted pre-cutoff FIFO rows were drained.
+                            work.reconcile_due(store, &session, options, cancel, true)?;
+                        }
+                    }
                     let pin = row.revision.expect("done request has revision");
-                    let current = store.status()?.revision;
-                    ensure!(
-                        pin.index_generation == current.index_generation
-                            && pin.index_revision <= current.index_revision,
-                        "storage_busy: completed request pin is not retained by current publication"
-                    );
+                    let response = store.evidence_response()?;
+                    response.validate_pin(pin)?;
+                    response.finish(())?;
                     return Ok((pin, session));
                 }
                 "failed" => anyhow::bail!(
@@ -564,6 +730,7 @@ pub fn enqueue_and_wait_observed(
             match store.recreate_pending_leader_session(options, cancel) {
                 Ok((_, session)) => {
                     store.fail_changed_root_requests(&session)?;
+                    leader_work = Some(LeaderWork::new(store, &session, options)?);
                     held = Some(session);
                 }
                 Err(error)
@@ -620,6 +787,7 @@ pub fn enqueue_and_wait_observed(
                     let startup =
                         IndexJobCoordinator::prepare_with_session(store, None, session.clone())?;
                     startup.run(&reconcile_options, cancel, &progress)?;
+                    leader_work = Some(LeaderWork::new(store, &session, options)?);
                     held = Some(session);
                 }
                 Err(error)
@@ -642,8 +810,15 @@ pub fn enqueue_and_wait_observed(
                     cancel,
                     |_, phase| progress(phase),
                     |_, _, _| {},
+                    1,
+                    None,
                 ) {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        if let Some(work) = leader_work.as_mut() {
+                            work.reconcile_due(store, session, options, cancel, false)?;
+                        }
+                        break;
+                    }
                     Err(error) => {
                         if crate::store::nonterminal_storage_busy(&error)
                             && !store.has_recorded_completion(session)?
@@ -722,6 +897,64 @@ mod tests {
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+
+    #[test]
+    fn takeover_watcher_switches_input_options_with_new_full_wake() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let head_options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let owner = establish_serving_session(&store, Some(&head_options), &cancel).unwrap();
+        let mut work = LeaderWork::new(&store, &owner, &head_options).unwrap();
+        let mut daemon_options = head_options.clone();
+        daemon_options.max_file_bytes = 1024;
+        work.reconcile_due(&store, &owner, &daemon_options, &cancel, false)
+            .unwrap();
+        assert_eq!(work.options.max_file_bytes, 1024);
+        assert!(
+            work.last_accounted_generation.is_some(),
+            "new option watcher must finish its first full inventory"
+        );
+        assert_eq!(
+            store
+                .recorded_index_options()
+                .unwrap()
+                .unwrap()
+                .max_file_bytes,
+            1024
+        );
+    }
+
+    #[test]
+    fn degraded_watcher_reconciles_once_then_waits_for_periodic_scan() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let owner = establish_serving_session(&store, Some(&options), &cancel).unwrap();
+        let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+        work.watch
+            .submit_event(Err(notify::Error::generic("watch failed")));
+        assert!(
+            work.reconcile_due(&store, &owner, &options, &cancel, false)
+                .unwrap()
+        );
+        let pin = store.status().unwrap().revision;
+        assert!(work.last_accounted_generation.is_some());
+        assert!(
+            !work
+                .reconcile_due(&store, &owner, &options, &cancel, false)
+                .unwrap()
+        );
+        assert_eq!(store.status().unwrap().revision, pin);
+        work.last_inventory -= std::time::Duration::from_secs(60);
+        work.reconcile_due(&store, &owner, &options, &cancel, false)
+            .unwrap();
+    }
 
     /// Per-source (opens, complete reads, hashes), keyed by path.
     type Counts = BTreeMap<String, (usize, usize, usize)>;
