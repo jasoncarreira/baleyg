@@ -1920,3 +1920,212 @@ fn invalid_retained_header_json_refuses_old_pin_without_mutating_sqlite_or_sidec
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn predecessor_stamps_cover_full_and_unchanged_publications() {
+    use baleyg::index_coordinator::IndexJobCoordinator;
+    use std::sync::Mutex;
+    let (state, root, store, cancel) = fixture();
+    let options = IndexOptions::new(root.path().to_owned());
+    let session = store.leader_session().unwrap();
+    let modes = Mutex::new(Vec::new());
+    let run = |expected, modes: &Mutex<Vec<String>>| {
+        IndexJobCoordinator::prepare_with_session(&store, expected, session.clone())
+            .unwrap()
+            .run_serving(&options, &cancel, |p| {
+                if p.phase.starts_with("mode:") {
+                    modes.lock().unwrap().push(p.phase);
+                }
+            })
+            .unwrap()
+    };
+    let r1 = run(None, &modes);
+    let r2 = run(Some(r1), &modes);
+    assert!(
+        modes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|mode| mode == "mode:unchanged")
+    );
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                r1.index_generation, r1.index_revision
+            )],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1,
+        "unchanged publication must stamp predecessor in same commit"
+    );
+    drop(db);
+    fs::write(
+        root.path().join("flow.js"),
+        "function hello(x) { if (x) { obj.run(); } }\n",
+    )
+    .unwrap();
+    let r3 = run(Some(r2), &modes);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let rows: Vec<(String, i64)> = db.prepare("SELECT revision_id,superseded_at FROM native_revision_supersessions ORDER BY revision_id")
+        .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+        .collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(rows.len(), 2);
+    for (pin, (key, second)) in [r1, r2].iter().zip(&rows) {
+        assert_eq!(
+            key,
+            &format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
+        );
+        assert!(*second > 0 && *second <= 9_007_199_254_740_991);
+        assert!(
+            store.graph_at(Some(*pin)).is_ok(),
+            "stamps must preserve old pinned graph"
+        );
+    }
+    let head: i64 = db
+        .query_row(
+            "SELECT count(*) FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                r3.index_generation, r3.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(head, 0);
+    assert_eq!(store.status().unwrap().revision, r3);
+}
+
+#[test]
+fn leader_migrates_legacy_v8_history_with_fresh_grace_without_changing_pins() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let first = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    fs::write(root.path().join("flow.js"), "function changed() {}\n").unwrap();
+    let head = publish(&store, root.path(), &cancel, first, &leader).unwrap();
+    drop(leader);
+    drop(store);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("DROP TABLE native_revision_supersessions")
+        .unwrap();
+    drop(db);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let leader = reopened.leader().unwrap();
+    let db = Connection::open(&path).unwrap();
+    let grace: i64 = db
+        .query_row(
+            "SELECT superseded_at FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                first.index_generation, first.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        (0..=3).contains(&(now - grace)),
+        "migration grants fresh 15-minute grace"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM native_revision_supersessions",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(reopened.index_baseline().unwrap(), head);
+    let next = publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
+    assert_eq!(next.index_generation, first.index_generation);
+    assert!(reopened.graph_at(Some(first)).is_ok());
+}
+
+#[test]
+fn supersession_backfill_omits_released_tombstones() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let r1 = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
+    let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
+    store.release_revision(r1, &leader).unwrap();
+    drop(leader);
+    drop(store);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("DROP TABLE native_revision_supersessions")
+        .unwrap();
+    drop(db);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let _leader = reopened.leader().unwrap();
+    let db = Connection::open(&path).unwrap();
+    let revisions: Vec<String> = db
+        .prepare("SELECT revision_id FROM native_revision_supersessions ORDER BY revision_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        revisions,
+        [format!(
+            "pin:v1:{}:{}",
+            r2.index_generation, r2.index_revision
+        )]
+    );
+    assert_eq!(reopened.index_baseline().unwrap(), r3);
+}

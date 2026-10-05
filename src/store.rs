@@ -278,6 +278,8 @@ SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.
 const DATABASE_SCHEMA_VERSION: u32 = 8;
 const EXTRACTOR_VERSION: &str = "native-v4-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
+const SUPERSESSION_SCHEMA_V8: &str = "CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991));";
+
 const CACHE_SCHEMA_V8: &str = r#"
 CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=8), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
@@ -748,12 +750,94 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         return Ok(());
     }
     expected.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
+    if actual == objects(&expected)? {
+        return Ok(());
+    }
+    expected.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+    if actual == objects(&expected)? {
+        return Ok(());
+    }
+    let without_binding = Connection::open_in_memory()?;
+    without_binding.execute_batch(CACHE_SCHEMA_V8)?;
+    without_binding.execute_batch(SUPERSESSION_SCHEMA_V8)?;
     control_ensure!(
-        actual == objects(&expected)?,
+        actual == objects(&without_binding)?,
         "incompatible_index: unknown cache object type, name or shape"
     );
     Ok(())
 }
+fn has_revision_supersessions(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_revision_supersessions')",
+        [], |r| r.get(0),
+    )?)
+}
+
+fn publication_second() -> Result<i64> {
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    ensure!(
+        seconds <= 9_007_199_254_740_991,
+        "invalid_supersession_time"
+    );
+    Ok(seconds as i64)
+}
+
+// Called only with the leader's immediate write transaction. Existing pins stay put.
+fn install_supersessions(db: &Connection, now: i64) -> Result<()> {
+    if !has_revision_supersessions(db)? {
+        db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+        db.execute(
+            "INSERT INTO native_revision_supersessions(revision_id,superseded_at)
+             SELECT r.id,?1 FROM native_revisions r CROSS JOIN index_metadata m
+             WHERE m.singleton=1 AND r.id != 'pin:v1:'||m.index_generation||':'||m.index_revision
+               AND NOT EXISTS (SELECT 1 FROM revision_capture_inputs c
+                 WHERE c.revision_id=r.id AND c.input_key='__released:v1')",
+            [now],
+        )?;
+    }
+    validate_supersessions(db)
+}
+
+fn validate_supersessions(db: &Connection) -> Result<()> {
+    if !has_revision_supersessions(db)? {
+        return Ok(());
+    }
+    let bad: i64 = db.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM native_revision_supersessions s
+           LEFT JOIN native_revisions r ON r.id=s.revision_id
+           CROSS JOIN index_metadata m
+           WHERE r.id IS NULL OR typeof(s.superseded_at)!='integer'
+             OR s.superseded_at NOT BETWEEN 0 AND 9007199254740991
+             OR s.revision_id='pin:v1:'||m.index_generation||':'||m.index_revision
+           UNION ALL
+           SELECT 1 FROM native_revisions r CROSS JOIN index_metadata m
+           WHERE r.id!='pin:v1:'||m.index_generation||':'||m.index_revision
+             AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs c
+               WHERE c.revision_id=r.id AND c.input_key='__released:v1')
+             AND NOT EXISTS(SELECT 1 FROM native_revision_supersessions s WHERE s.revision_id=r.id)
+         )",
+        [],
+        |r| r.get(0),
+    )?;
+    control_ensure!(
+        bad == 0,
+        "incompatible_index: invalid revision supersession inventory"
+    );
+    Ok(())
+}
+
+fn stamp_predecessor(db: &Connection, old: &str, now: i64) -> Result<()> {
+    ensure!(
+        db.execute(
+            "INSERT INTO native_revision_supersessions(revision_id,superseded_at) VALUES(?1,?2)",
+            params![old, now],
+        )? == 1,
+        "incompatible_index: predecessor supersession missing"
+    );
+    Ok(())
+}
+
 fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_binding_epoch')",
@@ -3012,6 +3096,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
 }
 
 fn validate_bounded_control(db: &Connection, root_id: &str) -> Result<()> {
+    validate_supersessions(db)?;
     bounded_graph_pair(
         db,
         "SELECT typeof(stats),length(CAST(stats AS BLOB)),
@@ -3042,6 +3127,7 @@ fn validate_bounded_control(db: &Connection, root_id: &str) -> Result<()> {
 }
 
 fn validate_paired_rows(db: &Connection) -> Result<()> {
+    validate_supersessions(db)?;
     let count = |table: &str| -> Result<i64> {
         Ok(db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
     };
@@ -4132,6 +4218,7 @@ impl Store {
             "incompatible_index: cache changed after admission"
         );
         if compatible {
+            install_supersessions(&tx, publication_second()?)?;
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
             storage_result(tx.execute(
@@ -5663,10 +5750,13 @@ impl Store {
             "INSERT INTO revision_producer_bindings VALUES(?1,?2,?3)",
             params![revision_key, bound_hash, binding_sha],
         )?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis()
-            .to_string();
+        let publication_time = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        ensure!(
+            publication_time.as_secs() <= 9_007_199_254_740_991,
+            "invalid_supersession_time"
+        );
+        let timestamp = publication_time.as_millis().to_string();
+        stamp_predecessor(&tx, &selected.key, publication_time.as_secs() as i64)?;
         ensure!(
             tx.execute(
                 "UPDATE index_metadata SET index_revision=?1,indexed_at=?2,                 reconciled_incarnation=?3 WHERE singleton=1",
@@ -6632,6 +6722,13 @@ impl Store {
                     .context("revision overflow")?
             },
         };
+        if rebaseline {
+            if !has_revision_supersessions(&tx)? {
+                tx.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+            }
+        } else {
+            install_supersessions(&tx, publication_second()?)?;
+        }
         let binding_extension = has_revision_producer_bindings(&tx)?;
         if rebaseline && binding_extension {
             tx.execute_batch(
@@ -6650,7 +6747,7 @@ impl Store {
                 DELETE FROM native_version_coverage_roles; DELETE FROM class_relations; DELETE FROM classes;
                 DELETE FROM class_projections; DELETE FROM graph_calls; DELETE FROM graph_regions;
                 DELETE FROM graph_nodes; DELETE FROM graph_projections; DELETE FROM document_versions;
-                DELETE FROM native_revisions; DELETE FROM native_source_set_dependencies;
+                DELETE FROM native_revision_supersessions; DELETE FROM native_revisions; DELETE FROM native_source_set_dependencies;
                 DELETE FROM native_source_set_languages; DELETE FROM native_source_sets;
                 DELETE FROM native_producer_inputs; DELETE FROM native_producer_languages;
                 DELETE FROM native_producers;")?;
@@ -6793,10 +6890,16 @@ impl Store {
             }
         }
         immutable.finish(&tx).map_err(classify_immutable)?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis()
-            .to_string();
+        let publication_time = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        ensure!(
+            publication_time.as_secs() <= 9_007_199_254_740_991,
+            "invalid_supersession_time"
+        );
+        let timestamp = publication_time.as_millis().to_string();
+        if !rebaseline && let Some(prior) = old_pin.filter(|pin| pin.index_revision > 0) {
+            let old_key = format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision);
+            stamp_predecessor(&tx, &old_key, publication_time.as_secs() as i64)?;
+        }
         tx.execute("UPDATE index_metadata SET schema_version=8,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconciled_incarnation=?7,reconcile_options=?8 WHERE singleton=1",
             params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,leader.incarnation.to_string(),json(capture.reconcile_options())?])?;
         immutable.counters.record(
