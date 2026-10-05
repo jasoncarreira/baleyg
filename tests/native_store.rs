@@ -2385,3 +2385,93 @@ fn migrated_history_gets_new_clock_grace_until_exact_boundary() {
             .is_some()
     );
 }
+
+#[test]
+fn expired_pin_rejects_each_selected_store_consumer_before_lookup() {
+    use baleyg::native_evidence::DocumentKey;
+    let (_state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let graph = store.graph_at(Some(old)).unwrap();
+    let symbol = graph
+        .nodes
+        .iter()
+        .find(|n| n.path == "flow.js")
+        .unwrap()
+        .id
+        .clone();
+    let key = DocumentKey {
+        source_set_id: format!("source-set:v1:{}", store.root_id()),
+        language: "javascript".into(),
+        path: "flow.js".into(),
+    };
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    assert!(store.native_source_at(old, &key).unwrap().is_some());
+    store.set_retention_clock_for_tests(1_900, 900);
+    store.maintain_revisions(&leader).unwrap();
+    macro_rules! expired {
+        ($label:expr, $result:expr) => {{
+            let error = $result.unwrap_err();
+            assert!(
+                error.downcast_ref::<baleyg::store::PinExpired>().is_some(),
+                "{}: {error:#}",
+                $label
+            );
+        }};
+    }
+    expired!("native source", store.native_source_at(old, &key));
+    expired!("native coverage", store.native_coverage_at(old, &key));
+    expired!(
+        "native declarations",
+        store.native_declarations_at(old, "javascript", "hello")
+    );
+    expired!("native calls", store.native_calls_at(old, &symbol));
+    expired!(
+        "native regions",
+        store.native_control_regions_at(old, &symbol)
+    );
+    expired!("graph", store.graph_at(Some(old)));
+    expired!("source", store.source_at("flow.js", Some(old)));
+    expired!("symbol", store.symbol_at(&symbol, Some(old)));
+    expired!("files", store.files_at(Some(old), 0, 20));
+    expired!("methods", store.methods_at("flow.js", Some(old)));
+    expired!(
+        "classes",
+        store.classes_at(Some("flow.java"), "", Some(old), 0, 10)
+    );
+    assert_eq!(
+        store.status().unwrap().revision,
+        head,
+        "reads never publish"
+    );
+    assert!(store.native_source_at(head, &key).unwrap().is_some());
+    for invalid in [
+        IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            ..old
+        },
+        IndexPin {
+            index_revision: head.index_revision + 1,
+            ..old
+        },
+        IndexPin {
+            index_revision: 0,
+            ..old
+        },
+    ] {
+        let error = store.native_source_at(invalid, &key).unwrap_err();
+        assert!(
+            error.to_string().starts_with("revision conflict"),
+            "{error:#}"
+        );
+        assert!(error.downcast_ref::<baleyg::store::PinExpired>().is_none());
+    }
+}

@@ -900,3 +900,144 @@ async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
     );
     assert!(!store.graph_at(Some(head)).unwrap().files.is_empty());
 }
+
+#[tokio::test]
+async fn expired_pin_saved_items_require_explicit_head_reattachment() {
+    let (dir, store, state, app) = setup();
+    let workspace = dir.path().join("workspace");
+    std::fs::write(workspace.join("a.js"), "function seed() {}\n").unwrap();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session = state.retained_serving_session().unwrap();
+    let publish = |expected| {
+        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+            &IndexOptions::new(workspace.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                expected,
+                &cancel,
+            )
+            .unwrap()
+    };
+    let old = publish(store.index_baseline().unwrap());
+    let seed = store
+        .graph_at(Some(old))
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|node| node.name == "seed")
+        .unwrap()
+        .id;
+    let pin_route = |route: &str, pin: IndexPin| {
+        format!(
+            "{route}{}indexGeneration={}&indexRevision={}",
+            if route.contains('?') { "&" } else { "?" },
+            pin.index_generation,
+            pin.index_revision
+        )
+    };
+    let view = json!({"id":"saved-view","title":"Saved", "query":{"seed":seed}});
+    let note = json!({"id":"saved-note","nodeId":seed,"body":"Durable note"});
+    for (route, payload) in [
+        ("/api/views/saved-view", &view),
+        ("/api/annotations/saved-note", &note),
+    ] {
+        let (status, saved) = call(&app, "PUT", &pin_route(route, old), payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["attachment"]["result"]["status"], "attached");
+    }
+    let head = publish(old); // identical source and measured IDs, but a different revision.
+    assert_eq!(store.status().unwrap().revision, head);
+    store.set_retention_clock_for_tests(1_900, 900);
+    state.force_retention_idle_tick_for_tests().unwrap();
+    for (method, route, payload) in [
+        ("GET", "/api/source?path=a.js", Value::Null),
+        ("GET", "/api/symbol?id=missing", Value::Null),
+        ("GET", "/api/files", Value::Null),
+        ("GET", "/api/methods?path=a.js", Value::Null),
+        ("GET", "/api/classes", Value::Null),
+        ("POST", "/api/query", json!({"seed":seed})),
+        ("GET", "/api/views", Value::Null),
+        ("GET", "/api/views/saved-view", Value::Null),
+        ("GET", "/api/annotations", Value::Null),
+        ("PUT", "/api/views/saved-view", view.clone()),
+        ("PUT", "/api/annotations/saved-note", note.clone()),
+    ] {
+        let (status, body) = call(&app, method, &pin_route(route, old), payload).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{method} {route}: {body}");
+        assert_eq!(
+            body["error"]["code"], "pin_expired",
+            "{method} {route}: {body}"
+        );
+    }
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/sequence",
+        json!({"seed":seed,"expectedRevision":old}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "pin_expired");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/questions/preview",
+        json!({"seed":seed,"question":"What does seed do?", "expectedRevision":old}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "pin_expired");
+    let foreign = IndexPin {
+        index_generation: uuid::Uuid::new_v4(),
+        ..old
+    };
+    let missing = IndexPin {
+        index_revision: head.index_revision + 1,
+        ..old
+    };
+    for invalid in [foreign, missing] {
+        for route in ["/api/views/saved-view", "/api/annotations"] {
+            let (status, body) = call(&app, "GET", &pin_route(route, invalid), Value::Null).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
+            assert_eq!(
+                body["error"]["code"], "revision_conflict",
+                "{route}: {body}"
+            );
+        }
+    }
+    // An explicit head read, not a retry at the expired pin, is the only reattachment.
+    for (route, expected) in [
+        ("/api/views/saved-view", &view),
+        ("/api/annotations", &note),
+    ] {
+        let (status, body) = call(&app, "GET", &pin_route(route, head), Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let attached = if route == "/api/annotations" {
+            &body[0]
+        } else {
+            &body
+        };
+        assert_eq!(
+            attached["attachment"]["result"]["status"], "attached",
+            "{body}"
+        );
+        let durable = if route == "/api/annotations" {
+            &attached["annotation"]
+        } else {
+            &attached["view"]
+        };
+        assert_eq!(durable["id"], expected["id"]);
+        assert_eq!(attached["indexRevision"], head.index_revision);
+    }
+    assert_eq!(store.status().unwrap().revision, head);
+}

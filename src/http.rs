@@ -1810,7 +1810,9 @@ async fn sequence(
         )
     })?
     .map_err(|e| {
-        if e.to_string().starts_with("revision conflict")
+        if e.chain()
+            .any(|cause| cause.downcast_ref::<crate::store::PinExpired>().is_some())
+            || e.to_string().starts_with("revision conflict")
             || e.to_string().starts_with("index_not_ready")
             || e.to_string().starts_with("incompatible_index")
         {
@@ -2370,7 +2372,9 @@ async fn delete_annotation(
 // These endpoints only transform locally indexed evidence. They never contact a provider.
 fn question_error(e: anyhow::Error) -> ApiError {
     let message = e.to_string();
-    if message.starts_with("revision conflict")
+    if e.chain()
+        .any(|cause| cause.downcast_ref::<crate::store::PinExpired>().is_some())
+        || message.starts_with("revision conflict")
         || [
             "root_changed",
             "root_key_collision",
@@ -2439,6 +2443,7 @@ async fn question_preview(
     request.validate().map_err(|_| invalid())?;
     question_work(move || {
         let response = s.store.evidence_response()?;
+        response.validate_pin(request.expected_revision)?;
         let packet = planning::prepare_in(&response, request)?;
         let selection = planning::preview(&packet)?;
         let view = planning::assemble(&packet, &selection, "localPreview")?;

@@ -439,6 +439,10 @@ impl EvidenceResponse {
     pub fn status(&self) -> Result<IndexStatus> {
         self.store.read_status(&self.db)
     }
+    pub fn validate_pin(&self, pin: IndexPin) -> Result<()> {
+        self.store.read_revision(&self.db, Some(pin))?;
+        Ok(())
+    }
     pub fn source_at(
         &self,
         path: &str,
@@ -9098,11 +9102,11 @@ impl Store {
     pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
         view.validate()?;
         let response = self.evidence_response()?;
+        Self::saved_pin(&response, Some(pin))?;
         ensure!(
             response.status()?.revision == pin,
             "revision conflict: mutation requires head"
         );
-        Self::saved_pin(&response, Some(pin))?;
         let record = self.records().update_view_record(
             &SavedViewRecord::from_base(view.clone(), None),
             || {
@@ -9192,11 +9196,11 @@ impl Store {
     ) -> Result<AnnotationState> {
         request.validate()?;
         let response = self.evidence_response()?;
+        Self::saved_pin(&response, Some(pin))?;
         ensure!(
             response.status()?.revision == pin,
             "revision conflict: mutation requires head"
         );
-        Self::saved_pin(&response, Some(pin))?;
         let title = request
             .title
             .as_ref()

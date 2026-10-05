@@ -1425,7 +1425,10 @@ async fn retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_p
         .release_revision(old_pin, session.leader_guard().unwrap())
         .unwrap();
     let old_request = json!({"expectedRevision":old_pin,"path":"A.java","line":2});
-    assert_eq!(call(&app, old_request).await.0, StatusCode::CONFLICT);
+    let (code, body) = call(&app, old_request).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "pin_expired");
+    assert_eq!(store.status().unwrap().revision, new_pin);
     store
         .collect_unreferenced(session.leader_guard().unwrap())
         .unwrap();
