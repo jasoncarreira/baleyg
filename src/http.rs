@@ -4770,7 +4770,7 @@ mod normal_post_capture_cancellation_tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(
-            matches!(tables.len(), 28 | 30),
+            matches!(tables.len(), 28 | 29 | 30 | 31),
             "compare the complete legacy or extended v8 evidence inventory"
         );
         let mut expected = vec![
@@ -4803,14 +4803,18 @@ mod normal_post_capture_cancellation_tests {
             "revision_capture_inputs",
             "revision_documents",
         ];
-        if tables.len() == 30 {
+        if tables.contains(&"native_binding_epoch".to_string()) {
             expected.extend(["native_binding_epoch", "revision_producer_bindings"]);
+            expected.sort_unstable();
+        }
+        if tables.contains(&"native_revision_supersessions".to_string()) {
+            expected.push("native_revision_supersessions");
             expected.sort_unstable();
         }
         assert_eq!(
             tables.iter().map(String::as_str).collect::<Vec<_>>(),
             expected,
-            "exact v8 table names: complete legacy 28 or paired producer-binding 30"
+            "exact v8 table names: complete legacy or paired producer-binding, with optional supersession extension"
         );
         for required in [
             "document_versions",

@@ -1898,6 +1898,9 @@ fn inspect_index_with_open_hook(
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let historical_marker = if version == 8 && super::validate_cache_shape(db).is_ok() {
+        if super::validate_supersessions(db).is_err() {
+            return Ok(("unknown", "invalid_supersession_inventory"));
+        }
         None // The current v8 shape is checked by the normal production guard.
     } else if (4..=8).contains(&version) {
         match historical_index_extractor(db, version)? {

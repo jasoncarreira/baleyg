@@ -734,10 +734,10 @@ fn sqlite_snapshot(
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert!(
-        matches!(tables.len(), 28 | 30),
+        matches!(tables.len(), 28 | 29 | 30 | 31),
         "compare exact legacy or extended v8 shape"
     );
-    if tables.len() == 30 {
+    if tables.contains(&"native_binding_epoch".to_string()) {
         let (first, bound): (i64, i64) = db
             .query_row(
                 "SELECT (SELECT first_revision FROM native_binding_epoch),
@@ -757,7 +757,7 @@ fn sqlite_snapshot(
         // Generation-specific control provenance is checked via pinned reads,
         // not compared to a cold oracle with a different generation UUID.
         .filter(|table| !matches!(table.as_str(),
-            "native_binding_epoch" | "revision_producer_bindings"))
+            "native_binding_epoch" | "revision_producer_bindings" | "native_revision_supersessions"))
         .map(|table| {
             // Select the complete revision projection, not all archived rows.
             // Every table remains in the independent cold-source comparison.
@@ -1208,6 +1208,43 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
         local_phases.iter().any(|phase| phase == "mode:local"),
         "a successful local edit must take the measured local branch: {local_phases:?}"
     );
+    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+        Some(workspace.path()),
+        workspace.path(),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let stamp: i64 = db
+        .query_row(
+            "SELECT superseded_at FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                first.index_generation, first.index_revision
+            )],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(stamp > 0, "local publication stamps its predecessor");
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                local.index_generation, local.index_revision
+            )],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+
     assert_eq!(
         store.source_at("local.js", Some(first)).unwrap().unwrap().1,
         old_source

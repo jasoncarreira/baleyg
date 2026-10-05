@@ -2933,3 +2933,35 @@ fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() 
         test_anchor_raw(target, 'f').get()
     );
 }
+
+#[test]
+fn gc_report_accepts_current_v8_supersession_extension_but_rejects_bad_inventory() {
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let store = common::open_store(temp.path(), &work).unwrap();
+    let leader = store.leader().unwrap();
+    drop(leader);
+    drop(store);
+    let db = rusqlite::Connection::open(roots.index_db(&identity)).unwrap();
+    let now = 1_800_000_000_i64;
+    db.execute("UPDATE index_metadata SET last_opened_at=?1", [now])
+        .unwrap();
+    let inspect = || roots.gc_report_at(now).unwrap().derived.remove(0);
+    let good = inspect();
+    assert_eq!((good.status, good.reason), ("unknown", "recent_open"));
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    db.execute(
+        "INSERT INTO native_revision_supersessions(revision_id,superseded_at) VALUES('missing',0)",
+        [],
+    )
+    .unwrap();
+    let bad = inspect();
+    assert_eq!(
+        (bad.status, bad.reason),
+        ("unknown", "invalid_supersession_inventory")
+    );
+    db.execute("DELETE FROM native_revision_supersessions", [])
+        .unwrap();
+    assert_eq!(inspect().reason, "recent_open");
+}
