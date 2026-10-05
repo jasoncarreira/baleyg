@@ -2085,22 +2085,47 @@ fn leader_migrates_legacy_v8_history_with_fresh_grace_without_changing_pins() {
 fn supersession_backfill_omits_released_tombstones() {
     let (state, root, store, cancel) = fixture();
     let leader = store.leader().unwrap();
-    let r1 = publish(&store, root.path(), &cancel, store.index_baseline().unwrap(), &leader).unwrap();
+    let r1 = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
     let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
     let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
     store.release_revision(r1, &leader).unwrap();
     drop(leader);
     drop(store);
-    let identity = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path()).unwrap();
-    let path = state.path().join("cache/indexes").join(identity.root_key).join("index.db");
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE native_revision_supersessions").unwrap();
+    db.execute_batch("DROP TABLE native_revision_supersessions")
+        .unwrap();
     drop(db);
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     let _leader = reopened.leader().unwrap();
     let db = Connection::open(&path).unwrap();
-    let revisions: Vec<String> = db.prepare("SELECT revision_id FROM native_revision_supersessions ORDER BY revision_id")
-        .unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-    assert_eq!(revisions, [format!("pin:v1:{}:{}", r2.index_generation, r2.index_revision)]);
+    let revisions: Vec<String> = db
+        .prepare("SELECT revision_id FROM native_revision_supersessions ORDER BY revision_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        revisions,
+        [format!(
+            "pin:v1:{}:{}",
+            r2.index_generation, r2.index_revision
+        )]
+    );
     assert_eq!(reopened.index_baseline().unwrap(), r3);
 }
