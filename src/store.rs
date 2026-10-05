@@ -3503,6 +3503,10 @@ impl Store {
     /// refresh is existing-only all the way through the SQLite open: it cannot
     /// initialize storage, rediscover/create a root marker, or rotate a pin.
     pub(crate) fn reopen_existing_current_root(&self) -> Result<Self> {
+        self.reopen_existing_current_root_with_pin()
+            .map(|(store, _)| store)
+    }
+    fn reopen_existing_current_root_with_pin(&self) -> Result<(Self, Option<IndexPin>)> {
         self.identity.verify()?;
         let use_guard = self.roots.index_use_existing(&self.identity)?;
         let path = self.roots.index_db(&self.identity);
@@ -3516,13 +3520,59 @@ impl Store {
         witness.verify()?;
         let mut db = reopened.cache()?;
         let tx = storage_result(db.transaction())?;
-        let _ = reopened.recovery_baseline(&tx)?;
+        let pin = reopened.recovery_baseline(&tx)?.pin();
         drop(tx);
         drop(db);
         witness.verify()?;
         use_guard.verify()?;
         self.identity.verify()?;
-        Ok(reopened)
+        Ok((reopened, pin))
+    }
+    /// Adopt a separately published, currently authenticated same-root index
+    /// without claiming leadership, creating storage, or reusing the stale
+    /// corruption authority. The daemon's clones share this disposition.
+    pub(crate) fn observe_external_ready_recovery(&self) -> Result<Option<IndexPin>> {
+        if self.disposition() != RecoveryDisposition::RecreatePending
+            || !self.recovery_required.load(Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let (_refreshed, pin) = match self.reopen_existing_current_root_with_pin() {
+            Ok(result) => result,
+            Err(error) if recovery_class(&error) == RecoveryClass::RecreatePending => {
+                // Original corrupt/obsolete bytes are still present. Only a
+                // verified leader's separate exceptional path may replace them.
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let pin =
+            pin.context("recovery_required: external publication has no authenticated pin")?;
+        ensure!(
+            pin.index_revision >= 1,
+            "recovery_required: external publication has no completed revision"
+        );
+        self.identity.verify()?;
+        let mut obsolete = self.obsolete_format_marker.lock().unwrap();
+        if self
+            .recovery_disposition
+            .compare_exchange(
+                RecoveryDisposition::RecreatePending as u8,
+                RecoveryDisposition::Ready as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            anyhow::bail!("storage_busy: daemon recovery disposition changed during observation");
+        }
+        *obsolete = None;
+        self.recovery_required.store(false, Ordering::Release);
+        if self.disposition() != RecoveryDisposition::Ready {
+            self.recovery_required.store(true, Ordering::Release);
+            anyhow::bail!("root_changed: daemon recovery disposition advanced after observation");
+        }
+        Ok(Some(pin))
     }
     pub fn open_for_tests(state: &Path, workspace: &Path) -> Result<Self> {
         let identity = topology::WorkspaceIdentity::discover(Some(workspace), workspace)?;

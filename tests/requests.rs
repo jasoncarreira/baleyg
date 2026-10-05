@@ -3,6 +3,36 @@ use baleyg::{indexer::IndexOptions, store::Store};
 use std::fs;
 
 #[test]
+fn partially_created_queue_readers_report_busy_without_initializing_schema() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let queue = store.request_db_path();
+    let db = rusqlite::Connection::open(&queue).unwrap();
+    drop(db);
+    fs::set_permissions(&queue, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::read(&queue).unwrap();
+    for result in [
+        store.current_request(),
+        store.earliest_unfinished_request(),
+        store.request_by_id(&uuid::Uuid::new_v4().to_string()),
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("storage_busy"),
+            "first creator can have a version-0 file before committed schema: {error:#}"
+        );
+        assert_eq!(
+            fs::read(&queue).unwrap(),
+            before,
+            "read path must not initialize a partially created queue"
+        );
+    }
+}
+
+#[test]
 fn absent_queue_readers_are_existing_only_and_leave_home_bytes_unchanged() {
     for read in ["current", "by_id"] {
         let state = tempfile::tempdir().unwrap();

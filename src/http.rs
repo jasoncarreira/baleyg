@@ -34,7 +34,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 
@@ -145,6 +145,7 @@ pub struct DaemonState {
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
     native_stream: Mutex<()>,
+    recovery_retry_after: Mutex<Option<Instant>>,
     #[cfg(test)]
     test_queue_before_stream: crate::store::TestOneShotHook,
     #[cfg(test)]
@@ -286,6 +287,7 @@ pub fn new_with_dependency_options(
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
         native_stream: Mutex::new(()),
+        recovery_retry_after: Mutex::new(None),
         #[cfg(test)]
         test_queue_before_stream: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
@@ -342,6 +344,18 @@ impl DaemonState {
         let _stream = self.native_stream.lock().unwrap();
         #[cfg(test)]
         self.test_queue_after_stream.run();
+        // A real exceptional storage error must not recapture/log every 20 ms.
+        // Root replacement is never delayed by that advisory retry deadline.
+        if !self.store.is_root_replaced()
+            && !self.store.root_path_replaced()?
+            && self
+                .recovery_retry_after
+                .lock()
+                .unwrap()
+                .is_some_and(|retry| Instant::now() < retry)
+        {
+            return Ok(());
+        }
         let mut pending = self.pending_requests.lock().unwrap();
         pending.retain(|id| {
             #[cfg(test)]
@@ -370,17 +384,51 @@ impl DaemonState {
         // A CLI process or a previous daemon has no ID in this daemon's local
         // pending vector. Its durable FIFO row must still drive exceptional
         // recovery; the existing-only read leaves a virgin Ready queue absent.
-        let durable_pending = self.store.is_recreate_pending()
-            && !pending_local
+        let durable_pending = !pending_local
             && !self.store.is_root_replaced()
             && self.store.earliest_unfinished_request()?.is_some();
+        let mut externally_repaired = false;
+        if self.store.is_recreate_pending() && !self.store.is_root_replaced() {
+            // Another verified process may have replaced the corrupt index.
+            // Never reuse our stale EX recreation authority in that case: the
+            // strict existing-only read authenticates the same root/new pin
+            // before this daemon's shared disposition is switched to Ready.
+            match self.store.observe_external_ready_recovery() {
+                Ok(Some(_)) => {
+                    *self.recovery_retry_after.lock().unwrap() = None;
+                    externally_repaired = true;
+                }
+                Ok(None) if !pending_local && !durable_pending => {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(500));
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::store::topology::StorageBusy>()
+                            .is_some()
+                    }) =>
+                {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(250));
+                    return Ok(());
+                }
+                Err(error) => {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(500));
+                    return Err(error);
+                }
+            }
+        }
         if self.store.is_recreate_pending()
             && !pending_local
             && !durable_pending
             && !self.store.is_root_replaced()
         {
-            // Admission may follow an empty snapshot; no verified durable
-            // request exists yet. RootReplaced still takes its fence below.
+            // Admission may follow an empty snapshot; RootReplaced still has
+            // to fail old-root durable requests below.
             return Ok(());
         }
         if self.store.is_recreate_pending() && (pending_local || durable_pending) {
@@ -410,9 +458,15 @@ impl DaemonState {
                             .is_some()
                     }) =>
                 {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(250));
                     return Ok(());
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    *self.recovery_retry_after.lock().unwrap() =
+                        Some(Instant::now() + Duration::from_millis(500));
+                    return Err(error);
+                }
             }
         }
         let retained = self.serving_session.lock().unwrap().clone();
@@ -438,7 +492,50 @@ impl DaemonState {
             }
             return Ok(());
         }
-        if !pending_local {
+        if !pending_local && !durable_pending {
+            if externally_repaired
+                || retained
+                    .as_ref()
+                    .is_some_and(|session| !session.is_leader() && session.verify().is_err())
+            {
+                // Public Status is fenced by a held leader incarnation. With
+                // no accepted work, a surviving external owner permits a
+                // verified follower with no publication; otherwise our new
+                // leader must finish normal reconciliation before Status opens.
+                drop(self.serving_session.lock().unwrap().take());
+                match self.store.leader_session() {
+                    Ok(session) => {
+                        self.store.fail_changed_root_requests(&session)?;
+                        let coordinator =
+                            crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+                                &self.store,
+                                None,
+                                session.clone(),
+                            )?;
+                        coordinator.run(
+                            &self.options,
+                            &Arc::new(AtomicBool::new(false)),
+                            |_| {},
+                        )?;
+                        *self.serving_session.lock().unwrap() = Some(session);
+                    }
+                    Err(error)
+                        if error.to_string().starts_with("storage_busy: ")
+                            || error.chain().any(|cause| {
+                                cause
+                                    .downcast_ref::<crate::store::topology::StorageBusy>()
+                                    .is_some()
+                            }) =>
+                    {
+                        // topology's leader.lock contention currently uses a
+                        // concrete `storage_busy: <lock path>` error; follower
+                        // construction independently verifies that live owner.
+                        let follower = self.store.follower_session()?;
+                        *self.serving_session.lock().unwrap() = Some(follower);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             return Ok(());
         }
         // A retained follower verifies both the held leader flock and incarnation
@@ -455,6 +552,15 @@ impl DaemonState {
             Ok(session) => {
                 let outcome = (|| {
                     self.store.fail_changed_root_requests(&session)?;
+                    // The verified takeover capture must use the FIFO head's
+                    // persisted inputs. This daemon's defaults may belong to a
+                    // different client and must never fail the head's ACK.
+                    let head_before = self.store.earliest_unfinished_request()?;
+                    let head_options = head_before.as_ref().and_then(|head| {
+                        head.options(std::path::Path::new(self.store.workspace_root()))
+                            .ok()
+                    });
+                    let takeover_options = head_options.as_ref().unwrap_or(&self.options);
                     let coordinator =
                         crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
                             &self.store,
@@ -463,7 +569,7 @@ impl DaemonState {
                         )?;
                     let before = self.store.index_baseline()?;
                     if let Err(error) =
-                        coordinator.run(&self.options, &Arc::new(AtomicBool::new(false)), |_| {})
+                        coordinator.run(takeover_options, &Arc::new(AtomicBool::new(false)), |_| {})
                     {
                         // This follower has acquired and verified leadership, but
                         // capture failed before any queue claim. Match the leader's
@@ -474,7 +580,21 @@ impl DaemonState {
                         if self.store.index_baseline()? != before {
                             return Err(error);
                         }
+                        let current_head = self.store.earliest_unfinished_request()?;
+                        // Do not claim/fail a row admitted after the capture,
+                        // or an earlier row whose options could not be read.
+                        if head_options.is_none()
+                            || current_head.as_ref().map(|row| &row.id)
+                                != head_before.as_ref().map(|row| &row.id)
+                        {
+                            return Err(error);
+                        }
                         if let Some(claimed) = self.store.claim_request(&session)? {
+                            if Some(&claimed.id) != head_before.as_ref().map(|row| &row.id) {
+                                // Raced a newer ACK after the protected head
+                                // check. Leave it running for a new leader.
+                                return Err(error);
+                            }
                             eprintln!(
                                 "queue takeover failed for accepted {}: {error:#}",
                                 claimed.id
@@ -1717,6 +1837,9 @@ async fn start_index(
     // A later durable admission supersedes the legacy exceptional display slot.
     s.jobs.lock().unwrap().current = None;
     s.pending_requests.lock().unwrap().push(job.id.clone());
+    // A newly durable browser ACK starts its own attempt immediately, even if
+    // an earlier exceptional storage probe was backed off.
+    *s.recovery_retry_after.lock().unwrap() = None;
     s.start_queue_tick();
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
@@ -3232,6 +3355,51 @@ mod serving_holder_tests {
     }
 
     #[tokio::test]
+    async fn follower_takeover_uses_claimed_clients_options_not_daemon_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let owner_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let own_options = IndexOptions::new(root.clone());
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
+            &owner_store,
+            &own_options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let follower = follower_store.follower_session().unwrap();
+        let mut bad_daemon_options = own_options.clone();
+        bad_daemon_options.scip_path = Some(root.clone()); // directory is an invalid optional input
+        let state = new(
+            follower_store.clone(),
+            bad_daemon_options,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        *state.serving_session.lock().unwrap() = Some(follower);
+        let client = follower_store.enqueue_request(&own_options, None).unwrap();
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(client.id.clone());
+        drop(owner);
+        state.queue_tick().unwrap();
+        let done = follower_store.request_by_id(&client.id).unwrap().unwrap();
+        assert_eq!(
+            done.state, "done",
+            "a client's valid inputs may not be failed by unrelated daemon defaults"
+        );
+        assert!(done.error_code.is_none() && done.revision.is_some());
+        assert!(state.retained_serving_session().unwrap().is_leader());
+    }
+
+    #[tokio::test]
     async fn failed_follower_takeover_does_not_recapture_every_tick_forever() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -3327,6 +3495,107 @@ mod exceptional_recovery_tests {
         (tmp, store, state, roots, identity)
     }
 
+    #[test]
+    fn idle_daemon_follows_external_repair_then_reconciles_after_owner_exits() {
+        let (_tmp, daemon_store, state, roots, identity) = fixture();
+        let cli = Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
+            .unwrap();
+        let (pin, owner) = crate::index_coordinator::enqueue_and_wait(
+            &cli,
+            &state.options,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let index = roots.index_db(&identity);
+        let before = std::fs::read(&index).unwrap();
+        assert!(daemon_store.is_recreate_pending());
+        *state.recovery_retry_after.lock().unwrap() = None;
+        state.queue_tick().unwrap();
+        assert!(!daemon_store.is_recreate_pending());
+        assert_eq!(daemon_store.status().unwrap().revision, pin);
+        assert!(
+            !state.retained_serving_session().unwrap().is_leader(),
+            "while CLI owner holds EX, daemon must follow without publication"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+        drop(owner);
+        state.queue_tick().unwrap();
+        assert!(
+            state.retained_serving_session().unwrap().is_leader(),
+            "after CLI owner exits, verified leader must reconcile before Status opens"
+        );
+        let after = daemon_store.status().unwrap().revision;
+        assert_eq!(after.index_generation, pin.index_generation);
+        assert!(after.index_revision > pin.index_revision);
+        assert!(roots.leader(&identity).is_err(), "daemon retains lock");
+        let after_bytes = std::fs::read(&index).unwrap();
+        assert_ne!(after_bytes, before);
+        state.queue_tick().unwrap();
+        assert_eq!(
+            daemon_store.status().unwrap().revision,
+            after,
+            "idle reacquisition must publish once, not on every timer tick"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), after_bytes);
+    }
+
+    #[tokio::test]
+    async fn cli_repair_must_refresh_stale_daemon_before_driving_browser_ack() {
+        let (_tmp, daemon_store, state, roots, identity) = fixture();
+        let cli_store =
+            Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
+                .unwrap();
+        let (cli_pin, cli_owner) = crate::index_coordinator::enqueue_and_wait(
+            &cli_store,
+            &state.options,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(
+            cli_pin.index_revision, 1,
+            "CLI must repair corrupt index to fresh r1"
+        );
+        assert_eq!(cli_store.current_request().unwrap().unwrap().state, "done");
+        assert!(
+            daemon_store.is_recreate_pending(),
+            "daemon retained its stale corruption classification"
+        );
+        assert!(daemon_store.status().is_err());
+        drop(cli_owner);
+        let free = roots.leader(&identity).unwrap();
+        drop(free);
+        let (code, Json(browser)) = start_index(State(state.clone()), Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(code, StatusCode::ACCEPTED);
+        let ack = daemon_store.request_by_id(&browser.id).unwrap().unwrap();
+        assert_eq!(ack.state, "queued");
+        assert!(ack.seq > 1);
+        let tick_results = (0..4)
+            .map(|_| state.queue_tick().map_err(|error| format!("{error:#}")))
+            .collect::<Vec<_>>();
+        assert!(
+            tick_results.iter().all(Result::is_ok),
+            "stale daemon must not reclassify already repaired index on every 20 ms tick: {tick_results:?}"
+        );
+        let completed = daemon_store.request_by_id(&browser.id).unwrap().unwrap();
+        assert_eq!(
+            completed.state, "done",
+            "external CLI repair must not strand accepted browser work"
+        );
+        assert!(completed.revision.unwrap().index_revision > cli_pin.index_revision);
+        assert!(!daemon_store.is_recreate_pending());
+        assert_eq!(
+            daemon_store.status().unwrap().revision,
+            completed.revision.unwrap()
+        );
+        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(
+            roots.leader(&identity).is_err(),
+            "new daemon leader holds the root lock"
+        );
+    }
+
     struct PausedRecoveryFixture {
         _tmp: tempfile::TempDir,
         store: Store,
@@ -3412,7 +3681,9 @@ mod exceptional_recovery_tests {
                 {
                     break row;
                 }
-                tokio::task::yield_now().await;
+                // This existing-only queue read takes SH; allow the writer
+                // admission/barrier a real turn even in busy verifier lanes.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await
@@ -3427,11 +3698,17 @@ mod exceptional_recovery_tests {
             "queued"
         );
         drop(reader);
-        let (cli_pin, _) = tokio::time::timeout(std::time::Duration::from_secs(15), cli)
+        let cli_result = tokio::time::timeout(std::time::Duration::from_secs(15), cli)
             .await
             .expect("accepted CLI did not finish after reader release")
-            .unwrap()
             .unwrap();
+        let (cli_pin, _)=cli_result.unwrap_or_else(|error| {
+            let browser=store.request_by_id(&q1.id).unwrap().unwrap();
+            let cli_row=store.request_by_id(&q2.id).unwrap().unwrap();
+            panic!("accepted FIFO CLI failed: {error:#}; browser={}/{:?}; cli={}/{:?}; recovery_pending={}; serving_leader={}",
+                browser.state,browser.error_code,cli_row.state,cli_row.error_code,
+                store.is_recreate_pending(),state.retained_serving_session().is_ok_and(|s|s.is_leader()));
+        });
         let browser_done = store.request_by_id(&q1.id).unwrap().unwrap();
         let cli_done = store.request_by_id(&q2.id).unwrap().unwrap();
         assert_eq!(
@@ -3605,6 +3882,9 @@ mod exceptional_recovery_tests {
         assert_eq!(blocked.state, "queued");
         assert!(blocked.finished_at.is_none());
         drop(reader);
+        // Advance the advisory retry deadline without sleeping. The held SH
+        // had fenced EX; the durable row remains queued for this next tick.
+        *state.recovery_retry_after.lock().unwrap() = None;
         let worker = state.clone();
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -3759,7 +4039,7 @@ mod exceptional_recovery_tests {
             .await
             .expect("child output drain did not finish")
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if fixture
                     .store
@@ -3771,11 +4051,24 @@ mod exceptional_recovery_tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                // Let the daemon's nonblocking EX acquire the use lock; a
+                // tight SH SQLite poll can starve it under all-target load.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("same accepted Q1 ID did not retry after external SH release");
+        .await;
+        let observed = fixture
+            .store
+            .request_by_id(&fixture.q1.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout_result.is_ok() && observed.finished_at.is_some(),
+            "same accepted Q1 ID did not retry after external SH release: row={}/{:?}, pending_recovery={}",
+            observed.state,
+            observed.error_code,
+            fixture.store.is_recreate_pending()
+        );
         assert_reclaimed_fifo(&fixture, old_incarnation, queue_inode);
     }
 
@@ -3869,7 +4162,7 @@ mod exceptional_recovery_tests {
             .expect("injected same-daemon tick did not finish")
             .unwrap()
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if fixture
                     .store
@@ -3881,11 +4174,22 @@ mod exceptional_recovery_tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("same queued ID never finished after EX");
+        .await;
+        let observed = fixture
+            .store
+            .request_by_id(&fixture.q1.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout_result.is_ok() && observed.finished_at.is_some(),
+            "same queued ID never finished after EX: row={}/{:?}, pending_recovery={}",
+            observed.state,
+            observed.error_code,
+            fixture.store.is_recreate_pending()
+        );
         assert_reclaimed_fifo(&fixture, old_incarnation, queue_inode);
     }
 
@@ -3925,7 +4229,7 @@ mod exceptional_recovery_tests {
             state.jobs.lock().unwrap().jobs.is_empty(),
             "legacy job map must not own queued work"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if store
                     .request_by_id(&ids[0])
@@ -3942,11 +4246,26 @@ mod exceptional_recovery_tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                // Each request_by_id takes a SQLite read. A tight yield-only
+                // loop can starve the daemon's nonblocking EX recovery while
+                // verifier lanes are busy. Observe at its 20 ms tick cadence.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("durable FIFO requests did not finish");
+        .await;
+        let first_snapshot = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second_snapshot = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert!(
+            timeout_result.is_ok()
+                && first_snapshot.finished_at.is_some()
+                && second_snapshot.finished_at.is_some(),
+            "durable FIFO requests did not finish: first={}/{:?}, second={}/{:?}, pending_recovery={}",
+            first_snapshot.state,
+            first_snapshot.error_code,
+            second_snapshot.state,
+            second_snapshot.error_code,
+            store.is_recreate_pending()
+        );
         let first = store.request_by_id(&ids[0]).unwrap().unwrap();
         let second = store.request_by_id(&ids[1]).unwrap().unwrap();
         assert_eq!(

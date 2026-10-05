@@ -236,9 +236,12 @@ impl Store {
         // root singleton and quick_check before interpreting any row.
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
+            // A concurrent first writer creates the private file before its
+            // schema transaction commits. Existing-only readers must neither
+            // initialize it nor mistake that transient for an incompatible ACK.
             ensure!(
                 !existing_only,
-                "incompatible_queue: missing initialized queue schema"
+                "storage_busy: requests.db initialization in progress"
             );
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let locked_version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -538,6 +541,11 @@ impl Store {
         result: Result<IndexPin>,
     ) -> Result<()> {
         self.verify_leader_session(session)?;
+        ensure!(
+            request.claim_incarnation.as_deref()
+                == Some(session.incarnation().to_string().as_str()),
+            "request claim changed"
+        );
         {
             let mut slot = self.pending_request_completion.lock().unwrap();
             ensure!(slot.is_none(), "storage_busy: unresolved FIFO completion");
@@ -698,6 +706,62 @@ impl Store {
             &self.test_queue_finish_failures
         };
         counter.store(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod stale_claim_tests {
+    use super::*;
+    #[test]
+    fn stale_claim_cannot_complete_a_row_after_new_leader_reclaims_it() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let (_, old_owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        let stale_claim = store.claim_request(&old_owner).unwrap().unwrap();
+        assert_eq!(stale_claim.id, accepted.id);
+        drop(old_owner);
+        let replacement = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (new_pin, new_owner) = crate::index_coordinator::reconcile_workspace(
+            &replacement,
+            &options,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let new_claim = replacement.claim_request(&new_owner).unwrap().unwrap();
+        assert_ne!(stale_claim.claim_incarnation, new_claim.claim_incarnation);
+        let error = replacement
+            .record_and_finish_request(&new_owner, &stale_claim, Ok(new_pin))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("request claim changed"),
+            "{error:#}"
+        );
+        let still_running = replacement.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(still_running.state, "running");
+        assert_eq!(still_running.claim_incarnation, new_claim.claim_incarnation);
+        assert!(still_running.revision.is_none() && still_running.error_code.is_none());
+        replacement
+            .record_and_finish_request(&new_owner, &new_claim, Ok(new_pin))
+            .unwrap();
+        assert_eq!(
+            replacement
+                .request_by_id(&accepted.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "done"
+        );
     }
 }
 

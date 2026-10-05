@@ -306,6 +306,15 @@ fn drain_requests_observed_with_cancel(
             )?;
             coordinator.run(&options, cancel, |p| progress(&request.id, p))
         })();
+        // Ctrl-C stops this CLI waiter, not any accepted client's durable work.
+        // The claim stays running under the old incarnation and the next
+        // verified leader reclaims the FIFO head after full reconciliation.
+        // Even a publication that raced Ctrl-C cannot be reported terminally
+        // by a cancelled waiter; repeat-after-commit is explicitly allowed.
+        ensure!(
+            !cancel.load(Ordering::Acquire),
+            "index wait interrupted; accepted request remains running for verified reclaim"
+        );
         // No unverified worker can mark a request terminal. On fencing loss leave it running
         // for the next incarnation to reclaim after its complete root reconciliation.
         store.record_and_finish_request(session, &request, outcome)?;
@@ -672,7 +681,63 @@ mod tests {
     }
 
     #[test]
-    fn cli_ctrl_c_during_request_capture_interrupts_drain_and_records_failure() {
+    fn cli_ctrl_c_must_not_fail_another_clients_running_fifo_request() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, old_owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        drop(old_owner);
+        let ahead = store.enqueue_request(&options, None).unwrap();
+        let browser = store.enqueue_request(&options, None).unwrap();
+        let captures = std::sync::atomic::AtomicUsize::new(0);
+        let error = enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
+            if phase.phase == "timing:capture" && captures.fetch_add(1, Ordering::AcqRel) > 0 {
+                cancel.store(true, Ordering::Release);
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            captures.load(Ordering::Acquire),
+            2,
+            "takeover satisfied earlier A; CLI Ctrl-C happened during browser B capture"
+        );
+        assert!(error.to_string().contains("interrupted"), "{error:#}");
+        let a = store.request_by_id(&ahead.id).unwrap().unwrap();
+        let b = store.request_by_id(&browser.id).unwrap().unwrap();
+        let cli = store.current_request().unwrap().unwrap();
+        assert_eq!(a.state, "done");
+        assert_eq!(
+            b.state, "running",
+            "other client's ACK must survive CLI Ctrl-C"
+        );
+        assert!(b.error_code.is_none() && b.revision.is_none());
+        assert_eq!(cli.state, "queued", "CLI's own later ACK also survives");
+        assert!(a.seq < b.seq && b.seq < cli.seq);
+        let reopened = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (_, new_leader) = reconcile_workspace(
+            &reopened,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(drain_requests(&reopened, &new_leader).unwrap(), 2);
+        let b_done = reopened.request_by_id(&browser.id).unwrap().unwrap();
+        let cli_done = reopened.request_by_id(&cli.id).unwrap().unwrap();
+        assert_eq!(
+            (b_done.state.as_str(), cli_done.state.as_str()),
+            ("done", "done")
+        );
+        assert!(
+            b_done.revision.unwrap().index_revision < cli_done.revision.unwrap().index_revision
+        );
+    }
+
+    #[test]
+    fn cli_ctrl_c_during_request_capture_leaves_own_request_running() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -700,8 +765,11 @@ mod tests {
             "done"
         );
         let row = store.current_request().unwrap().unwrap();
-        assert_eq!(row.state, "failed");
-        assert_eq!(row.error_code.as_deref(), Some("index_failed"));
+        assert_eq!(
+            row.state, "running",
+            "Ctrl-C stops waiting but preserves the accepted request"
+        );
+        assert!(row.error_code.is_none() && row.revision.is_none());
     }
 
     #[test]

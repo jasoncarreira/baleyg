@@ -953,11 +953,7 @@ fn standalone_takeover_keeps_configured_missing_presentation_absent() {
 #[tokio::test]
 async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_takeover() {
     use sha2::{Digest, Sha256};
-    use std::{
-        io::{BufRead, BufReader},
-        os::unix::fs::PermissionsExt,
-        process::Stdio,
-    };
+    use std::{os::unix::fs::PermissionsExt, process::Stdio};
     struct Server(Option<std::process::Child>);
     impl Drop for Server {
         fn drop(&mut self) {
@@ -989,7 +985,12 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let mut child = isolated_command(&home)
+    // Keep the daemon's stderr open through readiness and shutdown. Reading
+    // only the first banner line from a pipe closed its reader while later
+    // workers still wrote diagnostics on Linux CI.
+    let stderr_path = temp.path().join("serve-ingress-stderr.log");
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
+    let child = isolated_command(&home)
         .arg("serve")
         .arg("--workspace")
         .arg(&root)
@@ -1003,51 +1004,71 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         .arg("manifest.json")
         .current_dir(&first_cwd)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .unwrap();
-    let stderr = child.stderr.take().unwrap();
     let mut server = Server(Some(child));
-    let startup = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::task::spawn_blocking(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut text = String::new();
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 {
-                    return Err(text);
-                }
-                text.push_str(&line);
-                if line.contains("Baleyg:") {
-                    return Ok(text);
-                }
-            }
-        }),
-    )
-    .await
-    .expect("daemon startup timed out")
-    .unwrap()
-    .unwrap_or_else(|text| panic!("daemon exited before binding: {text}"));
-    assert!(
-        !startup.contains("Evidence unavailable at startup"),
-        "{startup}"
-    );
-    // The banner is printed before axum polls its SIGTERM handler. A successful
-    // HTTP response proves the listener and graceful-shutdown future are active.
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let startup = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
-            if reqwest::get(format!("http://127.0.0.1:{port}/healthz"))
-                .await
-                .is_ok_and(|response| response.status().is_success())
+            let log = fs::read(&stderr_path).unwrap();
+            if log
+                .windows(b"Baleyg:".len())
+                .any(|window| window == b"Baleyg:")
             {
-                break;
+                break log;
+            }
+            if let Some(exit) = server.0.as_mut().unwrap().try_wait().unwrap() {
+                panic!(
+                    "daemon exited before banner: {exit}; category={}",
+                    readiness_stderr_category(&log)
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("daemon health endpoint did not become ready");
+    .expect("daemon startup timed out");
+    assert!(
+        !String::from_utf8_lossy(&startup).contains("Evidence unavailable at startup"),
+        "unexpected startup evidence: {}",
+        readiness_stderr_category(&startup)
+    );
+    // The banner precedes axum polling its SIGTERM handler; a successful
+    // response, not a logged banner, proves the listener is actually ready.
+    let mut last_health = String::from("no_response");
+    let mut ready = false;
+    let health = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            match reqwest::get(format!("http://127.0.0.1:{port}/healthz")).await {
+                Ok(response) if response.status().is_success() => {
+                    ready = true;
+                    break;
+                }
+                Ok(response) => last_health = format!("http_status_{}", response.status().as_u16()),
+                Err(error) => {
+                    last_health = if error.is_connect() {
+                        "connection_error".into()
+                    } else if error.is_timeout() {
+                        "request_timeout".into()
+                    } else {
+                        "other_request_error".into()
+                    }
+                }
+            }
+            if server.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        health.is_ok() && ready,
+        "daemon health endpoint did not become ready: child={:?}, last_health={}, stderr_category={}",
+        server.0.as_mut().unwrap().try_wait().unwrap(),
+        last_health,
+        readiness_stderr_category(&fs::read(&stderr_path).unwrap())
+    );
     // The banner precedes an asynchronous queue tick. SIGKILL can interrupt
     // requests.db creation before its schema transaction commits; that partial
     // queue must remain incompatible. Model a clean cross-CWD takeover instead:
