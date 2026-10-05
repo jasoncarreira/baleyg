@@ -334,7 +334,10 @@ fn cli_accepted_during_held_exceptional_owner_waits_until_recreation_completes()
         .unwrap();
     cli.join().unwrap();
     assert_eq!(old.request_by_id(&ack.id).unwrap().unwrap().state, "done");
-    assert_eq!(pin.index_revision, 1, "recreated generation first pin");
+    assert_eq!(
+        pin.index_revision, 2,
+        "recreation and explicit claim need separate publications"
+    );
 }
 
 #[test]
@@ -362,7 +365,7 @@ fn request_rejects_symlink_to_captured_workspace() {
 }
 
 #[test]
-fn first_cli_takeover_capture_satisfies_fifo_head_once() {
+fn first_cli_takeover_reconciles_then_claims_fifo_head() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function seed() {}\n").unwrap();
@@ -371,7 +374,10 @@ fn first_cli_takeover_capture_satisfies_fifo_head_once() {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (pin, session) =
         baleyg::index_coordinator::enqueue_and_wait(&store, &options, &cancel).unwrap();
-    assert_eq!(pin.index_revision, 1);
+    assert_eq!(
+        pin.index_revision, 2,
+        "takeover and explicit claim need separate publications"
+    );
     assert!(session.is_leader());
     assert_eq!(store.status().unwrap().revision, pin);
     let head = store.current_request().unwrap().unwrap();
@@ -923,4 +929,168 @@ fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
     );
     assert!(!queue.exists());
     assert_eq!(fs::read(&index).unwrap(), index_before);
+}
+
+#[test]
+fn claimed_unchanged_fifo_publishes_fresh_manifest_without_reextracting() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (baseline, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |id, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push((id.to_owned(), p.phase));
+            }
+        })
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec![
+            (first.id.clone(), "mode:unchanged".into()),
+            (second.id.clone(), "mode:unchanged".into()),
+        ],
+        "both claimed requests must take the guarded unchanged path"
+    );
+    let a = store.request_by_id(&first.id).unwrap().unwrap();
+    let b = store.request_by_id(&second.id).unwrap().unwrap();
+    assert_eq!((a.state.as_str(), b.state.as_str()), ("done", "done"));
+    assert_eq!(
+        a.revision.unwrap().index_revision,
+        baseline.index_revision + 1
+    );
+    assert_eq!(
+        b.revision.unwrap().index_revision,
+        baseline.index_revision + 2
+    );
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    let manifest_count: i64 = db
+        .query_row("SELECT count(*) FROM revision_documents", [], |r| r.get(0))
+        .unwrap();
+    let document_count: i64 = db
+        .query_row("SELECT count(*) FROM document_versions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(manifest_count, 3);
+    assert_eq!(
+        document_count, 1,
+        "unchanged claimed work must reuse immutable measured facts"
+    );
+}
+
+#[test]
+fn changed_claimed_source_uses_native_fallback_not_unchanged() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let request = store.enqueue_request(&options, None).unwrap();
+    fs::write(workspace.path().join("a.js"), "function b() {}\n").unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |_, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push(p.phase);
+            }
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec!["mode:full"],
+        "declaration change is not #67 local"
+    );
+    assert_eq!(
+        store.request_by_id(&request.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+#[test]
+fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
+    use baleyg::index_coordinator::{drain_requests, reconcile_workspace};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (head, leader) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let request = store.enqueue_request(&options, None).unwrap();
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    db.execute(
+        "UPDATE document_versions SET source_bytes=?1 WHERE path='a.js'",
+        [b"function b() {}\n".as_slice()],
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(drain_requests(&store, &leader).unwrap(), 1);
+    let row = store.request_by_id(&request.id).unwrap().unwrap();
+    assert_eq!(row.state, "failed", "guard failure must not ACK done");
+    assert!(row.revision.is_none());
+    assert_eq!(
+        store.index_baseline().unwrap(),
+        head,
+        "selected pair must remain unchanged"
+    );
+}
+
+#[test]
+fn changed_capture_input_and_options_take_full_claimed_fallback() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    fs::write(workspace.path().join(".gitignore"), "absent.js\n").unwrap();
+    let input_request = store.enqueue_request(&options, None).unwrap();
+    let mut other_options = options.clone();
+    other_options.max_file_bytes = 1024;
+    let option_request = store.enqueue_request(&other_options, None).unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |id, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push((id.to_owned(), p.phase));
+            }
+        })
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec![
+            (input_request.id.clone(), "mode:full".into()),
+            (option_request.id.clone(), "mode:full".into()),
+        ],
+        "new ignore input and changed options cannot reuse selected facts via unchanged path"
+    );
+    for request in [input_request, option_request] {
+        assert_eq!(
+            store.request_by_id(&request.id).unwrap().unwrap().state,
+            "done"
+        );
+    }
 }

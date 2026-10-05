@@ -228,7 +228,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let dbpath = real_index_db(&home);
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r1, old_ids) = pin_and_ids(&db);
-    assert_eq!(r1, 1);
+    assert_eq!(r1, 2);
     let immutable = [
         "document_versions",
         "graph_projections",
@@ -256,8 +256,8 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let leader = serve(&root, &home, &first_log);
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r2, ids) = pin_and_ids(&db);
-    assert_eq!(r2, 2, "new header+manifest pin required");
-    assert_eq!(ids.len(), 2);
+    assert_eq!(r2, 3, "new header+manifest pin required");
+    assert_eq!(ids.len(), 3);
     assert_eq!(
         (&ids[0].1, &ids[0].2, &ids[0].3),
         (&ids[1].1, &ids[1].2, &ids[1].3)
@@ -285,7 +285,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&status.stdout).unwrap()["revision"]["indexRevision"],
-        2
+        3
     );
     drop(db);
     drop(leader);
@@ -324,11 +324,11 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let changed = serve(&root, &home, &changed_log);
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r3, next_ids) = pin_and_ids(&db);
-    assert_eq!(r3, 3, "new bytes must FULL publish, never reuse old pin");
-    assert_eq!(next_ids.len(), 3);
+    assert_eq!(r3, 4, "new bytes must FULL publish, never reuse old pin");
+    assert_eq!(next_ids.len(), 4);
     assert_eq!(next_ids[0].1, next_ids[1].1);
     assert_ne!(
-        next_ids[1].1, next_ids[2].1,
+        next_ids[1].1, next_ids[3].1,
         "same-length/mtime edit reused stale bytes"
     );
     assert_eq!(next_ids[0].1, old_ids[0].1, "retained old pin changed");
@@ -336,7 +336,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     drop(changed);
 
     let db = rusqlite::Connection::open(&dbpath).unwrap();
-    let selected_id = &next_ids[2].1;
+    let selected_id = &next_ids[3].1;
     assert_eq!(
         db.execute(
             "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
@@ -351,7 +351,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     assert_eq!(
         pin_and_ids(&db),
-        (3, next_ids.clone()),
+        (4, next_ids.clone()),
         "corrupt selected source was republished"
     );
     let headers: i64 = db
@@ -364,7 +364,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         .unwrap();
     assert_eq!(
         (headers, bindings),
-        (3, 3),
+        (4, 4),
         "refused Serve installed partial metadata"
     );
     drop(db);
@@ -407,7 +407,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     assert_eq!(
         pin_and_ids(&db).0,
-        3,
+        4,
         "bad selected producer binding reused"
     );
     assert!(
@@ -442,7 +442,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     assert_eq!(
         pin_and_ids(&db).0,
-        3,
+        4,
         "mismatched extraction inventory context reused"
     );
     assert!(
@@ -692,7 +692,7 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     );
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 0);
-    assert_eq!(status["revision"]["indexRevision"], 1);
+    assert_eq!(status["revision"]["indexRevision"], 2);
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.odin.baleyg"
     } else {
@@ -754,7 +754,7 @@ function boundary() {}
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 1);
-    assert_eq!(status["revision"]["indexRevision"], 1);
+    assert_eq!(status["revision"]["indexRevision"], 2);
     let exported = command(&root, &home, "export").output().unwrap();
     assert!(exported.status.success());
     let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
@@ -778,7 +778,7 @@ function boundary() {}
         3_145_728
     );
     assert_eq!(
-        revision, 2,
+        revision, 3,
         "export must perform exactly one recorded-option takeover"
     );
 
@@ -826,7 +826,7 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&indexed.stderr)
     );
     let initial: Value = serde_json::from_slice(&indexed.stdout).unwrap();
-    assert_eq!(initial["publishedRevision"]["indexRevision"], 1);
+    assert_eq!(initial["publishedRevision"]["indexRevision"], 2);
     let indexes = if cfg!(target_os = "macos") {
         home.join("Library/Caches/dev.odin.baleyg/indexes")
     } else {
@@ -868,7 +868,7 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&status.stderr)
     );
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["revision"]["indexRevision"], 1);
+    assert_eq!(status["revision"]["indexRevision"], 2);
     assert_eq!(
         status["revision"]["indexGeneration"],
         initial["publishedRevision"]["indexGeneration"]
@@ -1209,7 +1209,7 @@ fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
                 rusqlite::params![new_key, old_key],
             )
             .unwrap(),
-            1
+            2
         );
     }
     db.execute_batch("COMMIT").unwrap();
@@ -1240,7 +1240,7 @@ fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
         )
         .unwrap();
     assert_eq!(
-        revision, 1,
+        revision, 2,
         "relative legacy record cannot republish from B"
     );
 }
@@ -1315,7 +1315,7 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
     );
     let output: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(output["publishedRevision"], output["status"]["revision"]);
-    assert_eq!(output["publishedRevision"]["indexRevision"], 1);
+    assert_eq!(output["publishedRevision"]["indexRevision"], 2);
     assert_ne!(
         output["publishedRevision"]["indexGeneration"],
         first["publishedRevision"]["indexGeneration"]
@@ -1767,7 +1767,7 @@ fn fixed_locations_and_removed_flag() {
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
     let first = &first["status"];
-    assert_eq!(first["revision"]["indexRevision"], 1);
+    assert_eq!(first["revision"]["indexRevision"], 2);
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -1798,7 +1798,7 @@ fn fixed_locations_and_removed_flag() {
         final_status["revision"]["indexGeneration"],
         first["revision"]["indexGeneration"]
     );
-    assert_eq!(final_status["revision"]["indexRevision"], 1);
+    assert_eq!(final_status["revision"]["indexRevision"], 2);
 }
 #[test]
 fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
@@ -1825,7 +1825,7 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
     }
     assert_eq!(
         serde_json::from_slice::<Value>(&quiet.stdout).unwrap()["publishedRevision"]["indexRevision"],
-        1
+        2
     );
     let diagnostic = command(&root, &home, "index")
         .env("BALEYG_INDEX_DIAGNOSTICS", "1")
@@ -1837,22 +1837,23 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
         String::from_utf8_lossy(&diagnostic.stderr)
     );
     let diagnostic_stderr = String::from_utf8_lossy(&diagnostic.stderr);
-    for marker in [
-        "index-mode full",
-        "index-writer ",
-        "index-phase capture_ms=",
-        "index-phase publish_ms=",
-        "index-phase outside_status_output_ms=",
+    for (marker, count) in [
+        ("index-mode full", 1),
+        ("index-mode unchanged", 1),
+        ("index-writer ", 1),
+        ("index-phase capture_ms=", 2),
+        ("index-phase publish_ms=", 2),
+        ("index-phase outside_status_output_ms=", 1),
     ] {
         assert_eq!(
             diagnostic_stderr.matches(marker).count(),
-            1,
+            count,
             "opt-in telemetry missing or duplicated {marker}"
         );
     }
     assert_eq!(
         serde_json::from_slice::<Value>(&diagnostic.stdout).unwrap()["publishedRevision"]["indexRevision"],
-        2
+        4
     );
 }
 
@@ -1930,7 +1931,7 @@ fn index_forwards_pair_and_reports_pair() {
         published["status"]["evidenceFormat"],
         "terminal-native-graph-v1"
     );
-    assert_eq!(published["publishedRevision"]["indexRevision"], 1);
+    assert_eq!(published["publishedRevision"]["indexRevision"], 2);
     assert_eq!(
         uuid::Uuid::parse_str(
             published["publishedRevision"]["indexGeneration"]
@@ -1993,14 +1994,14 @@ fn current_commands_pair_matrix() {
         status["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(status["revision"]["indexRevision"], 1);
+    assert_eq!(status["revision"]["indexRevision"], 2);
     let symbols: Value =
         serde_json::from_slice(&command(&root, &home, "symbols").output().unwrap().stdout).unwrap();
     assert_eq!(
         symbols["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(symbols["revision"]["indexRevision"], 2);
+    assert_eq!(symbols["revision"]["indexRevision"], 3);
     let seed = symbols["items"]
         .as_array()
         .unwrap()
@@ -2019,7 +2020,7 @@ fn current_commands_pair_matrix() {
     )
     .unwrap();
     assert_eq!(query["revision"]["indexGeneration"], pin["indexGeneration"]);
-    assert_eq!(query["revision"]["indexRevision"], 3);
+    assert_eq!(query["revision"]["indexRevision"], 4);
     let exported: Value =
         serde_json::from_slice(&command(&root, &home, "export").output().unwrap().stdout).unwrap();
     assert_eq!(exported["files"].as_array().unwrap().len(), 1);
@@ -2029,7 +2030,7 @@ fn current_commands_pair_matrix() {
         status["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(status["revision"]["indexRevision"], 4);
+    assert_eq!(status["revision"]["indexRevision"], 5);
 }
 
 #[test]
@@ -4308,8 +4309,8 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
     reader.read_to_end(&mut stdout).unwrap();
     assert!(child.0.wait().unwrap().success());
     let output: Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(output["publishedRevision"]["indexRevision"], 1);
-    assert_eq!(output["status"]["revision"]["indexRevision"], 1);
+    assert_eq!(output["publishedRevision"]["indexRevision"], 2);
+    assert_eq!(output["status"]["revision"]["indexRevision"], 2);
     assert_eq!(output["status"]["stats"]["files"], 1);
     assert_eq!(
         unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
@@ -4917,7 +4918,7 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         String::from_utf8_lossy(&first.stderr)
     );
     let first_pin: Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(first_pin["publishedRevision"]["indexRevision"], 1);
+    assert_eq!(first_pin["publishedRevision"]["indexRevision"], 2);
     let original = command(&root, &home, "export")
         .current_dir(&other)
         .output()
@@ -4964,9 +4965,9 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    // Only writer commands publish: index r1, original export r2,
-    // changed export r3, read-only status r3, stale export r4, latest status r4.
-    assert_eq!(status["revision"]["indexRevision"], 3);
+    // Only writer commands publish: index reconciles r1 and claims r2, original export r3,
+    // changed export r4, read-only status r4, stale export r5, latest status r5.
+    assert_eq!(status["revision"]["indexRevision"], 4);
     assert_eq!(
         status["revision"]["indexGeneration"],
         first_pin["publishedRevision"]["indexGeneration"]
@@ -4996,5 +4997,53 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(latest.status.success());
     let latest: Value = serde_json::from_slice(&latest.stdout).unwrap();
-    assert_eq!(latest["revision"]["indexRevision"], 4);
+    assert_eq!(latest["revision"]["indexRevision"], 5);
+}
+
+#[test]
+fn explicit_cli_unchanged_claim_publishes_then_acks() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function unchanged() {}\n").unwrap();
+    for expected in [2_i64, 4] {
+        let output = command(&root, &home, "index").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let db = rusqlite::Connection::open(real_index_db(&home)).unwrap();
+        let actual: i64 = db
+            .query_row("SELECT index_revision FROM index_metadata", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "each fresh takeover and claimed request publish separately"
+        );
+        let immutable: i64 = db
+            .query_row("SELECT count(*) FROM document_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            immutable, 1,
+            "unchanged CLI claim must reuse measured document facts"
+        );
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM revision_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, expected, "each revision needs its own manifest");
+        let queue =
+            rusqlite::Connection::open(real_index_db(&home).with_file_name("requests.db")).unwrap();
+        let (state, revision): (String, i64) = queue
+            .query_row(
+                "SELECT state, result_revision FROM requests ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((state.as_str(), revision), ("done", expected));
+    }
 }

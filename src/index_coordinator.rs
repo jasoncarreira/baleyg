@@ -115,9 +115,8 @@ impl IndexJobCoordinator {
         self.run_with_capture(options, cancel, progress, observe, false)
     }
 
-    /// Only unchanged leader Serve may reuse selected native versions without
-    /// invoking extraction. Explicit index and accepted requests keep their
-    /// existing fully validated publication path.
+    /// A fresh, guarded unchanged capture may reuse selected native versions
+    /// for serving and for a normally claimed explicit request.
     pub fn run_serving(
         self,
         options: &IndexOptions,
@@ -133,7 +132,7 @@ impl IndexJobCoordinator {
         cancel: &CancelFlag,
         progress: impl Fn(IndexProgress) + Sync,
         observe: impl FnOnce(&Capture),
-        serving_fast: bool,
+        unchanged_fast: bool,
     ) -> Result<IndexPin> {
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         let mut phase_start = std::time::Instant::now();
@@ -148,7 +147,7 @@ impl IndexJobCoordinator {
         let capture = Capture::admit(options, cancel, &progress)?;
         report("capture", phase_start.elapsed());
         phase_start = std::time::Instant::now();
-        if serving_fast
+        if unchanged_fast
             && let Some(pin) = self.store.publish_unchanged_native_recovery(
                 &capture,
                 self.session.leader_guard()?,
@@ -327,7 +326,13 @@ fn drain_requests_observed_with_cancel(
             before_publish = Some(coordinator.expected.pin());
             #[cfg(test)]
             diagnostic_stage.set("run");
-            coordinator.run(&options, cancel, |p| progress(&request.id, p))
+            coordinator.run_with_capture(
+                &options,
+                cancel,
+                |p| progress(&request.id, p),
+                |_| {},
+                true,
+            )
         })();
         #[cfg(test)]
         if let Err(ref error) = outcome {
@@ -444,49 +449,6 @@ fn retry_cli_recorded_completion(
     }
 }
 
-/// A recovery full capture can satisfy the FIFO head when it used exactly that
-/// unpinned request's options. Never publish the same capture a second time.
-pub(crate) fn finish_reconciled_head(
-    store: &Store,
-    session: &Arc<LeaderSession>,
-    options: &IndexOptions,
-    pin: IndexPin,
-    head_before_capture: Option<&str>,
-) -> Result<()> {
-    // An ACK admitted during capture did not cause that publication. It must
-    // be claimed and indexed from its own options, not marked done by an
-    // earlier recovery pin with superficially matching options.
-    let Some(prior_id) = head_before_capture else {
-        return Ok(());
-    };
-    let Some(head) = store.earliest_unfinished_request()? else {
-        return Ok(());
-    };
-    if head.id != prior_id {
-        return Ok(());
-    }
-    let Ok(selected) = head.options(std::path::Path::new(store.workspace_root())) else {
-        return Ok(());
-    };
-    // The request root was verified by device/inode on enqueue and again on
-    // read/claim; only the persisted option fields need exact equality here.
-    if head.expected.is_some()
-        || selected.scip_path != options.scip_path
-        || selected.manifest_path != options.manifest_path
-        || selected.max_file_bytes != options.max_file_bytes
-    {
-        return Ok(());
-    }
-    if let Some(claimed) = store.claim_request(session)? {
-        ensure!(
-            claimed.id == head.id,
-            "storage_busy: FIFO head changed during recovery"
-        );
-        store.record_and_finish_request(session, &claimed, Ok(pin))?;
-    }
-    Ok(())
-}
-
 /// One explicit CLI command commits before waiting. A free lock requires a complete
 /// takeover reconciliation before any queued request is claimed.
 pub fn enqueue_and_wait(
@@ -568,20 +530,10 @@ pub fn enqueue_and_wait_observed(
             "index wait interrupted; accepted request remains queued"
         );
         if held.is_none() && store.is_recreate_pending() {
-            let head_before_capture = store.earliest_unfinished_request()?.map(|row| row.id);
             match store.recreate_pending_leader_session(options, cancel) {
-                Ok((pin, session)) => {
+                Ok((_, session)) => {
                     store.fail_changed_root_requests(&session)?;
-                    held = Some(session.clone());
-                    if let Err(error) = finish_reconciled_head(
-                        store,
-                        &session,
-                        options,
-                        pin,
-                        head_before_capture.as_deref(),
-                    ) {
-                        retry_cli_recorded_completion(store, &session, cancel, error)?;
-                    }
+                    held = Some(session);
                 }
                 Err(error)
                     if error.chain().any(|cause| {
@@ -618,40 +570,26 @@ pub fn enqueue_and_wait_observed(
         if held.is_none() {
             match store.leader_session() {
                 Ok(session) => {
-                    // The takeover reconciliation precedes claims and may itself satisfy
-                    // the FIFO head: it captured after acceptance using that request's
-                    // exact options. Claim only after the full root-checked publication.
+                    // Reconcile the root before claiming any accepted FIFO row.
+                    // This publication cannot acknowledge a request: each claim
+                    // must produce its own fresh, guarded revision afterwards.
                     store.fail_changed_root_requests(&session)?;
                     let earliest = store.earliest_unfinished_request()?;
-                    let reconcile_options = earliest
-                        .as_ref()
-                        .and_then(|row| {
-                            row.options(std::path::Path::new(store.workspace_root()))
-                                .ok()
+                    let reconcile_options = store
+                        .recorded_index_options()?
+                        .or_else(|| {
+                            earliest.as_ref().and_then(|row| {
+                                row.options(std::path::Path::new(store.workspace_root()))
+                                    .ok()
+                            })
                         })
-                        .unwrap_or_else(|| options.clone());
+                        .unwrap_or_else(|| {
+                            IndexOptions::new(std::path::PathBuf::from(store.workspace_root()))
+                        });
                     let startup =
                         IndexJobCoordinator::prepare_with_session(store, None, session.clone())?;
-                    let takeover_pin = startup.run(&reconcile_options, cancel, &progress)?;
-                    // Retain the verified owner before any terminal write can fail.
-                    held = Some(session.clone());
-                    if let Some(head) = earliest
-                        && head.expected.is_none()
-                        && head
-                            .options(std::path::Path::new(store.workspace_root()))
-                            .is_ok()
-                        && let Some(claimed) = store.claim_request(&session)?
-                    {
-                        ensure!(
-                            claimed.id == head.id,
-                            "storage_busy: FIFO head changed during takeover"
-                        );
-                        if let Err(error) =
-                            store.record_and_finish_request(&session, &claimed, Ok(takeover_pin))
-                        {
-                            retry_cli_recorded_completion(store, &session, cancel, error)?;
-                        }
-                    }
+                    startup.run(&reconcile_options, cancel, &progress)?;
+                    held = Some(session);
                 }
                 Err(error)
                     if format!("{error:#}").contains("storage_busy")
@@ -782,7 +720,11 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let (_, old_owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
         drop(old_owner);
-        let browser = store.enqueue_request(&options, None).unwrap();
+        let mut options = options;
+        options.max_file_bytes = 1024;
+        let browser = store
+            .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
+            .unwrap();
         let cli = store.enqueue_request(&options, None).unwrap();
         assert!(browser.seq < cli.seq);
         let (base, leader) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
@@ -865,6 +807,8 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let (_, old) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
         drop(old);
+        let mut options = options;
+        options.max_file_bytes = 1024;
         let earlier = store.enqueue_request(&options, None).unwrap();
         let captures = std::sync::atomic::AtomicUsize::new(0);
         let error = match enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
@@ -917,8 +861,16 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let (_, old) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
         drop(old);
+        let mut options = options;
+        options.max_file_bytes = 1024;
         let ack = store.enqueue_request(&options, None).unwrap();
-        let (before, leader) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let (before, leader) = reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
         store.fail_next_live_publish_post_commit_busy();
         let error = drain_requests(&store, &leader).unwrap_err();
         assert!(
@@ -965,15 +917,15 @@ mod tests {
         let browser = store.enqueue_request(&options, None).unwrap();
         let captures = std::sync::atomic::AtomicUsize::new(0);
         let error = enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
-            if phase.phase == "timing:capture" && captures.fetch_add(1, Ordering::AcqRel) > 0 {
+            if phase.phase == "timing:capture" && captures.fetch_add(1, Ordering::AcqRel) > 1 {
                 cancel.store(true, Ordering::Release);
             }
         })
         .unwrap_err();
         assert_eq!(
             captures.load(Ordering::Acquire),
-            2,
-            "takeover satisfied earlier A; CLI Ctrl-C happened during browser B capture"
+            3,
+            "takeover reconciled first, A then published, CLI Ctrl-C happened during B capture"
         );
         assert!(error.to_string().contains("interrupted"), "{error:#}");
         let a = store.request_by_id(&ahead.id).unwrap().unwrap();
@@ -1020,15 +972,15 @@ mod tests {
         let ahead = store.enqueue_request(&options, None).unwrap();
         let captures = std::sync::atomic::AtomicUsize::new(0);
         let error = enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
-            if phase.phase == "timing:capture" && captures.fetch_add(1, Ordering::AcqRel) > 0 {
+            if phase.phase == "timing:capture" && captures.fetch_add(1, Ordering::AcqRel) > 1 {
                 cancel.store(true, Ordering::Release);
             }
         })
         .unwrap_err();
         assert_eq!(
             captures.load(Ordering::Acquire),
-            2,
-            "first capture satisfied earlier FIFO row; second was CLI's own drain"
+            3,
+            "takeover reconciled first; earlier FIFO row published before CLI capture"
         );
         assert!(error.to_string().contains("interrupted"), "{error:#}");
         assert_eq!(
@@ -1055,7 +1007,6 @@ mod tests {
         // The owner published its source capture first; only then did a client
         // commit this new ACK. It cannot claim that earlier publication.
         let later = store.enqueue_request(&options, None).unwrap();
-        finish_reconciled_head(&store, &session, &options, old_pin, None).unwrap();
         assert_eq!(
             store.request_by_id(&later.id).unwrap().unwrap().state,
             "queued"
@@ -1415,13 +1366,13 @@ mod queue_completion_retry_tests {
         assert!(q1.seq < q2.seq);
         assert_eq!(
             first.revision.unwrap().index_revision,
-            baseline.index_revision + 1
+            baseline.index_revision + 2
         );
         assert_eq!(
             second.revision.unwrap().index_revision,
-            baseline.index_revision + 2
+            baseline.index_revision + 3
         );
-        assert_eq!(returned.index_revision, baseline.index_revision + 3);
+        assert_eq!(returned.index_revision, baseline.index_revision + 4);
         assert_eq!(store.status().unwrap().revision, returned);
     }
 
