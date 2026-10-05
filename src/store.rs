@@ -69,6 +69,7 @@ pub struct Store {
     obsolete_format_marker: Arc<Mutex<Option<IndexFormatMarker>>>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
     request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
+    aborted_staged_index: Arc<Mutex<Option<StagedIndex>>>,
     writer_counters: Arc<Mutex<Option<WriterCounters>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
     #[cfg(test)]
@@ -186,6 +187,16 @@ struct PublicationPlan<'a> {
     expected: ExpectedPublication,
     target: PublicationTarget<'a>,
 }
+#[derive(Debug)]
+struct ForeignStagedIndex;
+impl std::fmt::Display for ForeignStagedIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "unsafe_index: failed stage pathname occupied by a foreign inode; witness retained",
+        )
+    }
+}
+impl std::error::Error for ForeignStagedIndex {}
 #[derive(Debug)]
 struct ExceptionalIndexFormat;
 impl std::fmt::Display for ExceptionalIndexFormat {
@@ -363,7 +374,7 @@ CREATE TABLE revision_producer_bindings(revision_id TEXT PRIMARY KEY REFERENCES 
 "#;
 /// A normal connection keeps the verified index use lock until SQLite closes.
 struct IndexConnection {
-    db: Connection,
+    db: ProtectedSqliteConnection,
     _use_guard: topology::UseGuard,
 }
 impl Deref for IndexConnection {
@@ -381,7 +392,7 @@ impl DerefMut for IndexConnection {
 // the caller's verified exclusive leader guard alive across its transaction.
 enum PublicationConnection {
     Live(IndexConnection),
-    Stage(Connection),
+    Stage(ProtectedSqliteConnection),
 }
 impl Deref for PublicationConnection {
     type Target = Connection;
@@ -541,12 +552,248 @@ const MAX_RETAINED_SQLITE_WITNESSES: usize = 4096;
 #[derive(Default)]
 struct RetainedSqliteWitnesses {
     by_path: std::collections::HashMap<std::path::PathBuf, Vec<Arc<std::fs::File>>>,
+    live: std::collections::HashMap<(std::path::PathBuf, u64, u64), usize>,
     count: usize,
 }
 static RETAINED_SQLITE_WITNESSES: std::sync::OnceLock<Mutex<RetainedSqliteWitnesses>> =
     std::sync::OnceLock::new();
 fn sqlite_witnesses() -> &'static Mutex<RetainedSqliteWitnesses> {
     RETAINED_SQLITE_WITNESSES.get_or_init(|| Mutex::new(RetainedSqliteWitnesses::default()))
+}
+
+// Every managed SQLite opener carries a live-inode registration until SQLite closes.
+pub(crate) struct ProtectedSqliteConnection {
+    db: Option<Connection>,
+    key: (std::path::PathBuf, u64, u64),
+}
+impl Deref for ProtectedSqliteConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.db.as_ref().expect("closed SQLite connection")
+    }
+}
+impl DerefMut for ProtectedSqliteConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.db.as_mut().expect("closed SQLite connection")
+    }
+}
+impl Drop for ProtectedSqliteConnection {
+    fn drop(&mut self) {
+        let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+        drop(self.db.take());
+        let live = registry
+            .live
+            .get_mut(&self.key)
+            .expect("registered SQLite connection");
+        *live -= 1;
+        if *live == 0 {
+            registry.live.remove(&self.key);
+        }
+    }
+}
+fn protected_sqlite_open(
+    path: &Path,
+    flags: rusqlite::OpenFlags,
+) -> Result<ProtectedSqliteConnection> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        path.is_absolute(),
+        "unsafe_index: SQLite path must be absolute"
+    );
+    let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    let named = std::fs::symlink_metadata(path)?;
+    ensure!(
+        named.is_file() && !named.file_type().is_symlink(),
+        "unsafe_index: SQLite pathname changed"
+    );
+    let file = registry
+        .by_path
+        .get(path)
+        .and_then(|files| {
+            files.iter().find(|file| {
+                file.metadata()
+                    .is_ok_and(|m| (m.dev(), m.ino()) == (named.dev(), named.ino()))
+            })
+        })
+        .context("unsafe_index: SQLite witness missing")?;
+    let held = file.metadata()?;
+    ensure!(
+        (held.dev(), held.ino()) == (named.dev(), named.ino()),
+        "unsafe_index: SQLite witness changed"
+    );
+    let db = Connection::open_with_flags(path, flags)?;
+    let after = std::fs::symlink_metadata(path)?;
+    ensure!(
+        (after.dev(), after.ino()) == (named.dev(), named.ino()),
+        "unsafe_index: SQLite pathname changed during open"
+    );
+    let key = (path.to_owned(), named.dev(), named.ino());
+    *registry.live.entry(key.clone()).or_default() += 1;
+    Ok(ProtectedSqliteConnection { db: Some(db), key })
+}
+
+/// Rename and release only the exact obsolete inode while holding verified EX
+/// and the process-wide opener mutex. No managed connection can slip between
+/// the live-count proof, rename and descriptor close.
+fn replace_index_and_release_obsolete(
+    old: IndexFileWitness,
+    stage: &Path,
+    leader: &topology::LeaderGuard,
+    roots: &topology::TopologyRoots,
+    identity: &topology::WorkspaceIdentity,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let old_path = old.path.clone();
+    let path = old_path.as_path();
+    leader.verify_exclusive_use(&roots.index_use_lock(identity))?;
+    ensure!(
+        path == roots.index_db(identity),
+        "unsafe_index: wrong obsolete index path"
+    );
+    old.verify()?;
+    let held = old.file.metadata()?;
+    let inode = (held.dev(), held.ino());
+    let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    ensure!(
+        registry
+            .live
+            .get(&(path.to_owned(), inode.0, inode.1))
+            .copied()
+            .unwrap_or(0)
+            == 0,
+        "storage_busy: obsolete index has live SQLite connections"
+    );
+    let files = registry
+        .by_path
+        .get_mut(path)
+        .context("unsafe_index: obsolete witness missing")?;
+    let position = files
+        .iter()
+        .position(|file| file.metadata().is_ok_and(|m| (m.dev(), m.ino()) == inode))
+        .context("unsafe_index: obsolete witness identity changed")?;
+    ensure!(
+        Arc::strong_count(&files[position]) == 2,
+        "storage_busy: obsolete index witness still borrowed"
+    );
+    ensure!(
+        registry.live.keys().all(|(named, _, _)| named != stage),
+        "storage_busy: staged index still has live SQLite connections"
+    );
+    let staged_files = registry
+        .by_path
+        .get(stage)
+        .context("unsafe_index: staged witness missing")?;
+    ensure!(
+        staged_files.len() == 1,
+        "unsafe_index: unexpected staged witness count"
+    );
+    std::fs::rename(stage, path)?;
+    drop(old);
+    let files = registry
+        .by_path
+        .get_mut(path)
+        .expect("verified obsolete witness");
+    let file = files.remove(position);
+    if files.is_empty() {
+        registry.by_path.remove(path);
+    }
+    registry.count -= 1;
+    drop(file);
+    let staged = registry
+        .by_path
+        .remove(stage)
+        .expect("verified staged witness");
+    registry
+        .by_path
+        .entry(path.to_owned())
+        .or_default()
+        .extend(staged);
+    Ok(())
+}
+
+/// Called only after GC has unlinked an exact managed SQLite inode while it
+/// still holds the nonblocking verified EX index-use guard. Unrelated witnesses
+/// (including another incarnation at the same name) are never released.
+#[allow(dead_code)] // The GC deletion slice calls this after its guarded unlink.
+pub(crate) fn release_deleted_sqlite_witness(
+    path: &Path,
+    inode: (u64, u64),
+    exclusive: &topology::UseGuard,
+) -> Result<()> {
+    release_deleted_sqlite_witness_kind(path, inode, exclusive, false)
+}
+
+fn release_deleted_sqlite_witness_kind(
+    path: &Path,
+    inode: (u64, u64),
+    exclusive: &topology::UseGuard,
+    failed_stage: bool,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        path.is_absolute() && inode.0 != 0 && inode.1 != 0,
+        "unsafe_index: unproved SQLite inode identity"
+    );
+    let name = path.file_name().and_then(|s| s.to_str());
+    ensure!(
+        if failed_stage {
+            name.and_then(|s| s.strip_prefix("index.db.tmp-"))
+                .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
+        } else {
+            matches!(name, Some("index.db" | "requests.db"))
+        },
+        "unsafe_index: not an exact managed SQLite database"
+    );
+    let parent = path
+        .parent()
+        .context("unsafe_index: missing index directory")?;
+    let lock = parent.with_extension("lock");
+    exclusive.verify_exclusive_path(&lock)?;
+    let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    let named = match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+        Ok(named) => Some(named),
+    };
+    ensure!(
+        registry
+            .live
+            .get(&(path.to_owned(), inode.0, inode.1))
+            .copied()
+            .unwrap_or(0)
+            == 0,
+        "storage_busy: deleted SQLite inode has live connections"
+    );
+    let files = registry
+        .by_path
+        .get_mut(path)
+        .context("unsafe_index: deleted SQLite witness missing")?;
+    let position = files
+        .iter()
+        .position(|file| file.metadata().is_ok_and(|m| (m.dev(), m.ino()) == inode))
+        .context("unsafe_index: deleted SQLite witness identity changed")?;
+    let held = files[position].metadata()?;
+    ensure!(
+        held.nlink() == 0,
+        "unsafe_index: obsolete SQLite inode is still linked"
+    );
+    if named.is_some() {
+        if failed_stage {
+            return Err(ForeignStagedIndex.into());
+        }
+        anyhow::bail!("unsafe_index: SQLite pathname occupied; obsolete witness retained");
+    }
+    ensure!(
+        Arc::strong_count(&files[position]) == 1,
+        "storage_busy: deleted SQLite witness still borrowed"
+    );
+    let file = files.remove(position);
+    if files.is_empty() {
+        registry.by_path.remove(path);
+    }
+    registry.count -= 1;
+    drop(file);
+    Ok(())
 }
 
 fn retained_sqlite_file(
@@ -572,6 +819,24 @@ fn retained_sqlite_file(
                 return Ok(file.clone());
             }
         }
+    }
+    // A staged inode may have been renamed to index.db. Reuse its exact
+    // descriptor rather than open a second fd for the same SQLite inode.
+    if let Ok(named) = std::fs::symlink_metadata(path)
+        && named.is_file()
+        && !named.file_type().is_symlink()
+        && let Some(file) = witnesses.by_path.values().flatten().find(|file| {
+            file.metadata()
+                .is_ok_and(|m| (m.dev(), m.ino()) == (named.dev(), named.ino()))
+        })
+    {
+        let file = file.clone();
+        witnesses
+            .by_path
+            .entry(path.to_owned())
+            .or_default()
+            .push(file.clone());
+        return Ok(file);
     }
     ensure!(
         witnesses.count < MAX_RETAINED_SQLITE_WITNESSES,
@@ -720,6 +985,7 @@ impl IndexFileWitness {
     }
 }
 // The staged file is private to this attempt. On failure, only unlink our own inode.
+#[derive(Debug)]
 struct StagedIndex {
     path: std::path::PathBuf,
     file: Arc<std::fs::File>,
@@ -744,21 +1010,9 @@ impl StagedIndex {
         Ok(())
     }
 }
-impl Drop for StagedIndex {
-    fn drop(&mut self) {
-        use std::os::unix::fs::MetadataExt;
-        if self.published {
-            return;
-        }
-        if let (Ok(owned), Ok(named)) =
-            (self.file.metadata(), std::fs::symlink_metadata(&self.path))
-            && owned.dev() == named.dev()
-            && owned.ino() == named.ino()
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
+// Aborted stages are explicitly unlinked and unwitnessed under verified EX by
+// Store::cleanup_failed_staged_index. An unexpected drop leaves the temporary
+// file on disk rather than silently creating a retained, deleted inode.
 /// Match every cache schema object, including type, name, owning table, SQL,
 /// and SQLite autoindexes. Unknown views/triggers must never execute on rebaseline.
 fn validate_cache_shape(db: &Connection) -> Result<()> {
@@ -907,7 +1161,7 @@ fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
         [], |r| r.get(0),
     )?)
 }
-fn open_index_marker_probe(path: &Path, writable: bool) -> Result<Connection> {
+fn open_index_marker_probe(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
     use rusqlite::OpenFlags;
     reject_sidecars(path, writable)?;
     verify_index_file(path)?;
@@ -916,7 +1170,7 @@ fn open_index_marker_probe(path: &Path, writable: bool) -> Result<Connection> {
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let db = storage_result(Connection::open_with_flags(path, flags))?;
+    let db = protected_sqlite_open(path, flags)?;
     storage_result(db.busy_timeout(Duration::ZERO))?;
     storage_result(db.pragma_update(None, "temp_store", "MEMORY"))?;
     storage_result(db.pragma_update(None, "foreign_keys", "ON"))?;
@@ -963,7 +1217,7 @@ fn read_index_format_marker(db: &Connection) -> Result<IndexFormatMarker> {
     })
 }
 
-fn open_index(path: &Path, writable: bool) -> Result<Connection> {
+fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
     let db = open_index_marker_probe(path, writable)?;
     let marker = read_index_format_marker(&db)?;
     if marker.is_obsolete() {
@@ -3641,7 +3895,19 @@ impl Store {
         let store = Self::unopened(roots, identity)?;
         if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.leader(&store.identity)?;
-            store.initialize(&leader, before_publish)?;
+            let initialized = store.initialize(&leader, before_publish);
+            drop(leader);
+            if let Some(stage) = store.aborted_staged_index.lock().unwrap().take()
+                && let Err(cleanup) = store.cleanup_failed_staged_index(stage, None)
+            {
+                return Err(match initialized {
+                    Err(original) => {
+                        cleanup.context(format!("{original}: failed stage cleanup refused"))
+                    }
+                    Ok(()) => cleanup,
+                });
+            }
+            initialized?;
         }
         let admission = (|| -> Result<()> {
             let mut db = store.cache()?;
@@ -3682,6 +3948,7 @@ impl Store {
             obsolete_format_marker: Arc::new(Mutex::new(None)),
             pending_request_completion: Arc::new(Mutex::new(None)),
             request_file_witness: Arc::new(Mutex::new(None)),
+            aborted_staged_index: Arc::new(Mutex::new(None)),
             writer_counters: Arc::new(Mutex::new(None)),
             retention_clock: Arc::new(Mutex::new(RetentionClock {
                 origin_wall: publication_second()?,
@@ -3878,7 +4145,76 @@ impl Store {
     }
     /// Build a private schema-8 bootstrap only; the caller must validate and publish it.
     /// The returned guard unlinks only its own stage inode if it is not published.
-    fn create_staged_index(&self, leader: &topology::LeaderGuard) -> Result<StagedIndex> {
+    fn cleanup_failed_staged_index(
+        &self,
+        staged: StagedIndex,
+        exclusive_leader: Option<&topology::LeaderGuard>,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            !staged.published,
+            "unsafe_index: cannot discard published stage"
+        );
+        let path = staged.path.clone();
+        let metadata = staged.file.metadata()?;
+        let inode = (metadata.dev(), metadata.ino());
+        let use_path = self.roots.index_use_lock(&self.identity);
+        // Never unlink until exclusive admission; inability to prove this
+        // leaves a named temporary file rather than leaked deleted-file space.
+        let acquired = if exclusive_leader.is_none() {
+            Some(self.roots.index_use_exclusive_existing(&self.identity)?)
+        } else {
+            None
+        };
+        let guard = match exclusive_leader {
+            Some(leader) => leader.exclusive_use_guard(&use_path)?,
+            None => acquired.as_ref().expect("verified exclusive guard"),
+        };
+        match std::fs::symlink_metadata(&path) {
+            Ok(named) if (named.dev(), named.ino()) == inode => staged.verify_path()?,
+            Ok(_) => return Err(ForeignStagedIndex.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ensure!(
+                metadata.nlink() == 0,
+                "unsafe_index: failed stage inode location not proved"
+            ),
+            Err(error) => return Err(error.into()),
+        }
+        {
+            let registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+            ensure!(
+                registry
+                    .live
+                    .get(&(path.clone(), inode.0, inode.1))
+                    .copied()
+                    .unwrap_or(0)
+                    == 0,
+                "storage_busy: failed stage still has live SQLite connections"
+            );
+            let files = registry
+                .by_path
+                .get(&path)
+                .context("unsafe_index: failed stage witness missing")?;
+            ensure!(
+                files.len() == 1 && Arc::strong_count(&staged.file) == 2,
+                "storage_busy: failed stage witness still borrowed"
+            );
+            match std::fs::symlink_metadata(&path) {
+                Ok(named) if (named.dev(), named.ino()) == inode => {
+                    std::fs::remove_file(&path)?;
+                }
+                Ok(_) => return Err(ForeignStagedIndex.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        drop(staged); // release only the stage's Arc, never a live SQLite fd
+        release_deleted_sqlite_witness_kind(&path, inode, guard, true)
+    }
+    fn create_staged_index(
+        &self,
+        leader: &topology::LeaderGuard,
+        under_exclusive: bool,
+    ) -> Result<StagedIndex> {
         use rusqlite::OpenFlags;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
@@ -3890,43 +4226,56 @@ impl Store {
             file,
             published: false,
         };
-        let db = Connection::open_with_flags(
-            &staged.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        db.busy_timeout(Duration::ZERO)?;
-        db.pragma_update(None, "journal_mode", "DELETE")?;
-        db.pragma_update(None, "synchronous", "FULL")?;
-        db.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            db.execute_batch(CACHE_SCHEMA_V8)?;
-            let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
-            db.execute(
-                "INSERT INTO index_metadata VALUES(1,8,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL,NULL)",
-                params![
-                    EXTRACTOR_VERSION,
-                    self.workspace_root,
-                    self.identity.device.to_string(),
-                    self.identity.inode.to_string(),
-                    uuid::Uuid::new_v4().to_string(),
-                    age as i64,
-                    json(&IndexStats::default())?,
-                    json(&Vec::<Diagnostic>::new())?
-                ],
+        let creation = (|| -> Result<()> {
+            let db = protected_sqlite_open(
+                &staged.path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
-            db.execute_batch("COMMIT")?;
+            db.busy_timeout(Duration::ZERO)?;
+            db.pragma_update(None, "journal_mode", "DELETE")?;
+            db.pragma_update(None, "synchronous", "FULL")?;
+            db.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<()> {
+                db.execute_batch(CACHE_SCHEMA_V8)?;
+                let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
+                db.execute(
+                    "INSERT INTO index_metadata VALUES(1,8,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL,NULL)",
+                    params![
+                        EXTRACTOR_VERSION,
+                        self.workspace_root,
+                        self.identity.device.to_string(),
+                        self.identity.inode.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        age as i64,
+                        json(&IndexStats::default())?,
+                        json(&Vec::<Diagnostic>::new())?
+                    ],
+                )?;
+                db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
+                db.execute_batch("COMMIT")?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = db.execute_batch("ROLLBACK");
+            }
+            result?;
+            drop(db);
             Ok(())
         })();
-        if result.is_err() {
-            let _ = db.execute_batch("ROLLBACK");
+        match creation {
+            Ok(()) => Ok(staged),
+            Err(error) => {
+                if under_exclusive {
+                    self.cleanup_failed_staged_index(staged, Some(leader))?;
+                } else {
+                    *self.aborted_staged_index.lock().unwrap() = Some(staged);
+                }
+                Err(error)
+            }
         }
-        result?;
-        drop(db);
-        Ok(staged)
     }
     fn validate_replacement_index(
         &self,
@@ -4087,121 +4436,133 @@ impl Store {
                 "recovery_required: obsolete marker changed before stage"
             );
         }
-        let mut stage = self.create_staged_index(leader)?;
-        let (graph, native, capture) =
-            crate::indexer::index_workspace_bundle(options, self.root_id(), cancel, |_| {})?;
-        let pin = self.publish_native_to_stage(
-            (&graph, &capture, &native),
-            &stage,
-            leader,
-            cancel,
-            |_, _| Ok(()),
-        )?;
-        ensure!(
-            pin.index_revision == 1,
-            "recovery_required: replacement must start at revision one"
-        );
-        self.validate_replacement_index(&stage.path, &stage, leader, pin)?;
-        stage.file.sync_all()?;
-        stage.verify_path()?;
-        old.verify()?;
-        if let Some(journal) = &journal {
-            journal.verify()?;
-        }
-        check_cancel(cancel)?;
-        capture.verify(cancel)?;
-        self.identity.verify()?;
-        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
-        at(ActivationStage::BeforeRename)?;
-        old.verify()?;
-        stage.verify_path()?;
-        // The publisher's earlier validation is not enough: a failed or hot
-        // staged journal appearing at this barrier must never reach index.db.
-        reject_sidecars(&stage.path, true)?;
-        check_cancel(cancel)?;
-        capture.verify(cancel)?;
-        self.identity.verify()?;
-        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
-        let dir = self.roots.index_dir(&self.identity);
-        let backup = if let Some(journal) = &journal {
-            let backup = dir.join(format!("index.db-journal.tmp-{}", uuid::Uuid::new_v4()));
+        let mut stage = self.create_staged_index(leader, true)?;
+        let result = (|| -> Result<IndexPin> {
+            let (graph, native, capture) =
+                crate::indexer::index_workspace_bundle(options, self.root_id(), cancel, |_| {})?;
+            let pin = self.publish_native_to_stage(
+                (&graph, &capture, &native),
+                &stage,
+                leader,
+                cancel,
+                |_, _| Ok(()),
+            )?;
             ensure!(
-                !index_path_present(&backup)?,
-                "unsafe_index: journal backup exists"
+                pin.index_revision == 1,
+                "recovery_required: replacement must start at revision one"
             );
-            journal.verify()?;
-            std::fs::rename(&journal.path, &backup)?;
-            if let Err(error) = journal.verify_at(&backup) {
-                restore_index_journal(journal, &backup, &dir)
-                    .context("incomplete_recovery: journal restoration failed")?;
-                return Err(error);
+            self.validate_replacement_index(&stage.path, &stage, leader, pin)?;
+            stage.file.sync_all()?;
+            stage.verify_path()?;
+            old.verify()?;
+            if let Some(journal) = &journal {
+                journal.verify()?;
             }
-            // Make the retained journal backup durable before replacing its old
-            // index. On any failure before the live rename, restore its pathname.
-            let durable_backup = at(ActivationStage::AfterJournalBackupBeforeDirFsync)
-                .and_then(|_| reject_sidecars(&stage.path, true))
-                .and_then(|_| {
-                    std::fs::File::open(&dir)?.sync_all()?;
-                    Ok(())
-                });
-            if let Err(error) = durable_backup {
-                restore_index_journal(journal, &backup, &dir)
-                    .context("incomplete_recovery: journal restoration failed")?;
-                return Err(error);
-            }
-            Some(backup)
-        } else {
-            None
-        };
-        if let Some(marker) = &obsolete {
-            let recheck = (|| -> Result<()> {
-                old.verify()?;
-                let db = open_index_marker_probe(&path, false)?;
-                self.verify_metadata_root(&db)?;
+            check_cancel(cancel)?;
+            capture.verify(cancel)?;
+            self.identity.verify()?;
+            leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+            at(ActivationStage::BeforeRename)?;
+            old.verify()?;
+            stage.verify_path()?;
+            // The publisher's earlier validation is not enough: a failed or hot
+            // staged journal appearing at this barrier must never reach index.db.
+            reject_sidecars(&stage.path, true)?;
+            check_cancel(cancel)?;
+            capture.verify(cancel)?;
+            self.identity.verify()?;
+            leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+            let dir = self.roots.index_dir(&self.identity);
+            let backup = if let Some(journal) = &journal {
+                let backup = dir.join(format!("index.db-journal.tmp-{}", uuid::Uuid::new_v4()));
                 ensure!(
-                    read_index_format_marker(&db)?.eq(marker),
-                    "recovery_required: obsolete marker changed before rename"
+                    !index_path_present(&backup)?,
+                    "unsafe_index: journal backup exists"
                 );
-                stage.verify_path()?;
-                reject_sidecars(&stage.path, true)?;
-                reject_sidecars(&path, true)?;
-                leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
-                check_cancel(cancel)
-            })();
-            if let Err(error) = recheck {
+                journal.verify()?;
+                std::fs::rename(&journal.path, &backup)?;
+                if let Err(error) = journal.verify_at(&backup) {
+                    restore_index_journal(journal, &backup, &dir)
+                        .context("incomplete_recovery: journal restoration failed")?;
+                    return Err(error);
+                }
+                // Make the retained journal backup durable before replacing its old
+                // index. On any failure before the live rename, restore its pathname.
+                let durable_backup = at(ActivationStage::AfterJournalBackupBeforeDirFsync)
+                    .and_then(|_| reject_sidecars(&stage.path, true))
+                    .and_then(|_| {
+                        std::fs::File::open(&dir)?.sync_all()?;
+                        Ok(())
+                    });
+                if let Err(error) = durable_backup {
+                    restore_index_journal(journal, &backup, &dir)
+                        .context("incomplete_recovery: journal restoration failed")?;
+                    return Err(error);
+                }
+                Some(backup)
+            } else {
+                None
+            };
+            if let Some(marker) = &obsolete {
+                let recheck = (|| -> Result<()> {
+                    old.verify()?;
+                    let db = open_index_marker_probe(&path, false)?;
+                    self.verify_metadata_root(&db)?;
+                    ensure!(
+                        read_index_format_marker(&db)?.eq(marker),
+                        "recovery_required: obsolete marker changed before rename"
+                    );
+                    stage.verify_path()?;
+                    reject_sidecars(&stage.path, true)?;
+                    reject_sidecars(&path, true)?;
+                    leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+                    check_cancel(cancel)
+                })();
+                if let Err(error) = recheck {
+                    if let (Some(journal), Some(backup)) = (&journal, &backup) {
+                        restore_index_journal(journal, backup, &dir)
+                            .context("incomplete_recovery: journal restoration failed")?;
+                    }
+                    return Err(error);
+                }
+            }
+            if let Err(error) = replace_index_and_release_obsolete(
+                old,
+                &stage.path,
+                leader,
+                &self.roots,
+                &self.identity,
+            ) {
                 if let (Some(journal), Some(backup)) = (&journal, &backup) {
                     restore_index_journal(journal, backup, &dir)
                         .context("incomplete_recovery: journal restoration failed")?;
                 }
                 return Err(error);
             }
-        }
-        if let Err(error) = std::fs::rename(&stage.path, &path) {
-            if let (Some(journal), Some(backup)) = (&journal, &backup) {
-                restore_index_journal(journal, backup, &dir)
-                    .context("incomplete_recovery: journal restoration failed")?;
-            }
-            return Err(error.into());
-        }
-        // The atomic rename may already be durable even if any later step fails.
-        // Never let the stage guard unlink the now-live replacement inode.
-        stage.published = true;
-        at(ActivationStage::AfterRenameBeforeDirFsync)?;
-        std::fs::File::open(&dir)?.sync_all()?;
-        if let (Some(journal), Some(backup)) = (&journal, &backup) {
-            journal.verify_at(backup)?;
-            std::fs::remove_file(backup)?;
+            // The atomic rename may already be durable even if any later step fails.
+            // Never let the stage guard unlink the now-live replacement inode.
+            stage.published = true;
+            at(ActivationStage::AfterRenameBeforeDirFsync)?;
             std::fs::File::open(&dir)?.sync_all()?;
+            if let (Some(journal), Some(backup)) = (&journal, &backup) {
+                journal.verify_at(backup)?;
+                std::fs::remove_file(backup)?;
+                std::fs::File::open(&dir)?.sync_all()?;
+            }
+            self.validate_replacement_index(&path, &stage, leader, pin)?;
+            leader.downgrade_use_to_shared()?;
+            leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+            self.identity.verify()?;
+            // This order means every clone still refuses while recovery_required is true.
+            self.recovery_disposition
+                .store(RecoveryDisposition::Ready as u8, Ordering::Release);
+            self.recovery_required.store(false, Ordering::Release);
+            Ok(pin)
+        })();
+        if result.is_err() && !stage.published {
+            self.cleanup_failed_staged_index(stage, Some(leader))?;
         }
-        self.validate_replacement_index(&path, &stage, leader, pin)?;
-        leader.downgrade_use_to_shared()?;
-        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
-        self.identity.verify()?;
-        // This order means every clone still refuses while recovery_required is true.
-        self.recovery_disposition
-            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
-        self.recovery_required.store(false, Ordering::Release);
-        Ok(pin)
+        result
     }
     fn initialize(
         &self,
@@ -4215,41 +4576,87 @@ impl Store {
         if index_path_present(&path)? {
             return Ok(());
         }
-        let use_guard = self.roots.index_use(&self.identity)?;
-        let mut staged = self.create_staged_index(leader)?;
-        before_publish(&staged.path)?;
-        verify_index_file(&staged.path)?;
-        let mut checked = open_index(&staged.path, true)?;
-        let checked_snapshot = storage_result(checked.transaction())?;
-        self.decode_control_status_raw(&checked_snapshot)?;
-        let integrity: String =
-            storage_result(checked_snapshot.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
-        ensure!(
-            integrity == "ok",
-            "incompatible_index: staged integrity check failed"
-        );
-        drop(checked_snapshot);
-        drop(checked);
-        staged.file.sync_all()?;
-        // The verified pathname must still refer to the inode we created.
-        use std::os::unix::fs::MetadataExt;
-        let named = std::fs::symlink_metadata(&staged.path)?;
-        let opened = staged.file.metadata()?;
-        ensure!(
-            named.is_file() && named.dev() == opened.dev() && named.ino() == opened.ino(),
-            "unsafe_index: staged pathname changed"
-        );
-        leader.verify()?;
-        use_guard.verify()?;
-        self.identity.verify()?;
-        ensure!(
-            !index_path_present(&path)?,
-            "incompatible_index: index appeared during initialization"
-        );
-        std::fs::rename(&staged.path, &path)?;
-        staged.published = true;
-        std::fs::File::open(self.roots.index_dir(&self.identity))?.sync_all()?;
-        Ok(())
+        // Stage creation precedes SH admission so its own failure can seek EX
+        // to release a deleted inode without upgrading a held shared guard.
+        let mut staged = self.create_staged_index(leader, false)?;
+        let use_guard = match self.roots.index_use(&self.identity) {
+            Ok(guard) => guard,
+            Err(error) => {
+                *self.aborted_staged_index.lock().unwrap() = Some(staged);
+                return Err(error);
+            }
+        };
+        let result = (|| -> Result<()> {
+            before_publish(&staged.path)?;
+            verify_index_file(&staged.path)?;
+            let mut checked = open_index(&staged.path, true)?;
+            let checked_snapshot = storage_result(checked.transaction())?;
+            self.decode_control_status_raw(&checked_snapshot)?;
+            let integrity: String =
+                storage_result(checked_snapshot.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
+            ensure!(
+                integrity == "ok",
+                "incompatible_index: staged integrity check failed"
+            );
+            drop(checked_snapshot);
+            drop(checked);
+            staged.file.sync_all()?;
+            // The verified pathname must still refer to the inode we created.
+            use std::os::unix::fs::MetadataExt;
+            let named = std::fs::symlink_metadata(&staged.path)?;
+            let opened = staged.file.metadata()?;
+            ensure!(
+                named.is_file() && named.dev() == opened.dev() && named.ino() == opened.ino(),
+                "unsafe_index: staged pathname changed"
+            );
+            leader.verify()?;
+            use_guard.verify()?;
+            self.identity.verify()?;
+            ensure!(
+                !index_path_present(&path)?,
+                "incompatible_index: index appeared during initialization"
+            );
+            {
+                let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+                ensure!(
+                    registry
+                        .live
+                        .keys()
+                        .all(|(named, _, _)| named != &staged.path),
+                    "storage_busy: staged index still has live SQLite connections"
+                );
+                ensure!(
+                    registry.live.keys().all(|(named, _, _)| named != &path),
+                    "storage_busy: prior index incarnation still has live SQLite connections"
+                );
+                let files = registry
+                    .by_path
+                    .get(&staged.path)
+                    .context("unsafe_index: staged witness missing")?;
+                ensure!(
+                    files.len() == 1,
+                    "unsafe_index: unexpected staged witness count"
+                );
+                std::fs::rename(&staged.path, &path)?;
+                let files = registry
+                    .by_path
+                    .remove(&staged.path)
+                    .expect("verified staged witness");
+                registry
+                    .by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .extend(files);
+            }
+            staged.published = true;
+            std::fs::File::open(self.roots.index_dir(&self.identity))?.sync_all()?;
+            Ok(())
+        })();
+        drop(use_guard);
+        if result.is_err() && !staged.published {
+            *self.aborted_staged_index.lock().unwrap() = Some(staged);
+        }
+        result
     }
     pub fn leader(&self) -> Result<topology::LeaderGuard> {
         self.leader_with_open_hook(|_| Ok(()))
@@ -9992,7 +10399,7 @@ mod rebaseline_fault_tests {
             .roots
             .leader_under_exclusive(&recovering.identity, exclusive)
             .unwrap();
-        let stage = recovering.create_staged_index(&leader).unwrap();
+        let stage = recovering.create_staged_index(&leader, true).unwrap();
         let (graph, native, capture) =
             index_workspace_bundle(&options, recovering.root_id(), &cancel, |_| {}).unwrap();
         let replacement = recovering
@@ -10039,7 +10446,7 @@ mod rebaseline_fault_tests {
                 .contains("recovery_required")
         );
 
-        let failing = recovering.create_staged_index(&leader).unwrap();
+        let failing = recovering.create_staged_index(&leader, true).unwrap();
         let error = recovering
             .publish_native_to_stage(
                 (&graph, &capture, &native),
@@ -10087,6 +10494,12 @@ mod rebaseline_fault_tests {
                 .to_string()
                 .contains("recovery_required")
         );
+        recovering
+            .cleanup_failed_staged_index(failing, Some(&leader))
+            .unwrap();
+        recovering
+            .cleanup_failed_staged_index(stage, Some(&leader))
+            .unwrap();
     }
 
     #[test]
@@ -12373,5 +12786,348 @@ mod live_sqlite_witness_tests {
             witness.verify().unwrap();
             drop(witness);
         });
+    }
+}
+
+#[cfg(test)]
+mod sqlite_deleted_witness_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn fixed_capacity_fails_before_opening_another_sqlite_inode() {
+        if std::env::var_os("BALEYG_WITNESS_CAP_CHILD").is_none() {
+            let outcome = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("store::sqlite_deleted_witness_tests::fixed_capacity_fails_before_opening_another_sqlite_inode")
+                .env("BALEYG_WITNESS_CAP_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                outcome.status.success(),
+                "{}",
+                String::from_utf8_lossy(&outcome.stdout)
+            );
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("index.db");
+        {
+            let mut registry = sqlite_witnesses().lock().unwrap();
+            registry.count = MAX_RETAINED_SQLITE_WITNESSES;
+        }
+        let error = retained_sqlite_file(&path, true, true, false).unwrap_err();
+        assert!(error.to_string().contains("capacity reached"));
+        assert!(
+            !path.exists(),
+            "capacity refusal must precede file creation"
+        );
+    }
+
+    #[test]
+    fn exclusive_release_closes_only_deleted_index_after_all_sqlite_connections() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let guard = store
+            .roots
+            .index_use_exclusive_existing(&store.identity)
+            .unwrap();
+        let db = open_index(&path, false).unwrap();
+        let inode = std::fs::metadata(&path).unwrap();
+        let inode = (inode.dev(), inode.ino());
+        assert!(
+            release_deleted_sqlite_witness(&path, inode, &guard).is_err(),
+            "a named live index cannot be released"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            release_deleted_sqlite_witness(&path, inode, &guard).is_err(),
+            "a deleted inode with an open SQLite connection must remain witnessed"
+        );
+        drop(db);
+        release_deleted_sqlite_witness(&path, inode, &guard).unwrap();
+        let registry = sqlite_witnesses().lock().unwrap();
+        assert!(
+            !registry.by_path.contains_key(&path),
+            "deleted file descriptor must be closed"
+        );
+    }
+    #[test]
+    fn aborted_stage_retries_and_successful_recreations_do_not_accumulate_witnesses() {
+        if std::env::var_os("BALEYG_STAGE_RETRY_CHILD").is_none() {
+            let outcome = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("store::sqlite_deleted_witness_tests::aborted_stage_retries_and_successful_recreations_do_not_accumulate_witnesses")
+                .env("BALEYG_STAGE_RETRY_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                outcome.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&outcome.stdout),
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        for _ in 0..8 {
+            let error =
+                Store::open_for_tests_with_index_stage_hook(state.path(), workspace.path(), |_| {
+                    anyhow::bail!("injected aborted stage")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("injected aborted stage"));
+            let registry = sqlite_witnesses().lock().unwrap();
+            assert_eq!(
+                registry.count, 0,
+                "aborted stage leaked an inode descriptor/cap slot"
+            );
+            assert!(registry.by_path.is_empty());
+        }
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        assert_eq!(sqlite_witnesses().lock().unwrap().count, 1);
+        drop(store);
+        for _ in 0..3 {
+            std::fs::write(&path, b"short").unwrap();
+            let recovering = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+            let (_, leader) = recovering
+                .recreate_pending_leader_session(
+                    &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+                    &Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            drop(leader);
+            let registry = sqlite_witnesses().lock().unwrap();
+            assert_eq!(
+                registry.count, 1,
+                "recreation retained an obsolete fd/cap slot"
+            );
+            assert_eq!(registry.by_path.get(&path).map(Vec::len), Some(1));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
+        if std::env::var_os("BALEYG_SPACE_CHILD").is_none() {
+            let outcome = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("store::sqlite_deleted_witness_tests::isolated_filesystem_returns_allocated_blocks_only_after_verified_release")
+                .env("BALEYG_SPACE_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                outcome.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&outcome.stdout),
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        use std::process::Command;
+        let home = tempfile::tempdir().unwrap();
+        let image = home.path().join("witness.sparseimage");
+        let mount = home.path().join("mounted");
+        std::fs::create_dir(&mount).unwrap();
+        let created = Command::new("/usr/bin/hdiutil")
+            .args([
+                "create",
+                "-size",
+                "128m",
+                "-fs",
+                "HFS+",
+                "-volname",
+                "baleyg-witness-test",
+                "-type",
+                "SPARSE",
+                "-quiet",
+            ])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "hdiutil create: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let attached = Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg("-quiet")
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(
+            attached.status.success(),
+            "hdiutil attach: {}",
+            String::from_utf8_lossy(&attached.stderr)
+        );
+        struct Mounted {
+            path: std::path::PathBuf,
+            attached: bool,
+        }
+        impl Mounted {
+            fn detach(&mut self) -> Result<()> {
+                let outcome = Command::new("/usr/bin/hdiutil")
+                    .arg("detach")
+                    .arg(&self.path)
+                    .arg("-quiet")
+                    .output()?;
+                ensure!(
+                    outcome.status.success(),
+                    "hdiutil detach: {}",
+                    String::from_utf8_lossy(&outcome.stderr)
+                );
+                self.attached = false;
+                Ok(())
+            }
+        }
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                if self.attached
+                    && let Err(error) = self.detach()
+                {
+                    eprintln!("isolated filesystem cleanup failed: {error:#}");
+                }
+            }
+        }
+        let mut mounted = Mounted {
+            path: mount.clone(),
+            attached: true,
+        };
+        let mounted_device = std::fs::metadata(&mount).unwrap().dev();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fn available(path: &Path) -> u64 {
+            use std::ffi::CString;
+            let cpath = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) }, 0);
+            u64::from(stat.f_bavail) * stat.f_frsize
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(&mount, workspace.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let db = protected_sqlite_open(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        db.execute_batch("CREATE TABLE witness_allocation(payload BLOB); INSERT INTO witness_allocation VALUES(zeroblob(16777216));").unwrap();
+        drop(db);
+        let named = std::fs::metadata(&path).unwrap();
+        let allocated = named.blocks() * 512;
+        assert!(
+            allocated >= 8 * 1024 * 1024,
+            "SQLite payload is sparse: {allocated}"
+        );
+        let inode = (named.dev(), named.ino());
+        let descriptor = {
+            let registry = sqlite_witnesses().lock().unwrap();
+            let file = registry.by_path.get(&path).unwrap().first().unwrap();
+            file.as_raw_fd()
+        };
+        let guard = store
+            .roots
+            .index_use_exclusive_existing(&store.identity)
+            .unwrap();
+        let before = available(&mount);
+        std::fs::remove_file(&path).unwrap();
+        let still_held = available(&mount);
+        assert!(
+            still_held <= before + allocated / 4,
+            "deleted inode blocks returned before fd close: before={before}, held={still_held}, allocated={allocated}"
+        );
+        assert!(
+            unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0,
+            "retained deleted-inode fd was already closed"
+        );
+        release_deleted_sqlite_witness(&path, inode, &guard).unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_GETFD) },
+            -1,
+            "the exact deleted-inode kernel fd survived release"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let after = available(&mount);
+        assert!(
+            after >= still_held + allocated / 2,
+            "filesystem did not reclaim allocated deleted-inode blocks: held={still_held}, after={after}, allocated={allocated}"
+        );
+        drop(guard);
+        drop(store);
+        mounted.detach().unwrap();
+        assert_ne!(
+            std::fs::metadata(&mount).unwrap().dev(),
+            mounted_device,
+            "test image remained mounted after successful detach"
+        );
+    }
+    #[test]
+    fn foreign_replacement_stage_refuses_release_and_preserves_foreign_inode() {
+        if std::env::var_os("BALEYG_FOREIGN_STAGE_CHILD").is_none() {
+            let outcome = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("store::sqlite_deleted_witness_tests::foreign_replacement_stage_refuses_release_and_preserves_foreign_inode")
+                .env("BALEYG_FOREIGN_STAGE_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                outcome.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&outcome.stdout),
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let exclusive = store
+            .roots
+            .index_use_exclusive_existing(&store.identity)
+            .unwrap();
+        let leader = store
+            .roots
+            .leader_under_exclusive(&store.identity, exclusive)
+            .unwrap();
+        let stage = store.create_staged_index(&leader, true).unwrap();
+        let path = stage.path.clone();
+        let held = stage.file.metadata().unwrap();
+        let obsolete = (held.dev(), held.ino());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"foreign stage cannot be removed").unwrap();
+        let foreign = std::fs::symlink_metadata(&path).unwrap();
+        assert_ne!((foreign.dev(), foreign.ino()), obsolete);
+        let error = store
+            .cleanup_failed_staged_index(stage, Some(&leader))
+            .unwrap_err();
+        assert!(error.is::<ForeignStagedIndex>(), "wrong failure: {error:#}");
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!((foreign.dev(), foreign.ino()), (after.dev(), after.ino()));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"foreign stage cannot be removed"
+        );
+        let guard = leader
+            .exclusive_use_guard(&store.roots.index_use_lock(&store.identity))
+            .unwrap();
+        let error = release_deleted_sqlite_witness_kind(&path, obsolete, guard, true).unwrap_err();
+        assert!(
+            error.is::<ForeignStagedIndex>(),
+            "direct release did not fail closed: {error:#}"
+        );
+        let registry = sqlite_witnesses().lock().unwrap();
+        let files = registry.by_path.get(&path).unwrap();
+        assert_eq!(files.len(), 1, "obsolete witness must remain cache-owned");
+        let retained = files[0].metadata().unwrap();
+        assert_eq!((retained.dev(), retained.ino()), obsolete);
+        assert_eq!(Arc::strong_count(&files[0]), 1);
+        assert_eq!(registry.live.get(&(path, obsolete.0, obsolete.1)), None);
     }
 }
