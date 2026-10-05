@@ -59,6 +59,15 @@ impl IndexJobCoordinator {
     pub fn session(&self) -> Arc<LeaderSession> {
         self.session.clone()
     }
+    fn maintain_after_publish(&self) {
+        if let Ok(leader) = self.session.leader_guard()
+            && let Err(error) = self.store.maintain_revisions(leader)
+        {
+            // Publication is already committed. Idle maintenance retries rather
+            // than turning a committed pin into an ambiguous failed request.
+            eprintln!("revision maintenance deferred: {error:#}");
+        }
+    }
 
     /// A diagnostic decision for two immutable admissions. Publication classifies
     /// its persisted prior manifest in one private read snapshot instead.
@@ -154,6 +163,7 @@ impl IndexJobCoordinator {
             });
             report("publish", phase_start.elapsed());
             observe(&capture);
+            self.maintain_after_publish();
             return Ok(pin);
         }
         let root = std::fs::canonicalize(&options.workspace_root)?;
@@ -193,10 +203,11 @@ impl IndexJobCoordinator {
                     &capture,
                     prepared,
                     self.session.leader_guard()?,
-                    self.expected,
+                    self.expected.clone(),
                     cancel,
                 )?;
                 report("publish", phase_start.elapsed());
+                self.maintain_after_publish();
                 return Ok(pin);
             }
             // A moved D4 class cut is unproved: recalculate every native fact
@@ -226,10 +237,11 @@ impl IndexJobCoordinator {
             &capture,
             &native,
             self.session.leader_guard()?,
-            self.expected,
+            self.expected.clone(),
             cancel,
         )?;
         report("publish", phase_start.elapsed());
+        self.maintain_after_publish();
         Ok(published)
     }
 }

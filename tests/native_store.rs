@@ -1609,7 +1609,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
             .native_source_at(r1, &key)
             .unwrap_err()
             .to_string()
-            .contains("revision conflict")
+            .contains("pin_expired")
     );
     // Release is durable before collection: lose the owner/process now, then
     // reopen the index while r1's unreachable rows still await fenced GC.
@@ -1671,7 +1671,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
         cold.native_source_at(r1, &key)
             .unwrap_err()
             .to_string()
-            .contains("revision conflict")
+            .contains("pin_expired")
     );
     assert_eq!(cold.native_source_at(r2, &key).unwrap().unwrap(), source2);
     assert!(cold.native_source_at(r3, &key).unwrap().is_none());
@@ -2128,4 +2128,260 @@ fn supersession_backfill_omits_released_tombstones() {
         )]
     );
     assert_eq!(reopened.index_baseline().unwrap(), r3);
+}
+
+#[test]
+fn retention_boundary_preserves_younger_manifests_and_collects_only_unreferenced() {
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let r1 = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let original = store.source_at("flow.js", Some(r1)).unwrap().unwrap();
+    fs::write(
+        root.path().join("flow.js"),
+        "function changed() { newer(); }\n",
+    )
+    .unwrap();
+    let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    fs::write(
+        root.path().join("flow.js"),
+        "function latest() { newest(); }\n",
+    )
+    .unwrap();
+    let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
+    let retained = store.source_at("flow.js", Some(r2)).unwrap().unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let key = format!("pin:v1:{}:{}", r1.index_generation, r1.index_revision);
+    let key2 = format!("pin:v1:{}:{}", r2.index_generation, r2.index_revision);
+    let shared: (String, String, String) = db.query_row(
+        "SELECT document_version_id,graph_projection_id,class_projection_id FROM revision_documents WHERE revision_id=?1 AND path='flow.java'",
+        [&key2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    for (key, stamp) in [(&key, 1_000), (&key2, 1_001)] {
+        assert_eq!(
+            db.query_row(
+                "SELECT superseded_at FROM native_revision_supersessions WHERE revision_id=?1",
+                [key],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            stamp
+        );
+    }
+    store.set_retention_clock_for_tests(1_899, 899);
+    store.maintain_revisions(&leader).unwrap();
+    assert_eq!(
+        store.source_at("flow.js", Some(r1)).unwrap().unwrap(),
+        original
+    );
+    assert_eq!(
+        store.source_at("flow.js", Some(r2)).unwrap().unwrap(),
+        retained
+    );
+    // At 900 seconds the first pin expires, but the second is 899 seconds old.
+    store.set_retention_clock_for_tests(1_900, 900);
+    store.maintain_revisions(&leader).unwrap();
+    let expired = store.source_at("flow.js", Some(r1)).unwrap_err();
+    assert!(
+        expired
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some(),
+        "{expired:#}"
+    );
+    assert_eq!(
+        store.source_at("flow.js", Some(r2)).unwrap().unwrap(),
+        retained
+    );
+    assert_eq!(store.status().unwrap().revision, r3);
+    assert!(store.source_at("flow.js", Some(r3)).unwrap().is_some());
+    assert!(store.graph_at(Some(r2)).is_ok());
+    assert!(
+        store
+            .classes_at(Some("flow.java"), "", Some(r2), 0, 10)
+            .is_ok()
+    );
+    for (table, id) in [
+        ("document_versions", &shared.0),
+        ("graph_projections", &shared.1),
+        ("class_projections", &shared.2),
+    ] {
+        assert_eq!(
+            db.query_row(
+                &format!("SELECT count(*) FROM {table} WHERE id=?1"),
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "shared {table} removed"
+        );
+    }
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [key],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(
+        db.prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none()
+    );
+    let foreign = IndexPin {
+        index_generation: uuid::Uuid::new_v4(),
+        index_revision: r1.index_revision,
+    };
+    assert!(
+        store
+            .source_at("flow.js", Some(foreign))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_none()
+    );
+}
+
+#[test]
+fn future_supersession_rollback_cannot_expire_unaged_pin() {
+    let (_state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let first = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let second = publish(&store, root.path(), &cancel, first, &leader).unwrap();
+    store.set_retention_clock_for_tests(5_000, 1);
+    let head = publish(&store, root.path(), &cancel, second, &leader).unwrap();
+    store.maintain_revisions(&leader).unwrap();
+    store.set_retention_clock_for_tests(1_001, 2);
+    store.maintain_revisions(&leader).unwrap();
+    assert!(
+        store.graph_at(Some(first)).is_ok(),
+        "future stamp must not expire an unaged pin after rollback"
+    );
+    assert!(store.graph_at(Some(second)).is_ok());
+    assert_eq!(store.status().unwrap().revision, head);
+    store.set_retention_clock_for_tests(1_900, 900);
+    store.maintain_revisions(&leader).unwrap();
+    assert!(
+        store.graph_at(Some(first)).is_ok(),
+        "uncorroborated latest stamp still fences expiration"
+    );
+    store.set_retention_clock_for_tests(1_001, 4_000);
+    store.maintain_revisions(&leader).unwrap();
+    assert!(
+        store
+            .graph_at(Some(first))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some()
+    );
+    assert!(store.graph_at(Some(head)).is_ok());
+}
+
+#[test]
+fn backward_step_keeps_young_pin_and_restart_uses_persisted_utc() {
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let first = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let head = publish(&store, root.path(), &cancel, first, &leader).unwrap();
+    store.set_retention_clock_for_tests(900, 100);
+    store.maintain_revisions(&leader).unwrap();
+    assert!(store.graph_at(Some(first)).is_ok());
+    drop(leader);
+    drop(store);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    reopened.set_retention_clock_for_tests(1_900, 0);
+    let leader = reopened.leader().unwrap();
+    // Takeover must reconcile before it may read/release the selected history.
+    publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
+    reopened.maintain_revisions(&leader).unwrap();
+    assert!(
+        reopened
+            .graph_at(Some(first))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some()
+    );
+}
+
+#[test]
+fn migrated_history_gets_new_clock_grace_until_exact_boundary() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let first = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let head = publish(&store, root.path(), &cancel, first, &leader).unwrap();
+    drop(leader);
+    drop(store);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    Connection::open(path)
+        .unwrap()
+        .execute_batch("DROP TABLE native_revision_supersessions")
+        .unwrap();
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    reopened.set_retention_clock_for_tests(1_000, 0);
+    let leader = reopened.leader().unwrap();
+    publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
+    reopened.set_retention_clock_for_tests(1_899, 899);
+    reopened.maintain_revisions(&leader).unwrap();
+    assert!(reopened.graph_at(Some(first)).is_ok());
+    reopened.set_retention_clock_for_tests(1_900, 900);
+    reopened.maintain_revisions(&leader).unwrap();
+    assert!(
+        reopened
+            .graph_at(Some(first))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some()
+    );
 }
