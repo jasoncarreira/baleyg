@@ -401,6 +401,22 @@ fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
                 );
             }
         }
+        if step == 4 {
+            let selected_deleted = store
+                .native_declarations_at(selected_pin, "javascript", "added")
+                .unwrap();
+            let cold_deleted = cold
+                .native_declarations_at(cold_pin, "javascript", "added")
+                .unwrap();
+            assert_eq!(
+                selected_deleted, cold_deleted,
+                "deleted c.js native declaration must match independent cold full"
+            );
+            assert!(
+                selected_deleted.is_empty(),
+                "deleted c.js must not leave a stale pinned native declaration"
+            );
+        }
         let seed = store
             .graph()
             .unwrap()
