@@ -568,6 +568,14 @@ fn sqlite_witnesses() -> &'static Mutex<RetainedSqliteWitnesses> {
     RETAINED_SQLITE_WITNESSES.get_or_init(|| Mutex::new(RetainedSqliteWitnesses::default()))
 }
 
+#[doc(hidden)]
+pub fn retained_sqlite_witness_count_for_tests() -> usize {
+    sqlite_witnesses()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .count
+}
+
 // Every managed SQLite opener carries a live-inode registration until SQLite closes.
 pub(crate) struct ProtectedSqliteConnection {
     db: Option<Connection>,
@@ -718,10 +726,69 @@ fn replace_index_and_release_obsolete(
     Ok(())
 }
 
+/// Destructive GC holds the candidate's verified EX use lock and the opener
+/// mutex across the final witness check and unlink. No protected connection or
+/// borrowed witness may outlive the removed inode in this process.
+pub(crate) fn gc_unlink_sqlite(
+    paths: &[(std::path::PathBuf, (u64, u64))],
+    exclusive: &topology::UseGuard,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    for (path, inode) in paths {
+        ensure!(
+            matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("index.db" | "requests.db")
+            ),
+            "unsafe_index: GC SQLite path"
+        );
+        exclusive.verify_exclusive_path(
+            &path
+                .parent()
+                .context("GC index parent missing")?
+                .with_extension("lock"),
+        )?;
+        let named = std::fs::symlink_metadata(path)?;
+        ensure!(
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && (named.dev(), named.ino()) == *inode
+                && named.nlink() == 1
+                && named.mode() & 0o777 == 0o600,
+            "unsafe_index: GC SQLite inode changed"
+        );
+        ensure!(
+            registry.live.keys().all(|(name, _, _)| name != path),
+            "storage_busy: GC SQLite connection still live"
+        );
+        let files = registry
+            .by_path
+            .get(path)
+            .context("unsafe_index: GC witness missing")?;
+        ensure!(
+            files.len() == 1
+                && files[0]
+                    .metadata()
+                    .is_ok_and(|m| (m.dev(), m.ino()) == *inode)
+                && Arc::strong_count(&files[0]) == 1,
+            "storage_busy: GC SQLite witness borrowed or changed"
+        );
+    }
+    for (path, _) in paths {
+        exclusive.verify()?;
+        std::fs::remove_file(path)?;
+        let files = registry.by_path.remove(path).expect("preflight GC witness");
+        registry.count -= files.len();
+        drop(files);
+    }
+    Ok(())
+}
+
 /// Called only after GC has unlinked an exact managed SQLite inode while it
 /// still holds the nonblocking verified EX index-use guard. Unrelated witnesses
 /// (including another incarnation at the same name) are never released.
-#[allow(dead_code)] // The GC deletion slice calls this after its guarded unlink.
+#[allow(dead_code)] // Also exercised by the retained SQLite witness lifecycle tests.
 pub(crate) fn release_deleted_sqlite_witness(
     path: &Path,
     inode: (u64, u64),
@@ -7990,6 +8057,20 @@ impl Store {
             "invalid_supersession_time"
         );
         Ok(Duration::from_secs(wall as u64))
+    }
+
+    /// Leader-owned, best-effort derived GC. The caller chooses the hourly
+    /// check cadence; the shared cache stamp enforces the daily scan limit.
+    pub fn automatic_gc(&self, leader: &topology::LeaderGuard) -> Result<usize> {
+        let now = publication_second()?;
+        self.automatic_gc_at(leader, now)
+    }
+
+    #[doc(hidden)]
+    pub fn automatic_gc_at(&self, leader: &topology::LeaderGuard, now: i64) -> Result<usize> {
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        self.roots.automatic_gc_at(&self.identity, leader, now)
     }
 
     /// Only the verified owner may expire pins. An in-process forward clock jump

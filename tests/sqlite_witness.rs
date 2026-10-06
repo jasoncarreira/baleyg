@@ -202,3 +202,98 @@ fn corrupt_index_recreation_preserves_queue_and_replaces_only_index_inode() {
         String::from_utf8_lossy(&outcome.stderr)
     );
 }
+
+#[test]
+fn gc_releases_only_deleted_candidate_witnesses_child() {
+    if std::env::var_os("BALEYG_GC_WITNESS_CHILD").is_none() {
+        return;
+    }
+    use baleyg::{
+        index_coordinator::reconcile_workspace,
+        store::{
+            retained_sqlite_witness_count_for_tests,
+            topology::{TopologyRoots, WorkspaceIdentity},
+        },
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let old = tempfile::tempdir().unwrap();
+    let current = tempfile::tempdir().unwrap();
+    std::fs::write(
+        old.path().join("a.js"),
+        "function a() {}
+",
+    )
+    .unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    let old_id = WorkspaceIdentity::discover(Some(old.path()), old.path()).unwrap();
+    let original = Store::open_for_tests(state.path(), old.path()).unwrap();
+    let queue = original
+        .enqueue_request(&IndexOptions::new(old.path().to_owned()), None)
+        .unwrap();
+    let (pin, old_leader) = reconcile_workspace(
+        &original,
+        &IndexOptions::new(old.path().to_owned()),
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    assert!(roots.requests_db(&old_id).exists());
+    drop(old_leader);
+    drop(original);
+    let live = Store::open_for_tests(state.path(), current.path()).unwrap();
+    let live_id = WorkspaceIdentity::discover(Some(current.path()), current.path()).unwrap();
+    let leader = roots.leader(&live_id).unwrap();
+    let before = retained_sqlite_witness_count_for_tests();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 86_400;
+    Connection::open(roots.index_db(&old_id))
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    assert_eq!(live.automatic_gc_at(&leader, now).unwrap(), 1);
+    assert_eq!(
+        retained_sqlite_witness_count_for_tests(),
+        before - 2,
+        "both deleted SQLite inodes must release their retained handles"
+    );
+    assert!(roots.index_db(&live_id).exists());
+    assert!(!roots.index_dir(&old_id).exists());
+    assert!(!roots.index_use_lock(&old_id).exists());
+    assert_eq!(queue.state, "queued");
+    let replacement = Store::open_for_tests(state.path(), old.path()).unwrap();
+    assert_ne!(
+        replacement.index_baseline().unwrap().index_generation,
+        pin.index_generation
+    );
+    assert!(
+        replacement.saved_views_at(Some(pin)).is_err(),
+        "old generation pins cannot reopen"
+    );
+}
+
+#[test]
+fn gc_releases_only_deleted_candidate_witnesses() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "gc_releases_only_deleted_candidate_witnesses_child",
+            "--nocapture",
+        ])
+        .env("BALEYG_GC_WITNESS_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
