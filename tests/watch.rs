@@ -530,32 +530,39 @@ impl Drop for Server {
     }
 }
 
-#[test]
-fn killed_leader_reconciles_lost_edits_before_serving() {
-    use std::os::unix::fs::PermissionsExt;
+#[tokio::test]
+async fn killed_leader_reconciles_lost_edits_before_serving() {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::create_dir(&home).unwrap();
     fs::write(root.join("a.js"), "function before() {}\n").unwrap();
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let token = home.join("token");
-    fs::write(
-        &token,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    )
-    .unwrap();
+    fs::write(&token, TOKEN).unwrap();
     fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
+    let first_log = temp.path().join("first-stderr.log");
+    let first_stderr = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&first_log)
+        .unwrap();
     let server = cli(&root, &home, "serve")
         .arg("--bind")
         .arg(address.to_string())
         .arg("--token-file")
         .arg(&token)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(first_stderr))
         .spawn()
         .unwrap();
     let mut server = Server(server);
@@ -574,8 +581,19 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
     }
     assert!(ready, "daemon did not bind");
     let first = cli(&root, &home, "status").output().unwrap();
-    assert!(first.status.success(), "first selected status unavailable");
+    assert!(
+        first.status.success(),
+        "first selected status unavailable; first startup stderr={:?}",
+        String::from_utf8_lossy(&fs::read(&first_log).unwrap())
+    );
     let old: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(
+        old["revision"]["indexRevision"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "first daemon did not publish a positive baseline; first startup stderr={:?}",
+        String::from_utf8_lossy(&fs::read(&first_log).unwrap())
+    );
     let marker = fs::read(leader_lock_under(&home).unwrap()).unwrap();
     server.0.kill().unwrap();
     server.0.wait().unwrap();
@@ -586,13 +604,22 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let successor_addr = listener.local_addr().unwrap();
     drop(listener);
+    // Capture startup admission errors: TCP bind alone does not prove that
+    // establish_serving_session acquired a reconciled leader session.
+    let successor_log = temp.path().join("successor-stderr.log");
+    let successor_stderr = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&successor_log)
+        .unwrap();
     let successor_process = cli(&root, &home, "serve")
         .arg("--bind")
         .arg(successor_addr.to_string())
         .arg("--token-file")
         .arg(&token)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(successor_stderr))
         .spawn()
         .unwrap();
     let mut successor = Server(successor_process);
@@ -609,6 +636,177 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // A bound TCP listener is not an evidence-readiness signal. Only the
+    // authenticated HTTP selected snapshot can prove that this daemon serves
+    // H. A 503 index_not_ready is unserved and may be retried until the fixed
+    // deadline; 200 with the predecessor pin fails immediately.
+    let mut failure_details = |observed: &serde_json::Value| -> String {
+        // Failure-only snapshot. Keep the original strict AC1 assertion:
+        // a later watcher tick or explicit index cannot turn this RED green.
+        let lock_path = leader_lock_under(&home).unwrap();
+        let current_marker = fs::read(&lock_path).unwrap_or_default();
+        let lock_meta = fs::symlink_metadata(&lock_path).ok();
+        let lock_inode = lock_meta.as_ref().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino(), m.mode() & 0o777)
+        });
+        let probe = fs::OpenOptions::new().read(true).open(&lock_path).unwrap();
+        let acquired = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let ex_probe = if acquired == 0 {
+            assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+            "available".to_owned()
+        } else {
+            format!("blocked:{:?}", std::io::Error::last_os_error().kind())
+        };
+        let liveness = successor.0.try_wait().unwrap();
+        let first_stderr = String::from_utf8_lossy(
+            &fs::read(&first_log)
+                .unwrap()
+                .into_iter()
+                .take(8192)
+                .collect::<Vec<_>>(),
+        )
+        .into_owned();
+        let queue_witness = index_db_under(&home)
+            .map(|index| readonly_request_queue_snapshot(&index.with_file_name("requests.db")))
+            .unwrap_or_else(|| "index_db_missing".to_owned());
+        let stderr_len = fs::metadata(&successor_log).unwrap().len();
+        let stderr = String::from_utf8_lossy(
+            &fs::read(&successor_log)
+                .unwrap()
+                .into_iter()
+                .take(8192)
+                .collect::<Vec<_>>(),
+        )
+        .into_owned();
+        // A separate bounded selected export distinguishes the stale
+        // status snapshot from an already-reconciled source. It is only
+        // diagnostic: the failed original selected pin remains a RED.
+        let mut export = cli(&root, &home, "export")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let export_deadline = Instant::now() + Duration::from_secs(3);
+        let export_exit = loop {
+            if let Some(status) = export.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= export_deadline {
+                let _ = export.kill();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let export_output = export.wait_with_output().unwrap();
+        let export_json: serde_json::Value =
+            serde_json::from_slice(&export_output.stdout).unwrap_or(serde_json::Value::Null);
+        format!(
+            "old_pin={:?} selected_pin={:?} old_marker={:?} current_marker={:?} lock_inode={lock_inode:?} ex_probe={ex_probe} queue_witness={queue_witness} successor_pid={} successor_exit={liveness:?} first_stderr={first_stderr:?} stderr_len={stderr_len} stderr_head={stderr:?} export_exit={export_exit:?} export_text={:?} export_stderr={:?}",
+            old["revision"],
+            observed["revision"],
+            String::from_utf8_lossy(&marker),
+            String::from_utf8_lossy(&current_marker),
+            successor.0.id(),
+            export_json["files"][0]["text"],
+            String::from_utf8_lossy(&export_output.stderr)
+        )
+    };
+    let http_client = reqwest::Client::new();
+    let ready_deadline = Instant::now() + Duration::from_secs(12);
+    let ready_status: serde_json::Value = loop {
+        let response = http_client
+            .get(format!("http://{successor_addr}/api/status"))
+            .bearer_auth(TOKEN)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "successor HTTP status failed: {error}; {}",
+                    failure_details(&old)
+                )
+            });
+        let code = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or_else(|error| {
+            panic!(
+                "successor HTTP status malformed: {error}; {}",
+                failure_details(&old)
+            )
+        });
+        if code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && body.pointer("/error/code").and_then(|v| v.as_str()) == Some("index_not_ready")
+        {
+            assert!(
+                Instant::now() < ready_deadline,
+                "successor never reconciled before serving; {}",
+                failure_details(&body)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        assert_eq!(
+            code,
+            reqwest::StatusCode::OK,
+            "unexpected successor HTTP readiness response {code} {body:?}; {}",
+            failure_details(&body)
+        );
+        assert_eq!(
+            body["revision"]["indexGeneration"],
+            old["revision"]["indexGeneration"],
+            "successor HTTP selected generation differs; {}",
+            failure_details(&body)
+        );
+        assert!(
+            body["revision"]["indexRevision"]
+                .as_u64()
+                .is_some_and(|n| n > old["revision"]["indexRevision"].as_u64().unwrap()),
+            "successor served old selected pin before H; {}",
+            failure_details(&body)
+        );
+        break body;
+    };
+    assert_ne!(
+        fs::read(leader_lock_under(&home).unwrap()).unwrap(),
+        marker,
+        "successor HTTP ready under predecessor incarnation"
+    );
+    let revision_text = ready_status["revision"]["indexRevision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let source_response = http_client
+        .get(format!("http://{successor_addr}/api/source"))
+        .bearer_auth(TOKEN)
+        .query(&[
+            ("path", "a.js"),
+            (
+                "indexGeneration",
+                ready_status["revision"]["indexGeneration"]
+                    .as_str()
+                    .unwrap(),
+            ),
+            ("indexRevision", revision_text.as_str()),
+        ])
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        source_response.status(),
+        reqwest::StatusCode::OK,
+        "successor pinned source unavailable; {}",
+        failure_details(&ready_status)
+    );
+    let source_body: serde_json::Value = source_response.json().await.unwrap();
+    assert_eq!(
+        source_body["revision"], ready_status["revision"],
+        "successor pinned source changed revision"
+    );
+    assert_eq!(
+        source_body["file"]["text"], "function after() {}\n",
+        "successor served stale selected source before explicit request"
+    );
     let selected = cli(&root, &home, "status").output().unwrap();
     assert!(
         selected.status.success(),
@@ -616,13 +814,18 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
     );
     let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
     assert_eq!(
+        selected["revision"], ready_status["revision"],
+        "CLI selected pin differs from authenticated successor HTTP pin"
+    );
+    assert_eq!(
         selected["revision"]["indexGeneration"],
         old["revision"]["indexGeneration"]
     );
     assert!(
         selected["revision"]["indexRevision"].as_u64().unwrap()
             > old["revision"]["indexRevision"].as_u64().unwrap(),
-        "mandatory takeover must publish before any explicit request"
+        "mandatory takeover must publish before any explicit request; {}",
+        failure_details(&selected)
     );
     assert_ne!(fs::read(leader_lock_under(&home).unwrap()).unwrap(), marker);
     let exported = cli(&root, &home, "export").output().unwrap();
@@ -646,6 +849,132 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
     );
 }
 
+#[tokio::test]
+async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&home).unwrap();
+    let source = root.join("a.js");
+    fs::write(&source, "function before() {}\n").unwrap();
+    let seed = cli(&root, &home, "index").output().unwrap();
+    assert!(seed.status.success(), "healthy predecessor required");
+    let old: serde_json::Value = cli(&root, &home, "status")
+        .output()
+        .and_then(|out| serde_json::from_slice(&out.stdout).map_err(std::io::Error::other))
+        .unwrap();
+    assert!(
+        old["revision"]["indexRevision"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    );
+    let leader_lock = leader_lock_under(&home).unwrap();
+    let prior_marker = fs::read(&leader_lock).unwrap();
+    // The selected metadata stays healthy. Only the successor's authenticated
+    // source capture is made impossible; Store::open must complete first.
+    fs::write(&source, "function after() {}\n").unwrap();
+    let token_path = home.join("token");
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    fs::write(&token_path, token).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let stderr_path = temp.path().join("successor-stderr.log");
+    let stderr = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&stderr_path)
+        .unwrap();
+    let child = cli(&root, &home, "serve")
+        .arg("--bind")
+        .arg(address.to_string())
+        .arg("--token-file")
+        .arg(&token_path)
+        .arg("--max-file-bytes")
+        .arg("8")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .unwrap();
+    let mut successor = Server(child);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "successor did not bind after startup failure; stderr={:?}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
+        assert!(
+            successor.0.try_wait().unwrap().is_none(),
+            "successor exited before binding; stderr={:?}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let new_marker = fs::read(&leader_lock).unwrap();
+    assert_ne!(
+        new_marker, prior_marker,
+        "successor never acquired leader incarnation"
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        stderr.contains("Evidence unavailable at startup: unsafe or oversized input"),
+        "capture refusal missing after leader acquisition: {stderr:?}"
+    );
+    // The attempted successor released EX on error. This checks the failure
+    // boundary, not merely a TCP bind or a stale independent CLI status.
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .open(&leader_lock)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "successor retained EX despite failed H"
+    );
+    assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+    let selected = cli(&root, &home, "status").output().unwrap();
+    assert!(
+        selected.status.success(),
+        "selected status unavailable after capture refusal"
+    );
+    let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(
+        selected["revision"], old["revision"],
+        "failure unexpectedly published H"
+    );
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/api/status"))
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    let code = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        successor.0.try_wait().unwrap().is_none(),
+        "successor died after binding"
+    );
+    assert!(
+        code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && body.pointer("/error/code").and_then(|value| value.as_str())
+                == Some("index_not_ready"),
+        "failed mandatory H must refuse selected evidence with index_not_ready: old_pin={:?} selected_pin={:?} old_marker={:?} new_marker={:?} http_status={code} body={body:?} startup_stderr={stderr:?}",
+        old["revision"],
+        selected["revision"],
+        String::from_utf8_lossy(&prior_marker),
+        String::from_utf8_lossy(&new_marker)
+    );
+}
+
 fn leader_lock_under(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
@@ -660,6 +989,351 @@ fn leader_lock_under(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Failure-only queue witness. Every SQLite operation is READ_ONLY with a zero
+/// busy wait; this never initializes a v0 queue or replaces accepted ACKs.
+#[tokio::test]
+async fn virgin_queue_v0_does_not_block_mandatory_takeover_without_a_request() {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::write(root.join("a.js"), "function before() {}\n").unwrap();
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let token_path = home.join("token");
+    fs::write(&token_path, TOKEN).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let first_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_address = first_listener.local_addr().unwrap();
+    drop(first_listener);
+    let first = cli(&root, &home, "serve")
+        .arg("--bind")
+        .arg(first_address.to_string())
+        .arg("--token-file")
+        .arg(&token_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut predecessor = Server(first);
+    let first_deadline = Instant::now() + Duration::from_secs(12);
+    while std::net::TcpStream::connect_timeout(&first_address, Duration::from_millis(50)).is_err() {
+        assert!(Instant::now() < first_deadline, "predecessor never bound");
+        assert!(
+            predecessor.0.try_wait().unwrap().is_none(),
+            "predecessor exited"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let first_status = cli(&root, &home, "status").output().unwrap();
+    assert!(
+        first_status.status.success(),
+        "healthy predecessor selected status required"
+    );
+    let old: serde_json::Value = serde_json::from_slice(&first_status.stdout).unwrap();
+    assert!(
+        old["revision"]["indexRevision"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    );
+    let leader_lock = leader_lock_under(&home).unwrap();
+    let predecessor_marker = fs::read(&leader_lock).unwrap();
+    predecessor.0.kill().unwrap();
+    predecessor.0.wait().unwrap();
+    fs::write(root.join("a.js"), "function after() {}\n").unwrap();
+
+    // Synthetic crash-window model, NOT a claim that the historical first
+    // daemon created this file: SQLite's private inode was created but no
+    // schema transaction or accepted request ever committed. Do not replace
+    // or alter an existing queue with possible durable ACKs.
+    let queue = index_db_under(&home).unwrap().with_file_name("requests.db");
+    // The healthy predecessor may have initialized an EMPTY queue during an
+    // idle claim tick. Preserve its inode, never replace an accepted request.
+    let old_queue = readonly_request_queue_snapshot(&queue);
+    assert!(
+        old_queue.contains("mode=600") && old_queue.contains("quick_check=Ok(\"ok\")"),
+        "predecessor queue was not a private intact SQLite file: {old_queue}"
+    );
+    let prior = rusqlite::Connection::open_with_flags(
+        &queue,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    prior.busy_timeout(Duration::ZERO).unwrap();
+    let prior_version: i64 = prior
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        prior_version, 1,
+        "predecessor queue was not initialized: {old_queue}"
+    );
+    let prior_check: String = prior
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(prior_check, "ok", "predecessor queue integrity failed");
+    let (prior_root, prior_key): (String, String) = prior
+        .query_row(
+            "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(prior_root, old["workspaceRoot"].as_str().unwrap());
+    assert!(
+        !prior_key.is_empty(),
+        "predecessor queue root identity missing"
+    );
+    let prior_rows: i64 = prior
+        .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(prior_rows, 0, "cannot replace accepted durable FIFO rows");
+    drop(prior);
+    let preserved = temp.path().join("preserved-empty-requests.db");
+    fs::rename(&queue, &preserved).unwrap();
+    assert!(
+        fs::symlink_metadata(&queue)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
+    assert!(
+        readonly_request_queue_snapshot(&preserved).contains("version=Ok(1)"),
+        "preserved predecessor queue lost its schema"
+    );
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&queue)
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let initial_queue = readonly_request_queue_snapshot(&queue);
+    assert!(
+        initial_queue.contains("version=Ok(0)")
+            && initial_queue.contains("table_count=Ok(0)")
+            && initial_queue.contains("tables=Ok([])")
+            && initial_queue.contains("quick_check=Ok(\"ok\")"),
+        "synthetic zero-version queue lacks empty/private/healthy proof: {initial_queue}"
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let successor_log = temp.path().join("successor-stderr.log");
+    let stderr = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&successor_log)
+        .unwrap();
+    let successor_child = cli(&root, &home, "serve")
+        .arg("--bind")
+        .arg(address.to_string())
+        .arg("--token-file")
+        .arg(&token_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .unwrap();
+    let mut successor = Server(successor_child);
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ready: serde_json::Value = loop {
+        assert!(
+            Instant::now() < deadline,
+            "v0 queue prevented request-free mandatory H before serving: old_pin={:?} prior_marker={:?} current_marker={:?} leader_ex={:?} queue_before={initial_queue} queue_now={} stderr={:?}",
+            old["revision"],
+            String::from_utf8_lossy(&predecessor_marker),
+            fs::read(&leader_lock)
+                .ok()
+                .map(|m| String::from_utf8_lossy(&m).into_owned()),
+            {
+                let probe = fs::OpenOptions::new()
+                    .read(true)
+                    .open(&leader_lock)
+                    .unwrap();
+                let result =
+                    unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result == 0 {
+                    let _ = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
+                    "available"
+                } else {
+                    "blocked"
+                }
+            },
+            readonly_request_queue_snapshot(&queue),
+            fs::read_to_string(&successor_log).unwrap()
+        );
+        if let Some(exit) = successor.0.try_wait().unwrap() {
+            panic!(
+                "successor exited {exit} before H: queue={} stderr={:?}",
+                readonly_request_queue_snapshot(&queue),
+                fs::read_to_string(&successor_log).unwrap()
+            );
+        }
+        match client
+            .get(format!("http://{address}/api/status"))
+            .bearer_auth(TOKEN)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let code = response.status();
+                let body: serde_json::Value = response.json().await.unwrap();
+                if code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && body.pointer("/error/code").and_then(|v| v.as_str())
+                        == Some("index_not_ready")
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                assert_eq!(
+                    code,
+                    reqwest::StatusCode::OK,
+                    "unexpected successor response {code}: {body:?}; queue={}",
+                    readonly_request_queue_snapshot(&queue)
+                );
+                assert_eq!(
+                    body["revision"]["indexGeneration"],
+                    old["revision"]["indexGeneration"]
+                );
+                assert!(
+                    body["revision"]["indexRevision"]
+                        .as_u64()
+                        .is_some_and(|n| n > old["revision"]["indexRevision"].as_u64().unwrap()),
+                    "successor served old pin without mandatory H: {body:?}"
+                );
+                break body;
+            }
+            Err(error) if error.is_connect() => tokio::time::sleep(Duration::from_millis(20)).await,
+            Err(error) => panic!("successor status transport failed: {error}"),
+        }
+    };
+    assert_ne!(
+        fs::read(&leader_lock).unwrap(),
+        predecessor_marker,
+        "ready successor reused predecessor incarnation"
+    );
+    let revision = ready["revision"]["indexRevision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let source = client
+        .get(format!("http://{address}/api/source"))
+        .bearer_auth(TOKEN)
+        .query(&[
+            ("path", "a.js"),
+            (
+                "indexGeneration",
+                ready["revision"]["indexGeneration"].as_str().unwrap(),
+            ),
+            ("indexRevision", revision.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(source.status(), reqwest::StatusCode::OK);
+    let source: serde_json::Value = source.json().await.unwrap();
+    assert_eq!(source["revision"], ready["revision"]);
+    assert_eq!(source["file"]["text"], "function after() {}\n");
+    let db =
+        rusqlite::Connection::open_with_flags(&queue, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 1,
+        "recovered queue must have the authenticated schema"
+    );
+    let requests: i64 = db
+        .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(requests, 0, "request-free H cannot fabricate a FIFO row");
+}
+
+fn readonly_request_queue_snapshot(path: &std::path::Path) -> String {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    let named = match fs::symlink_metadata(path) {
+        Ok(named) => named,
+        Err(error) => return format!("metadata_error={:?}", error.kind()),
+    };
+    let identity = (named.dev(), named.ino());
+    let mode = named.mode() & 0o777;
+    let shape = (
+        named.is_file(),
+        named.file_type().is_symlink(),
+        named.nlink(),
+        named.uid(),
+    );
+    let fd = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(fd) => fd,
+        Err(error) => {
+            return format!(
+                "inode={identity:?} mode={mode:o} shape={shape:?} open_error={:?}",
+                error.kind()
+            );
+        }
+    };
+    let held = fd.metadata().unwrap();
+    if (held.dev(), held.ino()) != identity
+        || !named.is_file()
+        || named.file_type().is_symlink()
+        || mode != 0o600
+        || named.nlink() != 1
+        || named.uid() != unsafe { libc::geteuid() }
+    {
+        return format!(
+            "unsafe_queue_witness inode={identity:?} mode={mode:o} shape={shape:?} held_inode={:?}",
+            (held.dev(), held.ino())
+        );
+    }
+    let db = match rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(db) => db,
+        Err(error) => {
+            return format!("inode={identity:?} mode={mode:o} sqlite_open_error={error:?}");
+        }
+    };
+    let _ = db.busy_timeout(Duration::ZERO);
+    let version: rusqlite::Result<i64> =
+        db.pragma_query_value(None, "user_version", |row| row.get(0));
+    let table_count: rusqlite::Result<i64> = db.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table'",
+        [],
+        |row| row.get(0),
+    );
+    let names: rusqlite::Result<Vec<String>> = (|| {
+        let mut statement =
+            db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 16")?;
+        statement.query_map([], |row| row.get(0))?.collect()
+    })();
+    let check: rusqlite::Result<String> =
+        db.query_row("PRAGMA quick_check(1)", [], |row| row.get(0));
+    let after = fs::symlink_metadata(path)
+        .ok()
+        .map(|named| (named.dev(), named.ino()));
+    format!(
+        "inode={identity:?} mode={mode:o} fd={} after_inode={after:?} version={version:?} table_count={table_count:?} tables={names:?} quick_check={check:?}",
+        fd.as_raw_fd()
+    )
 }
 
 fn request_db_under(dir: &std::path::Path) -> Option<std::path::PathBuf> {
