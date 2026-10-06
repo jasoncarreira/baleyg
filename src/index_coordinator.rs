@@ -365,6 +365,24 @@ impl LeaderWork {
         })
     }
 
+    /// Model a watcher that lost its event channel without modifying the
+    /// workspace capture or publication path. The periodic full inventory
+    /// must still discover changes to source and previously absent inputs.
+    #[doc(hidden)]
+    pub fn suppress_watch_signals_for_tests(&mut self, absent_watch_root: std::path::PathBuf) {
+        assert!(!absent_watch_root.exists());
+        self.watch = crate::watch::WatchSignals::new(absent_watch_root, None, None);
+        assert!(self.watch.degraded());
+        self.last_accounted_generation = Some(self.watch.drain().generation);
+    }
+
+    /// Advance only the inventory deadline in a test. The next ordinary tick
+    /// still uses the production admission and publication fences.
+    #[doc(hidden)]
+    pub fn force_periodic_inventory_for_tests(&mut self) {
+        self.last_inventory = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    }
+
     /// A full capture always checks root, leader and selected publication fences.
     /// A failed capture keeps the dirty generation for a later signal or scan.
     pub fn reconcile_due(
@@ -429,11 +447,15 @@ impl LeaderWork {
         let periodic =
             now.duration_since(self.last_inventory) >= std::time::Duration::from_secs(60);
         let batch = self.watch.drain();
+        // A failing periodic inventory obeys the same retry delay as a failed
+        // watcher run. Do not spin at the queue tick rate while inputs are bad.
+        if !force && self.retry_after.is_some_and(|deadline| deadline > now) {
+            return Ok(false);
+        }
         if !force
             && !periodic
             && ((self.watch.degraded() && self.last_accounted_generation == Some(batch.generation))
-                || !self.watch.batch_ready_at(now)
-                || self.retry_after.is_some_and(|deadline| deadline > now))
+                || !self.watch.batch_ready_at(now))
         {
             return Ok(false);
         }
