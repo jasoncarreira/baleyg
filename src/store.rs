@@ -71,6 +71,9 @@ pub struct Store {
     request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
     aborted_staged_index: Arc<Mutex<Option<StagedIndex>>>,
     writer_counters: Arc<Mutex<Option<WriterCounters>>>,
+    // This Store's leader may claim FIFO only after its own post-acquisition
+    // selected reconciliation was observed committed under the synced EX.
+    reconciled_leader: Arc<Mutex<Option<uuid::Uuid>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
@@ -1388,6 +1391,46 @@ mod terminal_status_contention_tests {
             "storage_busy: SQLite lock contention"
         )));
     }
+
+    #[test]
+    fn cli_read_busy_retry_is_direct_and_expiry_is_typed() {
+        let raw: anyhow::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        )
+        .into();
+        assert!(cli_read_retryable_contention(&raw));
+        assert!(cli_read_retryable_contention(&SqliteContention(()).into()));
+        assert!(cli_read_retryable_contention(&topology::StorageBusy.into()));
+        for exact in [
+            "storage_busy: index journal sidecar present",
+            "storage_busy: requests.db initialization in progress",
+        ] {
+            assert!(cli_read_retryable_contention(&anyhow::anyhow!(exact)));
+            assert!(!cli_read_retryable_contention(
+                &Err::<(), _>(anyhow::anyhow!(exact))
+                    .context("root_changed: guard failed")
+                    .unwrap_err()
+            ));
+        }
+        assert!(!cli_read_retryable_contention(
+            &Err::<(), _>(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            ))
+            .context("incompatible_index: selected proof failed")
+            .unwrap_err()
+        ));
+        assert!(!cli_read_retryable_contention(&anyhow::anyhow!(
+            "storage_busy: cached claim changed"
+        )));
+        let expiry = cli_read_busy_expired();
+        assert!(expiry.downcast_ref::<CliReadBusy>().is_some());
+        assert_eq!(
+            expiry.to_string(),
+            "storage_busy: CLI read contention wait expired"
+        );
+    }
 }
 
 /// Publication contention only. A cached-claim mismatch or unresolved
@@ -1416,6 +1459,40 @@ pub(crate) fn transient_storage_contention(error: &anyhow::Error) -> bool {
 /// even if its subtype is an invariant error rather than retryable contention.
 pub(crate) fn nonterminal_storage_busy(error: &anyhow::Error) -> bool {
     transient_storage_contention(error) || error.to_string().starts_with("storage_busy")
+}
+
+/// A read-only CLI command may retry direct SQLite contention and exact
+/// operational sidecar/initialization contention, but never a wrapped root,
+/// incarnation, pin or selected-integrity guard or an invariant-busy string.
+pub fn cli_read_retryable_contention(error: &anyhow::Error) -> bool {
+    terminal_status_sqlite_contention(error)
+        || error
+            .chain()
+            .next()
+            .is_some_and(|direct| direct.downcast_ref::<topology::StorageBusy>().is_some())
+        || (error.chain().count() == 1
+            && matches!(
+                error.to_string().as_str(),
+                "storage_busy: index journal sidecar present"
+                    | "storage_busy: requests.db initialization in progress"
+            ))
+}
+
+/// A terminal typed error after the CLI read/admission wait expires. It is
+/// distinct from a direct SQLite failure because sidecar contention also waits.
+#[derive(Debug)]
+pub struct CliReadBusy;
+
+impl std::fmt::Display for CliReadBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("storage_busy: CLI read contention wait expired")
+    }
+}
+
+impl std::error::Error for CliReadBusy {}
+
+pub fn cli_read_busy_expired() -> anyhow::Error {
+    CliReadBusy.into()
 }
 
 /// A transient SQLite writer-lock conflict, distinct from invariant-busy
@@ -4126,6 +4203,7 @@ impl Store {
             request_file_witness: Arc::new(Mutex::new(None)),
             aborted_staged_index: Arc::new(Mutex::new(None)),
             writer_counters: Arc::new(Mutex::new(None)),
+            reconciled_leader: Arc::new(Mutex::new(None)),
             retention_clock: Arc::new(Mutex::new(RetentionClock {
                 origin_wall: publication_second()?,
                 origin_mono: 0,
@@ -5451,6 +5529,7 @@ impl Store {
             self.status()?.revision == pin,
             "index_not_ready: exceptional recovery pair not admitted"
         );
+        self.attest_post_acquisition_reconciliation(&session, pin)?;
         Ok((pin, session))
     }
     pub fn leader_session(&self) -> Result<Arc<topology::LeaderSession>> {
@@ -5461,6 +5540,44 @@ impl Store {
     }
     pub(crate) fn verify_leader_session(&self, session: &topology::LeaderSession) -> Result<()> {
         session.belongs_to(&self.identity, &self.roots.leader_lock(&self.identity))
+    }
+    /// Mint a claim proof only from a selected post-COMMIT revision carrying
+    /// this exact synced leader incarnation. Merely acquiring EX cannot mint it.
+    pub(crate) fn attest_post_acquisition_reconciliation(
+        &self,
+        session: &topology::LeaderSession,
+        committed_pin: IndexPin,
+    ) -> Result<()> {
+        self.verify_leader_session(session)?;
+        let db = self.cache()?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        let (selected, marker) = self.admit_evidence_control(&db)?;
+        ensure!(
+            marker == session.incarnation() && selected.revision == committed_pin,
+            "index_not_ready: mandatory leader reconciliation not committed"
+        );
+        self.verify_leader_session(session)?;
+        *self.reconciled_leader.lock().unwrap() = Some(marker);
+        Ok(())
+    }
+    /// The public Store::claim_request entry point must refuse pre-COMMIT
+    /// claims, including the leader's own request and direct API callers.
+    pub(crate) fn verify_reconciled_leader_claim(
+        &self,
+        session: &topology::LeaderSession,
+    ) -> Result<()> {
+        self.verify_leader_session(session)?;
+        if *self.reconciled_leader.lock().unwrap() != Some(session.incarnation()) {
+            return Err(topology::IndexNotReady::new(
+                "mandatory leader reconciliation not committed",
+            )
+            .into());
+        }
+        // A later request's failed publication can leave the selected-read
+        // latch closed until retry, but cannot undo this leader's committed H.
+        // Root/EX/marker verification still fences every claim. The selected
+        // revision itself is attested when the proof is minted after COMMIT.
+        self.verify_leader_session(session)
     }
     fn compose_selected_class_catalog(
         graph: &Graph,

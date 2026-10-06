@@ -2653,6 +2653,91 @@ async fn real_serve_pending_takeover_preserves_h_before_distinct_a_b_ack_pins() 
     observation_time!("final_late_accept");
 }
 
+// A native exclusive SQLite lock forces the actual CLI through admission and
+// selected-read contention without adding a production timing hook.
+fn cli_read_held_index_lock(command: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::write(root.join("a.js"), "function example() { return 1; }\n").unwrap();
+    let initial = cli(&root, &home, "index").output().unwrap();
+    assert!(
+        initial.status.success(),
+        "fixture index failed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let index_path = index_db_under(&home).expect("published index database");
+    let lock = rusqlite::Connection::open(&index_path).unwrap();
+    lock.busy_timeout(Duration::ZERO).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let destination = temp.path().join("never-created.json");
+    let mut invocation = cli(&root, &home, command);
+    match command {
+        "symbols" => {
+            invocation.arg("--search").arg("example");
+        }
+        "query" => {
+            invocation.arg("--seed").arg("example");
+        }
+        "export" => {
+            invocation.arg("--output").arg(&destination);
+        }
+        "status" => {}
+        _ => unreachable!(),
+    }
+    let started = Instant::now();
+    let result = invocation.output().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        !result.status.success(),
+        "{command} unexpectedly passed held lock"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(15),
+        "{command} did not use a bounded ~5s wait: {elapsed:?}"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("storage_busy: CLI read contention wait expired"),
+        "{command} did not return typed busy: {stderr}"
+    );
+    assert!(
+        !stderr.contains("database is locked") && !stderr.contains("database is busy"),
+        "{command} leaked raw SQLite lock error: {stderr}"
+    );
+    assert!(
+        result.stdout.is_empty(),
+        "{command} printed a partial response"
+    );
+    assert!(
+        !destination.exists(),
+        "export destination was created before success"
+    );
+    lock.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn status_cli_bounded_typed_busy_on_held_index_lock() {
+    cli_read_held_index_lock("status");
+}
+
+#[test]
+fn symbols_cli_bounded_typed_busy_on_held_index_lock() {
+    cli_read_held_index_lock("symbols");
+}
+
+#[test]
+fn query_cli_bounded_typed_busy_on_held_index_lock() {
+    cli_read_held_index_lock("query");
+}
+
+#[test]
+fn first_export_cli_bounded_typed_busy_on_held_index_lock() {
+    cli_read_held_index_lock("export");
+}
+
 #[test]
 fn empty_checkout_final_inventory_preserves_explicit_pin() {
     let state = tempfile::tempdir().unwrap();

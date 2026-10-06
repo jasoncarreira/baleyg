@@ -700,8 +700,6 @@ impl DaemonState {
                         .map(|head| head.options(std::path::Path::new(self.store.workspace_root())))
                         .transpose()?;
                     let selected_options = self.store.recorded_index_options()?;
-                    let selected_h_required = selected_options.is_some();
-                    mandatory_reconcile_incomplete = selected_h_required;
                     let takeover_options = selected_options
                         .or_else(|| head_options.clone())
                         .unwrap_or_else(|| self.options.clone());
@@ -717,68 +715,22 @@ impl DaemonState {
                         &Arc::new(AtomicBool::new(false)),
                         |_| {},
                     ) {
-                        // This follower has acquired and verified leadership, but
-                        // capture failed before any queue claim. Match the leader's
-                        // terminal failure path only if publication did not commit.
-                        // A lost fence or changed root must never fail another row.
+                        // No failed pre-COMMIT H (including a virgin-head H)
+                        // may claim or terminal-fail Q1. Keep its durable FIFO
+                        // row queued and drop this unreconciled EX/session.
                         self.store.verify_leader_session(&session)?;
                         self.store.fail_changed_root_requests(&session)?;
                         if self.store.index_baseline()? != before {
-                            // A possibly committed publication is never
-                            // guessed from a transient error. Reconcile it
-                            // under a fresh verified owner before any claim.
+                            // A possibly committed revision is not inferred
+                            // from a transient error; a new owner retries H.
                             return Err(error);
                         }
-                        if selected_h_required {
-                            // No H-specific error may be attributed to Q1. A
-                            // verified unchanged-pin, direct SQLite BUSY/LOCKED
-                            // waits 250ms and then elects a fresh EX to retry H.
-                            if crate::store::terminal_status_sqlite_contention(&error) {
-                                *self.recovery_retry_after.lock().unwrap() =
-                                    Some(Instant::now() + Duration::from_millis(250));
-                                return Ok(None);
-                            }
-                            *self.recovery_retry_after.lock().unwrap() =
-                                Some(Instant::now() + Duration::from_millis(500));
-                            return Err(error);
-                        }
-                        let current_head = self.store.earliest_unfinished_request()?;
-                        if crate::store::transient_storage_contention(&error) {
-                            // The rollback-journal COMMIT was busy before the
-                            // head was claimed. It remains the same durable
-                            // FIFO row; the next tick resumes with this
-                            // verified owner after a bounded reader backoff.
-                            *self.recovery_retry_after.lock().unwrap() =
-                                Some(Instant::now() + Duration::from_millis(250));
-                            return Ok(Some(0));
-                        }
-                        if crate::store::nonterminal_storage_busy(&error) {
-                            return Err(error);
-                        }
-                        // Do not claim/fail a row admitted after the capture,
-                        // or an earlier row whose options could not be read.
-                        if head_options.is_none()
-                            || current_head.as_ref().map(|row| &row.id)
-                                != head_before.as_ref().map(|row| &row.id)
-                        {
-                            return Err(error);
-                        }
-                        if let Some(claimed) = self.store.claim_request(&session)? {
-                            if Some(&claimed.id) != head_before.as_ref().map(|row| &row.id) {
-                                // Raced a newer ACK after the protected head
-                                // check. Leave it running for a new leader.
-                                return Err(error);
-                            }
-                            best_effort_queue_stderr(
-                                std::io::stderr(),
-                                format_args!(
-                                    "queue takeover failed for accepted {}: {error:#}\n",
-                                    claimed.id
-                                ),
-                            );
-                            self.store
-                                .record_and_finish_request(&session, &claimed, Err(error))?;
-                            return Ok(Some(1));
+                        let busy = crate::store::transient_storage_contention(&error);
+                        *self.recovery_retry_after.lock().unwrap() = Some(
+                            Instant::now() + Duration::from_millis(if busy { 250 } else { 500 }),
+                        );
+                        if busy {
+                            return Ok(None);
                         }
                         return Err(error);
                     }
@@ -3068,7 +3020,7 @@ mod live_tests {
         let options = IndexOptions::new(workspace.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
-        let (graph, native, capture) =
+        let (graph, _, _) =
             index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
         let seed = graph
             .nodes
@@ -3077,17 +3029,9 @@ mod live_tests {
             .unwrap()
             .id
             .clone();
-        let session = store.leader_session().unwrap();
-        let pin = store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                session.leader_guard().unwrap(),
-                store.index_baseline().unwrap(),
-                &cancel,
-            )
-            .unwrap();
+        let (pin, session) =
+            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
+                .unwrap();
         let state = new(
             store,
             options,
@@ -4629,6 +4573,9 @@ mod exceptional_recovery_tests {
         );
         assert_eq!(std::fs::read(&index).unwrap(), before);
         drop(owner);
+        // A follower normally waits 250ms before re-election. Advance the
+        // fixture explicitly instead of depending on ambient test CPU timing.
+        *state.recovery_retry_after.lock().unwrap() = None;
         state.queue_tick().unwrap();
         assert!(
             state.retained_serving_session().unwrap().is_leader(),
@@ -5889,20 +5836,9 @@ mod dependency_lifecycle_tests {
         let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let options = IndexOptions::new(workspace.clone());
-        let (graph, native, capture) =
-            crate::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+        let (pin, session) =
+            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
                 .unwrap();
-        let session = store.leader_session().unwrap();
-        let pin = store
-            .publish_native(
-                &graph,
-                &capture,
-                &native,
-                session.leader_guard().unwrap(),
-                store.index_baseline().unwrap(),
-                &cancel,
-            )
-            .unwrap();
         let state = new(
             store.clone(),
             options.clone(),

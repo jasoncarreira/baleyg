@@ -166,6 +166,8 @@ impl IndexJobCoordinator {
             });
             report("publish", phase_start.elapsed());
             observe(&capture);
+            self.store
+                .attest_post_acquisition_reconciliation(&self.session, pin)?;
             self.maintain_after_publish();
             return Ok(pin);
         }
@@ -210,6 +212,8 @@ impl IndexJobCoordinator {
                     cancel,
                 )?;
                 report("publish", phase_start.elapsed());
+                self.store
+                    .attest_post_acquisition_reconciliation(&self.session, pin)?;
                 self.maintain_after_publish();
                 return Ok(pin);
             }
@@ -249,6 +253,8 @@ impl IndexJobCoordinator {
             cancel,
         )?;
         report("publish", phase_start.elapsed());
+        self.store
+            .attest_post_acquisition_reconciliation(&self.session, published)?;
         self.maintain_after_publish();
         Ok(published)
     }
@@ -954,6 +960,60 @@ mod tests {
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+
+    #[test]
+    fn acquired_leader_cannot_claim_its_own_row_at_precommit_capture_pause() {
+        use crate::store::topology::IndexNotReady;
+        use std::{sync::mpsc, time::Duration};
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function old() {}\n").unwrap();
+        let original = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, old_owner) = reconcile_workspace(&original, &options, &cancel, |_| {}).unwrap();
+        drop(old_owner);
+        fs::write(workspace.path().join("a.js"), "function new() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let own = store.enqueue_request(&options, None).unwrap();
+        let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = coordinator.session();
+        let (paused_tx, paused_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let work = scope.spawn(move || {
+                coordinator.run_observed(
+                    &options,
+                    &cancel,
+                    |_| {},
+                    |_| {
+                        paused_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    },
+                )
+            });
+            paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(session.is_leader() && session.verify().is_ok());
+            let precommit = store.claim_request(&session).unwrap_err();
+            assert!(
+                precommit.downcast_ref::<IndexNotReady>().is_some(),
+                "an acquired EX without its own committed H cannot claim: {precommit:#}"
+            );
+            let row = store.request_by_id(&own.id).unwrap().unwrap();
+            assert_eq!(row.state, "queued");
+            assert!(row.claim_incarnation.is_none());
+            release_tx.send(()).unwrap();
+            let committed = work.join().unwrap().unwrap();
+            assert_eq!(store.status().unwrap().revision, committed);
+            let claimed = store.claim_request(&session).unwrap().unwrap();
+            assert_eq!(claimed.id, own.id);
+            assert_eq!(claimed.state, "running");
+            assert_eq!(
+                claimed.claim_incarnation,
+                Some(session.incarnation().to_string())
+            );
+        });
+    }
 
     #[test]
     fn takeover_marker_refuses_old_read_then_reconciles_before_fifo_claim() {

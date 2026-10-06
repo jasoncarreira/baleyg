@@ -228,6 +228,70 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+// Retry Store::open before admission, then reuse the admitted Store/session for
+// fresh selected-read snapshots. Guard loss outranks contention and expiry;
+// output destinations are opened only after a complete read succeeds.
+const CLI_READ_WAIT: Duration = Duration::from_secs(5);
+fn cli_read_with_retry<T>(
+    verify: impl Fn() -> Result<()>,
+    attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    cli_read_with_retry_until(Instant::now() + CLI_READ_WAIT, verify, attempt)
+}
+
+fn cli_read_with_retry_until<T>(
+    deadline: Instant,
+    verify: impl Fn() -> Result<()>,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        verify()?;
+        match attempt() {
+            Ok(value) => {
+                verify()?;
+                return Ok(value);
+            }
+            Err(error) => {
+                verify()?;
+                if !baleyg::store::cli_read_retryable_contention(&error) {
+                    return Err(error);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(baleyg::store::cli_read_busy_expired());
+                }
+                std::thread::sleep(backoff.min(remaining));
+                backoff = backoff.saturating_mul(2).min(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+// Do not repeat admission. It can commit H before failing its final attestation,
+// and a retry could elect another leader and publish another incarnation.
+fn cli_read_admit(
+    args: &WorkspaceArgs,
+    identity: &WorkspaceIdentity,
+    deadline: Instant,
+) -> Result<(Store, Arc<baleyg::store::topology::LeaderSession>)> {
+    let store = cli_read_with_retry_until(deadline, || identity.verify(), || args.store())?;
+    identity.verify()?;
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let result = baleyg::index_coordinator::establish_serving_session(&store, None, &cancel);
+    identity.verify()?;
+    let session = match result {
+        Ok(session) => session,
+        Err(error) if baleyg::store::cli_read_retryable_contention(&error) => {
+            // This may be after COMMIT; return typed contention without rerunning it.
+            return Err(baleyg::store::cli_read_busy_expired());
+        }
+        Err(error) => return Err(error),
+    };
+    session.verify()?;
+    Ok((store, session))
+}
+
 // Identity/incarnation loss outranks even direct selected SQLite BUSY.
 fn terminal_status_retryable_after_guard(
     error: &anyhow::Error,
@@ -679,7 +743,14 @@ async fn main() -> Result<()> {
         }
         Command::Status(args) => {
             let (roots, identity) = args.resolve_unattached()?;
-            let status = baleyg::store::Store::status_existing_readonly(roots, identity)?;
+            let identity = identity.attach_existing_marker_readonly()?;
+            let status = cli_read_with_retry(
+                || identity.verify_readonly(),
+                || {
+                    let (_, fresh) = args.resolve_unattached()?;
+                    Store::status_existing_readonly(roots.clone(), fresh)
+                },
+            )?;
             use std::io::Write;
             let mut output = std::io::stdout().lock();
             serde_json::to_writer_pretty(&mut output, &status)?;
@@ -688,11 +759,17 @@ async fn main() -> Result<()> {
         }
         Command::Symbols(args) => {
             ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
-            let store = args.workspace.store()?;
-            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let session =
-                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
-            let (revision, items) = store.symbols_at(&args.search, args.limit)?;
+            let (_, identity) = args.workspace.resolve()?;
+            let deadline = Instant::now() + CLI_READ_WAIT;
+            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
+            let (revision, items) = cli_read_with_retry_until(
+                deadline,
+                || {
+                    identity.verify()?;
+                    session.verify()
+                },
+                || store.symbols_at(&args.search, args.limit),
+            )?;
             write_session_json(
                 &serde_json::json!({"revision":revision,"items":items}),
                 &session,
@@ -709,13 +786,18 @@ async fn main() -> Result<()> {
                 exclude_paths: args.exclude_path,
             };
             query.validate()?;
-            let store = args.workspace.store()?;
-            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let session =
-                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
-            let view = store
-                .query_view(&query)?
-                .context("seed not found in current index")?;
+            let (_, identity) = args.workspace.resolve()?;
+            let deadline = Instant::now() + CLI_READ_WAIT;
+            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
+            let view = cli_read_with_retry_until(
+                deadline,
+                || {
+                    identity.verify()?;
+                    session.verify()
+                },
+                || store.query_view(&query),
+            )?
+            .context("seed not found in current index")?;
             write_session_json(&view, &session, std::io::stdout().lock())?;
         }
         Command::Export(args) => {
@@ -723,11 +805,17 @@ async fn main() -> Result<()> {
             if let Some(path) = args.output.as_ref() {
                 roots.validate_external(&identity, std::slice::from_ref(path))?;
             }
-            let store = Store::open(roots, identity.attach_marker()?)?;
-            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let session =
-                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
-            let graph = store.graph()?;
+            let identity = identity.attach_marker()?;
+            let deadline = Instant::now() + CLI_READ_WAIT;
+            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
+            let graph = cli_read_with_retry_until(
+                deadline,
+                || {
+                    identity.verify()?;
+                    session.verify()
+                },
+                || store.graph(),
+            )?;
             if let Some(path) = args.output {
                 let mut options = std::fs::OpenOptions::new();
                 options.write(true).create_new(true);
