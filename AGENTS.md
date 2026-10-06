@@ -4,11 +4,11 @@
 
 Baleyg is a local developer tool. One developer runs it on their own machine, across a few checkouts. A checkout has at most **2–3 Baleyg processes** at once: the daemon (index leader and file watcher, which also serves the browser), plus one CLI or MCP session. It is not a server and not multi-user, and it listens on loopback only. Don't design or test for heavy concurrency or many simultaneous clients.
 
-Baleyg is pre-release, so there is **no backward compatibility**. Old or intermediate state formats are recreated, never migrated or specially handled.
+Baleyg is pre-release, so there is **no backward compatibility**. Old or intermediate formats of **disposable derived state** (the indexes) are recreated where their contract permits it, never migrated or specially handled. Durable state, such as saved views, notes and the request queue, follows its own contract in `docs/local-topology.md`.
 
 ## Threat model: build and review to it, not beyond it
 
-The threat model is [`docs/local-topology.md` § T00](docs/local-topology.md#t00--threat-model). It defines what every implementation and review must defend against. A review finding outside T00 is not a blocker; at most it's a note.
+The threat model is [`docs/local-topology.md` § T00](docs/local-topology.md#t00--threat-model). It defines what every Stage 2–4 implementation and review must defend against. A review finding outside T00 is not a blocker; at most it's a note.
 
 Nobody is attacking Baleyg from inside the user's own account. A process running as the same user can already change the source, the binary and the configuration, so defenses against it add no security.
 
@@ -41,7 +41,7 @@ Races between Baleyg's own processes are in scope as ordinary faults. Fix them a
 
 - Build the simplest design that meets the acceptance criteria, and no mechanism beyond them.
 - Trust what Baleyg itself wrote and validated. Never validate data that's about to be discarded or rebuilt.
-- Write one clear test per acceptance criterion, at normal size. Use production-size data only when a criterion requires it.
+- Test each distinct required behavior, at normal size. One acceptance criterion may need several tests, for example one per failure path. Use production-size data only when a criterion requires it.
 - **Concurrency tests:**
   - model at most 2–3 processes;
   - prefer deterministic, hook-synchronized tests that pause one process at the critical point;
