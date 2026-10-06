@@ -86,6 +86,10 @@ pub struct Store {
     test_queue_post_commit_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     test_publish_commit_busy_once: Arc<AtomicBool>,
+    // Distinct direct typed SQLite BUSY fixture for mandatory H retries.
+    // The older plain-string hook remains unchanged for classifier tests.
+    #[cfg(test)]
+    test_publish_commit_typed_busy_once: Arc<AtomicBool>,
     #[cfg(test)]
     test_publish_post_commit_busy_once: Arc<AtomicBool>,
 }
@@ -1018,15 +1022,20 @@ impl StagedIndex {
 fn validate_cache_shape(db: &Connection) -> Result<()> {
     type Object = (String, String, String, Option<String>);
     fn objects(db: &Connection) -> Result<Vec<Object>> {
-        Ok(db
-            .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        // sqlite_master preparation also reads the schema. With journal_mode
+        // DELETE it can meet the owner's write transaction before a follower
+        // has elected or read its accepted request's DONE pin. Only direct
+        // SQLite BUSY/LOCKED is typed for the coordinator's bounded retry.
+        let mut statement = storage_result(
+            db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"),
+        )?;
+        let rows = storage_result(statement.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        }))?;
+        storage_result(rows.collect::<rusqlite::Result<Vec<_>>>())
     }
     let expected = Connection::open_in_memory()?;
-    let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     control_ensure!(
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
@@ -1161,7 +1170,11 @@ fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
         [], |r| r.get(0),
     )?)
 }
-fn open_index_marker_probe(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
+fn open_index_marker_probe(
+    path: &Path,
+    writable: bool,
+    busy_wait: Duration,
+) -> Result<ProtectedSqliteConnection> {
     use rusqlite::OpenFlags;
     reject_sidecars(path, writable)?;
     verify_index_file(path)?;
@@ -1171,7 +1184,7 @@ fn open_index_marker_probe(path: &Path, writable: bool) -> Result<ProtectedSqlit
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let db = protected_sqlite_open(path, flags)?;
-    storage_result(db.busy_timeout(Duration::ZERO))?;
+    storage_result(db.busy_timeout(busy_wait))?;
     storage_result(db.pragma_update(None, "temp_store", "MEMORY"))?;
     storage_result(db.pragma_update(None, "foreign_keys", "ON"))?;
     if writable {
@@ -1218,7 +1231,10 @@ fn read_index_format_marker(db: &Connection) -> Result<IndexFormatMarker> {
 }
 
 fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
-    let db = open_index_marker_probe(path, writable)?;
+    // Request-path schema/read admission waits through a normal writer commit.
+    // The finite busy timeout is per SQLite call; the accepted FIFO request
+    // keeps its durable ID if contention outlives this call.
+    let db = open_index_marker_probe(path, writable, Duration::from_secs(5))?;
     let marker = read_index_format_marker(&db)?;
     if marker.is_obsolete() {
         return Err(ObsoleteIndexFormat(marker).into());
@@ -1297,6 +1313,80 @@ fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
         error
     } else {
         SelectedIntegrity(format!("{error:#}")).into()
+    }
+}
+
+/// Opt-in, best-effort diagnostic stage; never carries IDs, paths, or pins.
+pub(crate) fn index_diagnostic_stage(stage: &'static str) {
+    if std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
+        use std::io::Write as _;
+        let stderr = std::io::stderr();
+        let mut locked = stderr.lock();
+        let _ = writeln!(locked, "index-phase {stage}");
+    }
+}
+/// Only direct typed SQLite BUSY/LOCKED from terminal selected status reads.
+/// A wrapped cause can belong to a higher-priority guard and is not retryable.
+pub fn terminal_status_sqlite_contention(error: &anyhow::Error) -> bool {
+    // Inspect only the outermost error. A direct rusqlite::Error may itself
+    // expose a natural ffi::Error source; that is not an external guard context.
+    let Some(direct) = error.chain().next() else {
+        return false;
+    };
+    direct.downcast_ref::<SqliteContention>().is_some()
+        || matches!(
+            direct.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(info, _))
+                if matches!(
+                    info.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+}
+
+#[cfg(test)]
+mod terminal_status_contention_tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn only_direct_sqlite_busy_is_terminal_read_retryable() {
+        let direct: anyhow::Error = SqliteContention(()).into();
+        assert!(terminal_status_sqlite_contention(&direct));
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error: anyhow::Error =
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into();
+            assert!(terminal_status_sqlite_contention(&error));
+            let wrapped = Err::<(), _>(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+            .context("root_changed: publication guard failed")
+            .unwrap_err();
+            assert!(!terminal_status_sqlite_contention(&wrapped));
+        }
+        for guard in [
+            "root_changed",
+            "index_not_ready",
+            "schema_invalid",
+            "pin_mismatch",
+        ] {
+            let nested = Err::<(), _>(SqliteContention(()))
+                .context(guard)
+                .unwrap_err();
+            assert!(!terminal_status_sqlite_contention(&nested), "{guard}");
+        }
+        let selected = Err::<(), _>(SqliteContention(()))
+            .context(SelectedIntegrity(
+                "incompatible_index: selected evidence".into(),
+            ))
+            .unwrap_err();
+        assert!(!terminal_status_sqlite_contention(&selected));
+        let leader: anyhow::Error = topology::StorageBusy.into();
+        assert!(!terminal_status_sqlite_contention(&leader));
+        assert!(!terminal_status_sqlite_contention(&anyhow::anyhow!(
+            "storage_busy: SQLite lock contention"
+        )));
     }
 }
 
@@ -1392,6 +1482,29 @@ mod sqlite_contention_type_tests {
             "storage_busy: cached claim changed"
         )));
         first.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn schema_admission_busy_is_typed_and_cannot_mark_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+            .unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let busy = validate_cache_shape(&reader).unwrap_err();
+        assert_eq!(busy.to_string(), "storage_busy: SQLite lock contention");
+        assert!(busy.downcast_ref::<SqliteContention>().is_some());
+        assert_eq!(recovery_class(&busy), RecoveryClass::Hard);
+        assert!(
+            !busy
+                .chain()
+                .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
@@ -4034,6 +4147,8 @@ impl Store {
             #[cfg(test)]
             test_publish_commit_busy_once: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
+            test_publish_commit_typed_busy_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             test_publish_post_commit_busy_once: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -4181,7 +4296,27 @@ impl Store {
     }
     #[cfg(test)]
     pub(crate) fn fail_next_live_publish_commit_busy(&self) {
+        assert!(
+            !self
+                .test_publish_commit_typed_busy_once
+                .load(Ordering::Acquire),
+            "only one live pre-commit BUSY fixture may be armed"
+        );
         self.test_publish_commit_busy_once
+            .store(true, Ordering::Release);
+    }
+    /// Direct typed BUSY at the same live pre-COMMIT point. Do not arm this
+    /// alongside the legacy plain-string fixture in one Store.
+    #[cfg(test)]
+    pub(crate) fn fail_next_live_publish_commit_typed_busy(&self) {
+        assert!(
+            !self.test_publish_commit_busy_once.load(Ordering::Acquire)
+                && !self
+                    .test_publish_commit_typed_busy_once
+                    .load(Ordering::Acquire),
+            "only one live pre-commit BUSY fixture may be armed"
+        );
+        self.test_publish_commit_typed_busy_once
             .store(true, Ordering::Release);
     }
     #[cfg(test)]
@@ -4450,7 +4585,7 @@ impl Store {
                         initial_marker.as_ref() == Some(&found.0),
                         "recovery_required: obsolete marker changed since admission"
                     );
-                    let db = open_index_marker_probe(&path, false)?;
+                    let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
                     self.verify_metadata_root(&db)?;
                     ensure!(
                         read_index_format_marker(&db)?.eq(&found.0),
@@ -4492,7 +4627,7 @@ impl Store {
         leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
         if let Some(marker) = &obsolete {
             old.verify()?;
-            let db = open_index_marker_probe(&path, false)?;
+            let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
             self.verify_metadata_root(&db)?;
             ensure!(
                 read_index_format_marker(&db)?.eq(marker),
@@ -4569,7 +4704,7 @@ impl Store {
             if let Some(marker) = &obsolete {
                 let recheck = (|| -> Result<()> {
                     old.verify()?;
-                    let db = open_index_marker_probe(&path, false)?;
+                    let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
                     self.verify_metadata_root(&db)?;
                     ensure!(
                         read_index_format_marker(&db)?.eq(marker),
@@ -5124,6 +5259,7 @@ impl Store {
         }
         match self.disposition() {
             RecoveryDisposition::Ready => {
+                index_diagnostic_stage("public_read_latched");
                 Err(topology::IndexNotReady::new("reconciliation required").into())
             }
             RecoveryDisposition::Rebuild => {
@@ -5389,6 +5525,7 @@ impl Store {
         let schema: u32 =
             storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         if schema != DATABASE_SCHEMA_VERSION {
+            index_diagnostic_stage("selected_schema_mismatch");
             return Err(topology::IndexNotReady::new("reconciliation required").into());
         }
         let status = self.read_status(db)?;
@@ -7621,6 +7758,15 @@ impl Store {
             // Deterministic pre-commit rollback-journal contention: the live
             // transaction drops without publishing any part of this revision.
             anyhow::bail!("storage_busy: SQLite lock contention");
+        }
+        #[cfg(test)]
+        if matches!(target, PublicationTarget::Live)
+            && self
+                .test_publish_commit_typed_busy_once
+                .swap(false, Ordering::AcqRel)
+        {
+            // Same rollback point, but a direct typed SQLite contention.
+            return Err(SqliteContention(()).into());
         }
         storage_result(tx.commit())?;
         #[cfg(test)]

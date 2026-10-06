@@ -643,10 +643,33 @@ pub fn enqueue_and_wait_observed(
     cancel: &CancelFlag,
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
+    let (_, pin, session) = enqueue_and_wait_observed_inner(store, options, cancel, progress)?;
+    Ok((pin, session))
+}
+
+/// Preserve the ID of the one accepted FIFO request for finite CLI reporting.
+pub fn enqueue_and_wait_observed_with_request(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+) -> Result<(String, crate::model::IndexPin, Arc<LeaderSession>)> {
+    enqueue_and_wait_observed_inner(store, options, cancel, progress)
+}
+
+fn enqueue_and_wait_observed_inner(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+) -> Result<(String, crate::model::IndexPin, Arc<LeaderSession>)> {
     let request = store.enqueue_request(options, None)?;
     let mut observed_store = store.clone();
     let mut held: Option<Arc<LeaderSession>> = None;
     let mut leader_work: Option<LeaderWork> = None;
+    // Only direct typed SQLite admission contention has a finite cumulative
+    // wait. A live owner's leader-lock contention can outlast a cold FULL run.
+    let mut sqlite_busy_since: Option<std::time::Instant> = None;
     loop {
         let store = &observed_store;
         if store.root_path_replaced()? {
@@ -659,6 +682,7 @@ pub fn enqueue_and_wait_observed(
         if let Some(row) = store.request_by_id(&request.id)? {
             match row.state.as_str() {
                 "done" => {
+                    crate::store::index_diagnostic_stage("done_row_seen");
                     let session = match held.take() {
                         Some(session) => session,
                         None => match store.follower_session() {
@@ -687,6 +711,7 @@ pub fn enqueue_and_wait_observed(
                         },
                     };
                     session.verify()?;
+                    crate::store::index_diagnostic_stage("session_verified");
                     if session.is_leader() {
                         // A finite owner finishes one bounded inventory/drain at its
                         // release fence. Later edits remain discoverable by takeover.
@@ -716,10 +741,12 @@ pub fn enqueue_and_wait_observed(
                         }
                     }
                     let pin = row.revision.expect("done request has revision");
+                    crate::store::index_diagnostic_stage("selected_proof_start");
                     let response = store.evidence_response()?;
                     response.validate_pin(pin)?;
                     response.finish(())?;
-                    return Ok((pin, session));
+                    crate::store::index_diagnostic_stage("selected_proof_complete");
+                    return Ok((request.id, pin, session));
                 }
                 "failed" => anyhow::bail!(
                     "{}: queued indexing failed",
@@ -774,6 +801,7 @@ pub fn enqueue_and_wait_observed(
         if held.is_none() {
             match store.leader_session() {
                 Ok(session) => {
+                    sqlite_busy_since = None;
                     // Reconcile the root before claiming any accepted FIFO row.
                     // This publication cannot acknowledge a request: each claim
                     // must produce its own fresh, guarded revision afterwards.
@@ -795,6 +823,26 @@ pub fn enqueue_and_wait_observed(
                     startup.run(&reconcile_options, cancel, &progress)?;
                     leader_work = Some(LeaderWork::new(store, &session, options)?);
                     held = Some(session);
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::store::SqliteContention>()
+                        .is_some() =>
+                {
+                    // The same accepted request retains its ID and FIFO place.
+                    // An index writer may still hold SQLite EX after we fail to
+                    // become leader; retry only this direct typed contention.
+                    let first = sqlite_busy_since.get_or_insert_with(std::time::Instant::now);
+                    if first.elapsed() >= std::time::Duration::from_secs(15) {
+                        if store.root_path_replaced()? {
+                            anyhow::bail!("root_changed: captured workspace pathname changed");
+                        }
+                        store.verify_root()?;
+                        return Err(error).context(format!(
+                            "storage_busy: request {} is durable and may already be complete; check job status",
+                            request.id
+                        ));
+                    }
                 }
                 Err(error)
                     if format!("{error:#}").contains("storage_busy")
@@ -1131,18 +1179,43 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-        let options = IndexOptions::new(workspace.path().to_owned());
+        let mut h = IndexOptions::new(workspace.path().canonicalize().unwrap());
+        h.max_file_bytes = 128;
+        let mut a_options = h.clone();
+        a_options.max_file_bytes = 32;
+        let mut b_options = h.clone();
+        b_options.max_file_bytes = 512;
+        let assert_selected_options = |expected: &IndexOptions| {
+            let observed = store.recorded_index_options().unwrap().unwrap();
+            assert_eq!(observed.workspace_root, expected.workspace_root);
+            assert_eq!(
+                crate::indexer::ReconcileOptions::from(&observed),
+                crate::indexer::ReconcileOptions::from(expected),
+            );
+        };
         let cancel = Arc::new(AtomicBool::new(false));
-        let (_, old_owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let (_, old_owner) = reconcile_workspace(&store, &h, &cancel, |_| {}).unwrap();
         drop(old_owner);
-        let mut options = options;
-        options.max_file_bytes = 1024;
-        let browser = store
-            .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
-            .unwrap();
-        let cli = store.enqueue_request(&options, None).unwrap();
-        assert!(browser.seq < cli.seq);
-        let (base, leader) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let browser = store.enqueue_request(&a_options, None).unwrap();
+        let cli = store.enqueue_request(&b_options, None).unwrap();
+        assert!(browser.seq < cli.seq && browser.id != cli.id);
+        let leader = establish_serving_session(&store, None, &cancel).unwrap();
+        let base = store.status().unwrap().revision;
+        assert_selected_options(&h);
+        assert_eq!(
+            store.request_by_id(&browser.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            store.request_by_id(&cli.id).unwrap().unwrap().state,
+            "queued"
+        );
+        let encoded_a =
+            serde_json::to_string(&crate::indexer::ReconcileOptions::from(&a_options)).unwrap();
+        let encoded_b =
+            serde_json::to_string(&crate::indexer::ReconcileOptions::from(&b_options)).unwrap();
+        assert_eq!(browser.options_json, encoded_a);
+        assert_eq!(cli.options_json, encoded_b);
         let injection = AtomicBool::new(false);
         assert_eq!(
             drain_requests_observed(&store, &leader, |id, phase| {
@@ -1164,6 +1237,13 @@ mod tests {
         let b = store.request_by_id(&cli.id).unwrap().unwrap();
         assert_eq!(a.state, "done");
         assert_eq!(
+            (a.id.as_str(), a.seq, a.options_json.as_str()),
+            (browser.id.as_str(), browser.seq, encoded_a.as_str())
+        );
+        assert_eq!(b.id, cli.id);
+        assert_eq!(b.options_json, encoded_b);
+        assert_selected_options(&a_options);
+        assert_eq!(
             b.seq, cli.seq,
             "accepted CLI ACK cannot be deleted/re-admitted under a new seq"
         );
@@ -1177,6 +1257,11 @@ mod tests {
             base.index_revision + 1,
             "failed commit must leave only the prior Q1 publication"
         );
+        let q1_pin = a.revision.unwrap();
+        // Selected status is fenced until Q2 reconciliation succeeds.
+        // Check Q1's durable DONE/pin and selected A options above; defer
+        // the historical source read until after Q2 publishes and recovers.
+        fs::write(workspace.path().join("a.js"), "function b() {}\n").unwrap();
         assert_eq!(
             drain_requests(&store, &leader).unwrap(),
             1,
@@ -1187,7 +1272,36 @@ mod tests {
             b.state, "done",
             "retry must finish the original accepted same-seq Q2"
         );
-        assert!(b.error_code.is_none());
+        assert!(b.finished_at.is_some() && b.error_code.is_none() && b.revision.is_some());
+        assert_eq!(
+            (
+                b.id.as_str(),
+                b.seq,
+                b.options_json.as_str(),
+                b.state.as_str()
+            ),
+            (cli.id.as_str(), cli.seq, encoded_b.as_str(), "done")
+        );
+        let final_q1 = store.request_by_id(&browser.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                final_q1.id.as_str(),
+                final_q1.seq,
+                final_q1.options_json.as_str(),
+                final_q1.state.as_str(),
+                final_q1.revision,
+            ),
+            (
+                browser.id.as_str(),
+                browser.seq,
+                encoded_a.as_str(),
+                "done",
+                Some(q1_pin)
+            ),
+            "Q2 retry cannot move Q1 out of its exact terminal DONE/pin",
+        );
+        assert!(final_q1.finished_at.is_some() && final_q1.error_code.is_none());
+        assert_selected_options(&b_options);
         assert_eq!(a.revision.unwrap().index_generation, base.index_generation);
         assert_eq!(a.revision.unwrap().index_revision, base.index_revision + 1);
         assert_eq!(
@@ -1196,6 +1310,27 @@ mod tests {
             "failed commit cannot leave a partially published revision"
         );
         assert_eq!(store.status().unwrap().revision, b.revision.unwrap());
+        let read = store.evidence_response().unwrap();
+        read.validate_pin(base).unwrap();
+        read.validate_pin(q1_pin).unwrap();
+        read.validate_pin(b.revision.unwrap()).unwrap();
+        assert_eq!(
+            read.source_at("a.js", Some(q1_pin))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function a() {}\n"
+        );
+        assert_eq!(
+            read.source_at("a.js", Some(b.revision.unwrap()))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function b() {}\n"
+        );
+        read.finish(()).unwrap();
         assert!(leader.verify().is_ok());
     }
 
