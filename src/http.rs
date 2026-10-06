@@ -4288,8 +4288,17 @@ mod serving_holder_tests {
         follower_store.fail_next_live_publish_commit_busy();
         drop(owner);
         // Typed pre-COMMIT contention is deferred with a 250ms deadline;
-        // the hook's rollback and changed synced marker prove it fired.
+        // inspect the scheduled bound before diagnostic reads can outlast it.
+        let retry_started = Instant::now();
         state.queue_tick().unwrap();
+        let retry_finished = Instant::now();
+        let scheduled_retry = *state.recovery_retry_after.lock().unwrap();
+        assert!(
+            scheduled_retry.is_some_and(|t| {
+                t >= retry_started && t <= retry_finished + Duration::from_millis(250)
+            }),
+            "failed empty-FIFO reconciliation must schedule its bounded 250ms retry"
+        );
         let successor_marker = fs::read(&leader_lock).unwrap();
         assert_ne!(successor_marker, predecessor_marker);
         assert_eq!(successor_marker.len(), 36);
@@ -4310,14 +4319,10 @@ mod serving_holder_tests {
             "{refused:#}"
         );
         assert!(follower_store.current_request().unwrap().is_none());
-        assert!(
-            state
-                .recovery_retry_after
-                .lock()
-                .unwrap()
-                .is_some_and(|t| t > Instant::now()),
-            "failed empty-FIFO reconciliation must retain bounded retry trigger"
-        );
+        // The reads above may run beyond 250ms under CI load. Hold the same
+        // retry branch open for the immediate-tick assertion without a clock race.
+        *state.recovery_retry_after.lock().unwrap() =
+            Some(Instant::now() + Duration::from_secs(10));
         state.queue_tick().unwrap();
         assert_eq!(
             fs::read(&leader_lock).unwrap(),
