@@ -335,6 +335,16 @@ impl DaemonState {
         self.replace_serving_session(Some(session));
         self.start_queue_tick();
     }
+    /// A failed initial H has no serving capability and no watcher yet. The
+    /// empty-queue retry must be armed *before* starting the tick; otherwise an
+    /// alive daemon binds HTTP but cannot discover a repaired checkout without
+    /// an explicit request. Back off from the already-failed startup attempt.
+    pub fn retry_failed_serving_startup(self: &Arc<Self>) {
+        self.empty_takeover_retry.store(true, Ordering::Release);
+        *self.recovery_retry_after.lock().unwrap() =
+            Some(Instant::now() + Duration::from_millis(250));
+        self.start_queue_tick();
+    }
     fn replace_serving_session(&self, next: Option<Arc<crate::store::topology::LeaderSession>>) {
         let mut current = self.serving_session.lock().unwrap();
         let changed = match (&*current, &next) {
@@ -463,8 +473,17 @@ impl DaemonState {
         // A CLI process or a previous daemon has no ID in this daemon's local
         // pending vector. Its durable FIFO row must still drive exceptional
         // recovery; the existing-only read leaves a virgin Ready queue absent.
+        // A failed initial Ready H must be retried before interpreting an
+        // existing queue. A v0 first-writer file can make even its read return
+        // storage_busy; the verified owner may safely repair that virgin file
+        // during mandatory H. Any durable FIFO rows wait for the next tick,
+        // after H, and are never acknowledged by this request-free retry.
+        let retry_initial_h = self.empty_takeover_retry.load(Ordering::Acquire)
+            && self.serving_session.lock().unwrap().is_none()
+            && self.store.is_ready_disposition();
         let durable_pending = !pending_local
             && !self.store.is_root_replaced()
+            && !retry_initial_h
             && self.store.earliest_unfinished_request()?.is_some();
         let mut externally_repaired = false;
         if self.store.is_recreate_pending() && !self.store.is_root_replaced() {

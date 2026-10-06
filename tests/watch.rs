@@ -861,9 +861,13 @@ async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
     fs::create_dir(&root).unwrap();
     fs::create_dir(&home).unwrap();
     let source = root.join("a.js");
-    fs::write(&source, "function before() {}\n").unwrap();
-    let seed = cli(&root, &home, "index").output().unwrap();
-    assert!(seed.status.success(), "healthy predecessor required");
+    fs::write(&source, "a=0;\n").unwrap();
+    let seed = cli(&root, &home, "index")
+        .arg("--max-file-bytes")
+        .arg("8")
+        .output()
+        .unwrap();
+    assert!(seed.status.success(), "healthy capped predecessor required");
     let old: serde_json::Value = cli(&root, &home, "status")
         .output()
         .and_then(|out| serde_json::from_slice(&out.stdout).map_err(std::io::Error::other))
@@ -972,6 +976,138 @@ async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
         selected["revision"],
         String::from_utf8_lossy(&prior_marker),
         String::from_utf8_lossy(&new_marker)
+    );
+
+    // Repair the *same persisted-option input* without POST, CLI index, restart,
+    // or a new daemon. A failed first H must trigger a bounded, request-free
+    // takeover. The initial HTTP 503 above never counts as serving success.
+    let queue = request_db_under(&home).unwrap();
+    type DurableRow = (i64, String, String, Option<String>, Option<i64>);
+    let durable_rows =
+        || -> Vec<DurableRow> {
+            let db = rusqlite::Connection::open_with_flags(
+                &queue,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut query = db.prepare(
+            "SELECT seq,id,state,result_generation,result_revision FROM requests ORDER BY seq"
+        ).unwrap();
+            query
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+    let before_rows = durable_rows();
+    assert_eq!(
+        before_rows.len(),
+        1,
+        "only the predecessor's explicit seed may be queued"
+    );
+    assert_eq!(before_rows[0].2, "done");
+    fs::write(&source, "x=1;\n").unwrap();
+    let same_pid = successor.0.id();
+    let client = reqwest::Client::new();
+    let ready_deadline = Instant::now() + Duration::from_secs(8);
+    let mut unserved = 0;
+    let ready: serde_json::Value = loop {
+        assert!(
+            successor.0.try_wait().unwrap().is_none(),
+            "successor PID {same_pid} exited before repair became served"
+        );
+        let response = client
+            .get(format!("http://{address}/api/status"))
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap();
+        let code = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        if code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && body.pointer("/error/code").and_then(|code| code.as_str()) == Some("index_not_ready")
+        {
+            unserved += 1;
+            assert!(
+                Instant::now() < ready_deadline,
+                "repaired checkout never became served without request: old_pin={:?} unserved={unserved} daemon_pid={same_pid} marker={:?} rows={:?} stderr={:?}",
+                old["revision"],
+                fs::read(&leader_lock)
+                    .ok()
+                    .map(|m| String::from_utf8_lossy(&m).into_owned()),
+                durable_rows(),
+                fs::read_to_string(&stderr_path).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        assert_eq!(
+            code,
+            reqwest::StatusCode::OK,
+            "unexpected post-repair serving response {code}: {body:?}"
+        );
+        assert_eq!(
+            body["revision"]["indexGeneration"],
+            old["revision"]["indexGeneration"]
+        );
+        assert!(
+            body["revision"]["indexRevision"].as_u64().is_some_and(
+                |revision| revision > old["revision"]["indexRevision"].as_u64().unwrap()
+            ),
+            "daemon served stale old pin after repair: {body:?}"
+        );
+        break body;
+    };
+    assert_eq!(
+        successor.0.id(),
+        same_pid,
+        "repair must use original daemon process"
+    );
+    assert_ne!(
+        fs::read(&leader_lock).unwrap(),
+        new_marker,
+        "repair requires a new leader incarnation after the failed H"
+    );
+    let revision = ready["revision"]["indexRevision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let source_response = client
+        .get(format!("http://{address}/api/source"))
+        .bearer_auth(token)
+        .query(&[
+            ("path", "a.js"),
+            (
+                "indexGeneration",
+                ready["revision"]["indexGeneration"].as_str().unwrap(),
+            ),
+            ("indexRevision", revision.as_str()),
+        ])
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        source_response.status(),
+        reqwest::StatusCode::OK,
+        "repaired source not available at exact H pin"
+    );
+    let pinned_source: serde_json::Value = source_response.json().await.unwrap();
+    assert_eq!(pinned_source["revision"], ready["revision"]);
+    assert_eq!(pinned_source["file"]["text"], "x=1;\n");
+    assert_eq!(
+        durable_rows(),
+        before_rows,
+        "request-free H must not fabricate FIFO/ACK rows"
     );
 }
 

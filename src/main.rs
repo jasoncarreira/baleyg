@@ -725,6 +725,11 @@ async fn main() -> Result<()> {
             )?;
             if let Some(session) = serving_session {
                 state.retain_serving_session(session);
+            } else {
+                // No selected evidence may be served until a fresh verified
+                // owner completes mandatory H. Retry request-free after source
+                // repair; a TCP listener alone is not readiness.
+                state.retry_failed_serving_startup();
             }
             state.start_dependency_index();
             eprintln!(
